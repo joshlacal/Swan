@@ -28,6 +28,14 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
     ],
     targets: [
+        .systemLibrary(
+            name: "CLibsodium",
+            pkgConfig: "libsodium",
+            providers: [
+                .brew(["libsodium"]),
+                .apt(["libsodium-dev"]),
+            ]
+        ),
         .target(
             name: "CBLAKE3",
             path: "Sources/CBLAKE3",
@@ -73,7 +81,13 @@ let package = Package(
                 .product(name: "Crypto", package: "swift-crypto"),
             ]
         ),
-        .target(name: "SwanAccounts", dependencies: ["SwanCore", "SwanStorage", .product(name: "Crypto", package: "swift-crypto")]),
+        .target(
+            name: "SwanAccounts",
+            dependencies: [
+                "CLibsodium", "SwanCore", "SwanStorage",
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
         .target(
             name: "SwanOAuth",
             dependencies: [
@@ -110,6 +124,7 @@ let package = Package(
             ]
         ),
         .testTarget(name: "SwanOAuthTests", dependencies: ["SwanOAuth", "SwanSpaces", .product(name: "Crypto", package: "swift-crypto")]),
+        .testTarget(name: "SwanAccountsTests", dependencies: ["SwanAccounts", "SwanCore"]),
         .testTarget(
             name: "SwanHTTPTests",
             dependencies: [

@@ -1,0 +1,780 @@
+import Dispatch
+import Foundation
+import SwanCore
+import XCTest
+@testable import SwanAccounts
+
+final class SwanAccountsTests: XCTestCase {
+    func testArgon2idHashVerifyUnicodeNULAndWrongPassword() throws {
+        let hasher = try LibsodiumArgon2idHasher()
+        let password = "correct\u{0} horse 🦢 батарея"
+        let encodedHash = try hasher.hash(password)
+
+        XCTAssertTrue(encodedHash.hasPrefix("$argon2id$v=19$"))
+        XCTAssertTrue(try hasher.verify(password, encodedHash: encodedHash))
+        XCTAssertFalse(try hasher.verify("correct horse 🦢 батарея", encodedHash: encodedHash))
+        XCTAssertFalse(try hasher.needsRehash(encodedHash))
+    }
+
+    func testArgon2idRejectsMalformedPHCAndUsesExplicitAlgorithmVersionRehashSemantics() throws {
+        let baseline = try LibsodiumArgon2idHasher()
+        XCTAssertThrowsError(try baseline.verify("password", encodedHash: "not-a-phc-string"))
+        XCTAssertThrowsError(try baseline.needsRehash(
+            "$argon2id$v=19$m=65536,m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"
+        ))
+
+        let encodedHash = try baseline.hash("rehash me")
+        let stronger = try LibsodiumArgon2idHasher(policy: Argon2idPolicy(
+            operationsLimit: 3,
+            memoryLimitBytes: Argon2idPolicy.minimumMemoryLimitBytes
+        ))
+        XCTAssertTrue(try stronger.needsRehash(encodedHash))
+
+        let argon2i = encodedHash.replacingOccurrences(of: "$argon2id$", with: "$argon2i$")
+        let oldVersion = encodedHash.replacingOccurrences(of: "$v=19$", with: "$v=16$")
+        let differentParallelism = encodedHash.replacingOccurrences(of: ",p=1$", with: ",p=2$")
+        XCTAssertTrue(try baseline.needsRehash(argon2i))
+        XCTAssertTrue(try baseline.needsRehash(oldVersion))
+        XCTAssertTrue(try baseline.needsRehash(differentParallelism))
+        XCTAssertThrowsError(try baseline.verify("rehash me", encodedHash: argon2i))
+        XCTAssertThrowsError(try baseline.verify("rehash me", encodedHash: oldVersion))
+        XCTAssertThrowsError(try baseline.verify(
+            "rehash me",
+            encodedHash: differentParallelism
+        ))
+    }
+
+    func testArgon2idExecutorEnforcesAdmissionBoundOffCooperativePool() async throws {
+        let release = DispatchSemaphore(value: 0)
+        let executor = try Argon2idVerificationExecutor(
+            maximumConcurrentVerifications: 2
+        ) { _, _ in
+            release.wait()
+            return true
+        }
+
+        async let first = executor.verify("1", encodedHash: "unused")
+        async let second = executor.verify("2", encodedHash: "unused")
+        async let third = executor.verify("3", encodedHash: "unused")
+        async let fourth = executor.verify("4", encodedHash: "unused")
+
+        try await waitUntil {
+            let metrics = await executor.metrics()
+            return metrics.active == 2 && metrics.queued == 2
+        }
+        let saturated = await executor.metrics()
+        XCTAssertEqual(saturated.active, 2)
+        XCTAssertEqual(saturated.queued, 2)
+        XCTAssertEqual(saturated.peakActive, 2)
+
+        for _ in 0 ..< 4 {
+            release.signal()
+        }
+        let results = try await (first, second, third, fourth)
+        XCTAssertTrue(results.0 && results.1 && results.2 && results.3)
+        let finalMetrics = await executor.metrics()
+        XCTAssertEqual(finalMetrics.peakActive, 2)
+    }
+
+    func testArgon2idExecutorRejectsOverloadAndNeverAdmitsCancelledQueuedWork() async throws {
+        let release = DispatchSemaphore(value: 0)
+        let executor = try Argon2idVerificationExecutor(
+            maximumConcurrentVerifications: 1,
+            maximumQueuedVerifications: 1
+        ) { _, _ in
+            release.wait()
+            return true
+        }
+
+        let active = Task { try await executor.verify("active", encodedHash: "unused") }
+        try await waitUntil {
+            let metrics = await executor.metrics()
+            return metrics.active == 1
+        }
+        let queued = Task { try await executor.verify("queued", encodedHash: "unused") }
+        try await waitUntil {
+            let metrics = await executor.metrics()
+            return metrics.queued == 1
+        }
+
+        await XCTAssertThrowsSwanErrorAsync(
+            try await executor.verify("rejected", encodedHash: "unused"),
+            expected: .unavailable("Argon2id verification capacity exhausted")
+        )
+        queued.cancel()
+        do {
+            _ = try await queued.value
+            XCTFail("cancelled queued verification unexpectedly completed")
+        } catch is CancellationError {
+            // Expected: cancellation removed this request before admission.
+        }
+        try await waitUntil {
+            let metrics = await executor.metrics()
+            return metrics.queued == 0
+        }
+
+        release.signal()
+        let activeResult = try await active.value
+        XCTAssertTrue(activeResult)
+        let metrics = await executor.metrics()
+        XCTAssertEqual(metrics.totalAdmitted, 1)
+        XCTAssertEqual(metrics.totalRejected, 1)
+        XCTAssertEqual(metrics.active, 0)
+        XCTAssertEqual(metrics.queued, 0)
+    }
+
+    func testCanonicalIdentifiersAndNormalizedHandleDuplicates() async throws {
+        let account = try SwanAccount(
+            did: Self.aliceDID,
+            handle: "Alice.Example.COM"
+        )
+        XCTAssertEqual(account.did, Self.aliceDID)
+        XCTAssertEqual(account.handle, "alice.example.com")
+
+        let directory = AccountDirectory()
+        try await directory.create(account)
+        let duplicate = try SwanAccount(
+            did: Self.bobDID,
+            handle: "ALICE.example.COM"
+        )
+        await XCTAssertThrowsSwanErrorAsync(
+            try await directory.create(duplicate),
+            expected: .conflict(expected: 0, actual: 1)
+        )
+        let resolved = await directory.resolve(handle: "Alice.Example.Com")
+        XCTAssertEqual(resolved?.did, account.did)
+
+        XCTAssertEqual(try AccountIdentifiers.validateDID(Self.aliceDID), Self.aliceDID)
+        XCTAssertEqual(
+            try AccountIdentifiers.validateDID("did:web:example.com%3A443:user:Alice"),
+            "did:web:example.com%3A443:user:Alice"
+        )
+        for did in [
+            "DID:plc:abcdefghijklmnopqrstuvwx",
+            "did:PLC:abcdefghijklmnopqrstuvwx",
+            "did:plc:",
+            "did:plc:ali ce",
+            "did:plc:abcdefghijklmnopqrstuvw0",
+            "did:plc:abcdefghijklmnopqrstuvWX",
+            "did:key:abcdefghijklmnopqrstuvwx",
+            "did:web:example.com%3a443",
+            "did:web:Example.com",
+            "did:web:example.com:%61",
+        ] {
+            XCTAssertThrowsError(try AccountIdentifiers.validateDID(did), did)
+        }
+        for handle in [
+            "singlelabel",
+            "alice..example.com",
+            "-alice.example.com",
+            "alice.example.123",
+            "álîce.example.com",
+            "alice.example.com\u{0}",
+        ] {
+            XCTAssertThrowsError(try AccountIdentifiers.canonicalHandle(handle), handle)
+        }
+        XCTAssertThrowsError(try AccountKeyReference(
+            accountDID: "did:PLC:abcdefghijklmnopqrstuvwx",
+            purpose: .signing,
+            generation: 1
+        ))
+
+        let invalidAccount = Data(
+            #"{"did":"did:PLC:abcdefghijklmnopqrstuvwx","handle":"alice.example.com","status":"active","createdAt":0}"#.utf8
+        )
+        XCTAssertThrowsError(try JSONDecoder().decode(SwanAccount.self, from: invalidAccount))
+        let invalidReference = Data(
+            #"{"accountDID":"did:PLC:abcdefghijklmnopqrstuvwx","purpose":"account-signing","generation":1}"#.utf8
+        )
+        XCTAssertThrowsError(try JSONDecoder().decode(AccountKeyReference.self, from: invalidReference))
+    }
+
+    func testEnvelopeAADRejectsDIDPurposeAndGenerationSwapsWithAuthenticationError() async throws {
+        let original = try keyReference()
+        let swaps = [
+            try AccountKeyReference(accountDID: Self.bobDID, purpose: .signing, generation: 1),
+            try AccountKeyReference(accountDID: Self.aliceDID, purpose: .rotation, generation: 1),
+            try AccountKeyReference(accountDID: Self.aliceDID, purpose: .signing, generation: 2),
+        ]
+
+        for swap in swaps {
+            let root = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let store = try FileAccountKeyStore(
+                root: root,
+                configuration: keyConfiguration(activeKeyID: "active", byte: 7)
+            )
+            try await store.create(Data(repeating: 1, count: 32), for: original)
+            let originalFile = try onlyKeyFile(in: root)
+            let originalEnvelope = try Data(contentsOf: originalFile)
+
+            try await store.create(Data(repeating: 2, count: 32), for: swap)
+            let targetFile = try Set(keyFiles(in: root)).subtracting([originalFile]).onlyElement()
+            try writeEnvelope(
+                originalEnvelope,
+                replacing: [
+                    "accountDID": swap.accountDID,
+                    "purpose": swap.purpose.rawValue,
+                    "generation": NSNumber(value: swap.generation),
+                ],
+                to: targetFile
+            )
+
+            await XCTAssertThrowsSwanErrorAsync(
+                try await store.key(for: swap),
+                expected: .unauthorized("account key envelope authentication failed")
+            )
+        }
+    }
+
+    func testEnvelopeCiphertextKIDAndFormatTamperingHaveConcreteFailureCategories() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = try AccountKeyEncryptionConfiguration(
+            activeKeyID: "active",
+            activeKey: Data(repeating: 1, count: 32),
+            decryptOnlyKeys: ["old": Data(repeating: 2, count: 32)]
+        )
+        let reference = try keyReference()
+
+        do {
+            let store = try FileAccountKeyStore(root: root, configuration: configuration)
+            try await store.create(Data(repeating: 3, count: 32), for: reference)
+            let keyFile = try onlyKeyFile(in: root)
+            var object = try envelopeObject(Data(contentsOf: keyFile))
+            var ciphertext = try XCTUnwrap(Data(base64Encoded: try XCTUnwrap(object["sealedKey"] as? String)))
+            ciphertext[ciphertext.startIndex] ^= 0x01
+            object["sealedKey"] = ciphertext.base64EncodedString()
+            try writeEnvelope(object, to: keyFile)
+            await XCTAssertThrowsSwanErrorAsync(
+                try await store.key(for: reference),
+                expected: .unauthorized("account key envelope authentication failed")
+            )
+        }
+
+        try FileManager.default.removeItem(at: try onlyKeyFile(in: root))
+        do {
+            let store = try FileAccountKeyStore(root: root, configuration: configuration)
+            try await store.create(Data(repeating: 3, count: 32), for: reference)
+            let keyFile = try onlyKeyFile(in: root)
+            try writeEnvelope(
+                Data(contentsOf: keyFile),
+                replacing: ["kid": "old"],
+                to: keyFile
+            )
+            await XCTAssertThrowsSwanErrorAsync(
+                try await store.key(for: reference),
+                expected: .unauthorized("account key envelope authentication failed")
+            )
+        }
+
+        try FileManager.default.removeItem(at: try onlyKeyFile(in: root))
+        do {
+            let store = try FileAccountKeyStore(root: root, configuration: configuration)
+            try await store.create(Data(repeating: 3, count: 32), for: reference)
+            let keyFile = try onlyKeyFile(in: root)
+            try writeEnvelope(
+                Data(contentsOf: keyFile),
+                replacing: ["format": "swan-key-envelope-v2"],
+                to: keyFile
+            )
+            await XCTAssertThrowsSwanErrorAsync(
+                try await store.key(for: reference),
+                expected: .malformed("account key envelope format mismatch")
+            )
+        }
+    }
+
+    func testDescriptorAnchoringResistsRootReplacementAndBoundsReads() async throws {
+        let parent = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appending(path: "keys")
+        let movedRoot = parent.appending(path: "pinned-keys")
+        let hostileRoot = parent.appending(path: "hostile")
+        let store = try FileAccountKeyStore(
+            root: root,
+            configuration: keyConfiguration(activeKeyID: "active", byte: 9)
+        )
+        XCTAssertEqual(try permissions(of: root), 0o700)
+        XCTAssertEqual(
+            try permissions(of: root.appending(path: ".swan-key-store.lock")),
+            0o600
+        )
+        XCTAssertEqual(
+            try permissions(of: root.appending(path: ".swan-active-kek-v1")),
+            0o600
+        )
+        try await store.create(Data(repeating: 8, count: 32), for: keyReference())
+
+        try FileManager.default.moveItem(at: root, to: movedRoot)
+        try FileManager.default.createDirectory(at: hostileRoot, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: root, withDestinationURL: hostileRoot)
+        let secondReference = try AccountKeyReference(
+            accountDID: Self.aliceDID,
+            purpose: .rotation,
+            generation: 1
+        )
+        try await store.create(Data(repeating: 7, count: 32), for: secondReference)
+
+        XCTAssertEqual(try keyFiles(in: movedRoot).count, 2)
+        XCTAssertTrue(try keyFiles(in: hostileRoot).isEmpty)
+        XCTAssertEqual(try permissions(of: movedRoot), 0o700)
+        for keyFile in try keyFiles(in: movedRoot) {
+            XCTAssertEqual(try permissions(of: keyFile), 0o600)
+        }
+
+        for keyFile in try keyFiles(in: movedRoot) {
+            try Data(repeating: 0, count: 16 * 1_024 + 1).write(to: keyFile)
+        }
+        await XCTAssertThrowsSwanErrorAsync(
+            try await store.key(for: try keyReference()),
+            expected: .malformed("account key-store entry failed validation")
+        )
+
+        let symlinkRoot = parent.appending(path: "symlink-root")
+        try FileManager.default.createSymbolicLink(at: symlinkRoot, withDestinationURL: hostileRoot)
+        XCTAssertThrowsError(try FileAccountKeyStore(
+            root: symlinkRoot,
+            configuration: keyConfiguration(activeKeyID: "active", byte: 9)
+        ))
+    }
+
+    func testKeyStoreRejectsUnreadablePrivateKeySizesBeforeInstallation() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try FileAccountKeyStore(
+            root: root,
+            configuration: keyConfiguration(activeKeyID: "active", byte: 10)
+        )
+        let reference = try keyReference()
+
+        for count in [31, 33] {
+            await XCTAssertThrowsSwanErrorAsync(
+                try await store.create(Data(repeating: 1, count: count), for: reference),
+                expected: .malformed("P-256 private key material must be exactly 32 bytes")
+            )
+            XCTAssertThrowsError(try AccountKeyMaterial(
+                reference: reference,
+                key: Data(repeating: 1, count: count)
+            ))
+        }
+        XCTAssertTrue(try keyFiles(in: root).isEmpty)
+    }
+
+    func testDirectoryIterationErrorIsNotMistakenForEndOfInventory() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = try keyConfiguration(activeKeyID: "active", byte: 13)
+        let writer = try FileAccountKeyStore(root: root, configuration: configuration)
+        try await writer.create(Data(repeating: 1, count: 32), for: keyReference())
+
+        let faultedReader = try FileAccountKeyStore(
+            root: root,
+            configuration: configuration,
+            failDirectoryIterationAfterEntryCount: 0
+        )
+        await XCTAssertThrowsSwanErrorAsync(
+            try await faultedReader.inventory(),
+            expected: .unavailable("could not inventory account key-store directory")
+        )
+    }
+
+    func testEagerKEKMigrationCoversDormantEnvelopesAndEnablesRetirement() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let oldKey = Data(repeating: 3, count: 32)
+        let newKey = Data(repeating: 4, count: 32)
+        let references = [
+            try keyReference(),
+            try AccountKeyReference(
+                accountDID: Self.aliceDID,
+                purpose: .rotation,
+                generation: 1
+            ),
+        ]
+        let oldStore = try FileAccountKeyStore(
+            root: root,
+            configuration: try AccountKeyEncryptionConfiguration(
+                activeKeyID: "old",
+                activeKey: oldKey
+            )
+        )
+        for (index, reference) in references.enumerated() {
+            try await oldStore.create(Data(repeating: UInt8(index + 1), count: 32), for: reference)
+        }
+
+        let rotatingStore = try FileAccountKeyStore(
+            root: root,
+            configuration: try AccountKeyEncryptionConfiguration(
+                activeKeyID: "new",
+                activeKey: newKey,
+                decryptOnlyKeys: ["old": oldKey]
+            )
+        )
+        let before = try await rotatingStore.inventory()
+        XCTAssertEqual(before.writerKeyID, "old")
+        XCTAssertEqual(before.envelopeCountByKeyID, ["old": 2])
+        XCTAssertFalse(before.isMigrationComplete)
+
+        let report = try await rotatingStore.migrateAllEnvelopesToActiveKey()
+        XCTAssertEqual(report.migratedEnvelopeCount, 2)
+        XCTAssertEqual(report.inventory.writerKeyID, "new")
+        XCTAssertEqual(report.inventory.envelopeCountByKeyID, ["new": 2])
+        XCTAssertTrue(report.inventory.isMigrationComplete)
+
+        let retiredStore = try FileAccountKeyStore(
+            root: root,
+            configuration: try AccountKeyEncryptionConfiguration(
+                activeKeyID: "new",
+                activeKey: newKey
+            )
+        )
+        for reference in references {
+            let key = try await retiredStore.key(for: reference)
+            XCTAssertEqual(key.count, 32)
+        }
+
+        XCTAssertThrowsError(try AccountKeyEncryptionConfiguration(
+            activeKeyID: "new",
+            activeKey: newKey,
+            decryptOnlyKeys: ["old": newKey]
+        ))
+    }
+
+    func testPersistentActiveKEKMarkerRejectsStaleAndPrematureWritersAcrossStores() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let oldKey = Data(repeating: 5, count: 32)
+        let newKey = Data(repeating: 6, count: 32)
+        let oldStore = try FileAccountKeyStore(
+            root: root,
+            configuration: try AccountKeyEncryptionConfiguration(
+                activeKeyID: "old",
+                activeKey: oldKey
+            )
+        )
+        try await oldStore.create(Data(repeating: 1, count: 32), for: keyReference())
+
+        let rotatingStore = try FileAccountKeyStore(
+            root: root,
+            configuration: try AccountKeyEncryptionConfiguration(
+                activeKeyID: "new",
+                activeKey: newKey,
+                decryptOnlyKeys: ["old": oldKey]
+            )
+        )
+        let nextReference = try AccountKeyReference(
+            accountDID: Self.aliceDID,
+            purpose: .signing,
+            generation: 2
+        )
+        await XCTAssertThrowsSwanErrorAsync(
+            try await rotatingStore.create(
+                Data(repeating: 2, count: 32),
+                for: nextReference
+            ),
+            expected: .unavailable(
+                "active KEK migration is required before writing account keys"
+            )
+        )
+
+        _ = try await rotatingStore.migrateAllEnvelopesToActiveKey()
+        await XCTAssertThrowsSwanErrorAsync(
+            try await oldStore.create(Data(repeating: 2, count: 32), for: nextReference),
+            expected: .unavailable(
+                "active KEK migration is required before writing account keys"
+            )
+        )
+        try await rotatingStore.create(Data(repeating: 2, count: 32), for: nextReference)
+        let inventory = try await rotatingStore.inventory()
+        XCTAssertEqual(inventory.writerKeyID, "new")
+        XCTAssertEqual(inventory.envelopeCountByKeyID, ["new": 2])
+        XCTAssertTrue(inventory.isMigrationComplete)
+        XCTAssertEqual(
+            try String(
+                contentsOf: root.appending(path: ".swan-active-kek-v1"),
+                encoding: .utf8
+            ),
+            "new"
+        )
+    }
+
+    func testRetiringOldKEKBeforeInventoryMigrationFailsClosed() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let oldStore = try FileAccountKeyStore(
+            root: root,
+            configuration: keyConfiguration(activeKeyID: "old", byte: 3)
+        )
+        try await oldStore.create(Data(repeating: 1, count: 32), for: keyReference())
+
+        let prematurelyRetired = try FileAccountKeyStore(
+            root: root,
+            configuration: keyConfiguration(activeKeyID: "new", byte: 4)
+        )
+        let inventory = try await prematurelyRetired.inventory()
+        XCTAssertEqual(inventory.envelopeCountByKeyID, ["old": 1])
+        XCTAssertFalse(inventory.isMigrationComplete)
+        await XCTAssertThrowsSwanErrorAsync(
+            try await prematurelyRetired.migrateAllEnvelopesToActiveKey(),
+            expected: .unavailable(
+                "active account KEK migration requires the currently active KEK"
+            )
+        )
+    }
+
+    func testProvisioningIsCreateOnlyAndRotationRequiresHigherGeneration() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try FileAccountKeyStore(
+            root: root,
+            configuration: keyConfiguration(activeKeyID: "active", byte: 11)
+        )
+        let provisioner = AccountKeyProvisioner(keyStore: store)
+        let provisioned = try await provisioner.provisionInitial(accountDID: Self.aliceDID)
+        let originalSigning = try await store.key(for: provisioned.signingReference)
+        let originalRotation = try await store.key(for: provisioned.rotationReference)
+
+        let resumed = try await provisioner.provisionInitial(accountDID: Self.aliceDID)
+        XCTAssertEqual(resumed, provisioned)
+        let duplicateSigning = try await store.key(for: provisioned.signingReference)
+        let duplicateRotation = try await store.key(for: provisioned.rotationReference)
+        XCTAssertEqual(duplicateSigning, originalSigning)
+        XCTAssertEqual(duplicateRotation, originalRotation)
+
+        await XCTAssertThrowsSwanErrorAsync(
+            try await provisioner.provisionRotation(
+                accountDID: Self.aliceDID,
+                generation: 1
+            ),
+            expected: .malformed("account key rotation requires an explicit higher generation")
+        )
+        let rotated = try await provisioner.provisionRotation(
+            accountDID: Self.aliceDID,
+            generation: 2
+        )
+        XCTAssertEqual(rotated.signingReference.generation, 2)
+        XCTAssertEqual(rotated.rotationReference.generation, 2)
+        let rotatedSigning = try await store.key(for: rotated.signingReference)
+        XCTAssertNotEqual(rotatedSigning, originalSigning)
+    }
+
+    func testResumeProvisioningRejectsStoredNonP256Scalars() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try FileAccountKeyStore(
+            root: root,
+            configuration: keyConfiguration(activeKeyID: "active", byte: 14)
+        )
+        let signing = try keyReference()
+        let rotation = try AccountKeyReference(
+            accountDID: Self.aliceDID,
+            purpose: .rotation,
+            generation: 1
+        )
+        try await store.create(Data(repeating: 0, count: 32), for: signing)
+        try await store.create(Data(repeating: 1, count: 32), for: rotation)
+
+        let provisioner = AccountKeyProvisioner(keyStore: store)
+        await XCTAssertThrowsSwanErrorAsync(
+            try await provisioner.resumeProvisioning(
+                accountDID: Self.aliceDID,
+                generation: 1
+            ),
+            expected: .malformed(
+                "stored account provisioning key is not a valid P-256 private key"
+            )
+        )
+    }
+
+    func testInterruptedSecondProvisioningWriteRecoversFromDurableJournal() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = try keyConfiguration(activeKeyID: "active", byte: 12)
+        let interruptedStore = try FileAccountKeyStore(
+            root: root,
+            configuration: configuration,
+            failAfterBatchInstallCount: 1
+        )
+        let provisioner = AccountKeyProvisioner(keyStore: interruptedStore)
+        await XCTAssertThrowsSwanErrorAsync(
+            try await provisioner.provisionInitial(accountDID: Self.aliceDID),
+            expected: .unavailable("injected account key provisioning interruption")
+        )
+        XCTAssertEqual(try keyFiles(in: root).count, 1)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: root.appending(path: ".swan-key-provisioning-journal-v1").path
+            )
+        )
+
+        let recoveredStore = try FileAccountKeyStore(
+            root: root,
+            configuration: configuration
+        )
+        let signing = try keyReference()
+        let rotation = try AccountKeyReference(
+            accountDID: Self.aliceDID,
+            purpose: .rotation,
+            generation: 1
+        )
+        let signingKey = try await recoveredStore.key(for: signing)
+        let rotationKey = try await recoveredStore.key(for: rotation)
+        XCTAssertNotEqual(signingKey, rotationKey)
+        let recoveredProvisioner = AccountKeyProvisioner(keyStore: recoveredStore)
+        let resumed = try await recoveredProvisioner.resumeProvisioning(
+            accountDID: Self.aliceDID,
+            generation: 1
+        )
+        XCTAssertEqual(resumed.signingReference, signing)
+        XCTAssertEqual(resumed.rotationReference, rotation)
+        XCTAssertEqual(resumed.signingPublicKey.count, 65)
+        XCTAssertEqual(resumed.rotationPublicKey.count, 65)
+        XCTAssertNotEqual(resumed.signingPublicKey, resumed.rotationPublicKey)
+        let retried = try await recoveredProvisioner.provisionInitial(
+            accountDID: Self.aliceDID
+        )
+        XCTAssertEqual(retried, resumed)
+        XCTAssertEqual(try keyFiles(in: root).count, 2)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: root.appending(path: ".swan-key-provisioning-journal-v1").path
+            )
+        )
+    }
+
+    func testLifecycleStatusIsCanonicalForwardCompatibleAndOnlyActiveIsActive() throws {
+        XCTAssertTrue(AccountStatus.active.isActive)
+        for status in [
+            AccountStatus.deactivated,
+            .deleted,
+            .takendown,
+            .suspended,
+            .desynchronized,
+            .throttled,
+            .unknown("future-moderation-state"),
+            .unknown("active"),
+        ] {
+            XCTAssertFalse(status.isActive)
+        }
+
+        let encoded = try JSONEncoder().encode(AccountStatus.unknown("future-moderation-state"))
+        XCTAssertEqual(
+            try JSONDecoder().decode(AccountStatus.self, from: encoded),
+            .unknown("future-moderation-state")
+        )
+        XCTAssertEqual(
+            try JSONDecoder().decode(AccountStatus.self, from: Data(#""active""#.utf8)),
+            .active
+        )
+        XCTAssertThrowsError(try JSONEncoder().encode(AccountStatus.unknown("active")))
+        XCTAssertThrowsError(try JSONEncoder().encode(AccountStatus.unknown("ACTIVE")))
+        XCTAssertThrowsError(try AccountStatus(rawValue: "future status"))
+    }
+
+    private func keyReference() throws -> AccountKeyReference {
+        try AccountKeyReference(
+            accountDID: Self.aliceDID,
+            purpose: .signing,
+            generation: 1
+        )
+    }
+
+    private static let aliceDID = "did:plc:abcdefghijklmnopqrstuvwx"
+    private static let bobDID = "did:plc:bcdefghijklmnopqrstuvwxy"
+
+    private func keyConfiguration(activeKeyID: String, byte: UInt8) throws
+        -> AccountKeyEncryptionConfiguration
+    {
+        try AccountKeyEncryptionConfiguration(
+            activeKeyID: activeKeyID,
+            activeKey: Data(repeating: byte, count: 32)
+        )
+    }
+
+    private func temporaryDirectory() throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appending(path: "SwanAccountsTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    private func keyFiles(in root: URL) throws -> [URL] {
+        try FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "key" }
+    }
+
+    private func onlyKeyFile(in root: URL) throws -> URL {
+        try keyFiles(in: root).onlyElement()
+    }
+
+    private func permissions(of url: URL) throws -> Int {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        return try XCTUnwrap(attributes[.posixPermissions] as? NSNumber).intValue
+    }
+
+    private func envelopeObject(_ data: Data) throws -> [String: Any] {
+        try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    private func writeEnvelope(
+        _ data: Data,
+        replacing fields: [String: Any],
+        to url: URL
+    ) throws {
+        var object = try envelopeObject(data)
+        for (field, value) in fields {
+            object[field] = value
+        }
+        try writeEnvelope(object, to: url)
+    }
+
+    private func writeEnvelope(_ object: [String: Any], to url: URL) throws {
+        try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            .write(to: url)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
+    }
+
+    private func waitUntil(
+        _ predicate: @escaping () async -> Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        for _ in 0 ..< 100 {
+            if await predicate() { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("condition was not reached", file: file, line: line)
+    }
+}
+
+private extension Collection {
+    func onlyElement(
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> Element {
+        XCTAssertEqual(count, 1, file: file, line: line)
+        return try XCTUnwrap(first, file: file, line: line)
+    }
+}
+
+private func XCTAssertThrowsSwanErrorAsync<T>(
+    _ expression: @autoclosure () async throws -> T,
+    expected: SwanError,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("expected \(expected)", file: file, line: line)
+    } catch let error as SwanError {
+        XCTAssertEqual(error, expected, file: file, line: line)
+    } catch {
+        XCTFail("unexpected error \(error)", file: file, line: line)
+    }
+}

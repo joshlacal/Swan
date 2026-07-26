@@ -1,28 +1,115 @@
-import Crypto
 import Foundation
 import SwanCore
-import SwanStorage
 
-public enum AccountStatus: String, Codable, Sendable {
+public enum AccountStatus: Codable, Sendable, Equatable {
     case active
     case deactivated
     case deleted
+    case takendown
+    case suspended
+    case desynchronized
+    case throttled
+    case unknown(String)
+
+    public init(rawValue: String) throws {
+        guard Self.isCanonicalStatusToken(rawValue) else {
+            throw SwanError.malformed("invalid account status")
+        }
+        self = switch rawValue {
+        case "active": .active
+        case "deactivated": .deactivated
+        case "deleted": .deleted
+        case "takendown": .takendown
+        case "suspended": .suspended
+        case "desynchronized": .desynchronized
+        case "throttled": .throttled
+        default: .unknown(rawValue)
+        }
+    }
+
+    public var rawValue: String {
+        switch self {
+        case .active: "active"
+        case .deactivated: "deactivated"
+        case .deleted: "deleted"
+        case .takendown: "takendown"
+        case .suspended: "suspended"
+        case .desynchronized: "desynchronized"
+        case .throttled: "throttled"
+        case let .unknown(value): value
+        }
+    }
+
+    public var isActive: Bool {
+        self == .active
+    }
+
+    public init(from decoder: any Decoder) throws {
+        try self.init(rawValue: decoder.singleValueContainer().decode(String.self))
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        if case let .unknown(value) = self {
+            guard Self.isCanonicalStatusToken(value),
+                  try AccountStatus(rawValue: value) == .unknown(value) else {
+                throw SwanError.malformed("invalid unknown account status")
+            }
+        }
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+
+    private static func isCanonicalStatusToken(_ value: String) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= 64,
+              let first = value.utf8.first,
+              first >= 97, first <= 122 else {
+            return false
+        }
+        return value.utf8.allSatisfy {
+            ($0 >= 97 && $0 <= 122)
+                || ($0 >= 48 && $0 <= 57)
+                || $0 == 45
+                || $0 == 95
+        }
+    }
 }
 
 public struct SwanAccount: Codable, Sendable, Equatable {
     public let did: String
-    public var handle: String
+    public private(set) var handle: String
     public var status: AccountStatus
     public let createdAt: Date
 
     public init(did: String, handle: String, status: AccountStatus = .active, createdAt: Date = Date()) throws {
-        guard did.hasPrefix("did:"), handle.split(separator: ".").count >= 2 else {
-            throw SwanError.invalidIdentifier("account DID or handle")
-        }
-        self.did = did
-        self.handle = handle
+        self.did = try AccountIdentifiers.validateDID(did)
+        self.handle = try AccountIdentifiers.canonicalHandle(handle)
         self.status = status
         self.createdAt = createdAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case did
+        case handle
+        case status
+        case createdAt
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            did: container.decode(String.self, forKey: .did),
+            handle: container.decode(String.self, forKey: .handle),
+            status: container.decode(AccountStatus.self, forKey: .status),
+            createdAt: container.decode(Date.self, forKey: .createdAt)
+        )
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(did, forKey: .did)
+        try container.encode(handle, forKey: .handle)
+        try container.encode(status, forKey: .status)
+        try container.encode(createdAt, forKey: .createdAt)
     }
 }
 
@@ -41,65 +128,16 @@ public actor AccountDirectory {
     }
 
     public func account(did: String) -> SwanAccount? { accounts[did] }
-    public func resolve(handle: String) -> SwanAccount? { handles[handle].flatMap { accounts[$0] } }
+    public func resolve(handle: String) -> SwanAccount? {
+        guard let canonical = try? AccountIdentifiers.canonicalHandle(handle) else { return nil }
+        return handles[canonical].flatMap { accounts[$0] }
+    }
 
     public func setStatus(_ status: AccountStatus, did: String) throws {
         guard var account = accounts[did] else { throw SwanError.malformed("unknown account") }
         account.status = status
         accounts[did] = account
     }
-}
-
-public protocol AccountKeyStore: Sendable {
-    func put(_ key: Data, named name: String) async throws
-    func key(named name: String) async throws -> Data
-}
-
-/// Development-only encrypted file key store. The caller supplies the master
-/// key from process configuration or a mounted secret; it is never written to
-/// SQLite or to the key-store directory.
-public actor FileAccountKeyStore: AccountKeyStore {
-    private let root: URL
-    private let masterKey: SymmetricKey
-
-    public init(root: URL, masterKey: Data) throws {
-        guard masterKey.count >= 32 else { throw SwanError.malformed("key-store master key is too short") }
-        self.root = root
-        self.masterKey = SymmetricKey(data: masterKey)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-    }
-
-    public func put(_ key: Data, named name: String) throws {
-        let sealed = try AES.GCM.seal(key, using: masterKey)
-        guard let combined = sealed.combined else { throw SwanError.unavailable("could not serialize encrypted key") }
-        let destination = fileURL(for: name)
-        try combined.write(to: destination, options: [.atomic])
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
-    }
-
-    public func key(named name: String) throws -> Data {
-        let combined = try Data(contentsOf: fileURL(for: name))
-        return try AES.GCM.open(AES.GCM.SealedBox(combined: combined), using: masterKey)
-    }
-
-    private func fileURL(for name: String) -> URL {
-        let digest = Hex.encode(SHA256.hash(data: Data(name.utf8)))
-        return root.appending(path: "\(digest).key")
-    }
-}
-
-public protocol PasswordHasher: Sendable {
-    func hash(_ password: String) throws -> String
-    func verify(_ password: String, encodedHash: String) throws -> Bool
-}
-
-/// Password login fails closed until a deployment configures the planned
-/// Argon2id/libsodium adapter. Swan intentionally never substitutes a fast
-/// hash for a password verifier.
-public struct UnavailablePasswordHasher: PasswordHasher {
-    public init() {}
-    public func hash(_ password: String) throws -> String { throw SwanError.unavailable("Argon2id password hashing is not configured") }
-    public func verify(_ password: String, encodedHash: String) throws -> Bool { throw SwanError.unavailable("Argon2id password hashing is not configured") }
 }
 
 public struct PortableAccountExportManifest: Codable, Sendable, Equatable {

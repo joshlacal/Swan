@@ -1,0 +1,5 @@
+module CLibsodium [system] {
+  header "include/CLibsodium.h"
+  link "sodium"
+  export *
+}
