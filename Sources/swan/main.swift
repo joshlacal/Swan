@@ -91,20 +91,34 @@ extension SwanCommand {
         @Option(name: .long, help: "Pinned protocol profile JSON")
         var profile: String = "Profiles/permissioned-data-0016-2026-07-03.json"
 
+        @Option(name: .long, help: "Swan package root containing generated wire sources")
+        var sourceRoot: String?
+
         @Option(name: .long, help: "Pinned reference checkout to checksum against")
         var referenceDirectory: String?
 
         func run() throws {
             let profileURL = URL(fileURLWithPath: profile)
-            let loaded = try ProtocolProfile.load(from: profileURL)
+            let report = OfflineProtocolProfileVerifier.verify(
+                profileURL: profileURL,
+                sourceRoot: sourceRoot.map { URL(fileURLWithPath: $0) }
+            )
+            guard report.isValid, let profileID = report.profileID else {
+                for diagnostic in report.diagnostics {
+                    FileHandle.standardError.write(Data((diagnostic.description + "\n").utf8))
+                }
+                throw ValidationError("offline protocol profile verification failed")
+            }
             if let referenceDirectory {
                 try ProtocolProfile.verifyPinnedLexicons(
-                    profileURL: profileURL, referenceRoot: URL(fileURLWithPath: referenceDirectory)
+                    profileURL: profileURL,
+                    referenceRoot: URL(fileURLWithPath: referenceDirectory)
                 )
-                print("PROFILE AND LEXICONS OK: \(loaded.id) reference=\(loaded.referenceImplementationCommit.prefix(12))")
-            } else {
-                print("PROFILE OK: \(loaded.id) reference=\(loaded.referenceImplementationCommit.prefix(12))")
             }
+            let suffix = referenceDirectory == nil
+                ? "offline artifacts verified"
+                : "offline artifacts and pinned lexicons verified"
+            print("PROFILE OK: \(profileID) (\(suffix))")
         }
     }
 

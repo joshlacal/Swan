@@ -288,9 +288,16 @@ public enum SpaceAuthorizationPolicy {
                     || parameters["collection"] == "*"
                     || parameters["collection"] == collection
             }
-            return collection.map {
-                parameters["collection"] == $0 || parameters["collection"] == "*"
-            } == true
+            // Space-management operations address the authority state rather
+            // than one repository record, so their scoped grant has no
+            // collection component.  Treating that as an implicit denial
+            // would make a syntactically valid `action=manage` scope useless
+            // while still allowing the broad `atproto` escape hatch.
+            guard collection == nil else {
+                return parameters["collection"] == collection
+                    || parameters["collection"] == "*"
+            }
+            return parameters["collection"] == nil || parameters["collection"] == "*"
         }
     }
 
@@ -705,6 +712,9 @@ public struct SimpleSpaceConfiguration: Sendable, Codable, Equatable {
         guard policy != .managingApp || managingApp != nil else {
             throw SwanError.malformed("managing-app spaces require a managing app")
         }
+        guard policy == .managingApp || managingApp == nil else {
+            throw SwanError.malformed("only managing-app spaces may name a managing app")
+        }
         self.policy = policy
         self.appAccess = appAccess
         self.managingApp = managingApp
@@ -717,6 +727,47 @@ public struct SimpleSpace: Sendable, Equatable {
     public let configuration: SimpleSpaceConfiguration
     public let members: Set<String>
     public let isDeleted: Bool
+
+    /// A decoded authority state must still satisfy the same ownership and
+    /// membership invariants as a newly created space.  SQLite adapters use
+    /// this failable construction point to reject tampered rows rather than
+    /// exposing a partially-valid policy object.
+    public init(
+        uri: SpaceURI,
+        owner: String,
+        configuration: SimpleSpaceConfiguration,
+        members: Set<String>,
+        isDeleted: Bool
+    ) throws {
+        guard owner == uri.authority,
+              SpaceURI.isValidDID(owner),
+              members.contains(owner),
+              members.allSatisfy(SpaceURI.isValidDID)
+        else {
+            throw SwanError.malformed("invalid simple-space authority state")
+        }
+        self.init(
+            uncheckedURI: uri,
+            owner: owner,
+            configuration: configuration,
+            members: members,
+            isDeleted: isDeleted
+        )
+    }
+
+    fileprivate init(
+        uncheckedURI uri: SpaceURI,
+        owner: String,
+        configuration: SimpleSpaceConfiguration,
+        members: Set<String>,
+        isDeleted: Bool
+    ) {
+        self.uri = uri
+        self.owner = owner
+        self.configuration = configuration
+        self.members = members
+        self.isDeleted = isDeleted
+    }
 }
 
 private struct MutableSimpleSpace: Sendable {
@@ -727,7 +778,13 @@ private struct MutableSimpleSpace: Sendable {
     var isDeleted: Bool
 
     var snapshot: SimpleSpace {
-        SimpleSpace(uri: uri, owner: owner, configuration: configuration, members: members, isDeleted: isDeleted)
+        SimpleSpace(
+            uncheckedURI: uri,
+            owner: owner,
+            configuration: configuration,
+            members: members,
+            isDeleted: isDeleted
+        )
     }
 }
 

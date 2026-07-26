@@ -5,6 +5,7 @@ import ServiceLifecycle
 import SwanCore
 import SwanOAuth
 import SwanSpaces
+import SwanSpacesWire
 import SwanStorage
 
 public struct SwanHTTPConfiguration: Sendable, Equatable {
@@ -69,15 +70,21 @@ public struct SwanHTTPServer: Sendable {
             ))
         }
 
-        // Permissioned methods never fall through to public handlers. OAuth
-        // metadata and token routes are not live yet, so there is no served
-        // bearer-token validation path to accidentally back with memory state.
-        router.get("/xrpc/com.atproto.space.getRecord") { _, _ -> Response in
-            oauthUnavailable()
+        // Do not route permissioned traffic to the in-memory repository store
+        // while durable OAuth and account control have no HTTP entry points.
+        // The checked-in wire registry is the sole source for this coverage:
+        // every profile method gets an explicit, method-correct closed handler
+        // until its authenticated implementation is ready.
+        for descriptor in PermissionedData0016.methods {
+            registerUnavailablePermissionedEndpoint(descriptor, on: router)
         }
-        router.post("/xrpc/com.atproto.space.applyWrites") { _, _ -> Response in
-            oauthUnavailable()
-        }
+
+        // Reject future/unknown permissioned methods explicitly instead of
+        // allowing a later generic XRPC route to become an accidental public
+        // fallback. Exact profile routes above have higher router precedence,
+        // so a wrong method on a known endpoint remains unavailable (404),
+        // rather than being mistaken for its method-correct 503 gate.
+        registerUnknownPermissionedEndpointGuards(on: router)
 
         return router
     }
@@ -116,6 +123,51 @@ private func oauthUnavailable() -> Response {
     // Do not publish OAuth discovery metadata until PAR, authorization,
     // token, revocation, consent, and proof validation are all registered.
     jsonResponseWithStatus(.serviceUnavailable, body: ["error": "oauth_flow_pending"])
+}
+
+private func registerUnavailablePermissionedEndpoint(
+    _ descriptor: XRPCMethodDescriptor,
+    on router: Router<BasicRequestContext>
+) {
+    let path = RouterPath("/xrpc/\(descriptor.nsid)")
+    switch descriptor.kind {
+    case .query, .subscription:
+        router.get(path) { _, _ -> Response in
+            permissionedDataUnavailable()
+        }
+    case .procedure:
+        router.post(path) { _, _ -> Response in
+            permissionedDataUnavailable()
+        }
+    }
+}
+
+private func registerUnknownPermissionedEndpointGuards(
+    on router: Router<BasicRequestContext>
+) {
+    let methods: [HTTPRequest.Method] = [
+        .get, .head, .post, .put, .patch, .delete, .options, .connect, .trace,
+    ]
+    let paths: [RouterPath] = [
+        "/xrpc/com.atproto.space.*",
+        "/xrpc/com.atproto.simplespace.*",
+    ]
+
+    for path in paths {
+        for method in methods {
+            router.on(path, method: method) { _, _ -> Response in
+                permissionedEndpointUnavailable()
+            }
+        }
+    }
+}
+
+private func permissionedEndpointUnavailable() -> Response {
+    jsonResponseWithStatus(.notFound, body: ["error": "permissioned_endpoint_unavailable"])
+}
+
+private func permissionedDataUnavailable() -> Response {
+    jsonResponseWithStatus(.serviceUnavailable, body: ["error": "permissioned_data_pending"])
 }
 
 private func jsonResponseWithStatus(_ status: HTTPResponse.Status, body: some Encodable) -> Response {

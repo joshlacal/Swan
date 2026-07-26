@@ -723,6 +723,269 @@ final class SwanSpacesTests: XCTestCase {
         let publicRecord = try await database.publicRecord(publicURI)
         XCTAssertNil(publicRecord)
     }
+
+    func testDurableSimpleSpaceAuthorityPersistsPolicyAndMakesDuplicateMutationsNoOps() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanDurableAuthorityTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let authorityDID = "did:plc:alice"
+        let space = try SpaceURI(
+            authority: authorityDID,
+            spaceType: "app.bsky.bookmarks",
+            skey: "authority"
+        )
+        let credentialSecret = Data(repeating: 0x5A, count: 32)
+        let managementScope = """
+        space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&action=manage
+        """
+        let manage = AuthorizationContext.accountOAuth(
+            subject: authorityDID,
+            scopes: [managementScope]
+        )
+        let initialConfiguration = try SimpleSpaceConfiguration(
+            policy: .memberList,
+            appAccess: .allowList(["https://reader.example/client.json"])
+        )
+        let database = try await SQLiteAccountDatabase(
+            dataDirectory: root,
+            did: authorityDID
+        )
+        let authority = try DurableSimpleSpaceAuthority(
+            database: database,
+            credentialSecret: credentialSecret
+        )
+        let created = try await authority.create(
+            space: space,
+            owner: authorityDID,
+            configuration: initialConfiguration,
+            authorization: manage
+        )
+        XCTAssertEqual(created.revision, 1)
+        XCTAssertEqual(created.space.members, [authorityDID])
+
+        await XCTAssertThrowsErrorAsync(
+            try await authority.addMember(
+                space: space,
+                member: "did:plc:bob",
+                authorization: .accountOAuth(subject: "did:plc:mallory", scopes: ["atproto"])
+            )
+        )
+        let firstMemberMutation = try await authority.addMember(
+            space: space,
+            member: "did:plc:bob",
+            authorization: manage
+        )
+        XCTAssertEqual(firstMemberMutation.revision, 2)
+        let duplicateMemberMutation = try await authority.addMember(
+            space: space,
+            member: "did:plc:bob",
+            authorization: manage
+        )
+        XCTAssertEqual(duplicateMemberMutation, firstMemberMutation)
+
+        let clientMutation = try await authority.setClientAccess(
+            space: space,
+            clientID: "https://second-reader.example/client.json",
+            allowed: true,
+            authorization: manage
+        )
+        XCTAssertEqual(clientMutation.revision, 3)
+        let duplicateClientMutation = try await authority.setClientAccess(
+            space: space,
+            clientID: "https://second-reader.example/client.json",
+            allowed: true,
+            authorization: manage
+        )
+        XCTAssertEqual(duplicateClientMutation, clientMutation)
+
+        // Bob is an authorized member, but Mallory must not be able to mint
+        // a credential for Bob by naming him as the requested user.
+        await XCTAssertThrowsErrorAsync(
+            try await authority.issueReadCredential(
+                space: space,
+                user: "did:plc:bob",
+                clientID: "https://second-reader.example/client.json",
+                authorization: .accountOAuth(
+                    subject: "did:plc:mallory",
+                    scopes: ["atproto"]
+                )
+            )
+        )
+
+        let credential = try await authority.issueReadCredential(
+            space: space,
+            user: "did:plc:bob",
+            clientID: "https://second-reader.example/client.json",
+            authorization: .accountOAuth(
+                subject: "did:plc:bob",
+                scopes: ["atproto"]
+            )
+        )
+        let verified = try HMACSpaceCredentialAuthority(key: credentialSecret)
+            .verify(credential)
+        XCTAssertEqual(verified.subject, "did:plc:bob")
+        await XCTAssertThrowsErrorAsync(
+            try await authority.issueReadCredential(
+                space: space,
+                user: "did:plc:bob",
+                clientID: "https://wrong.example/client.json",
+                authorization: .accountOAuth(
+                    subject: "did:plc:bob",
+                    scopes: ["atproto"]
+                )
+            )
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await authority.space(
+                space,
+                authorization: .accountOAuth(
+                    subject: "did:plc:bob",
+                    scopes: ["atproto"]
+                )
+            )
+        )
+        try await database.close()
+
+        let reopenedDatabase = try await SQLiteAccountDatabase(
+            dataDirectory: root,
+            did: authorityDID
+        )
+        let reopened = try DurableSimpleSpaceAuthority(
+            database: reopenedDatabase,
+            credentialSecret: credentialSecret
+        )
+        let restoredState = try await reopened.space(
+            space,
+            authorization: manage
+        )
+        let restored = try XCTUnwrap(restoredState)
+        XCTAssertEqual(restored, clientMutation)
+        let restoredCredential = try await reopened.issueReadCredential(
+            space: space,
+            user: "did:plc:bob",
+            clientID: "https://second-reader.example/client.json",
+            authorization: .accountOAuth(
+                subject: "did:plc:bob",
+                scopes: ["atproto"]
+            )
+        )
+        XCTAssertEqual(
+            try HMACSpaceCredentialAuthority(key: credentialSecret)
+                .verify(restoredCredential).subject,
+            "did:plc:bob"
+        )
+        try await reopenedDatabase.close()
+    }
+
+    func testDurableSimpleSpaceManagingAppAndDeletionFailClosedAcrossAuthorityAccounts() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanDurableAuthorityAccountsTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let alice = "did:plc:alice"
+        let bob = "did:plc:bob"
+        let space = try SpaceURI(
+            authority: bob,
+            spaceType: "app.bsky.bookmarks",
+            skey: "managed"
+        )
+        let configuration = try SimpleSpaceConfiguration(
+            policy: .managingApp,
+            appAccess: .open,
+            managingApp: "did:web:reader.example#space"
+        )
+        let aliceDatabase = try await SQLiteAccountDatabase(dataDirectory: root, did: alice)
+        let aliceAuthority = try DurableSimpleSpaceAuthority(
+            database: aliceDatabase,
+            credentialSecret: Data(repeating: 1, count: 32)
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await aliceAuthority.create(
+                space: space,
+                owner: bob,
+                configuration: configuration,
+                authorization: .accountOAuth(subject: bob, scopes: ["atproto"])
+            )
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await aliceAuthority.space(
+                space,
+                authorization: .accountOAuth(subject: bob, scopes: ["atproto"])
+            )
+        )
+
+        let bobDatabase = try await SQLiteAccountDatabase(dataDirectory: root, did: bob)
+        let bobAuthority = try DurableSimpleSpaceAuthority(
+            database: bobDatabase,
+            credentialSecret: Data(repeating: 2, count: 32)
+        )
+        let ownerAuthorization = AuthorizationContext.accountOAuth(
+            subject: bob,
+            scopes: ["atproto"]
+        )
+        _ = try await bobAuthority.create(
+            space: space,
+            owner: bob,
+            configuration: configuration,
+            authorization: ownerAuthorization
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await bobAuthority.setManagingAppAccess(
+                space: space,
+                user: alice,
+                allowed: true,
+                authorization: .service(
+                    subject: "did:web:wrong.example#space",
+                    audience: bob
+                )
+            )
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await bobAuthority.setManagingAppAccess(
+                space: space,
+                user: alice,
+                allowed: true,
+                authorization: .service(
+                    subject: "did:web:reader.example#space",
+                    audience: alice
+                )
+            )
+        )
+        _ = try await bobAuthority.setManagingAppAccess(
+            space: space,
+            user: alice,
+            allowed: true,
+            authorization: .service(
+                subject: "did:web:reader.example#space",
+                audience: bob
+            )
+        )
+        _ = try await bobAuthority.issueReadCredential(
+            space: space,
+            user: alice,
+            clientID: nil,
+            authorization: .accountOAuth(subject: alice, scopes: ["atproto"])
+        )
+        let deleted = try await bobAuthority.delete(
+            space: space,
+            authorization: ownerAuthorization
+        )
+        XCTAssertTrue(deleted.space.isDeleted)
+        let duplicateDelete = try await bobAuthority.delete(
+            space: space,
+            authorization: ownerAuthorization
+        )
+        XCTAssertEqual(duplicateDelete, deleted)
+        await XCTAssertThrowsErrorAsync(
+            try await bobAuthority.issueReadCredential(
+                space: space,
+                user: alice,
+                clientID: nil,
+                authorization: .accountOAuth(subject: alice, scopes: ["atproto"])
+            )
+        )
+        try await aliceDatabase.close()
+        try await bobDatabase.close()
+    }
 }
 
 private func XCTAssertThrowsErrorAsync<T>(_ expression: @autoclosure () async throws -> T, file: StaticString = #filePath, line: UInt = #line) async {

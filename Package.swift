@@ -99,13 +99,19 @@ let package = Package(
         .target(
             name: "SwanHTTP",
             dependencies: [
-                "SwanCore", "SwanSpaces", "SwanStorage", "SwanOAuth",
+                "SwanCore", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
             ]
         ),
-        .target(name: "SwanInterop", dependencies: ["SwanCore", "SwanSpaces"]),
+        .target(
+            name: "SwanInterop",
+            dependencies: [
+                "SwanCore", "SwanSpaces",
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
         .executableTarget(
             name: "swan",
             dependencies: [
@@ -147,9 +153,17 @@ let package = Package(
         .testTarget(
             name: "SwanHTTPTests",
             dependencies: [
-                "SwanHTTP", "SwanOAuth", "SwanSQLite",
+                "SwanHTTP", "SwanOAuth", "SwanSQLite", "SwanSpacesWire",
+                .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
                 .product(name: "Logging", package: "swift-log"),
+            ]
+        ),
+        .testTarget(
+            name: "SwanInteropTests",
+            dependencies: [
+                "SwanInterop",
+                .product(name: "Crypto", package: "swift-crypto"),
             ]
         ),
     ]

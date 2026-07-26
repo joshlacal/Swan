@@ -1,6 +1,413 @@
 import Foundation
+import Crypto
 import SwanCore
 import SwanSpaces
+
+/// A stable, offline-only diagnostic for a checked-in protocol artifact.
+///
+/// Deliberately do not carry filesystem paths, file contents, or underlying
+/// decoding errors here. `swan verify` is safe to use in CI logs, including
+/// when the profile directory is mounted from a secret-bearing environment.
+public struct ProtocolProfileVerificationDiagnostic: Error, Sendable, Equatable, CustomStringConvertible {
+    public enum Code: String, Sendable, Equatable, Codable {
+        case unreadableProfile
+        case malformedProfile
+        case unsupportedProfileID
+        case invalidRevisionPin
+        case invalidChecksumPin
+        case immutableProfilePinMismatch
+        case missingArtifactPin
+        case invalidArtifactName
+        case unreadableLexiconManifest
+        case lexiconManifestDigestMismatch
+        case malformedLexiconManifest
+        case unreadableGeneratedWireManifest
+        case generatedWireManifestDigestMismatch
+        case malformedGeneratedWireManifest
+        case generatedWireSourceMissing
+        case generatedWireSourceOutsideRoot
+        case generatedWireSourceSymlink
+        case generatedWireSourceChecksumMismatch
+        case generatedWireSourceSetMismatch
+    }
+
+    public let code: Code
+    public let artifact: String
+
+    public init(_ code: Code, artifact: String) {
+        self.code = code
+        self.artifact = artifact
+    }
+
+    public var description: String {
+        "profile verification failed: \(code.rawValue) (\(artifact))"
+    }
+}
+
+/// The result of checking a protocol profile without contacting any remote
+/// service. A caller can render the stable diagnostics in logs or map them to
+/// its own error transport without exposing potentially sensitive local paths.
+public struct ProtocolProfileVerificationReport: Sendable, Equatable {
+    public let profileID: String?
+    public let diagnostics: [ProtocolProfileVerificationDiagnostic]
+
+    public init(profileID: String?, diagnostics: [ProtocolProfileVerificationDiagnostic]) {
+        self.profileID = profileID
+        self.diagnostics = diagnostics
+    }
+
+    public var isValid: Bool { diagnostics.isEmpty }
+}
+
+/// Validates the immutable local profile and the checksums for its checked-in
+/// artifacts. This verifier is deliberately unable to fetch, unpack, or trust
+/// an upstream checkout: profile drift must be visible before network-backed
+/// regeneration happens in CI.
+public enum OfflineProtocolProfileVerifier {
+    public static let stableProfileID = "permissioned-data-0016-2026-07-03"
+
+    private struct ArtifactPins: Decodable {
+        let id: String
+        let proposalCommit: String
+        let referenceImplementationCommit: String
+        let petrelGeneratorCommit: String
+        let petrelCommit: String
+        let migrationCompatibility: String
+        let crypto: CryptoSuite
+        let permissionedDataIsEncrypted: Bool
+        let oplogRetention: Int
+        let referenceArchiveSHA256: String?
+        let lexiconManifest: String?
+        let lexiconManifestSHA256: String?
+        let generatedWireManifest: String?
+        let generatedWireManifestSHA256: String?
+        let endpoints: [String]
+    }
+
+    private struct CryptoSuite: Decodable, Equatable {
+        let lthashBytes: Int
+        let lthashHash: String
+        let commitmentHash: String
+        let contentBinding: String
+    }
+
+    private struct ManifestEntry: Equatable {
+        let checksum: String
+        let path: String
+    }
+
+    // This verifier deliberately supports exactly one immutable profile. Shape
+    // validation alone would let a modified JSON file substitute a different
+    // well-formed commit or manifest digest and still report success.
+    private static let expectedProposalCommit = "1caad93dbb1f445396f6abf3b97eb4040345e78e"
+    private static let expectedReferenceImplementationCommit = "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354"
+    private static let expectedPetrelGeneratorCommit = "d011ccf0029457434e659ec48c8024baa7b5c4e4"
+    private static let expectedPetrelCommit = "db84b2c9788aa38000ee3f134e21feffa8f351cd"
+    private static let expectedReferenceArchiveSHA256 = "1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea"
+    private static let expectedLexiconManifestSHA256 = "9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f"
+    private static let expectedGeneratedWireManifestSHA256 = "c1d5697f351a4209c7f8a9faaf460d423f9f44f37845ae2c92e150e78c552609"
+    private static let expectedEndpoints = [
+        "com.atproto.space.applyWrites",
+        "com.atproto.space.createRecord",
+        "com.atproto.space.deleteRecord",
+        "com.atproto.space.getBlob",
+        "com.atproto.space.getDelegationToken",
+        "com.atproto.space.getLatestCommit",
+        "com.atproto.space.getRecord",
+        "com.atproto.space.getRepo",
+        "com.atproto.space.getSpace",
+        "com.atproto.space.getSpaceCredential",
+        "com.atproto.space.listRecords",
+        "com.atproto.space.listRepoOps",
+        "com.atproto.space.listRepos",
+        "com.atproto.space.listSpaces",
+        "com.atproto.space.notifySpaceDeleted",
+        "com.atproto.space.notifyWrite",
+        "com.atproto.space.putRecord",
+        "com.atproto.space.registerNotify",
+        "com.atproto.simplespace.addMember",
+        "com.atproto.simplespace.checkUserAccess",
+        "com.atproto.simplespace.createSpace",
+        "com.atproto.simplespace.deleteSpace",
+        "com.atproto.simplespace.listMembers",
+        "com.atproto.simplespace.removeMember",
+        "com.atproto.simplespace.updateSpace",
+    ]
+
+    public static func verify(
+        profileURL: URL,
+        sourceRoot: URL? = nil
+    ) -> ProtocolProfileVerificationReport {
+        var diagnostics: [ProtocolProfileVerificationDiagnostic] = []
+        let profileData: Data
+        guard !isSymbolicLink(profileURL) else {
+            return .init(profileID: nil, diagnostics: [.init(.unreadableProfile, artifact: "profile")])
+        }
+        do {
+            profileData = try Data(contentsOf: profileURL, options: [.mappedIfSafe])
+        } catch {
+            return .init(profileID: nil, diagnostics: [.init(.unreadableProfile, artifact: "profile")])
+        }
+
+        let artifactPins: ArtifactPins
+        do {
+            artifactPins = try JSONDecoder().decode(ArtifactPins.self, from: profileData)
+        } catch {
+            return .init(profileID: nil, diagnostics: [.init(.malformedProfile, artifact: "profile")])
+        }
+
+        if artifactPins.id != stableProfileID {
+            diagnostics.append(.init(.unsupportedProfileID, artifact: "profile"))
+        }
+        for revision in [
+            artifactPins.proposalCommit,
+            artifactPins.referenceImplementationCommit,
+            artifactPins.petrelGeneratorCommit,
+            artifactPins.petrelCommit,
+        ] where !isLowercaseHex(revision, count: 40) {
+            diagnostics.append(.init(.invalidRevisionPin, artifact: "profile"))
+            break
+        }
+        if let archiveChecksum = artifactPins.referenceArchiveSHA256 {
+            if !isLowercaseHex(archiveChecksum, count: 64) {
+                diagnostics.append(.init(.invalidChecksumPin, artifact: "reference archive"))
+            }
+        } else {
+            diagnostics.append(.init(.missingArtifactPin, artifact: "reference archive"))
+        }
+        if artifactPins.endpoints.isEmpty || Set(artifactPins.endpoints).count != artifactPins.endpoints.count {
+            diagnostics.append(.init(.malformedProfile, artifact: "profile"))
+        }
+        if !hasExpectedImmutablePins(artifactPins) {
+            diagnostics.append(.init(.immutableProfilePinMismatch, artifact: "profile"))
+        }
+        do {
+            _ = try ProtocolProfile(data: profileData)
+        } catch {
+            diagnostics.append(.init(.malformedProfile, artifact: "profile"))
+        }
+
+        let expectedLexiconManifest = "\(stableProfileID).lexicons.sha256"
+        verifyManifest(
+            name: artifactPins.lexiconManifest,
+            checksum: artifactPins.lexiconManifestSHA256,
+            expectedName: expectedLexiconManifest,
+            profileDirectory: profileURL.deletingLastPathComponent(),
+            sourceRoot: nil,
+            kind: .lexicon,
+            diagnostics: &diagnostics
+        )
+
+        let expectedWireManifest = "\(stableProfileID).generated-wire.sha256"
+        verifyManifest(
+            name: artifactPins.generatedWireManifest,
+            checksum: artifactPins.generatedWireManifestSHA256,
+            expectedName: expectedWireManifest,
+            profileDirectory: profileURL.deletingLastPathComponent(),
+            sourceRoot: sourceRoot ?? profileURL
+                .deletingLastPathComponent()
+                .deletingLastPathComponent(),
+            kind: .generatedWire,
+            diagnostics: &diagnostics
+        )
+
+        return .init(profileID: artifactPins.id, diagnostics: diagnostics)
+    }
+
+    private enum ManifestKind: Equatable {
+        case lexicon
+        case generatedWire
+    }
+
+    private static func verifyManifest(
+        name: String?,
+        checksum: String?,
+        expectedName: String,
+        profileDirectory: URL,
+        sourceRoot: URL?,
+        kind: ManifestKind,
+        diagnostics: inout [ProtocolProfileVerificationDiagnostic]
+    ) {
+        let artifact = kind == .lexicon ? "lexicon manifest" : "generated wire manifest"
+        let missingCode: ProtocolProfileVerificationDiagnostic.Code = .missingArtifactPin
+        guard let name, let checksum else {
+            diagnostics.append(.init(missingCode, artifact: artifact))
+            return
+        }
+        guard name == expectedName else {
+            diagnostics.append(.init(.invalidArtifactName, artifact: artifact))
+            return
+        }
+        guard isLowercaseHex(checksum, count: 64) else {
+            diagnostics.append(.init(.invalidChecksumPin, artifact: artifact))
+            return
+        }
+
+        let manifestData: Data
+        let manifestURL = profileDirectory.appending(path: name)
+        guard !isSymbolicLink(manifestURL) else {
+            diagnostics.append(.init(
+                kind == .lexicon ? .unreadableLexiconManifest : .unreadableGeneratedWireManifest,
+                artifact: artifact
+            ))
+            return
+        }
+        do {
+            manifestData = try Data(contentsOf: manifestURL, options: [.mappedIfSafe])
+        } catch {
+            diagnostics.append(.init(
+                kind == .lexicon ? .unreadableLexiconManifest : .unreadableGeneratedWireManifest,
+                artifact: artifact
+            ))
+            return
+        }
+        guard Hex.encode(SHA256.hash(data: manifestData)) == checksum else {
+            diagnostics.append(.init(
+                kind == .lexicon ? .lexiconManifestDigestMismatch : .generatedWireManifestDigestMismatch,
+                artifact: artifact
+            ))
+            return
+        }
+        guard let manifestText = String(data: manifestData, encoding: .utf8),
+              let entries = parseManifest(manifestText, kind: kind) else {
+            diagnostics.append(.init(
+                kind == .lexicon ? .malformedLexiconManifest : .malformedGeneratedWireManifest,
+                artifact: artifact
+            ))
+            return
+        }
+
+        guard kind == .generatedWire, let sourceRoot else { return }
+        verifyGeneratedWireSources(entries, sourceRoot: sourceRoot, diagnostics: &diagnostics)
+    }
+
+    private static func parseManifest(_ text: String, kind: ManifestKind) -> [ManifestEntry]? {
+        guard text.unicodeScalars.allSatisfy({ $0.value != 13 }) else { return nil }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+        guard !lines.isEmpty else { return nil }
+        var entries: [ManifestEntry] = []
+        var paths = Set<String>()
+        for line in lines {
+            let fields = line.split(separator: " ", omittingEmptySubsequences: false)
+            guard fields.count == 3, fields[1].isEmpty,
+                  isLowercaseHex(String(fields[0]), count: 64) else { return nil }
+            let path = String(fields[2])
+            let expectedPrefix = kind == .lexicon ? "com/atproto/" : "Sources/SwanSpacesWire/"
+            let expectedSuffix = kind == .lexicon ? ".json" : ".swift"
+            guard path.hasPrefix(expectedPrefix), path.hasSuffix(expectedSuffix),
+                  isSafeRelativePath(path), paths.insert(path).inserted else { return nil }
+            entries.append(.init(checksum: String(fields[0]), path: path))
+        }
+        guard entries.map(\.path) == entries.map(\.path).sorted() else { return nil }
+        return entries
+    }
+
+    private static func verifyGeneratedWireSources(
+        _ entries: [ManifestEntry],
+        sourceRoot: URL,
+        diagnostics: inout [ProtocolProfileVerificationDiagnostic]
+    ) {
+        let canonicalRoot = sourceRoot.resolvingSymlinksInPath().standardizedFileURL
+        let expectedPaths = Set(entries.map(\.path))
+        var discoveredPaths = Set<String>()
+        for entry in entries {
+            let lexicalSource = canonicalRoot.appending(path: entry.path)
+                .standardizedFileURL
+            let source = lexicalSource
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+            guard lexicalSource == source else {
+                diagnostics.append(.init(.generatedWireSourceSymlink, artifact: "generated wire source"))
+                continue
+            }
+            guard isWithin(source, root: canonicalRoot) else {
+                diagnostics.append(.init(.generatedWireSourceOutsideRoot, artifact: "generated wire source"))
+                continue
+            }
+            let sourceData: Data
+            do {
+                sourceData = try Data(contentsOf: source, options: [.mappedIfSafe])
+            } catch {
+                diagnostics.append(.init(.generatedWireSourceMissing, artifact: "generated wire source"))
+                continue
+            }
+            guard Hex.encode(SHA256.hash(data: sourceData)) == entry.checksum else {
+                diagnostics.append(.init(.generatedWireSourceChecksumMismatch, artifact: "generated wire source"))
+                continue
+            }
+        }
+
+        let wireRoot = canonicalRoot.appending(path: "Sources/SwanSpacesWire", directoryHint: .isDirectory)
+        if let enumerator = FileManager.default.enumerator(
+            at: wireRoot,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            while let candidate = enumerator.nextObject() as? URL {
+                guard candidate.pathExtension == "swift" else { continue }
+                let lexicalCandidate = candidate.standardizedFileURL
+                let canonicalCandidate = lexicalCandidate.resolvingSymlinksInPath().standardizedFileURL
+                guard lexicalCandidate == canonicalCandidate else {
+                    diagnostics.append(.init(.generatedWireSourceSymlink, artifact: "generated wire source"))
+                    continue
+                }
+                guard isWithin(canonicalCandidate, root: canonicalRoot) else {
+                    diagnostics.append(.init(.generatedWireSourceOutsideRoot, artifact: "generated wire source"))
+                    continue
+                }
+                let components = canonicalCandidate.pathComponents.dropFirst(canonicalRoot.pathComponents.count)
+                discoveredPaths.insert(components.joined(separator: "/"))
+            }
+        }
+        if discoveredPaths != expectedPaths {
+            diagnostics.append(.init(.generatedWireSourceSetMismatch, artifact: "generated wire sources"))
+        }
+    }
+
+    private static func isSafeRelativePath(_ path: String) -> Bool {
+        guard !path.isEmpty, !path.hasPrefix("/"), !path.contains("\\") else { return false }
+        return !path.split(separator: "/").contains(where: { $0.isEmpty || $0 == "." || $0 == ".." })
+    }
+
+    private static func isWithin(_ candidate: URL, root: URL) -> Bool {
+        let rootComponents = root.pathComponents
+        let candidateComponents = candidate.pathComponents
+        return candidateComponents.starts(with: rootComponents) && candidateComponents.count > rootComponents.count
+    }
+
+    private static func isLowercaseHex(_ value: String, count: Int) -> Bool {
+        value.utf8.count == count && value.utf8.allSatisfy {
+            ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+        }
+    }
+
+    private static func isSymbolicLink(_ url: URL) -> Bool {
+        (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path)) != nil
+    }
+
+    private static func hasExpectedImmutablePins(_ pins: ArtifactPins) -> Bool {
+        pins.id == stableProfileID &&
+            pins.proposalCommit == expectedProposalCommit &&
+            pins.referenceImplementationCommit == expectedReferenceImplementationCommit &&
+            pins.petrelGeneratorCommit == expectedPetrelGeneratorCommit &&
+            pins.petrelCommit == expectedPetrelCommit &&
+            pins.migrationCompatibility == "destructiveBeforeAlpha" &&
+            pins.crypto == .init(
+                lthashBytes: 2_048,
+                lthashHash: "BLAKE3-XOF",
+                commitmentHash: "SHA-256",
+                contentBinding: "HMAC-SHA-256"
+            ) &&
+            pins.permissionedDataIsEncrypted == false &&
+            pins.oplogRetention == 10_000 &&
+            pins.referenceArchiveSHA256 == expectedReferenceArchiveSHA256 &&
+            pins.lexiconManifest == "\(stableProfileID).lexicons.sha256" &&
+            pins.lexiconManifestSHA256 == expectedLexiconManifestSHA256 &&
+            pins.generatedWireManifest == "\(stableProfileID).generated-wire.sha256" &&
+            pins.generatedWireManifestSHA256 == expectedGeneratedWireManifestSHA256 &&
+            pins.endpoints == expectedEndpoints
+    }
+}
 
 public struct ReferenceSourcePin: Codable, Sendable, Equatable {
     public let repository: URL

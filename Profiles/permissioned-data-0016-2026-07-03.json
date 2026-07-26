@@ -16,6 +16,8 @@
   "referenceArchiveSHA256": "1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea",
   "lexiconManifest": "permissioned-data-0016-2026-07-03.lexicons.sha256",
   "lexiconManifestSHA256": "9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f",
+  "generatedWireManifest": "permissioned-data-0016-2026-07-03.generated-wire.sha256",
+  "generatedWireManifestSHA256": "c1d5697f351a4209c7f8a9faaf460d423f9f44f37845ae2c92e150e78c552609",
   "endpoints": [
     "com.atproto.space.applyWrites",
     "com.atproto.space.createRecord",

@@ -229,6 +229,47 @@ public enum SQLiteLayout {
         CREATE INDEX IF NOT EXISTS permissioned_space_outbox_pending
         ON permissioned_space_outbox(created_at, id)
         """,
+        /// Authority-owned `com.atproto.simplespace` facts.  These stay in
+        /// the authority's account database, never in a member's repository
+        /// database or the cross-account control store.
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_simple_space_authorities (
+            space_uri TEXT PRIMARY KEY,
+            owner_did TEXT NOT NULL,
+            policy TEXT NOT NULL CHECK(policy IN ('public', 'member-list', 'managing-app')),
+            app_access TEXT NOT NULL CHECK(app_access IN ('open', 'allow-list')),
+            managing_app TEXT,
+            is_deleted INTEGER NOT NULL CHECK(is_deleted IN (0, 1)),
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+            CHECK(
+                (policy = 'managing-app' AND managing_app IS NOT NULL AND length(managing_app) > 0)
+                OR (policy != 'managing-app' AND managing_app IS NULL)
+            )
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_simple_space_members (
+            space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
+            member_did TEXT NOT NULL,
+            PRIMARY KEY(space_uri, member_did)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_simple_space_clients (
+            space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
+            client_id TEXT NOT NULL,
+            PRIMARY KEY(space_uri, client_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_simple_space_managing_app_decisions (
+            space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
+            user_did TEXT NOT NULL,
+            PRIMARY KEY(space_uri, user_did)
+        )
+        """,
         """
         CREATE TABLE IF NOT EXISTS blob_payloads (
             cid TEXT PRIMARY KEY,
@@ -456,6 +497,20 @@ public struct DurableSpaceRepositoryState: Sendable, Equatable {
     }
 }
 
+/// Authority facts recovered from the authority account's SQLite database.
+/// `revision` advances only when a lifecycle, policy, membership, client, or
+/// managing-app decision actually changes; duplicate mutations are explicit
+/// no-ops and therefore retain the prior revision.
+public struct DurableSimpleSpaceState: Sendable, Equatable {
+    public let space: SimpleSpace
+    public let revision: UInt64
+
+    public init(space: SimpleSpace, revision: UInt64) {
+        self.space = space
+        self.revision = revision
+    }
+}
+
 public struct PersistedOutboxEvent: Sendable, Equatable {
     public let id: UUID
     public let space: SpaceURI
@@ -497,6 +552,11 @@ struct SQLiteTestingHooks: Sendable {
         self.beforeApplyCommit = beforeApplyCommit
         self.afterSnapshotStateRead = afterSnapshotStateRead
     }
+}
+
+private struct LoadedSimpleSpaceAuthority: Sendable {
+    let state: DurableSimpleSpaceState
+    let managingAppAllowedUsers: Set<String>
 }
 
 /// The concrete SQLite/WAL boundary. Its actor is a coordination aid, while
@@ -1196,6 +1256,377 @@ public actor SQLiteAccountDatabase: BlobStore {
         )
     }
 
+    // MARK: Durable simple-space authority
+
+    /// Creates one authority-owned simple space. The authority/account and
+    /// OAuth management checks run while the insert transaction is held, so a
+    /// stale caller cannot race a policy mutation into a foreign account.
+    public func createSimpleSpace(
+        space: SpaceURI,
+        owner: String,
+        configuration: SimpleSpaceConfiguration,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        try validateSimpleSpaceConfiguration(configuration)
+        let timestamp = try simpleSpaceTimestamp(now)
+        return try await withConnectionGate {
+            try await transaction {
+                try requireAuthorityAccount(space: space, owner: owner)
+                try requireAuthorityManagement(space: space, authorization: authorization)
+                let existing = try await connection.query(
+                    "SELECT 1 FROM permissioned_simple_space_authorities WHERE space_uri = ?",
+                    [.text(space.rawValue)]
+                )
+                guard existing.isEmpty else {
+                    throw SwanError.conflict(expected: 0, actual: 1)
+                }
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_simple_space_authorities(
+                        space_uri, owner_did, policy, app_access, managing_app,
+                        is_deleted, revision, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 0, 1, ?, ?)
+                    """,
+                    [
+                        .text(space.rawValue), .text(owner),
+                        .text(configuration.policy.rawValue),
+                        .text(simpleSpaceAppAccessName(configuration.appAccess)),
+                        configuration.managingApp.map(SQLiteData.text) ?? .null,
+                        .integer(timestamp), .integer(timestamp),
+                    ]
+                )
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_simple_space_members(space_uri, member_did)
+                    VALUES (?, ?)
+                    """,
+                    [.text(space.rawValue), .text(owner)]
+                )
+                try await replaceSimpleSpaceClients(
+                    space: space,
+                    appAccess: configuration.appAccess
+                )
+                return try await requiredSimpleSpace(space).state
+            }
+        }
+    }
+
+    /// Reads authority facts from the account database. This local storage API
+    /// deliberately has no public HTTP surface. Full authority facts expose
+    /// membership and the client allow-list, so only the managing authority
+    /// can retrieve them; there is no accidentally-public projection yet.
+    public func simpleSpace(
+        _ space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws -> DurableSimpleSpaceState? {
+        try requireAuthorityAccount(space: space)
+        return try await withConnectionGate {
+            try await readTransaction {
+                try requireAuthorityManagement(
+                    space: space,
+                    authorization: authorization
+                )
+                return try await loadSimpleSpace(space)?.state
+            }
+        }
+    }
+
+    public func updateSimpleSpace(
+        space: SpaceURI,
+        configuration: SimpleSpaceConfiguration,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        try validateSimpleSpaceConfiguration(configuration)
+        let timestamp = try simpleSpaceTimestamp(now)
+        return try await withConnectionGate {
+            try await transaction {
+                try requireAuthorityAccount(space: space)
+                try requireAuthorityManagement(space: space, authorization: authorization)
+                let stored = try await requiredSimpleSpace(space)
+                try requireActiveSimpleSpace(stored.state)
+                guard stored.state.space.configuration != configuration else {
+                    return stored.state
+                }
+                let previous = stored.state.space.configuration
+                let nextRevision = try nextSimpleSpaceRevision(stored.state.revision)
+                _ = try await connection.query(
+                    """
+                    UPDATE permissioned_simple_space_authorities
+                    SET policy = ?, app_access = ?, managing_app = ?,
+                        revision = ?,
+                        updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END
+                    WHERE space_uri = ?
+                    """,
+                    [
+                        .text(configuration.policy.rawValue),
+                        .text(simpleSpaceAppAccessName(configuration.appAccess)),
+                        configuration.managingApp.map(SQLiteData.text) ?? .null,
+                        .integer(try sqliteRevision(nextRevision)),
+                        .integer(timestamp), .integer(timestamp),
+                        .text(space.rawValue),
+                    ]
+                )
+                try await replaceSimpleSpaceClients(
+                    space: space,
+                    appAccess: configuration.appAccess
+                )
+                // A decision belongs to one managing app identity. Never
+                // transfer it when the policy is disabled or the app changes.
+                if previous.policy != .managingApp
+                    || configuration.policy != .managingApp
+                    || previous.managingApp != configuration.managingApp {
+                    _ = try await connection.query(
+                        "DELETE FROM permissioned_simple_space_managing_app_decisions WHERE space_uri = ?",
+                        [.text(space.rawValue)]
+                    )
+                }
+                return try await requiredSimpleSpace(space).state
+            }
+        }
+    }
+
+    public func addSimpleSpaceMember(
+        space: SpaceURI,
+        member: String,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        guard isValidSimpleSpaceDID(member) else {
+            throw SwanError.invalidIdentifier(member)
+        }
+        let timestamp = try simpleSpaceTimestamp(now)
+        return try await withConnectionGate {
+            try await transaction {
+                try requireAuthorityAccount(space: space)
+                try requireAuthorityManagement(space: space, authorization: authorization)
+                let stored = try await requiredSimpleSpace(space)
+                try requireActiveSimpleSpace(stored.state)
+                guard !stored.state.space.members.contains(member) else {
+                    return stored.state
+                }
+                _ = try await connection.query(
+                    "INSERT INTO permissioned_simple_space_members(space_uri, member_did) VALUES (?, ?)",
+                    [.text(space.rawValue), .text(member)]
+                )
+                try await touchSimpleSpace(space: space, revision: stored.state.revision, timestamp: timestamp)
+                return try await requiredSimpleSpace(space).state
+            }
+        }
+    }
+
+    public func removeSimpleSpaceMember(
+        space: SpaceURI,
+        member: String,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        guard isValidSimpleSpaceDID(member) else {
+            throw SwanError.invalidIdentifier(member)
+        }
+        let timestamp = try simpleSpaceTimestamp(now)
+        return try await withConnectionGate {
+            try await transaction {
+                try requireAuthorityAccount(space: space)
+                try requireAuthorityManagement(space: space, authorization: authorization)
+                let stored = try await requiredSimpleSpace(space)
+                try requireActiveSimpleSpace(stored.state)
+                guard member != stored.state.space.owner else {
+                    throw SwanError.malformed("a space owner cannot be removed")
+                }
+                guard stored.state.space.members.contains(member) else {
+                    return stored.state
+                }
+                _ = try await connection.query(
+                    "DELETE FROM permissioned_simple_space_members WHERE space_uri = ? AND member_did = ?",
+                    [.text(space.rawValue), .text(member)]
+                )
+                try await touchSimpleSpace(space: space, revision: stored.state.revision, timestamp: timestamp)
+                return try await requiredSimpleSpace(space).state
+            }
+        }
+    }
+
+    /// Changes a single client restriction without accepting a mutable
+    /// allow-list from an untrusted caller. Open policies cannot accumulate
+    /// latent client rows that might become active on a later policy switch.
+    public func setSimpleSpaceClientAccess(
+        space: SpaceURI,
+        clientID: String,
+        allowed: Bool,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        try validateSimpleSpaceAppIdentifier(clientID)
+        let timestamp = try simpleSpaceTimestamp(now)
+        return try await withConnectionGate {
+            try await transaction {
+                try requireAuthorityAccount(space: space)
+                try requireAuthorityManagement(space: space, authorization: authorization)
+                let stored = try await requiredSimpleSpace(space)
+                try requireActiveSimpleSpace(stored.state)
+                guard case .allowList = stored.state.space.configuration.appAccess else {
+                    throw SwanError.malformed("client restrictions require an allow-list policy")
+                }
+                let currentlyAllowed: Bool
+                if case let .allowList(clients) = stored.state.space.configuration.appAccess {
+                    currentlyAllowed = clients.contains(clientID)
+                } else {
+                    currentlyAllowed = false
+                }
+                guard currentlyAllowed != allowed else { return stored.state }
+                if allowed {
+                    _ = try await connection.query(
+                        "INSERT INTO permissioned_simple_space_clients(space_uri, client_id) VALUES (?, ?)",
+                        [.text(space.rawValue), .text(clientID)]
+                    )
+                } else {
+                    _ = try await connection.query(
+                        "DELETE FROM permissioned_simple_space_clients WHERE space_uri = ? AND client_id = ?",
+                        [.text(space.rawValue), .text(clientID)]
+                    )
+                }
+                try await touchSimpleSpace(space: space, revision: stored.state.revision, timestamp: timestamp)
+                return try await requiredSimpleSpace(space).state
+            }
+        }
+    }
+
+    /// Records the managing app's result for a user. The app identity is an
+    /// explicit, already-validated service context, not an ambient boolean;
+    /// client-attestation verification remains a separate policy component
+    /// for this alpha.
+    public func setSimpleSpaceManagingAppAccess(
+        space: SpaceURI,
+        user: String,
+        allowed: Bool,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        guard isValidSimpleSpaceDID(user) else {
+            throw SwanError.invalidIdentifier(user)
+        }
+        let timestamp = try simpleSpaceTimestamp(now)
+        return try await withConnectionGate {
+            try await transaction {
+                try requireAuthorityAccount(space: space)
+                let stored = try await requiredSimpleSpace(space)
+                try requireActiveSimpleSpace(stored.state)
+                guard case let .service(subject, audience) = authorization,
+                      audience == space.authority,
+                      let managingApp = stored.state.space.configuration.managingApp,
+                      subject == managingApp
+                else {
+                    throw SwanError.unauthorized("wrong managing app")
+                }
+                guard stored.state.space.configuration.policy == .managingApp,
+                      stored.state.space.configuration.managingApp == managingApp
+                else {
+                    throw SwanError.unauthorized("wrong managing app")
+                }
+                let currentlyAllowed = stored.managingAppAllowedUsers.contains(user)
+                guard currentlyAllowed != allowed else { return stored.state }
+                if allowed {
+                    _ = try await connection.query(
+                        "INSERT INTO permissioned_simple_space_managing_app_decisions(space_uri, user_did) VALUES (?, ?)",
+                        [.text(space.rawValue), .text(user)]
+                    )
+                } else {
+                    _ = try await connection.query(
+                        "DELETE FROM permissioned_simple_space_managing_app_decisions WHERE space_uri = ? AND user_did = ?",
+                        [.text(space.rawValue), .text(user)]
+                    )
+                }
+                try await touchSimpleSpace(space: space, revision: stored.state.revision, timestamp: timestamp)
+                return try await requiredSimpleSpace(space).state
+            }
+        }
+    }
+
+    /// Deletion is an authenticated, idempotent lifecycle transition. It
+    /// leaves authority facts as a tombstone, so subsequent reads and
+    /// credential issuance fail closed instead of allowing silent recreation.
+    public func deleteSimpleSpace(
+        space: SpaceURI,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        let timestamp = try simpleSpaceTimestamp(now)
+        return try await withConnectionGate {
+            try await transaction {
+                try requireAuthorityAccount(space: space)
+                try requireAuthorityManagement(space: space, authorization: authorization)
+                let stored = try await requiredSimpleSpace(space)
+                guard !stored.state.space.isDeleted else { return stored.state }
+                let nextRevision = try nextSimpleSpaceRevision(stored.state.revision)
+                _ = try await connection.query(
+                    """
+                    UPDATE permissioned_simple_space_authorities
+                    SET is_deleted = 1, revision = ?,
+                        updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END
+                    WHERE space_uri = ?
+                    """,
+                    [
+                        .integer(try sqliteRevision(nextRevision)),
+                        .integer(timestamp), .integer(timestamp),
+                        .text(space.rawValue),
+                    ]
+                )
+                return try await requiredSimpleSpace(space).state
+            }
+        }
+    }
+
+    /// Evaluates persisted policy facts in a read transaction before the
+    /// caller mints a transient read credential. The supplied authorization
+    /// context is already verified by the OAuth/delegation layer, but it must
+    /// still name the user for whom a credential is being minted. It never
+    /// mutates membership or carries policy state in memory across a restart.
+    public func authorizeSimpleSpaceRead(
+        space: SpaceURI,
+        user: String,
+        clientID: String?,
+        authorization: AuthorizationContext
+    ) async throws {
+        guard isValidSimpleSpaceDID(user) else {
+            throw SwanError.invalidIdentifier(user)
+        }
+        if let clientID { try validateSimpleSpaceAppIdentifier(clientID) }
+        try requireAuthorityAccount(space: space)
+        try await withConnectionGate {
+            try await readTransaction {
+                try requireSimpleSpaceCredentialRequester(
+                    space: space,
+                    user: user,
+                    authorization: authorization
+                )
+                let stored = try await requiredSimpleSpace(space)
+                try requireActiveSimpleSpace(stored.state)
+                switch stored.state.space.configuration.appAccess {
+                case .open:
+                    break
+                case let .allowList(clients):
+                    guard let clientID, clients.contains(clientID) else {
+                        throw SwanError.unauthorized("app is not authorized for this space")
+                    }
+                }
+                switch stored.state.space.configuration.policy {
+                case .public:
+                    break
+                case .memberList:
+                    guard stored.state.space.members.contains(user) else {
+                        throw SwanError.unauthorized("user is not a space member")
+                    }
+                case .managingApp:
+                    guard stored.managingAppAllowedUsers.contains(user) else {
+                        throw SwanError.unauthorized("managing app denied user access")
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: Durable blob namespace
 
     public func put(
@@ -1484,6 +1915,391 @@ public actor SQLiteAccountDatabase: BlobStore {
             _ = try? await connection.query("ROLLBACK")
             throw error
         }
+    }
+
+    private func requireAuthorityAccount(
+        space: SpaceURI,
+        owner: String? = nil
+    ) throws {
+        guard space.authority == accountDID else {
+            throw SwanError.unauthorized(
+                "simple-space authority belongs to another account"
+            )
+        }
+        if let owner {
+            guard owner == space.authority,
+                  isValidSimpleSpaceDID(owner)
+            else {
+                throw SwanError.unauthorized(
+                    "only the authority DID may own this simple space"
+                )
+            }
+        }
+    }
+
+    private func requireAuthorityManagement(
+        space: SpaceURI,
+        authorization: AuthorizationContext
+    ) throws {
+        try SpaceAuthorizationPolicy.require(
+            space: space,
+            author: space.authority,
+            uri: nil,
+            authorization: authorization,
+            permission: .manage
+        )
+    }
+
+    /// A credential request is made on behalf of its eventual reader. The
+    /// authority must not allow an arbitrary authenticated account to mint a
+    /// credential for a member merely by naming that member in the request.
+    /// Service authentication is deliberately excluded: it is used only by
+    /// the separately modeled managing-app decision endpoint.
+    private func requireSimpleSpaceCredentialRequester(
+        space: SpaceURI,
+        user: String,
+        authorization: AuthorizationContext
+    ) throws {
+        switch authorization {
+        case let .accountOAuth(subject, _):
+            guard subject == user else {
+                throw SwanError.unauthorized(
+                    "credential requester does not match the requested user"
+                )
+            }
+        case let .spaceCredential(grant):
+            guard grant.subject == user, grant.space == space else {
+                throw SwanError.unauthorized(
+                    "delegated credential does not match the requested user"
+                )
+            }
+            try grant.allows(.read)
+        case let .spaceSelfRead(subject, grantSpace):
+            guard subject == user, grantSpace == space else {
+                throw SwanError.unauthorized(
+                    "self-read grant does not match the requested user"
+                )
+            }
+        case .public, .service:
+            throw SwanError.unauthorized(
+                "credential issuance requires a user OAuth or delegated grant"
+            )
+        }
+    }
+
+    private func requireActiveSimpleSpace(
+        _ state: DurableSimpleSpaceState
+    ) throws {
+        guard !state.space.isDeleted else {
+            throw SwanError.unauthorized("space deleted")
+        }
+    }
+
+    private func validateSimpleSpaceConfiguration(
+        _ configuration: SimpleSpaceConfiguration
+    ) throws {
+        switch configuration.appAccess {
+        case .open:
+            break
+        case let .allowList(clients):
+            for client in clients {
+                try validateSimpleSpaceAppIdentifier(client)
+            }
+        }
+        switch configuration.policy {
+        case .managingApp:
+            guard let managingApp = configuration.managingApp else {
+                throw SwanError.malformed("managing-app spaces require a managing app")
+            }
+            try validateSimpleSpaceAppIdentifier(managingApp)
+        case .public, .memberList:
+            guard configuration.managingApp == nil else {
+                throw SwanError.malformed("only managing-app spaces may name a managing app")
+            }
+        }
+    }
+
+    private func validateSimpleSpaceAppIdentifier(
+        _ identifier: String
+    ) throws {
+        guard !identifier.isEmpty,
+              identifier.utf8.count <= 2_048,
+              identifier.unicodeScalars.allSatisfy({
+                  $0.value >= 0x20 && $0.value != 0x7F
+              })
+        else {
+            throw SwanError.invalidIdentifier(identifier)
+        }
+    }
+
+    /// `SpaceURI` intentionally keeps its lexical helpers file-private. Use
+    /// its public throwing initializer as the one source of truth instead of
+    /// copying a relaxed DID regular expression into the persistence layer.
+    private func isValidSimpleSpaceDID(_ did: String) -> Bool {
+        (try? SpaceURI(
+            authority: did,
+            spaceType: "app.swan.validation",
+            skey: "did"
+        )) != nil
+    }
+
+    private func simpleSpaceTimestamp(_ date: Date) throws -> Int {
+        let microseconds = date.timeIntervalSince1970 * 1_000_000
+        guard microseconds.isFinite,
+              microseconds >= 0,
+              microseconds <= Double(Int.max)
+        else {
+            throw SwanError.malformed("simple-space timestamp is out of range")
+        }
+        return Int(microseconds)
+    }
+
+    private func simpleSpaceAppAccessName(
+        _ appAccess: SimpleSpaceAppAccess
+    ) -> String {
+        switch appAccess {
+        case .open: "open"
+        case .allowList: "allow-list"
+        }
+    }
+
+    private func requiredSimpleSpace(
+        _ space: SpaceURI
+    ) async throws -> LoadedSimpleSpaceAuthority {
+        guard let stored = try await loadSimpleSpace(space) else {
+            throw SwanError.malformed("space not found")
+        }
+        return stored
+    }
+
+    private func loadSimpleSpace(
+        _ expectedSpace: SpaceURI
+    ) async throws -> LoadedSimpleSpaceAuthority? {
+        let rows = try await connection.query(
+            """
+            SELECT space_uri, owner_did, policy, app_access, managing_app,
+                   is_deleted, revision, created_at, updated_at
+            FROM permissioned_simple_space_authorities
+            WHERE space_uri = ?
+            """,
+            [.text(expectedSpace.rawValue)]
+        )
+        guard let row = rows.first else { return nil }
+        guard rows.count == 1 else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "duplicate simple-space authority state"
+            )
+        }
+        let spaceRaw = try requiredText(row, "space_uri")
+        guard let space = try? SpaceURI(spaceRaw),
+              space == expectedSpace,
+              space.rawValue == spaceRaw,
+              space.authority == accountDID
+        else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid simple-space authority ownership"
+            )
+        }
+        let owner = try requiredText(row, "owner_did")
+        guard owner == space.authority, isValidSimpleSpaceDID(owner) else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid simple-space owner"
+            )
+        }
+        let policyRaw = try requiredText(row, "policy")
+        guard let policy = SimpleSpacePolicy(rawValue: policyRaw) else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid simple-space policy"
+            )
+        }
+        let appAccessRaw = try requiredText(row, "app_access")
+        guard appAccessRaw == "open" || appAccessRaw == "allow-list" else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid simple-space app access"
+            )
+        }
+        let managingApp: String?
+        if let value = row.column("managing_app"), !value.isNull {
+            managingApp = try requiredText(row, "managing_app")
+            try validateSimpleSpaceAppIdentifier(managingApp!)
+        } else {
+            managingApp = nil
+        }
+        let deleted = try requiredInteger(row, "is_deleted")
+        guard deleted == 0 || deleted == 1 else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid simple-space deleted state"
+            )
+        }
+        let revision = try requiredRevision(row, "revision")
+        guard revision > 0 else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid simple-space revision"
+            )
+        }
+        let createdAt = try requiredNonnegativeInteger(row, "created_at")
+        let updatedAt = try requiredNonnegativeInteger(row, "updated_at")
+        guard updatedAt >= createdAt else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid simple-space timestamps"
+            )
+        }
+
+        let memberRows = try await connection.query(
+            """
+            SELECT member_did
+            FROM permissioned_simple_space_members
+            WHERE space_uri = ?
+            ORDER BY member_did
+            """,
+            [.text(space.rawValue)]
+        )
+        var members = Set<String>()
+        for memberRow in memberRows {
+            let member = try requiredText(memberRow, "member_did")
+            guard isValidSimpleSpaceDID(member), members.insert(member).inserted else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "invalid simple-space member"
+                )
+            }
+        }
+
+        let clientRows = try await connection.query(
+            """
+            SELECT client_id
+            FROM permissioned_simple_space_clients
+            WHERE space_uri = ?
+            ORDER BY client_id
+            """,
+            [.text(space.rawValue)]
+        )
+        var clients = Set<String>()
+        for clientRow in clientRows {
+            let clientID = try requiredText(clientRow, "client_id")
+            try validateSimpleSpaceAppIdentifier(clientID)
+            guard clients.insert(clientID).inserted else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "duplicate simple-space client"
+                )
+            }
+        }
+        let appAccess: SimpleSpaceAppAccess
+        switch appAccessRaw {
+        case "open":
+            guard clients.isEmpty else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "open simple space has client restrictions"
+                )
+            }
+            appAccess = .open
+        case "allow-list":
+            appAccess = .allowList(clients)
+        default:
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid simple-space app access"
+            )
+        }
+        let configuration: SimpleSpaceConfiguration
+        do {
+            configuration = try SimpleSpaceConfiguration(
+                policy: policy,
+                appAccess: appAccess,
+                managingApp: managingApp
+            )
+            try validateSimpleSpaceConfiguration(configuration)
+        } catch {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid simple-space configuration"
+            )
+        }
+
+        let managingDecisionRows = try await connection.query(
+            """
+            SELECT user_did
+            FROM permissioned_simple_space_managing_app_decisions
+            WHERE space_uri = ?
+            ORDER BY user_did
+            """,
+            [.text(space.rawValue)]
+        )
+        var managingAppAllowedUsers = Set<String>()
+        for decisionRow in managingDecisionRows {
+            let user = try requiredText(decisionRow, "user_did")
+            guard isValidSimpleSpaceDID(user),
+                  managingAppAllowedUsers.insert(user).inserted
+            else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "invalid simple-space managing-app decision"
+                )
+            }
+        }
+        guard policy == .managingApp || managingAppAllowedUsers.isEmpty else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "non-managing simple space has app decisions"
+            )
+        }
+        let snapshot: SimpleSpace
+        do {
+            snapshot = try SimpleSpace(
+                uri: space,
+                owner: owner,
+                configuration: configuration,
+                members: members,
+                isDeleted: deleted == 1
+            )
+        } catch {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid simple-space authority state"
+            )
+        }
+        return LoadedSimpleSpaceAuthority(
+            state: DurableSimpleSpaceState(space: snapshot, revision: revision),
+            managingAppAllowedUsers: managingAppAllowedUsers
+        )
+    }
+
+    private func replaceSimpleSpaceClients(
+        space: SpaceURI,
+        appAccess: SimpleSpaceAppAccess
+    ) async throws {
+        _ = try await connection.query(
+            "DELETE FROM permissioned_simple_space_clients WHERE space_uri = ?",
+            [.text(space.rawValue)]
+        )
+        guard case let .allowList(clients) = appAccess else { return }
+        for clientID in clients.sorted() {
+            _ = try await connection.query(
+                "INSERT INTO permissioned_simple_space_clients(space_uri, client_id) VALUES (?, ?)",
+                [.text(space.rawValue), .text(clientID)]
+            )
+        }
+    }
+
+    private func touchSimpleSpace(
+        space: SpaceURI,
+        revision: UInt64,
+        timestamp: Int
+    ) async throws {
+        let nextRevision = try nextSimpleSpaceRevision(revision)
+        _ = try await connection.query(
+            """
+            UPDATE permissioned_simple_space_authorities
+            SET revision = ?,
+                updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END
+            WHERE space_uri = ?
+            """,
+            [
+                .integer(try sqliteRevision(nextRevision)),
+                .integer(timestamp), .integer(timestamp), .text(space.rawValue),
+            ]
+        )
+    }
+
+    private func nextSimpleSpaceRevision(_ revision: UInt64) throws -> UInt64 {
+        guard revision < UInt64(Int.max) else {
+            throw SQLiteRepositoryError.revisionOutOfRange(revision)
+        }
+        return revision + 1
     }
 
     private func requireAccount(_ author: String) throws {
@@ -2144,5 +2960,162 @@ public actor DurableSpaceRepository {
 
     private func ltHashElement(for record: PersistedSpaceRecord) -> String {
         "\(record.uri.collection)/\(record.uri.rkey)/\(record.cid)"
+    }
+}
+
+/// SQLite-backed `com.atproto.simplespace` authority facade. It retains no
+/// authority, membership, client, or managing-app decisions in actor memory:
+/// every operation delegates to the authority account database. A member's
+/// repository can still be hosted in a different account database; this
+/// facade simply refuses to create authority state anywhere but the DID named
+/// by `SpaceURI.authority`.
+public actor DurableSimpleSpaceAuthority {
+    private let database: SQLiteAccountDatabase
+    private let credentials: HMACSpaceCredentialAuthority
+
+    public init(
+        database: SQLiteAccountDatabase,
+        credentialSecret: Data
+    ) throws {
+        guard credentialSecret.count >= 16 else {
+            throw SwanError.malformed("simple-space credential secret is too short")
+        }
+        self.database = database
+        credentials = HMACSpaceCredentialAuthority(key: credentialSecret)
+    }
+
+    public func create(
+        space: SpaceURI,
+        owner: String,
+        configuration: SimpleSpaceConfiguration,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        try await database.createSimpleSpace(
+            space: space,
+            owner: owner,
+            configuration: configuration,
+            authorization: authorization,
+            now: now
+        )
+    }
+
+    public func space(
+        _ space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws -> DurableSimpleSpaceState? {
+        try await database.simpleSpace(space, authorization: authorization)
+    }
+
+    public func update(
+        space: SpaceURI,
+        configuration: SimpleSpaceConfiguration,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        try await database.updateSimpleSpace(
+            space: space,
+            configuration: configuration,
+            authorization: authorization,
+            now: now
+        )
+    }
+
+    public func addMember(
+        space: SpaceURI,
+        member: String,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        try await database.addSimpleSpaceMember(
+            space: space,
+            member: member,
+            authorization: authorization,
+            now: now
+        )
+    }
+
+    public func removeMember(
+        space: SpaceURI,
+        member: String,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        try await database.removeSimpleSpaceMember(
+            space: space,
+            member: member,
+            authorization: authorization,
+            now: now
+        )
+    }
+
+    public func setClientAccess(
+        space: SpaceURI,
+        clientID: String,
+        allowed: Bool,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        try await database.setSimpleSpaceClientAccess(
+            space: space,
+            clientID: clientID,
+            allowed: allowed,
+            authorization: authorization,
+            now: now
+        )
+    }
+
+    public func setManagingAppAccess(
+        space: SpaceURI,
+        user: String,
+        allowed: Bool,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        try await database.setSimpleSpaceManagingAppAccess(
+            space: space,
+            user: user,
+            allowed: allowed,
+            authorization: authorization,
+            now: now
+        )
+    }
+
+    public func delete(
+        space: SpaceURI,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        try await database.deleteSimpleSpace(
+            space: space,
+            authorization: authorization,
+            now: now
+        )
+    }
+
+    /// Credentials remain transient reader artifacts. SQLite records the
+    /// policy facts that permitted issuance, never the credential envelope,
+    /// nonce, MAC, or its two-hour expiry.
+    public func issueReadCredential(
+        space: SpaceURI,
+        user: String,
+        clientID: String?,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> SignedSpaceCredential {
+        try await database.authorizeSimpleSpaceRead(
+            space: space,
+            user: user,
+            clientID: clientID,
+            authorization: authorization
+        )
+        let grant = SpaceGrant(
+            subject: user,
+            space: space,
+            permissions: [.read],
+            expiresAt: now.addingTimeInterval(2 * 60 * 60),
+            clientID: clientID
+        )
+        return try credentials.issue(SpaceCredential(grant: grant, issuedAt: now))
     }
 }

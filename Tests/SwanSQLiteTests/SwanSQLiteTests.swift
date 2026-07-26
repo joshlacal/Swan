@@ -1647,22 +1647,46 @@ final class SwanSQLiteTests: XCTestCase {
         )
         try await legacy.close()
 
-        let databases = try await withThrowingTaskGroup(
-            of: SQLiteControlDatabase.self,
-            returning: [SQLiteControlDatabase].self
+        // A successfully opened database owns an SQLiteNIO connection until
+        // `close()` completes. Do not make it a result of a throwing group:
+        // if its peer throws, `withThrowingTaskGroup` discards unretrieved
+        // successful results while unwinding, which deinitializes that live
+        // connection before this test can close it. Keep every outcome first,
+        // then close successes on either path.
+        let concurrentOpenCount = 8
+        let openResults = await withTaskGroup(
+            of: Result<SQLiteControlDatabase, any Error>.self,
+            returning: [Result<SQLiteControlDatabase, any Error>].self
         ) { group in
-            for _ in 0 ..< 2 {
+            for _ in 0 ..< concurrentOpenCount {
                 group.addTask {
-                    try await SQLiteControlDatabase(dataDirectory: root)
+                    do {
+                        return .success(try await SQLiteControlDatabase(dataDirectory: root))
+                    } catch {
+                        return .failure(error)
+                    }
                 }
             }
-            var opened: [SQLiteControlDatabase] = []
-            for try await database in group {
-                opened.append(database)
-            }
-            return opened
+            return await group.reduce(into: []) { $0.append($1) }
         }
-        XCTAssertEqual(databases.count, 2)
+        var databases: [SQLiteControlDatabase] = []
+        var openingErrors: [any Error] = []
+        for result in openResults {
+            switch result {
+            case let .success(database):
+                databases.append(database)
+            case let .failure(error):
+                openingErrors.append(error)
+            }
+        }
+        if !openingErrors.isEmpty {
+            for database in databases {
+                try? await database.close()
+            }
+            XCTFail("concurrent legacy opens failed: \(openingErrors.map { String(reflecting: $0) })")
+            return
+        }
+        XCTAssertEqual(databases.count, concurrentOpenCount)
         let migratedAccount = try await databases[0].account(
             did: "did:plc:abcdefghijklmnopqrstuvwx"
         )
@@ -1679,6 +1703,69 @@ final class SwanSQLiteTests: XCTestCase {
         XCTAssertTrue(columns.contains("signing_key_generation"))
         XCTAssertTrue(columns.contains("export_reference"))
         try await inspected.close()
+    }
+    func testSimpleSpaceAuthorityRejectsTamperedPersistedFacts() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanSQLiteAuthorityTamperTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let did = "did:plc:alice"
+        let space = try SpaceURI(
+            authority: did,
+            spaceType: "app.bsky.bookmarks",
+            skey: "tamper"
+        )
+        let database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        let authority = try DurableSimpleSpaceAuthority(
+            database: database,
+            credentialSecret: Data(repeating: 7, count: 32)
+        )
+        _ = try await authority.create(
+            space: space,
+            owner: did,
+            configuration: try SimpleSpaceConfiguration(policy: .memberList),
+            authorization: .accountOAuth(subject: did, scopes: ["atproto"])
+        )
+        try await database.close()
+
+        let databasePath = SQLiteLayout.accountDatabase(in: root, did: did).path
+        let raw = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        _ = try await raw.query(
+            "DELETE FROM permissioned_simple_space_members WHERE space_uri = ? AND member_did = ?",
+            [.text(space.rawValue), .text(did)]
+        )
+        _ = try await raw.query(
+            "INSERT INTO permissioned_simple_space_managing_app_decisions(space_uri, user_did) VALUES (?, ?)",
+            [.text(space.rawValue), .text("did:plc:bob")]
+        )
+        try await raw.close()
+
+        let reopened = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        await XCTAssertThrowsErrorAsync(
+            try await reopened.simpleSpace(
+                space,
+                authorization: .accountOAuth(subject: did, scopes: ["atproto"])
+            )
+        ) { error in
+            guard case .corruptDatabase = error as? SQLiteRepositoryError else {
+                return XCTFail("expected a fail-closed corruption error, got \(error)")
+            }
+        }
+        let reopenedAuthority = try DurableSimpleSpaceAuthority(
+            database: reopened,
+            credentialSecret: Data(repeating: 7, count: 32)
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await reopenedAuthority.issueReadCredential(
+                space: space,
+                user: "did:plc:bob",
+                clientID: nil,
+                authorization: .accountOAuth(
+                    subject: "did:plc:bob",
+                    scopes: ["atproto"]
+                )
+            )
+        )
+        try await reopened.close()
     }
 }
 

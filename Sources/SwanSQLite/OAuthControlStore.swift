@@ -29,6 +29,13 @@ actor ControlSQLiteConnectionGate {
 /// across independently reopened Swan processes as well.
 public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
     private static let microsecondsPerSecond = 1_000_000.0
+    /// Cold control connections can contend during WAL configuration or the
+    /// idempotent migration transaction. SQLite can report that startup race
+    /// as BUSY instead of waiting for `busy_timeout`, so retry the complete
+    /// setup sequence with a bounded backoff.
+    private static let migrationBusyRetryLimit = 12
+    private static let migrationBusyInitialDelayNanoseconds: UInt64 = 5_000_000
+    private static let migrationBusyMaximumDelayNanoseconds: UInt64 = 80_000_000
 
     let connection: SQLiteConnection
     let connectionGate = ControlSQLiteConnectionGate()
@@ -41,7 +48,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
         let databaseURL = SQLiteLayout.controlDatabase(in: dataDirectory)
         connection = try await SQLiteConnection.open(storage: .file(path: databaseURL.path))
         do {
-            try await migrateWithoutGate()
+            try await migrateWithBusyRetry()
         } catch {
             try? await connection.close()
             throw error
@@ -58,7 +65,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
 
     public func migrate() async throws {
         try await withConnectionGate {
-            try await migrateWithoutGate()
+            try await migrateWithBusyRetry()
         }
     }
 
@@ -522,6 +529,24 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
 
     // MARK: Transactional helpers
 
+    private func migrateWithBusyRetry() async throws {
+        var delay = Self.migrationBusyInitialDelayNanoseconds
+        for attempt in 0 ..< Self.migrationBusyRetryLimit {
+            do {
+                try await migrateWithoutGate()
+                return
+            } catch {
+                guard isRetryableMigrationLock(error),
+                      attempt + 1 < Self.migrationBusyRetryLimit else {
+                    throw error
+                }
+                try await Task.sleep(nanoseconds: delay)
+                delay = min(delay * 2, Self.migrationBusyMaximumDelayNanoseconds)
+            }
+        }
+        preconditionFailure("migration retry loop must either return or throw")
+    }
+
     private func migrateWithoutGate() async throws {
         // These PRAGMAs configure this connection and must remain outside the
         // DDL transaction. All schema inspection, CREATE, ALTER, trigger, and
@@ -596,6 +621,17 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
         } catch {
             _ = try? await connection.query("ROLLBACK")
             throw error
+        }
+    }
+
+    private func isRetryableMigrationLock(_ error: any Error) -> Bool {
+        guard let sqliteError = error as? SQLiteError else { return false }
+        switch sqliteError.reason {
+        case .busy, .busyInRecovery, .busyInSnapshot, .busyTimeout,
+             .locked, .lockedBySharedCache:
+            return true
+        default:
+            return false
         }
     }
 
