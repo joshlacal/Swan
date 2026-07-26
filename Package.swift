@@ -151,6 +151,12 @@ let package = Package(
             ]
         ),
         .testTarget(
+            name: "SwanCLITests",
+            dependencies: [
+                "SwanAccounts", "SwanSQLite", "SwanStorage",
+            ]
+        ),
+        .testTarget(
             name: "SwanHTTPTests",
             dependencies: [
                 "SwanHTTP", "SwanOAuth", "SwanSQLite", "SwanSpacesWire",

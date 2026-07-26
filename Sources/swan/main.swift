@@ -1,6 +1,7 @@
 import ArgumentParser
 import Foundation
 import Logging
+import SwanAccounts
 import SwanHTTP
 import SwanInterop
 import SwanCore
@@ -12,7 +13,7 @@ struct SwanCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "swan",
         abstract: "Swift-native AT Protocol permissioned-data interoperability laboratory",
-        subcommands: [Serve.self, Verify.self, Lab.self],
+        subcommands: [Serve.self, Account.self, Verify.self, Lab.self],
         defaultSubcommand: Verify.self
     )
 }
@@ -122,6 +123,138 @@ extension SwanCommand {
         }
     }
 
+    struct Account: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Inspect or manage a provisioned Swan account",
+            subcommands: [Show.self, Deactivate.self, Reactivate.self, Delete.self]
+        )
+
+        struct Show: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Show sanitized durable control metadata for one account"
+            )
+
+            @Option(name: .long, help: "Required Swan data directory containing control.sqlite")
+            var dataDirectory: String
+
+            @Option(name: .long, help: "Account DID to look up")
+            var did: String?
+
+            @Option(name: .long, help: "Account handle to look up")
+            var handle: String?
+
+            func run() async throws {
+                let lookup: AccountOperatorLookup
+                switch (did, handle) {
+                case let (.some(value), .none):
+                    lookup = .did(value)
+                case let (.none, .some(value)):
+                    lookup = .handle(value)
+                default:
+                    throw ValidationError("supply exactly one of --did or --handle")
+                }
+                let view = try await AccountCommandSupport.withService(
+                    dataDirectory: dataDirectory
+                ) { service in
+                    try await service.show(lookup)
+                }
+                try AccountCommandSupport.write(view)
+            }
+        }
+
+        struct Deactivate: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Deactivate a provisioned Swan account"
+            )
+
+            @Option(name: .long, help: "Required Swan data directory containing control.sqlite")
+            var dataDirectory: String
+
+            @Option(name: .long, help: "Account DID to deactivate")
+            var did: String
+
+            @Option(name: .long, help: "Mounted operator-secret file; never accepted as a literal argument")
+            var operatorSecretFile: String?
+
+            func run() async throws {
+                let authorization = try AccountCommandSupport.authorization(
+                    secretFilePath: operatorSecretFile
+                )
+                let view = try await AccountCommandSupport.withService(
+                    dataDirectory: dataDirectory
+                ) { service in
+                    try await service.deactivate(did: did, authorization: authorization)
+                }
+                try AccountCommandSupport.write(view)
+            }
+        }
+
+        struct Reactivate: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Reactivate a provisioned Swan account"
+            )
+
+            @Option(name: .long, help: "Required Swan data directory containing control.sqlite")
+            var dataDirectory: String
+
+            @Option(name: .long, help: "Account DID to reactivate")
+            var did: String
+
+            @Option(name: .long, help: "Mounted operator-secret file; never accepted as a literal argument")
+            var operatorSecretFile: String?
+
+            func run() async throws {
+                let authorization = try AccountCommandSupport.authorization(
+                    secretFilePath: operatorSecretFile
+                )
+                let view = try await AccountCommandSupport.withService(
+                    dataDirectory: dataDirectory
+                ) { service in
+                    try await service.reactivate(did: did, authorization: authorization)
+                }
+                try AccountCommandSupport.write(view)
+            }
+        }
+
+        struct Delete: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Permanently deactivate an account and retain its declared tombstone"
+            )
+
+            @Option(name: .long, help: "Required Swan data directory containing control.sqlite")
+            var dataDirectory: String
+
+            @Option(name: .long, help: "Account DID to delete")
+            var did: String
+
+            @Option(name: .long, help: "Mounted operator-secret file; never accepted as a literal argument")
+            var operatorSecretFile: String?
+
+            @Option(name: .long, help: "Optional bounded tombstone reason")
+            var tombstoneReason: String?
+
+            @Option(name: .long, help: "Optional sha256:<64 lowercase hex> portable-export manifest reference")
+            var exportReference: String?
+
+            func run() async throws {
+                let authorization = try AccountCommandSupport.authorization(
+                    secretFilePath: operatorSecretFile
+                )
+                let view = try await AccountCommandSupport.withService(
+                    dataDirectory: dataDirectory
+                ) { service in
+                    try await service.delete(
+                        did: did,
+                        tombstoneReason: tombstoneReason,
+                        exportReference: exportReference,
+                        authorization: authorization
+                    )
+                }
+                try AccountCommandSupport.write(view)
+            }
+        }
+    }
+
     struct Lab: ParsableCommand {
         static let configuration = CommandConfiguration(abstract: "Print pinned TypeScript interop source information")
 
@@ -130,5 +263,59 @@ extension SwanCommand {
             print("REFERENCE: \(pin.repository.absoluteString)@\(pin.commit)")
             print("Use interop/fetch-reference.sh to populate the ignored .interop-cache directory.")
         }
+    }
+}
+
+private enum AccountCommandSupport {
+    static func authorization(secretFilePath: String?) throws -> AccountOperatorAuthorization {
+        do {
+            return try OperatorSecretResolver.authorize(
+                secretFile: secretFilePath.map { URL(fileURLWithPath: $0) }
+            )
+        } catch {
+            throw validationError(for: error)
+        }
+    }
+
+    static func withService(
+        dataDirectory: String,
+        operation: (AccountOperatorService) async throws -> AccountOperatorView
+    ) async throws -> AccountOperatorView {
+        guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ValidationError("--data-directory must not be empty")
+        }
+        let control: SQLiteControlDatabase
+        do {
+            control = try await SQLiteControlDatabase(
+                dataDirectory: URL(fileURLWithPath: dataDirectory)
+            )
+        } catch {
+            throw ValidationError("unable to open Swan control database")
+        }
+        do {
+            let view = try await operation(AccountOperatorService(store: control))
+            try await control.close()
+            return view
+        } catch {
+            try? await control.close()
+            throw validationError(for: error)
+        }
+    }
+
+    static func write(_ view: AccountOperatorView) throws {
+        let data = try AccountOperatorJSON.render(view)
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write(Data("\n".utf8))
+    }
+
+    private static func validationError(for error: any Error) -> ValidationError {
+        if let error = error as? AccountOperatorError,
+           let message = error.errorDescription {
+            return ValidationError(message)
+        }
+        if let error = error as? SwanError {
+            return ValidationError(error.description)
+        }
+        return ValidationError("account operation failed")
     }
 }
