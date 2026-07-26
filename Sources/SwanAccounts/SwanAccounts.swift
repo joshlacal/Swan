@@ -1,77 +1,13 @@
 import Foundation
 import SwanCore
+import SwanStorage
 
-public enum AccountStatus: Codable, Sendable, Equatable {
-    case active
-    case deactivated
-    case deleted
-    case takendown
-    case suspended
-    case desynchronized
-    case throttled
-    case unknown(String)
+/// Compatibility name for the account-domain lifecycle state now shared with
+/// durable storage. New control-plane APIs use `AccountControlStatus`.
+public typealias AccountStatus = AccountControlStatus
 
-    public init(rawValue: String) throws {
-        guard Self.isCanonicalStatusToken(rawValue) else {
-            throw SwanError.malformed("invalid account status")
-        }
-        self = switch rawValue {
-        case "active": .active
-        case "deactivated": .deactivated
-        case "deleted": .deleted
-        case "takendown": .takendown
-        case "suspended": .suspended
-        case "desynchronized": .desynchronized
-        case "throttled": .throttled
-        default: .unknown(rawValue)
-        }
-    }
-
-    public var rawValue: String {
-        switch self {
-        case .active: "active"
-        case .deactivated: "deactivated"
-        case .deleted: "deleted"
-        case .takendown: "takendown"
-        case .suspended: "suspended"
-        case .desynchronized: "desynchronized"
-        case .throttled: "throttled"
-        case let .unknown(value): value
-        }
-    }
-
-    public var isActive: Bool {
-        self == .active
-    }
-
-    public init(from decoder: any Decoder) throws {
-        try self.init(rawValue: decoder.singleValueContainer().decode(String.self))
-    }
-
-    public func encode(to encoder: any Encoder) throws {
-        if case let .unknown(value) = self {
-            guard Self.isCanonicalStatusToken(value),
-                  try AccountStatus(rawValue: value) == .unknown(value) else {
-                throw SwanError.malformed("invalid unknown account status")
-            }
-        }
-        var container = encoder.singleValueContainer()
-        try container.encode(rawValue)
-    }
-
-    private static func isCanonicalStatusToken(_ value: String) -> Bool {
-        guard !value.isEmpty, value.utf8.count <= 64,
-              let first = value.utf8.first,
-              first >= 97, first <= 122 else {
-            return false
-        }
-        return value.utf8.allSatisfy {
-            ($0 >= 97 && $0 <= 122)
-                || ($0 >= 48 && $0 <= 57)
-                || $0 == 45
-                || $0 == 95
-        }
-    }
+public extension AccountControlStatus {
+    var isActive: Bool { authorizesAccount }
 }
 
 public struct SwanAccount: Codable, Sendable, Equatable {
@@ -81,6 +17,9 @@ public struct SwanAccount: Codable, Sendable, Equatable {
     public let createdAt: Date
 
     public init(did: String, handle: String, status: AccountStatus = .active, createdAt: Date = Date()) throws {
+        guard status.isCanonicalValue else {
+            throw SwanError.malformed("invalid account status")
+        }
         self.did = try AccountIdentifiers.validateDID(did)
         self.handle = try AccountIdentifiers.canonicalHandle(handle)
         self.status = status
@@ -113,13 +52,19 @@ public struct SwanAccount: Codable, Sendable, Equatable {
     }
 }
 
-public actor AccountDirectory {
+/// A small process-local fixture for narrow unit tests. It is deliberately not
+/// the production control path; use `DurableAccountDirectory` with an
+/// `AccountControlStore` for any account that must survive a restart.
+public actor InMemoryAccountDirectory {
     private var accounts: [String: SwanAccount] = [:]
     private var handles: [String: String] = [:]
 
     public init() {}
 
     public func create(_ account: SwanAccount) throws {
+        guard account.status.isCanonicalValue else {
+            throw SwanError.malformed("invalid account status")
+        }
         guard accounts[account.did] == nil, handles[account.handle] == nil else {
             throw SwanError.conflict(expected: 0, actual: 1)
         }
@@ -134,6 +79,9 @@ public actor AccountDirectory {
     }
 
     public func setStatus(_ status: AccountStatus, did: String) throws {
+        guard status.isCanonicalValue else {
+            throw SwanError.malformed("invalid account status")
+        }
         guard var account = accounts[did] else { throw SwanError.malformed("unknown account") }
         account.status = status
         accounts[did] = account

@@ -944,6 +944,487 @@ final class SwanSQLiteTests: XCTestCase {
         }
         try await inspected.close()
     }
+
+    func testAccountControlRestartPersistsRegistryButLookupExcludesVerifier() async throws {
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        var database: SQLiteControlDatabase? = try await SQLiteControlDatabase(dataDirectory: root)
+        let registration = try controlRegistration(
+            did: "did:plc:abcdefghijklmnopqrstuvwx",
+            handle: "alice.example.com",
+            createdAt: now
+        )
+        let created = try await database!.createAccount(registration)
+        XCTAssertEqual(created.did, registration.did)
+        XCTAssertEqual(created.canonicalHandle, registration.canonicalHandle)
+        XCTAssertEqual(created.status, .active)
+        XCTAssertEqual(created.credentialState, .configured)
+        XCTAssertEqual(created.signingKey?.generation, 1)
+        XCTAssertEqual(created.rotationKey?.reference, "account-rotation:1")
+        XCTAssertFalse(String(describing: created).contains(registration.passwordVerifier))
+        try await database!.close()
+        database = nil
+
+        let reopened = try await SQLiteControlDatabase(dataDirectory: root)
+        let byDIDResult = try await reopened.account(did: registration.did)
+        let byHandleResult = try await reopened.account(canonicalHandle: registration.canonicalHandle)
+        let byDID = try XCTUnwrap(byDIDResult)
+        let byHandle = try XCTUnwrap(byHandleResult)
+        XCTAssertEqual(byDID, byHandle)
+        XCTAssertEqual(byDID.createdAt, now)
+        XCTAssertEqual(byDID.updatedAt, now)
+        let credential = try await reopened.credential(did: registration.did)
+        XCTAssertEqual(credential?.verifier, registration.passwordVerifier)
+        try await reopened.close()
+    }
+
+    func testAccountControlDuplicateDIDAndHandleRacesAreTypedAndAtomic() async throws {
+        let handleRoot = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: handleRoot) }
+        let handleFirst = try await SQLiteControlDatabase(dataDirectory: handleRoot)
+        let handleSecond = try await SQLiteControlDatabase(dataDirectory: handleRoot)
+        defer {
+            Task {
+                try? await handleFirst.close()
+                try? await handleSecond.close()
+            }
+        }
+        let handleResults = await controlCreateRace(
+            first: handleFirst,
+            second: handleSecond,
+            firstRegistration: try controlRegistration(
+                did: "did:plc:abcdefghijklmnopqrstuvwx",
+                handle: "race.example.com"
+            ),
+            secondRegistration: try controlRegistration(
+                did: "did:plc:bcdefghijklmnopqrstuvwxy",
+                handle: "race.example.com"
+            )
+        )
+        XCTAssertEqual(handleResults.successes, 1)
+        XCTAssertEqual(handleResults.errors, [.duplicateHandle])
+
+        let didRoot = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: didRoot) }
+        let didFirst = try await SQLiteControlDatabase(dataDirectory: didRoot)
+        let didSecond = try await SQLiteControlDatabase(dataDirectory: didRoot)
+        defer {
+            Task {
+                try? await didFirst.close()
+                try? await didSecond.close()
+            }
+        }
+        let didResults = await controlCreateRace(
+            first: didFirst,
+            second: didSecond,
+            firstRegistration: try controlRegistration(
+                did: "did:plc:abcdefghijklmnopqrstuvwx",
+                handle: "alice-one.example.com"
+            ),
+            secondRegistration: try controlRegistration(
+                did: "did:plc:abcdefghijklmnopqrstuvwx",
+                handle: "alice-two.example.com"
+            )
+        )
+        XCTAssertEqual(didResults.successes, 1)
+        XCTAssertEqual(didResults.errors, [.duplicateDID])
+    }
+
+    func testAccountControlMigrationMakesLegacyAccountsExplicitlyCredentialless() async throws {
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = SQLiteLayout.controlDatabase(in: root).path
+        let legacy = try await SQLiteConnection.open(storage: .file(path: path))
+        _ = try await legacy.query(
+            """
+            CREATE TABLE accounts (
+                did TEXT PRIMARY KEY,
+                handle TEXT UNIQUE NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        _ = try await legacy.query(
+            "INSERT INTO accounts(did, handle, status, created_at) VALUES (?, ?, ?, ?)",
+            [
+                .text("did:plc:abcdefghijklmnopqrstuvwx"),
+                .text("Alice.Example.COM"),
+                .text("active"),
+                .integer(1_750_000_000_000_000),
+            ]
+        )
+        try await legacy.close()
+
+        let migrated = try await SQLiteControlDatabase(dataDirectory: root)
+        let migratedAccount = try await migrated.account(did: "did:plc:abcdefghijklmnopqrstuvwx")
+        let account = try XCTUnwrap(migratedAccount)
+        XCTAssertEqual(account.canonicalHandle, "alice.example.com")
+        XCTAssertEqual(account.credentialState, .missing)
+        XCTAssertNil(account.signingKey)
+        XCTAssertNil(account.rotationKey)
+        let legacyCredential = try await migrated.credential(did: account.did)
+        XCTAssertNil(legacyCredential)
+        try await migrated.close()
+    }
+
+    func testAccountControlRejectsInvalidInputsAndStoresNoRawPasswordOrPrivateKeyBytes() async throws {
+        XCTAssertThrowsError(try AccountControlStatus(rawValue: "Active"))
+        XCTAssertThrowsError(try AccountControlStatus(rawValue: "future status"))
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        await XCTAssertThrowsErrorAsync(
+            try await database.account(canonicalHandle: "Alice.Example.COM")
+        ) { error in
+            XCTAssertEqual(error as? AccountControlStoreError, .invalidInput)
+        }
+        await XCTAssertThrowsErrorAsync(
+            try await database.createAccount(
+                AccountControlRegistration(
+                    did: "did:key:abcdefghijklmnopqrstuvwx",
+                    canonicalHandle: "invalid.example.com",
+                    passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                    signingKey: try AccountControlKeyReference(purpose: .signing, generation: 1),
+                    rotationKey: try AccountControlKeyReference(purpose: .rotation, generation: 1)
+                )
+            )
+        ) { error in
+            XCTAssertEqual(error as? AccountControlStoreError, .invalidInput)
+        }
+        let directStatusWrite = try await SQLiteConnection.open(
+            storage: .file(path: SQLiteLayout.controlDatabase(in: root).path)
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await directStatusWrite.query(
+                "INSERT INTO accounts(did, handle, status, created_at) VALUES (?, ?, ?, ?)",
+                [
+                    .text("did:plc:bcdefghijklmnopqrstuvwxy"),
+                    .text("status.example.com"),
+                    .text("invalid status"),
+                    .integer(1_750_000_000_000_000),
+                ]
+            )
+        )
+        try await directStatusWrite.close()
+        let registration = try controlRegistration(
+            did: "did:plc:abcdefghijklmnopqrstuvwx",
+            handle: "alice.example.com"
+        )
+        _ = try await database.createAccount(registration)
+        try await database.close()
+
+        let bytes = try Data(contentsOf: SQLiteLayout.controlDatabase(in: root))
+        let databaseText = String(decoding: bytes, as: UTF8.self)
+        XCTAssertFalse(databaseText.contains("raw-password-never-stored"))
+        XCTAssertFalse(databaseText.contains("\u{01}\u{02}\u{03}\u{04}"))
+        XCTAssertFalse(databaseText.contains("private-key-export-envelope"))
+        let direct = try await SQLiteConnection.open(
+            storage: .file(path: SQLiteLayout.controlDatabase(in: root).path)
+        )
+        let columns = try await direct.query("PRAGMA table_info(accounts)")
+            .compactMap { $0.column("name")?.string }
+        XCTAssertFalse(columns.contains(where: { $0.contains("private") || $0.contains("key_bytes") }))
+        try await direct.close()
+    }
+
+    func testAccountControlRejectsUnknownAliasesForEveryKnownStatusToken() async throws {
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
+        let registration = try controlRegistration(
+            did: "did:plc:abcdefghijklmnopqrstuvwx",
+            handle: "aliases.example.com"
+        )
+        let account = try await database.createAccount(registration)
+        let knownStatuses: [AccountControlStatus] = [
+            .active, .deactivated, .deleted, .takendown, .suspended,
+            .desynchronized, .throttled,
+        ]
+
+        for known in knownStatuses {
+            let alias = AccountControlStatus.unknown(known.rawValue)
+            XCTAssertFalse(alias.isCanonicalValue, "unknown alias for \(known.rawValue)")
+            XCTAssertFalse(AccountStatusTransitionPolicy.standard.permits(from: .deactivated, to: alias))
+            XCTAssertThrowsError(
+                try AccountStatusTransitionPolicy.standard.validate(from: .deactivated, to: alias)
+            ) { error in
+                XCTAssertEqual(error as? AccountControlStoreError, .invalidStatus)
+            }
+            XCTAssertThrowsError(
+                try AccountControlAccount(
+                    did: account.did,
+                    canonicalHandle: account.canonicalHandle,
+                    status: alias,
+                    createdAt: account.createdAt,
+                    updatedAt: account.updatedAt,
+                    credentialState: account.credentialState,
+                    signingKey: account.signingKey,
+                    rotationKey: account.rotationKey
+                )
+            ) { error in
+                XCTAssertEqual(error as? AccountControlStoreError, .invalidStatus)
+            }
+            await XCTAssertThrowsErrorAsync(
+                try await database.transitionStatus(
+                    did: account.did,
+                    to: alias,
+                    declaration: .init(),
+                    now: account.updatedAt.addingTimeInterval(1)
+                )
+            ) { error in
+                XCTAssertEqual(error as? AccountControlStoreError, .invalidStatus)
+            }
+        }
+
+        let reloaded = try await database.account(did: account.did)
+        XCTAssertEqual(reloaded?.status, .active)
+    }
+
+    func testAccountControlKeyReferencesRejectDecodedSecretsAndMismatchedGenerations() async throws {
+        let secretSentinel = "injected-private-key-bytes-never-persist"
+        let injectedReference = """
+        {"purpose":"account-signing","generation":1,"reference":"\(secretSentinel)"}
+        """
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                AccountControlKeyReference.self,
+                from: Data(injectedReference.utf8)
+            )
+        )
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                AccountControlKeyReference.self,
+                from: Data(#"{"purpose":"account-signing","generation":1,"reference":"account-rotation:1"}"#.utf8)
+            )
+        )
+
+        let signing = try AccountControlKeyReference(purpose: .signing, generation: 1)
+        let mismatchedRotation = try AccountControlKeyReference(purpose: .rotation, generation: 2)
+        XCTAssertThrowsError(
+            try AccountControlRegistration(
+                did: "did:plc:abcdefghijklmnopqrstuvwx",
+                canonicalHandle: "mismatch.example.com",
+                passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                signingKey: signing,
+                rotationKey: mismatchedRotation
+            )
+        ) { error in
+            XCTAssertEqual(error as? AccountControlStoreError, .invalidInput)
+        }
+        XCTAssertThrowsError(
+            try AccountControlAccount(
+                did: "did:plc:abcdefghijklmnopqrstuvwx",
+                canonicalHandle: "mismatch.example.com",
+                status: .active,
+                createdAt: Date(timeIntervalSince1970: 1_750_000_000),
+                updatedAt: Date(timeIntervalSince1970: 1_750_000_000),
+                credentialState: .configured,
+                signingKey: signing,
+                rotationKey: mismatchedRotation
+            )
+        ) { error in
+            XCTAssertEqual(error as? AccountControlStoreError, .invalidInput)
+        }
+
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        _ = try await database.createAccount(
+            controlRegistration(
+                did: "did:plc:abcdefghijklmnopqrstuvwx",
+                handle: "references.example.com"
+            )
+        )
+        try await database.close()
+        let controlBytes = try Data(contentsOf: SQLiteLayout.controlDatabase(in: root))
+        XCTAssertFalse(String(decoding: controlBytes, as: UTF8.self).contains(secretSentinel))
+    }
+
+    func testAccountControlExportMetadataOnlyPersistsCanonicalManifestDigests() async throws {
+        let secretSentinel = "recovery phrase private key export payload"
+        let validDigest = "sha256:" + String(repeating: "a", count: 64)
+        let invalidReferences = [
+            secretSentinel,
+            "c2VlZC1waHJhc2U=",
+            "sha256:" + String(repeating: "A", count: 64),
+            "sha256:" + String(repeating: "a", count: 63),
+        ]
+        for reference in invalidReferences {
+            XCTAssertThrowsError(try AccountExportMetadata(reference: reference))
+            let encoded = "{\"declaredAt\":0,\"reference\":\"\(reference)\"}"
+            XCTAssertThrowsError(
+                try JSONDecoder().decode(AccountExportMetadata.self, from: Data(encoded.utf8))
+            )
+        }
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                AccountTombstoneMetadata.self,
+                from: Data(#"{"declaredAt":-1000000000,"reason":"invalid"}"#.utf8)
+            )
+        )
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                AccountTombstoneMetadata.self,
+                from: Data(#"{"declaredAt":0,"reason":"operator\ntext"}"#.utf8)
+            )
+        )
+
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        let registration = try controlRegistration(
+            did: "did:plc:abcdefghijklmnopqrstuvwx",
+            handle: "exports.example.com",
+            createdAt: now
+        )
+        _ = try await database.createAccount(registration)
+        let transitioned = try await database.transitionStatus(
+            did: registration.did,
+            to: .active,
+            declaration: AccountLifecycleDeclaration(
+                export: try AccountExportMetadata(declaredAt: now, reference: validDigest)
+            ),
+            now: now.addingTimeInterval(1)
+        )
+        XCTAssertEqual(transitioned.export?.reference, validDigest)
+        try await database.close()
+
+        let reopened = try await SQLiteControlDatabase(dataDirectory: root)
+        let persisted = try await reopened.account(did: registration.did)
+        XCTAssertEqual(persisted?.export?.reference, validDigest)
+        try await reopened.close()
+
+        let controlBytes = try Data(contentsOf: SQLiteLayout.controlDatabase(in: root))
+        let controlText = String(decoding: controlBytes, as: UTF8.self)
+        XCTAssertTrue(controlText.contains(validDigest))
+        XCTAssertFalse(controlText.contains(secretSentinel))
+        XCTAssertFalse(controlText.contains("c2VlZC1waHJhc2U="))
+    }
+
+    func testAccountControlConcurrentLegacyOpenSerializesMigration() async throws {
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let path = SQLiteLayout.controlDatabase(in: root).path
+        let legacy = try await SQLiteConnection.open(storage: .file(path: path))
+        _ = try await legacy.query(
+            """
+            CREATE TABLE accounts (
+                did TEXT PRIMARY KEY,
+                handle TEXT UNIQUE NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        _ = try await legacy.query(
+            "INSERT INTO accounts(did, handle, status, created_at) VALUES (?, ?, ?, ?)",
+            [
+                .text("did:plc:abcdefghijklmnopqrstuvwx"),
+                .text("Alice.Example.COM"),
+                .text("active"),
+                .integer(1_750_000_000_000_000),
+            ]
+        )
+        try await legacy.close()
+
+        let databases = try await withThrowingTaskGroup(
+            of: SQLiteControlDatabase.self,
+            returning: [SQLiteControlDatabase].self
+        ) { group in
+            for _ in 0 ..< 2 {
+                group.addTask {
+                    try await SQLiteControlDatabase(dataDirectory: root)
+                }
+            }
+            var opened: [SQLiteControlDatabase] = []
+            for try await database in group {
+                opened.append(database)
+            }
+            return opened
+        }
+        XCTAssertEqual(databases.count, 2)
+        let migratedAccount = try await databases[0].account(
+            did: "did:plc:abcdefghijklmnopqrstuvwx"
+        )
+        XCTAssertEqual(migratedAccount?.canonicalHandle, "alice.example.com")
+        XCTAssertEqual(migratedAccount?.credentialState, .missing)
+        for database in databases {
+            try await database.close()
+        }
+
+        let inspected = try await SQLiteConnection.open(storage: .file(path: path))
+        let columns = try await inspected.query("PRAGMA table_info(accounts)")
+            .compactMap { $0.column("name")?.string }
+        XCTAssertTrue(columns.contains("password_verifier"))
+        XCTAssertTrue(columns.contains("signing_key_generation"))
+        XCTAssertTrue(columns.contains("export_reference"))
+        try await inspected.close()
+    }
+}
+
+private extension SwanSQLiteTests {
+    func controlRoot() throws -> URL {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanAccountControlTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
+
+    func controlRegistration(
+        did: String,
+        handle: String,
+        createdAt: Date = Date(timeIntervalSince1970: 1_750_000_000)
+    ) throws -> AccountControlRegistration {
+        try AccountControlRegistration(
+            did: did,
+            canonicalHandle: handle,
+            passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+            signingKey: try AccountControlKeyReference(purpose: .signing, generation: 1),
+            rotationKey: try AccountControlKeyReference(purpose: .rotation, generation: 1),
+            createdAt: createdAt
+        )
+    }
+
+    func controlCreateRace(
+        first: SQLiteControlDatabase,
+        second: SQLiteControlDatabase,
+        firstRegistration: AccountControlRegistration,
+        secondRegistration: AccountControlRegistration
+    ) async -> (successes: Int, errors: [AccountControlStoreError]) {
+        await withTaskGroup(
+            of: Result<AccountControlAccount, any Error>.self,
+            returning: (Int, [AccountControlStoreError]).self
+        ) { group in
+            group.addTask {
+                do {
+                    return .success(try await first.createAccount(firstRegistration))
+                } catch {
+                    return .failure(error)
+                }
+            }
+            group.addTask {
+                do {
+                    return .success(try await second.createAccount(secondRegistration))
+                } catch {
+                    return .failure(error)
+                }
+            }
+            let outcomes = await group.reduce(into: [Result<AccountControlAccount, any Error>]()) {
+                $0.append($1)
+            }
+            return (
+                outcomes.compactMap { try? $0.get() }.count,
+                outcomes.compactMap { result in
+                    guard case let .failure(error) = result else { return nil }
+                    return error as? AccountControlStoreError
+                }
+            )
+        }
+    }
 }
 
 private struct Fixture {

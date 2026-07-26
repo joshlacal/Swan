@@ -131,7 +131,13 @@ let package = Package(
                 .product(name: "Crypto", package: "swift-crypto"),
             ]
         ),
-        .testTarget(name: "SwanAccountsTests", dependencies: ["SwanAccounts", "SwanCore"]),
+        .testTarget(
+            name: "SwanAccountsTests",
+            dependencies: [
+                "SwanAccounts", "SwanCore", "SwanStorage", "SwanSQLite",
+                .product(name: "SQLiteNIO", package: "sqlite-nio"),
+            ]
+        ),
         .testTarget(
             name: "SwanHTTPTests",
             dependencies: [

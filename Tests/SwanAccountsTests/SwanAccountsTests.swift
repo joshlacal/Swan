@@ -1,6 +1,9 @@
 import Dispatch
 import Foundation
+import SQLiteNIO
 import SwanCore
+import SwanSQLite
+import SwanStorage
 import XCTest
 @testable import SwanAccounts
 
@@ -131,7 +134,7 @@ final class SwanAccountsTests: XCTestCase {
         XCTAssertEqual(account.did, Self.aliceDID)
         XCTAssertEqual(account.handle, "alice.example.com")
 
-        let directory = AccountDirectory()
+        let directory = InMemoryAccountDirectory()
         try await directory.create(account)
         let duplicate = try SwanAccount(
             did: Self.bobDID,
@@ -670,6 +673,238 @@ final class SwanAccountsTests: XCTestCase {
         XCTAssertThrowsError(try JSONEncoder().encode(AccountStatus.unknown("active")))
         XCTAssertThrowsError(try JSONEncoder().encode(AccountStatus.unknown("ACTIVE")))
         XCTAssertThrowsError(try AccountStatus(rawValue: "future status"))
+
+        for known in [
+            AccountStatus.active, .deactivated, .deleted, .takendown,
+            .suspended, .desynchronized, .throttled,
+        ] {
+            let alias = AccountStatus.unknown(known.rawValue)
+            XCTAssertFalse(alias.isCanonicalValue)
+            XCTAssertThrowsError(try JSONEncoder().encode(alias))
+            XCTAssertThrowsError(try SwanAccount(
+                did: Self.aliceDID,
+                handle: "alice.example.com",
+                status: alias
+            ))
+        }
+    }
+
+    func testDurableDirectoryAuthenticatesOnlyActiveAccountsRehashesAndKeepsVerifierPrivate() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
+        let hasher = DirectoryTestHasher()
+        let executor = try Argon2idVerificationExecutor(
+            maximumConcurrentVerifications: 1
+        ) { password, verifier in
+            password == "correct horse" && DirectoryTestHasher.acceptedVerifiers.contains(verifier)
+        }
+        let directory = DurableAccountDirectory(
+            store: database,
+            passwordHasher: hasher,
+            verificationExecutor: executor
+        )
+        let signing = try AccountKeyReference(
+            accountDID: Self.aliceDID,
+            purpose: .signing,
+            generation: 1
+        )
+        let rotation = try AccountKeyReference(
+            accountDID: Self.aliceDID,
+            purpose: .rotation,
+            generation: 1
+        )
+        _ = try await database.createAccount(
+            AccountControlRegistration(
+                did: Self.aliceDID,
+                canonicalHandle: "alice.example.com",
+                passwordVerifier: DirectoryTestHasher.legacyVerifier,
+                signingKey: try AccountControlKeyReference(purpose: .signing, generation: 1),
+                rotationKey: try AccountControlKeyReference(purpose: .rotation, generation: 1),
+                createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+            )
+        )
+
+        let normalLookupResult = try await directory.resolve(handle: "Alice.Example.COM")
+        let normalLookup = try XCTUnwrap(normalLookupResult)
+        XCTAssertEqual(normalLookup.credentialState, .configured)
+        XCTAssertFalse(String(describing: normalLookup).contains(DirectoryTestHasher.legacyVerifier))
+        let authenticationResult = await directory.authenticate(
+            handle: "alice.example.com",
+            password: "correct horse"
+        )
+        let success = try XCTUnwrap(authenticationResult)
+        XCTAssertTrue(success.credentialWasRehashed)
+        XCTAssertEqual(success.account.did, Self.aliceDID)
+        let rehashedCredential = try await database.credential(did: Self.aliceDID)?.verifier
+        XCTAssertEqual(rehashedCredential, DirectoryTestHasher.currentVerifier)
+        let wrongPassword = await directory.authenticate(handle: "alice.example.com", password: "wrong")
+        let unknownAccount = await directory.authenticate(handle: "missing.example.com", password: "correct horse")
+        let malformedHandle = await directory.authenticate(handle: "invalid handle", password: "correct horse")
+        XCTAssertNil(wrongPassword)
+        XCTAssertNil(unknownAccount)
+        XCTAssertNil(malformedHandle)
+
+        let deactivated = try await directory.transitionStatus(
+            did: Self.aliceDID,
+            to: .deactivated
+        )
+        XCTAssertEqual(deactivated.status, .deactivated)
+        let deactivatedAuthentication = await directory.authenticate(
+            handle: "alice.example.com",
+            password: "correct horse"
+        )
+        XCTAssertNil(deactivatedAuthentication)
+        let reactivated = try await directory.transitionStatus(did: Self.aliceDID, to: .active)
+        XCTAssertEqual(reactivated.status, .active)
+        let reactivatedAuthentication = await directory.authenticate(
+            handle: "alice.example.com",
+            password: "correct horse"
+        )
+        XCTAssertNotNil(reactivatedAuthentication)
+
+        for status in [AccountControlStatus.suspended, .takendown, .desynchronized, .throttled,
+                       .unknown("future-moderation-state")] {
+            _ = try await directory.transitionStatus(did: Self.aliceDID, to: status)
+            let authentication = await directory.authenticate(
+                handle: "alice.example.com",
+                password: "correct horse"
+            )
+            XCTAssertNil(authentication, "\(status.rawValue) must fail closed")
+        }
+        _ = try await directory.transitionStatus(did: Self.aliceDID, to: .active)
+        let deleted = try await directory.transitionStatus(
+            did: Self.aliceDID,
+            to: .deleted,
+            declaration: AccountLifecycleDeclaration(
+                tombstone: try AccountTombstoneMetadata(reason: "user-request")
+            )
+        )
+        XCTAssertEqual(deleted.status, .deleted)
+        XCTAssertEqual(deleted.tombstone?.reason, "user-request")
+        let deletedAuthentication = await directory.authenticate(
+            handle: "alice.example.com",
+            password: "correct horse"
+        )
+        XCTAssertNil(deletedAuthentication)
+        await XCTAssertThrowsErrorAsync(
+            try await directory.transitionStatus(did: Self.aliceDID, to: .active)
+        ) { error in
+            XCTAssertEqual(error as? AccountControlStoreError, .invalidTransition)
+        }
+
+        let keyReferencesResult = try await directory.keyReferences(did: Self.aliceDID)
+        let references = try XCTUnwrap(keyReferencesResult)
+        XCTAssertEqual(references.signing, signing)
+        XCTAssertEqual(references.rotation, rotation)
+    }
+
+    func testDurableAuthenticationFailsClosedWhenAnotherControlConnectionSuspendsBeforeFinalization() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = try await SQLiteControlDatabase(dataDirectory: root)
+        let second = try await SQLiteControlDatabase(dataDirectory: root)
+        let barrier = AuthenticationFinalizationBarrier()
+        let directory = DurableAccountDirectory(
+            store: FinalizationGatedAccountControlStore(base: first, barrier: barrier),
+            passwordHasher: DirectoryTestHasher(),
+            verificationExecutor: try Argon2idVerificationExecutor(
+                maximumConcurrentVerifications: 1
+            ) { password, verifier in
+                password == "correct horse" && verifier == DirectoryTestHasher.currentVerifier
+            }
+        )
+        _ = try await first.createAccount(
+            AccountControlRegistration(
+                did: Self.aliceDID,
+                canonicalHandle: "alice.example.com",
+                passwordVerifier: DirectoryTestHasher.currentVerifier,
+                signingKey: try AccountControlKeyReference(purpose: .signing, generation: 1),
+                rotationKey: try AccountControlKeyReference(purpose: .rotation, generation: 1)
+            )
+        )
+
+        let authentication = Task {
+            await directory.authenticate(handle: "alice.example.com", password: "correct horse")
+        }
+        await barrier.waitUntilEntered()
+        let suspended = try await second.transitionStatus(
+            did: Self.aliceDID,
+            to: .suspended,
+            declaration: .init(),
+            now: Date(timeIntervalSince1970: 1_750_000_001)
+        )
+        XCTAssertEqual(suspended.status, .suspended)
+        await barrier.release()
+
+        let result = await authentication.value
+        XCTAssertNil(result)
+        let finalAccount = try await second.account(did: Self.aliceDID)
+        XCTAssertEqual(finalAccount?.status, .suspended)
+        try await first.close()
+        try await second.close()
+    }
+
+    func testDurableDirectoryRejectsInvalidIdentifiersBeforeStorageAndRecordsExternalKeyReferencesOnly() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
+        let keyRoot = root.appending(path: "keys")
+        let keyStore = try FileAccountKeyStore(
+            root: keyRoot,
+            configuration: keyConfiguration(activeKeyID: "active", byte: 21)
+        )
+        let directory = DurableAccountDirectory(
+            store: database,
+            passwordHasher: DirectoryTestHasher(),
+            verificationExecutor: try Argon2idVerificationExecutor(
+                maximumConcurrentVerifications: 1
+            ) { _, _ in false },
+            keyProvisioner: AccountKeyProvisioner(keyStore: keyStore)
+        )
+        await XCTAssertThrowsSwanErrorAsync(
+            try await directory.provision(
+                did: "did:PLC:abcdefghijklmnopqrstuvwx",
+                handle: "alice.example.com",
+                password: "correct horse"
+            ),
+            expected: .invalidIdentifier("unsupported account DID method")
+        )
+        await XCTAssertThrowsSwanErrorAsync(
+            try await directory.provision(
+                did: Self.aliceDID,
+                handle: "singlelabel",
+                password: "correct horse"
+            ),
+            expected: .invalidIdentifier("account handle")
+        )
+
+        let account = try await directory.provision(
+            did: Self.aliceDID,
+            handle: "Alice.Example.COM",
+            password: "correct horse"
+        )
+        XCTAssertEqual(account.canonicalHandle, "alice.example.com")
+        let provisionedReferences = try await directory.keyReferences(did: Self.aliceDID)
+        let references = try XCTUnwrap(provisionedReferences)
+        XCTAssertEqual(references.signing.generation, 1)
+        let signingKey = try await keyStore.key(for: references.signing)
+        let rotationKey = try await keyStore.key(for: references.rotation)
+        XCTAssertEqual(signingKey.count, 32)
+        XCTAssertEqual(rotationKey.count, 32)
+        try await database.close()
+
+        let controlBytes = try Data(contentsOf: SQLiteLayout.controlDatabase(in: root))
+        XCTAssertFalse(String(decoding: controlBytes, as: UTF8.self).contains("correct horse"))
+        let columns = try await SQLiteConnection.open(
+            storage: .file(path: SQLiteLayout.controlDatabase(in: root).path)
+        )
+        let columnNames = try await columns.query("PRAGMA table_info(accounts)")
+            .compactMap { $0.column("name")?.string }
+        XCTAssertFalse(columnNames.contains(where: { $0.contains("private") || $0.contains("envelope") }))
+        try await columns.close()
     }
 
     private func keyReference() throws -> AccountKeyReference {
@@ -753,6 +988,121 @@ final class SwanAccountsTests: XCTestCase {
     }
 }
 
+private struct DirectoryTestHasher: PasswordHasher {
+    static let legacyVerifier = "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ"
+    static let currentVerifier = "$argon2id$v=19$m=65536,t=3,p=1$bcdefghijklmnopqrstuvw$BCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq"
+    static let acceptedVerifiers: Set<String> = [legacyVerifier, currentVerifier]
+
+    func hash(_ password: String) throws -> String {
+        guard !password.isEmpty else { throw SwanError.malformed("empty test password") }
+        return Self.currentVerifier
+    }
+
+    func verify(_ password: String, encodedHash: String) throws -> Bool {
+        password == "correct horse" && Self.acceptedVerifiers.contains(encodedHash)
+    }
+
+    func needsRehash(_ encodedHash: String) throws -> Bool {
+        encodedHash == Self.legacyVerifier
+    }
+}
+
+private actor AuthenticationFinalizationBarrier {
+    private var entered = false
+    private var released = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func enter() async {
+        entered = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+        guard !released else { return }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+}
+
+private struct FinalizationGatedAccountControlStore: AccountControlStore {
+    let base: SQLiteControlDatabase
+    let barrier: AuthenticationFinalizationBarrier
+
+    func createAccount(_ registration: AccountControlRegistration) async throws -> AccountControlAccount {
+        try await base.createAccount(registration)
+    }
+
+    func account(did: String) async throws -> AccountControlAccount? {
+        try await base.account(did: did)
+    }
+
+    func account(canonicalHandle: String) async throws -> AccountControlAccount? {
+        try await base.account(canonicalHandle: canonicalHandle)
+    }
+
+    func credential(did: String) async throws -> AccountControlCredential? {
+        try await base.credential(did: did)
+    }
+
+    func replaceCredential(
+        did: String,
+        expectedVerifier: String,
+        replacementVerifier: String,
+        now: Date
+    ) async throws -> AccountCredentialReplacement {
+        try await base.replaceCredential(
+            did: did,
+            expectedVerifier: expectedVerifier,
+            replacementVerifier: replacementVerifier,
+            now: now
+        )
+    }
+
+    func finalizeAuthentication(
+        did: String,
+        expectedVerifier: String,
+        replacementVerifier: String?,
+        now: Date
+    ) async throws -> AccountAuthenticationFinalization? {
+        await barrier.enter()
+        return try await base.finalizeAuthentication(
+            did: did,
+            expectedVerifier: expectedVerifier,
+            replacementVerifier: replacementVerifier,
+            now: now
+        )
+    }
+
+    func transitionStatus(
+        did: String,
+        to status: AccountControlStatus,
+        declaration: AccountLifecycleDeclaration,
+        now: Date
+    ) async throws -> AccountControlAccount {
+        try await base.transitionStatus(
+            did: did,
+            to: status,
+            declaration: declaration,
+            now: now
+        )
+    }
+}
+
 private extension Collection {
     func onlyElement(
         file: StaticString = #filePath,
@@ -776,5 +1126,19 @@ private func XCTAssertThrowsSwanErrorAsync<T>(
         XCTAssertEqual(error, expected, file: file, line: line)
     } catch {
         XCTFail("unexpected error \(error)", file: file, line: line)
+    }
+}
+
+private func XCTAssertThrowsErrorAsync<T>(
+    _ expression: @autoclosure () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    _ errorHandler: (any Error) -> Void = { _ in }
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("expected error", file: file, line: line)
+    } catch {
+        errorHandler(error)
     }
 }

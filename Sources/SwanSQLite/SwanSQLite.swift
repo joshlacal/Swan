@@ -22,10 +22,17 @@ public enum SQLiteLayout {
             .appending(path: "\(digest).sqlite")
     }
 
-    public static let controlMigrations = [
+    /// Connection-local configuration must run outside a migration write
+    /// transaction (`foreign_keys` and `journal_mode` are not safely changed
+    /// inside one). Schema DDL below is serialized separately with
+    /// `BEGIN IMMEDIATE` by `SQLiteControlDatabase`.
+    public static let controlConnectionPragmas = [
+        "PRAGMA busy_timeout=5000",
         "PRAGMA journal_mode=WAL",
         "PRAGMA foreign_keys=ON",
-        "PRAGMA busy_timeout=5000",
+    ]
+
+    public static let controlMigrations = controlConnectionPragmas + [
         "CREATE TABLE IF NOT EXISTS accounts (did TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS oauth_tokens (digest BLOB PRIMARY KEY, family_id TEXT NOT NULL, subject TEXT NOT NULL, expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS oauth_client_metadata (client_id TEXT PRIMARY KEY, document BLOB NOT NULL, expires_at INTEGER NOT NULL)",

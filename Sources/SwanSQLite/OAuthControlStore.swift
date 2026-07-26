@@ -2,7 +2,7 @@ import Foundation
 import SQLiteNIO
 import SwanStorage
 
-private actor ControlSQLiteConnectionGate {
+actor ControlSQLiteConnectionGate {
     private var isHeld = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
@@ -27,11 +27,11 @@ private actor ControlSQLiteConnectionGate {
 /// records deliberately never flow through this type. The actor serializes one
 /// process while `BEGIN IMMEDIATE` makes consume/rotate/revoke semantics hold
 /// across independently reopened Swan processes as well.
-public actor SQLiteControlDatabase: OAuthControlStore {
+public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
     private static let microsecondsPerSecond = 1_000_000.0
 
-    private let connection: SQLiteConnection
-    private let connectionGate = ControlSQLiteConnectionGate()
+    let connection: SQLiteConnection
+    let connectionGate = ControlSQLiteConnectionGate()
 
     public init(dataDirectory: URL) async throws {
         try FileManager.default.createDirectory(
@@ -523,42 +523,55 @@ public actor SQLiteControlDatabase: OAuthControlStore {
     // MARK: Transactional helpers
 
     private func migrateWithoutGate() async throws {
-        for statement in SQLiteLayout.controlMigrations {
+        // These PRAGMAs configure this connection and must remain outside the
+        // DDL transaction. All schema inspection, CREATE, ALTER, trigger, and
+        // index work below is one `BEGIN IMMEDIATE` transaction so two Swan
+        // processes cold-starting an old control DB cannot race an additive
+        // column migration.
+        for statement in SQLiteLayout.controlConnectionPragmas {
             _ = try await connection.query(statement)
         }
-        // `CREATE TABLE IF NOT EXISTS` preserves already-deployed control
-        // databases, so evolving a durable binding needs explicit additive
-        // columns. Existing identifier-only rows are rejected on decode rather
-        // than downgraded to public clients.
-        try await addColumnIfMissing(
-            table: "oauth_control_token_families",
-            column: "client_assertion_algorithm",
-            definition: "TEXT"
-        )
-        try await addColumnIfMissing(
-            table: "oauth_control_token_families",
-            column: "client_assertion_jkt",
-            definition: "TEXT"
-        )
-        try await addColumnIfMissing(
-            table: "oauth_control_par_requests",
-            column: "client_assertion_algorithm",
-            definition: "TEXT"
-        )
-        try await addColumnIfMissing(
-            table: "oauth_control_par_requests",
-            column: "client_assertion_jkt",
-            definition: "TEXT"
-        )
+        try await transaction {
+            for statement in SQLiteLayout.controlMigrations.dropFirst(
+                SQLiteLayout.controlConnectionPragmas.count
+            ) {
+                _ = try await connection.query(statement)
+            }
+            // `CREATE TABLE IF NOT EXISTS` preserves already-deployed control
+            // databases, so evolving a durable binding needs explicit additive
+            // columns. Existing identifier-only rows are rejected on decode
+            // rather than downgraded to public clients.
+            try await addColumnIfMissing(
+                table: "oauth_control_token_families",
+                column: "client_assertion_algorithm",
+                definition: "TEXT"
+            )
+            try await addColumnIfMissing(
+                table: "oauth_control_token_families",
+                column: "client_assertion_jkt",
+                definition: "TEXT"
+            )
+            try await addColumnIfMissing(
+                table: "oauth_control_par_requests",
+                column: "client_assertion_algorithm",
+                definition: "TEXT"
+            )
+            try await addColumnIfMissing(
+                table: "oauth_control_par_requests",
+                column: "client_assertion_jkt",
+                definition: "TEXT"
+            )
+            try await migrateAccountControlSchema()
+        }
     }
 
-    private func addColumnIfMissing(table: String, column: String, definition: String) async throws {
+    func addColumnIfMissing(table: String, column: String, definition: String) async throws {
         let columns = try await connection.query("PRAGMA table_info(\(table))")
         guard !columns.contains(where: { $0.column("name")?.string == column }) else { return }
         _ = try await connection.query("ALTER TABLE \(table) ADD COLUMN \(column) \(definition)")
     }
 
-    private func withConnectionGate<T: Sendable>(
+    func withConnectionGate<T: Sendable>(
         _ body: () async throws -> T
     ) async throws -> T {
         await connectionGate.acquire()
@@ -572,7 +585,7 @@ public actor SQLiteControlDatabase: OAuthControlStore {
         }
     }
 
-    private func transaction<T: Sendable>(
+    func transaction<T: Sendable>(
         _ body: () async throws -> T
     ) async throws -> T {
         _ = try await connection.query("BEGIN IMMEDIATE")
