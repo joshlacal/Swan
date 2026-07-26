@@ -1,0 +1,1042 @@
+import Foundation
+import SQLiteNIO
+import SwanStorage
+
+private actor ControlSQLiteConnectionGate {
+    private var isHeld = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        if !isHeld {
+            isHeld = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            isHeld = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
+/// Durable OAuth control-plane state backed by `control.sqlite`. Repository
+/// records deliberately never flow through this type. The actor serializes one
+/// process while `BEGIN IMMEDIATE` makes consume/rotate/revoke semantics hold
+/// across independently reopened Swan processes as well.
+public actor SQLiteControlDatabase: OAuthControlStore {
+    private static let microsecondsPerSecond = 1_000_000.0
+
+    private let connection: SQLiteConnection
+    private let connectionGate = ControlSQLiteConnectionGate()
+
+    public init(dataDirectory: URL) async throws {
+        try FileManager.default.createDirectory(
+            at: dataDirectory,
+            withIntermediateDirectories: true
+        )
+        let databaseURL = SQLiteLayout.controlDatabase(in: dataDirectory)
+        connection = try await SQLiteConnection.open(storage: .file(path: databaseURL.path))
+        do {
+            try await migrateWithoutGate()
+        } catch {
+            try? await connection.close()
+            throw error
+        }
+    }
+
+    /// Callers own lifecycle explicitly; the connection is not closed from
+    /// `deinit` because doing so would escape actor isolation.
+    public func close() async throws {
+        try await withConnectionGate {
+            try await connection.close()
+        }
+    }
+
+    public func migrate() async throws {
+        try await withConnectionGate {
+            try await migrateWithoutGate()
+        }
+    }
+
+    // MARK: Client metadata
+
+    public func cacheClientMetadata(
+        _ metadata: OAuthCachedClientMetadata,
+        now: Date = Date()
+    ) async throws {
+        try validate(metadata: metadata, now: now)
+        let expiry = try timestamp(metadata.expiresAt)
+        try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                _ = try await connection.query(
+                    """
+                    INSERT INTO oauth_control_client_metadata(client_id, document, expires_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(client_id) DO UPDATE SET
+                        document = excluded.document,
+                        expires_at = excluded.expires_at
+                    """,
+                    [.text(metadata.clientID), blob(metadata.document), .integer(expiry)]
+                )
+            }
+        }
+    }
+
+    public func cachedClientMetadata(
+        clientID: String,
+        now: Date = Date()
+    ) async throws -> OAuthCachedClientMetadata? {
+        guard validText(clientID) else { throw OAuthControlStoreError.invalidInput }
+        return try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                let rows = try await connection.query(
+                    """
+                    SELECT document, expires_at
+                    FROM oauth_control_client_metadata
+                    WHERE client_id = ?
+                    """,
+                    [.text(clientID)]
+                )
+                guard let row = rows.first else { return nil }
+                let expiresAt = try requiredDate(row, "expires_at")
+                guard expiresAt > now else {
+                    throw OAuthControlStoreError.malformedRecord
+                }
+                return OAuthCachedClientMetadata(
+                    clientID: clientID,
+                    document: try requiredBlob(row, "document"),
+                    expiresAt: expiresAt
+                )
+            }
+        }
+    }
+
+    // MARK: PAR and authorization code state
+
+    public func storePushedAuthorizationRequest(
+        _ request: OAuthPushedAuthorizationRequest,
+        now: Date = Date()
+    ) async throws {
+        try validate(request: request, now: now)
+        let scopes = try encodeScopes(request.binding.scopes)
+        try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                _ = try await connection.query(
+                    """
+                    INSERT INTO oauth_control_par_requests(
+                        request_digest, issuer, client_id, redirect_uri, scopes,
+                        dpop_jkt, client_assertion_key_id, state, state_digest,
+                        code_challenge_method, code_challenge_s256,
+                        expires_at, consumed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    [
+                        blob(request.requestDigest), .text(request.binding.issuer),
+                        .text(request.binding.clientID), .text(request.binding.redirectURI),
+                        blob(scopes), optionalText(request.binding.dpopJKT),
+                        optionalText(request.binding.clientAssertionKeyID),
+                        .text(request.state), blob(request.stateDigest),
+                        .text(request.codeChallengeMethod.rawValue),
+                        .text(request.codeChallengeS256),
+                        .integer(try timestamp(request.expiresAt)),
+                    ]
+                )
+                let stateRows = try await connection.query(
+                    "SELECT state_digest FROM oauth_control_par_state_replays WHERE state_digest = ?",
+                    [blob(request.stateDigest)]
+                )
+                guard stateRows.isEmpty else { throw OAuthControlStoreError.replayDetected }
+                _ = try await connection.query(
+                    """
+                    INSERT INTO oauth_control_par_state_replays(state_digest, expires_at)
+                    VALUES (?, ?)
+                    """,
+                    [blob(request.stateDigest), .integer(try timestamp(request.expiresAt))]
+                )
+            }
+        }
+    }
+
+    public func consumePushedAuthorizationRequest(
+        requestDigest: Data,
+        binding: OAuthClientBinding,
+        now: Date = Date()
+    ) async throws -> OAuthPushedAuthorizationRequest {
+        try validateDigest(requestDigest)
+        try validate(binding: binding)
+        return try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                let rows = try await connection.query(
+                    """
+                    SELECT issuer, client_id, redirect_uri, scopes, dpop_jkt,
+                           client_assertion_key_id, state, state_digest,
+                           code_challenge_method, code_challenge_s256,
+                           expires_at, consumed_at
+                    FROM oauth_control_par_requests
+                    WHERE request_digest = ?
+                    """,
+                    [blob(requestDigest)]
+                )
+                guard let row = rows.first else { throw OAuthControlStoreError.notFound }
+                let request = try decodePAR(row, digest: requestDigest)
+                guard request.binding == binding else {
+                    throw OAuthControlStoreError.bindingMismatch
+                }
+                guard request.expiresAt > now else { throw OAuthControlStoreError.expired }
+                guard row.column("consumed_at")?.isNull != false else {
+                    throw OAuthControlStoreError.alreadyConsumed
+                }
+                _ = try await connection.query(
+                    """
+                    UPDATE oauth_control_par_requests
+                    SET consumed_at = ?
+                    WHERE request_digest = ? AND consumed_at IS NULL
+                    """,
+                    [.integer(try timestamp(now)), blob(requestDigest)]
+                )
+                return request
+            }
+        }
+    }
+
+    public func storeAuthorizationCode(
+        _ code: OAuthAuthorizationCode,
+        now: Date = Date()
+    ) async throws {
+        try validate(code: code, now: now)
+        let family = OAuthTokenFamily(
+            familyID: code.familyID,
+            subject: code.subject,
+            binding: code.binding,
+            expiresAt: code.familyExpiresAt
+        )
+        try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                try await insertFamily(family)
+                _ = try await connection.query(
+                    """
+                    INSERT INTO oauth_control_authorization_codes(
+                        code_digest, family_id, code_challenge_method,
+                        code_challenge_s256, expires_at,
+                        reuse_expires_at, consumed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    [
+                        blob(code.codeDigest), .text(code.familyID.uuidString),
+                        .text(code.codeChallengeMethod.rawValue),
+                        .text(code.codeChallengeS256), .integer(try timestamp(code.expiresAt)),
+                        .integer(try timestamp(code.familyExpiresAt)),
+                    ]
+                )
+            }
+        }
+    }
+
+    public func authorizationCode(
+        codeDigest: Data,
+        now: Date = Date()
+    ) async throws -> OAuthAuthorizationCode? {
+        try validateDigest(codeDigest)
+        return try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                let rows = try await connection.query(
+                    codeSelectSQL,
+                    [blob(codeDigest)]
+                )
+                guard let row = rows.first else { return nil }
+                let code = try decodeCode(row, digest: codeDigest)
+                // A used code is intentionally retained through family expiry
+                // so a later verified replay can revoke the issued family.
+                if code.consumedAt == nil, code.expiresAt <= now {
+                    _ = try await connection.query(
+                        "DELETE FROM oauth_control_authorization_codes WHERE code_digest = ?",
+                        [blob(codeDigest)]
+                    )
+                    return nil
+                }
+                return code
+            }
+        }
+    }
+
+    public func redeemAuthorizationCode(
+        codeDigest: Data,
+        binding: OAuthClientBinding,
+        issuedTokens: OAuthIssuedTokenDigests,
+        now: Date = Date()
+    ) async throws {
+        try validateDigest(codeDigest)
+        try validate(binding: binding)
+        let replayDetected = try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                let rows = try await connection.query(codeSelectSQL, [blob(codeDigest)])
+                guard let row = rows.first else { throw OAuthControlStoreError.notFound }
+                let code = try decodeCode(row, digest: codeDigest)
+                guard code.binding == binding else {
+                    throw OAuthControlStoreError.bindingMismatch
+                }
+                guard code.familyID == issuedTokens.familyID else {
+                    throw OAuthControlStoreError.invalidInput
+                }
+                if code.consumedAt != nil {
+                    try await revokeFamily(code.familyID, now: now)
+                    return true
+                }
+                guard code.expiresAt > now else {
+                    _ = try await connection.query(
+                        "DELETE FROM oauth_control_authorization_codes WHERE code_digest = ?",
+                        [blob(codeDigest)]
+                    )
+                    throw OAuthControlStoreError.expired
+                }
+                let family = try await loadFamily(code.familyID)
+                guard family.subject == code.subject, family.binding == code.binding,
+                      family.revokedAt == nil, family.expiresAt > now else {
+                    throw OAuthControlStoreError.malformedRecord
+                }
+                try validate(tokens: issuedTokens, for: family, now: now)
+                _ = try await connection.query(
+                    """
+                    UPDATE oauth_control_authorization_codes
+                    SET consumed_at = ?
+                    WHERE code_digest = ? AND consumed_at IS NULL
+                    """,
+                    [.integer(try timestamp(now)), blob(codeDigest)]
+                )
+                try await insertTokenPair(issuedTokens)
+                return false
+            }
+        }
+        if replayDetected { throw OAuthControlStoreError.replayDetected }
+    }
+
+    // MARK: Opaque access and refresh token state
+
+    public func issueTokenPair(
+        family: OAuthTokenFamily,
+        tokens: OAuthIssuedTokenDigests,
+        now: Date = Date()
+    ) async throws {
+        try validate(family: family, now: now)
+        guard tokens.familyID == family.familyID, family.revokedAt == nil else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        try validate(tokens: tokens, for: family, now: now)
+        try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                try await insertFamily(family)
+                try await insertTokenPair(tokens)
+            }
+        }
+    }
+
+    public func validatedAccessToken(
+        accessTokenDigest: Data,
+        now: Date = Date()
+    ) async throws -> OAuthTokenFamily {
+        try validateDigest(accessTokenDigest)
+        return try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                let rows = try await connection.query(
+                    """
+                    SELECT f.family_id, f.subject, f.issuer, f.client_id,
+                           f.redirect_uri, f.scopes, f.dpop_jkt,
+                           f.client_assertion_key_id, f.expires_at, f.revoked_at,
+                           a.expires_at AS token_expires_at
+                    FROM oauth_control_access_tokens a
+                    JOIN oauth_control_token_families f ON f.family_id = a.family_id
+                    WHERE a.token_digest = ?
+                    """,
+                    [blob(accessTokenDigest)]
+                )
+                guard let row = rows.first else { throw OAuthControlStoreError.notFound }
+                let family = try decodeFamily(row)
+                guard family.revokedAt == nil, family.expiresAt > now,
+                      try requiredDate(row, "token_expires_at") > now else {
+                    throw OAuthControlStoreError.expired
+                }
+                return family
+            }
+        }
+    }
+
+    public func refreshTokenFamily(
+        refreshTokenDigest: Data,
+        now: Date = Date()
+    ) async throws -> OAuthTokenFamily {
+        try validateDigest(refreshTokenDigest)
+        let result = try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                let rows = try await connection.query(refreshSelectSQL, [blob(refreshTokenDigest)])
+                guard let row = rows.first else { throw OAuthControlStoreError.notFound }
+                let family = try decodeFamily(row)
+                guard family.revokedAt == nil, family.expiresAt > now,
+                      try requiredDate(row, "token_expires_at") > now else {
+                    throw OAuthControlStoreError.expired
+                }
+                if row.column("used_at")?.isNull == false {
+                    // The preflight is also a replay boundary: a caller that
+                    // races after a completed rotation must revoke the family
+                    // rather than merely learn that the old token was used.
+                    try await revokeFamily(family.familyID, now: now)
+                    return (family, true)
+                }
+                return (family, false)
+            }
+        }
+        if result.1 { throw OAuthControlStoreError.replayDetected }
+        return result.0
+    }
+
+    public func redeemRefreshToken(
+        refreshTokenDigest: Data,
+        replacement: OAuthIssuedTokenDigests,
+        now: Date = Date()
+    ) async throws {
+        try validateDigest(refreshTokenDigest)
+        let replayDetected = try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                let rows = try await connection.query(refreshSelectSQL, [blob(refreshTokenDigest)])
+                guard let row = rows.first else { throw OAuthControlStoreError.notFound }
+                let family = try decodeFamily(row)
+                guard family.revokedAt == nil, family.expiresAt > now,
+                      try requiredDate(row, "token_expires_at") > now else {
+                    throw OAuthControlStoreError.expired
+                }
+                guard replacement.familyID == family.familyID else {
+                    throw OAuthControlStoreError.invalidInput
+                }
+                if row.column("used_at")?.isNull == false {
+                    try await revokeFamily(family.familyID, now: now)
+                    return true
+                }
+                try validate(tokens: replacement, for: family, now: now)
+                _ = try await connection.query(
+                    """
+                    UPDATE oauth_control_refresh_tokens
+                    SET used_at = ?
+                    WHERE token_digest = ? AND used_at IS NULL
+                    """,
+                    [.integer(try timestamp(now)), blob(refreshTokenDigest)]
+                )
+                try await insertTokenPair(replacement)
+                return false
+            }
+        }
+        if replayDetected { throw OAuthControlStoreError.replayDetected }
+    }
+
+    public func revokeTokenFamily(
+        refreshTokenDigest: Data,
+        now: Date = Date()
+    ) async throws -> Bool {
+        try validateDigest(refreshTokenDigest)
+        return try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                let rows = try await connection.query(
+                    "SELECT family_id FROM oauth_control_refresh_tokens WHERE token_digest = ?",
+                    [blob(refreshTokenDigest)]
+                )
+                guard let rawID = try optionalRowText(rows.first, "family_id"),
+                      let familyID = UUID(uuidString: rawID) else {
+                    return false
+                }
+                try await revokeFamily(familyID, now: now)
+                return true
+            }
+        }
+    }
+
+    // MARK: Durable replay claims
+
+    public func claimDPoPReplay(
+        digest: Data,
+        expiresAt: Date,
+        now: Date = Date()
+    ) async throws -> Bool {
+        try await claimReplay(
+            table: "oauth_control_dpop_replays",
+            digest: digest,
+            clientID: nil,
+            expiresAt: expiresAt,
+            now: now
+        )
+    }
+
+    public func claimClientAssertion(
+        digest: Data,
+        clientID: String,
+        expiresAt: Date,
+        now: Date = Date()
+    ) async throws -> Bool {
+        guard validText(clientID) else { throw OAuthControlStoreError.invalidInput }
+        return try await claimReplay(
+            table: "oauth_control_client_assertion_replays",
+            digest: digest,
+            clientID: clientID,
+            expiresAt: expiresAt,
+            now: now
+        )
+    }
+
+    public func purgeExpiredOAuthControlState(now: Date = Date()) async throws {
+        try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+            }
+        }
+    }
+
+    // MARK: Transactional helpers
+
+    private func migrateWithoutGate() async throws {
+        for statement in SQLiteLayout.controlMigrations {
+            _ = try await connection.query(statement)
+        }
+    }
+
+    private func withConnectionGate<T: Sendable>(
+        _ body: () async throws -> T
+    ) async throws -> T {
+        await connectionGate.acquire()
+        do {
+            let result = try await body()
+            await connectionGate.release()
+            return result
+        } catch {
+            await connectionGate.release()
+            throw error
+        }
+    }
+
+    private func transaction<T: Sendable>(
+        _ body: () async throws -> T
+    ) async throws -> T {
+        _ = try await connection.query("BEGIN IMMEDIATE")
+        do {
+            let result = try await body()
+            _ = try await connection.query("COMMIT")
+            return result
+        } catch {
+            _ = try? await connection.query("ROLLBACK")
+            throw error
+        }
+    }
+
+    private func purgeExpiredLocked(now: Date) async throws {
+        let nowTimestamp = try timestamp(now)
+        _ = try await connection.query(
+            "DELETE FROM oauth_control_client_metadata WHERE expires_at <= ?",
+            [.integer(nowTimestamp)]
+        )
+        _ = try await connection.query(
+            "DELETE FROM oauth_control_par_requests WHERE expires_at <= ?",
+            [.integer(nowTimestamp)]
+        )
+        _ = try await connection.query(
+            "DELETE FROM oauth_control_par_state_replays WHERE expires_at <= ?",
+            [.integer(nowTimestamp)]
+        )
+        // Unredeemed codes have no sessions to protect. Redeemed codes remain
+        // until family expiry so their replay sentinel survives code expiry.
+        _ = try await connection.query(
+            """
+            DELETE FROM oauth_control_authorization_codes
+            WHERE (consumed_at IS NULL AND expires_at <= ?)
+               OR (consumed_at IS NOT NULL AND reuse_expires_at <= ?)
+            """,
+            [.integer(nowTimestamp), .integer(nowTimestamp)]
+        )
+        _ = try await connection.query(
+            "DELETE FROM oauth_control_access_tokens WHERE expires_at <= ?",
+            [.integer(nowTimestamp)]
+        )
+        _ = try await connection.query(
+            "DELETE FROM oauth_control_refresh_tokens WHERE expires_at <= ?",
+            [.integer(nowTimestamp)]
+        )
+        _ = try await connection.query(
+            "DELETE FROM oauth_control_dpop_replays WHERE expires_at <= ?",
+            [.integer(nowTimestamp)]
+        )
+        _ = try await connection.query(
+            "DELETE FROM oauth_control_client_assertion_replays WHERE expires_at <= ?",
+            [.integer(nowTimestamp)]
+        )
+        _ = try await connection.query(
+            """
+            DELETE FROM oauth_control_token_families
+            WHERE expires_at <= ?
+               OR (
+                    NOT EXISTS (
+                        SELECT 1 FROM oauth_control_authorization_codes c
+                        WHERE c.family_id = oauth_control_token_families.family_id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM oauth_control_access_tokens a
+                        WHERE a.family_id = oauth_control_token_families.family_id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM oauth_control_refresh_tokens r
+                        WHERE r.family_id = oauth_control_token_families.family_id
+                    )
+               )
+            """,
+            [.integer(nowTimestamp)]
+        )
+    }
+
+    private func claimReplay(
+        table: String,
+        digest: Data,
+        clientID: String?,
+        expiresAt: Date,
+        now: Date
+    ) async throws -> Bool {
+        try validateDigest(digest)
+        guard expiresAt > now else { throw OAuthControlStoreError.expired }
+        return try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                let rows = try await connection.query(
+                    "SELECT expires_at FROM \(table) WHERE jti_digest = ?",
+                    [blob(digest)]
+                )
+                if let row = rows.first {
+                    guard try requiredDate(row, "expires_at") > now else {
+                        throw OAuthControlStoreError.malformedRecord
+                    }
+                    return false
+                }
+                if let clientID {
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO oauth_control_client_assertion_replays(
+                            jti_digest, client_id, expires_at
+                        ) VALUES (?, ?, ?)
+                        """,
+                        [blob(digest), .text(clientID), .integer(try timestamp(expiresAt))]
+                    )
+                } else {
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO oauth_control_dpop_replays(jti_digest, expires_at)
+                        VALUES (?, ?)
+                        """,
+                        [blob(digest), .integer(try timestamp(expiresAt))]
+                    )
+                }
+                return true
+            }
+        }
+    }
+
+    private func insertFamily(_ family: OAuthTokenFamily) async throws {
+        _ = try await connection.query(
+            """
+            INSERT INTO oauth_control_token_families(
+                family_id, subject, issuer, client_id, redirect_uri, scopes,
+                dpop_jkt, client_assertion_key_id, expires_at, revoked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                .text(family.familyID.uuidString), .text(family.subject),
+                .text(family.binding.issuer), .text(family.binding.clientID),
+                .text(family.binding.redirectURI), blob(try encodeScopes(family.binding.scopes)),
+                optionalText(family.binding.dpopJKT),
+                optionalText(family.binding.clientAssertionKeyID),
+                .integer(try timestamp(family.expiresAt)),
+                family.revokedAt.map { try? timestamp($0) }.flatMap { $0 }.map(SQLiteData.integer) ?? .null,
+            ]
+        )
+    }
+
+    private func insertTokenPair(_ tokens: OAuthIssuedTokenDigests) async throws {
+        _ = try await connection.query(
+            """
+            INSERT INTO oauth_control_access_tokens(token_digest, family_id, expires_at)
+            VALUES (?, ?, ?)
+            """,
+            [
+                blob(tokens.accessTokenDigest), .text(tokens.familyID.uuidString),
+                .integer(try timestamp(tokens.accessExpiresAt)),
+            ]
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO oauth_control_refresh_tokens(token_digest, family_id, expires_at, used_at)
+            VALUES (?, ?, ?, NULL)
+            """,
+            [
+                blob(tokens.refreshTokenDigest), .text(tokens.familyID.uuidString),
+                .integer(try timestamp(tokens.refreshExpiresAt)),
+            ]
+        )
+    }
+
+    private func revokeFamily(_ familyID: UUID, now: Date) async throws {
+        _ = try await connection.query(
+            """
+            UPDATE oauth_control_token_families
+            SET revoked_at = COALESCE(revoked_at, ?)
+            WHERE family_id = ?
+            """,
+            [.integer(try timestamp(now)), .text(familyID.uuidString)]
+        )
+    }
+
+    private func loadFamily(_ familyID: UUID) async throws -> OAuthTokenFamily {
+        let rows = try await connection.query(
+            """
+            SELECT family_id, subject, issuer, client_id, redirect_uri, scopes,
+                   dpop_jkt, client_assertion_key_id, expires_at, revoked_at
+            FROM oauth_control_token_families
+            WHERE family_id = ?
+            """,
+            [.text(familyID.uuidString)]
+        )
+        guard let row = rows.first else { throw OAuthControlStoreError.notFound }
+        return try decodeFamily(row)
+    }
+
+    private var codeSelectSQL: String {
+        """
+        SELECT c.family_id, c.code_challenge_method, c.code_challenge_s256, c.expires_at,
+               c.reuse_expires_at, c.consumed_at,
+               f.subject, f.issuer, f.client_id, f.redirect_uri, f.scopes,
+               f.dpop_jkt, f.client_assertion_key_id, f.expires_at AS family_expires_at,
+               f.revoked_at
+        FROM oauth_control_authorization_codes c
+        JOIN oauth_control_token_families f ON f.family_id = c.family_id
+        WHERE c.code_digest = ?
+        """
+    }
+
+    private var refreshSelectSQL: String {
+        """
+        SELECT f.family_id, f.subject, f.issuer, f.client_id, f.redirect_uri,
+               f.scopes, f.dpop_jkt, f.client_assertion_key_id, f.expires_at,
+               f.revoked_at, r.expires_at AS token_expires_at, r.used_at
+        FROM oauth_control_refresh_tokens r
+        JOIN oauth_control_token_families f ON f.family_id = r.family_id
+        WHERE r.token_digest = ?
+        """
+    }
+
+    // MARK: Strict decoding and validation
+
+    private func decodePAR(
+        _ row: SQLiteRow,
+        digest: Data
+    ) throws -> OAuthPushedAuthorizationRequest {
+        OAuthPushedAuthorizationRequest(
+            requestDigest: digest,
+            binding: try decodeBinding(row),
+            state: try requiredText(row, "state"),
+            stateDigest: try requiredBlob(row, "state_digest"),
+            codeChallengeMethod: try decodeChallengeMethod(row),
+            codeChallengeS256: try requiredText(row, "code_challenge_s256"),
+            expiresAt: try requiredDate(row, "expires_at")
+        )
+    }
+
+    private func decodeCode(_ row: SQLiteRow, digest: Data) throws -> OAuthAuthorizationCode {
+        guard let familyID = UUID(uuidString: try requiredText(row, "family_id")) else {
+            throw OAuthControlStoreError.malformedRecord
+        }
+        let code = OAuthAuthorizationCode(
+            codeDigest: digest,
+            familyID: familyID,
+            subject: try requiredText(row, "subject"),
+            binding: try decodeBinding(row),
+            codeChallengeMethod: try decodeChallengeMethod(row),
+            codeChallengeS256: try requiredText(row, "code_challenge_s256"),
+            expiresAt: try requiredDate(row, "expires_at"),
+            familyExpiresAt: try requiredDate(row, "family_expires_at"),
+            consumedAt: try optionalDate(row, "consumed_at")
+        )
+        do {
+            try validate(code: code, now: Date.distantPast, permitExpired: true)
+        } catch {
+            // Rows crossed a durable trust boundary. Never reinterpret a
+            // malformed binding as an ordinary request-validation failure.
+            throw OAuthControlStoreError.malformedRecord
+        }
+        return code
+    }
+
+    private func decodeChallengeMethod(_ row: SQLiteRow) throws -> OAuthCodeChallengeMethod {
+        guard let method = OAuthCodeChallengeMethod(
+            rawValue: try requiredText(row, "code_challenge_method")
+        ) else {
+            throw OAuthControlStoreError.malformedRecord
+        }
+        return method
+    }
+
+    private func decodeFamily(_ row: SQLiteRow) throws -> OAuthTokenFamily {
+        guard let familyID = UUID(uuidString: try requiredText(row, "family_id")) else {
+            throw OAuthControlStoreError.malformedRecord
+        }
+        let family = OAuthTokenFamily(
+            familyID: familyID,
+            subject: try requiredText(row, "subject"),
+            binding: try decodeBinding(row),
+            expiresAt: try requiredDate(row, "expires_at"),
+            revokedAt: try optionalDate(row, "revoked_at")
+        )
+        do {
+            try validate(family: family, now: Date.distantPast, permitExpired: true)
+        } catch {
+            throw OAuthControlStoreError.malformedRecord
+        }
+        return family
+    }
+
+    private func decodeBinding(_ row: SQLiteRow) throws -> OAuthClientBinding {
+        let binding = OAuthClientBinding(
+            issuer: try requiredText(row, "issuer"),
+            clientID: try requiredText(row, "client_id"),
+            redirectURI: try requiredText(row, "redirect_uri"),
+            scopes: try decodeScopes(try requiredBlob(row, "scopes")),
+            dpopJKT: try optionalText(row, "dpop_jkt"),
+            clientAssertionKeyID: try optionalText(row, "client_assertion_key_id")
+        )
+        do {
+            try validate(binding: binding)
+        } catch {
+            throw OAuthControlStoreError.malformedRecord
+        }
+        return binding
+    }
+
+    private func validate(metadata: OAuthCachedClientMetadata, now: Date) throws {
+        guard validText(metadata.clientID), !metadata.document.isEmpty,
+              metadata.document.count <= 1_048_576 else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        guard metadata.expiresAt > now else { throw OAuthControlStoreError.expired }
+    }
+
+    private func validate(request: OAuthPushedAuthorizationRequest, now: Date) throws {
+        try validateDigest(request.requestDigest)
+        try validateDigest(request.stateDigest)
+        try validate(binding: request.binding)
+        guard validState(request.state), request.codeChallengeMethod == .s256,
+              validS256Challenge(request.codeChallengeS256) else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        guard request.expiresAt > now else { throw OAuthControlStoreError.expired }
+    }
+
+    private func validate(
+        code: OAuthAuthorizationCode,
+        now: Date,
+        permitExpired: Bool = false
+    ) throws {
+        try validateDigest(code.codeDigest)
+        try validate(binding: code.binding)
+        guard validText(code.subject), code.codeChallengeMethod == .s256,
+              validS256Challenge(code.codeChallengeS256),
+              code.familyExpiresAt >= code.expiresAt else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        guard permitExpired || (code.expiresAt > now && code.familyExpiresAt > now) else {
+            throw OAuthControlStoreError.expired
+        }
+    }
+
+    private func validate(
+        family: OAuthTokenFamily,
+        now: Date,
+        permitExpired: Bool = false
+    ) throws {
+        try validate(binding: family.binding)
+        guard validText(family.subject) else { throw OAuthControlStoreError.invalidInput }
+        guard permitExpired || family.expiresAt > now else {
+            throw OAuthControlStoreError.expired
+        }
+        if let revokedAt = family.revokedAt, revokedAt > family.expiresAt {
+            throw OAuthControlStoreError.invalidInput
+        }
+    }
+
+    private func validate(
+        tokens: OAuthIssuedTokenDigests,
+        for family: OAuthTokenFamily,
+        now: Date
+    ) throws {
+        try validateDigest(tokens.accessTokenDigest)
+        try validateDigest(tokens.refreshTokenDigest)
+        guard tokens.accessTokenDigest != tokens.refreshTokenDigest,
+              tokens.accessExpiresAt > now, tokens.refreshExpiresAt > now,
+              tokens.accessExpiresAt <= family.expiresAt,
+              tokens.refreshExpiresAt <= family.expiresAt else {
+            throw OAuthControlStoreError.invalidInput
+        }
+    }
+
+    private func validate(binding: OAuthClientBinding) throws {
+        guard validText(binding.issuer), validText(binding.clientID),
+              validText(binding.redirectURI),
+              binding.scopes.allSatisfy(validScope),
+              binding.scopes.contains("atproto"),
+              binding.dpopJKT.map(validDPoPJKT) ?? false,
+              binding.clientAssertionKeyID.map(validText) ?? true else {
+            throw OAuthControlStoreError.invalidInput
+        }
+    }
+
+    private func validateDigest(_ digest: Data) throws {
+        guard digest.count == 32 else { throw OAuthControlStoreError.invalidInput }
+    }
+
+    private func encodeScopes(_ scopes: Set<String>) throws -> Data {
+        guard scopes.allSatisfy(validScope) else { throw OAuthControlStoreError.invalidInput }
+        do {
+            return try JSONEncoder().encode(scopes.sorted())
+        } catch {
+            throw OAuthControlStoreError.invalidInput
+        }
+    }
+
+    private func decodeScopes(_ data: Data) throws -> Set<String> {
+        do {
+            let values = try JSONDecoder().decode([String].self, from: data)
+            let scopes = Set(values)
+            guard scopes.count == values.count, scopes.allSatisfy(validScope) else {
+                throw OAuthControlStoreError.malformedRecord
+            }
+            return scopes
+        } catch let error as OAuthControlStoreError {
+            throw error
+        } catch {
+            throw OAuthControlStoreError.malformedRecord
+        }
+    }
+
+    private func timestamp(_ date: Date) throws -> Int {
+        let seconds = date.timeIntervalSince1970
+        guard seconds.isFinite, seconds >= 0 else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        let value = seconds * Self.microsecondsPerSecond
+        guard value.isFinite, value <= Double(Int.max) else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        return Int(value.rounded(.down))
+    }
+
+    private func requiredDate(_ row: SQLiteRow?, _ column: String) throws -> Date {
+        guard let row else { throw OAuthControlStoreError.malformedRecord }
+        return try requiredDate(row, column)
+    }
+
+    private func requiredDate(_ row: SQLiteRow, _ column: String) throws -> Date {
+        guard case let .integer(value) = row.column(column), value >= 0 else {
+            throw OAuthControlStoreError.malformedRecord
+        }
+        let seconds = Double(value) / Self.microsecondsPerSecond
+        guard seconds.isFinite else { throw OAuthControlStoreError.malformedRecord }
+        return Date(timeIntervalSince1970: seconds)
+    }
+
+    private func optionalDate(_ row: SQLiteRow, _ column: String) throws -> Date? {
+        guard let value = row.column(column) else {
+            throw OAuthControlStoreError.malformedRecord
+        }
+        if value.isNull { return nil }
+        guard case let .integer(raw) = value, raw >= 0 else {
+            throw OAuthControlStoreError.malformedRecord
+        }
+        let seconds = Double(raw) / Self.microsecondsPerSecond
+        guard seconds.isFinite else { throw OAuthControlStoreError.malformedRecord }
+        return Date(timeIntervalSince1970: seconds)
+    }
+
+    private func requiredBlob(_ row: SQLiteRow, _ column: String) throws -> Data {
+        guard let value = row.column(column), let data = Data(sqliteData: value) else {
+            throw OAuthControlStoreError.malformedRecord
+        }
+        return data
+    }
+
+    private func optionalRowText(_ row: SQLiteRow?, _ column: String) throws -> String? {
+        guard let row else { return nil }
+        return try requiredText(row, column)
+    }
+
+    private func requiredText(_ row: SQLiteRow, _ column: String) throws -> String {
+        guard case let .text(value) = row.column(column), validText(value) else {
+            throw OAuthControlStoreError.malformedRecord
+        }
+        return value
+    }
+
+    private func optionalText(_ row: SQLiteRow, _ column: String) throws -> String? {
+        guard let value = row.column(column) else {
+            throw OAuthControlStoreError.malformedRecord
+        }
+        if value.isNull { return nil }
+        guard case let .text(text) = value, validText(text) else {
+            throw OAuthControlStoreError.malformedRecord
+        }
+        return text
+    }
+
+    private func optionalText(_ value: String?) -> SQLiteData {
+        value.map(SQLiteData.text) ?? .null
+    }
+
+    private func blob(_ data: Data) -> SQLiteData {
+        data.sqliteData!
+    }
+
+    private func validText(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 4_096 && !value.utf8.contains(0)
+    }
+
+    private func validScope(_ value: String) -> Bool {
+        validText(value) && value.utf8.count <= 256 &&
+            value.unicodeScalars.allSatisfy {
+                !$0.properties.isWhitespace && !CharacterSet.controlCharacters.contains($0)
+            }
+    }
+
+    private func validState(_ value: String) -> Bool {
+        validText(value) && value.utf8.count <= 4_096
+    }
+
+    private func validS256Challenge(_ value: String) -> Bool {
+        value.utf8.count == 43 && value.utf8.allSatisfy { byte in
+            (65 ... 90).contains(byte) || (97 ... 122).contains(byte) ||
+                (48 ... 57).contains(byte) || byte == 45 || byte == 95
+        }
+    }
+
+    /// A DPoP JKT is the base64url SHA-256 thumbprint defined by RFC 7638.
+    /// OAuth families are sender constrained, so NULL, empty, or malformed
+    /// values are always a corrupt/invalid control-plane state.
+    private func validDPoPJKT(_ value: String) -> Bool {
+        value.utf8.count == 43 && value.utf8.allSatisfy { byte in
+            (65 ... 90).contains(byte) || (97 ... 122).contains(byte) ||
+                (48 ... 57).contains(byte) || byte == 45 || byte == 95
+        }
+    }
+}

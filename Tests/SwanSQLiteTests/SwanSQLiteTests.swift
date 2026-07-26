@@ -1,5 +1,6 @@
 import Foundation
 import Petrel
+import SQLiteNIO
 import SwanCore
 @testable import SwanSQLite
 import SwanSpaces
@@ -677,6 +678,226 @@ final class SwanSQLiteTests: XCTestCase {
         XCTAssertNil(publicAsPrivate)
         XCTAssertEqual(publicRecord?.value, Data("public".utf8))
         XCTAssertEqual(privateRecord?.value, fixture.firstValue)
+    }
+
+    func testControlStorePersistsReplayStateAndPurgesExpiredMetadata() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanControlStoreTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let binding = OAuthClientBinding(
+            issuer: "https://swan.example",
+            clientID: "https://client.example/metadata",
+            redirectURI: "https://client.example/callback",
+            scopes: ["atproto"],
+            dpopJKT: String(repeating: "C", count: 43)
+        )
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        let metadata = OAuthCachedClientMetadata(
+            clientID: binding.clientID,
+            document: Data("{\"client_id\":\"example\"}".utf8),
+            expiresAt: now.addingTimeInterval(1)
+        )
+        try await database.cacheClientMetadata(metadata, now: now)
+        let cachedMetadata = try await database.cachedClientMetadata(
+            clientID: binding.clientID,
+            now: now
+        )
+        XCTAssertEqual(cachedMetadata, metadata)
+
+        let request = OAuthPushedAuthorizationRequest(
+            requestDigest: Data(repeating: 0x11, count: 32),
+            binding: binding,
+            state: "state=must-round-trip",
+            stateDigest: Data(repeating: 0x22, count: 32),
+            codeChallengeS256: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            expiresAt: now.addingTimeInterval(30)
+        )
+        try await database.storePushedAuthorizationRequest(request, now: now)
+        let consumed = try await database.consumePushedAuthorizationRequest(
+            requestDigest: request.requestDigest,
+            binding: binding,
+            now: now
+        )
+        XCTAssertEqual(consumed.state, "state=must-round-trip")
+        let duplicateState = OAuthPushedAuthorizationRequest(
+            requestDigest: Data(repeating: 0x33, count: 32),
+            binding: binding,
+            state: request.state,
+            stateDigest: request.stateDigest,
+            codeChallengeS256: request.codeChallengeS256,
+            expiresAt: request.expiresAt
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await database.storePushedAuthorizationRequest(duplicateState, now: now)
+        ) { error in
+            XCTAssertEqual(error as? OAuthControlStoreError, .replayDetected)
+        }
+        let expiredMetadata = try await database.cachedClientMetadata(
+            clientID: binding.clientID,
+            now: now.addingTimeInterval(2)
+        )
+        XCTAssertNil(expiredMetadata)
+        let firstReplayClaim = try await database.claimDPoPReplay(
+            digest: Data(repeating: 0x44, count: 32),
+            expiresAt: now.addingTimeInterval(30),
+            now: now
+        )
+        XCTAssertTrue(firstReplayClaim)
+        try await database.close()
+
+        let reopened = try await SQLiteControlDatabase(dataDirectory: root)
+        let secondReplayClaim = try await reopened.claimDPoPReplay(
+            digest: Data(repeating: 0x44, count: 32),
+            expiresAt: now.addingTimeInterval(30),
+            now: now.addingTimeInterval(1)
+        )
+        XCTAssertFalse(secondReplayClaim)
+        let reclaimedReplay = try await reopened.claimDPoPReplay(
+            digest: Data(repeating: 0x44, count: 32),
+            expiresAt: now.addingTimeInterval(60),
+            now: now.addingTimeInterval(31)
+        )
+        XCTAssertTrue(reclaimedReplay)
+        try await reopened.close()
+    }
+
+    func testControlStoreRejectsUnboundOrMismatchedFamiliesAndFailsClosedForCorruptBindings() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanControlStoreBindingsTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let familyID = UUID()
+        let binding = OAuthClientBinding(
+            issuer: "https://swan.example",
+            clientID: "https://client.example/metadata",
+            redirectURI: "https://client.example/callback",
+            scopes: ["atproto"],
+            dpopJKT: String(repeating: "D", count: 43)
+        )
+        let family = OAuthTokenFamily(
+            familyID: familyID,
+            subject: "did:plc:alice",
+            binding: binding,
+            expiresAt: now.addingTimeInterval(600)
+        )
+        let tokens = OAuthIssuedTokenDigests(
+            familyID: familyID,
+            accessTokenDigest: Data(repeating: 0xA1, count: 32),
+            refreshTokenDigest: Data(repeating: 0xB2, count: 32),
+            accessExpiresAt: now.addingTimeInterval(60),
+            refreshExpiresAt: now.addingTimeInterval(600)
+        )
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+
+        for invalidJKT in [nil, "", "not-a-jkt"] as [String?] {
+            let invalidFamily = OAuthTokenFamily(
+                familyID: UUID(),
+                subject: "did:plc:alice",
+                binding: OAuthClientBinding(
+                    issuer: binding.issuer,
+                    clientID: binding.clientID,
+                    redirectURI: binding.redirectURI,
+                    scopes: binding.scopes,
+                    dpopJKT: invalidJKT
+                ),
+                expiresAt: family.expiresAt
+            )
+            let invalidTokens = OAuthIssuedTokenDigests(
+                familyID: invalidFamily.familyID,
+                accessTokenDigest: Data(repeating: UInt8(0xC0 + (invalidJKT?.count ?? 0)), count: 32),
+                refreshTokenDigest: Data(repeating: UInt8(0xD0 + (invalidJKT?.count ?? 0)), count: 32),
+                accessExpiresAt: tokens.accessExpiresAt,
+                refreshExpiresAt: tokens.refreshExpiresAt
+            )
+            await XCTAssertThrowsErrorAsync(
+                try await database.issueTokenPair(
+                    family: invalidFamily,
+                    tokens: invalidTokens,
+                    now: now
+                )
+            ) { error in
+                XCTAssertEqual(error as? OAuthControlStoreError, .invalidInput)
+            }
+        }
+
+        let mismatchedTokens = OAuthIssuedTokenDigests(
+            familyID: UUID(),
+            accessTokenDigest: tokens.accessTokenDigest,
+            refreshTokenDigest: tokens.refreshTokenDigest,
+            accessExpiresAt: tokens.accessExpiresAt,
+            refreshExpiresAt: tokens.refreshExpiresAt
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await database.issueTokenPair(family: family, tokens: mismatchedTokens, now: now)
+        ) { error in
+            XCTAssertEqual(error as? OAuthControlStoreError, .invalidInput)
+        }
+        let revokedFamily = OAuthTokenFamily(
+            familyID: UUID(),
+            subject: family.subject,
+            binding: binding,
+            expiresAt: family.expiresAt,
+            revokedAt: now
+        )
+        let revokedTokens = OAuthIssuedTokenDigests(
+            familyID: revokedFamily.familyID,
+            accessTokenDigest: Data(repeating: 0xE1, count: 32),
+            refreshTokenDigest: Data(repeating: 0xF2, count: 32),
+            accessExpiresAt: tokens.accessExpiresAt,
+            refreshExpiresAt: tokens.refreshExpiresAt
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await database.issueTokenPair(family: revokedFamily, tokens: revokedTokens, now: now)
+        ) { error in
+            XCTAssertEqual(error as? OAuthControlStoreError, .invalidInput)
+        }
+
+        try await database.issueTokenPair(family: family, tokens: tokens, now: now)
+        let codeDigest = Data(repeating: 0xC3, count: 32)
+        let code = OAuthAuthorizationCode(
+            codeDigest: codeDigest,
+            familyID: UUID(),
+            subject: family.subject,
+            binding: binding,
+            codeChallengeS256: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+            expiresAt: now.addingTimeInterval(60),
+            familyExpiresAt: family.expiresAt
+        )
+        try await database.storeAuthorizationCode(code, now: now)
+        try await database.close()
+
+        let direct = try await SQLiteConnection.open(
+            storage: .file(path: SQLiteLayout.controlDatabase(in: root).path)
+        )
+        _ = try await direct.query(
+            "UPDATE oauth_control_token_families SET dpop_jkt = NULL"
+        )
+        try await direct.close()
+
+        let reopened = try await SQLiteControlDatabase(dataDirectory: root)
+        await XCTAssertThrowsErrorAsync(
+            try await reopened.validatedAccessToken(
+                accessTokenDigest: tokens.accessTokenDigest,
+                now: now
+            )
+        ) { error in
+            XCTAssertEqual(error as? OAuthControlStoreError, .malformedRecord)
+        }
+        await XCTAssertThrowsErrorAsync(
+            try await reopened.refreshTokenFamily(
+                refreshTokenDigest: tokens.refreshTokenDigest,
+                now: now
+            )
+        ) { error in
+            XCTAssertEqual(error as? OAuthControlStoreError, .malformedRecord)
+        }
+        await XCTAssertThrowsErrorAsync(
+            try await reopened.authorizationCode(codeDigest: codeDigest, now: now)
+        ) { error in
+            XCTAssertEqual(error as? OAuthControlStoreError, .malformedRecord)
+        }
+        try await reopened.close()
     }
 }
 

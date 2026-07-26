@@ -2,6 +2,7 @@
   "id": "permissioned-data-0016-2026-07-03",
   "proposalCommit": "1caad93dbb1f445396f6abf3b97eb4040345e78e",
   "referenceImplementationCommit": "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
+  "petrelGeneratorCommit": "d011ccf0029457434e659ec48c8024baa7b5c4e4",
   "petrelCommit": "db84b2c9788aa38000ee3f134e21feffa8f351cd",
   "migrationCompatibility": "destructiveBeforeAlpha",
   "crypto": {

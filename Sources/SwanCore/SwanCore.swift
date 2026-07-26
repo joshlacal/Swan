@@ -35,6 +35,10 @@ public struct ProtocolProfile: Codable, Sendable, Equatable {
     public let id: String
     public let proposalCommit: String
     public let referenceImplementationCommit: String
+    /// The isolated Petrel generator revision which produced the checked-in
+    /// wire source. This is intentionally distinct from `petrelCommit`, the
+    /// runtime package revision used by normal Swan builds.
+    public let petrelGeneratorCommit: String
     public let petrelCommit: String
     public let migrationCompatibility: String
     public let crypto: CryptoSuite
@@ -55,6 +59,13 @@ public struct ProtocolProfile: Codable, Sendable, Equatable {
               crypto.lthashHash == "BLAKE3-XOF", crypto.commitmentHash == "SHA-256",
               oplogRetention > 0 else {
             throw SwanError.invalidProfile("unsupported profile invariants")
+        }
+        for commit in [proposalCommit, referenceImplementationCommit, petrelGeneratorCommit, petrelCommit] {
+            guard commit.count == 40, commit.utf8.allSatisfy({
+                ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+            }) else {
+                throw SwanError.invalidProfile("invalid immutable revision pin")
+            }
         }
         for checksum in [referenceArchiveSHA256, lexiconManifestSHA256].compactMap({ $0 }) {
             guard checksum.count == 64, checksum.utf8.allSatisfy({

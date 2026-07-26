@@ -154,3 +154,249 @@ public actor AccountCoordinator {
         try await store.repository(for: space, author: author)
     }
 }
+
+// MARK: - OAuth control plane
+
+/// The deliberately narrow failure vocabulary for durable OAuth state.  None
+/// of these cases include a bearer token, authorization code, proof body, or
+/// client assertion, so an adapter can surface a safe OAuth error without
+/// accidentally logging a credential.
+public enum OAuthControlStoreError: Error, Sendable, Equatable {
+    case notFound
+    case expired
+    case bindingMismatch
+    case alreadyConsumed
+    case replayDetected
+    case invalidInput
+    case malformedRecord
+}
+
+/// Values which bind an OAuth request, authorization code, and token family.
+/// Keeping these values together makes it hard for a later HTTP adapter to
+/// accidentally turn a PAR or code for one client/redirect URI into a token
+/// for another.
+public struct OAuthClientBinding: Sendable, Equatable {
+    public let issuer: String
+    public let clientID: String
+    public let redirectURI: String
+    public let scopes: Set<String>
+    /// RFC 7638 S256 JWK thumbprint binding. This is public key metadata, not
+    /// a DPoP proof body.
+    public let dpopJKT: String?
+    /// The validated key identity for a `private_key_jwt` client, when used.
+    public let clientAssertionKeyID: String?
+
+    public init(
+        issuer: String,
+        clientID: String,
+        redirectURI: String,
+        scopes: Set<String>,
+        dpopJKT: String? = nil,
+        clientAssertionKeyID: String? = nil
+    ) {
+        self.issuer = issuer
+        self.clientID = clientID
+        self.redirectURI = redirectURI
+        self.scopes = scopes
+        self.dpopJKT = dpopJKT
+        self.clientAssertionKeyID = clientAssertionKeyID
+    }
+}
+
+/// A validated client metadata document cached until `expiresAt`. The
+/// document is public metadata; secret client credentials do not belong here.
+public struct OAuthCachedClientMetadata: Sendable, Equatable {
+    public let clientID: String
+    public let document: Data
+    public let expiresAt: Date
+
+    public init(clientID: String, document: Data, expiresAt: Date) {
+        self.clientID = clientID
+        self.document = document
+        self.expiresAt = expiresAt
+    }
+}
+
+/// Swan supports only RFC 7636's SHA-256 proof-key transform. The method is
+/// durable alongside the challenge so a future endpoint cannot silently fall
+/// back to `plain` PKCE when interpreting an old PAR or code.
+public enum OAuthCodeChallengeMethod: String, Sendable, Equatable {
+    case s256 = "S256"
+}
+
+/// A pushed authorization request keyed only by a digest of its opaque
+/// request URI. The raw request URI is intentionally never stored.
+public struct OAuthPushedAuthorizationRequest: Sendable, Equatable {
+    public let requestDigest: Data
+    public let binding: OAuthClientBinding
+    /// Exact opaque client state returned with a future authorization code.
+    /// It is bounded/untrusted client input, not a bearer credential.
+    public let state: String
+    /// A keyed digest which prevents state reuse through PAR expiry without
+    /// indexing a raw state value.
+    public let stateDigest: Data
+    public let codeChallengeMethod: OAuthCodeChallengeMethod
+    public let codeChallengeS256: String
+    public let expiresAt: Date
+
+    public init(
+        requestDigest: Data,
+        binding: OAuthClientBinding,
+        state: String,
+        stateDigest: Data,
+        codeChallengeMethod: OAuthCodeChallengeMethod = .s256,
+        codeChallengeS256: String,
+        expiresAt: Date
+    ) {
+        self.requestDigest = requestDigest
+        self.binding = binding
+        self.state = state
+        self.stateDigest = stateDigest
+        self.codeChallengeMethod = codeChallengeMethod
+        self.codeChallengeS256 = codeChallengeS256
+        self.expiresAt = expiresAt
+    }
+}
+
+/// A pending authorization code. `codeDigest` is a keyed digest; raw codes
+/// never cross the storage boundary. A consumed code remains as a replay
+/// sentinel until the associated token family can no longer be valid.
+public struct OAuthAuthorizationCode: Sendable, Equatable {
+    public let codeDigest: Data
+    public let familyID: UUID
+    public let subject: String
+    public let binding: OAuthClientBinding
+    public let codeChallengeMethod: OAuthCodeChallengeMethod
+    public let codeChallengeS256: String
+    public let expiresAt: Date
+    public let familyExpiresAt: Date
+    public let consumedAt: Date?
+
+    public init(
+        codeDigest: Data,
+        familyID: UUID,
+        subject: String,
+        binding: OAuthClientBinding,
+        codeChallengeMethod: OAuthCodeChallengeMethod = .s256,
+        codeChallengeS256: String,
+        expiresAt: Date,
+        familyExpiresAt: Date,
+        consumedAt: Date? = nil
+    ) {
+        self.codeDigest = codeDigest
+        self.familyID = familyID
+        self.subject = subject
+        self.binding = binding
+        self.codeChallengeMethod = codeChallengeMethod
+        self.codeChallengeS256 = codeChallengeS256
+        self.expiresAt = expiresAt
+        self.familyExpiresAt = familyExpiresAt
+        self.consumedAt = consumedAt
+    }
+}
+
+/// Durable status and binding facts for an OAuth token family. A family is
+/// created before a code is redeemed so that a later code replay can revoke
+/// every token the original redemption produced.
+public struct OAuthTokenFamily: Sendable, Equatable {
+    public let familyID: UUID
+    public let subject: String
+    public let binding: OAuthClientBinding
+    public let expiresAt: Date
+    public let revokedAt: Date?
+
+    public init(
+        familyID: UUID,
+        subject: String,
+        binding: OAuthClientBinding,
+        expiresAt: Date,
+        revokedAt: Date? = nil
+    ) {
+        self.familyID = familyID
+        self.subject = subject
+        self.binding = binding
+        self.expiresAt = expiresAt
+        self.revokedAt = revokedAt
+    }
+}
+
+/// A pair of *keyed HMAC digests* for opaque access and refresh tokens. The
+/// raw bearer strings are generated and retained only by the OAuth layer.
+public struct OAuthIssuedTokenDigests: Sendable, Equatable {
+    public let familyID: UUID
+    public let accessTokenDigest: Data
+    public let refreshTokenDigest: Data
+    public let accessExpiresAt: Date
+    public let refreshExpiresAt: Date
+
+    public init(
+        familyID: UUID,
+        accessTokenDigest: Data,
+        refreshTokenDigest: Data,
+        accessExpiresAt: Date,
+        refreshExpiresAt: Date
+    ) {
+        self.familyID = familyID
+        self.accessTokenDigest = accessTokenDigest
+        self.refreshTokenDigest = refreshTokenDigest
+        self.accessExpiresAt = accessExpiresAt
+        self.refreshExpiresAt = refreshExpiresAt
+    }
+}
+
+/// Domain-specific durable OAuth state. This is intentionally not a generic
+/// key/value API: every operation names the protocol fact and transaction
+/// boundary it needs to preserve.
+public protocol OAuthControlStore: Sendable {
+    func cacheClientMetadata(_ metadata: OAuthCachedClientMetadata, now: Date) async throws
+    func cachedClientMetadata(clientID: String, now: Date) async throws -> OAuthCachedClientMetadata?
+
+    func storePushedAuthorizationRequest(_ request: OAuthPushedAuthorizationRequest, now: Date) async throws
+    func consumePushedAuthorizationRequest(
+        requestDigest: Data,
+        binding: OAuthClientBinding,
+        now: Date
+    ) async throws -> OAuthPushedAuthorizationRequest
+
+    func storeAuthorizationCode(_ code: OAuthAuthorizationCode, now: Date) async throws
+    /// Returns a code's immutable PKCE/binding facts. A consumed code is
+    /// returned as a replay sentinel; only the redemption transaction decides
+    /// whether it can issue tokens.
+    func authorizationCode(codeDigest: Data, now: Date) async throws -> OAuthAuthorizationCode?
+    func redeemAuthorizationCode(
+        codeDigest: Data,
+        binding: OAuthClientBinding,
+        issuedTokens: OAuthIssuedTokenDigests,
+        now: Date
+    ) async throws
+
+    func issueTokenPair(
+        family: OAuthTokenFamily,
+        tokens: OAuthIssuedTokenDigests,
+        now: Date
+    ) async throws
+    func validatedAccessToken(accessTokenDigest: Data, now: Date) async throws -> OAuthTokenFamily
+    func refreshTokenFamily(refreshTokenDigest: Data, now: Date) async throws -> OAuthTokenFamily
+    func redeemRefreshToken(
+        refreshTokenDigest: Data,
+        replacement: OAuthIssuedTokenDigests,
+        now: Date
+    ) async throws
+    /// Revokes the complete family identified by a refresh-token digest. The
+    /// return value is false only when the digest was not known.
+    func revokeTokenFamily(refreshTokenDigest: Data, now: Date) async throws -> Bool
+
+    /// Atomically reserves a DPoP `jti` digest through its proof validity.
+    /// The store receives no DPoP proof body or raw `jti`.
+    func claimDPoPReplay(digest: Data, expiresAt: Date, now: Date) async throws -> Bool
+    /// Client assertion `jti` values have a separate durable replay namespace
+    /// and are likewise represented by a keyed digest only.
+    func claimClientAssertion(
+        digest: Data,
+        clientID: String,
+        expiresAt: Date,
+        now: Date
+    ) async throws -> Bool
+
+    func purgeExpiredOAuthControlState(now: Date) async throws
+}

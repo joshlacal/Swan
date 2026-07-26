@@ -23,18 +23,21 @@ public struct SwanHTTPServer: Sendable {
     public let profile: ProtocolProfile
     public let configuration: SwanHTTPConfiguration
     public let repositories: any AccountRepositoryStore
-    public let tokenVault: OAuthTokenVault
+    /// The durable OAuth control-plane runtime. The server deliberately has no
+    /// `OAuthTokenVault` fallback: an incomplete or missing durable runtime is
+    /// a startup failure, not a switch back to process-local bearer state.
+    public let oauthRuntime: SwanOAuthRuntime
 
     public init(
         profile: ProtocolProfile,
         configuration: SwanHTTPConfiguration = .init(),
         repositories: any AccountRepositoryStore = InMemoryAccountRepositoryStore(),
-        tokenVault: OAuthTokenVault = OAuthTokenVault()
+        oauthRuntime: SwanOAuthRuntime
     ) {
         self.profile = profile
         self.configuration = configuration
         self.repositories = repositories
-        self.tokenVault = tokenVault
+        self.oauthRuntime = oauthRuntime
     }
 
     /// All routes are registered before Application construction. Hummingbird
@@ -47,28 +50,14 @@ public struct SwanHTTPServer: Sendable {
         let publicURL = configuration.publicURL
         let profile = profile
         router.get("/.well-known/oauth-protected-resource") { _, _ -> Response in
-            jsonResponse(ProtectedResourceMetadata(
-                resource: publicURL.absoluteString,
-                authorizationServers: [publicURL.absoluteString]
-            ))
+            oauthUnavailable()
         }
         router.get("/.well-known/oauth-authorization-server") { _, _ -> Response in
-            jsonResponse(AuthorizationServerMetadata(
-                issuer: publicURL.absoluteString,
-                authorizationEndpoint: publicURL.appending(path: "oauth/authorize").absoluteString,
-                tokenEndpoint: publicURL.appending(path: "oauth/token").absoluteString,
-                pushedAuthorizationRequestEndpoint: publicURL.appending(path: "oauth/par").absoluteString,
-                revocationEndpoint: publicURL.appending(path: "oauth/revoke").absoluteString,
-                dpopSigningAlgValuesSupported: ["ES256"]
-            ))
+            oauthUnavailable()
         }
 
         router.get("/oauth/authorize") { _, _ -> Response in
-            Response(
-                status: .ok,
-                headers: [.contentType: "text/html; charset=utf-8", .cacheControl: "no-store"],
-                body: .init(byteBuffer: ByteBuffer(string: "<html><body><h1>Swan authorization</h1><p>Login and consent routes are enabled only after an Argon2id password backend is configured.</p></body></html>"))
-            )
+            oauthUnavailable()
         }
 
         router.get("/xrpc/com.atproto.server.describeServer") { _, _ -> Response in
@@ -80,20 +69,14 @@ public struct SwanHTTPServer: Sendable {
             ))
         }
 
-        // Permissioned methods never fall through to public handlers. Until a
-        // fully validated OAuth/space grant is supplied they return a generic
-        // error without revealing space or record existence.
-        router.get("/xrpc/com.atproto.space.getRecord") { request, _ -> Response in
-            guard request.headers[.authorization] != nil else {
-                return oauthError(status: .unauthorized, error: "invalid_token")
-            }
-            return oauthError(status: .notImplemented, error: "profile_endpoint_pending")
+        // Permissioned methods never fall through to public handlers. OAuth
+        // metadata and token routes are not live yet, so there is no served
+        // bearer-token validation path to accidentally back with memory state.
+        router.get("/xrpc/com.atproto.space.getRecord") { _, _ -> Response in
+            oauthUnavailable()
         }
-        router.post("/xrpc/com.atproto.space.applyWrites") { request, _ -> Response in
-            guard request.headers[.authorization] != nil else {
-                return oauthError(status: .unauthorized, error: "invalid_token")
-            }
-            return oauthError(status: .notImplemented, error: "profile_endpoint_pending")
+        router.post("/xrpc/com.atproto.space.applyWrites") { _, _ -> Response in
+            oauthUnavailable()
         }
 
         return router
@@ -105,34 +88,6 @@ public struct SwanHTTPServer: Sendable {
             configuration: .init(address: .hostname(configuration.host, port: configuration.port), serverName: "swan"),
             logger: logger
         )
-    }
-}
-
-private struct ProtectedResourceMetadata: Encodable {
-    let resource: String
-    let authorizationServers: [String]
-
-    enum CodingKeys: String, CodingKey {
-        case resource
-        case authorizationServers = "authorization_servers"
-    }
-}
-
-private struct AuthorizationServerMetadata: Encodable {
-    let issuer: String
-    let authorizationEndpoint: String
-    let tokenEndpoint: String
-    let pushedAuthorizationRequestEndpoint: String
-    let revocationEndpoint: String
-    let dpopSigningAlgValuesSupported: [String]
-
-    enum CodingKeys: String, CodingKey {
-        case issuer
-        case authorizationEndpoint = "authorization_endpoint"
-        case tokenEndpoint = "token_endpoint"
-        case pushedAuthorizationRequestEndpoint = "pushed_authorization_request_endpoint"
-        case revocationEndpoint = "revocation_endpoint"
-        case dpopSigningAlgValuesSupported = "dpop_signing_alg_values_supported"
     }
 }
 
@@ -157,8 +112,10 @@ private func jsonResponse(_ body: some Encodable) -> Response {
     return Response(status: .ok, headers: [.contentType: "application/json", .cacheControl: "no-store"], body: .init(byteBuffer: ByteBuffer(data: data)))
 }
 
-private func oauthError(status: HTTPResponse.Status, error: String) -> Response {
-    jsonResponseWithStatus(status, body: ["error": error])
+private func oauthUnavailable() -> Response {
+    // Do not publish OAuth discovery metadata until PAR, authorization,
+    // token, revocation, consent, and proof validation are all registered.
+    jsonResponseWithStatus(.serviceUnavailable, body: ["error": "oauth_flow_pending"])
 }
 
 private func jsonResponseWithStatus(_ status: HTTPResponse.Status, body: some Encodable) -> Response {

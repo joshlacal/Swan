@@ -1,0 +1,48 @@
+# Swan Spaces and Interoperability Plan
+
+## Boundary
+
+This plan implements permissioned-space behavior, synchronization, and the
+pinned two-host laboratory. It deliberately excludes general public record
+CRUD, relay/firehose completeness, AppView integration, FoundationDB, and
+Catbird UI work.
+
+## Sequenced work
+
+1. Use typed public and space URIs, credential grants, context signatures, and
+   deniable content bindings. Keep reader-specific envelopes out of repository
+   persistence.
+2. Make each account's WAL database the authority for records, LtHash,
+   revisions, blobs, oplogs, and notification outbox entries. Preserve separate
+   public and private blob reference namespaces.
+3. Implement local `simplespace` authority lifecycle and membership,
+   credential issuance, CRUD/apply-writes, streamed CAR/blob responses, and
+   independent self/member/managing-app/writer/public-policy checks.
+4. Implement writer registration, idempotent notifications, incremental ops,
+   compaction and full-CAR recovery, corruption rejection, and crash recovery
+   from the durable outbox.
+5. Wire all profile endpoints through generated contracts; no permissioned
+   endpoint may fall through to a public handler.
+6. Complete Compose with Swan, the source-pinned TypeScript PDS/PLC, Caddy
+   TLS, Mailpit, Toxiproxy, and a Swift scenario runner. Record sanitized
+   cross-implementation fixtures only.
+
+## Current evidence
+
+- `3a7c57b8` establishes per-account WAL repository tables, numeric CAS plus
+  wire revisions, one-revision batches, ordered oplogs, atomic outbox writes,
+  retention-gap snapshots, and durable blob namespace separation.
+- `c7403e5b` aligns the generated incremental-op contract with required-null
+  CIDs for deletes.
+- Existing HTTP endpoints intentionally return generic authorization errors or
+  `profile_endpoint_pending`; they are not interop evidence.
+
+## Acceptance gates
+
+Run the pinned matrix in both authority directions under normal, delayed,
+duplicate, reordered, disconnected, and corrupted traffic. Require
+convergence, full-CAR recovery after compaction, no state mutation on corrupt
+inputs, bounded-memory 256 MiB CAR/blob streams, and proof that public
+exports/endpoints/logs never disclose permissioned records or private-only
+blobs. Pass the same clean-cache matrix on macOS and Linux before declaring
+the alpha complete.

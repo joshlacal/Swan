@@ -23,9 +23,98 @@ public enum SQLiteLayout {
     }
 
     public static let controlMigrations = [
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA foreign_keys=ON",
+        "PRAGMA busy_timeout=5000",
         "CREATE TABLE IF NOT EXISTS accounts (did TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL)",
         "CREATE TABLE IF NOT EXISTS oauth_tokens (digest BLOB PRIMARY KEY, family_id TEXT NOT NULL, subject TEXT NOT NULL, expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS oauth_client_metadata (client_id TEXT PRIMARY KEY, document BLOB NOT NULL, expires_at INTEGER NOT NULL)",
+        """
+        CREATE TABLE IF NOT EXISTS oauth_control_client_metadata (
+            client_id TEXT PRIMARY KEY,
+            document BLOB NOT NULL,
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS oauth_control_token_families (
+            family_id TEXT PRIMARY KEY,
+            subject TEXT NOT NULL,
+            issuer TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            scopes BLOB NOT NULL,
+            dpop_jkt TEXT,
+            client_assertion_key_id TEXT,
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+            revoked_at INTEGER CHECK(revoked_at >= 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS oauth_control_par_requests (
+            request_digest BLOB PRIMARY KEY CHECK(length(request_digest) = 32),
+            issuer TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            scopes BLOB NOT NULL,
+            dpop_jkt TEXT,
+            client_assertion_key_id TEXT,
+            state TEXT NOT NULL,
+            state_digest BLOB NOT NULL CHECK(length(state_digest) = 32),
+            code_challenge_method TEXT NOT NULL CHECK(code_challenge_method = 'S256'),
+            code_challenge_s256 TEXT NOT NULL,
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+            consumed_at INTEGER CHECK(consumed_at >= 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS oauth_control_par_state_replays (
+            state_digest BLOB PRIMARY KEY CHECK(length(state_digest) = 32),
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS oauth_control_authorization_codes (
+            code_digest BLOB PRIMARY KEY CHECK(length(code_digest) = 32),
+            family_id TEXT NOT NULL REFERENCES oauth_control_token_families(family_id) ON DELETE CASCADE,
+            code_challenge_method TEXT NOT NULL CHECK(code_challenge_method = 'S256'),
+            code_challenge_s256 TEXT NOT NULL,
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+            reuse_expires_at INTEGER NOT NULL CHECK(reuse_expires_at >= 0),
+            consumed_at INTEGER CHECK(consumed_at >= 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS oauth_control_access_tokens (
+            token_digest BLOB PRIMARY KEY CHECK(length(token_digest) = 32),
+            family_id TEXT NOT NULL REFERENCES oauth_control_token_families(family_id) ON DELETE CASCADE,
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS oauth_control_refresh_tokens (
+            token_digest BLOB PRIMARY KEY CHECK(length(token_digest) = 32),
+            family_id TEXT NOT NULL REFERENCES oauth_control_token_families(family_id) ON DELETE CASCADE,
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+            used_at INTEGER CHECK(used_at >= 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS oauth_control_dpop_replays (
+            jti_digest BLOB PRIMARY KEY CHECK(length(jti_digest) = 32),
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS oauth_control_client_assertion_replays (
+            jti_digest BLOB PRIMARY KEY CHECK(length(jti_digest) = 32),
+            client_id TEXT NOT NULL,
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS oauth_control_access_token_expiry ON oauth_control_access_tokens(expires_at)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_refresh_token_expiry ON oauth_control_refresh_tokens(expires_at)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_family_expiry ON oauth_control_token_families(expires_at)",
     ]
 
     public static let accountMigrations = [

@@ -4,6 +4,8 @@ import Logging
 import SwanHTTP
 import SwanInterop
 import SwanCore
+import SwanOAuth
+import SwanSQLite
 
 @main
 struct SwanCommand: AsyncParsableCommand {
@@ -40,12 +42,46 @@ extension SwanCommand {
                 guard let url = URL(string: value) else { throw ValidationError("--public-url must be a URL") }
                 return url
             } ?? URL(string: "http://\(host):\(port)")!
-            try FileManager.default.createDirectory(at: URL(fileURLWithPath: dataDirectory), withIntermediateDirectories: true)
+            let dataURL = URL(fileURLWithPath: dataDirectory)
+            try FileManager.default.createDirectory(at: dataURL, withIntermediateDirectories: true)
+            let serverKey = try loadOAuthServerKey()
+            let controlDatabase = try await SQLiteControlDatabase(dataDirectory: dataURL)
+            let oauthRuntime: SwanOAuthRuntime
+            do {
+                oauthRuntime = try SwanOAuthRuntime(
+                    controlStore: controlDatabase,
+                    serverKey: serverKey
+                )
+            } catch {
+                try? await controlDatabase.close()
+                throw error
+            }
             var logger = Logger(label: "swan")
             logger.logLevel = .info
-            let server = SwanHTTPServer(profile: loadedProfile, configuration: .init(host: host, port: port, publicURL: baseURL))
+            let server = SwanHTTPServer(
+                profile: loadedProfile,
+                configuration: .init(host: host, port: port, publicURL: baseURL),
+                oauthRuntime: oauthRuntime
+            )
             logger.info("starting Swan", metadata: ["profile": .string(loadedProfile.id), "address": .string("\(host):\(port)")])
-            try await server.buildApplication(logger: logger).runService()
+            do {
+                try await server.buildApplication(logger: logger).runService()
+                try await controlDatabase.close()
+            } catch {
+                try? await controlDatabase.close()
+                throw error
+            }
+        }
+
+        private func loadOAuthServerKey() throws -> Data {
+            guard let encoded = ProcessInfo.processInfo.environment["SWAN_OAUTH_SERVER_KEY"],
+                  let key = Data(base64URLEncoded: encoded),
+                  key.count == 32 else {
+                throw ValidationError(
+                    "SWAN_OAUTH_SERVER_KEY must contain a URL-safe-base64 32-byte server key"
+                )
+            }
+            return key
         }
     }
 

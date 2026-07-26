@@ -91,7 +91,7 @@ let package = Package(
         .target(
             name: "SwanOAuth",
             dependencies: [
-                "SwanCore", "SwanSpaces",
+                "SwanCore", "SwanSpaces", "SwanStorage",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
             ]
@@ -109,7 +109,7 @@ let package = Package(
         .executableTarget(
             name: "swan",
             dependencies: [
-                "SwanAccounts", "SwanHTTP", "SwanInterop", "SwanOAuth",
+                "SwanAccounts", "SwanHTTP", "SwanInterop", "SwanOAuth", "SwanSQLite",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Logging", package: "swift-log"),
             ]
@@ -121,15 +121,23 @@ let package = Package(
             dependencies: [
                 "SwanCore", "SwanSQLite", "SwanStorage",
                 .product(name: "Petrel", package: "Petrel"),
+                .product(name: "SQLiteNIO", package: "sqlite-nio"),
             ]
         ),
-        .testTarget(name: "SwanOAuthTests", dependencies: ["SwanOAuth", "SwanSpaces", .product(name: "Crypto", package: "swift-crypto")]),
+        .testTarget(
+            name: "SwanOAuthTests",
+            dependencies: [
+                "SwanOAuth", "SwanSQLite", "SwanStorage", "SwanSpaces",
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
         .testTarget(name: "SwanAccountsTests", dependencies: ["SwanAccounts", "SwanCore"]),
         .testTarget(
             name: "SwanHTTPTests",
             dependencies: [
-                "SwanHTTP",
+                "SwanHTTP", "SwanOAuth", "SwanSQLite",
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
+                .product(name: "Logging", package: "swift-log"),
             ]
         ),
     ]

@@ -4,7 +4,8 @@
 
 - Proposal 0016: `1caad93dbb1f445396f6abf3b97eb4040345e78e`
 - TypeScript implementation: `3f6c96d5d2d25438bd40fa89d6ecc37865f8e354`
-- Petrel generator baseline: `db84b2c9788aa38000ee3f134e21feffa8f351cd`
+- Petrel runtime baseline: `db84b2c9788aa38000ee3f134e21feffa8f351cd`
+- Isolated Petrel generator revision: `d011ccf0029457434e659ec48c8024baa7b5c4e4`
 - Profile: `Profiles/permissioned-data-0016-2026-07-03.json`
 
 The profile pins the TypeScript source archive and a complete checksum manifest
