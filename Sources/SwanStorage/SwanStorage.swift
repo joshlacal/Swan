@@ -171,6 +171,22 @@ public enum OAuthControlStoreError: Error, Sendable, Equatable {
     case malformedRecord
 }
 
+/// The complete public-key identity verified for a confidential OAuth client.
+/// A key ID alone is not a cryptographic binding: the durable record carries
+/// the JOSE algorithm and RFC 7638 thumbprint as well, so a reused `kid` with
+/// new key material cannot silently inherit an existing token family.
+public struct OAuthConfidentialClientKeyBinding: Sendable, Equatable {
+    public let keyID: String
+    public let algorithm: String
+    public let keyThumbprint: String
+
+    public init(keyID: String, algorithm: String, keyThumbprint: String) {
+        self.keyID = keyID
+        self.algorithm = algorithm
+        self.keyThumbprint = keyThumbprint
+    }
+}
+
 /// Values which bind an OAuth request, authorization code, and token family.
 /// Keeping these values together makes it hard for a later HTTP adapter to
 /// accidentally turn a PAR or code for one client/redirect URI into a token
@@ -183,8 +199,10 @@ public struct OAuthClientBinding: Sendable, Equatable {
     /// RFC 7638 S256 JWK thumbprint binding. This is public key metadata, not
     /// a DPoP proof body.
     public let dpopJKT: String?
-    /// The validated key identity for a `private_key_jwt` client, when used.
-    public let clientAssertionKeyID: String?
+    /// The complete verified key identity for a `private_key_jwt` client.
+    /// It is intentionally absent for public clients; an identifier-only
+    /// confidential-client binding is not representable.
+    public let confidentialClientKey: OAuthConfidentialClientKeyBinding?
 
     public init(
         issuer: String,
@@ -192,14 +210,14 @@ public struct OAuthClientBinding: Sendable, Equatable {
         redirectURI: String,
         scopes: Set<String>,
         dpopJKT: String? = nil,
-        clientAssertionKeyID: String? = nil
+        confidentialClientKey: OAuthConfidentialClientKeyBinding? = nil
     ) {
         self.issuer = issuer
         self.clientID = clientID
         self.redirectURI = redirectURI
         self.scopes = scopes
         self.dpopJKT = dpopJKT
-        self.clientAssertionKeyID = clientAssertionKeyID
+        self.confidentialClientKey = confidentialClientKey
     }
 }
 
@@ -385,6 +403,10 @@ public protocol OAuthControlStore: Sendable {
     /// Revokes the complete family identified by a refresh-token digest. The
     /// return value is false only when the digest was not known.
     func revokeTokenFamily(refreshTokenDigest: Data, now: Date) async throws -> Bool
+    /// Revokes a family selected from already-validated durable state. This is
+    /// used when fresh confidential-client metadata shows the persisted key has
+    /// been removed or rekeyed, and must be a single durable transaction.
+    func revokeTokenFamily(familyID: UUID, now: Date) async throws
 
     /// Atomically reserves a DPoP `jti` digest through its proof validity.
     /// The store receives no DPoP proof body or raw `jti`.

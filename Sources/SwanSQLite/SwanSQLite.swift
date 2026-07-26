@@ -46,6 +46,8 @@ public enum SQLiteLayout {
             scopes BLOB NOT NULL,
             dpop_jkt TEXT,
             client_assertion_key_id TEXT,
+            client_assertion_algorithm TEXT,
+            client_assertion_jkt TEXT,
             expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
             revoked_at INTEGER CHECK(revoked_at >= 0)
         )
@@ -59,6 +61,8 @@ public enum SQLiteLayout {
             scopes BLOB NOT NULL,
             dpop_jkt TEXT,
             client_assertion_key_id TEXT,
+            client_assertion_algorithm TEXT,
+            client_assertion_jkt TEXT,
             state TEXT NOT NULL,
             state_digest BLOB NOT NULL CHECK(length(state_digest) = 32),
             code_challenge_method TEXT NOT NULL CHECK(code_challenge_method = 'S256'),

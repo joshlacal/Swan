@@ -899,6 +899,51 @@ final class SwanSQLiteTests: XCTestCase {
         }
         try await reopened.close()
     }
+
+    func testControlStoreAddsCompleteConfidentialKeyColumnsToExistingDatabase() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanControlStoreMigrationTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let path = SQLiteLayout.controlDatabase(in: root).path
+        let legacy = try await SQLiteConnection.open(storage: .file(path: path))
+        _ = try await legacy.query(
+            """
+            CREATE TABLE oauth_control_token_families (
+                family_id TEXT PRIMARY KEY, subject TEXT NOT NULL,
+                issuer TEXT NOT NULL, client_id TEXT NOT NULL,
+                redirect_uri TEXT NOT NULL, scopes BLOB NOT NULL,
+                dpop_jkt TEXT, client_assertion_key_id TEXT,
+                expires_at INTEGER NOT NULL, revoked_at INTEGER
+            )
+            """
+        )
+        _ = try await legacy.query(
+            """
+            CREATE TABLE oauth_control_par_requests (
+                request_digest BLOB PRIMARY KEY, issuer TEXT NOT NULL,
+                client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
+                scopes BLOB NOT NULL, dpop_jkt TEXT,
+                client_assertion_key_id TEXT, state TEXT NOT NULL,
+                state_digest BLOB NOT NULL, code_challenge_method TEXT NOT NULL,
+                code_challenge_s256 TEXT NOT NULL, expires_at INTEGER NOT NULL,
+                consumed_at INTEGER
+            )
+            """
+        )
+        try await legacy.close()
+
+        let migrated = try await SQLiteControlDatabase(dataDirectory: root)
+        try await migrated.close()
+        let inspected = try await SQLiteConnection.open(storage: .file(path: path))
+        for table in ["oauth_control_token_families", "oauth_control_par_requests"] {
+            let columns = try await inspected.query("PRAGMA table_info(\(table))")
+                .compactMap { $0.column("name")?.string }
+            XCTAssertTrue(columns.contains("client_assertion_algorithm"))
+            XCTAssertTrue(columns.contains("client_assertion_jkt"))
+        }
+        try await inspected.close()
+    }
 }
 
 private struct Fixture {

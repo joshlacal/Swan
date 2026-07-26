@@ -132,16 +132,19 @@ public actor SQLiteControlDatabase: OAuthControlStore {
                     """
                     INSERT INTO oauth_control_par_requests(
                         request_digest, issuer, client_id, redirect_uri, scopes,
-                        dpop_jkt, client_assertion_key_id, state, state_digest,
+                        dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
+                        client_assertion_jkt, state, state_digest,
                         code_challenge_method, code_challenge_s256,
                         expires_at, consumed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                     """,
                     [
                         blob(request.requestDigest), .text(request.binding.issuer),
                         .text(request.binding.clientID), .text(request.binding.redirectURI),
                         blob(scopes), optionalText(request.binding.dpopJKT),
-                        optionalText(request.binding.clientAssertionKeyID),
+                        optionalText(request.binding.confidentialClientKey?.keyID),
+                        optionalText(request.binding.confidentialClientKey?.algorithm),
+                        optionalText(request.binding.confidentialClientKey?.keyThumbprint),
                         .text(request.state), blob(request.stateDigest),
                         .text(request.codeChallengeMethod.rawValue),
                         .text(request.codeChallengeS256),
@@ -177,7 +180,8 @@ public actor SQLiteControlDatabase: OAuthControlStore {
                 let rows = try await connection.query(
                     """
                     SELECT issuer, client_id, redirect_uri, scopes, dpop_jkt,
-                           client_assertion_key_id, state, state_digest,
+                           client_assertion_key_id, client_assertion_algorithm,
+                           client_assertion_jkt, state, state_digest,
                            code_challenge_method, code_challenge_s256,
                            expires_at, consumed_at
                     FROM oauth_control_par_requests
@@ -354,7 +358,8 @@ public actor SQLiteControlDatabase: OAuthControlStore {
                     """
                     SELECT f.family_id, f.subject, f.issuer, f.client_id,
                            f.redirect_uri, f.scopes, f.dpop_jkt,
-                           f.client_assertion_key_id, f.expires_at, f.revoked_at,
+                           f.client_assertion_key_id, f.client_assertion_algorithm,
+                           f.client_assertion_jkt, f.expires_at, f.revoked_at,
                            a.expires_at AS token_expires_at
                     FROM oauth_control_access_tokens a
                     JOIN oauth_control_token_families f ON f.family_id = a.family_id
@@ -463,6 +468,18 @@ public actor SQLiteControlDatabase: OAuthControlStore {
         }
     }
 
+    public func revokeTokenFamily(
+        familyID: UUID,
+        now: Date = Date()
+    ) async throws {
+        try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                try await revokeFamily(familyID, now: now)
+            }
+        }
+    }
+
     // MARK: Durable replay claims
 
     public func claimDPoPReplay(
@@ -509,6 +526,36 @@ public actor SQLiteControlDatabase: OAuthControlStore {
         for statement in SQLiteLayout.controlMigrations {
             _ = try await connection.query(statement)
         }
+        // `CREATE TABLE IF NOT EXISTS` preserves already-deployed control
+        // databases, so evolving a durable binding needs explicit additive
+        // columns. Existing identifier-only rows are rejected on decode rather
+        // than downgraded to public clients.
+        try await addColumnIfMissing(
+            table: "oauth_control_token_families",
+            column: "client_assertion_algorithm",
+            definition: "TEXT"
+        )
+        try await addColumnIfMissing(
+            table: "oauth_control_token_families",
+            column: "client_assertion_jkt",
+            definition: "TEXT"
+        )
+        try await addColumnIfMissing(
+            table: "oauth_control_par_requests",
+            column: "client_assertion_algorithm",
+            definition: "TEXT"
+        )
+        try await addColumnIfMissing(
+            table: "oauth_control_par_requests",
+            column: "client_assertion_jkt",
+            definition: "TEXT"
+        )
+    }
+
+    private func addColumnIfMissing(table: String, column: String, definition: String) async throws {
+        let columns = try await connection.query("PRAGMA table_info(\(table))")
+        guard !columns.contains(where: { $0.column("name")?.string == column }) else { return }
+        _ = try await connection.query("ALTER TABLE \(table) ADD COLUMN \(column) \(definition)")
     }
 
     private func withConnectionGate<T: Sendable>(
@@ -652,15 +699,18 @@ public actor SQLiteControlDatabase: OAuthControlStore {
             """
             INSERT INTO oauth_control_token_families(
                 family_id, subject, issuer, client_id, redirect_uri, scopes,
-                dpop_jkt, client_assertion_key_id, expires_at, revoked_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
+                client_assertion_jkt, expires_at, revoked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 .text(family.familyID.uuidString), .text(family.subject),
                 .text(family.binding.issuer), .text(family.binding.clientID),
                 .text(family.binding.redirectURI), blob(try encodeScopes(family.binding.scopes)),
                 optionalText(family.binding.dpopJKT),
-                optionalText(family.binding.clientAssertionKeyID),
+                optionalText(family.binding.confidentialClientKey?.keyID),
+                optionalText(family.binding.confidentialClientKey?.algorithm),
+                optionalText(family.binding.confidentialClientKey?.keyThumbprint),
                 .integer(try timestamp(family.expiresAt)),
                 family.revokedAt.map { try? timestamp($0) }.flatMap { $0 }.map(SQLiteData.integer) ?? .null,
             ]
@@ -705,7 +755,8 @@ public actor SQLiteControlDatabase: OAuthControlStore {
         let rows = try await connection.query(
             """
             SELECT family_id, subject, issuer, client_id, redirect_uri, scopes,
-                   dpop_jkt, client_assertion_key_id, expires_at, revoked_at
+                   dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
+                   client_assertion_jkt, expires_at, revoked_at
             FROM oauth_control_token_families
             WHERE family_id = ?
             """,
@@ -720,7 +771,8 @@ public actor SQLiteControlDatabase: OAuthControlStore {
         SELECT c.family_id, c.code_challenge_method, c.code_challenge_s256, c.expires_at,
                c.reuse_expires_at, c.consumed_at,
                f.subject, f.issuer, f.client_id, f.redirect_uri, f.scopes,
-               f.dpop_jkt, f.client_assertion_key_id, f.expires_at AS family_expires_at,
+               f.dpop_jkt, f.client_assertion_key_id, f.client_assertion_algorithm,
+               f.client_assertion_jkt, f.expires_at AS family_expires_at,
                f.revoked_at
         FROM oauth_control_authorization_codes c
         JOIN oauth_control_token_families f ON f.family_id = c.family_id
@@ -731,7 +783,8 @@ public actor SQLiteControlDatabase: OAuthControlStore {
     private var refreshSelectSQL: String {
         """
         SELECT f.family_id, f.subject, f.issuer, f.client_id, f.redirect_uri,
-               f.scopes, f.dpop_jkt, f.client_assertion_key_id, f.expires_at,
+               f.scopes, f.dpop_jkt, f.client_assertion_key_id,
+               f.client_assertion_algorithm, f.client_assertion_jkt, f.expires_at,
                f.revoked_at, r.expires_at AS token_expires_at, r.used_at
         FROM oauth_control_refresh_tokens r
         JOIN oauth_control_token_families f ON f.family_id = r.family_id
@@ -810,13 +863,29 @@ public actor SQLiteControlDatabase: OAuthControlStore {
     }
 
     private func decodeBinding(_ row: SQLiteRow) throws -> OAuthClientBinding {
+        let keyID = try optionalText(row, "client_assertion_key_id")
+        let algorithm = try optionalText(row, "client_assertion_algorithm")
+        let keyThumbprint = try optionalText(row, "client_assertion_jkt")
+        let confidentialClientKey: OAuthConfidentialClientKeyBinding?
+        switch (keyID, algorithm, keyThumbprint) {
+        case (nil, nil, nil):
+            confidentialClientKey = nil
+        case let (.some(keyID), .some(algorithm), .some(keyThumbprint)):
+            confidentialClientKey = OAuthConfidentialClientKeyBinding(
+                keyID: keyID,
+                algorithm: algorithm,
+                keyThumbprint: keyThumbprint
+            )
+        default:
+            throw OAuthControlStoreError.malformedRecord
+        }
         let binding = OAuthClientBinding(
             issuer: try requiredText(row, "issuer"),
             clientID: try requiredText(row, "client_id"),
             redirectURI: try requiredText(row, "redirect_uri"),
             scopes: try decodeScopes(try requiredBlob(row, "scopes")),
             dpopJKT: try optionalText(row, "dpop_jkt"),
-            clientAssertionKeyID: try optionalText(row, "client_assertion_key_id")
+            confidentialClientKey: confidentialClientKey
         )
         do {
             try validate(binding: binding)
@@ -898,7 +967,7 @@ public actor SQLiteControlDatabase: OAuthControlStore {
               binding.scopes.allSatisfy(validScope),
               binding.scopes.contains("atproto"),
               binding.dpopJKT.map(validDPoPJKT) ?? false,
-              binding.clientAssertionKeyID.map(validText) ?? true else {
+              binding.confidentialClientKey.map(validConfidentialClientKey) ?? true else {
             throw OAuthControlStoreError.invalidInput
         }
     }
@@ -1038,5 +1107,9 @@ public actor SQLiteControlDatabase: OAuthControlStore {
             (65 ... 90).contains(byte) || (97 ... 122).contains(byte) ||
                 (48 ... 57).contains(byte) || byte == 45 || byte == 95
         }
+    }
+
+    private func validConfidentialClientKey(_ key: OAuthConfidentialClientKeyBinding) -> Bool {
+        validText(key.keyID) && key.algorithm == "ES256" && validDPoPJKT(key.keyThumbprint)
     }
 }

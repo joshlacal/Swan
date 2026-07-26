@@ -1,27 +1,7 @@
-import AsyncHTTPClient
 import Crypto
 import Foundation
 import SwanCore
 import SwanSpaces
-
-public struct OAuthClientMetadata: Codable, Sendable, Equatable {
-    public let clientID: URL
-    public let redirectURIs: [URL]
-    public let tokenEndpointAuthMethod: String
-
-    public init(clientID: URL, redirectURIs: [URL], tokenEndpointAuthMethod: String = "none") throws {
-        guard clientID.scheme == "https" || Self.isLoopback(clientID), !redirectURIs.isEmpty else {
-            throw SwanError.malformed("OAuth client metadata requires an HTTPS client ID and redirect URI")
-        }
-        self.clientID = clientID
-        self.redirectURIs = redirectURIs
-        self.tokenEndpointAuthMethod = tokenEndpointAuthMethod
-    }
-
-    private static func isLoopback(_ url: URL) -> Bool {
-        url.scheme == "http" && ["localhost", "127.0.0.1", "::1"].contains(url.host)
-    }
-}
 
 public enum PKCE {
     public static func verifyS256(verifier: String, challenge: String) -> Bool {
@@ -351,59 +331,6 @@ public enum PermissionedDataJWT {
         guard exp >= iat, exp >= current - Int64(clockSkew), iat <= current + Int64(clockSkew) else {
             throw SwanError.expired
         }
-    }
-}
-
-/// A conservative first gate before fetching remote OAuth metadata or JWKS.
-/// DNS re-resolution is performed by the HTTP fetcher integration; this value
-/// check prevents obviously unsafe literal endpoints before network I/O starts.
-public enum OAuthRemoteURLPolicy {
-    public static func validate(_ url: URL, allowLoopbackDevelopment: Bool = false) throws {
-        guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased(),
-              scheme == "https" || (allowLoopbackDevelopment && scheme == "http" && isLoopback(host)) else {
-            throw SwanError.unauthorized("remote OAuth metadata must use HTTPS")
-        }
-        guard !isPrivateOrLinkLocal(host) || (allowLoopbackDevelopment && isLoopback(host)) else {
-            throw SwanError.unauthorized("remote OAuth metadata host is not public")
-        }
-    }
-
-    private static func isLoopback(_ host: String) -> Bool {
-        host == "localhost" || host == "127.0.0.1" || host == "::1"
-    }
-
-    private static func isPrivateOrLinkLocal(_ host: String) -> Bool {
-        if isLoopback(host) { return true }
-        if let octets = ipv4Octets(host) {
-            switch octets {
-            case let values where values[0] == 0 || values[0] == 10 || values[0] == 127:
-                return true
-            case let values where values[0] == 169 && values[1] == 254:
-                return true
-            case let values where values[0] == 172 && (16...31).contains(values[1]):
-                return true
-            case let values where values[0] == 192 && values[1] == 168:
-                return true
-            case let values where values[0] == 100 && (64...127).contains(values[1]):
-                return true
-            case let values where values[0] == 198 && (18...19).contains(values[1]):
-                return true
-            default:
-                return false
-            }
-        }
-        let normalized = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        return normalized == "::" || normalized == "::1" || normalized.hasPrefix("fc") ||
-            normalized.hasPrefix("fd") || normalized.hasPrefix("fe8") || normalized.hasPrefix("fe9") ||
-            normalized.hasPrefix("fea") || normalized.hasPrefix("feb")
-    }
-
-    private static func ipv4Octets(_ host: String) -> [Int]? {
-        let pieces = host.split(separator: ".", omittingEmptySubsequences: false)
-        guard pieces.count == 4 else { return nil }
-        let values = pieces.compactMap { Int($0) }
-        guard values.count == 4, values.allSatisfy({ (0...255).contains($0) }) else { return nil }
-        return values
     }
 }
 

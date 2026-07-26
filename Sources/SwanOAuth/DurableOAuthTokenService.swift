@@ -10,6 +10,10 @@ import SwanStorage
 public struct SwanOAuthRuntime: Sendable {
     public let tokenService: DurableOAuthTokenService
     public let dpopReplayStore: DurableDPoPReplayStore
+    /// The nonce MAC key is the injected non-persisted OAuth server key. It
+    /// never crosses into `OAuthControlStore`; validators receive this service
+    /// from the runtime rather than accepting arbitrary caller text as a nonce.
+    public let dpopNonceService: DPoPNonceService
 
     public init(controlStore: any OAuthControlStore, serverKey: Data) throws {
         tokenService = try DurableOAuthTokenService(
@@ -20,6 +24,7 @@ public struct SwanOAuthRuntime: Sendable {
             controlStore: controlStore,
             serverKey: serverKey
         )
+        dpopNonceService = DPoPNonceService(secret: serverKey)
     }
 }
 
@@ -42,7 +47,7 @@ public actor DurableOAuthTokenService {
 
     /// A resource-facing grant deliberately includes the DPoP binding instead
     /// of looking like a plain bearer-token result. Resource middleware must
-    /// call `validateAccess(_:presentedDPoPJKT:now:)`, which verifies that
+    /// call `validateAccess(_:proof:now:)`, which verifies that
     /// binding before this value can be obtained.
     public struct AccessGrant: Sendable, Equatable {
         public let subject: String
@@ -73,12 +78,13 @@ public actor DurableOAuthTokenService {
     /// Creates an opaque access/refresh pair in a new durable family.
     public func issue(
         subject: String,
-        binding: OAuthClientBinding,
+        session: OAuthValidatedSession,
         accessLifetime: TimeInterval = 300,
         refreshLifetime: TimeInterval = 14 * 24 * 60 * 60,
         familyID: UUID = UUID(),
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
+        let binding = session.durableBinding
         try requireOAuthDPoPBinding(binding)
         let pair = try makeTokenPair(
             familyID: familyID,
@@ -107,7 +113,7 @@ public actor DurableOAuthTokenService {
     /// Stores a PAR by a digest of its returned opaque request URI. The caller
     /// gets the raw URI exactly once; SQLite gets only its HMAC digest.
     public func createPushedAuthorizationRequest(
-        binding: OAuthClientBinding,
+        session: OAuthValidatedSession,
         state: String,
         codeChallengeS256: String,
         lifetime: TimeInterval = 90,
@@ -116,6 +122,7 @@ public actor DurableOAuthTokenService {
         guard lifetime > 0, lifetime.isFinite else {
             throw SwanError.malformed("PAR lifetime must be positive")
         }
+        let binding = session.durableBinding
         try requireOAuthDPoPBinding(binding)
         let requestURI = "urn:ietf:params:oauth:request_uri:\(Self.randomOpaqueValue())"
         let request = OAuthPushedAuthorizationRequest(
@@ -141,9 +148,10 @@ public actor DurableOAuthTokenService {
     /// before a future HTTP authorization handler can create a code from it.
     public func consumePushedAuthorizationRequest(
         _ requestURI: String,
-        binding: OAuthClientBinding,
+        session: OAuthValidatedSession,
         now: Date = Date()
     ) async throws -> OAuthPushedAuthorizationRequest {
+        let binding = session.durableBinding
         do {
             return try await controlStore.consumePushedAuthorizationRequest(
                 requestDigest: digest(requestURI, purpose: .pushedAuthorizationRequest),
@@ -159,7 +167,7 @@ public actor DurableOAuthTokenService {
     /// the store revoke every resulting token if this code is replayed.
     public func issueAuthorizationCode(
         subject: String,
-        binding: OAuthClientBinding,
+        session: OAuthValidatedSession,
         codeChallengeS256: String,
         codeLifetime: TimeInterval = 60,
         refreshLifetime: TimeInterval = 14 * 24 * 60 * 60,
@@ -170,6 +178,7 @@ public actor DurableOAuthTokenService {
               codeLifetime.isFinite, refreshLifetime.isFinite else {
             throw SwanError.malformed("authorization code lifetimes must be positive")
         }
+        let binding = session.durableBinding
         try requireOAuthDPoPBinding(binding)
         let code = Self.randomOpaqueValue()
         let record = OAuthAuthorizationCode(
@@ -195,10 +204,11 @@ public actor DurableOAuthTokenService {
     public func redeemAuthorizationCode(
         _ code: String,
         verifier: String,
-        binding: OAuthClientBinding,
+        session: OAuthValidatedSession,
         accessLifetime: TimeInterval = 300,
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
+        let binding = session.durableBinding
         let codeDigest = digest(code, purpose: .authorizationCode)
         let record: OAuthAuthorizationCode
         do {
@@ -238,7 +248,7 @@ public actor DurableOAuthTokenService {
 
     public func validateAccess(
         _ token: String,
-        presentedDPoPJKT: String?,
+        proof: OAuthValidatedDPoPProof,
         now: Date = Date()
     ) async throws -> AccessGrant {
         do {
@@ -248,8 +258,8 @@ public actor DurableOAuthTokenService {
             )
             try requirePresentedBindings(
                 family: family,
-                presentedDPoPJKT: presentedDPoPJKT,
-                clientAssertionKeyID: nil,
+                dpopProof: proof,
+                clientAssertion: nil,
                 requireClientAssertionKey: false
             )
             return AccessGrant(family: family)
@@ -263,8 +273,9 @@ public actor DurableOAuthTokenService {
     /// atomically revokes the complete token family.
     public func redeemRefresh(
         _ refreshToken: String,
-        presentedDPoPJKT: String?,
-        clientAssertionKeyID: String?,
+        dpopProof: OAuthValidatedDPoPProof,
+        clientAssertion: OAuthValidatedClientAssertion?,
+        metadataLoader: OAuthClientMetadataLoader,
         accessLifetime: TimeInterval = 300,
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
@@ -279,10 +290,16 @@ public actor DurableOAuthTokenService {
             throw secureControlError(error)
         }
         do {
+            try await requireFreshConfidentialClientBinding(
+                family: family,
+                clientAssertion: clientAssertion,
+                metadataLoader: metadataLoader,
+                now: now
+            )
             try requirePresentedBindings(
                 family: family,
-                presentedDPoPJKT: presentedDPoPJKT,
-                clientAssertionKeyID: clientAssertionKeyID,
+                dpopProof: dpopProof,
+                clientAssertion: clientAssertion,
                 requireClientAssertionKey: true
             )
         } catch {
@@ -451,22 +468,87 @@ public actor DurableOAuthTokenService {
 
     private func requirePresentedBindings(
         family: OAuthTokenFamily,
-        presentedDPoPJKT: String?,
-        clientAssertionKeyID: String?,
+        dpopProof: OAuthValidatedDPoPProof,
+        clientAssertion: OAuthValidatedClientAssertion?,
         requireClientAssertionKey: Bool
     ) throws {
         guard let requiredJKT = family.binding.dpopJKT,
               Self.validDPoPJKT(requiredJKT),
-              let presentedDPoPJKT,
-              Self.validDPoPJKT(presentedDPoPJKT),
-              constantTimeTextEqual(requiredJKT, presentedDPoPJKT) else {
+              Self.validDPoPJKT(dpopProof.keyThumbprint),
+              constantTimeTextEqual(requiredJKT, dpopProof.keyThumbprint) else {
             throw OAuthControlStoreError.bindingMismatch
         }
-        if requireClientAssertionKey, let requiredKeyID = family.binding.clientAssertionKeyID {
-            guard let clientAssertionKeyID,
-                  constantTimeTextEqual(requiredKeyID, clientAssertionKeyID) else {
+        if requireClientAssertionKey, let requiredKey = family.binding.confidentialClientKey {
+            guard let clientAssertion,
+                  clientAssertion.clientID == family.binding.clientID,
+                  clientAssertion.algorithm == requiredKey.algorithm,
+                  constantTimeTextEqual(requiredKey.keyID, clientAssertion.selectedKeyID),
+                  constantTimeTextEqual(requiredKey.keyThumbprint, clientAssertion.keyThumbprint) else {
                 throw OAuthControlStoreError.bindingMismatch
             }
+        } else if requireClientAssertionKey, clientAssertion != nil {
+            throw OAuthControlStoreError.bindingMismatch
+        }
+    }
+
+    /// Confidential families are revalidated on every rotation. A matching
+    /// `kid` alone is explicitly insufficient: the refreshed JWKS must contain
+    /// the stored `(kid, ES256, JKT)` tuple, otherwise one transaction revokes
+    /// the entire family before the request is rejected.
+    private func requireFreshConfidentialClientBinding(
+        family: OAuthTokenFamily,
+        clientAssertion: OAuthValidatedClientAssertion?,
+        metadataLoader: OAuthClientMetadataLoader,
+        now: Date
+    ) async throws {
+        guard let persisted = family.binding.confidentialClientKey else {
+            guard clientAssertion == nil else { throw OAuthControlStoreError.bindingMismatch }
+            return
+        }
+        guard let clientID = URL(string: family.binding.clientID) else {
+            try await revokeFamilyAfterConfidentialKeyChange(family.familyID, now: now)
+            throw OAuthControlStoreError.bindingMismatch
+        }
+
+        let refreshed: OAuthResolvedClientMetadata
+        do {
+            refreshed = try await metadataLoader.revalidate(clientID: clientID, now: now)
+        } catch let error as SwanError {
+            // A transient loader failure denies this rotation but does not
+            // destroy a family solely because the network is unavailable.
+            throw error
+        } catch {
+            throw SwanError.unavailable("OAuth client metadata revalidation failed")
+        }
+        guard refreshed.metadata.clientID.absoluteString == family.binding.clientID,
+              refreshed.metadata.tokenEndpointAuthMethod == .privateKeyJWT,
+              let keySet = refreshed.keySet else {
+            try await revokeFamilyAfterConfidentialKeyChange(family.familyID, now: now)
+            throw OAuthControlStoreError.bindingMismatch
+        }
+        let refreshedKey: OAuthJSONWebKey
+        do {
+            refreshedKey = try keySet.select(keyID: persisted.keyID)
+        } catch {
+            try await revokeFamilyAfterConfidentialKeyChange(family.familyID, now: now)
+            throw OAuthControlStoreError.bindingMismatch
+        }
+        guard persisted.algorithm == "ES256",
+              refreshedKey.algorithm == nil || refreshedKey.algorithm == persisted.algorithm,
+              constantTimeTextEqual(refreshedKey.thumbprint(), persisted.keyThumbprint) else {
+            try await revokeFamilyAfterConfidentialKeyChange(family.familyID, now: now)
+            throw OAuthControlStoreError.bindingMismatch
+        }
+        guard let clientAssertion, clientAssertion.expiresAt > now else {
+            throw OAuthControlStoreError.bindingMismatch
+        }
+    }
+
+    private func revokeFamilyAfterConfidentialKeyChange(_ familyID: UUID, now: Date) async throws {
+        do {
+            try await controlStore.revokeTokenFamily(familyID: familyID, now: now)
+        } catch {
+            throw secureControlError(error)
         }
     }
 
