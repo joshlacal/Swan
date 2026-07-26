@@ -1,0 +1,25 @@
+services:
+  swan:
+    build:
+      context: ..
+      dockerfile: Swan/Dockerfile
+    command: ["serve", "--host", "0.0.0.0", "--port", "3000", "--public-url", "https://swan.test", "--data-directory", "/var/lib/swan/data"]
+    volumes:
+      - swan-data:/var/lib/swan
+    networks: [swan]
+
+  mailpit:
+    image: axllent/mailpit:v1.27.1
+    ports: ["8025:8025"]
+    networks: [swan]
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    ports: ["8474:8474"]
+    networks: [swan]
+
+volumes:
+  swan-data:
+
+networks:
+  swan: {}

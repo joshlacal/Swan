@@ -1,0 +1,21 @@
+{
+  "package": {
+    "name": "SwanSpacesWire",
+    "kind": "overlay",
+    "core_namespace_roots": []
+  },
+  "lexicons": {
+    "emit": [
+      "../Swan/.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354/lexicons/com/atproto/space",
+      "../Swan/.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354/lexicons/com/atproto/simplespace"
+    ],
+    "reference": [
+      "../Swan/.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354/lexicons"
+    ],
+    "exclude_namespaces": ["tools.ozone"]
+  },
+  "swift": {
+    "output": "../Swan/Sources/SwanSpacesWire/Generated",
+    "emit_server_contracts": true
+  }
+}
