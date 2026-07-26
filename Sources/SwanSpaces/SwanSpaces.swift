@@ -208,6 +208,115 @@ public enum AuthorizationContext: Sendable, Equatable {
     case service(subject: String, audience: String)
 }
 
+/// The permissioned-repository authorization policy. Keeping this decision at
+/// the domain layer means durable adapters preflight the exact same facts as
+/// the in-memory laboratory repository; no adapter gets an `authenticated`
+/// boolean escape hatch.
+public enum SpaceAuthorizationPolicy {
+    public static func require(
+        space: SpaceURI,
+        author: String,
+        uri: SpaceRecordURI?,
+        authorization: AuthorizationContext,
+        permission: SpacePermission
+    ) throws {
+        switch authorization {
+        case let .spaceCredential(grant):
+            guard grant.space == space else {
+                throw SwanError.unauthorized("credential is for another space")
+            }
+            // A proposal space credential is a read credential. Writes require
+            // a user OAuth grant for the author of this repository.
+            guard permission == .read else {
+                throw SwanError.unauthorized("space credentials are read-only")
+            }
+            try grant.allows(.read)
+        case let .spaceSelfRead(subject, grantSpace):
+            guard permission == .read, grantSpace == space, subject == author else {
+                throw SwanError.unauthorized("self grant cannot perform this operation")
+            }
+        case let .accountOAuth(subject, scopes):
+            guard subject == author,
+                  scopeAllows(scopes, space: space, permission: permission, collection: uri?.collection)
+            else {
+                throw SwanError.unauthorized("OAuth scope does not cover this space operation")
+            }
+        case let .service(_, audience):
+            guard permission == .read, audience == space.authority else {
+                throw SwanError.unauthorized("service authentication is read-only")
+            }
+        case .public:
+            throw SwanError.unauthorized("space credential or OAuth grant required")
+        }
+    }
+
+    private static func scopeAllows(
+        _ scopes: Set<String>,
+        space: SpaceURI,
+        permission: SpacePermission,
+        collection: String?
+    ) -> Bool {
+        if scopes.contains("atproto") { return true }
+        let action = permission.rawValue
+        let base = "space:\(space.spaceType)"
+        guard scopes.contains(where: { $0 == base || $0.hasPrefix(base + "?") }) else {
+            return false
+        }
+        // A full OAuth scope parser lives in SwanOAuth. This narrow matcher is
+        // fail-closed: only an unqualified space scope or one explicitly
+        // covering this authority/skey/action/collection is accepted.
+        return scopes.contains(base) || scopes.contains { scope in
+            guard scope.hasPrefix(base + "?"),
+                  let parameters = strictQueryParameters(
+                    String(scope.dropFirst(base.count + 1))
+                  ),
+                  parameters["authority"] == space.authority,
+                  parameters["skey"] == space.skey,
+                  parameters["action"] == action
+            else {
+                return false
+            }
+            if permission == .read {
+                // A collection-qualified grant may read only that collection's
+                // individual records. Aggregate surfaces must not silently
+                // censor their response; they require an unqualified or
+                // wildcard collection grant instead.
+                guard let collection else {
+                    return parameters["collection"] == nil || parameters["collection"] == "*"
+                }
+                return parameters["collection"] == nil
+                    || parameters["collection"] == "*"
+                    || parameters["collection"] == collection
+            }
+            return collection.map {
+                parameters["collection"] == $0 || parameters["collection"] == "*"
+            } == true
+        }
+    }
+
+    /// Parses only the compact query grammar used by scoped space grants.
+    /// Every key is single-valued and percent-decoded before comparison, so a
+    /// prefix (`action=creates`) or duplicate-key (`action=create&action=...`)
+    /// trick cannot broaden an authorization decision.
+    private static func strictQueryParameters(_ query: String) -> [String: String]? {
+        guard !query.isEmpty else { return nil }
+        var parameters: [String: String] = [:]
+        for segment in query.split(separator: "&", omittingEmptySubsequences: false) {
+            let pair = segment.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard pair.count == 2,
+                  !pair[0].isEmpty,
+                  let key = String(pair[0]).removingPercentEncoding,
+                  let value = String(pair[1]).removingPercentEncoding,
+                  parameters[key] == nil
+            else {
+                return nil
+            }
+            parameters[key] = value
+        }
+        return parameters
+    }
+}
+
 /// Transitional laboratory credential envelope. It is deliberately distinct
 /// from an author signature and is only used by the in-process policy tests;
 /// production wire credentials are JWTs handled by SwanOAuth.
@@ -520,6 +629,13 @@ public struct SpaceRecord: Sendable, Equatable {
     public let value: Data
     public let cid: String
     public let revision: UInt64
+
+    public init(uri: SpaceRecordURI, value: Data, cid: String, revision: UInt64) {
+        self.uri = uri
+        self.value = value
+        self.cid = cid
+        self.revision = revision
+    }
 }
 
 public enum SpaceWrite: Sendable, Equatable {
@@ -531,6 +647,12 @@ public struct SpaceOplogEntry: Sendable, Equatable {
     public let revision: UInt64
     public let write: SpaceWrite
     public let commitment: Data
+
+    public init(revision: UInt64, write: SpaceWrite, commitment: Data) {
+        self.revision = revision
+        self.write = write
+        self.commitment = commitment
+    }
 }
 
 public enum SpaceSyncResponse: Sendable, Equatable {
@@ -544,6 +666,20 @@ public struct SpaceRepositoryState: Sendable, Equatable {
     public let revision: UInt64
     public let ltHash: Data
     public let commitment: Data
+
+    public init(
+        space: SpaceURI,
+        author: String,
+        revision: UInt64,
+        ltHash: Data,
+        commitment: Data
+    ) {
+        self.space = space
+        self.author = author
+        self.revision = revision
+        self.ltHash = ltHash
+        self.commitment = commitment
+    }
 }
 
 public enum SimpleSpacePolicy: String, Codable, Sendable {
@@ -806,42 +942,13 @@ public actor SpaceRepository {
     }
 
     private func require(uri: SpaceRecordURI?, authorization: AuthorizationContext, permission: SpacePermission) throws {
-        switch authorization {
-        case let .spaceCredential(grant):
-            guard grant.space == space else { throw SwanError.unauthorized("credential is for another space") }
-            // A proposal space credential is a read credential. Writes require
-            // a user OAuth grant for the author of this repository.
-            guard permission == .read else { throw SwanError.unauthorized("space credentials are read-only") }
-            try grant.allows(.read)
-        case let .spaceSelfRead(subject, grantSpace):
-            guard permission == .read, grantSpace == space, subject == author else {
-                throw SwanError.unauthorized("self grant cannot perform this operation")
-            }
-        case let .accountOAuth(subject, scopes):
-            guard subject == author, scopeAllows(scopes, permission: permission, collection: uri?.collection) else {
-                throw SwanError.unauthorized("OAuth scope does not cover this space operation")
-            }
-        case let .service(_, audience):
-            guard audience == space.authority else { throw SwanError.unauthorized("service audience does not own the space") }
-        case .public:
-            throw SwanError.unauthorized("space credential or OAuth grant required")
-        }
-    }
-
-    private func scopeAllows(_ scopes: Set<String>, permission: SpacePermission, collection: String?) -> Bool {
-        if scopes.contains("atproto") { return true }
-        let action = permission.rawValue
-        let base = "space:\(space.spaceType)"
-        guard scopes.contains(where: { $0 == base || $0.hasPrefix(base + "?") }) else { return false }
-        // A full OAuth scope parser lives in SwanOAuth. This narrow matcher is
-        // fail-closed: only an unqualified space scope or one explicitly
-        // covering this authority/skey/action/collection is accepted.
-        return scopes.contains(base) || scopes.contains { scope in
-            scope.hasPrefix(base + "?") &&
-                scope.contains("authority=\(space.authority)") &&
-                scope.contains("skey=\(space.skey)") &&
-                scope.contains("action=\(action)") && (permission == .read || collection.map { scope.contains("collection=\($0)") || scope.contains("collection=*") } == true)
-        }
+        try SpaceAuthorizationPolicy.require(
+            space: space,
+            author: author,
+            uri: uri,
+            authorization: authorization,
+            permission: permission
+        )
     }
 
     private func element(for record: SpaceRecord) -> String {

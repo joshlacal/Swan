@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import Petrel
 import XCTest
 @testable import SwanSpaces
 @testable import SwanStorage
@@ -179,11 +180,12 @@ final class SwanSpacesTests: XCTestCase {
                 space: space,
                 revision: 1,
                 operation: Data("put".utf8),
-                commitment: Data(repeating: 1, count: 32),
-                notificationPayload: Data("notify".utf8)
+                commitment: Data(repeating: 1, count: 32)
             )
             let initialEvents = try await database.pendingOutbox()
             XCTAssertEqual(initialEvents, [event])
+            XCTAssertEqual(event.payload, Data(event.id.uuidString.lowercased().utf8))
+            XCTAssertNotEqual(event.payload, Data("notify".utf8))
             try await database.markAttempt(event.id)
             let afterAttempt = try await database.pendingOutbox()
             XCTAssertEqual(afterAttempt.first?.attempts, 1)
@@ -196,6 +198,531 @@ final class SwanSpacesTests: XCTestCase {
             throw error
         }
     }
+
+    func testDurableRepositoryRestartsFromSQLiteWithoutFacadeState() async throws {
+        let fixture = try DurableRepositoryFixture()
+        let requestID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+        let database = try await fixture.open()
+        let repository = try DurableSpaceRepository(
+            database: database,
+            space: fixture.space,
+            author: fixture.author
+        )
+        let entry = try await repository.apply(
+            .put(uri: fixture.first, value: fixture.firstValue),
+            expectedRevision: 0,
+            requestID: requestID,
+            wireRevision: try fixture.tid(0),
+            authorization: fixture.authorized
+        )
+        XCTAssertEqual(entry.revision, 1)
+        let initialState = try await repository.currentState(authorization: fixture.authorized)
+        let firstWireRevision = try fixture.tid(0)
+        XCTAssertEqual(initialState.revision, 1)
+        XCTAssertEqual(initialState.wireRevision, firstWireRevision)
+        try await database.close()
+
+        let reopened = try await fixture.open()
+        let reloaded = try DurableSpaceRepository(
+            database: reopened,
+            space: fixture.space,
+            author: fixture.author
+        )
+        let reloadedRecord = try await reloaded.record(
+            fixture.first,
+            authorization: fixture.authorized
+        )
+        let reloadedSnapshot = try await reloaded.snapshot(authorization: fixture.authorized)
+        let reloadedState = try await reloaded.currentState(authorization: fixture.authorized)
+        XCTAssertEqual(reloadedRecord?.value, fixture.firstValue)
+        XCTAssertEqual(reloadedSnapshot.map(\.uri), [fixture.first])
+        XCTAssertEqual(reloadedState.revision, 1)
+        XCTAssertEqual(reloadedState.wireRevision, firstWireRevision)
+        try await reopened.close()
+    }
+
+    func testDurableRepositoryAuthorizesScopedOAuthAndRejectsCredentialSelfAndServiceWrites() async throws {
+        let fixture = try DurableRepositoryFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        let durable = try DurableSpaceRepository(
+            database: database,
+            space: fixture.space,
+            author: fixture.author
+        )
+        let grant = SpaceGrant(
+            subject: "did:plc:reader",
+            space: fixture.space,
+            permissions: [.manage],
+            expiresAt: .distantFuture
+        )
+        let service = AuthorizationContext.service(
+            subject: "did:web:service.example",
+            audience: fixture.space.authority
+        )
+
+        await XCTAssertThrowsErrorAsync(
+            try await durable.apply(
+                .put(uri: fixture.first, value: fixture.firstValue),
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try fixture.tid(0),
+                authorization: .public
+            )
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await durable.apply(
+                .put(uri: fixture.first, value: fixture.firstValue),
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try fixture.tid(0),
+                authorization: .spaceCredential(grant)
+            )
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await durable.apply(
+                .put(uri: fixture.first, value: fixture.firstValue),
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try fixture.tid(0),
+                authorization: .spaceSelfRead(subject: fixture.author, space: fixture.space)
+            )
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await durable.apply(
+                .put(uri: fixture.first, value: fixture.firstValue),
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try fixture.tid(0),
+                authorization: service
+            )
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await durable.apply(
+                .put(uri: fixture.first, value: fixture.firstValue),
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try fixture.tid(0),
+                authorization: .accountOAuth(subject: "did:plc:other", scopes: ["atproto"])
+            )
+        )
+
+        let spoofedScope = """
+        space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=create&action=create&collection=\(fixture.first.collection)
+        """
+        await XCTAssertThrowsErrorAsync(
+            try await durable.apply(
+                .put(uri: fixture.first, value: fixture.firstValue),
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try fixture.tid(0),
+                authorization: .accountOAuth(subject: fixture.author, scopes: [spoofedScope])
+            )
+        )
+
+        let scopedCreate = """
+        space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=create&collection=\(fixture.first.collection)
+        """
+        _ = try await durable.apply(
+            .put(uri: fixture.first, value: fixture.firstValue),
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(0),
+            authorization: .accountOAuth(subject: fixture.author, scopes: [scopedCreate])
+        )
+        let serviceRead = try await durable.record(fixture.first, authorization: service)
+        XCTAssertEqual(serviceRead?.value, fixture.firstValue)
+
+        let inMemory = try SpaceRepository(space: fixture.space, author: fixture.author)
+        await XCTAssertThrowsErrorAsync(
+            try await inMemory.apply(
+                .put(uri: fixture.second, value: fixture.secondValue),
+                authorization: service
+            )
+        )
+    }
+
+    func testQualifiedCollectionReadScopesDenyAggregatePermissionedReads() async throws {
+        let fixture = try DurableRepositoryFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        let repository = try DurableSpaceRepository(
+            database: database,
+            space: fixture.space,
+            author: fixture.author
+        )
+        let otherCollection = try SpaceRecordURI(
+            space: fixture.space,
+            author: fixture.author,
+            collection: "app.bsky.actor.profile",
+            rkey: "self"
+        )
+        _ = try await repository.apply(
+            .put(uri: fixture.first, value: fixture.firstValue),
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(0),
+            authorization: fixture.authorized
+        )
+        _ = try await repository.apply(
+            .put(uri: otherCollection, value: fixture.secondValue),
+            expectedRevision: 1,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(1),
+            authorization: fixture.authorized
+        )
+
+        let collectionLimitedScope = """
+        space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=\(fixture.first.collection)
+        """
+        let collectionLimited = AuthorizationContext.accountOAuth(
+            subject: fixture.author,
+            scopes: [collectionLimitedScope]
+        )
+        let allowedRecord = try await repository.record(
+            fixture.first,
+            authorization: collectionLimited
+        )
+        XCTAssertEqual(allowedRecord?.value, fixture.firstValue)
+        await XCTAssertThrowsErrorAsync(
+            try await repository.record(otherCollection, authorization: collectionLimited)
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await repository.snapshot(authorization: collectionLimited)
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await repository.sync(since: 0, authorization: collectionLimited)
+        )
+        let signingKey = P256.Signing.PrivateKey()
+        await XCTAssertThrowsErrorAsync(
+            try await repository.exportCAR(
+                rev: try fixture.tid(2).toString(),
+                signingKey: signingKey,
+                authorization: collectionLimited
+            )
+        )
+
+        let wildcardScope = """
+        space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=*
+        """
+        let wildcard = AuthorizationContext.accountOAuth(
+            subject: fixture.author,
+            scopes: [wildcardScope]
+        )
+        let wildcardSnapshot = try await repository.snapshot(authorization: wildcard)
+        XCTAssertEqual(wildcardSnapshot.map(\.uri), [otherCollection, fixture.first])
+
+        let unspecifiedScope = """
+        space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read
+        """
+        let unspecified = AuthorizationContext.accountOAuth(
+            subject: fixture.author,
+            scopes: [unspecifiedScope]
+        )
+        guard case let .incremental(entries) = try await repository.sync(
+            since: 0,
+            authorization: unspecified
+        ) else {
+            return XCTFail("an unspecified read collection must permit an aggregate sync")
+        }
+        XCTAssertEqual(entries.count, 2)
+        let export = try await repository.exportCAR(
+            rev: try fixture.tid(2).toString(),
+            signingKey: signingKey,
+            authorization: unspecified
+        )
+        XCTAssertFalse(export.data.isEmpty)
+    }
+
+    func testDurableRepositoryPropagatesSQLiteCASRaceAndReplay() async throws {
+        let fixture = try DurableRepositoryFixture()
+        let firstDatabase = try await fixture.open()
+        let secondDatabase = try await fixture.open()
+        defer {
+            Task {
+                try? await firstDatabase.close()
+                try? await secondDatabase.close()
+            }
+        }
+        let first = try DurableSpaceRepository(
+            database: firstDatabase,
+            space: fixture.space,
+            author: fixture.author
+        )
+        let second = try DurableSpaceRepository(
+            database: secondDatabase,
+            space: fixture.space,
+            author: fixture.author
+        )
+
+        let outcomes = await withTaskGroup(
+            of: Result<DurableSpaceOplogEntry, any Error>.self,
+            returning: [Result<DurableSpaceOplogEntry, any Error>].self
+        ) { group in
+            group.addTask {
+                do {
+                    return .success(try await first.apply(
+                        .put(uri: fixture.first, value: fixture.firstValue),
+                        expectedRevision: 0,
+                        requestID: UUID(),
+                        wireRevision: try fixture.tid(0),
+                        authorization: fixture.authorized
+                    ))
+                } catch {
+                    return .failure(error)
+                }
+            }
+            group.addTask {
+                do {
+                    return .success(try await second.apply(
+                        .put(uri: fixture.second, value: fixture.secondValue),
+                        expectedRevision: 0,
+                        requestID: UUID(),
+                        wireRevision: try fixture.tid(0),
+                        authorization: fixture.authorized
+                    ))
+                } catch {
+                    return .failure(error)
+                }
+            }
+            return await group.reduce(into: []) { $0.append($1) }
+        }
+        XCTAssertEqual(outcomes.compactMap { try? $0.get() }.count, 1)
+        let errors = outcomes.compactMap { result -> (any Error)? in
+            guard case let .failure(error) = result else { return nil }
+            return error
+        }
+        XCTAssertEqual(errors.count, 1)
+        XCTAssertEqual(errors.first as? SwanError, .conflict(expected: 0, actual: 1))
+
+        let replayID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+        let third = try fixture.record(rkey: "third")
+        _ = try await first.apply(
+            .put(uri: third, value: fixture.thirdValue),
+            expectedRevision: 1,
+            requestID: replayID,
+            wireRevision: try fixture.tid(1),
+            authorization: fixture.authorized
+        )
+        let fourth = try fixture.record(rkey: "fourth")
+        do {
+            _ = try await second.apply(
+                .put(uri: fourth, value: fixture.thirdValue),
+                expectedRevision: 2,
+                requestID: replayID,
+                wireRevision: try fixture.tid(2),
+                authorization: fixture.authorized
+            )
+            XCTFail("the SQLite replay reservation must propagate through the facade")
+        } catch {
+            XCTAssertEqual(error as? SQLiteRepositoryError, .duplicateRequest(replayID))
+        }
+    }
+
+    func testDurableRepositoryRetentionReturnsSnapshotWithoutMutatingState() async throws {
+        let fixture = try DurableRepositoryFixture()
+        let database = try await fixture.open(retention: 1)
+        defer { Task { try? await database.close() } }
+        let repository = try DurableSpaceRepository(
+            database: database,
+            space: fixture.space,
+            author: fixture.author
+        )
+        let records = [fixture.first, fixture.second, try fixture.record(rkey: "third")]
+        let values = [fixture.firstValue, fixture.secondValue, fixture.thirdValue]
+        for (index, record) in records.enumerated() {
+            _ = try await repository.apply(
+                .put(uri: record, value: values[index]),
+                expectedRevision: UInt64(index),
+                requestID: UUID(),
+                wireRevision: try fixture.tid(index),
+                authorization: fixture.authorized
+            )
+        }
+
+        guard case let .fullSnapshot(revision, recovered, commitment) = try await repository.sync(
+            since: 0,
+            authorization: fixture.authorized
+        ) else {
+            return XCTFail("expired retention must return a durable full snapshot")
+        }
+        XCTAssertEqual(revision, 3)
+        XCTAssertEqual(recovered.map(\.uri), records)
+        let stateAfterRecovery = try await repository.currentState(authorization: fixture.authorized)
+        XCTAssertEqual(stateAfterRecovery.commitment, commitment)
+        XCTAssertEqual(stateAfterRecovery.revision, 3)
+    }
+
+    func testDurableRepositorySyncRetainsOrderedCursorTIDAndDeleteFacts() async throws {
+        let fixture = try DurableRepositoryFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        let repository = try DurableSpaceRepository(
+            database: database,
+            space: fixture.space,
+            author: fixture.author
+        )
+        let created = try await repository.applyAtomically(
+            [
+                .put(uri: fixture.first, value: fixture.firstValue),
+                .put(uri: fixture.second, value: fixture.secondValue),
+            ],
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(0),
+            authorization: fixture.authorized
+        )
+        XCTAssertEqual(created.map(\.cursor), [
+            PersistedOplogCursor(revision: 1, index: 0),
+            PersistedOplogCursor(revision: 1, index: 1),
+        ])
+        XCTAssertEqual(created.map(\.action), [.create, .create])
+
+        let updatedFirstValue = Data([
+            0xa1, 0x64, 0x74, 0x65, 0x78, 0x74,
+            0x67, 0x75, 0x70, 0x64, 0x61, 0x74, 0x65, 0x64,
+        ])
+        let changed = try await repository.applyAtomically(
+            [
+                .put(uri: fixture.first, value: updatedFirstValue),
+                .delete(uri: fixture.second),
+            ],
+            expectedRevision: 1,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(1),
+            authorization: fixture.authorized
+        )
+        XCTAssertEqual(changed.map(\.cursor), [
+            PersistedOplogCursor(revision: 2, index: 0),
+            PersistedOplogCursor(revision: 2, index: 1),
+        ])
+        XCTAssertEqual(changed.map(\.action), [.update, .delete])
+        XCTAssertEqual(changed[0].previousCID, created[0].cid)
+        XCTAssertEqual(changed[1].previousCID, created[1].cid)
+        XCTAssertNil(changed[1].cid)
+
+        guard case let .incremental(entries) = try await repository.sync(
+            since: 0,
+            authorization: fixture.authorized
+        ) else {
+            return XCTFail("retained oplog must remain incremental")
+        }
+        XCTAssertEqual(entries.map(\.cursor), [
+            PersistedOplogCursor(revision: 1, index: 0),
+            PersistedOplogCursor(revision: 1, index: 1),
+            PersistedOplogCursor(revision: 2, index: 0),
+            PersistedOplogCursor(revision: 2, index: 1),
+        ])
+        XCTAssertEqual(entries.map(\.wireRevision), [
+            try fixture.tid(0), try fixture.tid(0),
+            try fixture.tid(1), try fixture.tid(1),
+        ])
+        XCTAssertEqual(entries.map(\.action), [.create, .create, .update, .delete])
+        XCTAssertEqual(entries[2].previousCID, created[0].cid)
+        XCTAssertNil(entries[3].cid)
+        XCTAssertEqual(entries[3].previousCID, created[1].cid)
+    }
+
+    func testDurableRepositoryExportsFreshReaderCARsFromTheSameSQLiteRecords() async throws {
+        let fixture = try DurableRepositoryFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        let repository = try DurableSpaceRepository(
+            database: database,
+            space: fixture.space,
+            author: fixture.author
+        )
+        _ = try await repository.apply(
+            .put(uri: fixture.first, value: fixture.firstValue),
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(0),
+            authorization: fixture.authorized
+        )
+        let beforeExportSnapshot = try await database.repositorySnapshot(
+            space: fixture.space,
+            author: fixture.author
+        )
+        let persistedBeforeExport = try XCTUnwrap(beforeExportSnapshot)
+        let signingKey = P256.Signing.PrivateKey()
+        let firstCAR = try await repository.exportCAR(
+            rev: try fixture.tid(1).toString(),
+            signingKey: signingKey,
+            authorization: fixture.authorized
+        )
+        let secondCAR = try await repository.exportCAR(
+            rev: try fixture.tid(1).toString(),
+            signingKey: signingKey,
+            authorization: fixture.authorized
+        )
+        XCTAssertNotEqual(firstCAR.commitCID, secondCAR.commitCID)
+        XCTAssertEqual(firstCAR.indexCID, secondCAR.indexCID)
+        XCTAssertEqual(
+            try SpaceCARCodec.verify(
+                firstCAR.data,
+                space: fixture.space,
+                author: fixture.author,
+                publicKey: signingKey.publicKey
+            )["app.bsky.feed.post/first"],
+            fixture.firstValue
+        )
+        XCTAssertEqual(
+            try SpaceCARCodec.verify(
+                secondCAR.data,
+                space: fixture.space,
+                author: fixture.author,
+                publicKey: signingKey.publicKey
+            )["app.bsky.feed.post/first"],
+            fixture.firstValue
+        )
+        let afterExportSnapshot = try await database.repositorySnapshot(
+            space: fixture.space,
+            author: fixture.author
+        )
+        let persistedAfterExport = try XCTUnwrap(afterExportSnapshot)
+        XCTAssertEqual(persistedAfterExport.state.commit, persistedBeforeExport.state.commit)
+        XCTAssertNil(persistedAfterExport.state.commit.range(of: fixture.firstValue))
+    }
+
+    func testDurableRepositoryOutboxAndPublicNamespaceNeverExposeRecordValue() async throws {
+        let fixture = try DurableRepositoryFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        let repository = try DurableSpaceRepository(
+            database: database,
+            space: fixture.space,
+            author: fixture.author
+        )
+        // Canonical DAG-CBOR for {"secret": "private-value"}.
+        let privateValue = Data([
+            0xa1, 0x66, 0x73, 0x65, 0x63, 0x72, 0x65, 0x74,
+            0x6d, 0x70, 0x72, 0x69, 0x76, 0x61, 0x74, 0x65,
+            0x2d, 0x76, 0x61, 0x6c, 0x75, 0x65,
+        ])
+        _ = try await repository.apply(
+            .put(uri: fixture.first, value: privateValue),
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(0),
+            authorization: fixture.authorized
+        )
+        let privateRecord = try await repository.record(
+            fixture.first,
+            authorization: fixture.authorized
+        )
+        let record = try XCTUnwrap(privateRecord)
+        let pendingEvents = try await database.pendingOutbox()
+        let event = try XCTUnwrap(pendingEvents.only)
+        XCTAssertNil(event.payload.range(of: privateValue))
+        XCTAssertNil(event.payload.range(of: Data(record.cid.utf8)))
+        let publicBlob = try await database.publicData(cid: record.cid)
+        XCTAssertNil(publicBlob)
+        let publicURI = try PublicRecordURI(
+            "at://\(fixture.author)/\(fixture.first.collection)/\(fixture.first.rkey)"
+        )
+        let publicRecord = try await database.publicRecord(publicURI)
+        XCTAssertNil(publicRecord)
+    }
 }
 
 private func XCTAssertThrowsErrorAsync<T>(_ expression: @autoclosure () async throws -> T, file: StaticString = #filePath, line: UInt = #line) async {
@@ -203,4 +730,67 @@ private func XCTAssertThrowsErrorAsync<T>(_ expression: @autoclosure () async th
         _ = try await expression()
         XCTFail("expected error", file: file, line: line)
     } catch {}
+}
+
+private struct DurableRepositoryFixture {
+    let root: URL
+    let author = "did:plc:alice"
+    let space: SpaceURI
+    let first: SpaceRecordURI
+    let second: SpaceRecordURI
+    let firstValue = Data([0xa1, 0x64, 0x74, 0x65, 0x78, 0x74, 0x65, 0x66, 0x69, 0x72, 0x73, 0x74])
+    let secondValue = Data([0xa1, 0x64, 0x74, 0x65, 0x78, 0x74, 0x66, 0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64])
+    let thirdValue = Data([0xa1, 0x64, 0x74, 0x65, 0x78, 0x74, 0x65, 0x74, 0x68, 0x69, 0x72, 0x64])
+
+    var authorized: AuthorizationContext {
+        .accountOAuth(subject: author, scopes: ["atproto"])
+    }
+
+    init() throws {
+        root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanDurableRepositoryTests-\(UUID().uuidString)")
+        space = try SpaceURI(
+            authority: author,
+            spaceType: "app.bsky.bookmarks",
+            skey: "self"
+        )
+        first = try SpaceRecordURI(
+            space: space,
+            author: author,
+            collection: "app.bsky.feed.post",
+            rkey: "first"
+        )
+        second = try SpaceRecordURI(
+            space: space,
+            author: author,
+            collection: "app.bsky.feed.post",
+            rkey: "second"
+        )
+    }
+
+    func open(retention: Int = 10_000) async throws -> SQLiteAccountDatabase {
+        try await SQLiteAccountDatabase(
+            dataDirectory: root,
+            did: author,
+            oplogRetention: retention
+        )
+    }
+
+    func record(rkey: String) throws -> SpaceRecordURI {
+        try SpaceRecordURI(
+            space: space,
+            author: author,
+            collection: "app.bsky.feed.post",
+            rkey: rkey
+        )
+    }
+
+    func tid(_ offset: Int) throws -> TID {
+        let alphabet = Array("234567abcdefghijklmnopqrstuvwxyz")
+        return try TID(tidString: "222222222222\(alphabet[offset])")
+    }
+}
+
+private extension Array {
+    var only: Element? { count == 1 ? first : nil }
 }

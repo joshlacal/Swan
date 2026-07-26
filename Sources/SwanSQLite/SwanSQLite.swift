@@ -25,7 +25,7 @@ public enum SQLiteLayout {
     /// Connection-local configuration must run outside a migration write
     /// transaction (`foreign_keys` and `journal_mode` are not safely changed
     /// inside one). Schema DDL below is serialized separately with
-    /// `BEGIN IMMEDIATE` by `SQLiteControlDatabase`.
+    /// `BEGIN IMMEDIATE` by the owning SQLite database actor.
     public static let controlConnectionPragmas = [
         "PRAGMA busy_timeout=5000",
         "PRAGMA journal_mode=WAL",
@@ -128,9 +128,12 @@ public enum SQLiteLayout {
         "CREATE INDEX IF NOT EXISTS oauth_control_family_expiry ON oauth_control_token_families(expires_at)",
     ]
 
-    public static let accountMigrations = [
+    public static let accountConnectionPragmas = [
         "PRAGMA journal_mode=WAL",
         "PRAGMA foreign_keys=ON",
+    ]
+
+    public static let accountMigrations = accountConnectionPragmas + [
         // These four tables are retained for compatibility with the initial
         // alpha sketch. Durable repository APIs below use the explicitly
         // namespaced public_repository_* and permissioned_* tables.
@@ -156,6 +159,12 @@ public enum SQLiteLayout {
             lthash BLOB NOT NULL CHECK(length(lthash) = 2048),
             current_commit BLOB NOT NULL,
             PRIMARY KEY(space_uri, author_did)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_repository_migrations (
+            version INTEGER PRIMARY KEY CHECK(version > 0),
+            applied_at INTEGER NOT NULL CHECK(applied_at >= 0)
         )
         """,
         """
@@ -354,7 +363,8 @@ public struct PersistedRepositoryState: Sendable, Equatable {
     public let revision: UInt64
     public let wireRevision: TID
     public let ltHash: Data
-    /// Opaque current commit CID/value supplied by SwanSpaces.
+    /// Deterministic repository-state marker. Reader-specific commit envelopes
+    /// and their IKM/signatures/content bindings are never stored here.
     public let commit: Data
 
     public var commitment: Data { Data(SHA256.hash(data: ltHash)) }
@@ -376,6 +386,74 @@ public struct PersistedRepositoryCommit: Sendable, Equatable {
     public let state: PersistedRepositoryState
     public let entries: [PersistedSpaceOplogEntry]
     public let outbox: PersistedOutboxEvent
+}
+
+/// The facade-level oplog view retains every protocol fact SQLite persisted.
+/// In particular, a single repository revision may contain several ordered
+/// operations, and a delete deliberately has a null new CID but a previous
+/// CID. Collapsing this into the legacy in-memory oplog loses wire semantics.
+public struct DurableSpaceOplogEntry: Sendable, Equatable {
+    public let cursor: PersistedOplogCursor
+    public let wireRevision: TID
+    public let action: PersistedRepoAction
+    public let write: SpaceWrite
+    public let cid: String?
+    public let previousCID: String?
+    public let commitment: Data
+
+    public var revision: UInt64 { cursor.revision }
+    public var index: UInt64 { cursor.index }
+
+    public init(
+        cursor: PersistedOplogCursor,
+        wireRevision: TID,
+        action: PersistedRepoAction,
+        write: SpaceWrite,
+        cid: String?,
+        previousCID: String?,
+        commitment: Data
+    ) {
+        self.cursor = cursor
+        self.wireRevision = wireRevision
+        self.action = action
+        self.write = write
+        self.cid = cid
+        self.previousCID = previousCID
+        self.commitment = commitment
+    }
+}
+
+public enum DurableSpaceSyncResponse: Sendable, Equatable {
+    case incremental([DurableSpaceOplogEntry])
+    case fullSnapshot(revision: UInt64, records: [SpaceRecord], commitment: Data)
+}
+
+/// Current durable repository facts. A never-written repository has revision
+/// zero and no wire revision; after its first commit all values are recovered
+/// from SQLite's deterministic state marker and records, not an actor cache.
+public struct DurableSpaceRepositoryState: Sendable, Equatable {
+    public let space: SpaceURI
+    public let author: String
+    public let revision: UInt64
+    public let wireRevision: TID?
+    public let ltHash: Data
+    public let commitment: Data
+
+    public init(
+        space: SpaceURI,
+        author: String,
+        revision: UInt64,
+        wireRevision: TID?,
+        ltHash: Data,
+        commitment: Data
+    ) {
+        self.space = space
+        self.author = author
+        self.revision = revision
+        self.wireRevision = wireRevision
+        self.ltHash = ltHash
+        self.commitment = commitment
+    }
 }
 
 public struct PersistedOutboxEvent: Sendable, Equatable {
@@ -425,6 +503,8 @@ struct SQLiteTestingHooks: Sendable {
 /// `BEGIN IMMEDIATE` makes the oplog/outbox write atomic even if another Swan
 /// process later opens the same file.
 public actor SQLiteAccountDatabase: BlobStore {
+    private static let permissionedRepositoryStorageMigrationVersion = 1
+
     private let connection: SQLiteConnection
     private let connectionGate = SQLiteConnectionGate()
     private let accountDID: String
@@ -479,9 +559,133 @@ public actor SQLiteAccountDatabase: BlobStore {
     }
 
     private func migrateWithoutGate() async throws {
-        for statement in SQLiteLayout.accountMigrations {
+        // Keep connection-local PRAGMAs outside the transaction, then make
+        // schema installation and data upgrades one cross-process write.
+        for statement in SQLiteLayout.accountConnectionPragmas {
             _ = try await connection.query(statement)
         }
+        try await transaction {
+            for statement in SQLiteLayout.accountMigrations.dropFirst(
+                SQLiteLayout.accountConnectionPragmas.count
+            ) {
+                _ = try await connection.query(statement)
+            }
+            try await migratePermissionedRepositoryStorageIfNeeded()
+        }
+    }
+
+    /// Upgrades rows written before the persistence API owned its state marker
+    /// and outbox-body construction. The sentinel is committed with the row
+    /// rewrites: reopening a current database must validate tampering rather
+    /// than silently repair it.
+    private func migratePermissionedRepositoryStorageIfNeeded() async throws {
+        let version = Self.permissionedRepositoryStorageMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        let stateRows = try await connection.query(
+            """
+            SELECT space_uri, author_did, revision, wire_revision, lthash,
+                   current_commit
+            FROM permissioned_repository_state
+            ORDER BY space_uri, author_did
+            """
+        )
+        for row in stateRows {
+            let spaceRaw = try requiredText(row, "space_uri")
+            let author = try requiredText(row, "author_did")
+            let space = try migrationSpace(
+                rawValue: spaceRaw,
+                author: author,
+                table: "permissioned repository state"
+            )
+            let revision = try requiredRevision(row, "revision")
+            let wireRevision = try requiredTID(row, "wire_revision")
+            let ltHash = try requiredBlob(row, "lthash")
+            guard ltHash.count == LtHash.byteCount else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "invalid LtHash byte count"
+                )
+            }
+            // Legacy callers supplied arbitrary commit bytes. They are
+            // intentionally not interpreted, but a non-BLOB row is malformed.
+            _ = try requiredBlob(row, "current_commit")
+            let marker = try repositoryStateMarker(
+                space: space,
+                author: author,
+                revision: revision,
+                wireRevision: wireRevision,
+                commitment: Data(SHA256.hash(data: ltHash))
+            )
+            _ = try await connection.query(
+                """
+                UPDATE permissioned_repository_state
+                SET current_commit = ?
+                WHERE space_uri = ? AND author_did = ?
+                """,
+                [blob(marker), .text(spaceRaw), .text(author)]
+            )
+        }
+
+        let outboxRows = try await connection.query(
+            """
+            SELECT id, space_uri, author_did, revision, payload, attempts,
+                   created_at
+            FROM permissioned_space_outbox
+            ORDER BY created_at, id
+            """
+        )
+        for row in outboxRows {
+            let idRaw = try requiredText(row, "id")
+            guard let eventID = UUID(uuidString: idRaw) else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid outbox id")
+            }
+            let spaceRaw = try requiredText(row, "space_uri")
+            let author = try requiredText(row, "author_did")
+            _ = try migrationSpace(
+                rawValue: spaceRaw,
+                author: author,
+                table: "permissioned outbox"
+            )
+            _ = try requiredRevision(row, "revision")
+            _ = try requiredBlob(row, "payload")
+            _ = try requiredNonnegativeInteger(row, "attempts")
+            _ = try requiredInteger(row, "created_at")
+            _ = try await connection.query(
+                "UPDATE permissioned_space_outbox SET payload = ? WHERE id = ?",
+                [blob(opaqueNotificationPayload(eventID: eventID)), .text(idRaw)]
+            )
+        }
+
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
+    private func migrationSpace(
+        rawValue: String,
+        author: String,
+        table: String
+    ) throws -> SpaceURI {
+        guard author == accountDID,
+              let space = try? SpaceURI(rawValue),
+              space.rawValue == rawValue
+        else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid \(table) ownership"
+            )
+        }
+        return space
     }
 
     // MARK: Public repository namespace
@@ -553,16 +757,11 @@ public actor SQLiteAccountDatabase: BlobStore {
         requestID: UUID,
         wireRevision: TID,
         writes: [SQLiteSpaceWrite],
-        commit: Data,
-        notificationPayload: Data,
         eventID: UUID = UUID()
     ) async throws -> PersistedRepositoryCommit {
         try requireAccount(author)
         guard !writes.isEmpty else {
             throw SwanError.malformed("repository batch must contain a write")
-        }
-        guard !commit.isEmpty else {
-            throw SwanError.malformed("current commit must not be empty")
         }
         for write in writes {
             guard write.uri.space == space, write.uri.author == author else {
@@ -693,6 +892,13 @@ public actor SQLiteAccountDatabase: BlobStore {
             }
 
             let storedFinalRevision = try sqliteRevision(revision)
+            let marker = try repositoryStateMarker(
+                space: space,
+                author: author,
+                revision: revision,
+                wireRevision: wireRevision,
+                commitment: ltHash.commitment
+            )
             _ = try await connection.query(
                 """
                 INSERT INTO permissioned_repository_state(
@@ -709,7 +915,7 @@ public actor SQLiteAccountDatabase: BlobStore {
                     .text(space.rawValue), .text(author),
                     .integer(storedFinalRevision),
                     .text(wireRevision.toString()), blob(ltHash.serialized),
-                    blob(commit),
+                    blob(marker),
                 ]
             )
 
@@ -728,6 +934,7 @@ public actor SQLiteAccountDatabase: BlobStore {
             )
 
             let createdAt = Int(Date().timeIntervalSince1970 * 1_000_000)
+            let notificationPayload = opaqueNotificationPayload(eventID: eventID)
             _ = try await connection.query(
                 """
                 INSERT INTO permissioned_space_outbox(
@@ -780,7 +987,7 @@ public actor SQLiteAccountDatabase: BlobStore {
                 revision: revision,
                 wireRevision: wireRevision,
                 ltHash: ltHash.serialized,
-                commit: commit
+                commit: marker
             )
             let outbox = PersistedOutboxEvent(
                 id: eventID,
@@ -842,7 +1049,12 @@ public actor SQLiteAccountDatabase: BlobStore {
     ) async throws -> PersistedSpaceRecord? {
         try requireAccount(uri.author)
         return try await withConnectionGate {
-            try await loadRecord(uri)
+            try await readTransaction {
+                guard try await loadState(space: uri.space, author: uri.author) != nil else {
+                    return nil
+                }
+                return try await loadRecord(uri)
+            }
         }
     }
 
@@ -1127,11 +1339,11 @@ public actor SQLiteAccountDatabase: BlobStore {
         revision: UInt64,
         operation: Data,
         commitment: Data,
-        notificationPayload: Data,
         eventID: UUID = UUID()
     ) async throws -> PersistedOutboxEvent {
         try requireAccount(space.authority)
         let storedRevision = try sqliteRevision(revision)
+        let notificationPayload = opaqueNotificationPayload(eventID: eventID)
         try await withConnectionGate {
             try await transaction {
                 _ = try await connection.query(
@@ -1190,12 +1402,18 @@ public actor SQLiteAccountDatabase: BlobStore {
                         "invalid outbox row"
                     )
                 }
+                let payload = try requiredBlob(row, "payload")
+                guard payload == opaqueNotificationPayload(eventID: id) else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "invalid opaque notification payload"
+                    )
+                }
                 return PersistedOutboxEvent(
                     id: id,
                     space: try SpaceURI(spaceRaw),
                     author: author,
                     revision: try requiredRevision(row, "revision"),
-                    payload: try requiredBlob(row, "payload"),
+                    payload: payload,
                     attempts: attempts
                 )
             }
@@ -1295,13 +1513,28 @@ public actor SQLiteAccountDatabase: BlobStore {
                 "invalid LtHash byte count"
             )
         }
+        let revision = try requiredRevision(row, "revision")
+        let wireRevision = try requiredTID(row, "wire_revision")
+        let marker = try requiredBlob(row, "current_commit")
+        let expectedMarker = try repositoryStateMarker(
+            space: space,
+            author: author,
+            revision: revision,
+            wireRevision: wireRevision,
+            commitment: Data(SHA256.hash(data: ltHash))
+        )
+        guard marker == expectedMarker else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid deterministic repository state marker"
+            )
+        }
         return PersistedRepositoryState(
             space: space,
             author: author,
-            revision: try requiredRevision(row, "revision"),
-            wireRevision: try requiredTID(row, "wire_revision"),
+            revision: revision,
+            wireRevision: wireRevision,
             ltHash: ltHash,
-            commit: try requiredBlob(row, "current_commit")
+            commit: marker
         )
     }
 
@@ -1448,6 +1681,29 @@ public actor SQLiteAccountDatabase: BlobStore {
         "\(record.uri.collection)/\(record.uri.rkey)/\(record.cid)"
     }
 
+    private func repositoryStateMarker(
+        space: SpaceURI,
+        author: String,
+        revision: UInt64,
+        wireRevision: TID,
+        commitment: Data
+    ) throws -> Data {
+        guard revision <= UInt64(Int.max) else {
+            throw SQLiteRepositoryError.revisionOutOfRange(revision)
+        }
+        return try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "author", value: author),
+            (key: "commitment", value: commitment),
+            (key: "revision", value: Int(revision)),
+            (key: "space", value: space.rawValue),
+            (key: "wireRevision", value: wireRevision.toString()),
+        ]))
+    }
+
+    private func opaqueNotificationPayload(eventID: UUID) -> Data {
+        Data(eventID.uuidString.lowercased().utf8)
+    }
+
     private func blobNamespaceColumns(
         _ namespace: BlobNamespace
     ) -> (kind: String, spaceURI: String) {
@@ -1468,6 +1724,31 @@ public actor SQLiteAccountDatabase: BlobStore {
             throw SQLiteRepositoryError.revisionOutOfRange(revision)
         }
         return Int(revision)
+    }
+
+    private func requiredNonnegativeInteger(
+        _ row: SQLiteRow,
+        _ column: String
+    ) throws -> Int {
+        let value = try requiredInteger(row, column)
+        guard value >= 0 else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid \(column)"
+            )
+        }
+        return value
+    }
+
+    private func requiredInteger(
+        _ row: SQLiteRow,
+        _ column: String
+    ) throws -> Int {
+        guard let value = row.column(column), case let .integer(integer) = value else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid \(column)"
+            )
+        }
+        return integer
     }
 
     private func requiredRevision(
@@ -1536,5 +1817,332 @@ public actor SQLiteAccountDatabase: BlobStore {
     private func blob(_ data: Data) -> SQLiteData {
         // SQLiteNIO's Foundation conformance binds Data as a native BLOB.
         data.sqliteData!
+    }
+}
+
+/// Permissioned-repository facade backed solely by `SQLiteAccountDatabase`.
+///
+/// The actor holds immutable routing dependencies only; records, revisions,
+/// oplog entries, and commit facts are read from SQLite for every operation.
+/// Reader-specific commit envelopes are deliberately never persisted.
+public actor DurableSpaceRepository {
+    private let database: SQLiteAccountDatabase
+    private let space: SpaceURI
+    private let author: String
+
+    public init(
+        database: SQLiteAccountDatabase,
+        space: SpaceURI,
+        author: String
+    ) throws {
+        // Reuse the domain's strict DID grammar without fabricating any
+        // repository state for this facade.
+        _ = try SpaceRecordURI(
+            space: space,
+            author: author,
+            collection: "app.swan.repository",
+            rkey: "state"
+        )
+        self.database = database
+        self.space = space
+        self.author = author
+    }
+
+    public func record(
+        _ uri: SpaceRecordURI,
+        authorization: AuthorizationContext
+    ) async throws -> SpaceRecord? {
+        try requireRepositoryURI(uri)
+        try requireRead(uri: uri, authorization: authorization)
+        return try await database.spaceRecord(uri).map(record(from:))
+    }
+
+    /// Applies one write with an exact SQLite revision CAS, a caller-selected
+    /// replay key, and a monotonically advancing wire TID.
+    public func apply(
+        _ write: SpaceWrite,
+        expectedRevision: UInt64,
+        requestID: UUID,
+        wireRevision: TID,
+        authorization: AuthorizationContext
+    ) async throws -> DurableSpaceOplogEntry {
+        let entries = try await applyAtomically(
+            [write],
+            expectedRevision: expectedRevision,
+            requestID: requestID,
+            wireRevision: wireRevision,
+            authorization: authorization
+        )
+        guard entries.count == 1, let entry = entries.first else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "single repository write produced an invalid oplog result"
+            )
+        }
+        return entry
+    }
+
+    /// Preflights every write against a mutable copy of one expected SQLite
+    /// snapshot, then hands the same expected revision to SQLite for the
+    /// authoritative CAS. The mutable copy gives an atomic create → update or
+    /// create → delete batch the same permission and LtHash semantics SQLite
+    /// will commit, while the source of that copy remains the expected durable
+    /// snapshot rather than facade-owned repository state.
+    public func applyAtomically(
+        _ writes: [SpaceWrite],
+        expectedRevision: UInt64,
+        requestID: UUID,
+        wireRevision: TID,
+        authorization: AuthorizationContext
+    ) async throws -> [DurableSpaceOplogEntry] {
+        guard !writes.isEmpty else { return [] }
+        guard expectedRevision < UInt64(Int.max) else {
+            throw SQLiteRepositoryError.revisionOutOfRange(expectedRevision)
+        }
+
+        let snapshot = try await database.repositorySnapshot(
+            space: space,
+            author: author
+        )
+        let actualRevision = snapshot?.state.revision ?? 0
+        guard actualRevision == expectedRevision else {
+            throw SwanError.conflict(expected: expectedRevision, actual: actualRevision)
+        }
+        let finalRevision = expectedRevision + 1
+
+        var expectedRecords: [SpaceRecordURI: PersistedSpaceRecord] = [:]
+        for record in snapshot?.records ?? [] {
+            expectedRecords[record.uri] = record
+        }
+        var nextLtHash = try LtHash(
+            serialized: snapshot?.state.ltHash
+                ?? Data(repeating: 0, count: LtHash.byteCount)
+        )
+        var sqliteWrites: [SQLiteSpaceWrite] = []
+
+        for write in writes {
+            let uri = uri(for: write)
+            try requireRepositoryURI(uri)
+            let expectedRecord = expectedRecords[uri]
+            switch write {
+            case let .put(uri, value):
+                let permission: SpacePermission = expectedRecord == nil ? .create : .update
+                try requireWrite(
+                    uri: uri,
+                    authorization: authorization,
+                    permission: permission
+                )
+                let cid = CID.fromDAGCBOR(value).string
+                if let expectedRecord {
+                    nextLtHash.remove(element: ltHashElement(for: expectedRecord))
+                }
+                nextLtHash.add(element: "\(uri.collection)/\(uri.rkey)/\(cid)")
+                sqliteWrites.append(.put(uri: uri, value: value, cid: cid))
+                expectedRecords[uri] = PersistedSpaceRecord(
+                    uri: uri,
+                    value: value,
+                    cid: cid,
+                    revision: finalRevision
+                )
+            case let .delete(uri):
+                try requireWrite(
+                    uri: uri,
+                    authorization: authorization,
+                    permission: .delete
+                )
+                guard let expectedRecord else {
+                    throw SwanError.malformed("cannot delete a missing record")
+                }
+                nextLtHash.remove(element: ltHashElement(for: expectedRecord))
+                sqliteWrites.append(.delete(uri: uri))
+                expectedRecords.removeValue(forKey: uri)
+            }
+        }
+
+        let eventID = UUID()
+        let persisted = try await database.apply(
+            space: space,
+            author: author,
+            expectedRevision: expectedRevision,
+            requestID: requestID,
+            wireRevision: wireRevision,
+            writes: sqliteWrites,
+            eventID: eventID
+        )
+        return persisted.entries.map(oplogEntry(from:))
+    }
+
+    /// Returns ordered incremental operations when retained, or a durable full
+    /// snapshot after an oplog gap. Recovery only reads SQLite; it does not
+    /// mutate or replace local repository state.
+    public func sync(
+        since requestedRevision: UInt64,
+        authorization: AuthorizationContext
+    ) async throws -> DurableSpaceSyncResponse {
+        try requireRead(uri: nil, authorization: authorization)
+        switch try await database.spaceOplog(
+            space: space,
+            author: author,
+            since: requestedRevision
+        ) {
+        case let .incremental(entries):
+            return .incremental(entries.map(oplogEntry(from:)))
+        case let .fullRecoveryRequired(snapshot):
+            return .fullSnapshot(
+                revision: snapshot.state.revision,
+                records: snapshot.records.map(record(from:)),
+                commitment: snapshot.state.commitment
+            )
+        }
+    }
+
+    public func currentState(
+        authorization: AuthorizationContext
+    ) async throws -> DurableSpaceRepositoryState {
+        try requireRead(uri: nil, authorization: authorization)
+        let snapshot = try await database.repositorySnapshot(
+            space: space,
+            author: author
+        )
+        if let snapshot {
+            return state(from: snapshot.state)
+        }
+        let ltHash = LtHash()
+        return DurableSpaceRepositoryState(
+            space: space,
+            author: author,
+            revision: 0,
+            wireRevision: nil,
+            ltHash: ltHash.serialized,
+            commitment: ltHash.commitment
+        )
+    }
+
+    public func snapshot(
+        authorization: AuthorizationContext
+    ) async throws -> [SpaceRecord] {
+        try requireRead(uri: nil, authorization: authorization)
+        return try await database.repositorySnapshot(
+            space: space,
+            author: author
+        )?.records.map(record(from:)) ?? []
+    }
+
+    /// Builds a new, reader-specific commit envelope and complete CAR for each
+    /// request. SQLite holds a deterministic state marker only, never IKM,
+    /// context signatures, or reader content bindings.
+    public func exportCAR(
+        rev: String,
+        signingKey: P256.Signing.PrivateKey,
+        authorization: AuthorizationContext
+    ) async throws -> SpaceCAR {
+        try requireRead(uri: nil, authorization: authorization)
+        let snapshot = try await database.repositorySnapshot(
+            space: space,
+            author: author
+        )
+        let ltHash = try LtHash(
+            serialized: snapshot?.state.ltHash
+                ?? Data(repeating: 0, count: LtHash.byteCount)
+        )
+        let commit = try SpaceCommitCodec.createReaderEnvelope(
+            space: space,
+            author: author,
+            rev: rev,
+            commitment: ltHash.commitment,
+            key: signingKey
+        )
+        return try SpaceCARCodec.encode(
+            commit: commit,
+            records: snapshot?.records.map(record(from:)) ?? []
+        )
+    }
+
+    private func requireRepositoryURI(_ uri: SpaceRecordURI) throws {
+        guard uri.space == space, uri.author == author else {
+            throw SwanError.unauthorized("record belongs to another repository")
+        }
+    }
+
+    private func requireRead(
+        uri: SpaceRecordURI?,
+        authorization: AuthorizationContext
+    ) throws {
+        try SpaceAuthorizationPolicy.require(
+            space: space,
+            author: author,
+            uri: uri,
+            authorization: authorization,
+            permission: .read
+        )
+    }
+
+    private func requireWrite(
+        uri: SpaceRecordURI,
+        authorization: AuthorizationContext,
+        permission: SpacePermission
+    ) throws {
+        if case .service = authorization {
+            throw SwanError.unauthorized(
+                "service authentication cannot write a permissioned repository"
+            )
+        }
+        try SpaceAuthorizationPolicy.require(
+            space: space,
+            author: author,
+            uri: uri,
+            authorization: authorization,
+            permission: permission
+        )
+    }
+
+    private func uri(for write: SpaceWrite) -> SpaceRecordURI {
+        switch write {
+        case let .put(uri, _), let .delete(uri): uri
+        }
+    }
+
+    private func record(from persisted: PersistedSpaceRecord) -> SpaceRecord {
+        SpaceRecord(
+            uri: persisted.uri,
+            value: persisted.value,
+            cid: persisted.cid,
+            revision: persisted.revision
+        )
+    }
+
+    private func oplogEntry(
+        from persisted: PersistedSpaceOplogEntry
+    ) -> DurableSpaceOplogEntry {
+        let write: SpaceWrite
+        switch persisted.write {
+        case let .put(uri, value, _):
+            write = .put(uri: uri, value: value)
+        case let .delete(uri):
+            write = .delete(uri: uri)
+        }
+        return DurableSpaceOplogEntry(
+            cursor: persisted.cursor,
+            wireRevision: persisted.wireRevision,
+            action: persisted.action,
+            write: write,
+            cid: persisted.cid,
+            previousCID: persisted.previousCID,
+            commitment: persisted.commitment
+        )
+    }
+
+    private func state(from persisted: PersistedRepositoryState) -> DurableSpaceRepositoryState {
+        DurableSpaceRepositoryState(
+            space: persisted.space,
+            author: persisted.author,
+            revision: persisted.revision,
+            wireRevision: persisted.wireRevision,
+            ltHash: persisted.ltHash,
+            commitment: persisted.commitment
+        )
+    }
+
+    private func ltHashElement(for record: PersistedSpaceRecord) -> String {
+        "\(record.uri.collection)/\(record.uri.rkey)/\(record.cid)"
     }
 }

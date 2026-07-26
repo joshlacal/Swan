@@ -115,7 +115,13 @@ let package = Package(
             ]
         ),
         .testTarget(name: "SwanCoreTests", dependencies: ["SwanCore", "SwanSpacesWire"]),
-        .testTarget(name: "SwanSpacesTests", dependencies: ["SwanSpaces", "SwanStorage", "SwanSQLite"]),
+        .testTarget(
+            name: "SwanSpacesTests",
+            dependencies: [
+                "SwanSpaces", "SwanStorage", "SwanSQLite",
+                .product(name: "Petrel", package: "Petrel"),
+            ]
+        ),
         .testTarget(
             name: "SwanSQLiteTests",
             dependencies: [

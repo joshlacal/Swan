@@ -19,11 +19,14 @@ final class SwanSQLiteTests: XCTestCase {
             requestID: UUID(uuidString: "10000000-0000-0000-0000-000000000001")!,
             wireRevision: try fixture.tid(0),
             writes: [.put(uri: fixture.first, value: fixture.firstValue, cid: "cid:first")],
-            commit: Data([0x00, 0xff, 0x42]),
-            notificationPayload: Data([0xff, 0x00, 0x01]),
             eventID: UUID(uuidString: "20000000-0000-0000-0000-000000000001")!
         )
         XCTAssertEqual(result.state.revision, 1)
+        XCTAssertEqual(
+            result.outbox.payload,
+            Data(result.outbox.id.uuidString.lowercased().utf8)
+        )
+        XCTAssertNil(result.outbox.payload.range(of: fixture.firstValue))
         try await database!.close()
         database = nil
 
@@ -37,7 +40,8 @@ final class SwanSQLiteTests: XCTestCase {
         let snapshot = try XCTUnwrap(loadedSnapshot)
         XCTAssertEqual(snapshot.state.revision, 1)
         XCTAssertEqual(snapshot.state.ltHash.count, LtHash.byteCount)
-        XCTAssertEqual(snapshot.state.commit, Data([0x00, 0xff, 0x42]))
+        XCTAssertEqual(snapshot.state.commit, result.state.commit)
+        XCTAssertNotEqual(snapshot.state.commit, Data([0x00, 0xff, 0x42]))
         XCTAssertEqual(snapshot.records.map(\.value), [fixture.firstValue])
         XCTAssertEqual(snapshot.records.map(\.cid), ["cid:first"])
 
@@ -53,9 +57,353 @@ final class SwanSQLiteTests: XCTestCase {
         XCTAssertEqual(entries.first?.revision, 1)
 
         let pending = try await reopened.pendingOutbox()
-        XCTAssertEqual(pending.count, 1)
-        XCTAssertEqual(pending.first?.payload, Data([0xff, 0x00, 0x01]))
+        XCTAssertEqual(pending, [result.outbox])
+    }
+
+    func testRepositoryStateMarkerRejectsTamperedReaderEnvelopeAfterReopen() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        _ = try await fixture.commitFirst(on: database)
+        try await database.close()
+
+        let readerSpecificBytes = Data(
+            "ikm=reader-secret&contextSignature=signature&contentBinding=binding".utf8
+        )
+        let databasePath = SQLiteLayout.accountDatabase(
+            in: fixture.root,
+            did: fixture.author
+        ).path
+        let rawConnection = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        _ = try await rawConnection.query(
+            """
+            UPDATE permissioned_repository_state
+            SET current_commit = ?
+            WHERE space_uri = ? AND author_did = ?
+            """,
+            [
+                readerSpecificBytes.sqliteData!,
+                .text(fixture.space.rawValue),
+                .text(fixture.author),
+            ]
+        )
+        try await rawConnection.close()
+
+        let reopened = try await fixture.open()
+        defer { Task { try? await reopened.close() } }
+        await XCTAssertThrowsErrorAsync(
+            try await reopened.repositorySnapshot(
+                space: fixture.space,
+                author: fixture.author
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SQLiteRepositoryError,
+                .corruptDatabase("invalid deterministic repository state marker")
+            )
+        }
+        await XCTAssertThrowsErrorAsync(
+            try await reopened.spaceRecord(fixture.first)
+        )
+    }
+
+    func testOutboxRejectsTamperedPayloadAfterReopen() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        let committed = try await fixture.commitFirst(on: database)
+        try await database.close()
+
+        let readerSpecificPayload = Data(
+            "private-record-bytes-and-cid-must-not-be-a-notification".utf8
+        )
+        let databasePath = SQLiteLayout.accountDatabase(
+            in: fixture.root,
+            did: fixture.author
+        ).path
+        let rawConnection = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        _ = try await rawConnection.query(
+            "UPDATE permissioned_space_outbox SET payload = ? WHERE id = ?",
+            [readerSpecificPayload.sqliteData!, .text(committed.outbox.id.uuidString)]
+        )
+        try await rawConnection.close()
+
+        let reopened = try await fixture.open()
+        defer { Task { try? await reopened.close() } }
+        await XCTAssertThrowsErrorAsync(
+            try await reopened.pendingOutbox()
+        ) { error in
+            XCTAssertEqual(
+                error as? SQLiteRepositoryError,
+                .corruptDatabase("invalid opaque notification payload")
+            )
+        }
+    }
+
+    func testPermissionedStorageMigrationUpgradesLegacyRowsBeforeRecordingSentinel() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        let committed = try await fixture.commitFirst(on: database)
+        try await database.close()
+
+        let legacyCommit = Data(
+            "ikm=legacy-reader-secret&contextSignature=legacy-signature".utf8
+        )
+        let legacyPayload = Data(
+            "legacy-private-record-bytes-and-cid".utf8
+        )
+        let databasePath = SQLiteLayout.accountDatabase(
+            in: fixture.root,
+            did: fixture.author
+        ).path
+        let rawConnection = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        _ = try await rawConnection.query(
+            "DELETE FROM permissioned_repository_migrations WHERE version = 1"
+        )
+        _ = try await rawConnection.query(
+            """
+            UPDATE permissioned_repository_state
+            SET current_commit = ?
+            WHERE space_uri = ? AND author_did = ?
+            """,
+            [
+                legacyCommit.sqliteData!, .text(fixture.space.rawValue),
+                .text(fixture.author),
+            ]
+        )
+        _ = try await rawConnection.query(
+            "UPDATE permissioned_space_outbox SET payload = ? WHERE id = ?",
+            [legacyPayload.sqliteData!, .text(committed.outbox.id.uuidString)]
+        )
+        try await rawConnection.close()
+
+        let migrated = try await fixture.open()
+        let migratedSnapshot = try await migrated.repositorySnapshot(
+            space: fixture.space,
+            author: fixture.author
+        )
+        let snapshot = try XCTUnwrap(migratedSnapshot)
+        XCTAssertNotEqual(snapshot.state.commit, legacyCommit)
+        XCTAssertEqual(snapshot.records.map(\.value), [fixture.firstValue])
+        let pending = try await migrated.pendingOutbox()
+        XCTAssertEqual(
+            pending,
+            [
+                PersistedOutboxEvent(
+                    id: committed.outbox.id,
+                    space: fixture.space,
+                    author: fixture.author,
+                    revision: 1,
+                    payload: Data(committed.outbox.id.uuidString.lowercased().utf8),
+                    attempts: 0
+                ),
+            ]
+        )
+        try await migrated.close()
+
+        let inspected = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        let sentinelRows = try await inspected.query(
+            "SELECT version FROM permissioned_repository_migrations WHERE version = 1"
+        )
+        XCTAssertEqual(sentinelRows.count, 1)
+        XCTAssertEqual(sentinelRows.first?.column("version")?.integer, 1)
+        try await inspected.close()
+    }
+
+    func testPermissionedStorageMigrationPreservesForeignAuthoritySharedSpace() async throws {
+        let fixture = try Fixture()
+        let sharedSpace = try SpaceURI(
+            authority: "did:plc:bob",
+            spaceType: "app.bsky.bookmarks",
+            skey: "shared"
+        )
+        let sharedRecord = try SpaceRecordURI(
+            space: sharedSpace,
+            author: fixture.author,
+            collection: "app.bsky.feed.post",
+            rkey: "shared-first"
+        )
+        let database = try await fixture.open()
+        let committed = try await database.apply(
+            space: sharedSpace,
+            author: fixture.author,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(0),
+            writes: [
+                .put(
+                    uri: sharedRecord,
+                    value: fixture.firstValue,
+                    cid: "cid:shared-first"
+                ),
+            ]
+        )
+        try await database.close()
+
+        let databasePath = SQLiteLayout.accountDatabase(
+            in: fixture.root,
+            did: fixture.author
+        ).path
+        let rawConnection = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        _ = try await rawConnection.query(
+            "DELETE FROM permissioned_repository_migrations WHERE version = 1"
+        )
+        _ = try await rawConnection.query(
+            """
+            UPDATE permissioned_repository_state
+            SET current_commit = ?
+            WHERE space_uri = ? AND author_did = ?
+            """,
+            [
+                Data("legacy-shared-space-commit".utf8).sqliteData!,
+                .text(sharedSpace.rawValue),
+                .text(fixture.author),
+            ]
+        )
+        _ = try await rawConnection.query(
+            "UPDATE permissioned_space_outbox SET payload = ? WHERE id = ?",
+            [
+                Data("legacy-shared-space-payload".utf8).sqliteData!,
+                .text(committed.outbox.id.uuidString),
+            ]
+        )
+        try await rawConnection.close()
+
+        let migrated = try await fixture.open()
+        let migratedSnapshot = try await migrated.repositorySnapshot(
+            space: sharedSpace,
+            author: fixture.author
+        )
+        let snapshot = try XCTUnwrap(migratedSnapshot)
+        XCTAssertEqual(snapshot.state.revision, 1)
+        XCTAssertEqual(snapshot.records.map(\.uri), [sharedRecord])
+        let pending = try await migrated.pendingOutbox()
+        XCTAssertEqual(pending.first?.space, sharedSpace)
         XCTAssertEqual(pending.first?.author, fixture.author)
+        XCTAssertEqual(
+            pending.first?.payload,
+            Data(committed.outbox.id.uuidString.lowercased().utf8)
+        )
+        let next = try await migrated.apply(
+            space: sharedSpace,
+            author: fixture.author,
+            expectedRevision: 1,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(1),
+            writes: [
+                .put(
+                    uri: sharedRecord,
+                    value: fixture.secondValue,
+                    cid: "cid:shared-second"
+                ),
+            ]
+        )
+        XCTAssertEqual(next.state.revision, 2)
+        try await migrated.close()
+    }
+
+    func testPermissionedStorageMigrationRollsBackWithoutSentinelForMalformedLegacyRows() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        let committed = try await fixture.commitFirst(on: database)
+        try await database.close()
+
+        let legacyCommit = Data("legacy-raw-commit".utf8)
+        let databasePath = SQLiteLayout.accountDatabase(
+            in: fixture.root,
+            did: fixture.author
+        ).path
+        let rawConnection = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        _ = try await rawConnection.query(
+            "DELETE FROM permissioned_repository_migrations WHERE version = 1"
+        )
+        _ = try await rawConnection.query(
+            """
+            UPDATE permissioned_repository_state
+            SET current_commit = ?
+            WHERE space_uri = ? AND author_did = ?
+            """,
+            [
+                legacyCommit.sqliteData!, .text(fixture.space.rawValue),
+                .text(fixture.author),
+            ]
+        )
+        _ = try await rawConnection.query(
+            "UPDATE permissioned_space_outbox SET id = ? WHERE id = ?",
+            [.text("not-a-uuid"), .text(committed.outbox.id.uuidString)]
+        )
+        try await rawConnection.close()
+
+        await XCTAssertThrowsErrorAsync(
+            try await fixture.open()
+        ) { error in
+            XCTAssertEqual(
+                error as? SQLiteRepositoryError,
+                .corruptDatabase("invalid outbox id")
+            )
+        }
+
+        let inspected = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        let stateRows = try await inspected.query(
+            """
+            SELECT current_commit
+            FROM permissioned_repository_state
+            WHERE space_uri = ? AND author_did = ?
+            """,
+            [.text(fixture.space.rawValue), .text(fixture.author)]
+        )
+        let stateRow = try XCTUnwrap(stateRows.first)
+        let currentCommit = try XCTUnwrap(
+            Data(sqliteData: try XCTUnwrap(stateRow.column("current_commit")))
+        )
+        XCTAssertEqual(currentCommit, legacyCommit)
+        let sentinelRows = try await inspected.query(
+            "SELECT version FROM permissioned_repository_migrations WHERE version = 1"
+        )
+        XCTAssertTrue(sentinelRows.isEmpty)
+        try await inspected.close()
+    }
+
+    func testPermissionedStorageMigrationRejectsCrossAccountLegacyStateRow() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        _ = try await fixture.commitFirst(on: database)
+        try await database.close()
+
+        let databasePath = SQLiteLayout.accountDatabase(
+            in: fixture.root,
+            did: fixture.author
+        ).path
+        let rawConnection = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        _ = try await rawConnection.query(
+            "DELETE FROM permissioned_repository_migrations WHERE version = 1"
+        )
+        _ = try await rawConnection.query(
+            """
+            UPDATE permissioned_repository_state
+            SET author_did = ?
+            WHERE space_uri = ? AND author_did = ?
+            """,
+            [
+                .text("did:plc:mallory"), .text(fixture.space.rawValue),
+                .text(fixture.author),
+            ]
+        )
+        try await rawConnection.close()
+
+        await XCTAssertThrowsErrorAsync(
+            try await fixture.open()
+        ) { error in
+            XCTAssertEqual(
+                error as? SQLiteRepositoryError,
+                .corruptDatabase("invalid permissioned repository state ownership")
+            )
+        }
+
+        let inspected = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        let sentinelRows = try await inspected.query(
+            "SELECT version FROM permissioned_repository_migrations WHERE version = 1"
+        )
+        XCTAssertTrue(sentinelRows.isEmpty)
+        try await inspected.close()
     }
 
     func testCASFailureAndInvalidBatchRollBackEveryFact() async throws {
@@ -73,8 +421,6 @@ final class SwanSQLiteTests: XCTestCase {
                 requestID: UUID(),
                 wireRevision: try fixture.tid(1),
                 writes: [.put(uri: fixture.second, value: fixture.secondValue, cid: "cid:wrong-cas")],
-                commit: Data("wrong-cas".utf8),
-                notificationPayload: Data("wrong-cas".utf8)
             )
         ) { error in
             XCTAssertEqual(error as? SwanError, .conflict(expected: 0, actual: 1))
@@ -91,8 +437,6 @@ final class SwanSQLiteTests: XCTestCase {
                     .put(uri: fixture.second, value: fixture.secondValue, cid: "cid:second"),
                     .delete(uri: fixture.missing),
                 ],
-                commit: Data("invalid-batch".utf8),
-                notificationPayload: Data("invalid-batch".utf8)
             )
         )
 
@@ -131,8 +475,6 @@ final class SwanSQLiteTests: XCTestCase {
             requestID: requestID,
             wireRevision: try fixture.tid(0),
             writes: [.put(uri: fixture.first, value: fixture.firstValue, cid: "cid:first")],
-            commit: Data("first".utf8),
-            notificationPayload: Data("first".utf8)
         )
 
         await XCTAssertThrowsErrorAsync(
@@ -143,8 +485,6 @@ final class SwanSQLiteTests: XCTestCase {
                 requestID: requestID,
                 wireRevision: try fixture.tid(1),
                 writes: [.put(uri: fixture.second, value: fixture.secondValue, cid: "cid:second")],
-                commit: Data("second".utf8),
-                notificationPayload: Data("second".utf8)
             )
         ) { error in
             XCTAssertEqual(error as? SQLiteRepositoryError, .duplicateRequest(requestID))
@@ -192,8 +532,6 @@ final class SwanSQLiteTests: XCTestCase {
                                     cid: "cid:first"
                                 )
                             ],
-                            commit: Data("first-racer".utf8),
-                            notificationPayload: Data("first-racer".utf8)
                         )
                     )
                 } catch {
@@ -216,8 +554,6 @@ final class SwanSQLiteTests: XCTestCase {
                                     cid: "cid:second"
                                 )
                             ],
-                            commit: Data("second-racer".utf8),
-                            notificationPayload: Data("second-racer".utf8)
                         )
                     )
                 } catch {
@@ -269,8 +605,6 @@ final class SwanSQLiteTests: XCTestCase {
                 writes: [
                     .put(uri: fixture.first, value: fixture.firstValue, cid: "cid:first")
                 ],
-                commit: Data("rolled-back".utf8),
-                notificationPayload: Data("rolled-back".utf8)
             )
         }
         await barrier.waitUntilPaused()
@@ -293,8 +627,6 @@ final class SwanSQLiteTests: XCTestCase {
                 writes: [
                     .put(uri: fixture.second, value: fixture.secondValue, cid: "cid:second")
                 ],
-                commit: Data("committed".utf8),
-                notificationPayload: Data("committed".utf8)
             )
         }
 
@@ -347,8 +679,6 @@ final class SwanSQLiteTests: XCTestCase {
             writes: [
                 .put(uri: fixture.second, value: fixture.secondValue, cid: "cid:second")
             ],
-            commit: Data("second".utf8),
-            notificationPayload: Data("second".utf8)
         )
         await barrier.release()
 
@@ -381,8 +711,6 @@ final class SwanSQLiteTests: XCTestCase {
             writes: [
                 .put(uri: fixture.first, value: fixture.firstValue, cid: "cid:first")
             ],
-            commit: Data("create".utf8),
-            notificationPayload: Data("create".utf8)
         )
         _ = try await database!.apply(
             space: fixture.space,
@@ -393,8 +721,6 @@ final class SwanSQLiteTests: XCTestCase {
             writes: [
                 .put(uri: fixture.first, value: fixture.secondValue, cid: "cid:updated")
             ],
-            commit: Data("update".utf8),
-            notificationPayload: Data("update".utf8)
         )
         _ = try await database!.apply(
             space: fixture.space,
@@ -403,8 +729,6 @@ final class SwanSQLiteTests: XCTestCase {
             requestID: UUID(),
             wireRevision: deleteRevision,
             writes: [.delete(uri: fixture.first)],
-            commit: Data("delete".utf8),
-            notificationPayload: Data("delete".utf8)
         )
 
         try await database!.close()
@@ -452,8 +776,6 @@ final class SwanSQLiteTests: XCTestCase {
                 requestID: UUID(),
                 wireRevision: try fixture.tid(0),
                 writes: [.put(uri: otherRecord, value: fixture.firstValue, cid: "cid:other")],
-                commit: Data("other".utf8),
-                notificationPayload: Data("other".utf8)
             )
         ) { error in
             guard case .unauthorized = error as? SwanError else {
@@ -567,8 +889,6 @@ final class SwanSQLiteTests: XCTestCase {
                 .put(uri: fixture.first, value: fixture.firstValue, cid: "cid:first"),
                 .put(uri: fixture.second, value: fixture.secondValue, cid: "cid:second"),
             ],
-            commit: Data("batch".utf8),
-            notificationPayload: Data("batch".utf8)
         )
 
         XCTAssertEqual(result.state.revision, 1)
@@ -611,8 +931,6 @@ final class SwanSQLiteTests: XCTestCase {
             requestID: UUID(),
             wireRevision: try fixture.tid(1),
             writes: [.put(uri: fixture.second, value: fixture.secondValue, cid: "cid:second")],
-            commit: Data("second".utf8),
-            notificationPayload: Data("second".utf8)
         )
         _ = try await database.apply(
             space: fixture.space,
@@ -621,8 +939,6 @@ final class SwanSQLiteTests: XCTestCase {
             requestID: UUID(),
             wireRevision: try fixture.tid(2),
             writes: [.put(uri: fixture.third, value: fixture.thirdValue, cid: "cid:third")],
-            commit: Data("third".utf8),
-            notificationPayload: Data("third".utf8)
         )
 
         guard case let .fullRecoveryRequired(snapshot) = try await database.spaceOplog(
@@ -1489,8 +1805,6 @@ private struct Fixture {
             requestID: UUID(),
             wireRevision: try tid(0),
             writes: [.put(uri: first, value: firstValue, cid: "cid:first")],
-            commit: Data("first".utf8),
-            notificationPayload: Data("first".utf8)
         )
     }
 
