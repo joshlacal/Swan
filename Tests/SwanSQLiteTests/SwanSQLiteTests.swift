@@ -31,33 +31,279 @@ final class SwanSQLiteTests: XCTestCase {
         database = nil
 
         let reopened = try await fixture.open()
-        defer { Task { try? await reopened.close() } }
+        try await withClosedAccountDatabase(reopened) { reopened in
+            let loadedSnapshot = try await reopened.repositorySnapshot(
+                space: fixture.space,
+                author: fixture.author
+            )
+            let snapshot = try XCTUnwrap(loadedSnapshot)
+            XCTAssertEqual(snapshot.state.revision, 1)
+            XCTAssertEqual(snapshot.state.ltHash.count, LtHash.byteCount)
+            XCTAssertEqual(snapshot.state.commit, result.state.commit)
+            XCTAssertNotEqual(snapshot.state.commit, Data([0x00, 0xff, 0x42]))
+            XCTAssertEqual(snapshot.records.map(\.value), [fixture.firstValue])
+            XCTAssertEqual(snapshot.records.map(\.cid), ["cid:first"])
 
-        let loadedSnapshot = try await reopened.repositorySnapshot(
-            space: fixture.space,
-            author: fixture.author
-        )
-        let snapshot = try XCTUnwrap(loadedSnapshot)
-        XCTAssertEqual(snapshot.state.revision, 1)
-        XCTAssertEqual(snapshot.state.ltHash.count, LtHash.byteCount)
-        XCTAssertEqual(snapshot.state.commit, result.state.commit)
-        XCTAssertNotEqual(snapshot.state.commit, Data([0x00, 0xff, 0x42]))
-        XCTAssertEqual(snapshot.records.map(\.value), [fixture.firstValue])
-        XCTAssertEqual(snapshot.records.map(\.cid), ["cid:first"])
+            let oplog = try await reopened.spaceOplog(
+                space: fixture.space,
+                author: fixture.author,
+                since: 0
+            )
+            guard case let .incremental(entries) = oplog else {
+                return XCTFail("revision zero should still be inside retention")
+            }
+            XCTAssertEqual(entries.count, 1)
+            XCTAssertEqual(entries.first?.revision, 1)
 
-        let oplog = try await reopened.spaceOplog(
-            space: fixture.space,
-            author: fixture.author,
-            since: 0
-        )
-        guard case let .incremental(entries) = oplog else {
-            return XCTFail("revision zero should still be inside retention")
+            let pending = try await reopened.pendingOutbox()
+            XCTAssertEqual(pending, [result.outbox])
         }
-        XCTAssertEqual(entries.count, 1)
-        XCTAssertEqual(entries.first?.revision, 1)
+    }
 
-        let pending = try await reopened.pendingOutbox()
-        XCTAssertEqual(pending, [result.outbox])
+    func testOutboxWorkerDeliversOnceWithOpaquePayloadOutsideSQLiteTransaction() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        try await withClosedAccountDatabase(database) { database in
+            let committed = try await fixture.commitFirst(on: database)
+            let transport = RecordingOutboxTransport(database: database)
+            let worker = PermissionedSpaceOutboxDeliveryWorker(
+                database: database,
+                transport: transport,
+                configuration: try outboxConfiguration()
+            )
+            let now = Date(timeIntervalSinceNow: 60)
+
+            let result = try await worker.deliverNext(now: now)
+            XCTAssertEqual(result, .delivered(eventID: committed.outbox.id))
+            let pending = try await database.pendingOutbox()
+            let followUp = try await worker.deliverNext(now: now)
+            XCTAssertEqual(pending, [])
+            XCTAssertEqual(followUp, .idle)
+
+            let delivered = await transport.notifications()
+            XCTAssertEqual(delivered.count, 1)
+            XCTAssertEqual(delivered.first?.id, committed.outbox.id)
+            XCTAssertEqual(delivered.first?.payload, Data(committed.outbox.id.uuidString.lowercased().utf8))
+            XCTAssertNil(delivered.first?.payload.range(of: fixture.firstValue))
+            XCTAssertNil(delivered.first?.payload.range(of: Data("cid:first".utf8)))
+            let transactionStates = await transport.observedWriteTransactions()
+            XCTAssertEqual(transactionStates, [false])
+        }
+    }
+
+    func testOutboxWorkerFailureIncrementsAttemptsAndUsesBoundedRetryDeadline() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        try await withClosedAccountDatabase(database) { database in
+            let committed = try await fixture.commitFirst(on: database)
+            let transport = RecordingOutboxTransport(database: database, failuresRemaining: 1)
+            let configuration = try outboxConfiguration(
+                initialFailureBackoff: 3,
+                maximumFailureBackoff: 4
+            )
+            let worker = PermissionedSpaceOutboxDeliveryWorker(
+                database: database,
+                transport: transport,
+                configuration: configuration
+            )
+            let now = Date(timeIntervalSinceNow: 60)
+
+            let firstResult = try await worker.deliverNext(now: now)
+            let pending = try await database.pendingOutbox()
+            let beforeRetry = try await worker.deliverNext(now: now.addingTimeInterval(2.9))
+            let retryResult = try await worker.deliverNext(now: now.addingTimeInterval(3))
+            let deliveredIDs = (await transport.notifications()).map(\.id)
+            let transactionStates = await transport.observedWriteTransactions()
+            XCTAssertEqual(firstResult, .failed(eventID: committed.outbox.id, attempts: 1))
+            XCTAssertEqual(pending.first?.attempts, 1)
+            XCTAssertEqual(beforeRetry, .idle)
+            XCTAssertEqual(retryResult, .delivered(eventID: committed.outbox.id))
+            XCTAssertEqual(deliveredIDs, [committed.outbox.id, committed.outbox.id])
+            XCTAssertEqual(transactionStates, [false, false])
+        }
+    }
+
+    func testOutboxWorkerFailsClosedBeforeMaximumAttemptArithmetic() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        let committed = try await fixture.commitFirst(on: database)
+        try await database.close()
+
+        let databasePath = SQLiteLayout.accountDatabase(
+            in: fixture.root,
+            did: fixture.author
+        ).path
+        let rawConnection = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        _ = try await rawConnection.query(
+            "UPDATE permissioned_space_outbox SET attempts = ? WHERE id = ?",
+            [.integer(Int.max), .text(committed.outbox.id.uuidString)]
+        )
+        try await rawConnection.close()
+
+        let reopened = try await fixture.open()
+        try await withClosedAccountDatabase(reopened) { reopened in
+            let transport = RecordingOutboxTransport(database: reopened, failuresRemaining: 1)
+            let worker = PermissionedSpaceOutboxDeliveryWorker(
+                database: reopened,
+                transport: transport,
+                configuration: try outboxConfiguration()
+            )
+
+            await XCTAssertThrowsErrorAsync(
+                try await worker.deliverNext(now: Date(timeIntervalSinceNow: 60))
+            ) { error in
+                XCTAssertEqual(
+                    error as? SQLiteRepositoryError,
+                    .corruptDatabase("outbox attempts overflow")
+                )
+            }
+            let delivered = await transport.notifications()
+            XCTAssertEqual(delivered, [])
+        }
+    }
+
+    func testExpiredLeaseIsRecoveredAfterDatabaseRestartAndStaleTokenCannotAcknowledge() async throws {
+        let fixture = try Fixture()
+        var database: SQLiteAccountDatabase? = try await fixture.open()
+        let committed = try await fixture.commitFirst(on: database!)
+        let now = Date(timeIntervalSinceNow: 60)
+        let maybeFirstLease = try await database!.leaseNextOutbox(
+            now: now,
+            leaseDuration: 2
+        )
+        let firstLease = try XCTUnwrap(maybeFirstLease)
+        try await database!.close()
+        database = nil
+
+        let reopened = try await fixture.open()
+        try await withClosedAccountDatabase(reopened) { reopened in
+            let beforeExpiry = try await reopened.leaseNextOutbox(
+                now: now.addingTimeInterval(1),
+                leaseDuration: 2
+            )
+            let maybeRecovered = try await reopened.leaseNextOutbox(
+                now: now.addingTimeInterval(3),
+                leaseDuration: 2
+            )
+            XCTAssertNil(beforeExpiry)
+            let recovered = try XCTUnwrap(maybeRecovered)
+            XCTAssertEqual(recovered.event.id, committed.outbox.id)
+            XCTAssertNotEqual(recovered.token, firstLease.token)
+            let staleCompletion = try await reopened.completeOutboxLease(
+                eventID: committed.outbox.id,
+                token: firstLease.token
+            )
+            let recoveredCompletion = try await reopened.completeOutboxLease(
+                eventID: committed.outbox.id,
+                token: recovered.token
+            )
+            let pending = try await reopened.pendingOutbox()
+            XCTAssertFalse(staleCompletion)
+            XCTAssertTrue(recoveredCompletion)
+            XCTAssertEqual(pending, [])
+        }
+    }
+
+    func testOutboxLeaseMigrationUpgradesVersionOneRowsWithoutExposingPayload() async throws {
+        let fixture = try Fixture()
+        let databaseURL = SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.author)
+        try FileManager.default.createDirectory(
+            at: databaseURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let eventID = UUID(uuidString: "20000000-0000-0000-0000-000000000099")!
+        let createdAt = Int(Date().timeIntervalSince1970 * 1_000_000)
+        let raw = try await SQLiteConnection.open(storage: .file(path: databaseURL.path))
+        _ = try await raw.query(
+            """
+            CREATE TABLE permissioned_repository_migrations (
+                version INTEGER PRIMARY KEY CHECK(version > 0),
+                applied_at INTEGER NOT NULL CHECK(applied_at >= 0)
+            )
+            """
+        )
+        _ = try await raw.query(
+            """
+            CREATE TABLE permissioned_space_outbox (
+                id TEXT PRIMARY KEY,
+                space_uri TEXT NOT NULL,
+                author_did TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                payload BLOB NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        _ = try await raw.query(
+            "INSERT INTO permissioned_repository_migrations(version, applied_at) VALUES (1, ?)",
+            [.integer(createdAt)]
+        )
+        _ = try await raw.query(
+            """
+            INSERT INTO permissioned_space_outbox(
+                id, space_uri, author_did, revision, payload, attempts, created_at
+            ) VALUES (?, ?, ?, 1, ?, 0, ?)
+            """,
+            [
+                .text(eventID.uuidString), .text(fixture.space.rawValue),
+                .text(fixture.author),
+                Data(eventID.uuidString.lowercased().utf8).sqliteData!,
+                .integer(createdAt),
+            ]
+        )
+        try await raw.close()
+
+        let migrated = try await fixture.open()
+        try await withClosedAccountDatabase(migrated) { migrated in
+            let pending = try await migrated.pendingOutbox()
+            XCTAssertEqual(pending.map(\.id), [eventID])
+            XCTAssertEqual(pending.first?.payload, Data(eventID.uuidString.lowercased().utf8))
+            XCTAssertNil(pending.first?.payload.range(of: fixture.firstValue))
+            let lease = try await migrated.leaseNextOutbox(
+                now: Date(timeIntervalSince1970: Double(createdAt) / 1_000_000 + 1),
+                leaseDuration: 5
+            )
+            XCTAssertEqual(lease?.event.id, eventID)
+        }
+    }
+
+    func testConcurrentWorkersHaveOneActiveLeaseAndAtLeastOnceIdempotencyKey() async throws {
+        let fixture = try Fixture()
+        let firstDatabase = try await fixture.open()
+        let secondDatabase = try await fixture.open()
+        try await withClosedAccountDatabases(firstDatabase, secondDatabase) {
+            firstDatabase, secondDatabase in
+            let committed = try await fixture.commitFirst(on: firstDatabase)
+            let barrier = OutboxDeliveryBarrier()
+            let firstTransport = BlockingOutboxTransport(barrier: barrier)
+            let firstWorker = PermissionedSpaceOutboxDeliveryWorker(
+                database: firstDatabase,
+                transport: firstTransport,
+                configuration: try outboxConfiguration()
+            )
+            let secondTransport = RecordingOutboxTransport(database: secondDatabase)
+            let secondWorker = PermissionedSpaceOutboxDeliveryWorker(
+                database: secondDatabase,
+                transport: secondTransport,
+                configuration: try outboxConfiguration()
+            )
+            let now = Date(timeIntervalSinceNow: 60)
+
+            let firstTask = Task { try await firstWorker.deliverNext(now: now) }
+            await barrier.waitUntilStarted()
+            let secondResult = try await secondWorker.deliverNext(now: now)
+            let secondNotifications = await secondTransport.notifications()
+            await barrier.release()
+            let firstResult = try await firstTask.value
+            let firstNotifications = (await firstTransport.notifications()).map(\.id)
+            let pending = try await firstDatabase.pendingOutbox()
+            XCTAssertEqual(secondResult, .idle)
+            XCTAssertEqual(secondNotifications, [])
+            XCTAssertEqual(firstResult, .delivered(eventID: committed.outbox.id))
+            XCTAssertEqual(firstNotifications, [committed.outbox.id])
+            XCTAssertEqual(pending, [])
+        }
     }
 
     func testRepositoryStateMarkerRejectsTamperedReaderEnvelopeAfterReopen() async throws {
@@ -127,15 +373,104 @@ final class SwanSQLiteTests: XCTestCase {
         try await rawConnection.close()
 
         let reopened = try await fixture.open()
-        defer { Task { try? await reopened.close() } }
-        await XCTAssertThrowsErrorAsync(
-            try await reopened.pendingOutbox()
-        ) { error in
+        do {
+            _ = try await reopened.pendingOutbox()
+            XCTFail("tampered outbox payload must fail closed")
+        } catch {
             XCTAssertEqual(
                 error as? SQLiteRepositoryError,
                 .corruptDatabase("invalid opaque notification payload")
             )
         }
+        try await reopened.close()
+    }
+
+    func testPendingOutboxRejectsMalformedLeasePairAfterReopen() async throws {
+        let fixture = try Fixture()
+        let databaseURL = SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.author)
+        try FileManager.default.createDirectory(
+            at: databaseURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let eventID = UUID(uuidString: "20000000-0000-0000-0000-000000000098")!
+        let timestamp = Int(Date().timeIntervalSince1970 * 1_000_000)
+        let rawConnection = try await SQLiteConnection.open(storage: .file(path: databaseURL.path))
+        do {
+            _ = try await rawConnection.query(
+                """
+                CREATE TABLE permissioned_repository_migrations (
+                    version INTEGER PRIMARY KEY CHECK(version > 0),
+                    applied_at INTEGER NOT NULL CHECK(applied_at >= 0)
+                )
+                """
+            )
+            _ = try await rawConnection.query(
+                """
+                CREATE TABLE permissioned_space_outbox (
+                    id TEXT PRIMARY KEY,
+                    space_uri TEXT NOT NULL,
+                    author_did TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    payload BLOB NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+            _ = try await rawConnection.query(
+                "INSERT INTO permissioned_repository_migrations(version, applied_at) VALUES (1, ?)",
+                [.integer(timestamp)]
+            )
+            _ = try await rawConnection.query(
+                """
+                INSERT INTO permissioned_space_outbox(
+                    id, space_uri, author_did, revision, payload, attempts, created_at
+                ) VALUES (?, ?, ?, 1, ?, 0, ?)
+                """,
+                [
+                    .text(eventID.uuidString), .text(fixture.space.rawValue),
+                    .text(fixture.author),
+                    Data(eventID.uuidString.lowercased().utf8).sqliteData!,
+                    .integer(timestamp),
+                ]
+            )
+            try await rawConnection.close()
+        } catch {
+            try? await rawConnection.close()
+            throw error
+        }
+
+        // This is the actual upgrade sequence for an old table: the additive
+        // migration adds columns but SQLite cannot retroactively add the new
+        // lease-pair CHECK constraint. A later corrupted legacy row must still
+        // be rejected by `pendingOutbox`'s decoder.
+        let upgraded = try await fixture.open()
+        try await upgraded.close()
+        let corruptingConnection = try await SQLiteConnection.open(
+            storage: .file(path: databaseURL.path)
+        )
+        do {
+            _ = try await corruptingConnection.query(
+                "UPDATE permissioned_space_outbox SET lease_token = ?, lease_expires_at = NULL WHERE id = ?",
+                [.text(UUID().uuidString), .text(eventID.uuidString)]
+            )
+            try await corruptingConnection.close()
+        } catch {
+            try? await corruptingConnection.close()
+            throw error
+        }
+
+        let reopened = try await fixture.open()
+        do {
+            _ = try await reopened.pendingOutbox()
+            XCTFail("malformed outbox lease must fail closed")
+        } catch {
+            XCTAssertEqual(
+                error as? SQLiteRepositoryError,
+                .corruptDatabase("invalid outbox lease")
+            )
+        }
+        try await reopened.close()
     }
 
     func testPermissionedStorageMigrationUpgradesLegacyRowsBeforeRecordingSentinel() async throws {
@@ -1915,7 +2250,126 @@ private func XCTAssertThrowsErrorAsync<T>(
     }
 }
 
+private func withClosedAccountDatabase<T>(
+    _ database: SQLiteAccountDatabase,
+    body: (SQLiteAccountDatabase) async throws -> T
+) async throws -> T {
+    do {
+        let value = try await body(database)
+        try await database.close()
+        return value
+    } catch {
+        try? await database.close()
+        throw error
+    }
+}
+
+private func withClosedAccountDatabases<T>(
+    _ first: SQLiteAccountDatabase,
+    _ second: SQLiteAccountDatabase,
+    body: (SQLiteAccountDatabase, SQLiteAccountDatabase) async throws -> T
+) async throws -> T {
+    do {
+        let value = try await body(first, second)
+        try await first.close()
+        try await second.close()
+        return value
+    } catch {
+        try? await first.close()
+        try? await second.close()
+        throw error
+    }
+}
+
 private struct InjectedTransactionFailure: Error {}
+private struct InjectedOutboxTransportFailure: Error {}
+
+private func outboxConfiguration(
+    leaseDuration: TimeInterval = 10,
+    idlePollInterval: TimeInterval = 1,
+    initialFailureBackoff: TimeInterval = 1,
+    maximumFailureBackoff: TimeInterval = 8
+) throws -> PermissionedSpaceOutboxDeliveryConfiguration {
+    try PermissionedSpaceOutboxDeliveryConfiguration(
+        leaseDuration: leaseDuration,
+        idlePollInterval: idlePollInterval,
+        initialFailureBackoff: initialFailureBackoff,
+        maximumFailureBackoff: maximumFailureBackoff
+    )
+}
+
+private actor RecordingOutboxTransport: PermissionedSpaceOutboxTransport {
+    private let database: SQLiteAccountDatabase?
+    private var failuresRemaining: Int
+    private var delivered: [PermissionedSpaceOutboxNotification] = []
+    private var writeTransactionStates: [Bool] = []
+
+    init(
+        database: SQLiteAccountDatabase?,
+        failuresRemaining: Int = 0
+    ) {
+        self.database = database
+        self.failuresRemaining = failuresRemaining
+    }
+
+    func deliver(_ notification: PermissionedSpaceOutboxNotification) async throws {
+        if let database {
+            writeTransactionStates.append(await database.hasActiveWriteTransactionForTesting())
+        }
+        delivered.append(notification)
+        if failuresRemaining > 0 {
+            failuresRemaining -= 1
+            throw InjectedOutboxTransportFailure()
+        }
+    }
+
+    func notifications() -> [PermissionedSpaceOutboxNotification] { delivered }
+
+    func observedWriteTransactions() -> [Bool] { writeTransactionStates }
+}
+
+private actor BlockingOutboxTransport: PermissionedSpaceOutboxTransport {
+    private let barrier: OutboxDeliveryBarrier
+    private var delivered: [PermissionedSpaceOutboxNotification] = []
+
+    init(barrier: OutboxDeliveryBarrier) {
+        self.barrier = barrier
+    }
+
+    func deliver(_ notification: PermissionedSpaceOutboxNotification) async throws {
+        delivered.append(notification)
+        await barrier.started()
+        await barrier.waitForRelease()
+    }
+
+    func notifications() -> [PermissionedSpaceOutboxNotification] { delivered }
+}
+
+private actor OutboxDeliveryBarrier {
+    private var didStart = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func started() {
+        didStart = true
+        startWaiters.forEach { $0.resume() }
+        startWaiters.removeAll()
+    }
+
+    func waitUntilStarted() async {
+        guard !didStart else { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func waitForRelease() async {
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
 
 private actor FailingApplyBarrier {
     private var hasFailed = false

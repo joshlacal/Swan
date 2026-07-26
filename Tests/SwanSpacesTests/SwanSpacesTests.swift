@@ -186,10 +186,30 @@ final class SwanSpacesTests: XCTestCase {
             XCTAssertEqual(initialEvents, [event])
             XCTAssertEqual(event.payload, Data(event.id.uuidString.lowercased().utf8))
             XCTAssertNotEqual(event.payload, Data("notify".utf8))
-            try await database.markAttempt(event.id)
+            let now = Date(timeIntervalSinceNow: 10)
+            let maybeFirstLease = try await database.leaseNextOutbox(
+                now: now,
+                leaseDuration: 30
+            )
+            let firstLease = try XCTUnwrap(maybeFirstLease)
+            let attempts = try await database.failOutboxLease(
+                eventID: event.id,
+                token: firstLease.token,
+                retryAt: now.addingTimeInterval(1)
+            )
+            XCTAssertEqual(attempts, 1)
             let afterAttempt = try await database.pendingOutbox()
             XCTAssertEqual(afterAttempt.first?.attempts, 1)
-            try await database.markDelivered(event.id)
+            let maybeSecondLease = try await database.leaseNextOutbox(
+                now: now.addingTimeInterval(2),
+                leaseDuration: 30
+            )
+            let secondLease = try XCTUnwrap(maybeSecondLease)
+            let delivered = try await database.completeOutboxLease(
+                eventID: event.id,
+                token: secondLease.token
+            )
+            XCTAssertTrue(delivered)
             let remainingEvents = try await database.pendingOutbox()
             XCTAssertEqual(remainingEvents, [])
             try await database.close()

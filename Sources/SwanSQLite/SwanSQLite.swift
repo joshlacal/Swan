@@ -222,7 +222,15 @@ public enum SQLiteLayout {
             revision INTEGER NOT NULL CHECK(revision >= 0),
             payload BLOB NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            available_at INTEGER NOT NULL CHECK(available_at >= 0),
+            lease_token TEXT,
+            lease_expires_at INTEGER,
+            CHECK(
+                (lease_token IS NULL AND lease_expires_at IS NULL)
+                OR (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL
+                    AND lease_expires_at >= 0)
+            )
         )
         """,
         """
@@ -520,6 +528,21 @@ public struct PersistedOutboxEvent: Sendable, Equatable {
     public let attempts: Int
 }
 
+/// A durable lease held by one delivery worker. The token is deliberately
+/// separate from the notification passed to a transport: transports need an
+/// idempotency key, but never authority to acknowledge a database event.
+public struct PersistedOutboxLease: Sendable, Equatable {
+    public let event: PersistedOutboxEvent
+    public let token: UUID
+    public let expiresAt: Date
+
+    public init(event: PersistedOutboxEvent, token: UUID, expiresAt: Date) {
+        self.event = event
+        self.token = token
+        self.expiresAt = expiresAt
+    }
+}
+
 private actor SQLiteConnectionGate {
     private var isHeld = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -564,12 +587,14 @@ private struct LoadedSimpleSpaceAuthority: Sendable {
 /// process later opens the same file.
 public actor SQLiteAccountDatabase: BlobStore {
     private static let permissionedRepositoryStorageMigrationVersion = 1
+    private static let permissionedOutboxLeaseMigrationVersion = 2
 
     private let connection: SQLiteConnection
     private let connectionGate = SQLiteConnectionGate()
     private let accountDID: String
     private let oplogRetention: Int
     private var testingHooks = SQLiteTestingHooks()
+    private var activeWriteTransactions = 0
 
     public init(
         dataDirectory: URL,
@@ -618,6 +643,13 @@ public actor SQLiteAccountDatabase: BlobStore {
         testingHooks = hooks
     }
 
+    /// Test-only probe used to prove an injected delivery transport is called
+    /// after the lease transaction has committed. It intentionally exposes no
+    /// SQLite connection or row data.
+    func hasActiveWriteTransactionForTesting() -> Bool {
+        activeWriteTransactions > 0
+    }
+
     private func migrateWithoutGate() async throws {
         // Keep connection-local PRAGMAs outside the transaction, then make
         // schema installation and data upgrades one cross-process write.
@@ -631,6 +663,7 @@ public actor SQLiteAccountDatabase: BlobStore {
                 _ = try await connection.query(statement)
             }
             try await migratePermissionedRepositoryStorageIfNeeded()
+            try await migratePermissionedOutboxLeasesIfNeeded()
         }
     }
 
@@ -729,6 +762,103 @@ public actor SQLiteAccountDatabase: BlobStore {
                 .integer(version),
                 .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
             ]
+        )
+    }
+
+    /// Adds durable delivery scheduling and lease columns without widening the
+    /// control database. The marker/payload migration is version 1; this
+    /// version is intentionally separate so an upgraded database is never
+    /// silently rewritten after a later integrity failure.
+    private func migratePermissionedOutboxLeasesIfNeeded() async throws {
+        let version = Self.permissionedOutboxLeaseMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        try await addAccountColumnIfMissing(
+            table: "permissioned_space_outbox",
+            column: "available_at",
+            definition: "INTEGER NOT NULL DEFAULT 0"
+        )
+        try await addAccountColumnIfMissing(
+            table: "permissioned_space_outbox",
+            column: "lease_token",
+            definition: "TEXT"
+        )
+        try await addAccountColumnIfMissing(
+            table: "permissioned_space_outbox",
+            column: "lease_expires_at",
+            definition: "INTEGER"
+        )
+        _ = try await connection.query(
+            """
+            CREATE INDEX IF NOT EXISTS permissioned_space_outbox_available
+            ON permissioned_space_outbox(available_at, created_at, id)
+            """
+        )
+
+        let rows = try await connection.query(
+            """
+            SELECT id, payload, attempts, created_at, available_at,
+                   lease_token, lease_expires_at
+            FROM permissioned_space_outbox
+            ORDER BY created_at, id
+            """
+        )
+        for row in rows {
+            let idRaw = try requiredText(row, "id")
+            guard let eventID = UUID(uuidString: idRaw) else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid outbox id")
+            }
+            let payload = try requiredBlob(row, "payload")
+            guard payload == opaqueNotificationPayload(eventID: eventID) else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "invalid opaque notification payload"
+                )
+            }
+            _ = try requiredNonnegativeInteger(row, "attempts")
+            let createdAt = try requiredNonnegativeInteger(row, "created_at")
+            let availableAt = try requiredNonnegativeInteger(row, "available_at")
+            let lease = try decodeOutboxLease(row)
+            if lease.token == nil {
+                // Rows written before this migration initially receive a zero
+                // default. Make that explicit as immediately eligible at their
+                // original enqueue time, without changing an intentional
+                // positive retry deadline.
+                if availableAt == 0 && createdAt > 0 {
+                    _ = try await connection.query(
+                        "UPDATE permissioned_space_outbox SET available_at = ? WHERE id = ?",
+                        [.integer(createdAt), .text(idRaw)]
+                    )
+                }
+            }
+        }
+
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
+    private func addAccountColumnIfMissing(
+        table: String,
+        column: String,
+        definition: String
+    ) async throws {
+        let rows = try await connection.query("PRAGMA table_info(\(table))")
+        if rows.contains(where: { $0.column("name")?.string == column }) {
+            return
+        }
+        _ = try await connection.query(
+            "ALTER TABLE \(table) ADD COLUMN \(column) \(definition)"
         )
     }
 
@@ -999,13 +1129,15 @@ public actor SQLiteAccountDatabase: BlobStore {
                 """
                 INSERT INTO permissioned_space_outbox(
                     id, space_uri, author_did, revision,
-                    payload, attempts, created_at
-                ) VALUES (?, ?, ?, ?, ?, 0, ?)
+                    payload, attempts, created_at, available_at,
+                    lease_token, lease_expires_at
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL)
                 """,
                 [
                     .text(eventID.uuidString), .text(space.rawValue),
                     .text(author), .integer(storedFinalRevision),
                     blob(notificationPayload), .integer(createdAt),
+                    .integer(createdAt),
                 ]
             )
 
@@ -1775,6 +1907,7 @@ public actor SQLiteAccountDatabase: BlobStore {
         try requireAccount(space.authority)
         let storedRevision = try sqliteRevision(revision)
         let notificationPayload = opaqueNotificationPayload(eventID: eventID)
+        let createdAt = try outboxTimestamp(Date())
         try await withConnectionGate {
             try await transaction {
                 _ = try await connection.query(
@@ -1786,17 +1919,18 @@ public actor SQLiteAccountDatabase: BlobStore {
                 )
                 _ = try await connection.query(
                     """
-                    INSERT INTO permissioned_space_outbox(
-                        id, space_uri, author_did, revision,
-                        payload, attempts, created_at
-                    ) VALUES (?, ?, ?, ?, ?, 0, ?)
-                    """,
-                    [
-                        .text(eventID.uuidString), .text(space.rawValue),
+                INSERT INTO permissioned_space_outbox(
+                    id, space_uri, author_did, revision,
+                    payload, attempts, created_at, available_at,
+                    lease_token, lease_expires_at
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL)
+                """,
+                [
+                    .text(eventID.uuidString), .text(space.rawValue),
                         .text(space.authority), .integer(storedRevision),
                         blob(notificationPayload),
-                        .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
-                    ]
+                        .integer(createdAt), .integer(createdAt),
+                ]
                 )
             }
         }
@@ -1810,6 +1944,140 @@ public actor SQLiteAccountDatabase: BlobStore {
         )
     }
 
+    /// Atomically claims the oldest notification that is eligible for delivery.
+    /// An expired lease is eligible again after a process crash. This method
+    /// contains only SQLite work: callers must invoke a transport only after it
+    /// returns and complete or fail the lease with the exact token below.
+    public func leaseNextOutbox(
+        now: Date = Date(),
+        leaseDuration: TimeInterval
+    ) async throws -> PersistedOutboxLease? {
+        let nowTimestamp = try outboxTimestamp(now)
+        let leaseExpiry = try outboxTimestamp(
+            now.addingTimeInterval(try validOutboxInterval(leaseDuration, name: "lease duration"))
+        )
+        return try await withConnectionGate {
+            try await transaction {
+                let token = UUID()
+                let rows = try await connection.query(
+                    """
+                    SELECT id, space_uri, author_did, revision, payload, attempts,
+                           lease_token, lease_expires_at
+                    FROM permissioned_space_outbox
+                    WHERE available_at <= ?
+                      AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                    ORDER BY available_at, created_at, id
+                    LIMIT 1
+                    """,
+                    [.integer(nowTimestamp), .integer(nowTimestamp)]
+                )
+                guard let row = rows.first else { return nil }
+                let event = try decodeOutboxEvent(row)
+                _ = try decodeOutboxLease(row)
+                _ = try await connection.query(
+                    """
+                    UPDATE permissioned_space_outbox
+                    SET lease_token = ?, lease_expires_at = ?
+                    WHERE id = ?
+                    """,
+                    [
+                        .text(token.uuidString), .integer(leaseExpiry),
+                        .text(event.id.uuidString),
+                    ]
+                )
+                return PersistedOutboxLease(
+                    event: event,
+                    token: token,
+                    expiresAt: Date(timeIntervalSince1970: Double(leaseExpiry) / 1_000_000)
+                )
+            }
+        }
+    }
+
+    /// Deletes an event only if the caller still owns its durable lease. A
+    /// stale worker can therefore never acknowledge an event reclaimed by a
+    /// later worker after its lease expired.
+    @discardableResult
+    public func completeOutboxLease(
+        eventID: UUID,
+        token: UUID
+    ) async throws -> Bool {
+        try await withConnectionGate {
+            try await transaction {
+                let rows = try await connection.query(
+                    """
+                    SELECT id, space_uri, author_did, revision, payload, attempts,
+                           lease_token, lease_expires_at
+                    FROM permissioned_space_outbox
+                    WHERE id = ?
+                    """,
+                    [.text(eventID.uuidString)]
+                )
+                guard let row = rows.first else { return false }
+                _ = try decodeOutboxEvent(row)
+                let lease = try decodeOutboxLease(row)
+                guard lease.token == token
+                else {
+                    return false
+                }
+                _ = try await connection.query(
+                    "DELETE FROM permissioned_space_outbox WHERE id = ? AND lease_token = ?",
+                    [.text(eventID.uuidString), .text(token.uuidString)]
+                )
+                return true
+            }
+        }
+    }
+
+    /// Records a failed delivery only while the same lease is current, then
+    /// clears that lease and makes the opaque event eligible at `retryAt`.
+    /// Returning `nil` means another worker reclaimed or completed the event.
+    @discardableResult
+    public func failOutboxLease(
+        eventID: UUID,
+        token: UUID,
+        retryAt: Date
+    ) async throws -> Int? {
+        let retryTimestamp = try outboxTimestamp(retryAt)
+        return try await withConnectionGate {
+            try await transaction {
+                let rows = try await connection.query(
+                    """
+                    SELECT id, space_uri, author_did, revision, payload, attempts,
+                           lease_token, lease_expires_at
+                    FROM permissioned_space_outbox
+                    WHERE id = ?
+                    """,
+                    [.text(eventID.uuidString)]
+                )
+                guard let row = rows.first else { return nil }
+                let event = try decodeOutboxEvent(row)
+                let lease = try decodeOutboxLease(row)
+                guard lease.token == token
+                else {
+                    return nil
+                }
+                guard event.attempts < Int.max else {
+                    throw SQLiteRepositoryError.corruptDatabase("outbox attempts overflow")
+                }
+                let nextAttempts = event.attempts + 1
+                _ = try await connection.query(
+                    """
+                    UPDATE permissioned_space_outbox
+                    SET attempts = ?, available_at = ?,
+                        lease_token = NULL, lease_expires_at = NULL
+                    WHERE id = ? AND lease_token = ?
+                    """,
+                    [
+                        .integer(nextAttempts), .integer(retryTimestamp),
+                        .text(eventID.uuidString), .text(token.uuidString),
+                    ]
+                )
+                return nextAttempts
+            }
+        }
+    }
+
     public func pendingOutbox(limit: Int = 100) async throws -> [PersistedOutboxEvent] {
         guard limit >= 0 else {
             throw SwanError.malformed("outbox limit must not be negative")
@@ -1817,7 +2085,8 @@ public actor SQLiteAccountDatabase: BlobStore {
         return try await withConnectionGate {
             let rows = try await connection.query(
                 """
-                SELECT id, space_uri, author_did, revision, payload, attempts
+                SELECT id, space_uri, author_did, revision, payload, attempts,
+                       lease_token, lease_expires_at
                 FROM permissioned_space_outbox
                 ORDER BY created_at, id
                 LIMIT ?
@@ -1825,51 +2094,9 @@ public actor SQLiteAccountDatabase: BlobStore {
                 [.integer(limit)]
             )
             return try rows.map { row in
-                guard let id = row.column("id")?.string.flatMap(UUID.init(uuidString:)),
-                      let spaceRaw = row.column("space_uri")?.string,
-                      let author = row.column("author_did")?.string,
-                      let attempts = row.column("attempts")?.integer else {
-                    throw SQLiteRepositoryError.corruptDatabase(
-                        "invalid outbox row"
-                    )
-                }
-                let payload = try requiredBlob(row, "payload")
-                guard payload == opaqueNotificationPayload(eventID: id) else {
-                    throw SQLiteRepositoryError.corruptDatabase(
-                        "invalid opaque notification payload"
-                    )
-                }
-                return PersistedOutboxEvent(
-                    id: id,
-                    space: try SpaceURI(spaceRaw),
-                    author: author,
-                    revision: try requiredRevision(row, "revision"),
-                    payload: payload,
-                    attempts: attempts
-                )
+                _ = try decodeOutboxLease(row)
+                return try decodeOutboxEvent(row)
             }
-        }
-    }
-
-    public func markDelivered(_ id: UUID) async throws {
-        try await withConnectionGate {
-            _ = try await connection.query(
-                "DELETE FROM permissioned_space_outbox WHERE id = ?",
-                [.text(id.uuidString)]
-            )
-        }
-    }
-
-    public func markAttempt(_ id: UUID) async throws {
-        try await withConnectionGate {
-            _ = try await connection.query(
-                """
-                UPDATE permissioned_space_outbox
-                SET attempts = attempts + 1
-                WHERE id = ? AND attempts < ?
-                """,
-                [.text(id.uuidString), .integer(Int.max)]
-            )
         }
     }
 
@@ -1893,12 +2120,15 @@ public actor SQLiteAccountDatabase: BlobStore {
         _ body: () async throws -> T
     ) async throws -> T {
         _ = try await connection.query("BEGIN IMMEDIATE")
+        activeWriteTransactions += 1
         do {
             let result = try await body()
             _ = try await connection.query("COMMIT")
+            activeWriteTransactions -= 1
             return result
         } catch {
             _ = try? await connection.query("ROLLBACK")
+            activeWriteTransactions -= 1
             throw error
         }
     }
@@ -2514,6 +2744,79 @@ public actor SQLiteAccountDatabase: BlobStore {
             (key: "space", value: space.rawValue),
             (key: "wireRevision", value: wireRevision.toString()),
         ]))
+    }
+
+    private func decodeOutboxEvent(
+        _ row: SQLiteRow
+    ) throws -> PersistedOutboxEvent {
+        guard let id = row.column("id")?.string.flatMap(UUID.init(uuidString:)),
+              let spaceRaw = row.column("space_uri")?.string,
+              let author = row.column("author_did")?.string
+        else {
+            throw SQLiteRepositoryError.corruptDatabase("invalid outbox row")
+        }
+        guard author == accountDID,
+              let space = try? SpaceURI(spaceRaw),
+              space.rawValue == spaceRaw
+        else {
+            throw SQLiteRepositoryError.corruptDatabase("invalid outbox ownership")
+        }
+        let payload = try requiredBlob(row, "payload")
+        guard payload == opaqueNotificationPayload(eventID: id) else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid opaque notification payload"
+            )
+        }
+        return PersistedOutboxEvent(
+            id: id,
+            space: space,
+            author: author,
+            revision: try requiredRevision(row, "revision"),
+            payload: payload,
+            attempts: try requiredNonnegativeInteger(row, "attempts")
+        )
+    }
+
+    private func decodeOutboxLease(
+        _ row: SQLiteRow
+    ) throws -> (token: UUID?, expiresAt: Int?) {
+        let token = row.column("lease_token")
+        let expiry = row.column("lease_expires_at")
+        switch (token, expiry) {
+        case (.some(.null), .some(.null)):
+            return (nil, nil)
+        case let (.some(.text(rawToken)), .some(.integer(rawExpiry))):
+            guard let token = UUID(uuidString: rawToken), rawExpiry >= 0 else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid outbox lease")
+            }
+            return (token, rawExpiry)
+        default:
+            throw SQLiteRepositoryError.corruptDatabase("invalid outbox lease")
+        }
+    }
+
+    private func validOutboxInterval(
+        _ interval: TimeInterval,
+        name: String
+    ) throws -> TimeInterval {
+        // Lease and retry scheduling are intentionally bounded. Long-lived
+        // leases would turn a stopped worker into an avoidable availability
+        // failure, while unbounded doubles could overflow SQLite timestamps.
+        guard interval.isFinite, interval > 0, interval <= 86_400 else {
+            throw SwanError.malformed("\(name) must be between zero and one day")
+        }
+        return interval
+    }
+
+    private func outboxTimestamp(_ date: Date) throws -> Int {
+        let microseconds = date.timeIntervalSince1970 * 1_000_000
+        guard microseconds.isFinite,
+              microseconds >= 0,
+              microseconds <= Double(Int.max)
+        else {
+            throw SwanError.malformed("outbox timestamp is out of range")
+        }
+        return Int(microseconds.rounded(.down))
     }
 
     private func opaqueNotificationPayload(eventID: UUID) -> Data {
