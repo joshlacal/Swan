@@ -16,12 +16,12 @@ public struct OpEntry: ATProtocolCodable, ATProtocolValue {
             public let rev: String
             public let collection: NSID
             public let rkey: RecordKey
-            public let cid: CID
-            public let prev: CID
+            public let cid: CID?
+            public let prev: CID?
             public let value: ATProtocolValueContainer?
 
         public init(
-            rev: String, collection: NSID, rkey: RecordKey, cid: CID, prev: CID, value: ATProtocolValueContainer?
+            rev: String, collection: NSID, rkey: RecordKey, cid: CID?, prev: CID?, value: ATProtocolValueContainer?
         ) {
             self.rev = rev
             self.collection = collection
@@ -52,13 +52,31 @@ public struct OpEntry: ATProtocolCodable, ATProtocolValue {
                 throw error
             }
             do {
-                self.cid = try container.decode(CID.self, forKey: .cid)
+                guard container.contains(.cid) else {
+                    throw DecodingError.keyNotFound(
+                        CodingKeys.cid,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Missing required property 'cid'"
+                        )
+                    )
+                }
+                self.cid = try container.decodeIfPresent(CID.self, forKey: .cid)
             } catch {
                 LogManager.logError("Decoding error for required property 'cid': \(error)")
                 throw error
             }
             do {
-                self.prev = try container.decode(CID.self, forKey: .prev)
+                guard container.contains(.prev) else {
+                    throw DecodingError.keyNotFound(
+                        CodingKeys.prev,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Missing required property 'prev'"
+                        )
+                    )
+                }
+                self.prev = try container.decodeIfPresent(CID.self, forKey: .prev)
             } catch {
                 LogManager.logError("Decoding error for required property 'prev': \(error)")
                 throw error
@@ -88,8 +106,16 @@ public struct OpEntry: ATProtocolCodable, ATProtocolValue {
             hasher.combine(rev)
             hasher.combine(collection)
             hasher.combine(rkey)
-            hasher.combine(cid)
-            hasher.combine(prev)
+            if let value = cid {
+                hasher.combine(value)
+            } else {
+                hasher.combine(nil as Int?)
+            }
+            if let value = prev {
+                hasher.combine(value)
+            } else {
+                hasher.combine(nil as Int?)
+            }
             if let value = value {
                 hasher.combine(value)
             } else {
@@ -133,10 +159,18 @@ public struct OpEntry: ATProtocolCodable, ATProtocolValue {
             map = map.adding(key: "collection", value: collectionValue)
             let rkeyValue = try rkey.toCBORValue()
             map = map.adding(key: "rkey", value: rkeyValue)
-            let cidValue = try cid.toCBORValue()
-            map = map.adding(key: "cid", value: cidValue)
-            let prevValue = try prev.toCBORValue()
-            map = map.adding(key: "prev", value: prevValue)
+            if let value = cid {
+                let cidValue = try value.toCBORValue()
+                map = map.adding(key: "cid", value: cidValue)
+            } else {
+                map = map.adding(key: "cid", value: NSNull())
+            }
+            if let value = prev {
+                let prevValue = try value.toCBORValue()
+                map = map.adding(key: "prev", value: prevValue)
+            } else {
+                map = map.adding(key: "prev", value: NSNull())
+            }
             if let value = value {
                 let valueValue = try value.toCBORValue()
                 map = map.adding(key: "value", value: valueValue)
