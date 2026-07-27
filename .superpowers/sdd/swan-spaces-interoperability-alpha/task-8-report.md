@@ -4,6 +4,8 @@
 
 - `185633ce59e916fd55595793beaf358b5f2d1eb5` —
   `feat(sync): add authenticated repository sync reads`
+- `f53f95e96242805fc54e536abdc82c516a781d77` —
+  `fix(sync): preserve shared-TID oplog batches`
 
 ## Delivered
 
@@ -38,6 +40,15 @@
 - Validated all emitted revisions, collections, rkeys, CIDs, action/CID
   shapes, current record CID bindings, and DAG-CBOR values. Corrupt durable
   projections fail as generic unavailable responses without record bytes.
+- Review repair: `since` is a revision-only cursor, so a direct SQL row limit
+  could split an atomic multi-operation TID and make its remaining operations
+  permanently unreachable after the client advanced `since`. The SQLite
+  projection now uses `limit` to select its terminal revision, then extends
+  that page through the entire revision batch. A page can therefore exceed
+  `limit` only by the terminal batch; this is the documented, conservative
+  compatibility behavior that preserves convergence. Such an overfull page
+  omits the commit and the following empty page at that TID returns the fresh
+  head commit, matching the existing caught-up handshake.
 
 ## Files changed
 
@@ -61,6 +72,11 @@ All commands ran from `/Users/joshlacalamito/Developer/Catbird+Petrel/Swan`.
 | `Scripts/verify-profile.sh` | PASS — every pinned permissioned lexicon, including both sync endpoint lexicons, verified. |
 | `CPATH=/opt/homebrew/include LIBRARY_PATH=/opt/homebrew/lib swift run swan verify --profile Profiles/permissioned-data-0016-2026-07-03.json --source-root .` | PASS — `PROFILE OK` for the checked-in offline artifacts. |
 | `git diff --check` | PASS before commit. |
+
+The shared-TID repair additionally exercised a `limit=4` page whose terminal
+revision contains two atomic writes: it returns all five eligible operations,
+including both terminal siblings; a subsequent request with that TID returns
+zero operations plus a verifiable fresh commit.
 
 The expected local Petrel `libsecret-1` pkg-config warning and macOS
 libsodium deployment-target linker warning remained non-fatal.
