@@ -356,6 +356,101 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
+    /// Reads only the durable state facts required to create a fresh signed
+    /// commit.  The selected database was opened at startup; neither this
+    /// projection nor its signer has a request-time SQLite construction path.
+    public func repositoryCommitState(
+        space: SpaceURI,
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositoryCommitState {
+        let database = try await preopenedRepositoryDatabase(
+            for: author,
+            authorization: authorization
+        )
+        guard let database else {
+            throw SwanError.unauthorized("account repository is unavailable")
+        }
+        do {
+            let repository = try DurableSpaceRepository(
+                database: database,
+                space: space,
+                author: author
+            )
+            let state = try await repository.currentCommitState(
+                authorization: authorization
+            )
+            guard state.space == space, state.author == author,
+                  try await isActiveAccount(author) else {
+                throw SwanError.unauthorized("account repository is unavailable")
+            }
+            guard !isClosed else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return state
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    /// Reads one strictly bounded, ordered permissioned oplog page through a
+    /// startup-preopened account database.  A recovery gap remains a distinct
+    /// domain result; no snapshot or historic record value becomes available
+    /// through this incremental-read adapter.
+    public func repositoryOplog(
+        space: SpaceURI,
+        author: String,
+        since: String?,
+        limit: Int,
+        includeValues: Bool,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositoryOplogRead {
+        let database = try await preopenedRepositoryDatabase(
+            for: author,
+            authorization: authorization
+        )
+        guard let database else {
+            throw SwanError.unauthorized("account repository is unavailable")
+        }
+        do {
+            let cursor = try since.map { try TID(tidString: $0) }
+            let repository = try DurableSpaceRepository(
+                database: database,
+                space: space,
+                author: author
+            )
+            let result = try await repository.incrementalOplog(
+                since: cursor,
+                limit: limit,
+                includeValues: includeValues,
+                authorization: authorization
+            )
+            if case let .incremental(state, entries) = result {
+                guard state.space == space, state.author == author,
+                      entries.allSatisfy({
+                          $0.collection.utf8.count > 0 && $0.rkey.utf8.count > 0
+                      }),
+                      try await isActiveAccount(author) else {
+                    throw SwanError.unauthorized("account repository is unavailable")
+                }
+            } else {
+                guard try await isActiveAccount(author) else {
+                    throw SwanError.unauthorized("account repository is unavailable")
+                }
+            }
+            guard !isClosed else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return result
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
     /// Writes only through a database that was opened and migrated before the
     /// listener accepted traffic. The actor rechecks lifecycle, terminal
     /// shutdown, and the resolved database path around the durable operation;

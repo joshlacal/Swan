@@ -44,6 +44,70 @@ public struct AuthorizedSpaceRepositoryWriteResult: Sendable, Equatable {
     }
 }
 
+/// The current durable facts needed to create a reader-specific permissioned
+/// commit.  The value deliberately contains the LtHash *commitment*, never
+/// the serialized LtHash state, an account key reference, or a database
+/// handle.  A `nil` wire revision means the repository has not committed a
+/// permissioned write, matching the reference PDS's absent signed commit.
+public struct AuthorizedSpaceRepositoryCommitState: Sendable, Equatable {
+    public let space: SpaceURI
+    public let author: String
+    public let wireRevision: String?
+    public let commitment: Data
+
+    public init(
+        space: SpaceURI,
+        author: String,
+        wireRevision: String?,
+        commitment: Data
+    ) {
+        self.space = space
+        self.author = author
+        self.wireRevision = wireRevision
+        self.commitment = commitment
+    }
+}
+
+/// One privacy-safe permissioned oplog row for the incremental-sync XRPC
+/// surface.  `value` is present only when the current live record still has
+/// this row's CID; historic values and SQLite implementation details never
+/// cross this boundary.
+public struct AuthorizedSpaceRepositoryOplogEntry: Sendable, Equatable {
+    public let wireRevision: String
+    public let collection: String
+    public let rkey: String
+    public let cid: String?
+    public let previousCID: String?
+    public let value: Data?
+
+    public init(
+        wireRevision: String,
+        collection: String,
+        rkey: String,
+        cid: String?,
+        previousCID: String?,
+        value: Data?
+    ) {
+        self.wireRevision = wireRevision
+        self.collection = collection
+        self.rkey = rkey
+        self.cid = cid
+        self.previousCID = previousCID
+        self.value = value
+    }
+}
+
+/// The only two incremental-read outcomes visible to the HTTP adapter.  A
+/// retention gap carries no historic records or recovery CAR; callers must
+/// use the separate, later `getRepo` full-recovery endpoint.
+public enum AuthorizedSpaceRepositoryOplogRead: Sendable, Equatable {
+    case incremental(
+        state: AuthorizedSpaceRepositoryCommitState,
+        entries: [AuthorizedSpaceRepositoryOplogEntry]
+    )
+    case fullRecoveryRequired
+}
+
 /// The deliberately narrow result available to an authenticated authority
 /// lookup. It is a projection made only after the durable simple-space state
 /// has been fully decoded and validated; owner, members, revision, deletion
@@ -195,6 +259,29 @@ public protocol AuthorizedSpaceRepositoryDirectory: Sendable {
         reverse: Bool,
         authorization: AuthorizationContext
     ) async throws -> [SpaceRecord]
+
+    /// Returns the current durable commitment facts for one preopened
+    /// permissioned repository.  The supplied authorization is evaluated at
+    /// the domain boundary; this is not an account-key lookup.
+    func repositoryCommitState(
+        space: SpaceURI,
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositoryCommitState
+
+    /// Returns an ordered, bounded page after the supplied wire TID cursor.
+    /// A retention gap is intentionally distinct from an empty incremental
+    /// page so HTTP cannot fabricate a convergent response from incomplete
+    /// history.  `includeValues` requests only values that still match live
+    /// records; it never permits historic value retrieval.
+    func repositoryOplog(
+        space: SpaceURI,
+        author: String,
+        since: String?,
+        limit: Int,
+        includeValues: Bool,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositoryOplogRead
 
     /// Applies an ordered, all-or-nothing mutation batch through an account
     /// database that was opened during startup. Implementations must retain

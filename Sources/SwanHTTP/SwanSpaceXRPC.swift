@@ -1186,7 +1186,7 @@ private func parseAuthenticatedListRecordsParameters(
     )
 }
 
-private func strictAuthenticatedRecordQuery(
+func strictAuthenticatedRecordQuery(
     _ request: Request,
     required: Set<String>,
     optional: Set<String>
@@ -1216,7 +1216,7 @@ private func strictAuthenticatedRecordQuery(
     return decoded
 }
 
-private func requiredQueryValue(
+func requiredQueryValue(
     _ name: String,
     in query: [String: String],
     maximumBytes: Int
@@ -1227,7 +1227,7 @@ private func requiredQueryValue(
     return try bounded(value, maximumBytes: maximumBytes)
 }
 
-private func bounded(_ value: String, maximumBytes: Int) throws -> String {
+func bounded(_ value: String, maximumBytes: Int) throws -> String {
     guard !value.isEmpty, value.utf8.count <= maximumBytes else {
         throw AuthenticatedSpaceRecordFailure.invalidRequest
     }
@@ -1244,7 +1244,7 @@ private func strictRecordPageLimit(_ value: String) throws -> Int {
     return limit
 }
 
-private func strictBoolean(_ value: String) throws -> Bool {
+func strictBoolean(_ value: String) throws -> Bool {
     switch value {
     case "true": return true
     case "false": return false

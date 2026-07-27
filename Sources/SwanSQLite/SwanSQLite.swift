@@ -453,6 +453,43 @@ public enum PersistedOplogRead: Sendable, Equatable {
     case fullRecoveryRequired(PersistedRepositorySnapshot)
 }
 
+/// One wire-shaped permissioned oplog entry.  Unlike the write-side durable
+/// entry, `value` is the live-record join result: it is absent when a later
+/// write superseded this operation or when the caller requested metadata
+/// only.  Historic oplog values never escape through this projection.
+public struct PersistedWireOplogEntry: Sendable, Equatable {
+    public let wireRevision: TID
+    public let action: PersistedRepoAction
+    public let uri: SpaceRecordURI
+    public let cid: String?
+    public let previousCID: String?
+    public let value: Data?
+
+    public init(
+        wireRevision: TID,
+        action: PersistedRepoAction,
+        uri: SpaceRecordURI,
+        cid: String?,
+        previousCID: String?,
+        value: Data?
+    ) {
+        self.wireRevision = wireRevision
+        self.action = action
+        self.uri = uri
+        self.cid = cid
+        self.previousCID = previousCID
+        self.value = value
+    }
+}
+
+/// Read-only result for the wire-TID incremental-sync surface.  The recovery
+/// branch intentionally carries no snapshot so a caller cannot accidentally
+/// turn `listRepoOps` into a full-repository export.
+public enum PersistedWireOplogRead: Sendable, Equatable {
+    case incremental(state: PersistedRepositoryState?, entries: [PersistedWireOplogEntry])
+    case fullRecoveryRequired
+}
+
 public struct PersistedRepositoryCommit: Sendable, Equatable {
     public let state: PersistedRepositoryState
     public let entries: [PersistedSpaceOplogEntry]
@@ -1535,6 +1572,21 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         }
     }
 
+    /// Loads only the current permissioned repository state.  Sync commit
+    /// creation must not read every record merely to obtain the durable LtHash
+    /// commitment and wire TID.
+    public func repositoryState(
+        space: SpaceURI,
+        author: String
+    ) async throws -> PersistedRepositoryState? {
+        try requireAccount(author)
+        return try await withConnectionGate {
+            try await readTransaction {
+                try await loadState(space: space, author: author)
+            }
+        }
+    }
+
     private func repositorySnapshotWithoutTransaction(
         space: SpaceURI,
         author: String
@@ -1588,6 +1640,125 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                 )
             }
         }
+    }
+
+    /// Returns a bounded incremental page after an XRPC wire-TID cursor.
+    /// The reference PDS treats TIDs as its protocol cursor, while its
+    /// operation ordering is still `(commit revision, operation index)`.
+    /// Keep that distinction here: a batch may deliberately contain multiple
+    /// operations with the same wire TID.
+    public func wireOplog(
+        space: SpaceURI,
+        author: String,
+        since: TID?,
+        limit: Int,
+        includeValues: Bool
+    ) async throws -> PersistedWireOplogRead {
+        try requireAccount(author)
+        guard (1 ... 1_000).contains(limit) else {
+            throw SwanError.malformed("permissioned oplog page limit is invalid")
+        }
+        return try await withConnectionGate {
+            try await readTransaction {
+                try await wireOplogWithoutTransaction(
+                    space: space,
+                    author: author,
+                    since: since,
+                    limit: limit,
+                    includeValues: includeValues
+                )
+            }
+        }
+    }
+
+    private func wireOplogWithoutTransaction(
+        space: SpaceURI,
+        author: String,
+        since: TID?,
+        limit: Int,
+        includeValues: Bool
+    ) async throws -> PersistedWireOplogRead {
+        guard let state = try await loadState(space: space, author: author) else {
+            return .incremental(state: nil, entries: [])
+        }
+
+        if let since {
+            let oldestRows = try await connection.query(
+                """
+                SELECT wire_revision
+                FROM permissioned_space_oplog
+                WHERE space_uri = ? AND author_did = ?
+                ORDER BY revision, operation_index
+                LIMIT 1
+                """,
+                [.text(space.rawValue), .text(author)]
+            )
+            guard let oldestRow = oldestRows.first else {
+                // A state without retained history cannot safely answer an
+                // incremental request from a known cursor.
+                return .fullRecoveryRequired
+            }
+            let oldest = try requiredTID(oldestRow, "wire_revision")
+            // TIDs cannot express the predecessor relationship that SQLite's
+            // private numeric cursor has.  Be conservatively fail-closed: a
+            // cursor older than the first retained TID gets the later full
+            // CAR recovery path rather than a plausible, divergent delta.
+            if since < oldest {
+                return .fullRecoveryRequired
+            }
+        }
+
+        let rows: [SQLiteRow]
+        if includeValues {
+            rows = try await connection.query(
+                """
+                SELECT oplog.wire_revision, oplog.action, oplog.collection,
+                       oplog.rkey, oplog.cid, oplog.previous_cid,
+                       live.value AS current_value
+                FROM permissioned_space_oplog AS oplog
+                LEFT JOIN permissioned_space_records AS live
+                  ON live.space_uri = oplog.space_uri
+                 AND live.author_did = oplog.author_did
+                 AND live.collection = oplog.collection
+                 AND live.rkey = oplog.rkey
+                 AND live.cid = oplog.cid
+                WHERE oplog.space_uri = ? AND oplog.author_did = ?
+                  AND (? IS NULL OR oplog.wire_revision > ?)
+                ORDER BY oplog.revision, oplog.operation_index
+                LIMIT ?
+                """,
+                [
+                    .text(space.rawValue), .text(author),
+                    since.map { .text($0.toString()) } ?? .null,
+                    since.map { .text($0.toString()) } ?? .null,
+                    .integer(limit),
+                ]
+            )
+        } else {
+            rows = try await connection.query(
+                """
+                SELECT wire_revision, action, collection, rkey, cid,
+                       previous_cid, NULL AS current_value
+                FROM permissioned_space_oplog
+                WHERE space_uri = ? AND author_did = ?
+                  AND (? IS NULL OR wire_revision > ?)
+                ORDER BY revision, operation_index
+                LIMIT ?
+                """,
+                [
+                    .text(space.rawValue), .text(author),
+                    since.map { .text($0.toString()) } ?? .null,
+                    since.map { .text($0.toString()) } ?? .null,
+                    .integer(limit),
+                ]
+            )
+        }
+        return .incremental(
+            state: state,
+            entries: try rows.map {
+                try decodeWireOplog($0, space: space, author: author)
+            }
+        )
     }
 
     /// Cursor-precise variant for adapters that page within one commit.
@@ -3137,6 +3308,60 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         )
     }
 
+    /// Decodes the read-side join projection.  Validate the durable action
+    /// shape before HTTP has a chance to render nullable CIDs: corrupted rows
+    /// must become an opaque unavailable response, not a malformed partial
+    /// operation list.
+    private func decodeWireOplog(
+        _ row: SQLiteRow,
+        space: SpaceURI,
+        author: String
+    ) throws -> PersistedWireOplogEntry {
+        let actionRaw = try requiredText(row, "action")
+        guard let action = PersistedRepoAction(rawValue: actionRaw) else {
+            throw SQLiteRepositoryError.corruptDatabase("invalid oplog action")
+        }
+        let uri = try SpaceRecordURI(
+            space: space,
+            author: author,
+            collection: try requiredText(row, "collection"),
+            rkey: try requiredText(row, "rkey")
+        )
+        let cid = row.column("cid")?.string
+        let previousCID = row.column("previous_cid")?.string
+        let value: Data?
+        if let currentValue = row.column("current_value"), !currentValue.isNull {
+            guard let decoded = Data(sqliteData: currentValue) else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid current_value")
+            }
+            value = decoded
+        } else {
+            value = nil
+        }
+        switch action {
+        case .create:
+            guard cid != nil, previousCID == nil else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid create oplog entry")
+            }
+        case .update:
+            guard cid != nil, previousCID != nil else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid update oplog entry")
+            }
+        case .delete:
+            guard cid == nil, previousCID != nil, value == nil else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid delete oplog entry")
+            }
+        }
+        return PersistedWireOplogEntry(
+            wireRevision: try requiredTID(row, "wire_revision"),
+            action: action,
+            uri: uri,
+            cid: cid,
+            previousCID: previousCID,
+            value: value
+        )
+    }
+
     private func ltHashElement(for record: PersistedSpaceRecord) -> String {
         "\(record.uri.collection)/\(record.uri.rkey)/\(record.cid)"
     }
@@ -3698,6 +3923,83 @@ public actor DurableSpaceRepository {
             ltHash: ltHash.serialized,
             commitment: ltHash.commitment
         )
+    }
+
+    /// Returns only the durable facts that an account-key backed signer needs
+    /// for a fresh reader-specific commit.  A never-written repository has a
+    /// zero LtHash commitment but no wire revision, so the HTTP handler emits
+    /// no signed commit exactly like the pinned TypeScript PDS.
+    public func currentCommitState(
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositoryCommitState {
+        try requireRead(uri: nil, authorization: authorization)
+        if let state = try await database.repositoryState(space: space, author: author) {
+            return AuthorizedSpaceRepositoryCommitState(
+                space: state.space,
+                author: state.author,
+                wireRevision: state.wireRevision.toString(),
+                commitment: state.commitment
+            )
+        }
+        return AuthorizedSpaceRepositoryCommitState(
+            space: space,
+            author: author,
+            wireRevision: nil,
+            commitment: LtHash().commitment
+        )
+    }
+
+    /// Reads the pinned wire-TID incremental oplog page.  The durable query
+    /// joins values only against their matching live records; this facade
+    /// preserves operation ordering and maps a retention gap to an explicit
+    /// recovery requirement rather than synthesizing an incomplete delta.
+    public func incrementalOplog(
+        since: TID?,
+        limit: Int,
+        includeValues: Bool,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositoryOplogRead {
+        try requireRead(uri: nil, authorization: authorization)
+        switch try await database.wireOplog(
+            space: space,
+            author: author,
+            since: since,
+            limit: limit,
+            includeValues: includeValues
+        ) {
+        case let .incremental(state, entries):
+            let projectedState: AuthorizedSpaceRepositoryCommitState
+            if let state {
+                projectedState = AuthorizedSpaceRepositoryCommitState(
+                    space: state.space,
+                    author: state.author,
+                    wireRevision: state.wireRevision.toString(),
+                    commitment: state.commitment
+                )
+            } else {
+                projectedState = AuthorizedSpaceRepositoryCommitState(
+                    space: space,
+                    author: author,
+                    wireRevision: nil,
+                    commitment: LtHash().commitment
+                )
+            }
+            return .incremental(
+                state: projectedState,
+                entries: entries.map { entry in
+                    AuthorizedSpaceRepositoryOplogEntry(
+                        wireRevision: entry.wireRevision.toString(),
+                        collection: entry.uri.collection,
+                        rkey: entry.uri.rkey,
+                        cid: entry.cid,
+                        previousCID: entry.previousCID,
+                        value: entry.value
+                    )
+                }
+            )
+        case .fullRecoveryRequired:
+            return .fullRecoveryRequired
+        }
     }
 
     public func snapshot(

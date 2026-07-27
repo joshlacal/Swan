@@ -115,6 +115,19 @@ public struct SwanSpaceDelegationHTTPConfiguration: Sendable {
     }
 }
 
+/// The explicit account-key backed dependency for authenticated incremental
+/// permissioned repository reads.  It deliberately exposes only fresh
+/// proposal-0016 commit construction, not raw account signing or a database
+/// connection.  Space-credential verification remains separately configured
+/// through ``SwanSpaceCredentialHTTPConfiguration``.
+public struct SwanSpaceRepositorySyncHTTPConfiguration: Sendable {
+    let commitSigner: any SpaceRepositoryCommitSigner
+
+    public init(commitSigner: any SpaceRepositoryCommitSigner) {
+        self.commitSigner = commitSigner
+    }
+}
+
 public struct SwanHTTPServer: Sendable {
     public let profile: ProtocolProfile
     public let configuration: SwanHTTPConfiguration
@@ -154,6 +167,10 @@ public struct SwanHTTPServer: Sendable {
     /// AccountKeyStore-backed issuer and a startup-preopened account directory
     /// are both supplied alongside durable DPoP OAuth authorization.
     public let authenticatedSpaceDelegationMinting: SwanSpaceDelegationMintingCapability?
+    /// Read-only current-commit and incremental-oplog endpoints.  They remain
+    /// closed until a startup-preopened repository directory and narrow
+    /// account-key commit signer are both explicitly configured.
+    public let authenticatedSpaceRepositorySync: SwanAuthenticatedSpaceRepositorySyncCapability?
 
     public init(
         profile: ProtocolProfile,
@@ -166,7 +183,8 @@ public struct SwanHTTPServer: Sendable {
         authenticatedGetSpaceDirectory: (any AuthorizedSimpleSpaceDirectory)? = nil,
         accountControlStore: (any AccountControlStore)? = nil,
         spaceCredentialConfiguration: SwanSpaceCredentialHTTPConfiguration? = nil,
-        spaceDelegationConfiguration: SwanSpaceDelegationHTTPConfiguration? = nil
+        spaceDelegationConfiguration: SwanSpaceDelegationHTTPConfiguration? = nil,
+        spaceRepositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -265,12 +283,33 @@ public struct SwanHTTPServer: Sendable {
             } else {
                 authenticatedSpaceDelegationMinting = nil
             }
+            if let repositoryDirectory = authenticatedGetSpaceDirectory
+                as? any AuthorizedSpaceRepositoryDirectory,
+               let spaceRepositorySyncConfiguration {
+                let credentialVerifier: (any SpaceCredentialAuthorizationVerifier)?
+                if let spaceCredentialConfiguration {
+                    credentialVerifier = DurableSpaceCredentialVerifier(
+                        publicKeys: spaceCredentialConfiguration.credentialPublicKeys
+                    )
+                } else {
+                    credentialVerifier = nil
+                }
+                authenticatedSpaceRepositorySync = SwanAuthenticatedSpaceRepositorySyncCapability(
+                    authorizer: authorizer,
+                    directory: repositoryDirectory,
+                    credentialAuthorizer: credentialVerifier,
+                    commitSigner: spaceRepositorySyncConfiguration.commitSigner
+                )
+            } else {
+                authenticatedSpaceRepositorySync = nil
+            }
         } else {
             authenticatedGetSpace = nil
             authenticatedSpaceRecords = nil
             authenticatedSimpleSpaceLifecycle = nil
             authenticatedSpaceCredentialExchange = nil
             authenticatedSpaceDelegationMinting = nil
+            authenticatedSpaceRepositorySync = nil
         }
     }
 
@@ -395,6 +434,18 @@ public struct SwanHTTPServer: Sendable {
             } else if descriptor.nsid == ComAtprotoSpaceApplyWrites.typeIdentifier,
                       let authenticatedSpaceRecords {
                 registerAuthenticatedApplyWritesEndpoint(on: router, capability: authenticatedSpaceRecords)
+            } else if descriptor.nsid == ComAtprotoSpaceGetLatestCommit.typeIdentifier,
+                      let authenticatedSpaceRepositorySync {
+                registerAuthenticatedGetLatestCommitEndpoint(
+                    on: router,
+                    capability: authenticatedSpaceRepositorySync
+                )
+            } else if descriptor.nsid == ComAtprotoSpaceListRepoOps.typeIdentifier,
+                      let authenticatedSpaceRepositorySync {
+                registerAuthenticatedListRepoOpsEndpoint(
+                    on: router,
+                    capability: authenticatedSpaceRepositorySync
+                )
             } else if let authenticatedSimpleSpaceLifecycle,
                       Self.isSimpleSpaceLifecycleMethod(descriptor.nsid) {
                 if !installedSimpleSpaceLifecycle {
