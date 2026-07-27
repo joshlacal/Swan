@@ -48,6 +48,12 @@ let package = Package(
             ]
         ),
         .target(
+            name: "CATHandleDNS",
+            path: "Sources/CATHandleDNS",
+            publicHeadersPath: "include",
+            linkerSettings: [.linkedLibrary("resolv")]
+        ),
+        .target(
             name: "CBLAKE3",
             path: "Sources/CBLAKE3",
             publicHeadersPath: "include",
@@ -105,10 +111,13 @@ let package = Package(
         .target(
             name: "SwanAccounts",
             dependencies: [
-                "CLibsodium", "SwanCore", "SwanPublicRepository", "SwanStorage",
+                "CATHandleDNS", "CLibsodium", "SwanCore", "SwanPublicRepository", "SwanStorage",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl"),
                 .product(name: "Petrel", package: "Petrel"),
             ]
         ),

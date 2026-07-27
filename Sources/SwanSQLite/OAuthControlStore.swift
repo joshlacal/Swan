@@ -43,6 +43,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
     let connection: SQLiteConnection
     let connectionGate = ControlSQLiteConnectionGate()
     private var dataDirectoryDescriptor: Int32
+    private var activeWriteTransactions = 0
 
     public init(dataDirectory: URL) async throws {
         let rootDescriptor = try SQLiteProtectedPaths.openRoot(dataDirectory)
@@ -767,14 +768,21 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         _ body: () async throws -> T
     ) async throws -> T {
         _ = try await connection.query("BEGIN IMMEDIATE")
+        activeWriteTransactions += 1
         do {
             let result = try await body()
             _ = try await connection.query("COMMIT")
+            activeWriteTransactions -= 1
             return result
         } catch {
             _ = try? await connection.query("ROLLBACK")
+            activeWriteTransactions -= 1
             throw error
         }
+    }
+
+    func hasActiveWriteTransactionForTesting() -> Bool {
+        activeWriteTransactions > 0
     }
 
     private func isRetryableMigrationLock(_ error: any Error) -> Bool {

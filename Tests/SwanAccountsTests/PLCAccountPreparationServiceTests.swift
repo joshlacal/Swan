@@ -543,6 +543,366 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
     }
 }
 
+final class PLCAccountActivationServiceTests: XCTestCase {
+    func testActivationAndExactRetryPreserveGenerationAndPublicCAR() async throws {
+        let fixture = try await ActivationFixture(requestID: "activate-success")
+        defer { fixture.removeFiles() }
+        let store = try await fixture.preparation.opener
+            .openPLCAccountPreparationStore(did: fixture.identity.did)
+        let signingReference = fixture.identity.signingReference
+        let signingMaterial = try await fixture.preparation.keyStore.key(
+            for: signingReference
+        )
+        let signingKey = try P256.Signing.PrivateKey(
+            rawRepresentation: signingMaterial
+        )
+        let loadedGenesis = try await store.loadPublicRepositoryGenesis(
+            did: fixture.identity.did,
+            signingPublicKey: signingKey.publicKey
+        )
+        let genesisBefore = try XCTUnwrap(loadedGenesis)
+        let inventoryBefore = try await fixture.preparation.keyStore.inventory()
+        let activeBefore = try await fixture.preparation.control.account(
+            did: fixture.identity.did
+        )
+        XCTAssertNil(activeBefore)
+
+        let first = try await fixture.activation().activate(
+            requestID: "activate-success",
+            password: "correct horse battery staple"
+        )
+        let second = try await fixture.activation().activate(
+            requestID: "activate-success",
+            password: "correct horse battery staple"
+        )
+
+        XCTAssertEqual(first.account, second.account)
+        XCTAssertEqual(first.publicGenesis, genesisBefore)
+        XCTAssertEqual(second.publicGenesis.genesis.car, genesisBefore.genesis.car)
+        XCTAssertEqual(first.account.status, .active)
+        XCTAssertEqual(first.account.publicGenesisCommitCID, fixture.identity.publicGenesisCommitCID)
+        let inventoryAfter = try await fixture.preparation.keyStore.inventory()
+        XCTAssertEqual(inventoryBefore.totalEnvelopeCount, 2)
+        XCTAssertEqual(inventoryAfter.totalEnvelopeCount, 2)
+        XCTAssertEqual(fixture.identity.signingReference.generation, 1)
+        XCTAssertEqual(fixture.identity.rotationReference.generation, 1)
+        let verifierCalls = await fixture.verifier.callCount()
+        XCTAssertEqual(verifierCalls, 2)
+        try await fixture.close()
+    }
+
+    func testCrashAfterRegistrationConvergesOnExactRetry() async throws {
+        let fixture = try await ActivationFixture(requestID: "activate-crash")
+        defer { fixture.removeFiles() }
+        let crashing = fixture.activation(
+            hooks: .init(afterRegistration: {
+                throw PreparationFailure.repository
+            })
+        )
+        await assertActivationError(
+            try await crashing.activate(
+                requestID: "activate-crash",
+                password: "crash-safe-password"
+            ),
+            expected: .unavailable
+        )
+        let loadedRegistered = try await fixture.preparation.control.account(
+            did: fixture.identity.did
+        )
+        let registered = try XCTUnwrap(loadedRegistered)
+        let recovered = try await fixture.activation().activate(
+            requestID: "activate-crash",
+            password: "crash-safe-password"
+        )
+        XCTAssertEqual(recovered.account, registered)
+        XCTAssertTrue(recovered.registrationWasRecovered)
+        try await fixture.close()
+    }
+
+    func testBadPasswordAndDuplicateHandleFailWithoutSecondAccount() async throws {
+        let badPassword = try await ActivationFixture(requestID: "activate-password")
+        defer { badPassword.removeFiles() }
+        let installed = try await badPassword.activation().activate(
+            requestID: "activate-password",
+            password: "first-password"
+        )
+        await assertActivationError(
+            try await badPassword.activation().activate(
+                requestID: "activate-password",
+                password: "wrong-password"
+            ),
+            expected: .conflict
+        )
+        let afterBadPassword = try await badPassword.preparation.control.account(
+            did: installed.account.did
+        )
+        XCTAssertEqual(afterBadPassword, installed.account)
+        try await badPassword.close()
+
+        let conflict = try await ActivationFixture(requestID: "activate-handle-conflict")
+        defer { conflict.removeFiles() }
+        let otherDID = "did:plc:zyxwvutsrqponmlkjihgfedc"
+        _ = try await conflict.directory.registerProvisionedAccount(
+            did: otherDID,
+            canonicalHandle: conflict.identity.canonicalHandle,
+            password: "other-password",
+            signingReference: try AccountKeyReference(
+                accountDID: otherDID,
+                purpose: .signing,
+                generation: 1
+            ),
+            rotationReference: try AccountKeyReference(
+                accountDID: otherDID,
+                purpose: .rotation,
+                generation: 1
+            )
+        )
+        await assertActivationError(
+            try await conflict.activation().activate(
+                requestID: "activate-handle-conflict",
+                password: "new-password"
+            ),
+            expected: .conflict
+        )
+        let pendingAccount = try await conflict.preparation.control.account(
+            did: conflict.identity.did
+        )
+        let conflictingAccount = try await conflict.preparation.control.account(
+            canonicalHandle: conflict.identity.canonicalHandle
+        )
+        XCTAssertNil(pendingAccount)
+        XCTAssertEqual(conflictingAccount?.did, otherDID)
+        try await conflict.close()
+    }
+
+    func testVerifierPLCTombstoneMutationAndPublicGenesisFailuresNeverActivate() async throws {
+        let verifierFailure = try await ActivationFixture(
+            requestID: "activate-verifier",
+            verifierMode: .failure
+        )
+        defer { verifierFailure.removeFiles() }
+        await assertActivationError(
+            try await verifierFailure.activation().activate(
+                requestID: "activate-verifier",
+                password: "password"
+            ),
+            expected: .conflict
+        )
+        let verifierActive = try await verifierFailure.preparation.control.account(
+            did: verifierFailure.identity.did
+        )
+        XCTAssertNil(verifierActive)
+        try await verifierFailure.close()
+
+        for (suffix, mode) in [
+            ("tombstone", FakePLC.Mode.inactiveTerminal),
+            ("handle", FakePLC.Mode.mismatchedHandle),
+            ("pds", FakePLC.Mode.mismatchedPDSOrigin),
+        ] {
+            let fixture = try await ActivationFixture(
+                requestID: "activate-plc-\(suffix)"
+            )
+            defer { fixture.removeFiles() }
+            await fixture.preparation.plc.setMode(mode)
+            await assertActivationError(
+                try await fixture.activation().activate(
+                    requestID: "activate-plc-\(suffix)",
+                    password: "password"
+                ),
+                expected: .conflict
+            )
+            let active = try await fixture.preparation.control.account(
+                did: fixture.identity.did
+            )
+            XCTAssertNil(active)
+            try await fixture.close()
+        }
+
+        let tampered = try await ActivationFixture(requestID: "activate-genesis")
+        defer { tampered.removeFiles() }
+        try await tampered.preparation.opener.tamperPublicGenesisCommitCID(
+            did: tampered.identity.did
+        )
+        await assertActivationError(
+            try await tampered.activation().activate(
+                requestID: "activate-genesis",
+                password: "password"
+            ),
+            expected: .unavailable
+        )
+        let tamperedActive = try await tampered.preparation.control.account(
+            did: tampered.identity.did
+        )
+        XCTAssertNil(tamperedActive)
+        try await tampered.close()
+    }
+
+    func testPLCAndHandleNetworkProofRunsOutsideStorageTransactions() async throws {
+        let fixture = try await ActivationFixture(requestID: "activate-transactions")
+        defer { fixture.removeFiles() }
+        let control = fixture.preparation.control
+        let opener = fixture.preparation.opener
+        await fixture.preparation.plc.setTransactionProbe {
+            let controlOpen = await control.hasActiveWriteTransactionForTesting()
+            let accountOpen = await opener.hasActiveWriteTransactionForTesting()
+            return !controlOpen && !accountOpen
+        }
+        await fixture.verifier.setTransactionProbe {
+            let controlOpen = await control.hasActiveWriteTransactionForTesting()
+            let accountOpen = await opener.hasActiveWriteTransactionForTesting()
+            return !controlOpen && !accountOpen
+        }
+        _ = try await fixture.activation().activate(
+            requestID: "activate-transactions",
+            password: "transaction-password"
+        )
+        let plcProbesClear = await fixture.preparation.plc
+            .allTransactionProbesWereClear()
+        let handleProbesClear = await fixture.verifier
+            .allTransactionProbesWereClear()
+        XCTAssertTrue(plcProbesClear)
+        XCTAssertTrue(handleProbesClear)
+        try await fixture.close()
+    }
+
+    func testUnknownOrUnsubmittedRequestIsOpaqueAndInvisible() async throws {
+        let fixture = try await ActivationFixture(requestID: "activate-known")
+        defer { fixture.removeFiles() }
+        await assertActivationError(
+            try await fixture.activation().activate(
+                requestID: "unknown-request",
+                password: "password"
+            ),
+            expected: .conflict
+        )
+        let active = try await fixture.preparation.control.account(
+            did: fixture.identity.did
+        )
+        XCTAssertNil(active)
+        try await fixture.close()
+    }
+
+    private func assertActivationError<T>(
+        _ expression: @autoclosure () async throws -> T,
+        expected: PLCAccountActivationError,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            _ = try await expression()
+            XCTFail("expected activation error", file: file, line: line)
+        } catch {
+            XCTAssertEqual(
+                error as? PLCAccountActivationError,
+                expected,
+                file: file,
+                line: line
+            )
+        }
+    }
+}
+
+private final class ActivationFixture: @unchecked Sendable {
+    let preparation: PreparationFixture
+    let identity: PreparedPLCAccountIdentity
+    let directory: DurableAccountDirectory
+    let verifier: ActivationHandleVerifier
+
+    init(
+        requestID: String,
+        verifierMode: ActivationHandleVerifier.Mode = .success
+    ) async throws {
+        preparation = try await PreparationFixture()
+        identity = try await preparation.service().prepare(
+            requestID: requestID,
+            handle: "activation.example.org",
+            pdsOrigin: URL(string: "https://pds.example.org")!,
+            repositoryRevision: "3lqby3xuo4k2z"
+        )
+        let hasher = try LibsodiumArgon2idHasher(policy: .interactive)
+        directory = DurableAccountDirectory(
+            store: preparation.control,
+            passwordHasher: hasher,
+            verificationExecutor: try Argon2idVerificationExecutor(
+                hasher: hasher,
+                maximumConcurrentVerifications: 2,
+                maximumQueuedVerifications: 4
+            )
+        )
+        verifier = ActivationHandleVerifier(mode: verifierMode)
+    }
+
+    func activation(
+        hooks: PLCAccountActivationHooks = .init()
+    ) -> PLCAccountActivationService {
+        PLCAccountActivationService(
+            intentStore: preparation.control,
+            accountStoreOpener: preparation.opener,
+            keyStore: preparation.keyStore,
+            plcClient: preparation.plc,
+            handleVerifier: verifier,
+            directory: directory,
+            hooks: hooks
+        )
+    }
+
+    func close() async throws {
+        try await preparation.close()
+    }
+
+    func removeFiles() {
+        preparation.removeFiles()
+    }
+}
+
+private actor ActivationHandleVerifier: PLCHandleVerifying {
+    enum Mode: Sendable {
+        case success
+        case failure
+    }
+
+    let mode: Mode
+    var calls = 0
+    var transactionProbe: (@Sendable () async -> Bool)?
+    var transactionResults: [Bool] = []
+
+    init(mode: Mode) {
+        self.mode = mode
+    }
+
+    func verify(
+        plcState: PLCDocumentData,
+        expectedDID: String,
+        handle: String,
+        pdsOrigin: String
+    ) async throws -> VerifiedATHandleIdentity {
+        calls += 1
+        if let transactionProbe {
+            transactionResults.append(await transactionProbe())
+        }
+        guard mode == .success else {
+            throw ATHandleVerificationError.verificationFailed
+        }
+        return .init(
+            did: expectedDID,
+            canonicalHandle: handle,
+            pdsOrigin: pdsOrigin
+        )
+    }
+
+    func setTransactionProbe(
+        _ probe: @escaping @Sendable () async -> Bool
+    ) {
+        transactionProbe = probe
+    }
+
+    func callCount() -> Int { calls }
+
+    func allTransactionProbesWereClear() -> Bool {
+        !transactionResults.isEmpty && transactionResults.allSatisfy(\.self)
+    }
+}
+
 private enum PreparationFailure: String, Error, CaseIterable, Sendable {
     case staged
     case intent
@@ -715,13 +1075,17 @@ private actor FakePLC: PLCClient {
         case inactiveTerminal = "inactive"
     }
 
-    let mode: Mode
+    var mode: Mode
     var operations: [String: PLCSignedOperation] = [:]
     var submissions = 0
     var transactionProbe: (@Sendable () async -> Bool)?
     var transactionProbeResults: [Bool] = []
 
     init(mode: Mode) {
+        self.mode = mode
+    }
+
+    func setMode(_ mode: Mode) {
         self.mode = mode
     }
 
