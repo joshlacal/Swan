@@ -465,6 +465,12 @@ public protocol AccountControlStore: Sendable {
     func createAccount(_ registration: AccountControlRegistration) async throws -> AccountControlAccount
     func account(did: String) async throws -> AccountControlAccount?
     func account(canonicalHandle: String) async throws -> AccountControlAccount?
+    /// Lists only canonical, active account DIDs in binary lexical order.
+    ///
+    /// This is a trusted startup inventory, not a request-time account
+    /// discovery surface. Implementations must not load credential, key,
+    /// handle, export, or repository fields to answer it.
+    func activeAccountDIDs() async throws -> [String]
     func credential(did: String) async throws -> AccountControlCredential?
     func replaceCredential(
         did: String,
@@ -487,6 +493,15 @@ public protocol AccountControlStore: Sendable {
         declaration: AccountLifecycleDeclaration,
         now: Date
     ) async throws -> AccountControlAccount
+}
+
+public extension AccountControlStore {
+    /// Stores that predate the startup inventory capability must fail closed:
+    /// a service must never infer an account-database location by probing a
+    /// request's authority DID.
+    func activeAccountDIDs() async throws -> [String] {
+        throw AccountControlStoreError.unavailable
+    }
 }
 
 /// Strict lexical account identifiers shared by durable adapters that cannot

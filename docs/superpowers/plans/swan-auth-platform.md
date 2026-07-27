@@ -53,9 +53,10 @@ production deployment.
   explicit gate: local macOS testing uses Homebrew libsodium include/library
   paths, and Linux plus the minimum supported macOS have not yet been run.
 - `OAuthTokenVault` and memory-only DPoP replay are compatibility scaffolds,
-  not sufficient durable authorization state. The next HTTP unit must combine
-  this resource boundary with a pre-migrated account-directory read path;
-  request handling must never create or migrate an account database.
+  not sufficient durable authorization state. The pre-migrated
+  account-directory read path now exists; the next HTTP unit may combine it
+  with the resource boundary, but request handling must never create or
+  migrate an account database.
 
 ## Acceptance gates
 

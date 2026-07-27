@@ -209,6 +209,32 @@ extension SQLiteControlDatabase {
         }
     }
 
+    /// A startup-only inventory for services that must preopen known account
+    /// databases. Keep this status-only: control credentials, handles, keys,
+    /// exports, and repository metadata must not cross this boundary.
+    public func activeAccountDIDs() async throws -> [String] {
+        try await withConnectionGate {
+            let rows = try await connection.query(
+                "SELECT did, status FROM accounts WHERE status = 'active' ORDER BY did"
+            )
+            var result: [String] = []
+            var previous: String?
+            for row in rows {
+                let did = try requiredText(row, "did")
+                let status = try AccountControlStatus(rawValue: requiredText(row, "status"))
+                guard AccountControlIdentifiers.isDID(did),
+                      status == .active,
+                      status.isCanonicalValue,
+                      previous.map({ $0 < did }) ?? true else {
+                    throw AccountControlStoreError.malformedRecord
+                }
+                result.append(did)
+                previous = did
+            }
+            return result
+        }
+    }
+
     public func credential(did: String) async throws -> AccountControlCredential? {
         guard AccountControlIdentifiers.isDID(did) else { throw AccountControlStoreError.invalidInput }
         return try await withConnectionGate {

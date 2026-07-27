@@ -37,9 +37,9 @@ Catbird UI work.
 - Existing HTTP endpoints intentionally return generic authorization errors or
   `profile_endpoint_pending`; they are not interop evidence. In particular,
   pinned TypeScript `com.atproto.space.getSpace` is an authenticated,
-  authority-only query, so Swan must not publish its policy or client
-  configuration until the DPoP-bound resource authorization and pre-migrated
-  account-directory boundaries are installed.
+  authority-only query. Swan now has its DPoP-bound authorization prerequisite
+  and a startup-preopened account-directory boundary, but no HTTP route is
+  registered until its typed adapter has the same authority-only behavior.
 
 ## Acceptance gates
 
