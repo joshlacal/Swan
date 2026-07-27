@@ -11,6 +11,10 @@ source "${root}/Scripts/wire-generation-common.sh"
 # checked: an ordinary ../Petrel checkout predates server contracts and would
 # otherwise delete them from the checked-in output.
 wire_generation_verify_profile_lexicons
+# Reject stale or injected checked-in Swift files before Petrel ever receives
+# the real output path. The same immutable inventory/checksum runs again as
+# the postcondition after generation.
+wire_generation_verify_checked_in_manifest
 wire_generation_require_pinned_generator
 
 temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/swan-wire-regeneration.XXXXXX")"

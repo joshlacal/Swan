@@ -34,6 +34,19 @@ if PETREL_GENERATOR_ROOT="${temporary_root}/missing-generator" ./Scripts/regener
 fi
 assert_unchanged
 
+# The capability check must run only after the pinned workspace identity has
+# passed. Shadow rg for this invocation so the real immutable workspace is
+# selected but advertises neither required server-contract capability.
+capability_bin="${temporary_root}/capability-bin"
+mkdir "${capability_bin}"
+printf '#!/usr/bin/env sh\nexit 1\n' >"${capability_bin}/rg"
+chmod +x "${capability_bin}/rg"
+if PATH="${capability_bin}:${PATH}" PETREL_GENERATOR_ROOT="${PETREL_GENERATOR_ROOT}" ./Scripts/regenerate-wire.sh; then
+  echo "test-wire-generation: missing server-contract capability unexpectedly succeeded" >&2
+  exit 1
+fi
+assert_unchanged
+
 # An editable profile cannot retarget the immutable generator SHA. Exercise
 # this preflight directly with a throwaway profile while retaining the same
 # generated-output inventory assertion.
