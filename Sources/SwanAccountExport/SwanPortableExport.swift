@@ -418,6 +418,7 @@ public struct SwanPortableAccountExporter: Sendable {
     private let keyStore: any AccountKeyMaterialReader
     private let now: @Sendable () -> Date
     private let afterArtifactWrite: (@Sendable (Int) throws -> Void)?
+    private let afterRenameBeforeParentSync: (@Sendable () throws -> Void)?
 
     public init(
         profileID: String = PermissionedData0016.profileID,
@@ -433,6 +434,7 @@ public struct SwanPortableAccountExporter: Sendable {
         self.keyStore = keyStore
         self.now = now
         afterArtifactWrite = nil
+        afterRenameBeforeParentSync = nil
     }
 
     init(
@@ -450,6 +452,25 @@ public struct SwanPortableAccountExporter: Sendable {
         self.keyStore = keyStore
         self.now = now
         self.afterArtifactWrite = afterArtifactWrite
+        afterRenameBeforeParentSync = nil
+    }
+
+    init(
+        profileID: String = PermissionedData0016.profileID,
+        database: SQLiteAccountDatabase,
+        keyStore: any AccountKeyMaterialReader,
+        now: @escaping @Sendable () -> Date = Date.init,
+        afterRenameBeforeParentSync: @escaping @Sendable () throws -> Void
+    ) throws {
+        guard profileID == PermissionedData0016.profileID else {
+            throw SwanPortableExportError.invalidManifest
+        }
+        self.profileID = profileID
+        self.database = database
+        self.keyStore = keyStore
+        self.now = now
+        afterArtifactWrite = nil
+        self.afterRenameBeforeParentSync = afterRenameBeforeParentSync
     }
 
     public func export(
@@ -689,7 +710,14 @@ public struct SwanPortableAccountExporter: Sendable {
                 source: stagingName,
                 destination: destination.outputName
             )
+            // `rename` is the publication linearization point. Record the
+            // installed state before any later operation can fail so cleanup
+            // never targets the now-missing staging name.
             published = true
+            try afterRenameBeforeParentSync?()
+            try SwanPortableExportFilesystem.synchronizeParent(
+                destination.parentDescriptor
+            )
             try destination.requireCurrentParentAndInstalledTarget()
             _ = close(stagingDescriptor)
         } catch {

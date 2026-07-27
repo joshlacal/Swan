@@ -346,7 +346,13 @@ enum SwanPortableExportFilesystem {
                 #endif
             }
         }
-        guard result == 0, fsync(parent) == 0 else {
+        guard result == 0 else {
+            throw SwanPortableExportError.publicationFailed
+        }
+    }
+
+    static func synchronizeParent(_ parent: Int32) throws {
+        guard fsync(parent) == 0 else {
             throw SwanPortableExportError.publicationFailed
         }
     }

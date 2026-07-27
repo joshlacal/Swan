@@ -381,6 +381,36 @@ final class SwanPortableExportTests: XCTestCase {
         XCTAssertEqual(after, before)
     }
 
+    func testPostRenamePreSyncFailureRemovesInstalledOutputAndAllowsSafeRetry() async throws {
+        let fixture = try await ExporterFixture()
+        defer { fixture.remove() }
+        let output = fixture.root.appending(path: "post-rename-failure")
+        let faultedExporter = try SwanPortableAccountExporter(
+            database: fixture.database,
+            keyStore: fixture.keyStore,
+            afterRenameBeforeParentSync: {
+                throw SwanPortableExportError.publicationFailed
+            }
+        )
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await faultedExporter.export(account: fixture.account, to: output)
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
+                .contains { $0.hasPrefix(".swan-export-") }
+        )
+
+        let retried = try await fixture.export(to: output)
+        XCTAssertEqual(retried.outputDirectory, output.path)
+        _ = try SwanPortableExportVerifier.verifyArchive(
+            at: output,
+            signingPublicKey: fixture.signingKey.publicKey
+        )
+    }
+
     func testParentReplacementDuringPublicationCannotRedirectOrOrphanStaging() async throws {
         let fixture = try await ExporterFixture()
         defer { fixture.remove() }
