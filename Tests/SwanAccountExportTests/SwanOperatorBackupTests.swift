@@ -185,6 +185,16 @@ final class SwanOperatorBackupTests: XCTestCase {
                 reference["reference"] = "account-rotation:2"
                 object["rotationKeyReference"] = reference
             }),
+            ("both-references-generation", { (object: inout [String: Any]) in
+                var signing = object["signingKeyReference"] as! [String: Any]
+                signing["generation"] = 2
+                signing["reference"] = "account-signing:2"
+                object["signingKeyReference"] = signing
+                var rotation = object["rotationKeyReference"] as! [String: Any]
+                rotation["generation"] = 2
+                rotation["reference"] = "account-rotation:2"
+                object["rotationKeyReference"] = rotation
+            }),
         ] as [(String, (inout [String: Any]) -> Void)] {
             let output = fixture.root.appending(path: "swapped-\(name)")
             _ = try await fixture.backup(to: output)

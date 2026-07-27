@@ -35,6 +35,8 @@ final class OperatorBackupCLITests: XCTestCase {
         XCTAssertFalse(error.contains(sentinel))
         XCTAssertFalse(error.contains(root.path))
         XCTAssertFalse(error.contains("abcdefghijklmnopqrstuvwx"))
+        XCTAssertTrue(error.contains("operator backup failed"))
+        XCTAssertFalse(error.contains("operator secret file is unavailable"))
     }
 
     func testBackupEmitsExactSanitizedSuccessAndProducesVerifiableArchive() async throws {

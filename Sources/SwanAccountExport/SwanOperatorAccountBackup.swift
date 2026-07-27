@@ -260,7 +260,10 @@ public struct SwanOperatorAccountBackupExporter: Sendable {
               let rotationControlReference = account.rotationKey,
               signingControlReference.purpose == .signing,
               rotationControlReference.purpose == .rotation,
-              signingControlReference.generation == rotationControlReference.generation,
+              signingControlReference.generation
+                == SwanOperatorAccountSecrets.supportedKeyGeneration,
+              rotationControlReference.generation
+                == SwanOperatorAccountSecrets.supportedKeyGeneration,
               let publicGenesisCommitCID = account.publicGenesisCommitCID else {
             throw SwanOperatorAccountBackupError.failed
         }
@@ -512,7 +515,9 @@ public enum SwanOperatorAccountBackupVerifier {
               secrets.signingKeyReference.purpose == .signing,
               secrets.rotationKeyReference.purpose == .rotation,
               secrets.signingKeyReference.generation
-                == secrets.rotationKeyReference.generation else {
+                == SwanOperatorAccountSecrets.supportedKeyGeneration,
+              secrets.rotationKeyReference.generation
+                == SwanOperatorAccountSecrets.supportedKeyGeneration else {
             throw SwanOperatorAccountBackupError.failed
         }
         _ = try AccountControlCredential(
@@ -538,6 +543,12 @@ public enum SwanOperatorAccountBackupVerifier {
 /// Plaintext secret material remains module-internal, non-Codable, and has no
 /// description/debug representation.
 struct SwanOperatorAccountSecrets: Sendable {
+    /// The pinned alpha portable archive carries the genesis PLC operation,
+    /// so generation one is the only key generation it can independently
+    /// authenticate. A later format must add an authenticated rotation fact
+    /// before accepting current references above generation one.
+    static let supportedKeyGeneration: UInt64 = 1
+
     let profileID: String
     let portableManifestSHA256: String
     let did: String
@@ -573,7 +584,8 @@ struct SwanOperatorAccountSecrets: Sendable {
               AccountControlIdentifiers.isPublicGenesisCommitCID(publicGenesisCommitCID),
               signingKeyReference.purpose == .signing,
               rotationKeyReference.purpose == .rotation,
-              signingKeyReference.generation == rotationKeyReference.generation,
+              signingKeyReference.generation == Self.supportedKeyGeneration,
+              rotationKeyReference.generation == Self.supportedKeyGeneration,
               signingPrivateScalar.count == 32,
               rotationPrivateScalar.count == 32 else {
             throw SwanOperatorAccountBackupError.failed
@@ -621,41 +633,32 @@ private enum SwanOperatorAccountSecretsCodec {
     ])
     private static let referenceKeys = Set(["generation", "purpose", "reference"])
 
-    private struct Wire: Codable {
-        let canonicalHandle: String
-        let did: String
-        let format: String
-        let passwordVerifier: String
-        let portableManifestSHA256: String
-        let profileID: String
-        let publicGenesisCommitCID: String
-        let rotationKeyReference: AccountControlKeyReference
-        let rotationPrivateScalar: String
-        let signingKeyReference: AccountControlKeyReference
-        let signingPrivateScalar: String
-    }
-
     static func encode(_ secrets: SwanOperatorAccountSecrets) throws -> Data {
-        let wire = Wire(
-            canonicalHandle: secrets.canonicalHandle,
-            did: secrets.did,
-            format: formatValue,
-            passwordVerifier: secrets.passwordVerifier,
-            portableManifestSHA256: secrets.portableManifestSHA256,
-            profileID: secrets.profileID,
-            publicGenesisCommitCID: secrets.publicGenesisCommitCID,
-            rotationKeyReference: secrets.rotationKeyReference,
-            rotationPrivateScalar: SwanOperatorBackupBase64URL.encode(
+        let object: [String: Any] = [
+            "canonicalHandle": secrets.canonicalHandle,
+            "did": secrets.did,
+            "format": formatValue,
+            "passwordVerifier": secrets.passwordVerifier,
+            "portableManifestSHA256": secrets.portableManifestSHA256,
+            "profileID": secrets.profileID,
+            "publicGenesisCommitCID": secrets.publicGenesisCommitCID,
+            "rotationKeyReference": referenceObject(secrets.rotationKeyReference),
+            "rotationPrivateScalar": SwanOperatorBackupBase64URL.encode(
                 secrets.rotationPrivateScalar
             ),
-            signingKeyReference: secrets.signingKeyReference,
-            signingPrivateScalar: SwanOperatorBackupBase64URL.encode(
+            "signingKeyReference": referenceObject(secrets.signingKeyReference),
+            "signingPrivateScalar": SwanOperatorBackupBase64URL.encode(
                 secrets.signingPrivateScalar
+            ),
+        ]
+        do {
+            return try JSONSerialization.data(
+                withJSONObject: object,
+                options: [.sortedKeys, .withoutEscapingSlashes]
             )
-        )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        return try encoder.encode(wire)
+        } catch {
+            throw SwanOperatorAccountBackupError.failed
+        }
     }
 
     static func decode(_ data: Data) throws -> SwanOperatorAccountSecrets {
@@ -663,39 +666,43 @@ private enum SwanOperatorAccountSecretsCodec {
               let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               Set(object.keys) == rootKeys,
               object["format"] as? String == formatValue,
-              (object["signingKeyReference"] as? [String: Any]).map({
-                  Set($0.keys) == referenceKeys
-              }) == true,
-              (object["rotationKeyReference"] as? [String: Any]).map({
-                  Set($0.keys) == referenceKeys
-              }) == true else {
-            throw SwanOperatorAccountBackupError.failed
-        }
-        let wire: Wire
-        do {
-            wire = try JSONDecoder().decode(Wire.self, from: data)
-        } catch {
+              let canonicalHandle = object["canonicalHandle"] as? String,
+              let did = object["did"] as? String,
+              let passwordVerifier = object["passwordVerifier"] as? String,
+              let portableManifestSHA256 = object["portableManifestSHA256"] as? String,
+              let profileID = object["profileID"] as? String,
+              let publicGenesisCommitCID = object["publicGenesisCommitCID"] as? String,
+              let rotationScalarText = object["rotationPrivateScalar"] as? String,
+              let signingScalarText = object["signingPrivateScalar"] as? String,
+              let rotationReferenceObject =
+                object["rotationKeyReference"] as? [String: Any],
+              Set(rotationReferenceObject.keys) == referenceKeys,
+              let signingReferenceObject =
+                object["signingKeyReference"] as? [String: Any],
+              Set(signingReferenceObject.keys) == referenceKeys else {
             throw SwanOperatorAccountBackupError.failed
         }
         guard let signing = SwanOperatorBackupBase64URL.decode(
-                  wire.signingPrivateScalar
+                  signingScalarText
               ),
               let rotation = SwanOperatorBackupBase64URL.decode(
-                  wire.rotationPrivateScalar
+                  rotationScalarText
               ),
-              SwanOperatorBackupBase64URL.encode(signing) == wire.signingPrivateScalar,
-              SwanOperatorBackupBase64URL.encode(rotation) == wire.rotationPrivateScalar else {
+              SwanOperatorBackupBase64URL.encode(signing) == signingScalarText,
+              SwanOperatorBackupBase64URL.encode(rotation) == rotationScalarText else {
             throw SwanOperatorAccountBackupError.failed
         }
+        let signingReference = try decodeReference(signingReferenceObject)
+        let rotationReference = try decodeReference(rotationReferenceObject)
         let secrets = try SwanOperatorAccountSecrets(
-            profileID: wire.profileID,
-            portableManifestSHA256: wire.portableManifestSHA256,
-            did: wire.did,
-            canonicalHandle: wire.canonicalHandle,
-            passwordVerifier: wire.passwordVerifier,
-            publicGenesisCommitCID: wire.publicGenesisCommitCID,
-            signingKeyReference: wire.signingKeyReference,
-            rotationKeyReference: wire.rotationKeyReference,
+            profileID: profileID,
+            portableManifestSHA256: portableManifestSHA256,
+            did: did,
+            canonicalHandle: canonicalHandle,
+            passwordVerifier: passwordVerifier,
+            publicGenesisCommitCID: publicGenesisCommitCID,
+            signingKeyReference: signingReference,
+            rotationKeyReference: rotationReference,
             signingPrivateScalar: signing,
             rotationPrivateScalar: rotation
         )
@@ -703,6 +710,39 @@ private enum SwanOperatorAccountSecretsCodec {
             throw SwanOperatorAccountBackupError.failed
         }
         return secrets
+    }
+
+    private static func referenceObject(
+        _ reference: AccountControlKeyReference
+    ) -> [String: Any] {
+        [
+            "generation": reference.generation,
+            "purpose": reference.purpose.rawValue,
+            "reference": reference.reference,
+        ]
+    }
+
+    private static func decodeReference(
+        _ object: [String: Any]
+    ) throws -> AccountControlKeyReference {
+        guard Set(object.keys) == referenceKeys,
+              let purposeText = object["purpose"] as? String,
+              let purpose = AccountControlKeyReference.Purpose(rawValue: purposeText),
+              let reference = object["reference"] as? String,
+              let generationValue = object["generation"],
+              let generationNumber = generationValue as? NSNumber,
+              let generation = UInt64(generationNumber.stringValue) else {
+            throw SwanOperatorAccountBackupError.failed
+        }
+        do {
+            return try AccountControlKeyReference(
+                purpose: purpose,
+                generation: generation,
+                reference: reference
+            )
+        } catch {
+            throw SwanOperatorAccountBackupError.failed
+        }
     }
 }
 

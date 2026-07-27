@@ -320,27 +320,26 @@ extension SwanCommand {
         var accountKeyDirectory: String?
 
         func run() async throws {
-            // Authorization is deliberately the first operation. No
-            // user-supplied source, output, or key path is standardized,
-            // opened, or otherwise probed before this capability exists.
-            _ = try AccountCommandSupport.authorization(
-                secretFilePath: operatorSecretFile
-            )
-            guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  !did.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  !outputDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  !accountKEKFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  !backupKeyFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  !accountKEKID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  accountKeyDirectory.map({
-                      !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                  }) ?? true else {
-                throw ValidationError("operator backup failed")
-            }
-
             var control: SQLiteControlDatabase?
             var accountDatabase: SQLiteAccountDatabase?
             do {
+                // Authorization remains the first operation. It is inside the
+                // backup error boundary so even its failures collapse to the
+                // command's one safe error without probing another path.
+                _ = try AccountCommandSupport.authorization(
+                    secretFilePath: operatorSecretFile
+                )
+                guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      !did.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      !outputDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      !accountKEKFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      !backupKeyFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      !accountKEKID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      accountKeyDirectory.map({
+                          !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      }) ?? true else {
+                    throw SwanOperatorAccountBackupError.failed
+                }
                 let canonicalDID = try AccountIdentifiers.validateDID(did)
                 let backupKey = try SwanOperatorBackupKey(
                     secretFile: URL(fileURLWithPath: backupKeyFile)
