@@ -370,6 +370,13 @@ public protocol OAuthControlStore: Sendable {
     func cachedClientMetadata(clientID: String, now: Date) async throws -> OAuthCachedClientMetadata?
 
     func storePushedAuthorizationRequest(_ request: OAuthPushedAuthorizationRequest, now: Date) async throws
+    /// Returns an unexpired, unconsumed PAR selected by the keyed digest of
+    /// its opaque request URI. The raw URI and any browser-session material
+    /// never enter durable storage.
+    func activePushedAuthorizationRequest(
+        requestDigest: Data,
+        now: Date
+    ) async throws -> OAuthPushedAuthorizationRequest?
     func consumePushedAuthorizationRequest(
         requestDigest: Data,
         binding: OAuthClientBinding,

@@ -243,6 +243,37 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
         }
     }
 
+    public func activePushedAuthorizationRequest(
+        requestDigest: Data,
+        now: Date = Date()
+    ) async throws -> OAuthPushedAuthorizationRequest? {
+        try validateDigest(requestDigest)
+        return try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                let rows = try await connection.query(
+                    """
+                    SELECT issuer, client_id, redirect_uri, scopes, dpop_jkt,
+                           client_assertion_key_id, client_assertion_algorithm,
+                           client_assertion_jkt, state, state_digest,
+                           code_challenge_method, code_challenge_s256,
+                           expires_at, consumed_at
+                    FROM oauth_control_par_requests
+                    WHERE request_digest = ?
+                    """,
+                    [blob(requestDigest)]
+                )
+                guard let row = rows.first else { return nil }
+                let request = try decodePAR(row, digest: requestDigest)
+                guard request.expiresAt > now,
+                      row.column("consumed_at")?.isNull != false else {
+                    return nil
+                }
+                return request
+            }
+        }
+    }
+
     public func storeAuthorizationCode(
         _ code: OAuthAuthorizationCode,
         now: Date = Date()

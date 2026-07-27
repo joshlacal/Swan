@@ -163,6 +163,49 @@ public actor DurableOAuthTokenService {
         }
     }
 
+    /// Returns the live PAR selected by its opaque request URI without
+    /// consuming it. This is the browser-authorization handoff: the handler
+    /// can render login and consent from durable, DPoP-bound facts, then the
+    /// final consent POST consumes the same binding atomically. Possession of
+    /// the high-entropy request URI is the only lookup capability; its raw
+    /// value is never persisted.
+    public func activePushedAuthorizationRequest(
+        _ requestURI: String,
+        now: Date = Date()
+    ) async throws -> OAuthPushedAuthorizationRequest? {
+        try validateRequestURI(requestURI)
+        do {
+            return try await controlStore.activePushedAuthorizationRequest(
+                requestDigest: digest(requestURI, purpose: .pushedAuthorizationRequest),
+                now: now
+            )
+        } catch {
+            throw secureControlError(error)
+        }
+    }
+
+    /// Consumes a PAR using the exact binding previously returned by
+    /// ``activePushedAuthorizationRequest(_:now:)``. A browser never needs to
+    /// reconstruct a DPoP proof: DPoP was validated at PAR, and the durable
+    /// comparison below proves the approval is still bound to that proof,
+    /// redirect URI, scopes, and (if applicable) confidential-client key.
+    public func consumePushedAuthorizationRequest(
+        _ requestURI: String,
+        binding: OAuthClientBinding,
+        now: Date = Date()
+    ) async throws -> OAuthPushedAuthorizationRequest {
+        try validateRequestURI(requestURI)
+        do {
+            return try await controlStore.consumePushedAuthorizationRequest(
+                requestDigest: digest(requestURI, purpose: .pushedAuthorizationRequest),
+                binding: binding,
+                now: now
+            )
+        } catch {
+            throw secureControlError(error)
+        }
+    }
+
     /// Creates a code whose future token family is already durable. That lets
     /// the store revoke every resulting token if this code is replayed.
     public func issueAuthorizationCode(
@@ -174,11 +217,34 @@ public actor DurableOAuthTokenService {
         familyID: UUID = UUID(),
         now: Date = Date()
     ) async throws -> String {
+        try await issueAuthorizationCode(
+            subject: subject,
+            binding: session.durableBinding,
+            codeChallengeS256: codeChallengeS256,
+            codeLifetime: codeLifetime,
+            refreshLifetime: refreshLifetime,
+            familyID: familyID,
+            now: now
+        )
+    }
+
+    /// Issues an authorization code after a browser approval has consumed a
+    /// persisted PAR. The caller supplies the PAR's durable binding rather
+    /// than strings selected from a form, preserving the DPoP/PKCE/client
+    /// tuple that PAR validated.
+    public func issueAuthorizationCode(
+        subject: String,
+        binding: OAuthClientBinding,
+        codeChallengeS256: String,
+        codeLifetime: TimeInterval = 60,
+        refreshLifetime: TimeInterval = 14 * 24 * 60 * 60,
+        familyID: UUID = UUID(),
+        now: Date = Date()
+    ) async throws -> String {
         guard codeLifetime > 0, refreshLifetime > 0,
               codeLifetime.isFinite, refreshLifetime.isFinite else {
             throw SwanError.malformed("authorization code lifetimes must be positive")
         }
-        let binding = session.durableBinding
         try requireOAuthDPoPBinding(binding)
         let code = Self.randomOpaqueValue()
         let record = OAuthAuthorizationCode(
@@ -449,6 +515,18 @@ public actor DurableOAuthTokenService {
         var input = Data("swan.oauth.\(purpose.rawValue)\u{0}".utf8)
         input.append(contentsOf: rawValue.utf8)
         return Data(HMAC<SHA256>.authenticationCode(for: input, using: macKey))
+    }
+
+    private func validateRequestURI(_ requestURI: String) throws {
+        let prefix = "urn:ietf:params:oauth:request_uri:"
+        guard requestURI.hasPrefix(prefix),
+              requestURI.utf8.count == prefix.utf8.count + 43,
+              requestURI.utf8.dropFirst(prefix.utf8.count).allSatisfy({ byte in
+                  (65 ... 90).contains(byte) || (97 ... 122).contains(byte)
+                      || (48 ... 57).contains(byte) || byte == 45 || byte == 95
+              }) else {
+            throw SwanError.unauthorized("authorization request rejected")
+        }
     }
 
     private func secureControlError(_ error: any Error) -> any Error {

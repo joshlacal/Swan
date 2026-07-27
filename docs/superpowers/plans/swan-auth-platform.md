@@ -77,6 +77,12 @@ production deployment.
   capability—constructs that route's authorizer from its canonical URL and
   OAuth runtime, so the DPoP `htu`, nonce issuer, token service, and handler
   cannot be miswired independently.
+- PAR now has a durable browser-handoff primitive: an opaque request URI can
+  retrieve only its live, unconsumed bound request, and final approval
+  consumes that exact binding before issuing a code. This gives upcoming login
+  and consent routes the original PAR DPoP, PKCE, redirect, scope, and
+  confidential-client-key tuple without persisting browser sessions or
+  reconstructing a DPoP proof from form input.
 
 ## Acceptance gates
 

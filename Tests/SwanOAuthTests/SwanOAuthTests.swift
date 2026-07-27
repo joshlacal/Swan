@@ -332,14 +332,21 @@ final class SwanOAuthTests: XCTestCase {
             codeChallengeS256: challenge,
             now: now
         )
+        let maybeActive = try await service.activePushedAuthorizationRequest(requestURI, now: now)
+        let active = try XCTUnwrap(maybeActive)
+        XCTAssertEqual(active.state, "exact-client-state=alpha")
+        XCTAssertEqual(active.codeChallengeMethod, .s256)
+        XCTAssertEqual(active.binding, session.durableBinding)
         let pushed = try await service.consumePushedAuthorizationRequest(
             requestURI,
-            session: session,
+            binding: active.binding,
             now: now
         )
         XCTAssertEqual(pushed.state, "exact-client-state=alpha")
         XCTAssertEqual(pushed.codeChallengeMethod, .s256)
         XCTAssertEqual(pushed.binding, session.durableBinding)
+        let consumedRequest = try await service.activePushedAuthorizationRequest(requestURI, now: now)
+        XCTAssertNil(consumedRequest)
         await XCTAssertThrowsErrorAsync(
             try await service.consumePushedAuthorizationRequest(requestURI, session: session, now: now)
         )
@@ -358,6 +365,11 @@ final class SwanOAuthTests: XCTestCase {
             lifetime: 1,
             now: now
         )
+        let expiredActiveRequest = try await service.activePushedAuthorizationRequest(
+            expiredRequest,
+            now: now.addingTimeInterval(2)
+        )
+        XCTAssertNil(expiredActiveRequest)
         await XCTAssertThrowsErrorAsync(
             try await service.consumePushedAuthorizationRequest(
                 expiredRequest,
@@ -368,8 +380,8 @@ final class SwanOAuthTests: XCTestCase {
 
         let code = try await service.issueAuthorizationCode(
             subject: "did:plc:alice",
-            session: session,
-            codeChallengeS256: challenge,
+            binding: pushed.binding,
+            codeChallengeS256: pushed.codeChallengeS256,
             now: now
         )
         let tokens = try await service.redeemAuthorizationCode(
