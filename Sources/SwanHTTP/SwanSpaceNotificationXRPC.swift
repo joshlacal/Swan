@@ -518,7 +518,7 @@ private func serviceAuthentication(
 ) async throws -> VerifiedSpaceServiceAuthentication {
     let compact: String
     do {
-        compact = try exactServiceBearerToken(from: request.headers)
+        compact = try exactSpaceServiceBearerToken(from: request.headers)
         return try await capability.serviceAuthentication.authenticate(
             compact,
             expectedAudience: expectedAudience,
@@ -537,22 +537,25 @@ private func serviceAuthentication(
     }
 }
 
-private func exactServiceBearerToken(from headers: HTTPFields) throws -> String {
+/// Parses the only authorization presentation accepted by service-auth XRPC
+/// endpoints. OAuth DPoP and generic Bearer credentials never fall through:
+/// callers must supply exactly one bounded compact service JWT.
+func exactSpaceServiceBearerToken(from headers: HTTPFields) throws -> String {
     let values = headers[values: .authorization]
     guard values.count == 1,
           let raw = values.first else {
-        throw AuthenticatedSpaceNotificationFailure.denied
+        throw SwanError.unauthorized("service authentication is invalid")
     }
     let prefix = "Bearer "
     guard raw.count >= prefix.count,
           raw.prefix(prefix.count).caseInsensitiveCompare(prefix) == .orderedSame else {
-        throw AuthenticatedSpaceNotificationFailure.denied
+        throw SwanError.unauthorized("service authentication is invalid")
     }
     let token = String(raw.dropFirst(prefix.count))
     guard !token.isEmpty,
           token.utf8.count <= SpaceServiceJWT.maximumCompactBytes,
           token.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
-        throw AuthenticatedSpaceNotificationFailure.denied
+        throw SwanError.unauthorized("service authentication is invalid")
     }
     return token
 }

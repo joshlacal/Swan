@@ -182,6 +182,28 @@ public struct SwanSpaceNotificationHTTPConfiguration: Sendable {
     }
 }
 
+/// Explicitly enables Swan's generic managing-app response for
+/// `com.atproto.simplespace.checkUserAccess`.  It deliberately contains no
+/// account directory, authority policy, or repository capability: a generic
+/// PDS can verify who called it, but cannot make an application-policy grant.
+public struct SwanSimpleSpaceCheckUserAccessHTTPConfiguration: Sendable {
+    let serviceAuthentication: any SpaceServiceAuthenticationVerifier
+    let managingServiceAudience: String
+
+    public init(
+        serviceAuthentication: any SpaceServiceAuthenticationVerifier,
+        managingServiceAudience: String
+    ) throws {
+        guard !managingServiceAudience.isEmpty,
+              managingServiceAudience.utf8.count <= 2_048,
+              managingServiceAudience.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+            throw SwanError.malformed("managing service audience is invalid")
+        }
+        self.serviceAuthentication = serviceAuthentication
+        self.managingServiceAudience = managingServiceAudience
+    }
+}
+
 public struct SwanHTTPServer: Sendable {
     public let profile: ProtocolProfile
     public let configuration: SwanHTTPConfiguration
@@ -240,6 +262,10 @@ public struct SwanHTTPServer: Sendable {
     /// notification receivers. It is closed unless both an exact preopened
     /// notification directory and local/pinned service verifier are supplied.
     public let authenticatedSpaceNotifications: SwanAuthenticatedSpaceNotificationsCapability?
+    /// The standalone managing-app service-auth endpoint. Unlike authority
+    /// routes, this has no storage dependency and always returns the pinned
+    /// generic PDS denial after authenticating its service caller.
+    public let simpleSpaceCheckUserAccess: SwanSimpleSpaceCheckUserAccessCapability?
 
     public init(
         profile: ProtocolProfile,
@@ -255,12 +281,21 @@ public struct SwanHTTPServer: Sendable {
         spaceCredentialConfiguration: SwanSpaceCredentialHTTPConfiguration? = nil,
         spaceDelegationConfiguration: SwanSpaceDelegationHTTPConfiguration? = nil,
         spaceRepositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration? = nil,
-        spaceNotificationConfiguration: SwanSpaceNotificationHTTPConfiguration? = nil
+        spaceNotificationConfiguration: SwanSpaceNotificationHTTPConfiguration? = nil,
+        simpleSpaceCheckUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
         self.repositories = repositories
         self.oauthRuntime = oauthRuntime
+        if let simpleSpaceCheckUserAccessConfiguration {
+            simpleSpaceCheckUserAccess = SwanSimpleSpaceCheckUserAccessCapability(
+                serviceAuthentication: simpleSpaceCheckUserAccessConfiguration.serviceAuthentication,
+                managingServiceAudience: simpleSpaceCheckUserAccessConfiguration.managingServiceAudience
+            )
+        } else {
+            simpleSpaceCheckUserAccess = nil
+        }
         // A caller may not smuggle metadata publication through a partial
         // assembly. Only the complete remote authorization-server config can
         // publish discovery; all other inputs remain closed by default.
@@ -641,6 +676,12 @@ public struct SwanHTTPServer: Sendable {
                 registerAuthenticatedNotifySpaceDeletedEndpoint(
                     on: router,
                     capability: authenticatedSpaceNotifications
+                )
+            } else if descriptor.nsid == ComAtprotoSimplespaceCheckUserAccess.typeIdentifier,
+                      let simpleSpaceCheckUserAccess {
+                registerSimpleSpaceCheckUserAccessEndpoint(
+                    on: router,
+                    capability: simpleSpaceCheckUserAccess
                 )
             } else if let authenticatedSimpleSpaceLifecycle,
                       Self.isSimpleSpaceLifecycleMethod(descriptor.nsid) {
