@@ -35,7 +35,11 @@ Catbird UI work.
 - `c7403e5b` aligns the generated incremental-op contract with required-null
   CIDs for deletes.
 - Existing HTTP endpoints intentionally return generic authorization errors or
-  `profile_endpoint_pending`; they are not interop evidence.
+  `profile_endpoint_pending`; they are not interop evidence. In particular,
+  pinned TypeScript `com.atproto.space.getSpace` is an authenticated,
+  authority-only query, so Swan must not publish its policy or client
+  configuration until the DPoP-bound resource authorization and pre-migrated
+  account-directory boundaries are installed.
 
 ## Acceptance gates
 

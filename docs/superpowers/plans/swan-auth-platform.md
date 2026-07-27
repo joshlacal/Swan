@@ -44,12 +44,18 @@ production deployment.
   DPoP nonce/replay validation. Discovery, authorization, token, and
   revocation routes remain unavailable; PAR success is not a claim of a
   complete authorization server.
+- The protected-resource foundation accepts only one DPoP authorization
+  credential and proof, binds the proof to a configured route target and
+  access-token hash, checks the durable token-family JKT, and rechecks the
+  account lifecycle before it can create `AuthorizationContext.accountOAuth`.
+  It is not registered on an XRPC route yet.
 - The account suite passes locally. Its native-library portability remains an
   explicit gate: local macOS testing uses Homebrew libsodium include/library
   paths, and Linux plus the minimum supported macOS have not yet been run.
 - `OAuthTokenVault` and memory-only DPoP replay are compatibility scaffolds,
-  not sufficient durable authorization state. The next implementation unit is
-  the `control.sqlite` OAuth store with atomic token-family semantics.
+  not sufficient durable authorization state. The next HTTP unit must combine
+  this resource boundary with a pre-migrated account-directory read path;
+  request handling must never create or migrate an account database.
 
 ## Acceptance gates
 

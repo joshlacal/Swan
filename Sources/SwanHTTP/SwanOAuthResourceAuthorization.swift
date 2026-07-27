@@ -1,0 +1,304 @@
+import Foundation
+import Hummingbird
+import HTTPTypes
+import SwanCore
+import SwanOAuth
+import SwanSpaces
+import SwanStorage
+
+/// The only failures a future resource HTTP adapter needs to render. They do
+/// not carry a token, DPoP proof, JTI, account identifier, or storage detail.
+///
+/// A missing or structurally unusable proof receives a fresh nonce challenge.
+/// Once a proof has enough structure to attempt validation, every invalid,
+/// expired, replayed, token-binding, and account-lifecycle predicate becomes
+/// the same denial. This avoids turning the protected-resource boundary into
+/// a DPoP or account-status oracle.
+public enum SwanResourceAuthorizationFailure: Error, Sendable, Equatable {
+    case nonceChallengeRequired
+    case denied
+    case unavailable
+}
+
+/// Validates sender-constrained OAuth access for a *preselected* resource
+/// route. This is deliberately not Hummingbird middleware: callers must pass
+/// the route's fixed method and path, which prevents a hostile `Host` header
+/// or request target from becoming the DPoP `htu` binding.
+///
+/// The authorizer knows only the durable control plane. In particular it has
+/// no account-repository store and never opens an account database.
+public struct SwanOAuthResourceAuthorizer: Sendable {
+    /// The maximum accepted opaque access-token representation. The service
+    /// does not parse the token, but it bounds it before hashing and querying
+    /// durable control state.
+    public static let maximumAccessTokenBytes = 8 * 1024
+    /// Matches the compact-JWT bound enforced by `OAuthCompactJWT` while
+    /// rejecting an oversized header before any proof parsing or persistence.
+    public static let maximumDPoPProofBytes = 32 * 1024
+
+    private let publicURL: URL
+    private let runtime: SwanOAuthRuntime
+    private let accountControlStore: any AccountControlStore
+
+    /// `publicURL` is the process's configured canonical public identity, not
+    /// a request-derived origin. It must be a scheme/host root URL so each
+    /// caller-provided fixed path has one unambiguous DPoP target.
+    public init(
+        publicURL: URL,
+        runtime: SwanOAuthRuntime,
+        accountControlStore: any AccountControlStore
+    ) throws {
+        guard Self.validPublicURL(publicURL) else {
+            throw SwanError.malformed("resource authorization public URL is invalid")
+        }
+        self.publicURL = publicURL
+        self.runtime = runtime
+        self.accountControlStore = accountControlStore
+    }
+
+    /// Returns only a domain authorization context. A raw opaque token, a
+    /// parsed subject, or a DPoP JKT is never treated as authorization on its
+    /// own: all three durable/token/lifecycle checks must complete first.
+    ///
+    /// - Parameters:
+    ///   - request: Used solely for `Authorization` and `DPoP` headers. Its
+    ///     URI and Host/authority are intentionally ignored.
+    ///   - method: The exact method registered by the eventual route.
+    ///   - fixedPath: The exact route path registered by the eventual route.
+    public func authorize(
+        request: Request,
+        method: String,
+        fixedPath: String,
+        now: Date = Date()
+    ) async throws -> AuthorizationContext {
+        let accessToken: String
+        do {
+            accessToken = try Self.accessToken(from: request.headers)
+        } catch {
+            throw SwanResourceAuthorizationFailure.denied
+        }
+
+        // Do all no-side-effect header and nonce-shape work before invoking
+        // the validator. The validator's replay reservation is therefore
+        // never reached for a missing/malformed header or nonce candidate.
+        guard let proof = Self.dpopProof(from: request.headers),
+              let presentedNonce = Self.untrustedNonce(from: proof) else {
+            throw SwanResourceAuthorizationFailure.nonceChallengeRequired
+        }
+
+        let target: URL
+        do {
+            target = try Self.target(publicURL: publicURL, fixedPath: fixedPath)
+            try Self.validateFixedMethod(method)
+        } catch {
+            // An invalid fixed route is a deployment/programming mistake, but
+            // it still must not turn a request into a proof predicate oracle.
+            throw SwanResourceAuthorizationFailure.denied
+        }
+
+        let proofBinding: OAuthValidatedDPoPProof
+        do {
+            let validator = try OAuthDPoPProofValidator(runtime: runtime)
+            proofBinding = try await validator.validate(
+                proof,
+                request: OAuthDPoPRequest(
+                    method: method,
+                    target: target,
+                    serverNonce: presentedNonce,
+                    accessToken: accessToken,
+                    requiresAccessTokenHash: true
+                ),
+                now: now
+            )
+        } catch {
+            throw Self.proofFailure(for: error)
+        }
+
+        let grant: DurableOAuthTokenService.AccessGrant
+        do {
+            // Validate only after the DPoP proof has verified its method,
+            // configured htu, nonce, ath, and replay reservation. This keeps
+            // the opaque token permanently sender constrained.
+            grant = try await runtime.tokenService.validateAccess(
+                accessToken,
+                proof: proofBinding,
+                now: now
+            )
+        } catch {
+            throw Self.durableOrDeniedFailure(for: error)
+        }
+
+        // Issuance requires `atproto`, but token families are durable input at
+        // this boundary. Do not let a malformed or legacy stored binding
+        // bypass the resource-profile scope requirement merely because its
+        // DPoP proof and opaque token digest were otherwise valid.
+        guard grant.scopes.contains("atproto") else {
+            throw SwanResourceAuthorizationFailure.denied
+        }
+
+        do {
+            guard let account = try await accountControlStore.account(did: grant.subject),
+                  account.status.authorizesAccount else {
+                throw SwanResourceAuthorizationFailure.denied
+            }
+        } catch let failure as SwanResourceAuthorizationFailure {
+            throw failure
+        } catch {
+            throw Self.accountFailure(for: error)
+        }
+
+        return .accountOAuth(subject: grant.subject, scopes: grant.scopes)
+    }
+
+    private static func accessToken(from headers: HTTPFields) throws -> String {
+        let values = headers[values: .authorization]
+        guard values.count == 1 else { throw HeaderError.malformed }
+        let value = values[0]
+        let prefix = "DPoP "
+        guard value.hasPrefix(prefix) else { throw HeaderError.malformed }
+        let token = String(value.dropFirst(prefix.count))
+        guard token.utf8.count > 0,
+              token.utf8.count <= maximumAccessTokenBytes,
+              validToken68(token) else {
+            throw HeaderError.malformed
+        }
+        return token
+    }
+
+    /// RFC 9110 token68 is the one Authorization credential grammar that can
+    /// represent Swan's opaque tokens without admitting whitespace, parameter
+    /// delimiters, or quoted-string syntax into a supposedly single token.
+    /// `=` is padding only, and therefore may appear only after all payload
+    /// characters. Swan currently issues URL-safe values, while this accepts
+    /// the full token68 alphabet for future compatible opaque issuers.
+    private static func validToken68(_ token: String) -> Bool {
+        var sawPadding = false
+        var sawPayload = false
+        for byte in token.utf8 {
+            switch byte {
+            case UInt8(ascii: "A") ... UInt8(ascii: "Z"),
+                 UInt8(ascii: "a") ... UInt8(ascii: "z"),
+                 UInt8(ascii: "0") ... UInt8(ascii: "9"),
+                 UInt8(ascii: "-"), UInt8(ascii: "."), UInt8(ascii: "_"),
+                 UInt8(ascii: "~"), UInt8(ascii: "+"), UInt8(ascii: "/"):
+                guard !sawPadding else { return false }
+                sawPayload = true
+            case UInt8(ascii: "="):
+                guard sawPayload else { return false }
+                sawPadding = true
+            default:
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func dpopProof(from headers: HTTPFields) -> String? {
+        let name = HTTPField.Name("DPoP")!
+        let values = headers[values: name]
+        guard values.count == 1,
+              !values[0].isEmpty,
+              values[0].utf8.count <= maximumDPoPProofBytes,
+              values[0].utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+            return nil
+        }
+        return values[0]
+    }
+
+    /// Reads a nonce only as an untrusted candidate. The proof validator
+    /// later verifies the compact JWT, duplicate-member-free claims, nonce
+    /// MAC/lifetime, and exact signed nonce equality. This mirrors the PAR
+    /// bridge's deliberately narrow pre-validation parse.
+    private static func untrustedNonce(from proof: String) -> String? {
+        struct UntrustedNonce: Decodable {
+            let nonce: String
+        }
+
+        let parts = proof.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+              let payload = try? OAuthBase64URL.decode(String(parts[1]), maxBytes: 16_384),
+              let claims = try? JSONDecoder().decode(UntrustedNonce.self, from: payload),
+              !claims.nonce.isEmpty,
+              claims.nonce.utf8.count <= 4_096,
+              !claims.nonce.utf8.contains(0) else {
+            return nil
+        }
+        return claims.nonce
+    }
+
+    private static func validPublicURL(_ url: URL) -> Bool {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              components.host != nil,
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil,
+              components.percentEncodedPath.isEmpty || components.percentEncodedPath == "/" else {
+            return false
+        }
+        return true
+    }
+
+    private static func target(publicURL: URL, fixedPath: String) throws -> URL {
+        guard fixedPath.utf8.count > 0,
+              fixedPath.utf8.count <= 4_096,
+              fixedPath.hasPrefix("/"),
+              !fixedPath.contains("?"), !fixedPath.contains("#"),
+              fixedPath.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+            throw SwanError.malformed("resource authorization fixed path is invalid")
+        }
+        guard var components = URLComponents(url: publicURL, resolvingAgainstBaseURL: false) else {
+            throw SwanError.malformed("resource authorization public URL is invalid")
+        }
+        components.percentEncodedPath = fixedPath
+        components.query = nil
+        components.fragment = nil
+        guard let target = components.url else {
+            throw SwanError.malformed("resource authorization target is invalid")
+        }
+        return target
+    }
+
+    private static func validateFixedMethod(_ method: String) throws {
+        guard !method.isEmpty, method.utf8.count <= 32,
+              method == method.uppercased(),
+              method.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+            throw SwanError.malformed("resource authorization fixed method is invalid")
+        }
+    }
+
+    private static func proofFailure(for error: any Error) -> SwanResourceAuthorizationFailure {
+        if let swanError = error as? SwanError, case .unavailable = swanError {
+            return .unavailable
+        }
+        // `OAuthDPoPProofValidator` maps its durable replay write failures to
+        // SwanError.unavailable. Everything else is an intentionally opaque
+        // proof denial, including expiry and replay.
+        return .denied
+    }
+
+    private static func durableOrDeniedFailure(for error: any Error) -> SwanResourceAuthorizationFailure {
+        if let swanError = error as? SwanError, case .unavailable = swanError {
+            return .unavailable
+        }
+        return .denied
+    }
+
+    private static func accountFailure(for error: any Error) -> SwanResourceAuthorizationFailure {
+        guard let controlError = error as? AccountControlStoreError else {
+            // This call is exclusively durable control-plane I/O. Never leak
+            // a backend/serialization error through a resource response.
+            return .unavailable
+        }
+        switch controlError {
+        case .unavailable, .malformedRecord:
+            return .unavailable
+        case .notFound, .duplicateDID, .duplicateHandle, .invalidInput,
+                .invalidStatus, .invalidTransition:
+            return .denied
+        }
+    }
+
+    private enum HeaderError: Error {
+        case malformed
+    }
+}
