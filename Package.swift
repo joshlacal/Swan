@@ -194,8 +194,13 @@ let package = Package(
         .testTarget(
             name: "SwanAccountsTests",
             dependencies: [
-                "SwanAccounts", "SwanCore", "SwanPublicRepository", "SwanStorage", "SwanSQLite",
+                "CATHandleDNS", "SwanAccounts", "SwanCore", "SwanPublicRepository", "SwanStorage",
+                "SwanSQLite",
                 .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl"),
                 .product(name: "Petrel", package: "Petrel"),
                 .product(name: "SQLiteNIO", package: "sqlite-nio"),
             ]

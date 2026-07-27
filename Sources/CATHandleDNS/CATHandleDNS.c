@@ -1,32 +1,25 @@
 #include "CATHandleDNS.h"
 
 #include <arpa/nameser.h>
+#include <limits.h>
 #include <resolv.h>
 #include <string.h>
 
-int swan_at_handle_query_txt(
-    const char *name,
+int swan_at_handle_parse_txt_response(
+    const uint8_t *response,
+    size_t response_length,
     uint8_t *output,
     size_t output_capacity
 ) {
-    if (name == NULL || output == NULL || output_capacity == 0) {
+    if (
+        response == NULL || response_length == 0 || response_length > INT_MAX ||
+        output == NULL || output_capacity == 0
+    ) {
         return -2;
     }
 
-    unsigned char answer[65536];
-    int answer_length = res_query(
-        name,
-        ns_c_in,
-        ns_t_txt,
-        answer,
-        (int)sizeof(answer)
-    );
-    if (answer_length < 0) {
-        return -1;
-    }
-
     ns_msg message;
-    if (ns_initparse(answer, answer_length, &message) < 0) {
+    if (ns_initparse(response, (int)response_length, &message) < 0) {
         return -2;
     }
 
@@ -79,4 +72,32 @@ int swan_at_handle_query_txt(
         }
     }
     return (int)written;
+}
+
+int swan_at_handle_query_txt(
+    const char *name,
+    uint8_t *output,
+    size_t output_capacity
+) {
+    if (name == NULL || output == NULL || output_capacity == 0) {
+        return -2;
+    }
+
+    unsigned char answer[65536];
+    int answer_length = res_query(
+        name,
+        ns_c_in,
+        ns_t_txt,
+        answer,
+        (int)sizeof(answer)
+    );
+    if (answer_length < 0) {
+        return -1;
+    }
+    return swan_at_handle_parse_txt_response(
+        answer,
+        (size_t)answer_length,
+        output,
+        output_capacity
+    );
 }

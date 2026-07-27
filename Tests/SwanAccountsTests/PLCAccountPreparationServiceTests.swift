@@ -782,6 +782,64 @@ final class PLCAccountActivationServiceTests: XCTestCase {
         try await fixture.close()
     }
 
+    func testSensitiveActivationInputsNeverReachPersistenceOrOpaqueErrors() async throws {
+        let fixture = try await ActivationFixture(requestID: "activate-sensitive")
+        defer { fixture.removeFiles() }
+        let password = "task15-raw-password-sentinel-7f4c"
+        let dnsSentinel = "task15-dns-response-sentinel-91ab"
+        let httpSentinel = "task15-http-body-sentinel-2de0"
+        let signingMaterial = try await fixture.preparation.keyStore.key(
+            for: fixture.identity.signingReference
+        )
+        let rotationMaterial = try await fixture.preparation.keyStore.key(
+            for: fixture.identity.rotationReference
+        )
+        let sensitiveVerifier = ActivationHandleVerifier(mode: .sensitiveFailure)
+
+        do {
+            _ = try await fixture.activation(
+                handleVerifier: sensitiveVerifier
+            ).activate(
+                requestID: "activate-sensitive",
+                password: password
+            )
+            XCTFail("expected sensitive verifier failure")
+        } catch {
+            XCTAssertEqual(
+                error as? PLCAccountActivationError,
+                .unavailable
+            )
+            let description = String(describing: error)
+            XCTAssertFalse(description.contains(dnsSentinel))
+            XCTAssertFalse(description.contains(httpSentinel))
+            XCTAssertFalse(description.contains(password))
+        }
+
+        _ = try await fixture.activation(
+            handleVerifier: ActivationHandleVerifier(mode: .success)
+        ).activate(
+            requestID: "activate-sensitive",
+            password: password
+        )
+        let forbidden = [
+            ("password", Data(password.utf8)),
+            ("signing key", signingMaterial),
+            ("rotation key", rotationMaterial),
+            ("DNS response", Data(dnsSentinel.utf8)),
+            ("HTTP body", Data(httpSentinel.utf8)),
+        ]
+        for file in try regularFiles(under: fixture.preparation.root) {
+            let bytes = try Data(contentsOf: file)
+            for (name, sentinel) in forbidden {
+                XCTAssertNil(
+                    bytes.range(of: sentinel),
+                    "\(name) leaked to \(file.lastPathComponent)"
+                )
+            }
+        }
+        try await fixture.close()
+    }
+
     private func assertActivationError<T>(
         _ expression: @autoclosure () async throws -> T,
         expected: PLCAccountActivationError,
@@ -799,6 +857,30 @@ final class PLCAccountActivationServiceTests: XCTestCase {
                 line: line
             )
         }
+    }
+
+    private func regularFiles(under root: URL) throws -> [URL] {
+        let keys: [URLResourceKey] = [
+            .isRegularFileKey,
+            .isSymbolicLinkKey,
+        ]
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: keys,
+            options: [.skipsHiddenFiles]
+        ) else {
+            throw SwanError.unavailable("test persistence inventory unavailable")
+        }
+        var files: [URL] = []
+        for case let file as URL in enumerator {
+            let values = try file.resourceValues(forKeys: Set(keys))
+            guard values.isSymbolicLink != true,
+                  values.isRegularFile == true else {
+                continue
+            }
+            files.append(file)
+        }
+        return files
     }
 }
 
@@ -835,12 +917,19 @@ private final class ActivationFixture: @unchecked Sendable {
     func activation(
         hooks: PLCAccountActivationHooks = .init()
     ) -> PLCAccountActivationService {
+        activation(handleVerifier: verifier, hooks: hooks)
+    }
+
+    func activation(
+        handleVerifier: any PLCHandleVerifying,
+        hooks: PLCAccountActivationHooks = .init()
+    ) -> PLCAccountActivationService {
         PLCAccountActivationService(
             intentStore: preparation.control,
             accountStoreOpener: preparation.opener,
             keyStore: preparation.keyStore,
             plcClient: preparation.plc,
-            handleVerifier: verifier,
+            handleVerifier: handleVerifier,
             directory: directory,
             hooks: hooks
         )
@@ -859,6 +948,7 @@ private actor ActivationHandleVerifier: PLCHandleVerifying {
     enum Mode: Sendable {
         case success
         case failure
+        case sensitiveFailure
     }
 
     let mode: Mode
@@ -880,6 +970,12 @@ private actor ActivationHandleVerifier: PLCHandleVerifying {
         if let transactionProbe {
             transactionResults.append(await transactionProbe())
         }
+        if mode == .sensitiveFailure {
+            throw SensitiveHandleTransportError(
+                dnsResponse: "task15-dns-response-sentinel-91ab",
+                httpBody: "task15-http-body-sentinel-2de0"
+            )
+        }
         guard mode == .success else {
             throw ATHandleVerificationError.verificationFailed
         }
@@ -900,6 +996,17 @@ private actor ActivationHandleVerifier: PLCHandleVerifying {
 
     func allTransactionProbesWereClear() -> Bool {
         !transactionResults.isEmpty && transactionResults.allSatisfy(\.self)
+    }
+}
+
+private struct SensitiveHandleTransportError: Error, Sendable,
+    CustomStringConvertible
+{
+    let dnsResponse: String
+    let httpBody: String
+
+    var description: String {
+        "sensitive handle fixture \(dnsResponse) \(httpBody)"
     }
 }
 

@@ -2448,6 +2448,14 @@ final class SwanSQLiteTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? AccountControlStoreError, .invalidInput)
         }
+        XCTAssertThrowsError(
+            try controlRegistration(
+                did: "did:plc:abcdefghijklmnopqrstuvwx",
+                handle: "alice.3com"
+            )
+        ) { error in
+            XCTAssertEqual(error as? AccountControlStoreError, .invalidInput)
+        }
         await XCTAssertThrowsErrorAsync(
             try await database.createAccount(
                 AccountControlRegistration(

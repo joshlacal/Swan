@@ -98,16 +98,39 @@ public enum ATHandleIPAddress: Hashable, Sendable, Equatable, CustomStringConver
                 return Self.ipv4(mapped).isPublicInternetAddress
             }
             guard bytes[0] & 0xe0 == 0x20 else { return false }
-            if bytes[0] == 0x20, bytes[1] == 0x01,
-               bytes[2] == 0x0d, bytes[3] == 0xb8 {
-                return false
+            // IANA IPv6 Special-Purpose Address Registry, last updated
+            // 2025-10-09. Swan deliberately rejects the whole 2001::/23
+            // protocol-assignment umbrella instead of maintaining exceptions
+            // for protocol anycast/tunneling ranges as fetch destinations.
+            let deniedSpecialPurposePrefixes: [(Data, Int)] = [
+                (Data([0x20, 0x01, 0x00]), 23),       // IETF assignments
+                (Data([0x20, 0x01, 0x0d, 0xb8]), 32), // documentation
+                (Data([0x20, 0x02]), 16),             // 6to4
+                (Data([0x3f, 0xff, 0x00]), 20),       // documentation
+            ]
+            return !deniedSpecialPurposePrefixes.contains {
+                Self.ipv6(bytes, hasPrefix: $0.0, bitCount: $0.1)
             }
-            if bytes[0] == 0x20, bytes[1] == 0x01,
-               bytes[2] == 0x00, bytes[3] < 0x20 {
-                return false
-            }
-            return true
         }
+    }
+
+    private static func ipv6(
+        _ address: Data,
+        hasPrefix prefix: Data,
+        bitCount: Int
+    ) -> Bool {
+        guard address.count == 16, bitCount >= 0,
+              bitCount <= prefix.count * 8 else {
+            return false
+        }
+        let wholeBytes = bitCount / 8
+        guard address.prefix(wholeBytes) == prefix.prefix(wholeBytes) else {
+            return false
+        }
+        let remainingBits = bitCount % 8
+        guard remainingBits > 0 else { return true }
+        let mask = UInt8.max << (8 - remainingBits)
+        return address[wholeBytes] & mask == prefix[wholeBytes] & mask
     }
 }
 

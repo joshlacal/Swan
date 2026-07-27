@@ -1,3 +1,4 @@
+import CATHandleDNS
 import Foundation
 @testable import SwanAccounts
 import XCTest
@@ -59,6 +60,83 @@ final class ATHandleVerificationTests: XCTestCase {
             XCTAssertEqual(txtNames, [])
             XCTAssertEqual(requests, [])
         }
+    }
+
+    func testNumericLeadingTLDIsRejectedBeforeNetwork() async throws {
+        let dns = FakeHandleDNS(txt: [], addresses: [])
+        let http = FakeHandleHTTP([])
+        await assertVerificationFailure(
+            try await verifier(dns: dns, http: http).verify(
+                plcState: state(handle: "alice.3com"),
+                expectedDID: did,
+                handle: "alice.3com",
+                pdsOrigin: "https://pds.example.org"
+            )
+        )
+        let txtNames = await dns.txtNames()
+        let requests = await http.requests()
+        XCTAssertEqual(txtNames, [])
+        XCTAssertEqual(requests, [])
+    }
+
+    func testProductionIPv6PolicyRejectsCurrentSpecialPurposeRanges() throws {
+        for literal in [
+            "2001::1",       // IETF protocol assignments
+            "2001:db8::1",   // documentation
+            "2002::1",       // 6to4
+            "3fff::1",       // documentation
+            "3fff:fff::1",   // upper edge of 3fff::/20
+        ] {
+            let address = try XCTUnwrap(ATHandleIPAddress(literal: literal))
+            XCTAssertFalse(address.isPublicInternetAddress, literal)
+        }
+        XCTAssertTrue(
+            try XCTUnwrap(
+                ATHandleIPAddress(literal: "2606:4700:4700::1111")
+            ).isPublicInternetAddress
+        )
+        let loopback = try XCTUnwrap(ATHandleIPAddress(literal: "::1"))
+        XCTAssertTrue(loopback.isLoopback)
+        XCTAssertFalse(loopback.isPublicInternetAddress)
+    }
+
+    func testPortableTXTParserCombinesChunksAndRejectsMalformedWireData() throws {
+        let response = dnsTXTResponse(chunks: [
+            Data("did=".utf8),
+            Data(did.utf8),
+        ])
+        var output = [UInt8](repeating: 0, count: 128)
+        let count = response.withUnsafeBufferPointer { input in
+            output.withUnsafeMutableBufferPointer { destination in
+                swan_at_handle_parse_txt_response(
+                    input.baseAddress,
+                    input.count,
+                    destination.baseAddress,
+                    destination.count
+                )
+            }
+        }
+        let payload = Data("did=\(did)".utf8)
+        XCTAssertEqual(Int(count), payload.count + 2)
+        XCTAssertEqual(
+            Data(output.prefix(Int(count))),
+            Data([UInt8(payload.count >> 8), UInt8(payload.count & 0xff)])
+                + payload
+        )
+
+        var malformed = response
+        malformed[malformed.count - did.utf8.count - 1] = 0xff
+        let malformedResult = malformed.withUnsafeBufferPointer { input in
+            output.withUnsafeMutableBufferPointer { destination in
+                swan_at_handle_parse_txt_response(
+                    input.baseAddress,
+                    input.count,
+                    destination.baseAddress,
+                    destination.count
+                )
+            }
+        }
+        XCTAssertLessThan(malformedResult, 0)
     }
 
     func testLaboratoryTestHandleUsesConfiguredLiteralLoopbackOrigin() async throws {
@@ -190,11 +268,19 @@ final class ATHandleVerificationTests: XCTestCase {
 
     func testPrivateReboundAndMissingPeerResponsesFailClosed() async throws {
         let privatePeer = ATHandleIPAddress(literal: "10.0.0.1")!
+        let documentationPeer = ATHandleIPAddress(literal: "3fff::1")!
         let cases: [(FakeHandleDNS, FakeHandleHTTP)] = [
             (
                 FakeHandleDNS(
                     txt: [.success([])],
                     addresses: [.success([privatePeer])]
+                ),
+                FakeHandleHTTP([])
+            ),
+            (
+                FakeHandleDNS(
+                    txt: [.success([])],
+                    addresses: [.success([documentationPeer])]
                 ),
                 FakeHandleHTTP([])
             ),
@@ -343,6 +429,38 @@ final class ATHandleVerificationTests: XCTestCase {
                 ),
             ]
         )
+    }
+
+    private func dnsTXTResponse(chunks: [Data]) -> [UInt8] {
+        var question: [UInt8] = []
+        for label in ["_atproto", "alice", "example", "org"] {
+            question.append(UInt8(label.utf8.count))
+            question.append(contentsOf: label.utf8)
+        }
+        question.append(0)
+        question.append(contentsOf: [0, 16, 0, 1])
+
+        var rdata: [UInt8] = []
+        for chunk in chunks {
+            precondition(chunk.count <= 255)
+            rdata.append(UInt8(chunk.count))
+            rdata.append(contentsOf: chunk)
+        }
+        var response: [UInt8] = [
+            0x12, 0x34, 0x81, 0x80,
+            0x00, 0x01, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00,
+        ]
+        response.append(contentsOf: question)
+        response.append(contentsOf: [
+            0xc0, 0x0c,
+            0x00, 0x10,
+            0x00, 0x01,
+            0x00, 0x00, 0x00, 0x3c,
+            UInt8(rdata.count >> 8), UInt8(rdata.count & 0xff),
+        ])
+        response.append(contentsOf: rdata)
+        return response
     }
 
     private func txt(_ value: String) throws -> ATHandleTXTRecord {

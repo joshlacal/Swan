@@ -48,6 +48,9 @@ public enum AccountIdentifiers {
 
         let canonical = handle.lowercased()
         let labels = canonical.split(separator: ".", omittingEmptySubsequences: false)
+        let finalLabelStartsWithASCIIAlpha = labels.last?.utf8.first.map {
+            ($0 >= 97 && $0 <= 122)
+        } == true
         guard labels.count >= 2,
               labels.allSatisfy({
                   !$0.isEmpty
@@ -55,7 +58,7 @@ public enum AccountIdentifiers {
                       && $0.first != "-"
                       && $0.last != "-"
               }),
-              labels.last?.allSatisfy(\.isNumber) == false else {
+              finalLabelStartsWithASCIIAlpha else {
             throw SwanError.invalidIdentifier("account handle")
         }
         return canonical

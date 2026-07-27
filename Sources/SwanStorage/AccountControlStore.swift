@@ -621,9 +621,12 @@ enum AccountControlMetadata {
             return false
         }
         let labels = name.split(separator: ".", omittingEmptySubsequences: false)
+        let finalLabelStartsWithASCIIAlpha = labels.last?.utf8.first.map {
+            ($0 >= 97 && $0 <= 122)
+        } == true
         return labels.count >= 2 && labels.allSatisfy {
             !$0.isEmpty && $0.utf8.count <= 63 && $0.first != "-" && $0.last != "-"
-        } && labels.last?.allSatisfy(\.isNumber) == false
+        } && finalLabelStartsWithASCIIAlpha
     }
 
     private static func isCanonicalWebPathSegment(_ segment: Substring) -> Bool {

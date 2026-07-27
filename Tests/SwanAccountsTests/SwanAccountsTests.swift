@@ -172,6 +172,7 @@ final class SwanAccountsTests: XCTestCase {
             "alice..example.com",
             "-alice.example.com",
             "alice.example.123",
+            "alice.3com",
             "álîce.example.com",
             "alice.example.com\u{0}",
         ] {

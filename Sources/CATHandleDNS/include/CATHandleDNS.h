@@ -14,4 +14,14 @@ int swan_at_handle_query_txt(
     size_t output_capacity
 );
 
+/// Parses one complete DNS wire response and writes each TXT answer as a
+/// two-byte big-endian length followed by the concatenated character-string
+/// chunks. Returns bytes written, or a negative value for malformed input.
+int swan_at_handle_parse_txt_response(
+    const uint8_t *response,
+    size_t response_length,
+    uint8_t *output,
+    size_t output_capacity
+);
+
 #endif
