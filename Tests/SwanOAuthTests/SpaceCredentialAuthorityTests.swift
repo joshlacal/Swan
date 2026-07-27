@@ -38,7 +38,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
             XCTAssertNotNil(UUID(uuidString: inspection.claims.jti))
 
             let verifier = DurableSpaceCredentialVerifier(
-                publicKeys: fixture.localKeyResolver
+                publicKeys: fixture.localPublicKeyResolver
             )
             let authorization = try await verifier.authorization(
                 for: token,
@@ -77,7 +77,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                 authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
                 now: now
             )
-            let verifier = DurableSpaceCredentialVerifier(publicKeys: fixture.localKeyResolver)
+            let verifier = DurableSpaceCredentialVerifier(publicKeys: fixture.localPublicKeyResolver)
             let otherSpace = try SpaceURI(
                 authority: authority,
                 spaceType: space.spaceType,
@@ -198,6 +198,111 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                 now: now.addingTimeInterval(1)
             )
         )
+    }
+
+    func testCredentialTimeValidationRejectsSignedExtremeValuesWithoutOverflow() throws {
+        let space = try SpaceURI(
+            authority: authority,
+            spaceType: "app.bsky.bookmarks",
+            skey: "time-bounds"
+        )
+        let key = P256.Signing.PrivateKey()
+
+        let extreme = try signedSpaceCredential(
+            issuer: authority,
+            space: space,
+            iat: .min,
+            exp: .max,
+            key: key
+        )
+        XCTAssertThrowsError(try PermissionedDataJWT.verifySpaceCredential(
+            extreme,
+            publicKey: key.publicKey,
+            expectedSpace: space,
+            now: now
+        ))
+
+        let issuedAt = Int64(now.timeIntervalSince1970)
+        let exactLifetime = try signedSpaceCredential(
+            issuer: authority,
+            space: space,
+            iat: issuedAt,
+            exp: issuedAt + 7_200,
+            key: key
+        )
+        _ = try PermissionedDataJWT.verifySpaceCredential(
+            exactLifetime,
+            publicKey: key.publicKey,
+            expectedSpace: space,
+            now: now
+        )
+
+        let excessiveLifetime = try signedSpaceCredential(
+            issuer: authority,
+            space: space,
+            iat: issuedAt,
+            exp: issuedAt + 7_201,
+            key: key
+        )
+        XCTAssertThrowsError(try PermissionedDataJWT.verifySpaceCredential(
+            excessiveLifetime,
+            publicKey: key.publicKey,
+            expectedSpace: space,
+            now: now
+        ))
+
+        let expiryAtSkewBoundary = try signedSpaceCredential(
+            issuer: authority,
+            space: space,
+            iat: issuedAt - 7_200,
+            exp: issuedAt - 60,
+            key: key
+        )
+        _ = try PermissionedDataJWT.verifySpaceCredential(
+            expiryAtSkewBoundary,
+            publicKey: key.publicKey,
+            expectedSpace: space,
+            now: now
+        )
+    }
+
+    func testVerificationOnlyResolverNeverReadsPrivateSigningMaterial() async throws {
+        let fixture = try await Fixture(authority: authority)
+        defer { fixture.cleanup() }
+        do {
+            let space = try SpaceURI(
+                authority: authority,
+                spaceType: "app.bsky.bookmarks",
+                skey: "verification-only"
+            )
+            let privateKey = P256.Signing.PrivateKey()
+            let keyStore = CountingVerificationKeyStore(
+                publicKey: privateKey.publicKey.x963Representation
+            )
+            let resolver = LocalAccountSpaceCredentialPublicKeyResolver(
+                accounts: fixture.accountDirectory,
+                publicKeyStore: keyStore
+            )
+            let token = try PermissionedDataJWT.createSpaceCredential(
+                issuer: authority,
+                space: space,
+                key: privateKey,
+                now: now
+            )
+            let verifier = DurableSpaceCredentialVerifier(publicKeys: resolver)
+            _ = try await verifier.authorization(
+                for: token,
+                expectedSpace: space,
+                now: now.addingTimeInterval(1)
+            )
+            let reads = await keyStore.reads()
+            XCTAssertEqual(reads.publicMetadata, 1)
+            XCTAssertEqual(reads.privateMaterial, 0)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
     }
 
     func testDurablePolicyBindsRequesterAndFailsClosedForMembersAppsAndManagingApps() async throws {
@@ -351,13 +456,82 @@ private struct StaticAttestationPolicy: SpaceCredentialClientAttestationPolicy {
     }
 }
 
+/// The public resolver is deliberately given a store which also records a
+/// private-key read attempt. Its `AccountKeyStore` conformance lets the test
+/// prove at runtime that verification uses only the narrower metadata API.
+private actor CountingVerificationKeyStore: AccountKeyStore, AccountKeyPublicKeyStore {
+    private let encodedPublicKey: Data
+    private var publicMetadataReads = 0
+    private var privateMaterialReads = 0
+
+    init(publicKey: Data) {
+        encodedPublicKey = publicKey
+    }
+
+    func create(_: Data, for _: AccountKeyReference) throws {
+        throw SwanError.unavailable("test verification store cannot create keys")
+    }
+
+    func createBatch(_: [AccountKeyMaterial]) throws {
+        throw SwanError.unavailable("test verification store cannot create keys")
+    }
+
+    func key(for _: AccountKeyReference) throws -> Data {
+        privateMaterialReads += 1
+        throw SwanError.unavailable("verification attempted to read private key material")
+    }
+
+    func publicKey(for _: AccountKeyReference) -> Data? {
+        publicMetadataReads += 1
+        return encodedPublicKey
+    }
+
+    func reads() -> (publicMetadata: Int, privateMaterial: Int) {
+        (publicMetadataReads, privateMaterialReads)
+    }
+}
+
+private func signedSpaceCredential(
+    issuer: String,
+    space: SpaceURI,
+    iat: Int64,
+    exp: Int64,
+    key: P256.Signing.PrivateKey
+) throws -> String {
+    let header = try JSONSerialization.data(
+        withJSONObject: [
+            "alg": "ES256",
+            "kid": PermissionedDataJWT.spaceCredentialKeyID,
+            "typ": PermissionedDataJWT.credentialType,
+        ],
+        options: [.sortedKeys, .withoutEscapingSlashes]
+    )
+    let payload = try JSONSerialization.data(
+        withJSONObject: [
+            "exp": NSNumber(value: exp),
+            "iat": NSNumber(value: iat),
+            "iss": issuer,
+            "jti": UUID().uuidString,
+            "sub": space.rawValue,
+        ],
+        options: [.sortedKeys, .withoutEscapingSlashes]
+    )
+    let signingInput = "\(header.base64URLEncodedString()).\(payload.base64URLEncodedString())"
+    let signature = try P256WireSignature.sign(
+        Data(signingInput.utf8),
+        using: key
+    ).base64URLEncodedString()
+    return "\(signingInput).\(signature)"
+}
+
 private struct Fixture: Sendable {
     let root: URL
     let control: SQLiteControlDatabase
     let accountDatabase: SQLiteAccountDatabase
     let keyStore: FileAccountKeyStore
     let accountDirectory: DurableAccountDirectory
-    let localKeyResolver: LocalAccountSpaceCredentialKeyResolver
+    let localSigningKeyResolver: LocalAccountSpaceCredentialSigningKeyResolver
+    let localPublicKeyResolver: LocalAccountSpaceCredentialPublicKeyResolver
     let preopenedDirectory: SQLitePreMigratedAccountDirectory
     let authority: String
     let signingReference: AccountKeyReference
@@ -403,9 +577,13 @@ private struct Fixture: Sendable {
                 maximumQueuedVerifications: 1
             )
         )
-        localKeyResolver = LocalAccountSpaceCredentialKeyResolver(
+        localSigningKeyResolver = LocalAccountSpaceCredentialSigningKeyResolver(
             accounts: accountDirectory,
             keyStore: keyStore
+        )
+        localPublicKeyResolver = LocalAccountSpaceCredentialPublicKeyResolver(
+            accounts: accountDirectory,
+            publicKeyStore: keyStore
         )
         try await accountDatabase.close()
         preopenedDirectory = try await SQLitePreMigratedAccountDirectory.bootstrap(
@@ -419,7 +597,7 @@ private struct Fixture: Sendable {
     ) -> DurableSpaceCredentialAuthority {
         DurableSpaceCredentialAuthority(
             policyDirectory: preopenedDirectory,
-            signingKeys: localKeyResolver,
+            signingKeys: localSigningKeyResolver,
             clientAttestationPolicy: attestationPolicy
         )
     }

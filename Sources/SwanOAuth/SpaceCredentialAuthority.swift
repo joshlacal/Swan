@@ -107,13 +107,12 @@ public struct UnavailableSpaceCredentialClientAttestationPolicy:
     }
 }
 
-/// A local resolver joins durable account generation references to encrypted
-/// key-store material. `control.sqlite` contains only the reference; the
-/// private scalar is read from ``AccountKeyStore`` immediately before signing
-/// or deriving a local verification key and is never returned as `Data`.
-public struct LocalAccountSpaceCredentialKeyResolver:
-    SpaceCredentialSigningKeyResolver,
-    SpaceCredentialPublicKeyResolver
+/// A local signing resolver joins durable account generation references to
+/// encrypted key-store material. `control.sqlite` contains only the reference;
+/// the private scalar is read from ``AccountKeyStore`` immediately before
+/// signing and is never returned as `Data`.
+public struct LocalAccountSpaceCredentialSigningKeyResolver:
+    SpaceCredentialSigningKeyResolver
 {
     private let accounts: DurableAccountDirectory
     private let keyStore: any AccountKeyStore
@@ -148,15 +147,42 @@ public struct LocalAccountSpaceCredentialKeyResolver:
         )
     }
 
+}
+
+/// A local verification resolver joins the same durable account generation
+/// references to authenticated public-key metadata. Its static dependency is
+/// deliberately ``AccountKeyPublicKeyStore`` rather than ``AccountKeyStore``:
+/// verification cannot cause a private signing scalar to be decrypted.
+public struct LocalAccountSpaceCredentialPublicKeyResolver:
+    SpaceCredentialPublicKeyResolver
+{
+    private let accounts: DurableAccountDirectory
+    private let publicKeyStore: any AccountKeyPublicKeyStore
+
+    public init(
+        accounts: DurableAccountDirectory,
+        publicKeyStore: any AccountKeyPublicKeyStore
+    ) {
+        self.accounts = accounts
+        self.publicKeyStore = publicKeyStore
+    }
+
     public func publicKey(
         for issuer: String,
         keyID: String
     ) async throws -> P256.Signing.PublicKey? {
         guard keyID == PermissionedDataJWT.spaceCredentialKeyID,
-              let signing = try await signingKey(for: issuer) else {
+              let account = try await accounts.account(did: issuer),
+              account.status.authorizesAccount,
+              let references = try await accounts.keyReferences(did: issuer),
+              let encoded = try await publicKeyStore.publicKey(for: references.signing) else {
             return nil
         }
-        return signing.privateKey.publicKey
+        do {
+            return try P256.Signing.PublicKey(x963Representation: encoded)
+        } catch {
+            throw SwanError.unavailable("space credential verification key is unavailable")
+        }
     }
 }
 

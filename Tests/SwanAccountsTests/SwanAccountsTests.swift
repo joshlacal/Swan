@@ -1,3 +1,4 @@
+import Crypto
 import Dispatch
 import Foundation
 import SQLiteNIO
@@ -228,6 +229,34 @@ final class SwanAccountsTests: XCTestCase {
                 expected: .unauthorized("account key envelope authentication failed")
             )
         }
+    }
+
+    func testPublicKeyMetadataIsAuthenticatedWithoutReadingPrivateMaterial() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let reference = try keyReference()
+        let signingKey = P256.Signing.PrivateKey()
+        let store = try FileAccountKeyStore(
+            root: root,
+            configuration: keyConfiguration(activeKeyID: "active", byte: 17)
+        )
+        try await store.create(signingKey.rawRepresentation, for: reference)
+
+        let storedPublicKey = try await store.publicKey(for: reference)
+        let publicKey = try XCTUnwrap(storedPublicKey)
+        XCTAssertEqual(publicKey, signingKey.publicKey.x963Representation)
+
+        let keyFile = try onlyKeyFile(in: root)
+        var envelope = try envelopeObject(Data(contentsOf: keyFile))
+        envelope["publicKey"] = P256.Signing.PrivateKey()
+            .publicKey
+            .x963Representation
+            .base64EncodedString()
+        try writeEnvelope(envelope, to: keyFile)
+        await XCTAssertThrowsSwanErrorAsync(
+            try await store.publicKey(for: reference),
+            expected: .unauthorized("account key public metadata authentication failed")
+        )
     }
 
     func testEnvelopeCiphertextKIDAndFormatTamperingHaveConcreteFailureCategories() async throws {

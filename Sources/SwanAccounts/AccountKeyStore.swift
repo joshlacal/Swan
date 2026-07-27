@@ -128,9 +128,19 @@ public protocol AccountKeyStore: Sendable {
     func key(for reference: AccountKeyReference) async throws -> Data
 }
 
+/// Exposes authenticated P-256 public-key metadata without making an account
+/// private scalar readable. Callers that only verify signatures should depend
+/// on this capability rather than on ``AccountKeyStore``.
+public protocol AccountKeyPublicKeyStore: Sendable {
+    /// Returns `nil` for a legacy envelope that predates authenticated public
+    /// metadata. Implementations must not decrypt private key material to
+    /// synthesize a result for that case.
+    func publicKey(for reference: AccountKeyReference) async throws -> Data?
+}
+
 /// Purpose-bound encrypted file storage anchored to a pinned directory
 /// descriptor. KEKs are deployment configuration and are never serialized.
-public actor FileAccountKeyStore: AccountKeyStore {
+public actor FileAccountKeyStore: AccountKeyStore, AccountKeyPublicKeyStore {
     public static let envelopeFormat = "swan-key-envelope-v1"
 
     private static let journalFormat = "swan-key-provisioning-journal-v1"
@@ -148,6 +158,11 @@ public actor FileAccountKeyStore: AccountKeyStore {
         let accountDID: String
         let generation: UInt64
         let sealedKey: Data
+        /// An optional authenticated copy of the P-256 public key. It stays
+        /// optional so existing v1 envelopes remain decryptable; those
+        /// envelopes intentionally cannot serve verification-only requests.
+        let publicKey: Data?
+        let publicKeyAuthentication: Data?
     }
 
     private struct JournalEntry: Codable {
@@ -326,6 +341,47 @@ public actor FileAccountKeyStore: AccountKeyStore {
         }
     }
 
+    /// Reads only an authenticated public-key projection from the envelope. This path
+    /// authenticates metadata with the configured KEK but never calls
+    /// ``decrypt(_:reference:)`` or otherwise reads the private scalar.
+    public func publicKey(for reference: AccountKeyReference) throws -> Data? {
+        try withExclusiveLock {
+            let loaded = try loadEnvelope(
+                named: Self.filename(for: reference),
+                expectedReference: reference
+            )
+            guard let publicKey = loaded.envelope.publicKey,
+                  let authentication = loaded.envelope.publicKeyAuthentication else {
+                // A mixed optional state is tampering, while two absent
+                // fields describe a pre-metadata v1 envelope.
+                guard loaded.envelope.publicKey == nil,
+                      loaded.envelope.publicKeyAuthentication == nil else {
+                    throw SwanError.malformed("account key public metadata is incomplete")
+                }
+                return nil
+            }
+            guard let keyData = configuration.key(for: loaded.envelope.kid) else {
+                throw SwanError.unavailable("account key envelope references an unavailable KEK")
+            }
+            do {
+                _ = try P256.Signing.PublicKey(x963Representation: publicKey)
+            } catch {
+                throw SwanError.malformed("account key public metadata is invalid")
+            }
+            let expected = Self.publicKeyAuthentication(
+                keyID: loaded.envelope.kid,
+                reference: reference,
+                sealedKey: loaded.envelope.sealedKey,
+                publicKey: publicKey,
+                keyData: keyData
+            )
+            guard Self.constantTimeEqual(expected, authentication) else {
+                throw SwanError.unauthorized("account key public metadata authentication failed")
+            }
+            return publicKey
+        }
+    }
+
     public func inventory() throws -> AccountKeyEnvelopeInventory {
         try withExclusiveLock {
             try inventoryUnlocked()
@@ -441,13 +497,27 @@ public actor FileAccountKeyStore: AccountKeyStore {
         guard let combined = sealed.combined else {
             throw SwanError.unavailable("could not serialize encrypted account key")
         }
+        let publicKey = try? P256.Signing.PrivateKey(rawRepresentation: key)
+            .publicKey
+            .x963Representation
+        let publicKeyAuthentication = publicKey.map {
+            Self.publicKeyAuthentication(
+                keyID: keyID,
+                reference: reference,
+                sealedKey: combined,
+                publicKey: $0,
+                keyData: keyData
+            )
+        }
         let envelope = Envelope(
             format: Self.envelopeFormat,
             kid: keyID,
             purpose: reference.purpose,
             accountDID: reference.accountDID,
             generation: reference.generation,
-            sealedKey: combined
+            sealedKey: combined,
+            publicKey: publicKey,
+            publicKeyAuthentication: publicKeyAuthentication
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -563,6 +633,35 @@ public actor FileAccountKeyStore: AccountKeyStore {
             data.append(contentsOf: field.utf8)
         }
         return data
+    }
+
+    private static func publicKeyAuthentication(
+        keyID: String,
+        reference: AccountKeyReference,
+        sealedKey: Data,
+        publicKey: Data,
+        keyData: Data
+    ) -> Data {
+        var metadata = Data("swan-account-public-key-v1\u{0}".utf8)
+        metadata.append(additionalAuthenticatedData(keyID: keyID, reference: reference))
+        for value in [sealedKey, publicKey] {
+            var length = UInt64(value.count).bigEndian
+            withUnsafeBytes(of: &length) { metadata.append(contentsOf: $0) }
+            metadata.append(value)
+        }
+        return Data(HMAC<SHA256>.authenticationCode(
+            for: metadata,
+            using: SymmetricKey(data: keyData)
+        ))
+    }
+
+    private static func constantTimeEqual(_ lhs: Data, _ rhs: Data) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        var difference: UInt8 = 0
+        for (left, right) in zip(lhs, rhs) {
+            difference |= left ^ right
+        }
+        return difference == 0
     }
 
     private static func openProtectedRoot(_ root: URL) throws -> Int32 {

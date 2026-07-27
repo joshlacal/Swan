@@ -442,13 +442,59 @@ public enum PermissionedDataJWT {
         clockSkew: TimeInterval,
         maximumLifetime: Int64? = nil
     ) throws {
-        let current = Int64(now.timeIntervalSince1970)
-        guard exp >= iat,
-              maximumLifetime.map({ exp - iat <= $0 }) ?? true,
-              exp >= current - Int64(clockSkew),
-              iat <= current + Int64(clockSkew) else {
+        guard let current = integerTimestamp(now),
+              let allowedSkew = integerClockSkew(clockSkew),
+              exp >= iat,
+              maximumLifetime.map({ maximumLifetime in
+                  guard maximumLifetime >= 0 else { return false }
+                  let duration = exp.subtractingReportingOverflow(iat)
+                  return !duration.overflow && duration.partialValue <= maximumLifetime
+              }) ?? true,
+              isNotTooFarInPast(exp, comparedTo: current, allowedSkew: allowedSkew),
+              isNotTooFarInFuture(iat, comparedTo: current, allowedSkew: allowedSkew) else {
             throw SwanError.expired
         }
+    }
+
+    private static func integerTimestamp(_ date: Date) -> Int64? {
+        let timestamp = date.timeIntervalSince1970
+        // `Double(Int64.max)` rounds up to 2^63, which cannot safely convert
+        // back to Int64. Keep the upper bound exclusive before conversion.
+        guard timestamp.isFinite,
+              timestamp >= Double(Int64.min),
+              timestamp < Double(Int64.max) else {
+            return nil
+        }
+        return Int64(timestamp)
+    }
+
+    private static func integerClockSkew(_ skew: TimeInterval) -> Int64? {
+        guard skew.isFinite,
+              skew >= 0,
+              skew < Double(Int64.max) else {
+            return nil
+        }
+        return Int64(skew)
+    }
+
+    private static func isNotTooFarInPast(
+        _ value: Int64,
+        comparedTo current: Int64,
+        allowedSkew: Int64
+    ) -> Bool {
+        guard value < current else { return true }
+        let elapsed = current.subtractingReportingOverflow(value)
+        return !elapsed.overflow && elapsed.partialValue <= allowedSkew
+    }
+
+    private static func isNotTooFarInFuture(
+        _ value: Int64,
+        comparedTo current: Int64,
+        allowedSkew: Int64
+    ) -> Bool {
+        guard value > current else { return true }
+        let lead = value.subtractingReportingOverflow(current)
+        return !lead.overflow && lead.partialValue <= allowedSkew
     }
 }
 
