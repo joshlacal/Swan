@@ -59,6 +59,20 @@ final class AccountOperatorServiceTests: XCTestCase {
         }
     }
 
+    func testOperatorSecretVerifierRejectsWrongMalformedAndOversizedBearerValues() throws {
+        let verifier = try OperatorSecretResolver.loadVerifier(
+            environment: ["SWAN_OPERATOR_SECRET": "operator-secret"],
+            secretFile: nil
+        )
+        XCTAssertNoThrow(try verifier.authorize(bearerValue: "operator-secret"))
+        for value in ["wrong-secret", "", "operator secret", String(repeating: "a", count: 4_097)] {
+            XCTAssertThrowsError(try verifier.authorize(bearerValue: value)) { error in
+                XCTAssertEqual(error as? AccountOperatorError, .operatorSecretRejected)
+                XCTAssertFalse(error.localizedDescription.contains("operator-secret"))
+            }
+        }
+    }
+
     func testOperatorServiceTransitionsLifecycleAndProjectsOnlySanitizedJSON() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

@@ -99,10 +99,11 @@ let package = Package(
         .target(
             name: "SwanHTTP",
             dependencies: [
-                "SwanCore", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth",
+                "SwanAccounts", "SwanCore", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
+                .product(name: "UnixSignals", package: "swift-service-lifecycle"),
             ]
         ),
         .target(
@@ -118,6 +119,7 @@ let package = Package(
                 "SwanAccounts", "SwanHTTP", "SwanInterop", "SwanOAuth", "SwanSQLite",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Logging", package: "swift-log"),
+                .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
             ]
         ),
         .testTarget(name: "SwanCoreTests", dependencies: ["SwanCore", "SwanSpacesWire"]),
@@ -159,10 +161,11 @@ let package = Package(
         .testTarget(
             name: "SwanHTTPTests",
             dependencies: [
-                "SwanHTTP", "SwanOAuth", "SwanSQLite", "SwanSpacesWire",
+                "SwanAccounts", "SwanHTTP", "SwanOAuth", "SwanSQLite", "SwanSpacesWire",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
                 .product(name: "Logging", package: "swift-log"),
+                .product(name: "UnixSignals", package: "swift-service-lifecycle"),
             ]
         ),
         .testTarget(

@@ -8,6 +8,33 @@ import SwanSpaces
 import SwanSpacesWire
 import SwanStorage
 
+/// An explicit publication boundary for OAuth discovery. The only public
+/// construction is `.unavailable`; a future complete HTTP assembly inside
+/// `SwanHTTP` must supply validated metadata before discovery can return 200.
+/// This prevents a caller from accidentally advertising incomplete PAR,
+/// authorization, token, or revocation routes.
+public struct OAuthPublicationGate: Sendable {
+    private let publication: OAuthMetadataPublication?
+
+    public static let unavailable = OAuthPublicationGate(publication: nil)
+
+    init(completePublication: OAuthMetadataPublication) {
+        publication = completePublication
+    }
+
+    private init(publication: OAuthMetadataPublication?) {
+        self.publication = publication
+    }
+
+    func protectedResourceMetadata() -> OAuthProtectedResourceMetadata? {
+        publication?.protectedResource
+    }
+
+    func authorizationServerMetadata() -> OAuthAuthorizationServerMetadata? {
+        publication?.authorizationServer
+    }
+}
+
 public struct SwanHTTPConfiguration: Sendable, Equatable {
     public let host: String
     public let port: Int
@@ -28,17 +55,23 @@ public struct SwanHTTPServer: Sendable {
     /// `OAuthTokenVault` fallback: an incomplete or missing durable runtime is
     /// a startup failure, not a switch back to process-local bearer state.
     public let oauthRuntime: SwanOAuthRuntime
+    /// Discovery is unavailable unless a later complete OAuth HTTP assembly
+    /// explicitly supplies a ready gate. Durable OAuth primitives alone are
+    /// not sufficient authorization-server behavior.
+    public let oauthPublicationGate: OAuthPublicationGate
 
     public init(
         profile: ProtocolProfile,
         configuration: SwanHTTPConfiguration = .init(),
         repositories: any AccountRepositoryStore = InMemoryAccountRepositoryStore(),
-        oauthRuntime: SwanOAuthRuntime
+        oauthRuntime: SwanOAuthRuntime,
+        oauthPublicationGate: OAuthPublicationGate = .unavailable
     ) {
         self.profile = profile
         self.configuration = configuration
         self.repositories = repositories
         self.oauthRuntime = oauthRuntime
+        self.oauthPublicationGate = oauthPublicationGate
     }
 
     /// All routes are registered before Application construction. Hummingbird
@@ -50,11 +83,18 @@ public struct SwanHTTPServer: Sendable {
 
         let publicURL = configuration.publicURL
         let profile = profile
+        let oauthPublicationGate = oauthPublicationGate
         router.get("/.well-known/oauth-protected-resource") { _, _ -> Response in
-            oauthUnavailable()
+            guard let metadata = oauthPublicationGate.protectedResourceMetadata() else {
+                return oauthUnavailable()
+            }
+            return jsonResponse(metadata)
         }
         router.get("/.well-known/oauth-authorization-server") { _, _ -> Response in
-            oauthUnavailable()
+            guard let metadata = oauthPublicationGate.authorizationServerMetadata() else {
+                return oauthUnavailable()
+            }
+            return jsonResponse(metadata)
         }
 
         router.get("/oauth/authorize") { _, _ -> Response in

@@ -7,6 +7,7 @@ import SwanInterop
 import SwanCore
 import SwanOAuth
 import SwanSQLite
+import ServiceLifecycle
 
 @main
 struct SwanCommand: AsyncParsableCommand {
@@ -37,6 +38,15 @@ extension SwanCommand {
         @Option(name: .long, help: "Reserved root for control/account databases and blobs")
         var dataDirectory: String = ".swan-data"
 
+        @Option(name: .long, help: "Enable the separate loopback-only management listener on this port")
+        var managementPort: Int?
+
+        @Option(name: .long, help: "Literal loopback address for management: 127.0.0.1 or ::1")
+        var managementAddress: String = "127.0.0.1"
+
+        @Option(name: .long, help: "Mounted operator-secret file for the enabled management listener")
+        var managementOperatorSecretFile: String?
+
         func run() async throws {
             let loadedProfile = try ProtocolProfile.load(from: URL(fileURLWithPath: profile))
             let baseURL = try publicURL.map { value in
@@ -64,9 +74,65 @@ extension SwanCommand {
                 configuration: .init(host: host, port: port, publicURL: baseURL),
                 oauthRuntime: oauthRuntime
             )
+            // Both applications are built before a ServiceGroup starts either
+            // one. A bad management bind/config/secret therefore exits rather
+            // than silently serving a public-only process to an operator who
+            // asked for control-plane access.
+            let publicApplication = server.buildApplication(logger: logger)
+            let managementApplication: (any Service)?
+            if let managementPort {
+                guard managementPort != port else {
+                    try? await controlDatabase.close()
+                    throw ValidationError("--management-port must differ from --port")
+                }
+                let managementConfiguration: SwanManagementHTTPConfiguration
+                do {
+                    managementConfiguration = try .init(
+                        bindAddressLiteral: managementAddress,
+                        port: managementPort
+                    )
+                } catch {
+                    try? await controlDatabase.close()
+                    throw ValidationError("management listener must use literal 127.0.0.1 or ::1 and a valid port")
+                }
+                let verifier: OperatorSecretVerifier
+                do {
+                    verifier = try OperatorSecretResolver.loadVerifier(
+                        secretFile: managementOperatorSecretFile.map { URL(fileURLWithPath: $0) }
+                    )
+                } catch {
+                    try? await controlDatabase.close()
+                    throw ValidationError("management operator secret is unavailable")
+                }
+                let managementServer = SwanManagementHTTPServer(
+                    configuration: managementConfiguration,
+                    controlStore: controlDatabase,
+                    operatorSecretVerifier: verifier
+                )
+                managementApplication = managementServer.buildApplication(
+                    logger: Logger(label: "swan.management")
+                )
+            } else {
+                guard managementOperatorSecretFile == nil else {
+                    try? await controlDatabase.close()
+                    throw ValidationError("--management-operator-secret-file requires --management-port")
+                }
+                managementApplication = nil
+            }
             logger.info("starting Swan", metadata: ["profile": .string(loadedProfile.id), "address": .string("\(host):\(port)")])
             do {
-                try await server.buildApplication(logger: logger).runService()
+                var services: [any Service] = [publicApplication]
+                if let managementApplication {
+                    services.append(managementApplication)
+                    logger.info("starting Swan management listener", metadata: [
+                        "address": .string("\(managementAddress):\(managementPort!)"),
+                    ])
+                }
+                let serviceGroup = SwanHTTPServiceLifecycle.makeServiceGroup(
+                    services: services,
+                    logger: logger
+                )
+                try await serviceGroup.run()
                 try await controlDatabase.close()
             } catch {
                 try? await controlDatabase.close()
