@@ -514,6 +514,285 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testOmittedApplyWriteRKeysRemainUniquePastPetrelCounterRange() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let app = try makeServer(fixture).buildApplication(logger: Logger(label: "PermissionedRecordWriteTIDTests"))
+            let operationCount = 1_026
+            let create = #"{"$type":"com.atproto.space.applyWrites#create","collection":"\#(Self.collection)","value":{"$type":"app.bsky.feed.post"}}"#
+            let batch = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","writes":[\#(Array(repeating: create, count: operationCount).joined(separator: ","))]}"#
+            XCTAssertLessThan(batch.utf8.count, 1 * 1024 * 1024)
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: Self.applyPath,
+                    method: .post,
+                    headers: try self.writeHeaders(fixture, path: Self.applyPath, jti: "omitted-batch"),
+                    body: ByteBuffer(string: batch)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let results = try XCTUnwrap((try self.jsonObject(response.body))["results"] as? [[String: Any]])
+                    XCTAssertEqual(results.count, operationCount)
+                    let uris = try Set(results.map { try XCTUnwrap($0["uri"] as? String) })
+                    XCTAssertEqual(uris.count, operationCount)
+
+                    let postBatchCreate = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","collection":"\#(Self.collection)","record":{"$type":"app.bsky.feed.post"}}"#
+                    try await client.execute(
+                        uri: Self.createPath,
+                        method: .post,
+                        headers: try self.writeHeaders(fixture, path: Self.createPath, jti: "omitted-after-batch"),
+                        body: ByteBuffer(string: postBatchCreate)
+                    ) { response in
+                        XCTAssertEqual(response.status, .ok)
+                        XCTAssertFalse(uris.contains(try XCTUnwrap((try self.jsonObject(response.body))["uri"] as? String)))
+                    }
+                }
+            }
+
+            // Omitted rkeys are allocated before the write reaches the CAS
+            // transaction. Exercise genuinely concurrent HTTP invocations,
+            // then test the same allocator directly so losing CAS contenders
+            // cannot mask an accidental duplicate allocation.
+            let concurrentRequestCount = 32
+            let concurrentRequests = try (0 ..< concurrentRequestCount).map { index -> (HTTPFields, String) in
+                let body = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","collection":"\#(Self.collection)","record":{"$type":"app.bsky.feed.post","text":"concurrent-\#(index)"}}"#
+                return (
+                    try writeHeaders(fixture, path: Self.createPath, jti: "omitted-concurrent-\(index)"),
+                    body
+                )
+            }
+            try await app.test(.router) { client in
+                let outcomes = await withTaskGroup(of: ConcurrentWriteOutcome.self, returning: [ConcurrentWriteOutcome].self) { group in
+                    for (headers, body) in concurrentRequests {
+                        group.addTask {
+                            do {
+                                return try await client.execute(
+                                    uri: Self.createPath,
+                                    method: .post,
+                                    headers: headers,
+                                    body: ByteBuffer(string: body)
+                                ) { response in
+                                    let uri: String?
+                                    if response.status == .ok {
+                                        let object = try JSONSerialization.jsonObject(with: Data(buffer: response.body)) as? [String: Any]
+                                        uri = object?["uri"] as? String
+                                    } else {
+                                        uri = nil
+                                    }
+                                    return ConcurrentWriteOutcome(status: response.status.code, uri: uri)
+                                }
+                            } catch {
+                                return ConcurrentWriteOutcome(status: -1, uri: nil)
+                            }
+                        }
+                    }
+                    return await group.reduce(into: []) { $0.append($1) }
+                }
+                XCTAssertFalse(outcomes.contains { $0.status == -1 })
+                XCTAssertTrue(outcomes.allSatisfy { $0.status == 200 || $0.status == 409 })
+                let successfulURIs = outcomes.compactMap(\.uri)
+                XCTAssertFalse(successfulURIs.isEmpty)
+                XCTAssertEqual(Set(successfulURIs).count, successfulURIs.count)
+            }
+            let allocator = SwanPermissionedTIDAllocator()
+            let allocated = await withTaskGroup(of: String?.self, returning: [String].self) { group in
+                for _ in 0 ..< concurrentRequestCount {
+                    group.addTask { try? await allocator.next().toString() }
+                }
+                return await group.reduce(into: []) { values, value in
+                    if let value { values.append(value) }
+                }
+            }
+            XCTAssertEqual(allocated.count, concurrentRequestCount)
+            XCTAssertEqual(Set(allocated).count, concurrentRequestCount)
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
+    func testWriteBoundaryScopesReplayAndPrivateIsolation() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let app = try makeServer(fixture).buildApplication(logger: Logger(label: "PermissionedRecordWriteBoundaryTests"))
+            let createBody = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","collection":"\#(Self.collection)","rkey":"scoped","record":{"$type":"app.bsky.feed.post"}}"#
+            let createScope = "space:app.bsky.bookmarks?authority=\(Self.alice)&skey=record-read&action=create&collection=\(Self.collection)"
+            let updateScope = "space:app.bsky.bookmarks?authority=\(Self.alice)&skey=record-read&action=update&collection=\(Self.collection)"
+            let deleteScope = "space:app.bsky.bookmarks?authority=\(Self.alice)&skey=record-read&action=delete&collection=\(Self.collection)"
+            let createToken = try await issueToken(fixture.runtime, subject: Self.alice, scopes: [createScope])
+            let updateToken = try await issueToken(fixture.runtime, subject: Self.alice, scopes: [updateScope])
+            let deleteToken = try await issueToken(fixture.runtime, subject: Self.alice, scopes: [deleteScope])
+            try await app.test(.router) { client in
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.writeHeaders(createToken, fixture: fixture, path: Self.createPath, jti: "create-scope"), body: ByteBuffer(string: createBody)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                // A put needs both possible state-transition grants, while an
+                // update and delete each need their own action grant.
+                try await client.execute(uri: Self.putPath, method: .post, headers: try self.writeHeaders(createToken, fixture: fixture, path: Self.putPath, jti: "put-needs-update"), body: ByteBuffer(string: createBody)) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+                let update = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","writes":[{"$type":"com.atproto.space.applyWrites#update","collection":"\#(Self.collection)","rkey":"scoped","value":{"$type":"app.bsky.feed.post","text":"updated"}}]}"#
+                try await client.execute(uri: Self.applyPath, method: .post, headers: try self.writeHeaders(updateToken, fixture: fixture, path: Self.applyPath, jti: "update-scope"), body: ByteBuffer(string: update)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                let deleteCreate = createBody.replacingOccurrences(of: "scoped", with: "delete-me")
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.writeHeaders(createToken, fixture: fixture, path: Self.createPath, jti: "delete-create"), body: ByteBuffer(string: deleteCreate)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                let delete = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","collection":"\#(Self.collection)","rkey":"delete-me"}"#
+                try await client.execute(uri: Self.deletePath, method: .post, headers: try self.writeHeaders(deleteToken, fixture: fixture, path: Self.deletePath, jti: "delete-scope"), body: ByteBuffer(string: delete)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                var absentType = try self.signedHeaders(fixture, subject: Self.alice, path: Self.createPath, jti: "absent-content", method: "POST")
+                try await client.execute(uri: Self.createPath, method: .post, headers: absentType, body: ByteBuffer(string: createBody)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                }
+                absentType[.contentType] = "text/plain"
+                try await client.execute(uri: Self.createPath, method: .post, headers: absentType, body: ByteBuffer(string: createBody)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                }
+                let oversized = String(repeating: " ", count: 1 * 1024 * 1024 + 1)
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.writeHeaders(fixture, path: Self.createPath, jti: "oversized"), body: ByteBuffer(string: oversized)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                }
+                // Keep the authority URI unchanged.  The route must fail
+                // before it can probe Bob's repository and disclose whether
+                // it is open or contains this rkey.
+                let foreign = createBody.replacingOccurrences(
+                    of: "\"repo\":\"\(Self.alice)\"",
+                    with: "\"repo\":\"\(Self.bob)\""
+                )
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.writeHeaders(fixture, path: Self.createPath, jti: "foreign"), body: ByteBuffer(string: foreign)) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(try self.errorCode(response.body), "SpaceNotFound")
+                }
+                let replay = try self.writeHeaders(fixture, path: Self.createPath, jti: "replay")
+                let replayBody = createBody.replacingOccurrences(of: "scoped", with: "replay")
+                try await client.execute(uri: Self.createPath, method: .post, headers: replay, body: ByteBuffer(string: replayBody)) { response in XCTAssertEqual(response.status, .ok) }
+                try await client.execute(uri: Self.createPath, method: .post, headers: replay, body: ByteBuffer(string: replayBody)) { response in XCTAssertEqual(response.status, .unauthorized) }
+                let wrongTarget = try self.signedHeaders(fixture, subject: Self.alice, path: Self.getPath, jti: "wrong-target", method: "POST")
+                var wrongTargetJSON = wrongTarget; wrongTargetJSON[.contentType] = "application/json"
+                try await client.execute(uri: Self.createPath, method: .post, headers: wrongTargetJSON, body: ByteBuffer(string: createBody.replacingOccurrences(of: "scoped", with: "wrong-target"))) { response in XCTAssertEqual(response.status, .unauthorized) }
+                try await client.execute(uri: "/xrpc/com.atproto.repo.getRecord?repo=\(Self.alice)&collection=\(Self.collection)&rkey=scoped", method: .get) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertFalse(String(decoding: response.body.readableBytesView, as: UTF8.self).contains("scoped"))
+                }
+            }
+
+            // These direct reads inspect only durable postconditions of the
+            // HTTP writes: each successful request advanced the oplog and
+            // atomically inserted an opaque, pending notification intent.
+            let database = try await SQLiteAccountDatabase(dataDirectory: fixture.root, did: Self.alice)
+            let facts = try await database.spaceOplog(space: fixture.space, author: Self.alice, since: 3)
+            guard case let .incremental(entries) = facts else {
+                try await database.close()
+                return XCTFail("recent HTTP writes unexpectedly require full recovery")
+            }
+            XCTAssertEqual(entries.map(\.action), [.create, .update, .create, .delete, .create])
+            let outbox = try await database.pendingOutbox(limit: 20)
+            XCTAssertEqual(outbox.filter { $0.revision > 3 }.count, 5)
+            XCTAssertTrue(outbox.allSatisfy { !$0.payload.contains(Data("scoped".utf8)) })
+            try await database.close()
+
+            _ = try await fixture.control.transitionStatus(
+                did: Self.alice,
+                to: .deactivated,
+                declaration: .init(),
+                now: Date()
+            )
+            try await app.test(.router) { client in
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.writeHeaders(fixture, path: Self.createPath, jti: "deactivated-write"), body: ByteBuffer(string: createBody.replacingOccurrences(of: "scoped", with: "inactive"))) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try self.errorCode(response.body), "Unauthorized")
+                }
+            }
+            try await close(fixture)
+        } catch { try? await close(fixture); throw error }
+    }
+
+    func testWriteFailsClosedWhenPreopenedDatabaseVanishes() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let app = try makeServer(fixture).buildApplication(
+                logger: Logger(label: "PermissionedRecordWriteMissingDatabaseTests")
+            )
+            let accountPath = SQLiteLayout.accountDatabase(in: fixture.root, did: Self.alice)
+            try FileManager.default.removeItem(at: accountPath)
+            let body = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","collection":"\#(Self.collection)","rkey":"missing-db","record":{"$type":"app.bsky.feed.post"}}"#
+            try await app.test(.router) { client in
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.writeHeaders(fixture, path: Self.createPath, jti: "missing-db-write"), body: ByteBuffer(string: body)) { response in
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(try self.errorCode(response.body), "temporarily_unavailable")
+                }
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: accountPath.path))
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
+    func testConcurrentHTTPWritesExposeCASConflictsWithoutLosingCommittedFacts() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let app = try makeServer(fixture).buildApplication(
+                logger: Logger(label: "PermissionedRecordWriteCASRaceTests")
+            )
+            let requestCount = 16
+            let requests = try (0 ..< requestCount).map { index -> (HTTPFields, String) in
+                let body = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","collection":"\#(Self.collection)","rkey":"race-\#(index)","record":{"$type":"app.bsky.feed.post"}}"#
+                return (
+                    try writeHeaders(fixture, path: Self.createPath, jti: "cas-race-\(index)"),
+                    body
+                )
+            }
+            try await app.test(.router) { client in
+                let statuses = await withTaskGroup(of: Int.self, returning: [Int].self) { group in
+                    for (headers, body) in requests {
+                        group.addTask {
+                            do {
+                                return try await client.execute(
+                                    uri: Self.createPath,
+                                    method: .post,
+                                    headers: headers,
+                                    body: ByteBuffer(string: body)
+                                ) { $0.status.code }
+                            } catch {
+                                return -1
+                            }
+                        }
+                    }
+                    return await group.reduce(into: []) { $0.append($1) }
+                }
+                XCTAssertFalse(statuses.contains(-1))
+                XCTAssertTrue(statuses.allSatisfy { $0 == 200 || $0 == 409 })
+                XCTAssertGreaterThan(statuses.filter { $0 == 200 }.count, 0)
+                XCTAssertGreaterThan(statuses.filter { $0 == 409 }.count, 0)
+
+                let database = try await SQLiteAccountDatabase(dataDirectory: fixture.root, did: Self.alice)
+                let facts = try await database.spaceOplog(space: fixture.space, author: Self.alice, since: 3)
+                guard case let .incremental(entries) = facts else {
+                    try await database.close()
+                    return XCTFail("concurrent HTTP writes unexpectedly require full recovery")
+                }
+                XCTAssertEqual(entries.count, statuses.filter { $0 == 200 }.count)
+                XCTAssertEqual(Set(entries.map(\.wireRevision)).count, entries.count)
+                try await database.close()
+            }
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
     private func makeFixture() async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "PermissionedRecordReadHTTPTests-\(UUID().uuidString)")
@@ -732,6 +1011,12 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         return headers
     }
 
+    private func writeHeaders(_ token: TokenMaterial, fixture: Fixture, path: String, jti: String) throws -> HTTPFields {
+        var headers = try signedHeaders(token: token.token, key: token.key, jwk: token.jwk, path: path, nonce: fixture.runtime.dpopNonceService.issue(), jti: jti, method: "POST")
+        headers[.contentType] = "application/json"
+        return headers
+    }
+
     private func getURI(
         _ fixture: Fixture,
         space: SpaceURI? = nil,
@@ -813,6 +1098,11 @@ private struct TokenMaterial: Sendable {
     let token: String
     let key: P256.Signing.PrivateKey
     let jwk: OAuthJSONWebKey
+}
+
+private struct ConcurrentWriteOutcome: Sendable {
+    let status: Int
+    let uri: String?
 }
 
 private struct Fixture: Sendable {

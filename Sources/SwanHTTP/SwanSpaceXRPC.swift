@@ -310,6 +310,7 @@ private func authenticatedGetSpaceJSON(
 public struct SwanAuthenticatedSpaceRecordsCapability: Sendable {
     let authorizer: SwanOAuthResourceAuthorizer
     let directory: any AuthorizedSpaceRepositoryDirectory
+    let tidAllocator: SwanPermissionedTIDAllocator
 
     init(
         authorizer: SwanOAuthResourceAuthorizer,
@@ -317,6 +318,7 @@ public struct SwanAuthenticatedSpaceRecordsCapability: Sendable {
     ) {
         self.authorizer = authorizer
         self.directory = directory
+        tidAllocator = SwanPermissionedTIDAllocator()
     }
 }
 
@@ -572,12 +574,40 @@ private func authorize(
     }
 }
 
+/// Write routes deliberately map OAuth/DPoP failures into the write failure
+/// domain.  Reusing the read helper would throw `AuthenticatedSpaceRecordFailure`,
+/// which the write route's catch-all would otherwise mislabel as malformed
+/// input (400) instead of an authorization denial or nonce challenge.
+private func authorizeWrite(
+    _ authorizer: SwanOAuthResourceAuthorizer,
+    request: Request,
+    fixedPath: String,
+    method: String = "POST"
+) async throws -> AuthorizationContext {
+    do {
+        return try await authorizer.authorize(
+            request: request,
+            method: method,
+            fixedPath: fixedPath
+        )
+    } catch let failure as SwanResourceAuthorizationFailure {
+        throw switch failure {
+        case .nonceChallengeRequired: AuthenticatedSpaceWriteFailure.nonceChallenge
+        case .denied: AuthenticatedSpaceWriteFailure.denied
+        case .unavailable: AuthenticatedSpaceWriteFailure.unavailable
+        }
+    } catch {
+        throw AuthenticatedSpaceWriteFailure.unavailable
+    }
+}
+
 // MARK: - Authenticated permissioned record writes
 
 /// A deliberately conservative cap for JSON XRPC write bodies. Record and
 /// blob transfer use different streaming endpoints; accepting a large record
 /// here would make this control-plane path an accidental buffering surface.
 private let authenticatedSpaceWriteMaximumJSONBytes = 1 * 1024 * 1024
+private let authenticatedSpaceWriteMaximumOperations = 4_096
 
 private enum AuthenticatedSpaceWriteFailure: Error {
     case invalidRequest
@@ -597,7 +627,7 @@ private struct AuthenticatedCreateRecordHandler: ComAtprotoSpaceCreateRecord.Ser
         let rkey = if let supplied = input.rkey {
             supplied
         } else {
-            try RecordKey(keyString: await TIDGenerator.next())
+            try RecordKey(keyString: try await capability.tidAllocator.next().toString())
         }
         let uri = try makeWriteURI(
             space: input.space,
@@ -606,7 +636,7 @@ private struct AuthenticatedCreateRecordHandler: ComAtprotoSpaceCreateRecord.Ser
             rkey: rkey
         )
         let value = try canonicalRecordValue(input.record)
-        let authorization = try await authorize(
+        let authorization = try await authorizeWrite(
             capability.authorizer, request: request,
             fixedPath: "/xrpc/com.atproto.space.createRecord", method: "POST"
         )
@@ -633,7 +663,7 @@ private struct AuthenticatedPutRecordHandler: ComAtprotoSpacePutRecord.ServerHan
         guard input.validate != true else { throw AuthenticatedSpaceWriteFailure.invalidRequest }
         let uri = try makeWriteURI(space: input.space, repo: input.repo, collection: input.collection, rkey: input.rkey)
         let value = try canonicalRecordValue(input.record)
-        let authorization = try await authorize(
+        let authorization = try await authorizeWrite(
             capability.authorizer, request: request,
             fixedPath: "/xrpc/com.atproto.space.putRecord", method: "POST"
         )
@@ -659,7 +689,7 @@ private struct AuthenticatedDeleteRecordHandler: ComAtprotoSpaceDeleteRecord.Ser
 
     func handle(parameters: Void, input: ComAtprotoSpaceDeleteRecord.Input, context request: Request) async throws -> ComAtprotoSpaceDeleteRecord.Output {
         let uri = try makeWriteURI(space: input.space, repo: input.repo, collection: input.collection, rkey: input.rkey)
-        let authorization = try await authorize(
+        let authorization = try await authorizeWrite(
             capability.authorizer, request: request,
             fixedPath: "/xrpc/com.atproto.space.deleteRecord", method: "POST"
         )
@@ -680,7 +710,10 @@ private struct AuthenticatedApplyWritesHandler: ComAtprotoSpaceApplyWrites.Serve
     let capability: SwanAuthenticatedSpaceRecordsCapability
 
     func handle(parameters: Void, input: ComAtprotoSpaceApplyWrites.Input, context request: Request) async throws -> ComAtprotoSpaceApplyWrites.Output {
-        guard input.validate != true, !input.writes.isEmpty else { throw AuthenticatedSpaceWriteFailure.invalidRequest }
+        guard input.validate != true,
+              !input.writes.isEmpty,
+              input.writes.count <= authenticatedSpaceWriteMaximumOperations
+        else { throw AuthenticatedSpaceWriteFailure.invalidRequest }
         let space: SpaceURI
         let author: String
         do { space = try SpaceURI(input.space.uriString()); author = input.repo.didString() }
@@ -693,7 +726,7 @@ private struct AuthenticatedApplyWritesHandler: ComAtprotoSpaceApplyWrites.Serve
                 let rkey = if let supplied = create.rkey {
                     supplied
                 } else {
-                    try RecordKey(keyString: await TIDGenerator.next())
+                    try RecordKey(keyString: try await capability.tidAllocator.next().toString())
                 }
                 writes.append(.create(
                     uri: try makeWriteURI(space: input.space, repo: input.repo, collection: create.collection, rkey: rkey),
@@ -710,7 +743,7 @@ private struct AuthenticatedApplyWritesHandler: ComAtprotoSpaceApplyWrites.Serve
                 throw AuthenticatedSpaceWriteFailure.invalidRequest
             }
         }
-        let authorization = try await authorize(
+        let authorization = try await authorizeWrite(
             capability.authorizer, request: request,
             fixedPath: "/xrpc/com.atproto.space.applyWrites", method: "POST"
         )
@@ -775,7 +808,7 @@ private func applyWrite(
     do {
         return try await capability.directory.apply(
             space: space, author: author, writes: writes, requestID: UUID(),
-            wireRevision: await TIDGenerator.next(), authorization: authorization
+            wireRevision: try await capability.tidAllocator.next().toString(), authorization: authorization
         )
     } catch let error as SwanError {
         if case .conflict = error { throw AuthenticatedSpaceWriteFailure.conflict }
