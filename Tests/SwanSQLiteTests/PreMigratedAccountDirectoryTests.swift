@@ -293,6 +293,7 @@ private extension PreMigratedAccountDirectoryTests {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "SwanPreMigratedAccountDirectoryTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
         return root
     }
 

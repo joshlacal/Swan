@@ -342,6 +342,10 @@ private struct Fixture: Sendable {
     init(root: URL) async throws {
         self.root = root
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o700)],
+            ofItemAtPath: root.path
+        )
         database = try await SQLiteAccountDatabase(
             dataDirectory: root,
             did: "did:plc:abcdefghijklmnopqrstuvwx"

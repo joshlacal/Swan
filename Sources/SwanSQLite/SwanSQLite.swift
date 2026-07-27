@@ -603,6 +603,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     private let connectionGate = SQLiteConnectionGate()
     private let accountDID: String
     private let oplogRetention: Int
+    private var accountDirectoryDescriptor: Int32
     private var testingHooks = SQLiteTestingHooks()
     private var activeWriteTransactions = 0
 
@@ -619,18 +620,55 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             spaceType: "app.swan.account",
             skey: "self"
         )
-        let databaseURL = SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
-        try FileManager.default.createDirectory(
-            at: databaseURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
+        let rootDescriptor = try SQLiteProtectedPaths.openRoot(dataDirectory)
+        let accountDescriptor: Int32
+        do {
+            accountDescriptor = try SQLiteProtectedPaths.openAccountDirectory(
+                rootDescriptor: rootDescriptor,
+                did: did
+            )
+        } catch {
+            SQLiteProtectedPaths.closeDirectory(rootDescriptor)
+            throw error
+        }
+        let databasePath: String
+        do {
+            databasePath = try SQLiteProtectedPaths.openDatabaseFile(
+                parentDescriptor: accountDescriptor,
+                name: "\(Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite",
+                resolvedPath: SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
+                    .standardizedFileURL.path
+            )
+        } catch {
+            SQLiteProtectedPaths.closeDirectory(accountDescriptor)
+            SQLiteProtectedPaths.closeDirectory(rootDescriptor)
+            throw error
+        }
+        // The account directory descriptor remains live for the database
+        // lifetime. SQLite opens a revalidated absolute path because macOS
+        // does not support SQLite paths through `/dev/fd`; its owner-only
+        // parent directory prevents another local user from swapping it.
+        SQLiteProtectedPaths.closeDirectory(rootDescriptor)
         self.accountDID = did
         self.oplogRetention = oplogRetention
-        connection = try await SQLiteConnection.open(storage: .file(path: databaseURL.path))
+        let openedConnection: SQLiteConnection
+        do {
+            openedConnection = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        } catch {
+            SQLiteProtectedPaths.closeDirectory(accountDescriptor)
+            throw error
+        }
+        connection = openedConnection
+        accountDirectoryDescriptor = accountDescriptor
         do {
             try await migrateWithoutGate()
+            try SQLiteProtectedPaths.hardenSQLiteFiles(
+                parentDescriptor: accountDescriptor,
+                databaseName: "\(Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite"
+            )
         } catch {
-            try? await connection.close()
+            try? await openedConnection.close()
+            SQLiteProtectedPaths.closeDirectory(accountDescriptor)
             throw error
         }
     }
@@ -639,6 +677,9 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     /// a task that captures an actor instance under Swift 6 isolation rules.
     public func close() async throws {
         try await withConnectionGate {
+            let descriptor = accountDirectoryDescriptor
+            accountDirectoryDescriptor = -1
+            defer { SQLiteProtectedPaths.closeDirectory(descriptor) }
             try await connection.close()
         }
     }

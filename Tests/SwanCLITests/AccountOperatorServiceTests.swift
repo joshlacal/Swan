@@ -189,6 +189,7 @@ final class AccountOperatorServiceTests: XCTestCase {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "swan-cli-tests-\(UUID().uuidString)", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
         return root
     }
 

@@ -39,18 +39,40 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
 
     let connection: SQLiteConnection
     let connectionGate = ControlSQLiteConnectionGate()
+    private var dataDirectoryDescriptor: Int32
 
     public init(dataDirectory: URL) async throws {
-        try FileManager.default.createDirectory(
-            at: dataDirectory,
-            withIntermediateDirectories: true
-        )
-        let databaseURL = SQLiteLayout.controlDatabase(in: dataDirectory)
-        connection = try await SQLiteConnection.open(storage: .file(path: databaseURL.path))
+        let rootDescriptor = try SQLiteProtectedPaths.openRoot(dataDirectory)
+        let databasePath: String
+        do {
+            databasePath = try SQLiteProtectedPaths.openDatabaseFile(
+                parentDescriptor: rootDescriptor,
+                name: "control.sqlite",
+                resolvedPath: SQLiteLayout.controlDatabase(in: dataDirectory)
+                    .standardizedFileURL.path
+            )
+        } catch {
+            SQLiteProtectedPaths.closeDirectory(rootDescriptor)
+            throw error
+        }
+        let openedConnection: SQLiteConnection
+        do {
+            openedConnection = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        } catch {
+            SQLiteProtectedPaths.closeDirectory(rootDescriptor)
+            throw error
+        }
+        connection = openedConnection
+        dataDirectoryDescriptor = rootDescriptor
         do {
             try await migrateWithBusyRetry()
+            try SQLiteProtectedPaths.hardenSQLiteFiles(
+                parentDescriptor: rootDescriptor,
+                databaseName: "control.sqlite"
+            )
         } catch {
-            try? await connection.close()
+            try? await openedConnection.close()
+            SQLiteProtectedPaths.closeDirectory(rootDescriptor)
             throw error
         }
     }
@@ -59,6 +81,9 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
     /// `deinit` because doing so would escape actor isolation.
     public func close() async throws {
         try await withConnectionGate {
+            let descriptor = dataDirectoryDescriptor
+            dataDirectoryDescriptor = -1
+            defer { SQLiteProtectedPaths.closeDirectory(descriptor) }
             try await connection.close()
         }
     }

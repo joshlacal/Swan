@@ -253,6 +253,7 @@ final class SwanSQLiteTests: XCTestCase {
             ]
         )
         try await raw.close()
+        try lockDownLegacySQLiteDatabase(databaseURL, dataDirectory: fixture.root)
 
         let migrated = try await fixture.open()
         try await withClosedAccountDatabase(migrated) { migrated in
@@ -439,6 +440,7 @@ final class SwanSQLiteTests: XCTestCase {
             try? await rawConnection.close()
             throw error
         }
+        try lockDownLegacySQLiteDatabase(databaseURL, dataDirectory: fixture.root)
 
         // This is the actual upgrade sequence for an old table: the additive
         // migration adds columns but SQLite cannot retroactively add the new
@@ -1556,6 +1558,10 @@ final class SwanSQLiteTests: XCTestCase {
             .appending(path: "SwanControlStoreMigrationTests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o700)],
+            ofItemAtPath: root.path
+        )
         let path = SQLiteLayout.controlDatabase(in: root).path
         let legacy = try await SQLiteConnection.open(storage: .file(path: path))
         _ = try await legacy.query(
@@ -1583,6 +1589,7 @@ final class SwanSQLiteTests: XCTestCase {
             """
         )
         try await legacy.close()
+        try lockDownLegacySQLiteDatabase(URL(fileURLWithPath: path), dataDirectory: root)
 
         let migrated = try await SQLiteControlDatabase(dataDirectory: root)
         try await migrated.close()
@@ -1707,6 +1714,7 @@ final class SwanSQLiteTests: XCTestCase {
             ]
         )
         try await legacy.close()
+        try lockDownLegacySQLiteDatabase(URL(fileURLWithPath: path), dataDirectory: root)
 
         let migrated = try await SQLiteControlDatabase(dataDirectory: root)
         let migratedAccount = try await migrated.account(did: "did:plc:abcdefghijklmnopqrstuvwx")
@@ -1981,6 +1989,7 @@ final class SwanSQLiteTests: XCTestCase {
             ]
         )
         try await legacy.close()
+        try lockDownLegacySQLiteDatabase(URL(fileURLWithPath: path), dataDirectory: root)
 
         // A successfully opened database owns an SQLiteNIO connection until
         // `close()` completes. Do not make it a result of a throwing group:
@@ -2102,6 +2111,82 @@ final class SwanSQLiteTests: XCTestCase {
         )
         try await reopened.close()
     }
+
+    func testSQLiteCreatesOwnerOnlyRootDirectoriesAndDatabaseFiles() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanSQLiteProtectedPathsTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        let account = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        defer {
+            Task {
+                try? await control.close()
+                try? await account.close()
+            }
+        }
+
+        let accountDatabase = SQLiteLayout.accountDatabase(in: root, did: did)
+        XCTAssertEqual(try permissions(of: root), 0o700)
+        XCTAssertEqual(try permissions(of: root.appending(path: "actors")), 0o700)
+        XCTAssertEqual(try permissions(of: accountDatabase.deletingLastPathComponent()), 0o700)
+        XCTAssertEqual(try permissions(of: SQLiteLayout.controlDatabase(in: root)), 0o600)
+        XCTAssertEqual(try permissions(of: accountDatabase), 0o600)
+
+        for database in [SQLiteLayout.controlDatabase(in: root), accountDatabase] {
+            for suffix in ["-wal", "-shm"] {
+                let sidecar = URL(fileURLWithPath: database.path + suffix)
+                if FileManager.default.fileExists(atPath: sidecar.path) {
+                    XCTAssertEqual(try permissions(of: sidecar), 0o600)
+                }
+            }
+        }
+    }
+
+    func testSQLiteRejectsUnsafeOrSymlinkDataRootBeforeOpeningDatabases() async throws {
+        let base = FileManager.default.temporaryDirectory
+            .appending(path: "SwanSQLiteUnsafeRootTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o755)],
+            ofItemAtPath: base.path
+        )
+
+        await XCTAssertThrowsErrorAsync(
+            try await SQLiteControlDatabase(dataDirectory: base)
+        ) { error in
+            XCTAssertEqual(error as? SwanError, .unavailable("SQLite data directory is unavailable"))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: SQLiteLayout.controlDatabase(in: base).path
+        ))
+
+        let target = FileManager.default.temporaryDirectory
+            .appending(path: "SwanSQLiteUnsafeRootTarget-\(UUID().uuidString)")
+        let link = FileManager.default.temporaryDirectory
+            .appending(path: "SwanSQLiteUnsafeRootLink-\(UUID().uuidString)")
+        defer {
+            try? FileManager.default.removeItem(at: target)
+            try? FileManager.default.removeItem(at: link)
+        }
+        try FileManager.default.createDirectory(
+            at: target,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: 0o700)]
+        )
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        await XCTAssertThrowsErrorAsync(
+            try await SQLiteControlDatabase(dataDirectory: link)
+        ) { error in
+            XCTAssertEqual(error as? SwanError, .unavailable("SQLite data directory is unavailable"))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: SQLiteLayout.controlDatabase(in: target).path
+        ))
+    }
 }
 
 private extension SwanSQLiteTests {
@@ -2109,7 +2194,45 @@ private extension SwanSQLiteTests {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "SwanAccountControlTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o700)],
+            ofItemAtPath: root.path
+        )
         return root
+    }
+
+    func permissions(of url: URL) throws -> Int {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let mode = try XCTUnwrap(attributes[.posixPermissions] as? NSNumber)
+        return mode.intValue & 0o777
+    }
+
+    func lockDownLegacySQLiteDatabase(
+        _ database: URL,
+        dataDirectory: URL
+    ) throws {
+        let root = dataDirectory.standardizedFileURL
+        var directory = database.deletingLastPathComponent().standardizedFileURL
+        while true {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: 0o700)],
+                ofItemAtPath: directory.path
+            )
+            if directory == root { break }
+            let parent = directory.deletingLastPathComponent().standardizedFileURL
+            guard parent.path.hasPrefix(root.path) else {
+                throw SwanError.unavailable("test database escaped its root")
+            }
+            directory = parent
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let file = URL(fileURLWithPath: database.path + suffix)
+            guard FileManager.default.fileExists(atPath: file.path) else { continue }
+            try FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: 0o600)],
+                ofItemAtPath: file.path
+            )
+        }
     }
 
     func controlRegistration(

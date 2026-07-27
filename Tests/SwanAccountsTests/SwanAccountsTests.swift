@@ -918,6 +918,45 @@ final class SwanAccountsTests: XCTestCase {
     private static let aliceDID = "did:plc:abcdefghijklmnopqrstuvwx"
     private static let bobDID = "did:plc:bcdefghijklmnopqrstuvwxy"
 
+    func testProvisioningSecretsRequireProtectedMatchingSources() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let key = Data(repeating: 0xAB, count: 32)
+        let encoded = base64URLEncoded(key)
+        let keyFile = root.appending(path: "account-kek")
+        try Data((encoded + "\n").utf8).write(to: keyFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyFile.path)
+
+        let fromBoth = try AccountProvisioningSecrets.accountKeyConfiguration(
+            environment: [AccountProvisioningSecrets.kekEnvironmentName: encoded],
+            activeKeyID: "lab-primary",
+            secretFile: keyFile
+        )
+        XCTAssertEqual(fromBoth.activeKeyID, "lab-primary")
+
+        XCTAssertThrowsError(
+            try AccountProvisioningSecrets.accountKeyConfiguration(
+                environment: [AccountProvisioningSecrets.kekEnvironmentName: base64URLEncoded(Data(repeating: 0xBC, count: 32))],
+                activeKeyID: "lab-primary",
+                secretFile: keyFile
+            )
+        )
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: keyFile.path)
+        XCTAssertThrowsError(
+            try AccountProvisioningSecrets.accountKeyConfiguration(
+                environment: [:],
+                activeKeyID: "lab-primary",
+                secretFile: keyFile
+            )
+        )
+
+        let passwordFile = root.appending(path: "password")
+        try Data("correct horse 🦢\r\n".utf8).write(to: passwordFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: passwordFile.path)
+        XCTAssertEqual(try AccountProvisioningSecrets.password(secretFile: passwordFile), "correct horse 🦢")
+    }
+
     private func keyConfiguration(activeKeyID: String, byte: UInt8) throws
         -> AccountKeyEncryptionConfiguration
     {
@@ -931,7 +970,15 @@ final class SwanAccountsTests: XCTestCase {
         let url = FileManager.default.temporaryDirectory
             .appending(path: "SwanAccountsTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
         return url
+    }
+
+    private func base64URLEncoded(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 
     private func keyFiles(in root: URL) throws -> [URL] {

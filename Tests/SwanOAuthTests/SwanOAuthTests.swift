@@ -928,6 +928,7 @@ private func temporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory
         .appending(path: "SwanOAuthTests-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
     return url
 }
 

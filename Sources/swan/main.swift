@@ -57,7 +57,6 @@ extension SwanCommand {
                 return url
             } ?? URL(string: "http://\(host):\(port)")!
             let dataURL = URL(fileURLWithPath: dataDirectory)
-            try FileManager.default.createDirectory(at: dataURL, withIntermediateDirectories: true)
             let serverKey = try loadOAuthServerKey()
             let controlDatabase = try await SQLiteControlDatabase(dataDirectory: dataURL)
             var preopenedAccountDirectory: SQLitePreMigratedAccountDirectory?
@@ -226,8 +225,113 @@ extension SwanCommand {
     struct Account: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
             abstract: "Inspect or manage a provisioned Swan account",
-            subcommands: [Show.self, Deactivate.self, Reactivate.self, Delete.self]
+            subcommands: [InstallLocal.self, Show.self, Deactivate.self, Reactivate.self, Delete.self]
         )
+
+        /// Installs the local, durable half of a Swan account. It deliberately
+        /// does not claim PLC registration or remote handle verification: the
+        /// command is the offline/recoverable prerequisite for those future
+        /// protocol operations, and creates the verified empty public repo.
+        struct InstallLocal: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "install-local",
+                abstract: "Install a local account, encrypted keys, and an empty public repository"
+            )
+
+            @Option(name: .long, help: "Swan data directory; control and per-account databases are created here")
+            var dataDirectory: String
+
+            @Option(name: .long, help: "Account DID to install")
+            var did: String
+
+            @Option(name: .long, help: "Canonical account handle")
+            var handle: String
+
+            @Option(name: .long, help: "Valid repository-v3 revision for the immutable empty public genesis")
+            var revision: String
+
+            @Option(name: .long, help: "Owner-only mounted file containing the account password; never accepted literally")
+            var passwordFile: String
+
+            @Option(name: .long, help: "Mounted operator-secret file; never accepted as a literal argument")
+            var operatorSecretFile: String?
+
+            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64); SWAN_ACCOUNT_KEK is the alternative")
+            var accountKEKFile: String?
+
+            @Option(name: .customLong("account-kek-id"), help: "Account-KEK identifier written into encrypted envelopes")
+            var accountKEKID: String = "primary"
+
+            @Option(name: .long, help: "Protected key-envelope directory; defaults to <data-directory>/keys")
+            var accountKeyDirectory: String?
+
+            func run() async throws {
+                // Local installation is a management action even though it
+                // has no HTTP listener. Resolve the process capability first
+                // so an untrusted caller cannot cause key-store mutations.
+                _ = try AccountCommandSupport.authorization(
+                    secretFilePath: operatorSecretFile
+                )
+                let password = try AccountProvisioningSecrets.password(
+                    secretFile: URL(fileURLWithPath: passwordFile)
+                )
+                let keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                    activeKeyID: accountKEKID,
+                    secretFile: accountKEKFile.map { URL(fileURLWithPath: $0) }
+                )
+                guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw ValidationError("--data-directory must not be empty")
+                }
+
+                let dataURL = URL(fileURLWithPath: dataDirectory)
+                let keyURL = accountKeyDirectory.map { URL(fileURLWithPath: $0) }
+                    ?? dataURL.appending(path: "keys")
+                let control: SQLiteControlDatabase
+                let accountDatabase: SQLiteAccountDatabase
+                do {
+                    control = try await SQLiteControlDatabase(dataDirectory: dataURL)
+                    accountDatabase = try await SQLiteAccountDatabase(dataDirectory: dataURL, did: did)
+                } catch {
+                    throw ValidationError("unable to open Swan account storage")
+                }
+                do {
+                    let keyStore = try FileAccountKeyStore(
+                        root: keyURL,
+                        configuration: keyConfiguration
+                    )
+                    let keyProvisioner = AccountKeyProvisioner(keyStore: keyStore)
+                    let passwordHasher = try LibsodiumArgon2idHasher()
+                    let verificationExecutor = try Argon2idVerificationExecutor(hasher: passwordHasher)
+                    let directory = DurableAccountDirectory(
+                        store: control,
+                        passwordHasher: passwordHasher,
+                        verificationExecutor: verificationExecutor,
+                        keyProvisioner: keyProvisioner
+                    )
+                    let installer = LocalAccountProvisioner(
+                        directory: directory,
+                        publicGenesisStore: accountDatabase,
+                        keyProvisioner: keyProvisioner,
+                        keyStore: keyStore
+                    )
+                    let installation = try await installer.install(
+                        did: did,
+                        handle: handle,
+                        password: password,
+                        revision: revision
+                    )
+                    try await accountDatabase.close()
+                    try await control.close()
+                    try AccountCommandSupport.write(
+                        LocalAccountInstallationView(installation: installation)
+                    )
+                } catch {
+                    try? await accountDatabase.close()
+                    try? await control.close()
+                    throw AccountCommandSupport.validationError(for: error)
+                }
+            }
+        }
 
         struct Show: AsyncParsableCommand {
             static let configuration = CommandConfiguration(
@@ -366,6 +470,24 @@ extension SwanCommand {
     }
 }
 
+private struct LocalAccountInstallationView: Encodable {
+    let did: String
+    let canonicalHandle: String
+    let status: String
+    let publicGenesisCommitCID: String
+    let publicGenesisRevision: String
+    let recovered: Bool
+
+    init(installation: LocalAccountInstallation) {
+        did = installation.account.did
+        canonicalHandle = installation.account.canonicalHandle
+        status = installation.account.status.rawValue
+        publicGenesisCommitCID = installation.publicGenesis.genesis.commitCID.string
+        publicGenesisRevision = installation.publicGenesis.genesis.revision
+        recovered = installation.registrationWasRecovered
+    }
+}
+
 private enum AccountCommandSupport {
     static func authorization(secretFilePath: String?) throws -> AccountOperatorAuthorization {
         do {
@@ -402,13 +524,21 @@ private enum AccountCommandSupport {
         }
     }
 
+    static func write(_ view: some Encodable) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let data = try encoder.encode(view)
+        FileHandle.standardOutput.write(data)
+        FileHandle.standardOutput.write(Data("\n".utf8))
+    }
+
     static func write(_ view: AccountOperatorView) throws {
         let data = try AccountOperatorJSON.render(view)
         FileHandle.standardOutput.write(data)
         FileHandle.standardOutput.write(Data("\n".utf8))
     }
 
-    private static func validationError(for error: any Error) -> ValidationError {
+    static func validationError(for error: any Error) -> ValidationError {
         if let error = error as? AccountOperatorError,
            let message = error.errorDescription {
             return ValidationError(message)

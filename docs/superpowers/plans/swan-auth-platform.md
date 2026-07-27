@@ -34,6 +34,20 @@ production deployment.
   account's WAL database before an active control-plane row is written. Its
   commit-CID binding makes duplicate recovery and legacy-state rejection
   explicit without treating a matching timestamp as provenance.
+- `swan account install-local` now exposes that exact offline installation
+  workflow to an operator. It requires the operator capability, an
+  owner-only password file, and a 32-byte URL-safe-base64 KEK supplied through
+  `SWAN_ACCOUNT_KEK` and/or an owner-only mounted KEK file. It creates only
+  encrypted file envelopes, the empty public genesis, and the local control
+  row; PLC registration and remote handle verification remain explicitly
+  outside this command.
+- SQLite roots, account directories, database files, and SQLite WAL/SHM
+  sidecars are now owner-only (`0700` directories and `0600` files). Swan
+  validates every root and account path without following links and refuses
+  pre-existing unsafe objects before SQLite opens them. macOS SQLite cannot
+  open `/dev/fd/<directory-fd>/database`, so it receives a descriptor-validated
+  absolute path beneath those owner-only directories; retained descriptors
+  anchor validation and all sidecar operations.
 - `5eb0d957` adds the separate bearer-authenticated loopback management
   listener and process lifecycle wiring. It does not make public OAuth routes
   available; those remain deliberately fail-closed pending the full HTTP
