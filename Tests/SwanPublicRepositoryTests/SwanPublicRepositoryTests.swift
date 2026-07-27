@@ -41,6 +41,33 @@ final class SwanPublicRepositoryTests: XCTestCase {
         XCTAssertEqual(verified.unsignedCommit, genesis.unsignedCommit)
     }
 
+    func testPinnedTypeScriptAndSwiftGenesisVectorsCrossVerify() throws {
+        let fixture = try PinnedPublicGenesisFixture.load()
+        let publicKey = try fixedSigningKey().publicKey
+
+        let typeScriptCAR = try XCTUnwrap(Data(base64Encoded: fixture.typeScript.carBase64))
+        let typeScript = try PublicRepositoryGenesisCodec.verify(
+            car: typeScriptCAR,
+            publicKey: publicKey
+        )
+        XCTAssertEqual(typeScript.did, fixture.did)
+        XCTAssertEqual(typeScript.revision, fixture.revision)
+        XCTAssertEqual(typeScript.emptyMSTCID.string, fixture.emptyMSTCID)
+        XCTAssertEqual(typeScript.commitCID.string, fixture.typeScript.commitCID)
+        XCTAssertEqual(hex(typeScript.unsignedCommit), fixture.unsignedCommitHex)
+
+        let swiftCAR = try XCTUnwrap(Data(base64Encoded: fixture.swift.carBase64))
+        let swift = try PublicRepositoryGenesisCodec.verify(
+            car: swiftCAR,
+            publicKey: publicKey
+        )
+        XCTAssertEqual(swift.did, fixture.did)
+        XCTAssertEqual(swift.revision, fixture.revision)
+        XCTAssertEqual(swift.emptyMSTCID.string, fixture.emptyMSTCID)
+        XCTAssertEqual(swift.commitCID.string, fixture.swift.commitCID)
+        XCTAssertEqual(hex(swift.unsignedCommit), fixture.unsignedCommitHex)
+    }
+
     func testWrongKeyAndCriticalTamperingReject() throws {
         let key = try fixedSigningKey()
         let genesis = try PublicRepositoryGenesisCodec.create(did: did, revision: revision, signingKey: key)
@@ -62,6 +89,22 @@ final class SwanPublicRepositoryTests: XCTestCase {
         invalidSignature[0] = 1
         XCTAssertThrowsError(try PublicRepositoryGenesisCodec.verify(
             car: makeCAR(commit: signedCommit(prev: .null, signature: invalidSignature)),
+            publicKey: key.publicKey
+        ))
+
+        // Swift Crypto accepts either algebraically equivalent ECDSA scalar,
+        // while the pinned TypeScript verifier requires low-S ES256. A high-S
+        // signature is therefore a valid local signature that this wire codec
+        // must still reject.
+        let highS = forceHighS(
+            try key.signature(for: unsignedCommit(prev: .null)).rawRepresentation
+        )
+        XCTAssertTrue(key.publicKey.isValidSignature(
+            try P256.Signing.ECDSASignature(rawRepresentation: highS),
+            for: try unsignedCommit(prev: .null)
+        ))
+        XCTAssertThrowsError(try PublicRepositoryGenesisCodec.verify(
+            car: makeCAR(commit: signedCommit(prev: .null, signature: highS)),
             publicKey: key.publicKey
         ))
 
@@ -263,5 +306,78 @@ final class SwanPublicRepositoryTests: XCTestCase {
             if value != 0 { byte |= 0x80 }
             data.append(byte)
         } while value != 0
+    }
+
+    private func forceHighS(_ signature: Data) -> Data {
+        precondition(signature.count == 64)
+        let r = signature.prefix(32)
+        let s = Data(signature.suffix(32))
+        let halfOrder = Data([
+            0x7f, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00,
+            0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xde, 0x73, 0x7d, 0x56, 0xd3, 0x8b, 0xcf, 0x42,
+            0x79, 0xdc, 0xd6, 0x61, 0x7e, 0x31, 0x92, 0xa8,
+        ])
+        guard compareBytes(s, halfOrder) != .orderedDescending else {
+            return signature
+        }
+        let order = Data([
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84,
+            0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
+        ])
+        var result = [UInt8](repeating: 0, count: 32)
+        var borrow = 0
+        for index in result.indices.reversed() {
+            let minuend = Int(order[index]) - borrow
+            let subtrahend = Int(s[index])
+            if minuend >= subtrahend {
+                result[index] = UInt8(minuend - subtrahend)
+                borrow = 0
+            } else {
+                result[index] = UInt8(minuend + 256 - subtrahend)
+                borrow = 1
+            }
+        }
+        precondition(borrow == 0)
+        return Data(r) + Data(result)
+    }
+
+    private func compareBytes(_ lhs: Data, _ rhs: Data) -> ComparisonResult {
+        for (left, right) in zip(lhs, rhs) {
+            if left < right { return .orderedAscending }
+            if left > right { return .orderedDescending }
+        }
+        return .orderedSame
+    }
+
+    private func hex(_ data: Data) -> String {
+        data.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private struct PinnedPublicGenesisFixture: Decodable {
+    struct CAR: Decodable {
+        let commitCID: String
+        let carBase64: String
+    }
+
+    let did: String
+    let revision: String
+    let emptyMSTCID: String
+    let unsignedCommitHex: String
+    let typeScript: CAR
+    let swift: CAR
+
+    static func load() throws -> PinnedPublicGenesisFixture {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let url = packageRoot.appending(
+            path: "fixtures/permissioned-data-0016-2026-07-03/public-repository-genesis.json"
+        )
+        return try JSONDecoder().decode(Self.self, from: Data(contentsOf: url))
     }
 }

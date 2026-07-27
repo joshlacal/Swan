@@ -87,8 +87,9 @@ public enum PublicRepositoryGenesisCodec {
 
         let (emptyMST, emptyMSTCID) = try emptyMSTBlock()
         let unsignedCommit = try encodeUnsignedCommit(did: did, revision: revision, dataCID: emptyMSTCID)
-        let signature = try signingKey.signature(for: unsignedCommit).rawRepresentation
-        guard signature.count == 64 else { throw PublicRepositoryGenesisError.invalidSignature }
+        let signature = try canonicalLowSSignature(
+            signingKey.signature(for: unsignedCommit).rawRepresentation
+        )
         let signedCommit = try encodeSignedCommit(
             did: did,
             revision: revision,
@@ -171,6 +172,9 @@ public enum PublicRepositoryGenesisCodec {
             throw PublicRepositoryGenesisError.invalidCommit
         }
 
+        guard isCanonicalLowSSignature(decoded.signature) else {
+            throw PublicRepositoryGenesisError.invalidSignature
+        }
         let signature: P256.Signing.ECDSASignature
         do {
             signature = try P256.Signing.ECDSASignature(rawRepresentation: decoded.signature)
@@ -290,6 +294,81 @@ public enum PublicRepositoryGenesisCodec {
         guard car.count <= maximumCARBytes else { throw PublicRepositoryGenesisError.malformedCAR }
         return car
     }
+
+    /// The pinned TypeScript repository verifier follows the WebCrypto/Jose
+    /// ES256 convention and rejects high-S ECDSA encodings. Swift Crypto
+    /// validates both mathematically equivalent encodings, so normalize every
+    /// locally emitted raw `r || s` signature and reject the non-canonical
+    /// form at this wire boundary.
+    private static func canonicalLowSSignature(_ signature: Data) throws -> Data {
+        guard signature.count == 64 else { throw PublicRepositoryGenesisError.invalidSignature }
+        let r = signature.prefix(32)
+        let s = Data(signature.suffix(32))
+        guard isStrictlyBetweenZeroAndOrder(s) else {
+            throw PublicRepositoryGenesisError.invalidSignature
+        }
+        guard compareBytes(s, p256HalfOrder) == .orderedDescending else {
+            return signature
+        }
+        var normalized = Data(r)
+        normalized.append(subtractP256Order(s))
+        return normalized
+    }
+
+    private static func isCanonicalLowSSignature(_ signature: Data) -> Bool {
+        guard signature.count == 64 else { return false }
+        let s = Data(signature.suffix(32))
+        return isStrictlyBetweenZeroAndOrder(s)
+            && compareBytes(s, p256HalfOrder) != .orderedDescending
+    }
+
+    private static func isStrictlyBetweenZeroAndOrder(_ scalar: Data) -> Bool {
+        scalar.count == 32
+            && scalar.contains(where: { $0 != 0 })
+            && compareBytes(scalar, p256Order) == .orderedAscending
+    }
+
+    private static func compareBytes(_ lhs: Data, _ rhs: Data) -> ComparisonResult {
+        precondition(lhs.count == rhs.count)
+        for (left, right) in zip(lhs, rhs) {
+            if left < right { return .orderedAscending }
+            if left > right { return .orderedDescending }
+        }
+        return .orderedSame
+    }
+
+    private static func subtractP256Order(_ scalar: Data) -> Data {
+        precondition(scalar.count == p256Order.count)
+        var result = [UInt8](repeating: 0, count: p256Order.count)
+        var borrow = 0
+        for index in result.indices.reversed() {
+            let minuend = Int(p256Order[index]) - borrow
+            let subtrahend = Int(scalar[index])
+            if minuend >= subtrahend {
+                result[index] = UInt8(minuend - subtrahend)
+                borrow = 0
+            } else {
+                result[index] = UInt8(minuend + 256 - subtrahend)
+                borrow = 1
+            }
+        }
+        precondition(borrow == 0)
+        return Data(result)
+    }
+
+    private static let p256Order = Data([
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84,
+        0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
+    ])
+
+    private static let p256HalfOrder = Data([
+        0x7f, 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00,
+        0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xde, 0x73, 0x7d, 0x56, 0xd3, 0x8b, 0xcf, 0x42,
+        0x79, 0xdc, 0xd6, 0x61, 0x7e, 0x31, 0x92, 0xa8,
+    ])
 
     private static func parseGenesisCAR(_ car: Data, reader: CARReader) throws -> ParsedCAR {
         var offset = 0

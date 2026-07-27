@@ -1,0 +1,17 @@
+{
+  "profile": "permissioned-data-0016-2026-07-03",
+  "referenceCommit": "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
+  "did": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+  "revision": "3jzfcijpj2z2a",
+  "signingKeyDID": "did:key:zDnaeXxvmFHMHjqgQTbadpWG7gPHwnga1i7SMwxrV2BSdUjAD",
+  "emptyMSTCID": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm",
+  "unsignedCommitHex": "a56364696478206469643a706c633a65777669376e787a796f756e367a687872687336346f697a637265766d336a7a6663696a706a327a32616464617461d82a582500017112209dfefe61dd76ea3dcae5023880b08379d57adf20482d6fdbe2759289f647677b6470726576f66776657273696f6e03",
+  "typeScript": {
+    "commitCID": "bafyreibg4rb6b5fdkonirmsovz6h2y6r4tzks7zlgumzn3p452tl5vef7a",
+    "carBase64": "OqJlcm9vdHOB2CpYJQABcRIgJuRD4PSjU5qIsk6ufH1j0eTyqX8rNRmW7fzupr7UhfhndmVyc2lvbgHgAQFxEiAm5EPg9KNTmoiyTq58fWPR5PKpfys1GZbt/O6mvtSF+KZjZGlkeCBkaWQ6cGxjOmV3dmk3bnh6eW91bjZ6aHhyaHM2NG9pemNyZXZtM2p6ZmNpanBqMnoyYWNzaWdYQOfp1i8BEMS/MryM/AN7w1CQ2XhtJ9FbfcU66vPPykCwbSG6gGwCZdDCFNQAxNbCUcNl7i9osjqDDo0KLzuKlJZkZGF0YdgqWCUAAXESIJ3+/mHdduo9yuUCOICwg3nVet8gSC1v2+J1kon2R2d7ZHByZXb2Z3ZlcnNpb24DKwFxEiCd/v5h3XbqPcrlAjiAsIN51XrfIEgtb9vidZKJ9kdne6JhZYBhbPY="
+  },
+  "swift": {
+    "commitCID": "bafyreics3ioqqtnjo232z53jrzsg4cbchnxo5nh2uepy5usvojds5dbxzu",
+    "carBase64": "OqJlcm9vdHOB2CpYJQABcRIgUtodCE2pdres92mOZG4IIjtu7rT6oR+O0lVyRy6MN81ndmVyc2lvbgHgAQFxEiBS2h0ITal2t6z3aY5kbggiO27utPqhH47SVXJHLow3zaZjZGlkeCBkaWQ6cGxjOmV3dmk3bnh6eW91bjZ6aHhyaHM2NG9pemNyZXZtM2p6ZmNpanBqMnoyYWNzaWdYQB5HYJ+6+EbpENfYyjjia3Huj6F8ARm5GC7HmX4ft+f2Nmv+uxMsJDj/E0thgrdjrS1oIm3BMeD+gRPx5HTyUVBkZGF0YdgqWCUAAXESIJ3+/mHdduo9yuUCOICwg3nVet8gSC1v2+J1kon2R2d7ZHByZXb2Z3ZlcnNpb24DKwFxEiCd/v5h3XbqPcrlAjiAsIN51XrfIEgtb9vidZKJ9kdne6JhZYBhbPY="
+  }
+}
