@@ -10,6 +10,7 @@ import SwanStorage
 /// successfully preopened for an active account at bootstrap.
 public actor SQLitePreMigratedAccountDirectory:
     AuthorizedSimpleSpaceDirectory,
+    AuthorizedPreopenedAccountDirectory,
     AuthorizedSimpleSpaceLifecycleDirectory,
     AuthorizedSimpleSpaceCredentialDirectory,
     AuthorizedSpaceRepositoryDirectory
@@ -418,6 +419,32 @@ public actor SQLitePreMigratedAccountDirectory:
             }
         }
         if failed {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    /// Checks only the active/startup-preopened account inventory.  This is
+    /// intentionally not a repository or simple-space lookup: a user PDS can
+    /// mint a delegation for an authority it does not control, and the remote
+    /// authority alone decides membership and policy during exchange.
+    public func requireActivePreopenedAccount(_ did: String) async throws {
+        guard !isClosed else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard try await isActiveAccount(did) else {
+            throw SwanError.unauthorized("account is unavailable")
+        }
+        guard !isClosed else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        do {
+            try Self.requireExistingRegularDatabase(
+                SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
+            )
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard databases[did] != nil else {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
     }

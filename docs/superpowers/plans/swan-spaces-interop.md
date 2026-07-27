@@ -112,7 +112,8 @@ Catbird UI work.
   Focused tests cover durable public/member policy, app and managing-app
   denial, wrong issuer/key/audience/space, expiry/tampering, single-use
   replay rejection across reopen, cross-repository reads, duplicate/oversized
-  bodies, write rejection, and no request-time DB opening.
+  bodies, write rejection, and no request-time DB opening. User-PDS
+  delegation minting is recorded separately below.
 - All unimplemented HTTP endpoints intentionally return generic authorization
   errors or `profile_endpoint_pending`; they are not interop evidence. The
   pinned TypeScript `com.atproto.space.getSpace` exception is now a typed,
@@ -123,6 +124,20 @@ Catbird UI work.
   projection, and maps foreign/missing/deleted spaces to the same 404. The
   route remains closed unless the server itself can bind the authorizer to its
   configured public URL and durable OAuth runtime.
+- `com.atproto.space.getDelegationToken` is now a separately capability-gated
+  user-PDS endpoint. It is installed only with durable DPoP OAuth, an active
+  startup-preopened account database, and an explicit
+  `AccountKeyStore`-backed signer; the ordinary/default server still returns a
+  no-store 503, with a no-store 404 for wrong methods. Its singleton `space`
+  query is decoded before authorization, and the user can mint only with
+  broad `atproto` or an exact whole-space `action=read` scope—collection,
+  `read_self`, foreign, malformed, or decoded-duplicate grants cannot be
+  amplified. The issuer reads the encrypted account signing key immediately
+  before producing the fixed ES256 60-second `#atproto` delegation; it never
+  consults remote authority membership or policy. Focused HTTP tests use real
+  durable OAuth/DPoP and encrypted key storage to verify the emitted token
+  through the local Task-6 public-key resolver, as well as replay, lifecycle,
+  missing-key/preopened-database, opacity, and default-closure cases.
 
 ## Acceptance gates
 

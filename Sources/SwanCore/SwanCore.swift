@@ -180,6 +180,105 @@ public enum PermissionedSpaceScopeSyntax {
         // accepting both would leave the resource operation ambiguous.
         return requiredKeys == ["authority", "skey"] && (hasAction != hasManage)
     }
+
+    /// Returns whether an OAuth grant can be exchanged for a whole-space
+    /// read delegation.  This is deliberately stricter than a normal record
+    /// read: a collection-qualified grant (including `collection=*`) and
+    /// `read_self` can never be amplified into a credential which reads every
+    /// member repository.
+    ///
+    /// The broad `atproto` scope remains the one explicit whole-account
+    /// grant.  Every profile-specific grant must name exactly the requested
+    /// type, authority, skey, and `action=read`; extra or duplicate decoded
+    /// query members fail closed.
+    public static func permitsWholeSpaceRead(
+        _ scopes: Set<String>,
+        spaceType: String,
+        authority: String,
+        skey: String
+    ) -> Bool {
+        guard !spaceType.isEmpty, !authority.isEmpty, !skey.isEmpty else {
+            return false
+        }
+        if scopes.contains("atproto") { return true }
+
+        let prefix = "space:\(spaceType)?"
+        return scopes.contains { scope in
+            guard scope.hasPrefix(prefix),
+                  let parameters = strictQualifiedParameters(scope),
+                  parameters.count == 3,
+                  parameters["authority"] == authority,
+                  parameters["skey"] == skey,
+                  parameters["action"] == "read" else {
+                return false
+            }
+            return Set(parameters.keys) == ["authority", "skey", "action"]
+        }
+    }
+
+    /// Decodes the already-qualified permissioned-space query with a
+    /// singleton-after-decoding rule.  A raw `authority` plus a percent-coded
+    /// duplicate such as `%61uthority` must not escape the duplicate-key
+    /// check performed by ``isQualified(_:)``.
+    private static func strictQualifiedParameters(_ scope: String) -> [String: String]? {
+        guard isQualified(scope),
+              let queryStart = scope.firstIndex(of: "?") else {
+            return nil
+        }
+
+        var parameters: [String: String] = [:]
+        for component in scope[scope.index(after: queryStart)...]
+            .split(separator: "&", omittingEmptySubsequences: false)
+        {
+            let pair = component.split(
+                separator: "=", maxSplits: 1, omittingEmptySubsequences: false
+            )
+            guard pair.count == 2,
+                  let key = strictPercentDecode(pair[0]),
+                  let value = strictPercentDecode(pair[1]),
+                  !key.isEmpty, !value.isEmpty,
+                  parameters[key] == nil else {
+                return nil
+            }
+            parameters[key] = value
+        }
+        return parameters
+    }
+
+    private static func strictPercentDecode(_ value: Substring) -> String? {
+        var decoded: [UInt8] = []
+        decoded.reserveCapacity(value.utf8.count)
+        var iterator = value.utf8.makeIterator()
+        while let byte = iterator.next() {
+            if byte == UInt8(ascii: "%") {
+                guard let high = iterator.next(), let low = iterator.next(),
+                      let highValue = hexValue(high), let lowValue = hexValue(low) else {
+                    return nil
+                }
+                decoded.append(highValue << 4 | lowValue)
+            } else {
+                decoded.append(byte)
+            }
+        }
+        guard let result = String(bytes: decoded, encoding: .utf8),
+              result.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+            return nil
+        }
+        return result
+    }
+
+    private static func hexValue(_ byte: UInt8) -> UInt8? {
+        switch byte {
+        case UInt8(ascii: "0") ... UInt8(ascii: "9"):
+            byte - UInt8(ascii: "0")
+        case UInt8(ascii: "A") ... UInt8(ascii: "F"):
+            byte - UInt8(ascii: "A") + 10
+        case UInt8(ascii: "a") ... UInt8(ascii: "f"):
+            byte - UInt8(ascii: "a") + 10
+        default:
+            nil
+        }
+    }
 }
 
 /// Canonical raw P-256 signatures used by Swan wire protocols.

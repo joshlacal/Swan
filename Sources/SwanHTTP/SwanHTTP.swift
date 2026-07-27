@@ -103,6 +103,18 @@ public struct SwanSpaceCredentialHTTPConfiguration: Sendable {
     }
 }
 
+/// The explicit key-backed dependency required for a user PDS to mint a
+/// proposal-0016 delegation.  This is intentionally separate from authority
+/// credential exchange configuration: a user PDS does not consult authority
+/// policy or membership before it signs the user's short-lived assertion.
+public struct SwanSpaceDelegationHTTPConfiguration: Sendable {
+    let tokenIssuer: any SpaceDelegationTokenIssuer
+
+    public init(tokenIssuer: any SpaceDelegationTokenIssuer) {
+        self.tokenIssuer = tokenIssuer
+    }
+}
+
 public struct SwanHTTPServer: Sendable {
     public let profile: ProtocolProfile
     public let configuration: SwanHTTPConfiguration
@@ -138,6 +150,10 @@ public struct SwanHTTPServer: Sendable {
     /// a caller supplied local/pinned key resolvers and the same startup
     /// directory exposes the narrow durable credential-policy projection.
     public let authenticatedSpaceCredentialExchange: SwanSpaceCredentialExchangeCapability?
+    /// User-PDS delegation minting remains unavailable unless an explicit
+    /// AccountKeyStore-backed issuer and a startup-preopened account directory
+    /// are both supplied alongside durable DPoP OAuth authorization.
+    public let authenticatedSpaceDelegationMinting: SwanSpaceDelegationMintingCapability?
 
     public init(
         profile: ProtocolProfile,
@@ -149,7 +165,8 @@ public struct SwanHTTPServer: Sendable {
         localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration? = nil,
         authenticatedGetSpaceDirectory: (any AuthorizedSimpleSpaceDirectory)? = nil,
         accountControlStore: (any AccountControlStore)? = nil,
-        spaceCredentialConfiguration: SwanSpaceCredentialHTTPConfiguration? = nil
+        spaceCredentialConfiguration: SwanSpaceCredentialHTTPConfiguration? = nil,
+        spaceDelegationConfiguration: SwanSpaceDelegationHTTPConfiguration? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -237,11 +254,23 @@ public struct SwanHTTPServer: Sendable {
             } else {
                 authenticatedSpaceCredentialExchange = nil
             }
+            if let preopenedAccountDirectory = authenticatedGetSpaceDirectory
+                as? any AuthorizedPreopenedAccountDirectory,
+               let spaceDelegationConfiguration {
+                authenticatedSpaceDelegationMinting = SwanSpaceDelegationMintingCapability(
+                    authorizer: authorizer,
+                    accounts: preopenedAccountDirectory,
+                    tokenIssuer: spaceDelegationConfiguration.tokenIssuer
+                )
+            } else {
+                authenticatedSpaceDelegationMinting = nil
+            }
         } else {
             authenticatedGetSpace = nil
             authenticatedSpaceRecords = nil
             authenticatedSimpleSpaceLifecycle = nil
             authenticatedSpaceCredentialExchange = nil
+            authenticatedSpaceDelegationMinting = nil
         }
     }
 
@@ -336,6 +365,12 @@ public struct SwanHTTPServer: Sendable {
             if descriptor.nsid == ComAtprotoSpaceGetSpace.typeIdentifier,
                let authenticatedGetSpace {
                 registerAuthenticatedGetSpaceEndpoint(on: router, capability: authenticatedGetSpace)
+            } else if descriptor.nsid == ComAtprotoSpaceGetDelegationToken.typeIdentifier,
+                      let authenticatedSpaceDelegationMinting {
+                registerAuthenticatedGetSpaceDelegationTokenEndpoint(
+                    on: router,
+                    capability: authenticatedSpaceDelegationMinting
+                )
             } else if descriptor.nsid == ComAtprotoSpaceGetSpaceCredential.typeIdentifier,
                       let authenticatedSpaceCredentialExchange {
                 registerAuthenticatedGetSpaceCredentialEndpoint(
@@ -439,14 +474,30 @@ private func registerUnavailablePermissionedEndpoint(
     on router: Router<BasicRequestContext>
 ) {
     let path = RouterPath("/xrpc/\(descriptor.nsid)")
+    let allMethods: [HTTPRequest.Method] = [
+        .get, .head, .post, .put, .patch, .delete, .options, .connect, .trace,
+    ]
+    let availableMethod: HTTPRequest.Method
     switch descriptor.kind {
     case .query, .subscription:
         router.get(path) { _, _ -> Response in
             permissionedDataUnavailable()
         }
+        availableMethod = .get
     case .procedure:
         router.post(path) { _, _ -> Response in
             permissionedDataUnavailable()
+        }
+        availableMethod = .post
+    }
+    // A disabled profile endpoint stays method-correct.  Hummingbird's bare
+    // router 404 has no cache policy or structured body, which would make a
+    // closed delegation route observably different from its enabled shape.
+    // Install explicit no-store guards for every wrong method before the
+    // broader unknown-namespace guards below.
+    for method in allMethods where method != availableMethod {
+        router.on(path, method: method) { _, _ -> Response in
+            permissionedEndpointUnavailable()
         }
     }
 }

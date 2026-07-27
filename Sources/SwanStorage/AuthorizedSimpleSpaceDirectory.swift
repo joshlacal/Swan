@@ -74,6 +74,15 @@ public protocol AuthorizedSimpleSpaceDirectory: Sendable {
     func close() async throws
 }
 
+/// A proof that an account database was selected from the startup inventory
+/// and remains usable without a request-time open or migration.  It exposes
+/// no repository or authority state: user-PDS delegation minting needs only
+/// this lifecycle/preopen gate before asking its separately configured key
+/// signer to create a short-lived token.
+public protocol AuthorizedPreopenedAccountDirectory: Sendable {
+    func requireActivePreopenedAccount(_ did: String) async throws
+}
+
 /// A deliberately narrow lifecycle/membership projection for a simple-space
 /// authority account that was opened at service startup.  It names domain
 /// operations rather than exposing a SQLite handle or mutable authority
