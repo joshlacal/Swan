@@ -96,6 +96,7 @@ final class PLCAccountPreparationCLITests: XCTestCase {
             excludes: [
                 Data(fixture.operatorSecret.utf8),
                 Data(fixture.encodedKEK.utf8),
+                fixture.rawKEK,
             ]
         )
     }
@@ -141,6 +142,7 @@ final class PLCAccountPreparationCLITests: XCTestCase {
                 Data(responseSentinel.utf8),
                 Data(fixture.operatorSecret.utf8),
                 Data(fixture.encodedKEK.utf8),
+                fixture.rawKEK,
             ]
         )
     }
@@ -289,7 +291,7 @@ final class PLCAccountPreparationCLITests: XCTestCase {
         guard let enumerator = FileManager.default.enumerator(
             at: root,
             includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles]
+            options: []
         ) else {
             XCTFail("unable to enumerate persisted data")
             return
@@ -318,6 +320,7 @@ private final class Fixture {
     let operatorSecretFile: URL
     let kekFile: URL
     let operatorSecret = "operator-secret-MUST-NOT-PERSIST-71D9"
+    let rawKEK: Data
     let encodedKEK: String
 
     init() throws {
@@ -327,7 +330,8 @@ private final class Fixture {
         secrets = root.appending(path: "mounted-secrets")
         operatorSecretFile = secrets.appending(path: "operator")
         kekFile = secrets.appending(path: "account-kek")
-        encodedKEK = Self.base64URLEncoded(Data(repeating: 0xD7, count: 32))
+        rawKEK = Data(repeating: 0xD7, count: 32)
+        encodedKEK = Self.base64URLEncoded(rawKEK)
         try FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: secrets, withIntermediateDirectories: true)
         for directory in [root, data, secrets] {

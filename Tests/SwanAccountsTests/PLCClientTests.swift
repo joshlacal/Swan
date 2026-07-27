@@ -83,6 +83,8 @@ final class PLCClientTests: XCTestCase {
         let requested = URL(string: "http://127.0.0.1:2582/\(fixture.did)")!
         let cases: [PLCHTTPResponse] = [
             .init(status: 201, headers: ["content-type": "text/plain; charset=utf-8"], body: Data("OK".utf8), finalURL: nil, redirectCount: 0),
+            .init(status: 204, headers: [:], body: Data(), finalURL: nil, redirectCount: 0),
+            .init(status: 202, headers: ["content-type": "application/json"], body: Data("{}".utf8), finalURL: nil, redirectCount: 0),
             .init(status: 200, headers: ["content-type": "text/plain; charset=utf-8"], body: Data("ok".utf8), finalURL: nil, redirectCount: 0),
             .init(status: 200, headers: ["content-type": "text/plain; charset=utf-8"], body: Data("OK\n".utf8), finalURL: nil, redirectCount: 0),
             .init(status: 200, headers: ["content-type": "text/plain"], body: Data("OK".utf8), finalURL: nil, redirectCount: 0),
@@ -110,6 +112,36 @@ final class PLCClientTests: XCTestCase {
             )
         }
         XCTAssertEqual(requested.path, "/\(fixture.did)")
+    }
+
+    func testStrictProductionSubmitPreservesGenericTwoXXEmptyAndJSONResponses() async throws {
+        let fixture = try operationFixture()
+        let responses: [PLCHTTPResponse] = [
+            .init(
+                status: 204,
+                headers: [:],
+                body: Data(),
+                finalURL: nil,
+                redirectCount: 0
+            ),
+            .init(
+                status: 202,
+                headers: ["content-type": "application/json"],
+                body: Data("{}".utf8),
+                finalURL: nil,
+                redirectCount: 0
+            ),
+        ]
+
+        for response in responses {
+            let client = try PLCDirectoryClient(
+                configuration: .production(
+                    origin: URL(string: "https://plc.example.com")!
+                ),
+                transport: RecordingPLCTransport(responses: [response])
+            )
+            try await client.submit(did: fixture.did, operation: fixture.operation)
+        }
     }
 
     func testFetchAuditUsesExactRouteAndVerifiesOperationCIDSignatureAndDID() async throws {

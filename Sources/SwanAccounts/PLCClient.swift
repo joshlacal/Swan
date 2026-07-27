@@ -434,11 +434,22 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
             throw SwanError.unavailable("PLC directory response exceeded its bound")
         }
 
-        if configuration.submitSuccessResponsePolicy == .didPLCServer001,
-           response.status == 200,
-           response.headers["content-type"] == "text/plain; charset=utf-8",
-           response.body == Data([0x4f, 0x4b]) {
+        switch configuration.submitSuccessResponsePolicy {
+        case .didPLCServer001:
+            guard response.status == 200 else {
+                throw SwanError.unavailable(
+                    "PLC directory returned an incompatible submit status"
+                )
+            }
+            guard response.headers["content-type"] == "text/plain; charset=utf-8",
+                  response.body == Data([0x4f, 0x4b]) else {
+                throw SwanError.malformed(
+                    "PLC directory returned an incompatible submit response"
+                )
+            }
             return
+        case .strict:
+            break
         }
 
         guard (200 ... 299).contains(response.status) else {
