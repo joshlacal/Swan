@@ -6,6 +6,7 @@
 .env
 .env.*
 !.env.example
+.swan-interop-secrets/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal

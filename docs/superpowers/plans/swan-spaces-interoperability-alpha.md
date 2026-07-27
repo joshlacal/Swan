@@ -59,29 +59,29 @@ checksum-verified way to populate the ignored reference cache.
   Toxiproxy, and a Swift scenario-runner. `interop/fetch-reference.sh` is the
   only source-population path; both image Dockerfiles verify the archive SHA
   before unpacking it and contain no source clone or curl. `swan lab validate`
-  checks the same archive/source prerequisites without starting containers;
-  `swan lab scenario --output ...` emits a summary-only, planned-not-executed
-  artifact whose type has no credential, token, key, request, response, or
-  account-data field.
+  checks the same archive/source prerequisites without starting containers; `swan
+  lab scenario --output ...` probes pinned profile endpoints on both hosts and
+  records per-endpoint request/response summaries under a fixture policy that
+  intentionally carries no credential, token, key, account, or blob payload data.
 - The first non-authority record-read slice is live only behind the durable
   resource capability: `com.atproto.space.getRecord` and
   `com.atproto.space.listRecords` use generated server contracts, fixed-route
   DPoP validation, self-only OAuth subject/repository matching, and the
   startup-preopened SQLite directory. It implements the pinned list ordering,
-  cursor, and `excludeValues` behavior, but does not yet implement
-  credentials, cross-host reads, writes, CAR/blob transfer, or other profile
-  endpoints. A profile-specific qualified
+  cursor, and `excludeValues` behavior, plus the credential-reader path and
+  write/apply-writes flows. Cross-host behavior remains defined by the live
+  interop matrix for end-to-end confidence. A profile-specific qualified
   `space:<type>?authority=...&skey=...&action=...` OAuth scope can now be
   issued as a narrow resource grant without adding the broad `atproto` token
   scope. Bare/default type scopes are rejected; the domain policy remains the
   exact space/collection authorization decision.
 - The six authority-owned `com.atproto.simplespace` lifecycle/membership
   routes now use checked-in generated server contracts and the same
-  startup-preopened DPoP/OAuth capability. They are intentionally limited to
-  local authority state; managing-app service auth, credentials,
-  notifications, remote delegation, and synchronization remain closed pending
-  their dedicated capability work. SQLite migration v3 rebuilds legacy
-  simple-space authority CHECK constraints and preserves all FK child facts,
+  startup-preopened DPoP/OAuth capability. They are available for local-authority
+  lifecycle and membership workflows with managing-app and credential-aware policy
+  checks; notifications and repository sync are available via their dedicated
+  capability slices. SQLite migration v3 rebuilds legacy simple-space authority
+  CHECK constraints and preserves all FK child facts,
   so a policy-only patch retains its omitted managing-app value and an empty
   wire value clears it. This is not evidence of cross-host SimpleSpace
   interoperability.
@@ -119,9 +119,9 @@ checksum-verified way to populate the ignored reference cache.
 
 Completion still requires the full pinned XRPC surface, delegation minting at
 the user PDS, durable repositories/CARs/blobs, OAuth and account
-lifecycle, generated wire sources, Compose reference PDS/PLC/Caddy matrix,
-and macOS/Linux verification. The public-genesis vector is a narrow
-cross-language gate; it is not evidence that the complete matrix has passed.
+lifecycle, and Compose reference PDS/PLC/Caddy matrix, plus macOS/Linux verification.
+The public-genesis vector is a narrow cross-language gate; it is not evidence
+that the complete live interop matrix has passed.
 
 ## Compose laboratory evidence and live gates
 
@@ -133,8 +133,9 @@ cross-language gate; it is not evidence that the complete matrix has passed.
   has only local-CA TLS routes for `swan.test` and `pds.test`; PDS traffic goes
   through its named Toxiproxy listener. No permissioned route gains a public
   fallback.
-- A live matrix is still unverified. It requires Docker Compose v2, locally
-  supplied disposable secrets (never committed or included in artifacts),
-  trust of Caddy's laboratory CA by the runner, and implementation of the
-  remaining pinned endpoint/credential paths. The scenario artifact records
-  intent only and must not be represented as a passing reference-PDS matrix.
+- A live matrix is still unverified in this environment. It requires Docker
+  Compose v2, locally supplied disposable secrets (never committed or included
+  in artifacts), trust of Caddy's laboratory CA by the runner, and cross-host
+  execution under the pinned faults. The scenario artifact records transport
+  and endpoint status only and must not be interpreted as full protocol
+  interoperability proof on its own.

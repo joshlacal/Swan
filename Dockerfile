@@ -16,6 +16,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --home-dir /var/lib/swan swan
 COPY --from=build /workspace/Swan/.build/release/swan /usr/local/bin/swan
+COPY interop/bootstrap-local-space.sh /usr/local/bin/swan-interop-bootstrap
+RUN chmod +x /usr/local/bin/swan-interop-bootstrap
 USER swan
 WORKDIR /var/lib/swan
 EXPOSE 3000

@@ -1,0 +1,15 @@
+{
+  "credentialPublicKeys": [],
+  "servicePublicKeys": [],
+  "authorityDestinations": [
+    {
+      "key": "did:plc:abcdefghijklmnopqrstuvwx",
+      "endpoint": "http://localhost:3000",
+      "audience": "did:web:interop-swan-managing-service",
+      "finalPeer": "127.0.0.1"
+    }
+  ],
+  "registrationDestinations": [],
+  "recipientServiceBindings": [],
+  "managingServiceAudience": "did:web:interop-swan-managing-service"
+}

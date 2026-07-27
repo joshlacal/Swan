@@ -25,8 +25,10 @@ import Glibc
 private struct ServeNotificationRuntime {
     let credentialConfiguration: SwanSpaceCredentialHTTPConfiguration
     let notificationConfiguration: SwanSpaceNotificationHTTPConfiguration
+    let serviceAuthentication: any SpaceServiceAuthenticationVerifier
     let destinations: StaticSwanSpaceNotificationDestinations
     let peerPinnedTransportConfiguration: NIOPeerPinnedOAuthPostTransport.Configuration
+    let checkUserAccessAudience: String?
 
     private struct Configuration: Decodable {
         let credentialPublicKeys: [CredentialKey]
@@ -34,6 +36,7 @@ private struct ServeNotificationRuntime {
         let authorityDestinations: [Destination]
         let registrationDestinations: [Destination]
         let recipientServiceBindings: [RecipientServiceBinding]?
+        let managingServiceAudience: String?
     }
 
     private struct CredentialKey: Decodable {
@@ -123,6 +126,15 @@ private struct ServeNotificationRuntime {
             let recipientBindings = try SwanSpaceNotificationRecipientBindings(
                 bindings: recipientAccounts
             )
+            let managedAudience = try resolveManagingServiceAudience(
+                requested: configuration.managingServiceAudience,
+                authorityDestinations: authorities,
+                registrationDestinations: registrations
+            )
+            let serviceAuthentication: any SpaceServiceAuthenticationVerifier =
+                DurableSpaceServiceAuthenticationVerifier(
+                    publicKeys: try PinnedSpaceServicePublicKeyResolver(pins: servicePins)
+                )
             return ServeNotificationRuntime(
                 credentialConfiguration: .init(
                     authoritySigningKeys: ServeUnavailableCredentialSigningKeyResolver(),
@@ -130,20 +142,57 @@ private struct ServeNotificationRuntime {
                     credentialPublicKeys: try PinnedSpaceCredentialPublicKeyResolver(pins: credentialPins)
                 ),
                 notificationConfiguration: .init(
-                    serviceAuthentication: DurableSpaceServiceAuthenticationVerifier(
-                        publicKeys: try PinnedSpaceServicePublicKeyResolver(pins: servicePins)
-                    ),
+                    serviceAuthentication: serviceAuthentication,
                     recipientBindings: recipientBindings
                 ),
+                serviceAuthentication: serviceAuthentication,
                 destinations: try StaticSwanSpaceNotificationDestinations(
                     authorityDestinations: authorities,
                     registrationDestinations: registrations
                 ),
-                peerPinnedTransportConfiguration: try .init(endpointPeers: peers)
+                peerPinnedTransportConfiguration: try .init(endpointPeers: peers),
+                checkUserAccessAudience: managedAudience
             )
         } catch {
             throw ValidationError("--notification-config contains invalid pinned notification material")
         }
+    }
+
+    private static func resolveManagingServiceAudience(
+        requested: String?,
+        authorityDestinations: [String: SwanSpaceNotificationDestination],
+        registrationDestinations: [String: SwanSpaceNotificationDestination]
+    ) throws -> String? {
+        if let requested {
+            let normalized = requested.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty else {
+                return nil
+            }
+            guard normalized.utf8.count <= 2_048,
+                  normalized.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+                throw SwanError.malformed("notification managing service audience is invalid")
+            }
+            return normalized
+        }
+        for destination in authorityDestinations.values {
+            let value = destination.audience
+            guard !value.isEmpty,
+                  value.utf8.count <= 2_048,
+                  value.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+                continue
+            }
+            return value
+        }
+        for destination in registrationDestinations.values {
+            let value = destination.audience
+            guard !value.isEmpty,
+                  value.utf8.count <= 2_048,
+                  value.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+                continue
+            }
+            return value
+        }
+        return nil
     }
 
     private static func decode(
@@ -296,6 +345,8 @@ struct ServeLocalSpaceRuntime {
     let delegationConfiguration: SwanSpaceDelegationHTTPConfiguration
     let repositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration
     let repositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration
+    let notificationServiceAuthentication: any SpaceServiceAuthenticationVerifier
+    let checkUserAccessAudience: String
 
     static func make(
         keyDirectory: URL,
@@ -336,6 +387,15 @@ struct ServeLocalSpaceRuntime {
                 throw SwanError.unavailable("local space runtime account keys are unavailable")
             }
         }
+        guard let checkUserAccessAudience = activeDIDs.sorted().first else {
+            throw SwanError.unavailable("local space runtime has no active account")
+        }
+        let notificationServiceAuthentication = DurableSpaceServiceAuthenticationVerifier(
+            publicKeys: LocalAccountSpaceServicePublicKeyResolver(
+                accounts: accounts,
+                publicKeyStore: keyStore
+            )
+        )
 
         return .init(
             credentialExchangeConfiguration: .init(
@@ -369,7 +429,9 @@ struct ServeLocalSpaceRuntime {
                     accounts: accounts,
                     publicKeyStore: keyStore
                 )
-            )
+            ),
+            notificationServiceAuthentication: notificationServiceAuthentication,
+            checkUserAccessAudience: checkUserAccessAudience
         )
     }
 }
@@ -392,6 +454,58 @@ private func requireExistingOwnerOnlyKeyDirectory(_ url: URL) throws {
           status.st_uid == geteuid(),
           Int(status.st_mode & mode_t(0o777)) == 0o700 else {
         throw SwanError.unavailable("local space key directory is unavailable")
+    }
+}
+
+private func decodeBase64URLOAuthServerKey(_ value: Data) throws -> Data {
+    var normalized = value
+    if normalized.last == 0x0A {
+        normalized.removeLast()
+        if normalized.last == 0x0D {
+            normalized.removeLast()
+        }
+    }
+    guard let base64 = String(data: normalized, encoding: .utf8) else {
+        throw ValidationError("oauth-server-key is invalid")
+    }
+    guard !normalized.isEmpty,
+          normalized.count <= 256,
+          let key = Data(base64URLEncoded: base64),
+          key.count == 32 else {
+        throw ValidationError("oauth-server-key is invalid")
+    }
+    return key
+}
+
+private func readOAuthServerKeyFile(_ url: URL) throws -> Data {
+    let descriptor: Int32 = url.withUnsafeFileSystemRepresentation { path in
+        guard let path else { return Int32(-1) }
+        return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+    }
+    guard descriptor >= 0 else { throw ValidationError("oauth-server-key file is unavailable") }
+    defer { _ = close(descriptor) }
+
+    var metadata = stat()
+    guard fstat(descriptor, &metadata) == 0,
+          (metadata.st_mode & S_IFMT) == S_IFREG,
+          metadata.st_uid == geteuid(),
+          (metadata.st_mode & (S_IRWXG | S_IRWXO)) == 0,
+          metadata.st_size > 0,
+          metadata.st_size <= off_t(256) else {
+        throw ValidationError("oauth-server-key file is unavailable")
+    }
+
+    do {
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        let raw = try handle.read(upToCount: 259) ?? Data()
+        guard raw.count <= 258 else {
+            throw ValidationError("oauth-server-key file is invalid")
+        }
+        return try decodeBase64URLOAuthServerKey(raw)
+    } catch let error as ValidationError {
+        throw error
+    } catch {
+        throw ValidationError("oauth-server-key is unavailable")
     }
 }
 
@@ -772,6 +886,12 @@ extension SwanCommand {
         @Flag(name: .customLong("oauth-allow-localhost-development-client"), help: "Permit only AT Protocol's exact http://localhost development client metadata exception in the complete OAuth server")
         var oauthAllowLocalhostDevelopmentClient = false
 
+        @Option(
+            name: .customLong("oauth-server-key-file"),
+            help: "Owner-only mounted file containing the URL-safe-base64 OAuth server key; SWAN_OAUTH_SERVER_KEY is the legacy alternative"
+        )
+        var oauthServerKeyFile: String?
+
         @Option(name: .customLong("oauth-allow-metadata-ip"), help: "Explicit literal IP allowlist for laboratory OAuth client metadata/JWKS retrieval; repeat for each address")
         var oauthMetadataAllowedIPs: [String] = []
 
@@ -816,7 +936,7 @@ extension SwanCommand {
 
         @Flag(
             name: .customLong("enable-local-space-interop"),
-            help: "Enable local account-key credential, delegation, and repository-sync interop. Conflicts with all notification configuration until resolver merging is separately reviewed."
+            help: "Enable local account-key credential, delegation, and repository-sync interop."
         )
         var enableLocalSpaceInterop = false
 
@@ -861,12 +981,11 @@ extension SwanCommand {
                     )
                 }
                 guard !enableNotificationDelivery,
-                      notificationConfig == nil,
                       notificationAccountKEKFile == nil,
                       notificationAccountKEKID == nil,
                       notificationAccountKeyDirectory == nil else {
                     throw ValidationError(
-                        "--enable-local-space-interop conflicts with notification configuration"
+                        "notification account options require --enable-notification-delivery"
                     )
                 }
             }
@@ -903,7 +1022,7 @@ extension SwanCommand {
                 )
             }
             let dataURL = URL(fileURLWithPath: dataDirectory)
-            let serverKey = try loadOAuthServerKey()
+            let serverKey = try loadOAuthServerKey(fromFile: oauthServerKeyFile)
             let controlDatabase = try await SQLiteControlDatabase(dataDirectory: dataURL)
             var preopenedAccountDirectory: SQLitePreMigratedAccountDirectory?
             var preopenedManagementProvisioning: SwanManagementPLCProvisioningRuntime?
@@ -1041,6 +1160,23 @@ extension SwanCommand {
                 guard !enableNotificationDelivery || notificationRuntime != nil else {
                     throw ValidationError("--enable-notification-delivery requires --notification-config")
                 }
+                let spaceNotificationConfiguration: SwanSpaceNotificationHTTPConfiguration? = if let localSpaceRuntime {
+                    .init(serviceAuthentication: localSpaceRuntime.notificationServiceAuthentication)
+                } else {
+                    notificationRuntime?.notificationConfiguration
+                }
+                let spaceCredentialConfiguration = localSpaceRuntime?.credentialExchangeConfiguration
+                    ?? notificationRuntime?.credentialConfiguration
+                let simpleSpaceCheckUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration? = if let configuration = spaceNotificationConfiguration,
+                   let managedAudience = localSpaceRuntime?.checkUserAccessAudience
+                   ?? notificationRuntime?.checkUserAccessAudience {
+                    try .init(
+                        serviceAuthentication: configuration.serviceAuthentication,
+                        managingServiceAudience: managedAudience
+                    )
+                } else {
+                    nil
+                }
                 let notificationRecoveryService: SwanNotificationRecoveryService?
                 if enableNotificationDelivery, let notificationRuntime {
                     guard !notificationRuntime.peerPinnedTransportConfiguration.endpointPeers.isEmpty else {
@@ -1144,14 +1280,16 @@ extension SwanCommand {
                     authenticatedGetSpaceDirectory: directory,
                     accountControlStore: controlDatabase,
                     // Local interop activates only exchange and sync
-                    // credential verification. It must not turn on the
-                    // broader record/blob credential read surfaces.
-                    spaceCredentialConfiguration: notificationRuntime?.credentialConfiguration,
+                    // Local interop uses account-keyed credential verification
+                    // for exchange, reads, and sync. Notification runtime also
+                    // supports this path when configured separately.
+                    spaceCredentialConfiguration: spaceCredentialConfiguration,
                     spaceCredentialExchangeConfiguration: localSpaceRuntime?.credentialExchangeConfiguration,
                     spaceDelegationConfiguration: localSpaceRuntime?.delegationConfiguration,
                     spaceRepositorySyncConfiguration: localSpaceRuntime?.repositorySyncConfiguration,
                     spaceRepositoryCredentialConfiguration: localSpaceRuntime?.repositoryCredentialConfiguration,
-                    spaceNotificationConfiguration: notificationRuntime?.notificationConfiguration
+                    spaceNotificationConfiguration: spaceNotificationConfiguration,
+                    simpleSpaceCheckUserAccessConfiguration: simpleSpaceCheckUserAccessConfiguration
                 )
                 guard server.authenticatedGetSpace != nil else {
                     throw ValidationError(
@@ -1202,7 +1340,7 @@ extension SwanCommand {
                 }
                 logger.info("starting Swan", metadata: ["profile": .string(loadedProfile.id), "address": .string("\(host):\(port)")])
                 var services: [any Service] = [publicApplication]
-                if notificationRuntime != nil {
+                if spaceNotificationConfiguration != nil {
                     logger.info("space notification receiver routes enabled")
                 }
                 if let notificationRecoveryService {
@@ -1235,8 +1373,21 @@ extension SwanCommand {
             }
         }
 
-        private func loadOAuthServerKey() throws -> Data {
-            guard let encoded = ProcessInfo.processInfo.environment["SWAN_OAUTH_SERVER_KEY"],
+        private func loadOAuthServerKey(fromFile path: String?) throws -> Data {
+            let trimmedPath = path?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let encoded = ProcessInfo.processInfo.environment["SWAN_OAUTH_SERVER_KEY"]
+            if trimmedPath != nil && encoded != nil {
+                throw ValidationError(
+                    "oauth-server-key source is ambiguous; use either --oauth-server-key-file or SWAN_OAUTH_SERVER_KEY"
+                )
+            }
+            if let keyFilePath = trimmedPath {
+                guard !keyFilePath.isEmpty else {
+                    throw ValidationError("oauth-server-key-file must not be empty")
+                }
+                return try readOAuthServerKeyFile(URL(fileURLWithPath: keyFilePath))
+            }
+            guard let encoded,
                   let key = Data(base64URLEncoded: encoded),
                   key.count == 32 else {
                 throw ValidationError(
@@ -1885,7 +2036,7 @@ extension SwanCommand {
     struct Lab: ParsableCommand {
         static let configuration = CommandConfiguration(
             abstract: "Validate and record sanitized Compose laboratory scenarios",
-            subcommands: [Validate.self, Scenario.self],
+            subcommands: [Validate.self, Matrix.self, Scenario.self],
             defaultSubcommand: Validate.self
         )
 
@@ -1915,28 +2066,84 @@ extension SwanCommand {
             }
         }
 
-        struct Scenario: ParsableCommand {
+        struct Scenario: AsyncParsableCommand {
             static let configuration = CommandConfiguration(
-                abstract: "Write a summary-only scenario artifact; it never accepts or records credentials"
+                abstract: "Probe host endpoints and record sanitized interoperability scenario output"
             )
 
             @Option(name: .long, help: "Scenario identifier (letters, numbers, hyphen, and underscore only)")
             var name: String = "reference-matrix"
 
-            @Option(name: .long, parsing: .upToNextOption, help: "Repeatable fault mode: offline, delayed, duplicated, reordered, or corrupted")
+            @Option(
+                name: .long,
+                parsing: .upToNextOption,
+                help: "Repeatable fault mode: offline, disconnected, delayed, duplicated, reordered, or corrupted"
+            )
             var fault: [String] = []
 
             @Option(name: .long, help: "Explicit destination for the sanitized JSON artifact")
             var output: String
 
-            func run() throws {
+            @Option(name: .long, help: "Swan base URL for scenario probes (default: https://swan.test)")
+            var swanBaseURL: String = ""
+
+            @Option(name: .long, help: "Reference PDS base URL for scenario probes (default: https://pds.test)")
+            var referenceBaseURL: String = ""
+
+            @Option(name: .long, help: "Per-request timeout in seconds for scenario probes")
+            var requestTimeoutSeconds: Double = 8
+
+            @Flag(name: .long, help: "Require strict cross-host convergence for every probed endpoint")
+            var strictConvergence: Bool = false
+
+            @Option(
+                name: .long,
+                parsing: .upToNextOption,
+                help: "Repeatable allowlist for strict-convergence mismatches (path or METHOD path)")
+            var allowedConvergenceDivergences: [String] = []
+
+            @Flag(name: .long, help: "Return non-zero when scenario status is not passed")
+            var failOnFailure: Bool = false
+
+            func run() async throws {
+                let normalizedScenario = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !normalizedScenario.isEmpty,
+                      normalizedScenario.unicodeScalars.allSatisfy({
+                          CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_")).contains($0)
+                      }) else {
+                    throw ValidationError("scenario must be an alphanumeric identifier using only letters, numbers, '-' and '_'")
+                }
                 let modes = try fault.map { rawValue -> FaultMode in
                     guard let mode = FaultMode(rawValue: rawValue) else {
                         throw ValidationError("unsupported lab fault mode")
                     }
                     return mode
                 }
-                let artifact = try SanitizedScenarioArtifact(scenario: name, faultModes: modes)
+
+                let swanURLString = !swanBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? swanBaseURL
+                    : ProcessInfo.processInfo.environment["SWAN_SCENARIO_SWAN_URL"] ?? "https://swan.test"
+                let referenceURLString = !referenceBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? referenceBaseURL
+                    : ProcessInfo.processInfo.environment["SWAN_SCENARIO_REFERENCE_URL"] ?? "https://pds.test"
+
+                guard let swanURL = URL(string: swanURLString), let referenceURL = URL(string: referenceURLString) else {
+                    throw ValidationError("lab scenario URL is invalid")
+                }
+
+                let runtimeConfiguration = InteropScenarioRunner.RuntimeConfiguration(
+                    swanBaseURL: swanURL,
+                    referenceBaseURL: referenceURL,
+                    timeoutInterval: requestTimeoutSeconds,
+                    strictConvergence: strictConvergence,
+                    allowedConvergenceDivergences: Set(allowedConvergenceDivergences.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+                )
+
+                let artifact = await InteropScenarioRunner.execute(
+                    scenario: normalizedScenario,
+                    faultModes: modes,
+                    runtime: runtimeConfiguration
+                )
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
                 let outputURL = URL(fileURLWithPath: output)
@@ -1945,7 +2152,126 @@ extension SwanCommand {
                     withIntermediateDirectories: true
                 )
                 try encoder.encode(artifact).write(to: outputURL, options: .atomic)
-                print("SANITIZED SCENARIO ARTIFACT WRITTEN")
+                print("INTEROP SCENARIO ARTIFACT WRITTEN")
+                guard !failOnFailure || artifact.status == "passed" else {
+                    throw ValidationError("interop scenario did not pass; inspect \(outputURL.lastPathComponent)")
+                }
+            }
+        }
+
+        struct Matrix: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Run multiple interoperability fault modes and write one sanitized artifact per mode"
+            )
+
+            @Option(name: .long, help: "Scenario identifier (letters, numbers, hyphen, and underscore only)")
+            var name: String = "reference-matrix"
+
+            @Option(
+                name: .long,
+                parsing: .upToNextOption,
+                help: "Repeatable fault mode: normal, offline, disconnected, delayed, duplicated, reordered, or corrupted"
+            )
+            var fault: [String] = []
+
+            @Option(name: .long, help: "Directory for per-mode output JSON artifacts")
+            var outputDirectory: String = "artifacts"
+
+            @Option(name: .long, help: "Swan base URL for scenario probes (default: https://swan.test)")
+            var swanBaseURL: String = ""
+
+            @Option(name: .long, help: "Reference PDS base URL for scenario probes (default: https://pds.test)")
+            var referenceBaseURL: String = ""
+
+            @Option(name: .long, help: "Per-request timeout in seconds for scenario probes")
+            var requestTimeoutSeconds: Double = 8
+
+            @Flag(name: .long, help: "Require strict cross-host convergence for every probed endpoint")
+            var strictConvergence: Bool = false
+
+            @Option(
+                name: .long,
+                parsing: .upToNextOption,
+                help: "Repeatable allowlist for strict-convergence mismatches (path or METHOD path)")
+            var allowedConvergenceDivergences: [String] = []
+
+            @Flag(name: .long, help: "Return non-zero when any matrix cell is not passed")
+            var failOnFailure: Bool = false
+
+            func run() async throws {
+                let normalizedScenario = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !normalizedScenario.isEmpty,
+                      normalizedScenario.unicodeScalars.allSatisfy({
+                          CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_")).contains($0)
+                      }) else {
+                    throw ValidationError("matrix scenario must be an alphanumeric identifier using only letters, numbers, '-' and '_'")
+                }
+
+                let requestedFaults = fault.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                let modes: [String] = requestedFaults.isEmpty
+                    ? ["normal", "delayed", "duplicated", "reordered", "offline", "disconnected", "corrupted"]
+                    : requestedFaults
+
+                let swanURLString = !swanBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? swanBaseURL
+                    : ProcessInfo.processInfo.environment["SWAN_SCENARIO_SWAN_URL"] ?? "https://swan.test"
+                let referenceURLString = !referenceBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? referenceBaseURL
+                    : ProcessInfo.processInfo.environment["SWAN_SCENARIO_REFERENCE_URL"] ?? "https://pds.test"
+
+                guard let swanURL = URL(string: swanURLString), let referenceURL = URL(string: referenceURLString) else {
+                    throw ValidationError("lab matrix URL is invalid")
+                }
+
+                let runtimeConfiguration = InteropScenarioRunner.RuntimeConfiguration(
+                    swanBaseURL: swanURL,
+                    referenceBaseURL: referenceURL,
+                    timeoutInterval: requestTimeoutSeconds,
+                    strictConvergence: strictConvergence,
+                    allowedConvergenceDivergences: Set(allowedConvergenceDivergences.map {
+                        $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    })
+                )
+
+                let outputDirectoryURL = URL(fileURLWithPath: outputDirectory)
+                try FileManager.default.createDirectory(
+                    at: outputDirectoryURL,
+                    withIntermediateDirectories: true
+                )
+
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                var hadFailure = false
+                var writtenArtifacts: [String] = []
+
+                for rawFault in modes {
+                    let matrixMode: [FaultMode]
+                    if rawFault == "normal" {
+                        matrixMode = []
+                    } else if let faultMode = FaultMode(rawValue: rawFault) {
+                        matrixMode = [faultMode]
+                    } else {
+                        throw ValidationError("unsupported lab fault mode")
+                    }
+
+                    let scenarioName = "\(normalizedScenario)-\(rawFault)"
+                    let artifact = await InteropScenarioRunner.execute(
+                        scenario: scenarioName,
+                        faultModes: matrixMode,
+                        runtime: runtimeConfiguration
+                    )
+                    let outputURL = outputDirectoryURL.appending(path: "\(scenarioName).json")
+                    try encoder.encode(artifact).write(to: outputURL, options: .atomic)
+                    writtenArtifacts.append(outputURL.lastPathComponent)
+                    print("INTEROP SCENARIO ARTIFACT WRITTEN: \(outputURL.lastPathComponent) status=\(artifact.status)")
+                    if artifact.status != "passed" {
+                        hadFailure = true
+                    }
+                }
+
+                if failOnFailure && hadFailure {
+                    throw ValidationError("interop matrix did not pass; inspect \(writtenArtifacts)")
+                }
             }
         }
     }

@@ -523,6 +523,7 @@ public enum InteropLaboratory {
 
 public enum FaultMode: String, Codable, Sendable, CaseIterable {
     case offline
+    case disconnected
     case delayed
     case duplicated
     case reordered
@@ -542,10 +543,56 @@ public enum FixtureSanitizer {
         "authorization", "access_token", "refresh_token", "password", "dpop", "private_key", "ikm",
     ]
 
-    public static func sanitize(_ fields: [String: String]) throws -> [String: String] {
-        guard !fields.keys.contains(where: { forbiddenKeys.contains($0.lowercased()) }) else {
-            throw SwanError.unauthorized("fixtures may not contain credential or key material")
+    private static let forbiddenFragments: [String] = [
+        "authorization", "access_token", "refresh_token", "password", "dpop", "private_key", "private-key",
+        "ikm", "bearer", "token", "atproto-token", "secret", "proof", "jti",
+    ]
+
+    public static func sanitize(_ fields: [String: String]) -> [String: String] {
+        var output: [String: String] = [:]
+        for (key, value) in fields {
+            let normalizedKey = key.lowercased()
+            let isKeySensitive = forbiddenKeys.contains(normalizedKey)
+                || forbiddenFragments.contains(where: { normalizedKey.contains($0) })
+                || shouldRedactValue(value)
+
+            if isKeySensitive {
+                output[key] = "<redacted>"
+                continue
+            }
+
+            if containsBearerLikeOrJWT(value) {
+                output[key] = "<redacted>"
+            } else {
+                output[key] = value
+            }
         }
-        return fields
+        return output
+    }
+
+    private static func shouldRedactValue(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        // Hide values that look like hex digest identifiers when they are long.
+        if trimmed.count >= 48,
+           trimmed.count <= 80,
+           trimmed.allSatisfy({
+               ("0123456789abcdefABCDEF".contains($0)) && !trimmed.starts(with: "baf")
+           }) {
+            return true
+        }
+        return false
+    }
+
+    private static func containsBearerLikeOrJWT(_ value: String) -> Bool {
+        let parts = value.split(separator: ".")
+        guard parts.count == 3 else { return false }
+        return parts.allSatisfy { part in
+            let charset: Set<Character> = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=")
+            guard part.count >= 10 else {
+                return false
+            }
+            return part.allSatisfy(charset.contains)
+        }
     }
 }

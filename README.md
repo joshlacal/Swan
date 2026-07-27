@@ -16,6 +16,12 @@ swift run swan verify
 swift run swan serve --data-directory .swan-data
 ```
 
+The interoperability compose lab binds `swan` with a lab notification material
+configuration from `${SWAN_INTEROP_NOTIFICATION_CONFIG}` by default. If unset,
+it falls back to `interop/notification-config.json`, which enables
+`com.atproto.simplespace.checkUserAccess` with non-sensitive placeholder
+audience and destination data.
+
 ### Pinned wire generation
 
 Normal Swift builds use only the checked-in `Sources/SwanSpacesWire/Generated`

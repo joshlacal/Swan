@@ -16,5 +16,8 @@
 **/*.p8
 **/keys/
 **/keys/**
+.swan-interop-secrets/
+**/.swan-interop-secrets/
+**/.swan-interop-secrets/**
 Swan/.interop-cache/
 Swan/.interop-cache/**

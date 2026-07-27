@@ -6,7 +6,7 @@ cd "$root"
 
 ./interop/verify-reference.sh
 
-for service in swan reference-pds reference-plc caddy mailpit toxiproxy scenario-runner scenario-artifacts-init; do
+for service in swan swan-data-init swan-bootstrap reference-pds reference-plc caddy mailpit toxiproxy scenario-runner scenario-artifacts-init; do
   rg -q "^  ${service}:" docker-compose.yml
 done
 rg -q 'permissioned-data-0016-2026-07-03' Sources/SwanInterop/SwanInterop.swift
@@ -21,16 +21,94 @@ rg -q 'libsodium-dev pkg-config' Dockerfile
 rg -qx 'FROM ubuntu:24\.04' Dockerfile
 rg -q 'libsodium23' Dockerfile
 
-# A named volume starts root-owned. This root-only init container is the sole
-# ownership transition; the scenario runner retains the Dockerfile's swan user.
-init_block="$(awk '/^  scenario-artifacts-init:/{capture=1; next} capture && /^  [[:alnum:]][[:alnum:]-]*:/{capture=0} capture {print}' docker-compose.yml)"
+# New seed/secret contract and startup ordering.
+swan_block="$(awk '/^  swan:/{capture=1; next} capture && /^  [[:alnum:]][[:alnum:]-]*:/{capture=0} capture {print}' docker-compose.yml)"
+init_block="$(awk '/^  swan-data-init:/{capture=1; next} capture && /^  [[:alnum:]][[:alnum:]-]*:/{capture=0} capture {print}' docker-compose.yml)"
+bootstrap_block="$(awk '/^  swan-bootstrap:/{capture=1; next} capture && /^  [[:alnum:]][[:alnum:]-]*:/{capture=0} capture {print}' docker-compose.yml)"
+reference_block="$(awk '/^  reference-pds:/{capture=1; next} capture && /^  [[:alnum:]][[:alnum:]-]*:/{capture=0} capture {print}' docker-compose.yml)"
 runner_block="$(awk '/^  scenario-runner:/{capture=1; next} capture && /^  [[:alnum:]][[:alnum:]-]*:/{capture=0} capture {print}' docker-compose.yml)"
+artifact_init_block="$(awk '/^  scenario-artifacts-init:/{capture=1; next} capture && /^  [[:alnum:]][[:alnum:]-]*:/{capture=0} capture {print}' docker-compose.yml)"
+
 [[ "$init_block" == *'user: root'* ]]
-[[ "$init_block" == *'install -d -o swan -g swan -m 0700 /artifacts'* ]]
-[[ "$init_block" == *'scenario-artifacts:/artifacts'* ]]
-[[ "$runner_block" == *'scenario-artifacts-init:'* ]]
+[[ "$init_block" == *'network_mode: "none"'* ]]
+[[ "$init_block" == *'install -d -o swan -g swan -m 0700 /var/lib/swan/data'* ]]
+[[ "$init_block" == *'swan-data:/var/lib/swan'* ]]
+
+[[ "$bootstrap_block" == *'user: swan'* ]]
+[[ "$bootstrap_block" == *'swan-interop-bootstrap'* ]]
+[[ "$bootstrap_block" == *'SWAN_INTEROP_SECRETS_DIR'* ]]
+
+[[ "$swan_block" == *'--oauth-server-key-file'* ]]
+[[ "$swan_block" == *'--notification-config'* ]]
+[[ "$swan_block" == *'--enable-local-space-interop'* ]]
+[[ "$swan_block" == *'--space-account-kek-file'* ]]
+[[ "$swan_block" == *'/swan-interoperability-secrets/account-kek'* ]]
+[[ "$swan_block" == *'https://swan.test'* ]]
+[[ "$swan_block" == *'aliases:'* ]]
+[[ "$swan_block" == *'swan.test'* ]]
+
+[[ "$reference_block" == *'aliases:'* ]]
+[[ "$reference_block" == *'pds.test'* ]]
+
+[[ "$runner_block" == *'find /caddy-data -type f -name root.crt | head -n 1'* ]]
+[[ "$runner_block" == *'/usr/local/bin/swan lab matrix'* ]]
+[[ "$runner_block" == *'caddy-data:/caddy-data:ro'* ]]
+[[ "$runner_block" == *'SSL_CERT_FILE'* ]]
 [[ "$runner_block" == *'condition: service_completed_successfully'* ]]
-[[ "$runner_block" != *'user:'* ]]
+
+[[ "$artifact_init_block" == *'user: root'* ]]
+[[ "$artifact_init_block" == *'install -d -o swan -g swan -m 0700 /artifacts'* ]]
+[[ "$artifact_init_block" == *'scenario-artifacts:/artifacts'* ]]
+
+if rg -q 'SWAN_OAUTH_SERVER_KEY' docker-compose.yml; then
+  echo "swan compose must use --oauth-server-key-file" >&2
+  exit 1
+fi
+
+[[ -f interop/notification-config.json ]]
+
+if command -v jq >/dev/null 2>&1; then
+  jq -e '
+    . as $config |
+    ( $config | type == "object" ) and
+    ( $config.authorityDestinations | type == "array" ) and
+    ( $config.registrationDestinations | type == "array" ) and
+    ( $config.credentialPublicKeys | type == "array" ) and
+    ( $config.servicePublicKeys | type == "array" ) and
+    ( $config.recipientServiceBindings | type == "array" or . == null ) and
+    ( $config.managingServiceAudience | type == "string" or . == null )
+  ' interop/notification-config.json >/dev/null
+elif command -v python3 >/dev/null 2>&1; then
+  python3 - <<'PY'
+import json
+import sys
+
+with open("interop/notification-config.json", encoding="utf-8") as file:
+    config = json.load(file)
+
+if not isinstance(config, dict):
+    sys.exit("notification-config is not a JSON object")
+for key in [
+    "authorityDestinations",
+    "registrationDestinations",
+    "credentialPublicKeys",
+    "servicePublicKeys",
+]:
+    if not isinstance(config.get(key), list):
+        sys.exit(f"notification-config key {key!r} is not an array")
+
+recipient_bindings = config.get("recipientServiceBindings")
+if recipient_bindings is not None and not isinstance(recipient_bindings, list):
+    sys.exit("'recipientServiceBindings' is not an array when present")
+
+managing_audience = config.get("managingServiceAudience")
+if managing_audience is not None and not isinstance(managing_audience, str):
+    sys.exit("'managingServiceAudience' is not a string when present")
+PY
+else
+  echo "notification-config validation requires jq or python3, neither is available" >&2
+  exit 1
+fi
 
 for reference_dockerfile in interop/Dockerfile.reference-pds interop/Dockerfile.reference-plc; do
   ! rg -q '^ARG[[:space:]]+REFERENCE_ARCHIVE_SHA256' "$reference_dockerfile"
@@ -48,6 +126,9 @@ for ignore_file in Dockerfile.dockerignore interop/Dockerfile.reference-pds.dock
   rg -qx '\*\*/\.swan-data/' "$ignore_file"
   rg -qx '\*\*/\*\.sqlite' "$ignore_file"
   rg -qx '\*\*/\*\.key' "$ignore_file"
+  rg -qx '\.swan-interop-secrets/' "$ignore_file"
+  rg -qx '\*\*/\.swan-interop-secrets/' "$ignore_file"
+  rg -qx '\*\*/\.swan-interop-secrets/**' "$ignore_file"
 done
 for ignore_file in Dockerfile.dockerignore; do
   rg -qx 'Swan/\.interop-cache/\*\*' "$ignore_file"

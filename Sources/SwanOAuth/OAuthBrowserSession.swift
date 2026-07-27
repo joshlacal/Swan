@@ -88,10 +88,14 @@ public struct OAuthBrowserSessionService: Sendable {
             throw SwanError.unauthorized("OAuth browser session rejected")
         }
         let components = value.split(separator: ".", omittingEmptySubsequences: false)
-        guard let payloadData = Data(base64URLEncoded: String(components[0])),
+        let payloadText = String(components[0])
+        let signatureText = String(components[1])
+        guard let payloadData = Data(base64URLEncoded: payloadText),
               payloadData.count <= 4 * 1024,
-              let presentedSignature = Data(base64URLEncoded: String(components[1])),
+              let presentedSignature = Data(base64URLEncoded: signatureText),
               presentedSignature.count == 32,
+              payloadData.base64URLEncodedString() == payloadText,
+              presentedSignature.base64URLEncodedString() == signatureText,
               Self.constantTimeEqual(presentedSignature, sign(payloadData)) else {
             throw SwanError.unauthorized("OAuth browser session rejected")
         }

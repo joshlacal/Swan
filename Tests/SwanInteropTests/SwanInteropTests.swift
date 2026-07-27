@@ -206,6 +206,261 @@ final class SwanInteropTests: XCTestCase {
         XCTAssertEqual(object["status"] as? String, "planned-not-executed")
         XCTAssertTrue((object["fixturePolicy"] as? String ?? "").hasPrefix("summary-only"))
     }
+
+    func testDuplicatedFaultModeProbesEachEndpointTwice() async throws {
+        let runtime = InteropScenarioRunner.RuntimeConfiguration(
+            swanBaseURL: URL(string: "https://127.0.0.1:1")!,
+            referenceBaseURL: URL(string: "https://127.0.0.1:1")!,
+            timeoutInterval: 0.2
+        )
+        let artifact = await InteropScenarioRunner.execute(
+            scenario: "duplication-matrix",
+            faultModes: [.duplicated],
+            runtime: runtime
+        )
+        XCTAssertEqual(artifact.faultModes, ["duplicated"])
+        XCTAssertEqual(artifact.hostResults.count, 2)
+
+        for host in artifact.hostResults {
+            let grouped = Dictionary(grouping: host.endpointResults, by: \.path)
+            XCTAssertTrue(
+                grouped.values.allSatisfy { $0.count == 2 },
+                "Expected duplicated probe to produce two requests per endpoint on \(host.host)"
+            )
+            XCTAssertTrue(
+                host.endpointResults.contains(where: { $0.transportError == "network" }),
+                "Expected duplicated probe to include network failure on unreachable test host for \(host.host)"
+            )
+        }
+    }
+
+    func testReorderedFaultModeReversesEndpointExecutionOrder() async throws {
+        let runtime = InteropScenarioRunner.RuntimeConfiguration(
+            swanBaseURL: URL(string: "https://127.0.0.1:1")!,
+            referenceBaseURL: URL(string: "https://127.0.0.1:1")!,
+            timeoutInterval: 0.2
+        )
+        let normal = await InteropScenarioRunner.execute(
+            scenario: "baseline-matrix",
+            faultModes: [],
+            runtime: runtime
+        )
+        let reordered = await InteropScenarioRunner.execute(
+            scenario: "reordered-matrix",
+            faultModes: [.reordered],
+            runtime: runtime
+        )
+
+        XCTAssertEqual(normal.hostResults.count, 2)
+        XCTAssertEqual(reordered.hostResults.count, 2)
+
+        for (normalHost, reorderedHost) in zip(normal.hostResults, reordered.hostResults) {
+            let normalPaths = normalHost.endpointResults.map(\.path)
+            let reorderedPaths = reorderedHost.endpointResults.map(\.path)
+            XCTAssertEqual(reorderedPaths.count, normalPaths.count)
+            XCTAssertEqual(reorderedPaths, normalPaths.reversed(), "\(normalHost.host) and \(reorderedHost.host) order should be reversed")
+        }
+    }
+
+    func testCorruptedFaultModeCapturesUnsuccessfulCorruptionVariants() async throws {
+        let runtime = InteropScenarioRunner.RuntimeConfiguration(
+            swanBaseURL: URL(string: "https://127.0.0.1:1")!,
+            referenceBaseURL: URL(string: "https://127.0.0.1:1")!,
+            timeoutInterval: 0.2
+        )
+        let artifact = await InteropScenarioRunner.execute(
+            scenario: "corruption-matrix",
+            faultModes: [.corrupted],
+            runtime: runtime
+        )
+        XCTAssertEqual(artifact.faultModes, ["corrupted"])
+
+        for host in artifact.hostResults {
+            let grouped = Dictionary(grouping: host.endpointResults, by: \.path)
+            XCTAssertTrue(
+                grouped.values.allSatisfy { $0.count == 2 },
+                "Expected corrupted fault mode to include baseline and malformed request for each endpoint on \(host.host)"
+            )
+            XCTAssertTrue(
+                host.endpointResults.contains {
+                    $0.mode == "corrupted" &&
+                    ($0.responseSummary["status"] != nil || $0.responseSummary["error"] != nil)
+                }
+            )
+        }
+    }
+
+    func testInteropScenarioRunnerSummarizesCrossHostConvergence() async throws {
+        let runtime = InteropScenarioRunner.RuntimeConfiguration(
+            swanBaseURL: URL(string: "https://127.0.0.1:1")!,
+            referenceBaseURL: URL(string: "https://127.0.0.1:1")!,
+            timeoutInterval: 0.2
+        )
+        let artifact = await InteropScenarioRunner.execute(
+            scenario: "convergence-matrix",
+            faultModes: [],
+            runtime: runtime
+        )
+
+        XCTAssertFalse(artifact.convergence.isEmpty)
+        let describe = artifact.convergence.first {
+            $0.path == "/xrpc/com.atproto.server.describeServer" && $0.mode == "normal"
+        }
+        XCTAssertNotNil(describe)
+        XCTAssertGreaterThan(describe!.swanProbeCount, 0)
+        XCTAssertEqual(describe!.swanProbeCount, describe!.referenceProbeCount)
+        XCTAssertEqual(describe!.swanTransportError, true)
+        XCTAssertEqual(describe!.referenceTransportError, true)
+    }
+
+    func testConvergenceSummaryDetectsStrictMismatch() {
+        let key = InteropScenarioRunner.EndpointResultKey(mode: "normal", method: "GET", path: "/xrpc/com.atproto.server.describeServer")
+        let buckets: [String: [InteropScenarioRunner.EndpointResultKey: [EndpointResult]]] = [
+            "swan": [
+                key: [
+                    EndpointResult(
+                        mode: "normal",
+                        method: "GET",
+                        path: "/xrpc/com.atproto.server.describeServer",
+                        statusCode: 200,
+                        requestSummary: ["host": "swan"],
+                        responseSummary: ["status": "200"]
+                    )
+                ]
+            ],
+            "reference-pds": [
+                key: [
+                    EndpointResult(
+                        mode: "normal",
+                        method: "GET",
+                        path: "/xrpc/com.atproto.server.describeServer",
+                        statusCode: 503,
+                        requestSummary: ["host": "pds"],
+                        responseSummary: ["status": "503", "error": "temporarily_unavailable"]
+                    )
+                ]
+            ],
+        ]
+
+        var unexpectedFailure = false
+        var warnings: [String] = []
+        let convergence = InteropScenarioRunner.summarizeCrossHostConvergence(
+            from: buckets,
+            strictConvergence: true,
+            allowedConvergenceDivergences: [],
+            hasUnexpectedFailure: &unexpectedFailure,
+            warnings: &warnings
+        )
+
+        XCTAssertEqual(convergence.count, 1)
+        XCTAssertFalse(convergence[0].firstProbeAligned)
+        XCTAssertFalse(convergence[0].allowedMismatch)
+        XCTAssertTrue(unexpectedFailure)
+        XCTAssertEqual(warnings.count, 1)
+    }
+
+    func testConvergenceSummaryAllowsConfiguredMismatch() {
+        let key = InteropScenarioRunner.EndpointResultKey(mode: "normal", method: "GET", path: "/xrpc/com.atproto.server.describeServer")
+        let buckets: [String: [InteropScenarioRunner.EndpointResultKey: [EndpointResult]]] = [
+            "swan": [
+                key: [
+                    EndpointResult(
+                        mode: "normal",
+                        method: "GET",
+                        path: "/xrpc/com.atproto.server.describeServer",
+                        statusCode: 200,
+                        requestSummary: ["host": "swan"],
+                        responseSummary: ["status": "200"]
+                    )
+                ]
+            ],
+            "reference-pds": [
+                key: [
+                    EndpointResult(
+                        mode: "normal",
+                        method: "GET",
+                        path: "/xrpc/com.atproto.server.describeServer",
+                        statusCode: 503,
+                        requestSummary: ["host": "pds"],
+                        responseSummary: ["status": "503", "error": "temporarily_unavailable"]
+                    )
+                ]
+            ],
+        ]
+
+        var unexpectedFailure = false
+        var warnings: [String] = []
+        let convergence = InteropScenarioRunner.summarizeCrossHostConvergence(
+            from: buckets,
+            strictConvergence: true,
+            allowedConvergenceDivergences: ["/xrpc/com.atproto.server.describeServer"],
+            hasUnexpectedFailure: &unexpectedFailure,
+            warnings: &warnings
+        )
+
+        XCTAssertEqual(convergence.count, 1)
+        XCTAssertTrue(convergence[0].allowedMismatch)
+        XCTAssertFalse(unexpectedFailure)
+        XCTAssertTrue(warnings.isEmpty)
+    }
+
+    func testInteropScenarioRunnerProducesSanitizedProbeFixture() async throws {
+        let runtime = InteropScenarioRunner.RuntimeConfiguration(
+            swanBaseURL: URL(string: "https://127.0.0.1:1")!,
+            referenceBaseURL: URL(string: "https://127.0.0.1:1")!,
+            timeoutInterval: 0.2
+        )
+        let artifact = await InteropScenarioRunner.execute(
+            scenario: "reference-matrix",
+            faultModes: [.offline, .corrupted],
+            runtime: runtime
+        )
+        XCTAssertEqual(artifact.scenario, "reference-matrix")
+        XCTAssertEqual(artifact.faultModes, ["offline", "corrupted"])
+        XCTAssertEqual(artifact.status, "failed")
+        XCTAssertEqual(artifact.hostResults.count, 2)
+        let encoded = try JSONEncoder().encode(artifact)
+        let decoded = try JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        let forbidden: Set<String> = ["password", "authorization", "access_token", "refresh_token", "dpop", "private_key", "ikm"]
+        let containsForbidden = decoded.flatMap {
+            Self.sanitizedKeys(in: $0).contains { key in
+                forbidden.contains(where: { key.lowercased().contains($0) })
+            }
+        } ?? false
+        XCTAssertFalse(containsForbidden)
+    }
+
+    func testDisconnectedFaultModeIsAcceptedInScenarioExecution() async throws {
+        let runtime = InteropScenarioRunner.RuntimeConfiguration(
+            swanBaseURL: URL(string: "https://127.0.0.1:1")!,
+            referenceBaseURL: URL(string: "https://127.0.0.1:1")!,
+            timeoutInterval: 0.2
+        )
+        let artifact = await InteropScenarioRunner.execute(
+            scenario: "disconnect-matrix",
+            faultModes: [.disconnected],
+            runtime: runtime
+        )
+        XCTAssertEqual(artifact.faultModes, ["disconnected"])
+        XCTAssertEqual(artifact.hostResults.count, 2)
+        XCTAssertEqual(artifact.status, "passed")
+        for host in artifact.hostResults {
+            XCTAssertTrue(host.endpointResults.contains { $0.transportError == "network" })
+        }
+    }
+
+    private static func sanitizedKeys(in value: Any) -> [String] {
+        switch value {
+        case let object as [String: Any]:
+            return object.keys.flatMap { key in
+                [key] + sanitizedKeys(in: object[key]!)
+            }
+        case let array as [Any]:
+            return array.flatMap(sanitizedKeys(in:))
+        default:
+            return []
+        }
+    }
 }
 
 private final class ProfileFixture {

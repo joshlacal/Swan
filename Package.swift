@@ -158,7 +158,7 @@ let package = Package(
         .target(
             name: "SwanInterop",
             dependencies: [
-                "SwanCore", "SwanSpaces",
+                "SwanCore", "SwanSpaces", "SwanSpacesWire",
                 .product(name: "Crypto", package: "swift-crypto"),
             ]
         ),

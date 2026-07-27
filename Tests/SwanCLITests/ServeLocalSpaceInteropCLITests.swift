@@ -120,13 +120,83 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
         XCTAssertFalse(result.error.contains("argon2"))
     }
 
-    private func runServe(data: URL, arguments: [String]) throws -> ProcessResult {
+    func testOAuthServerKeyCanBeLoadedFromFileAndRejectsAmbiguousSource() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appending(path: "data")
+        try FileManager.default.createDirectory(
+            at: data,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let keyFile = root.appending(path: "oauth-server-key")
+        let envKey = base64URLEncoded(Data(repeating: 0xAA, count: 32))
+        try protectedWrite(Data(repeating: 0x5A, count: 43), to: keyFile)
+
+        let fileResult = try runServe(
+            data: data,
+            arguments: ["--oauth-server-key-file", keyFile.path],
+            environment: ["SWAN_OAUTH_SERVER_KEY": envKey]
+        )
+        XCTAssertNotEqual(fileResult.status, 0)
+        XCTAssertTrue(fileResult.output.isEmpty)
+        XCTAssertTrue(fileResult.error.contains("oauth-server-key source is ambiguous"))
+        XCTAssertFalse(fileResult.error.contains(keyFile.path))
+        XCTAssertFalse(fileResult.error.contains(root.path))
+    }
+
+    func testOAuthServerKeyFileRequiresSecureOwnerOnlyFile() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appending(path: "data")
+        try FileManager.default.createDirectory(
+            at: data,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let keyFile = root.appending(path: "oauth-server-key")
+        try protectedWrite(Data(repeating: 0x41, count: 43), to: keyFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: keyFile.path)
+
+        let result = try runServe(
+            data: data,
+            arguments: ["--oauth-server-key-file", keyFile.path],
+            environment: [:]
+        )
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.isEmpty)
+        XCTAssertFalse(result.error.contains(keyFile.path))
+        XCTAssertTrue(result.error.contains("oauth-server-key"))
+    }
+
+    private func runServe(
+        data: URL,
+        arguments: [String],
+        environment: [String: String]? = nil
+    ) throws -> ProcessResult {
         let process = Process()
         process.executableURL = try XCTUnwrap(executableURL())
         process.arguments = ["serve", "--data-directory", data.path] + arguments
-        process.environment = [
-            "SWAN_OAUTH_SERVER_KEY": base64URLEncoded(Data(repeating: 0x5A, count: 32)),
-        ]
+        var processEnvironment = ProcessInfo.processInfo.environment
+        processEnvironment.removeValue(forKey: "SWAN_OAUTH_SERVER_KEY")
+        processEnvironment.removeValue(forKey: "SWAN_OAUTH_SERVER_KEY_FILE")
+        if let environment {
+            for (key, value) in environment {
+                processEnvironment[key] = value
+            }
+            if environment.isEmpty {
+                processEnvironment.removeValue(forKey: "SWAN_OAUTH_SERVER_KEY")
+            } else if environment["SWAN_OAUTH_SERVER_KEY"] == nil {
+                processEnvironment["SWAN_OAUTH_SERVER_KEY"] = base64URLEncoded(
+                    Data(repeating: 0x5A, count: 32)
+                )
+            }
+        } else {
+            processEnvironment["SWAN_OAUTH_SERVER_KEY"] = base64URLEncoded(
+                Data(repeating: 0x5A, count: 32)
+            )
+        }
+        process.environment = processEnvironment
         let output = Pipe()
         let error = Pipe()
         process.standardOutput = output

@@ -183,7 +183,7 @@ public struct SwanSpaceRepositorySyncHTTPConfiguration: Sendable {
 /// by the writer notification endpoints. It contains no remote DID resolver;
 /// service claims can never turn an XRPC request into a network lookup.
 public struct SwanSpaceNotificationHTTPConfiguration: Sendable {
-    let serviceAuthentication: any SpaceServiceAuthenticationVerifier
+    public let serviceAuthentication: any SpaceServiceAuthenticationVerifier
     let recipientBindings: SwanSpaceNotificationRecipientBindings
 
     public init(
@@ -200,7 +200,7 @@ public struct SwanSpaceNotificationHTTPConfiguration: Sendable {
 /// account directory, authority policy, or repository capability: a generic
 /// PDS can verify who called it, but cannot make an application-policy grant.
 public struct SwanSimpleSpaceCheckUserAccessHTTPConfiguration: Sendable {
-    let serviceAuthentication: any SpaceServiceAuthenticationVerifier
+    public let serviceAuthentication: any SpaceServiceAuthenticationVerifier
     let managingServiceAudience: String
 
     public init(

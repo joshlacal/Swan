@@ -4,16 +4,71 @@ name: swan-interop-alpha
 # wrapper verifies the ignored reference cache before Docker receives a build
 # context, so the normal build never fetches TypeScript source from the network.
 services:
+  swan-data-init:
+    build:
+      context: ..
+      dockerfile: Swan/Dockerfile
+    user: root
+    entrypoint: ["/bin/sh", "-ec"]
+    command: "install -d -o swan -g swan -m 0700 /var/lib/swan/data"
+    volumes:
+      - swan-data:/var/lib/swan
+    network_mode: "none"
+    restart: "no"
+
+  swan-bootstrap:
+    build:
+      context: ..
+      dockerfile: Swan/Dockerfile
+    user: swan
+    entrypoint: ["/usr/local/bin/swan-interop-bootstrap"]
+    command: []
+    environment:
+      DATA_DIRECTORY: /var/lib/swan/data
+      SWAN_INTEROP_SECRETS_DIR: ${SWAN_INTEROP_SECRETS_DIR:?set the lab interop secret directory path}
+    volumes:
+      - swan-data:/var/lib/swan
+      - ${SWAN_INTEROP_SECRETS_DIR:?set the lab interop secret directory path}:/swan-interoperability-secrets:ro
+    depends_on:
+      swan-data-init:
+        condition: service_completed_successfully
+    restart: "no"
+
   swan:
     build:
       context: ..
       dockerfile: Swan/Dockerfile
-    command: ["serve", "--host", "0.0.0.0", "--port", "3000", "--public-url", "https://swan.test", "--data-directory", "/var/lib/swan/data"]
-    environment:
-      SWAN_OAUTH_SERVER_KEY: ${SWAN_OAUTH_SERVER_KEY:?set a disposable 32-byte URL-safe-base64 lab key outside the repository}
+    command:
+      - serve
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "3000"
+      - --public-url
+      - "https://swan.test"
+      - --notification-config
+      - ${SWAN_INTEROP_NOTIFICATION_CONFIG:-/swan-notification-config.json}
+      - --data-directory
+      - /var/lib/swan/data
+      - --enable-local-space-interop
+      - --space-account-kek-file
+      - /swan-interoperability-secrets/account-kek
+      - --space-account-kek-id
+      - primary
+      - --oauth-server-key-file
+      - /swan-interoperability-secrets/oauth-server-key
+      - --enable-localhost-oauth
     volumes:
       - swan-data:/var/lib/swan
-    networks: [swan]
+      - ./interop/notification-config.json:/swan-notification-config.json:ro
+      - ${SWAN_INTEROP_SECRETS_DIR:?set the lab interop secret directory path}:/swan-interoperability-secrets:ro
+    networks:
+      swan:
+        aliases:
+          - swan.test
+    depends_on:
+      swan-bootstrap:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "test -e /usr/local/bin/swan"]
       interval: 5s
@@ -40,7 +95,10 @@ services:
       LOG_ENABLED: "false"
     volumes:
       - reference-pds-data:/pds
-    networks: [swan]
+    networks:
+      swan:
+        aliases:
+          - pds.test
     depends_on:
       reference-plc:
         condition: service_started
@@ -66,6 +124,8 @@ services:
       - caddy-config:/config
     networks: [swan]
     depends_on:
+      swan-bootstrap:
+        condition: service_completed_successfully
       swan:
         condition: service_started
       toxiproxy-setup:
@@ -102,11 +162,24 @@ services:
     build:
       context: ..
       dockerfile: Swan/Dockerfile
-    command: ["lab", "scenario", "--name", "reference-matrix", "--fault", "delayed", "--fault", "duplicated", "--fault", "reordered", "--fault", "offline", "--fault", "corrupted", "--output", "/artifacts/reference-matrix.json"]
+    entrypoint: ["/bin/sh", "-ec"]
+    user: root
+    command: >
+      CADDY_CA_PATH="$(find /caddy-data -type f -name root.crt | head -n 1)"
+      if [ -z "$CADDY_CA_PATH" ] || [ ! -f "$CADDY_CA_PATH" ]; then
+        echo "caddy local CA certificate was not available" >&2
+        exit 1
+      fi
+      SSL_CERT_FILE="$CADDY_CA_PATH"
+      export SSL_CERT_FILE
+      /usr/local/bin/swan lab matrix --name reference-matrix --output-directory /artifacts --fail-on-failure
     volumes:
       - scenario-artifacts:/artifacts
+      - caddy-data:/caddy-data:ro
     networks: [swan]
     depends_on:
+      swan:
+        condition: service_started
       caddy:
         condition: service_started
       scenario-artifacts-init:
@@ -135,4 +208,4 @@ volumes:
   scenario-artifacts:
 
 networks:
-  swan: {}
+  swan:
