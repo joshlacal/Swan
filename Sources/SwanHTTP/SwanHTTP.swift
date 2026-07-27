@@ -101,6 +101,10 @@ public struct SwanHTTPServer: Sendable {
     /// default and only constructed from this server's runtime and canonical
     /// public URL after account databases have been preopened at startup.
     public let authenticatedGetSpace: SwanAuthenticatedGetSpaceCapability?
+    /// The first authenticated permissioned record readers. They remain
+    /// unavailable unless the supplied startup-preopened directory also
+    /// implements the deliberately narrower repository projection.
+    public let authenticatedSpaceRecords: SwanAuthenticatedSpaceRecordsCapability?
 
     public init(
         profile: ProtocolProfile,
@@ -155,8 +159,18 @@ public struct SwanHTTPServer: Sendable {
                 authorizer: authorizer,
                 directory: authenticatedGetSpaceDirectory
             )
+            if let repositoryDirectory = authenticatedGetSpaceDirectory
+                as? any AuthorizedSpaceRepositoryDirectory {
+                authenticatedSpaceRecords = SwanAuthenticatedSpaceRecordsCapability(
+                    authorizer: authorizer,
+                    directory: repositoryDirectory
+                )
+            } else {
+                authenticatedSpaceRecords = nil
+            }
         } else {
             authenticatedGetSpace = nil
+            authenticatedSpaceRecords = nil
         }
     }
 
@@ -250,6 +264,12 @@ public struct SwanHTTPServer: Sendable {
             if descriptor.nsid == ComAtprotoSpaceGetSpace.typeIdentifier,
                let authenticatedGetSpace {
                 registerAuthenticatedGetSpaceEndpoint(on: router, capability: authenticatedGetSpace)
+            } else if descriptor.nsid == ComAtprotoSpaceGetRecord.typeIdentifier,
+                      let authenticatedSpaceRecords {
+                registerAuthenticatedGetRecordEndpoint(on: router, capability: authenticatedSpaceRecords)
+            } else if descriptor.nsid == ComAtprotoSpaceListRecords.typeIdentifier,
+                      let authenticatedSpaceRecords {
+                registerAuthenticatedListRecordsEndpoint(on: router, capability: authenticatedSpaceRecords)
             } else {
                 registerUnavailablePermissionedEndpoint(descriptor, on: router)
             }

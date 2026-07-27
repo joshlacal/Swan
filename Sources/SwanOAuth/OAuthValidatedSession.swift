@@ -25,7 +25,7 @@ public struct OAuthValidatedSession: Sendable, Equatable {
     ) throws {
         guard !issuer.isEmpty, issuer.utf8.count <= 4_096, !issuer.utf8.contains(0),
               client.metadata.matchesRedirectURI(redirectURI),
-              scopes.contains("atproto"), !scopes.isEmpty,
+              Self.hasATProtocolResourceScope(scopes),
               scopes.isSubset(of: client.metadata.scopes),
               Self.validThumbprint(dpopProof.keyThumbprint) else {
             throw SwanError.unauthorized("OAuth session binding is invalid")
@@ -78,6 +78,20 @@ public struct OAuthValidatedSession: Sendable, Equatable {
         value.utf8.count == 43 && value.utf8.allSatisfy { byte in
             (65 ... 90).contains(byte) || (97 ... 122).contains(byte) ||
                 (48 ... 57).contains(byte) || byte == 45 || byte == 95
+        }
+    }
+
+    /// A complete client metadata document must still advertise `atproto`,
+    /// but an issued access token may carry only one profile-specific
+    /// permissioned-space grant. The resource boundary and SwanSpaces parse
+    /// its exact authority/skey/action/collection later; this layer only
+    /// admits a bounded, printable scope representation rather than forcing
+    /// an unrelated broad grant onto that token.
+    private static func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
+        scopes.contains("atproto") || scopes.contains { scope in
+            scope.hasPrefix("space:")
+                && (7 ... 4_096).contains(scope.utf8.count)
+                && scope.utf8.allSatisfy { $0 >= 0x21 && $0 <= 0x7e }
         }
     }
 }

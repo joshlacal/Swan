@@ -7,7 +7,10 @@ import SwanStorage
 /// migrated before the service accepted traffic. It intentionally has no
 /// fallback construction path: a request can select only a database that was
 /// successfully preopened for an active account at bootstrap.
-public actor SQLitePreMigratedAccountDirectory: AuthorizedSimpleSpaceDirectory {
+public actor SQLitePreMigratedAccountDirectory:
+    AuthorizedSimpleSpaceDirectory,
+    AuthorizedSpaceRepositoryDirectory
+{
     private let controlStore: any AccountControlStore
     private let dataDirectory: URL
     private var databases: [String: SQLiteAccountDatabase]
@@ -122,6 +125,83 @@ public actor SQLitePreMigratedAccountDirectory: AuthorizedSimpleSpaceDirectory {
         )
     }
 
+    /// Reads one record only from a database which was opened during startup.
+    /// The actor never treats a requested DID as a construction request: a
+    /// missing preopened database, a replaced path, or shutdown is always
+    /// unavailable rather than a chance to migrate or open SQLite on demand.
+    public func record(
+        _ uri: SpaceRecordURI,
+        authorization: AuthorizationContext
+    ) async throws -> SpaceRecord? {
+        let database = try await preopenedRepositoryDatabase(
+            for: uri.author,
+            authorization: authorization
+        )
+        guard let database else { return nil }
+
+        do {
+            let repository = try DurableSpaceRepository(
+                database: database,
+                space: uri.space,
+                author: uri.author
+            )
+            let result = try await repository.record(uri, authorization: authorization)
+            guard try await isActiveAccount(uri.author) else { return nil }
+            guard !isClosed else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return result
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    /// Reads a bounded page only from an already-open repository database.
+    /// Ordering and tolerant cursor semantics live in
+    /// ``DurableSpaceRepository/listRecords(collection:limit:cursor:reverse:authorization:)``
+    /// so SQLite cannot bypass the domain's collection-scoped authorization.
+    public func records(
+        space: SpaceURI,
+        author: String,
+        collection: String?,
+        limit: Int,
+        cursor: String?,
+        reverse: Bool,
+        authorization: AuthorizationContext
+    ) async throws -> [SpaceRecord] {
+        let database = try await preopenedRepositoryDatabase(
+            for: author,
+            authorization: authorization
+        )
+        guard let database else { return [] }
+
+        do {
+            let repository = try DurableSpaceRepository(
+                database: database,
+                space: space,
+                author: author
+            )
+            let result = try await repository.listRecords(
+                collection: collection,
+                limit: limit,
+                cursor: cursor,
+                reverse: reverse,
+                authorization: authorization
+            )
+            guard try await isActiveAccount(author) else { return [] }
+            guard !isClosed else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return result
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
     /// Explicitly releases every startup-opened connection. The method is
     /// idempotent, and lookup after closing is unavailable rather than able to
     /// reopen a database on demand.
@@ -153,6 +233,38 @@ public actor SQLitePreMigratedAccountDirectory: AuthorizedSimpleSpaceDirectory {
         } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
+    }
+
+    /// Selects an existing startup-opened database for the OAuth subject's
+    /// own repository. This is intentionally shared by the two record-read
+    /// projections so one path cannot regress into request-time opening or
+    /// forget the stale-path defense.
+    private func preopenedRepositoryDatabase(
+        for did: String,
+        authorization: AuthorizationContext
+    ) async throws -> SQLiteAccountDatabase? {
+        guard !isClosed else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard case let .accountOAuth(subject, _) = authorization,
+              subject == did else {
+            throw SwanError.unauthorized("account OAuth may read only its own repository")
+        }
+        guard try await isActiveAccount(did) else { return nil }
+        guard !isClosed else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        do {
+            try Self.requireExistingRegularDatabase(
+                SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
+            )
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard let database = databases[did] else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        return database
     }
 
     private static func validateStartupDIDs(_ dids: [String]) throws {

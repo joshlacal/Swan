@@ -737,8 +737,8 @@ public actor DurableOAuthTokenService {
     /// always have a syntactically valid DPoP JKT. The nullable model type is
     /// useful while parsing untrusted input, but it cannot cross this boundary.
     private func requireOAuthDPoPBinding(_ binding: OAuthClientBinding) throws {
-        guard binding.scopes.contains("atproto") else {
-            throw SwanError.unauthorized("atproto scope is required for OAuth")
+        guard Self.hasATProtocolResourceScope(binding.scopes) else {
+            throw SwanError.unauthorized("an AT Protocol resource scope is required for OAuth")
         }
         guard let jkt = binding.dpopJKT, Self.validDPoPJKT(jkt) else {
             throw SwanError.unauthorized("DPoP binding is required for OAuth")
@@ -749,6 +749,14 @@ public actor DurableOAuthTokenService {
         value.utf8.count == 43 && value.utf8.allSatisfy { byte in
             (65 ... 90).contains(byte) || (97 ... 122).contains(byte) ||
                 (48 ... 57).contains(byte) || byte == 45 || byte == 95
+        }
+    }
+
+    private static func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
+        scopes.contains("atproto") || scopes.contains { scope in
+            scope.hasPrefix("space:")
+                && (7 ... 4_096).contains(scope.utf8.count)
+                && scope.utf8.allSatisfy { $0 >= 0x21 && $0 <= 0x7e }
         }
     }
 

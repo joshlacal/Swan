@@ -3363,6 +3363,77 @@ public actor DurableSpaceRepository {
         )?.records.map(record(from:)) ?? []
     }
 
+    /// Returns the exact page shape used by the pinned
+    /// `com.atproto.space.listRecords` reader. The pinned implementation
+    /// orders the default page descending by `(collection, rkey)` and flips
+    /// to ascending only when `reverse` is true. Cursor syntax that cannot
+    /// name a domain record is deliberately ignored, matching the reference
+    /// reader's tolerant `parseListCursor` behavior.
+    ///
+    /// This remains a domain operation: a collection-qualified OAuth grant
+    /// is checked against a synthetic, valid record URI before the durable
+    /// snapshot is queried. An omitted collection therefore cannot silently
+    /// downgrade an aggregate response to a censored list.
+    public func listRecords(
+        collection: String?,
+        limit: Int,
+        cursor: String?,
+        reverse: Bool,
+        authorization: AuthorizationContext
+    ) async throws -> [SpaceRecord] {
+        guard (1 ... 100).contains(limit) else {
+            throw SwanError.malformed("permissioned record page limit is invalid")
+        }
+
+        let authorizationURI: SpaceRecordURI?
+        if let collection {
+            // The value exists only to carry the collection into the domain
+            // policy. It is never queried or serialized.
+            authorizationURI = try SpaceRecordURI(
+                space: space,
+                author: author,
+                collection: collection,
+                rkey: "scope"
+            )
+        } else {
+            authorizationURI = nil
+        }
+        try requireRead(uri: authorizationURI, authorization: authorization)
+
+        let allRecords = try await database.repositorySnapshot(
+            space: space,
+            author: author
+        )?.records.map(record(from:)) ?? []
+        let filtered = allRecords.filter { record in
+            collection.map { record.uri.collection == $0 } ?? true
+        }
+        let ordered = filtered.sorted { lhs, rhs in
+            if lhs.uri.collection == rhs.uri.collection {
+                return reverse
+                    ? lhs.uri.rkey < rhs.uri.rkey
+                    : lhs.uri.rkey > rhs.uri.rkey
+            }
+            return reverse
+                ? lhs.uri.collection < rhs.uri.collection
+                : lhs.uri.collection > rhs.uri.collection
+        }
+
+        let cursorKey = cursor.flatMap(Self.parseListCursor)
+        let afterCursor = ordered.filter { record in
+            guard let cursorKey else { return true }
+            let key = (collection: record.uri.collection, rkey: record.uri.rkey)
+            if key.collection == cursorKey.collection {
+                return reverse
+                    ? key.rkey > cursorKey.rkey
+                    : key.rkey < cursorKey.rkey
+            }
+            return reverse
+                ? key.collection > cursorKey.collection
+                : key.collection < cursorKey.collection
+        }
+        return Array(afterCursor.prefix(limit))
+    }
+
     /// Builds a new, reader-specific commit envelope and complete CAR for each
     /// request. SQLite holds a deterministic state marker only, never IKM,
     /// context signatures, or reader content bindings.
@@ -3480,6 +3551,26 @@ public actor DurableSpaceRepository {
 
     private func ltHashElement(for record: PersistedSpaceRecord) -> String {
         "\(record.uri.collection)/\(record.uri.rkey)/\(record.cid)"
+    }
+
+    private static func parseListCursor(
+        _ cursor: String
+    ) -> (collection: String, rkey: String)? {
+        let pieces = cursor.split(separator: "/", omittingEmptySubsequences: false)
+        guard pieces.count == 2,
+              let URI = try? SpaceRecordURI(
+                  space: try SpaceURI(
+                      authority: "did:plc:abcdefghijklmnopqrstuvwx",
+                      spaceType: "app.swan.cursor",
+                      skey: "cursor"
+                  ),
+                  author: "did:plc:abcdefghijklmnopqrstuvwx",
+                  collection: String(pieces[0]),
+                  rkey: String(pieces[1])
+              ) else {
+            return nil
+        }
+        return (URI.collection, URI.rkey)
     }
 }
 

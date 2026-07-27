@@ -136,11 +136,13 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
             throw Self.durableOrDeniedFailure(for: error)
         }
 
-        // Issuance requires `atproto`, but token families are durable input at
-        // this boundary. Do not let a malformed or legacy stored binding
-        // bypass the resource-profile scope requirement merely because its
-        // DPoP proof and opaque token digest were otherwise valid.
-        guard grant.scopes.contains("atproto") else {
+        // Token families are durable input at this boundary. Accept the
+        // broad `atproto` resource grant or a bounded permissioned-space
+        // scope, then let SwanSpaces make the exact authority/skey/action/
+        // collection decision for the selected operation. Do not let a
+        // malformed or legacy stored binding reach that domain policy merely
+        // because its DPoP proof and opaque token digest were otherwise valid.
+        guard Self.hasATProtocolResourceScope(grant.scopes) else {
             throw SwanResourceAuthorizationFailure.denied
         }
 
@@ -199,6 +201,14 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
             }
         }
         return true
+    }
+
+    private static func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
+        scopes.contains("atproto") || scopes.contains { scope in
+            scope.hasPrefix("space:")
+                && (7 ... 4_096).contains(scope.utf8.count)
+                && scope.utf8.allSatisfy { $0 >= 0x21 && $0 <= 0x7e }
+        }
     }
 
     private static func dpopProof(from headers: HTTPFields) -> String? {

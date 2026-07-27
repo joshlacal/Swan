@@ -34,6 +34,22 @@ Catbird UI work.
   retention-gap snapshots, and durable blob namespace separation.
 - `c7403e5b` aligns the generated incremental-op contract with required-null
   CIDs for deletes.
+- The pinned `com.atproto.space.getRecord` and
+  `com.atproto.space.listRecords` queries now have their first durable,
+  self-repository-only HTTP adapters. They use the generated async
+  `ServerHandler` contracts, fixed DPoP paths, and a startup-preopened SQLite
+  repository directory; neither path can create, migrate, or reopen an
+  account database for a request. The adapters validate duplicate/malformed
+  query input before authorization, render only declared JSON fields with
+  `Cache-Control: no-store`, and retain the pinned descending default
+  `(collection,rkey)` pagination plus tolerant semantic cursor parsing.
+  They expose no credential, service-auth, remote-repository, or cross-host
+  behavior. Account OAuth is self-only; `atproto` is accepted as a broad
+  grant and a bounded `space:` scope is passed to the domain policy for exact
+  authority/skey/read/collection enforcement. The focused HTTP tests exercise
+  SQLite-backed values, real durable OAuth tokens and signed DPoP proofs,
+  narrow grants, foreign-repository opacity, lifecycle closure, replay, and
+  no public-repository fallback.
 - All unimplemented HTTP endpoints intentionally return generic authorization
   errors or `profile_endpoint_pending`; they are not interop evidence. The
   pinned TypeScript `com.atproto.space.getSpace` exception is now a typed,

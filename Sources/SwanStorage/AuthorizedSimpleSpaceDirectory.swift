@@ -30,3 +30,35 @@ public protocol AuthorizedSimpleSpaceDirectory: Sendable {
 
     func close() async throws
 }
+
+/// Startup-preopened, authenticated projection of a permissioned repository.
+///
+/// This is intentionally separate from ``AuthorizedSimpleSpaceDirectory``:
+/// an authority-description adapter must not accidentally become a record
+/// reader merely by conforming to a broad store protocol. Implementations may
+/// select only a database that was opened during startup, and must invoke the
+/// domain repository with the supplied ``AuthorizationContext`` rather than
+/// treating a successful HTTP authentication as a boolean capability.
+public protocol AuthorizedSpaceRepositoryDirectory: Sendable {
+    /// Returns a single durable permissioned record, or `nil` when the
+    /// selected repository/record is absent. Callers are responsible for
+    /// rendering that absence without disclosing whether the space exists.
+    func record(
+        _ uri: SpaceRecordURI,
+        authorization: AuthorizationContext
+    ) async throws -> SpaceRecord?
+
+    /// Returns a bounded, deterministic page from one durable permissioned
+    /// repository. `cursor` is already syntactically bounded by the HTTP
+    /// adapter; malformed cursor *semantics* are tolerated by the domain
+    /// reader to match the pinned TypeScript implementation.
+    func records(
+        space: SpaceURI,
+        author: String,
+        collection: String?,
+        limit: Int,
+        cursor: String?,
+        reverse: Bool,
+        authorization: AuthorizationContext
+    ) async throws -> [SpaceRecord]
+}

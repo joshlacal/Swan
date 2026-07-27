@@ -1108,7 +1108,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
         guard validText(binding.issuer), validText(binding.clientID),
               validText(binding.redirectURI),
               binding.scopes.allSatisfy(validScope),
-              binding.scopes.contains("atproto"),
+              hasATProtocolResourceScope(binding.scopes),
               binding.dpopJKT.map(validDPoPJKT) ?? false,
               binding.confidentialClientKey.map(validConfidentialClientKey) ?? true else {
             throw OAuthControlStoreError.invalidInput
@@ -1229,6 +1229,12 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
             value.unicodeScalars.allSatisfy {
                 !$0.properties.isWhitespace && !CharacterSet.controlCharacters.contains($0)
             }
+    }
+
+    private func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
+        scopes.contains("atproto") || scopes.contains { scope in
+            scope.hasPrefix("space:") && validScope(scope)
+        }
     }
 
     private func validState(_ value: String) -> Bool {

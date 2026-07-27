@@ -63,6 +63,16 @@ checksum-verified way to populate the ignored reference cache.
   `swan lab scenario --output ...` emits a summary-only, planned-not-executed
   artifact whose type has no credential, token, key, request, response, or
   account-data field.
+- The first non-authority record-read slice is live only behind the durable
+  resource capability: `com.atproto.space.getRecord` and
+  `com.atproto.space.listRecords` use generated server contracts, fixed-route
+  DPoP validation, self-only OAuth subject/repository matching, and the
+  startup-preopened SQLite directory. It implements the pinned list ordering,
+  cursor, and `excludeValues` behavior, but does not yet implement
+  credentials, cross-host reads, writes, CAR/blob transfer, or other profile
+  endpoints. A profile-specific `space:` OAuth scope can now be issued as a
+  narrow resource grant without adding the broad `atproto` token scope; the
+  domain policy remains the exact space/collection authorization decision.
 
 ## Completion gates
 
