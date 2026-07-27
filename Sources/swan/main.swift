@@ -679,8 +679,8 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(
             abstract: "Inspect or manage a provisioned Swan account",
             subcommands: [
-                InstallLocal.self, PreparePLC.self, Show.self, Deactivate.self,
-                Reactivate.self, Delete.self,
+                InstallLocal.self, PreparePLC.self, ActivatePLC.self, Show.self,
+                Deactivate.self, Reactivate.self, Delete.self,
             ]
         )
 
@@ -944,6 +944,189 @@ extension SwanCommand {
                     try await control.close()
                     try AccountCommandSupport.write(
                         PreparedPLCAccountIdentityView(identity: prepared)
+                    )
+                } catch {
+                    try? await opener.close()
+                    try? await control.close()
+                    throw AccountCommandSupport.validationError(for: error)
+                }
+            }
+        }
+
+        /// Activates one remotely submitted PLC identity after authenticating
+        /// its directory state and proving the recorded AT handle.
+        struct ActivatePLC: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "activate-plc",
+                abstract: "Activate a submitted PLC identity after directory and handle proof"
+            )
+
+            @Option(name: .long, help: "Swan data directory containing the submitted PLC preparation")
+            var dataDirectory: String
+
+            @Option(name: .long, help: "Stable idempotency identifier used by prepare-plc")
+            var requestID: String
+
+            @Option(name: .long, help: "Owner-only mounted account-password file; never accepted literally")
+            var passwordFile: String
+
+            @Option(name: .long, help: "PLC directory origin")
+            var plcOrigin: String = PLCClientConfiguration.defaultProductionOrigin.absoluteString
+
+            @Flag(name: .long, help: "Select explicit literal-loopback HTTP PLC laboratory policy")
+            var plcLaboratory = false
+
+            @Option(
+                name: .long,
+                help: "Literal-loopback HTTP origin for laboratory /.well-known/atproto-did proof"
+            )
+            var handleLaboratoryOrigin: String?
+
+            @Option(name: .long, help: "Mounted operator-secret file; never accepted as a literal argument")
+            var operatorSecretFile: String?
+
+            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64); SWAN_ACCOUNT_KEK is the alternative")
+            var accountKEKFile: String?
+
+            @Option(name: .customLong("account-kek-id"), help: "Account-KEK identifier used by encrypted envelopes")
+            var accountKEKID: String = "primary"
+
+            @Option(name: .long, help: "Protected key-envelope directory; defaults to <data-directory>/keys")
+            var accountKeyDirectory: String?
+
+            func run() async throws {
+                let preparedConfiguration: (
+                    dataURL: URL,
+                    plc: PLCClientConfiguration,
+                    handle: ATHandleResolutionPolicy
+                )
+                do {
+                    guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw SwanError.malformed("--data-directory must not be empty")
+                    }
+                    guard !requestID.isEmpty, requestID.utf8.count <= 128,
+                          requestID.utf8.allSatisfy({
+                              ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90)
+                                  || ($0 >= 97 && $0 <= 122)
+                                  || [45, 46, 58, 95].contains($0)
+                          }) else {
+                        throw SwanError.malformed("--request-id is invalid")
+                    }
+                    guard !passwordFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw SwanError.malformed("--password-file must not be empty")
+                    }
+                    guard !accountKEKID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw SwanError.malformed("--account-kek-id must not be empty")
+                    }
+                    if let accountKeyDirectory,
+                       accountKeyDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        throw SwanError.malformed("--account-key-directory must not be empty")
+                    }
+                    guard let directoryOrigin = URL(string: plcOrigin) else {
+                        throw SwanError.malformed("--plc-origin must be a URL")
+                    }
+
+                    let plcConfiguration: PLCClientConfiguration
+                    let handlePolicy: ATHandleResolutionPolicy
+                    if plcLaboratory {
+                        guard let rawHandleOrigin = handleLaboratoryOrigin,
+                              let handleOrigin = URL(string: rawHandleOrigin) else {
+                            throw SwanError.malformed(
+                                "--handle-laboratory-origin is required with --plc-laboratory"
+                            )
+                        }
+                        plcConfiguration = try .laboratory(origin: directoryOrigin)
+                        handlePolicy = try .laboratory(origin: handleOrigin)
+                    } else {
+                        guard handleLaboratoryOrigin == nil else {
+                            throw SwanError.malformed(
+                                "--handle-laboratory-origin requires --plc-laboratory"
+                            )
+                        }
+                        plcConfiguration = try .production(origin: directoryOrigin)
+                        handlePolicy = try .production()
+                    }
+                    preparedConfiguration = (
+                        URL(fileURLWithPath: dataDirectory),
+                        plcConfiguration,
+                        handlePolicy
+                    )
+                } catch {
+                    throw AccountCommandSupport.validationError(for: error)
+                }
+
+                // Authentication must precede password/KEK reads, key-store
+                // construction, and every writable database open.
+                _ = try AccountCommandSupport.authorization(
+                    secretFilePath: operatorSecretFile
+                )
+
+                let password: String
+                let keyConfiguration: AccountKeyEncryptionConfiguration
+                do {
+                    password = try AccountProvisioningSecrets.password(
+                        secretFile: URL(fileURLWithPath: passwordFile)
+                    )
+                    keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                        activeKeyID: accountKEKID,
+                        secretFile: accountKEKFile.map { URL(fileURLWithPath: $0) }
+                    )
+                } catch {
+                    throw AccountCommandSupport.validationError(for: error)
+                }
+                let keyURL = accountKeyDirectory.map { URL(fileURLWithPath: $0) }
+                    ?? preparedConfiguration.dataURL.appending(path: "keys")
+
+                let control: SQLiteControlDatabase
+                do {
+                    control = try await SQLiteControlDatabase(
+                        dataDirectory: preparedConfiguration.dataURL
+                    )
+                } catch {
+                    throw ValidationError("unable to open Swan control database")
+                }
+                let opener = SQLitePLCAccountPreparationStoreOpener(
+                    dataDirectory: preparedConfiguration.dataURL
+                )
+                do {
+                    let keyStore = try FileAccountKeyStore(
+                        root: keyURL,
+                        configuration: keyConfiguration
+                    )
+                    let plcClient = try PLCDirectoryClient(
+                        configuration: preparedConfiguration.plc
+                    )
+                    let handleTransport = try NIOPeerPinnedATHandleHTTPTransport()
+                    let handleVerifier = ATProtocolHandleVerifier(
+                        policy: preparedConfiguration.handle,
+                        http: handleTransport
+                    )
+                    let passwordHasher = try LibsodiumArgon2idHasher()
+                    let verificationExecutor = try Argon2idVerificationExecutor(
+                        hasher: passwordHasher
+                    )
+                    let directory = DurableAccountDirectory(
+                        store: control,
+                        passwordHasher: passwordHasher,
+                        verificationExecutor: verificationExecutor,
+                        keyProvisioner: AccountKeyProvisioner(keyStore: keyStore)
+                    )
+                    let service = PLCAccountActivationService(
+                        intentStore: control,
+                        accountStoreOpener: opener,
+                        keyStore: keyStore,
+                        plcClient: plcClient,
+                        handleVerifier: handleVerifier,
+                        directory: directory
+                    )
+                    let installation = try await service.activate(
+                        requestID: requestID,
+                        password: password
+                    )
+                    try await opener.close()
+                    try await control.close()
+                    try AccountCommandSupport.write(
+                        LocalAccountInstallationView(installation: installation)
                     )
                 } catch {
                     try? await opener.close()

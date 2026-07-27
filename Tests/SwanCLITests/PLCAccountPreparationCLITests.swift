@@ -199,6 +199,158 @@ final class PLCAccountPreparationCLITests: XCTestCase {
         }
     }
 
+    func testPrepareThenActivatePLCIsIdempotentSanitizedAndStoresArgon2idVerifier() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let server = try TestPLCDirectory(submitBody: Data("OK".utf8))
+        defer { server.shutdown() }
+
+        let preparation = try runPrepare(
+            fixture: fixture,
+            server: server,
+            compatibility: "did-plc-server-0.0.1",
+            handle: "alice.test"
+        )
+        XCTAssertEqual(preparation.status, 0, preparation.error)
+        let prepared = try decode(preparation.output)
+        let did = try XCTUnwrap(prepared["did"] as? String)
+
+        let first = try runActivate(fixture: fixture, server: server)
+        XCTAssertEqual(first.status, 0, first.error)
+        let firstJSON = try decode(first.output)
+        XCTAssertEqual(firstJSON["did"] as? String, did)
+        XCTAssertEqual(firstJSON["canonicalHandle"] as? String, "alice.test")
+        XCTAssertEqual(firstJSON["status"] as? String, "active")
+        XCTAssertEqual(
+            firstJSON["publicGenesisCommitCID"] as? String,
+            prepared["publicGenesisCommitCID"] as? String
+        )
+        XCTAssertEqual(firstJSON["publicGenesisRevision"] as? String, revision)
+        XCTAssertEqual(firstJSON["recovered"] as? Bool, true)
+        XCTAssertEqual(Set(firstJSON.keys), [
+            "did", "canonicalHandle", "status", "publicGenesisCommitCID",
+            "publicGenesisRevision", "recovered",
+        ])
+
+        let retry = try runActivate(fixture: fixture, server: server)
+        XCTAssertEqual(retry.status, 0, retry.error)
+        XCTAssertEqual(
+            try decode(retry.output) as NSDictionary,
+            firstJSON as NSDictionary
+        )
+
+        let control = try await SQLiteControlDatabase(dataDirectory: fixture.data)
+        let credential = try await control.credential(did: did)
+        XCTAssertTrue(try XCTUnwrap(credential).verifier.hasPrefix("$argon2id$"))
+        let hasher = try LibsodiumArgon2idHasher()
+        let directory = DurableAccountDirectory(
+            store: control,
+            passwordHasher: hasher,
+            verificationExecutor: try Argon2idVerificationExecutor(hasher: hasher)
+        )
+        let acceptedPassword = await directory.authenticate(
+            handle: "alice.test",
+            password: fixture.password
+        )
+        XCTAssertNotNil(acceptedPassword)
+        let rejectedPassword = await directory.authenticate(
+            handle: "alice.test",
+            password: "not-the-mounted-password"
+        )
+        XCTAssertNil(rejectedPassword)
+        try await control.close()
+
+        for rendered in [
+            preparation.output, preparation.error, first.output, first.error,
+            retry.output, retry.error,
+        ] {
+            for sentinel in fixture.renderedSecretSentinels {
+                XCTAssertFalse(rendered.contains(sentinel))
+            }
+            XCTAssertFalse(rendered.contains(TestPLCState.responseBodySentinel))
+        }
+        try assertPersistedData(
+            under: fixture.data,
+            excludes: fixture.persistedSecretSentinels
+                + [Data(TestPLCState.responseBodySentinel.utf8)]
+        )
+    }
+
+    func testWrongOrMissingWellKnownProofDoesNotActivateSubmittedIdentity() async throws {
+        for proof in [
+            TestWellKnownResponse.body(
+                Data("did:plc:zyxwvutsrqponmlkjihgfedc".utf8)
+            ),
+            .missing,
+        ] {
+            let fixture = try Fixture()
+            defer { fixture.remove() }
+            let server = try TestPLCDirectory(submitBody: Data("OK".utf8))
+            defer { server.shutdown() }
+
+            let preparation = try runPrepare(
+                fixture: fixture,
+                server: server,
+                compatibility: "did-plc-server-0.0.1",
+                handle: "alice.test"
+            )
+            XCTAssertEqual(preparation.status, 0, preparation.error)
+            let did = try XCTUnwrap(try decode(preparation.output)["did"] as? String)
+            server.setWellKnownResponse(proof)
+
+            let activation = try runActivate(fixture: fixture, server: server)
+            XCTAssertNotEqual(activation.status, 0)
+            XCTAssertTrue(activation.output.isEmpty)
+            XCTAssertFalse(
+                activation.error.contains("did:plc:zyxwvutsrqponmlkjihgfedc")
+            )
+            for sentinel in fixture.renderedSecretSentinels {
+                XCTAssertFalse(activation.error.contains(sentinel))
+            }
+
+            let control = try await SQLiteControlDatabase(dataDirectory: fixture.data)
+            let activeAccount = try await control.account(did: did)
+            XCTAssertNil(activeAccount)
+            try await control.close()
+        }
+    }
+
+    func testActivatePLCModeRelationshipsFailBeforeStorageMutation() throws {
+        let cases: [[String]] = [
+            [
+                "--plc-origin", "http://127.0.0.1:2582",
+                "--plc-laboratory",
+            ],
+            [
+                "--plc-origin", "https://plc.directory",
+                "--handle-laboratory-origin", "http://127.0.0.1:2583",
+            ],
+            [
+                "--plc-origin", "https://plc.directory/path",
+            ],
+            [
+                "--plc-origin", "http://127.0.0.1:2582",
+                "--plc-laboratory",
+                "--handle-laboratory-origin", "https://127.0.0.1:2583",
+            ],
+        ]
+        for extraArguments in cases {
+            let fixture = try Fixture()
+            defer { fixture.remove() }
+            let result = try runActivate(
+                fixture: fixture,
+                extraArguments: extraArguments
+            )
+            XCTAssertNotEqual(result.status, 0)
+            XCTAssertTrue(result.output.isEmpty)
+            XCTAssertFalse(
+                FileManager.default.fileExists(
+                    atPath: fixture.data.appending(path: "control.sqlite").path
+                )
+            )
+        }
+    }
+
     private func runPrepare(
         fixture: Fixture,
         server: TestPLCDirectory? = nil,
@@ -248,6 +400,58 @@ final class PLCAccountPreparationCLITests: XCTestCase {
             status: process.terminationStatus,
             output: String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
             error: String(decoding: error.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        )
+    }
+
+    private func runActivate(
+        fixture: Fixture,
+        server: TestPLCDirectory? = nil,
+        extraArguments: [String]? = nil
+    ) throws -> ProcessResult {
+        let process = Process()
+        process.executableURL = try XCTUnwrap(executableURL())
+        var arguments = [
+            "account", "activate-plc",
+            "--data-directory", fixture.data.path,
+            "--request-id", requestID,
+            "--password-file", fixture.passwordFile.path,
+            "--operator-secret-file", fixture.operatorSecretFile.path,
+            "--account-kek-file", fixture.kekFile.path,
+            "--account-kek-id", "test-primary",
+            "--account-key-directory", fixture.data.appending(path: "account-keys").path,
+        ]
+        if let extraArguments {
+            arguments.append(contentsOf: extraArguments)
+        } else {
+            let port = try XCTUnwrap(server?.port)
+            let origin = "http://127.0.0.1:\(port)"
+            arguments.append(contentsOf: [
+                "--plc-origin", origin,
+                "--plc-laboratory",
+                "--handle-laboratory-origin", origin,
+            ])
+        }
+        process.arguments = arguments
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "SWAN_OPERATOR_SECRET")
+        environment.removeValue(forKey: "SWAN_ACCOUNT_KEK")
+        process.environment = environment
+        let output = Pipe()
+        let error = Pipe()
+        process.standardOutput = output
+        process.standardError = error
+        try process.run()
+        process.waitUntilExit()
+        return ProcessResult(
+            status: process.terminationStatus,
+            output: String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            ),
+            error: String(
+                decoding: error.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
         )
     }
 
@@ -319,9 +523,25 @@ private final class Fixture {
     let secrets: URL
     let operatorSecretFile: URL
     let kekFile: URL
+    let passwordFile: URL
     let operatorSecret = "operator-secret-MUST-NOT-PERSIST-71D9"
+    let password = "password-MUST-NOT-PERSIST-E28AC7"
     let rawKEK: Data
     let encodedKEK: String
+
+    var renderedSecretSentinels: [String] {
+        [
+            operatorSecret, password, encodedKEK, rawKEK.base64EncodedString(),
+            operatorSecretFile.path, kekFile.path, passwordFile.path,
+        ]
+    }
+
+    var persistedSecretSentinels: [Data] {
+        [
+            Data(operatorSecret.utf8), Data(password.utf8), Data(encodedKEK.utf8),
+            Data(rawKEK.base64EncodedString().utf8), rawKEK,
+        ]
+    }
 
     init() throws {
         root = FileManager.default.temporaryDirectory
@@ -330,6 +550,7 @@ private final class Fixture {
         secrets = root.appending(path: "mounted-secrets")
         operatorSecretFile = secrets.appending(path: "operator")
         kekFile = secrets.appending(path: "account-kek")
+        passwordFile = secrets.appending(path: "password")
         rawKEK = Data(repeating: 0xD7, count: 32)
         encodedKEK = Self.base64URLEncoded(rawKEK)
         try FileManager.default.createDirectory(at: data, withIntermediateDirectories: true)
@@ -342,7 +563,8 @@ private final class Fixture {
         }
         try Data((operatorSecret + "\n").utf8).write(to: operatorSecretFile)
         try Data((encodedKEK + "\n").utf8).write(to: kekFile)
-        for file in [operatorSecretFile, kekFile] {
+        try Data((password + "\n").utf8).write(to: passwordFile)
+        for file in [operatorSecretFile, kekFile, passwordFile] {
             try FileManager.default.setAttributes(
                 [.posixPermissions: 0o600],
                 ofItemAtPath: file.path
@@ -370,6 +592,10 @@ private final class TestPLCDirectory {
     var port: Int { channel.localAddress!.port! }
     var submitCount: Int { state.submitCount }
 
+    func setWellKnownResponse(_ response: TestWellKnownResponse) {
+        state.setWellKnownResponse(response)
+    }
+
     init(submitBody: Data) throws {
         group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let sharedState = TestPLCState(submitBody: submitBody)
@@ -393,10 +619,14 @@ private final class TestPLCDirectory {
 }
 
 private final class TestPLCState: @unchecked Sendable {
+    static let responseBodySentinel = "2026-07-27T12:34:56.789Z"
+
     private let lock = NSLock()
     private let submitBody: Data
     private var audit: Data?
     private var document: Data?
+    private var submittedDID: String?
+    private var wellKnownResponse = TestWellKnownResponse.automatic
     private var count = 0
 
     init(submitBody: Data) {
@@ -422,7 +652,7 @@ private final class TestPLCState: @unchecked Sendable {
             "operation": rawOperation,
             "cid": try operation.cid.string,
             "nullified": false,
-            "createdAt": "2026-07-27T12:00:00.000Z",
+            "createdAt": Self.responseBodySentinel,
         ]], options: [.sortedKeys])
         let document = try JSONSerialization.data(withJSONObject: [
             "did": did,
@@ -435,6 +665,7 @@ private final class TestPLCState: @unchecked Sendable {
             count += 1
             audit = body
             self.document = document
+            submittedDID = did
         }
         return submitBody
     }
@@ -447,6 +678,26 @@ private final class TestPLCState: @unchecked Sendable {
         locked { document }
     }
 
+    func setWellKnownResponse(_ response: TestWellKnownResponse) {
+        locked {
+            wellKnownResponse = response
+        }
+    }
+
+    func currentWellKnownResponse() -> TestWellKnownResponse {
+        locked {
+            switch wellKnownResponse {
+            case .automatic:
+                guard let submittedDID else { return .missing }
+                return .body(Data(submittedDID.utf8))
+            case let .body(body):
+                return .body(body)
+            case .missing:
+                return .missing
+            }
+        }
+    }
+
     private func locked<T>(_ body: () throws -> T) rethrows -> T {
         lock.lock()
         defer { lock.unlock() }
@@ -456,6 +707,12 @@ private final class TestPLCState: @unchecked Sendable {
     private enum TestPLCError: Error {
         case malformedOperation
     }
+}
+
+private enum TestWellKnownResponse {
+    case automatic
+    case body(Data)
+    case missing
 }
 
 private final class TestPLCHandler: ChannelInboundHandler, @unchecked Sendable {
@@ -485,6 +742,22 @@ private final class TestPLCHandler: ChannelInboundHandler, @unchecked Sendable {
     private func respond(context: ChannelHandlerContext) {
         guard let head else {
             write(status: .badRequest, body: Data(), contentType: nil, context: context)
+            return
+        }
+        if head.method == .GET, head.uri == "/.well-known/atproto-did" {
+            switch state.currentWellKnownResponse() {
+            case .automatic:
+                write(status: .notFound, body: Data(), contentType: nil, context: context)
+            case let .body(body):
+                write(
+                    status: .ok,
+                    body: body,
+                    contentType: "text/plain; charset=utf-8",
+                    context: context
+                )
+            case .missing:
+                write(status: .notFound, body: Data(), contentType: nil, context: context)
+            }
             return
         }
         let components = head.uri.split(separator: "/", omittingEmptySubsequences: true)
