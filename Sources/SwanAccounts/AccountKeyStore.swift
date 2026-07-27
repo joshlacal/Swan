@@ -279,6 +279,40 @@ public actor FileAccountKeyStore:
         failDirectoryIterationAfterEntryCount = nil
     }
 
+    /// Restore-only constructor for a key directory already opened below a
+    /// pinned unpublished root. All subsequent key operations remain relative
+    /// to the duplicated descriptor and never reopen a lexical staging path.
+    @_spi(OperatorRestore)
+    public init(
+        operatorRestoreDirectoryDescriptor descriptor: Int32,
+        configuration: AccountKeyEncryptionConfiguration
+    ) throws {
+        let descriptor = try Self.duplicateProtectedRoot(descriptor)
+        var openedLockDescriptor: Int32 = -1
+        do {
+            openedLockDescriptor = try Self.openLockFile(directoryDescriptor: descriptor)
+            try Self.withExclusiveLock(openedLockDescriptor) {
+                try Self.initializeActiveKeyMarkerIfNeeded(
+                    directoryDescriptor: descriptor,
+                    activeKeyID: configuration.activeKeyID
+                )
+                try Self.recoverProvisioningJournal(
+                    directoryDescriptor: descriptor,
+                    configuration: configuration
+                )
+            }
+        } catch {
+            if openedLockDescriptor >= 0 { _ = close(openedLockDescriptor) }
+            _ = close(descriptor)
+            throw error
+        }
+        directoryDescriptor = descriptor
+        lockDescriptor = openedLockDescriptor
+        self.configuration = configuration
+        failAfterBatchInstallCount = nil
+        failDirectoryIterationAfterEntryCount = nil
+    }
+
     init(
         root: URL,
         configuration: AccountKeyEncryptionConfiguration,
@@ -1086,6 +1120,24 @@ public actor FileAccountKeyStore:
             throw SwanError.unavailable("account key-store root failed ownership or permission validation")
         }
         return descriptor
+    }
+
+    private static func duplicateProtectedRoot(_ descriptor: Int32) throws -> Int32 {
+        let duplicate = fcntl(descriptor, F_DUPFD_CLOEXEC, 0)
+        guard duplicate >= 0 else {
+            throw SwanError.unavailable("account key-store root is unavailable")
+        }
+        var status = stat()
+        guard fstat(duplicate, &status) == 0,
+              (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR),
+              status.st_uid == geteuid(),
+              Int(status.st_mode & mode_t(0o777)) == 0o700 else {
+            _ = close(duplicate)
+            throw SwanError.unavailable(
+                "account key-store root failed ownership or permission validation"
+            )
+        }
+        return duplicate
     }
 
     private static func openLockFile(directoryDescriptor: Int32) throws -> Int32 {

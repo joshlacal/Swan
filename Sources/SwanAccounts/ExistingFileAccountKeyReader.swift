@@ -81,6 +81,56 @@ public final class ExistingFileAccountKeyReader: AccountKeyMaterialReader, @unch
         self.configuration = configuration
     }
 
+    @_spi(OperatorRestore)
+    public init(
+        operatorRestoreDirectoryDescriptor descriptor: Int32,
+        configuration: AccountKeyEncryptionConfiguration
+    ) throws {
+        let directory = fcntl(descriptor, F_DUPFD_CLOEXEC, 0)
+        guard directory >= 0 else {
+            throw SwanError.unavailable("existing account key-store root is unavailable")
+        }
+        var directoryStatus = stat()
+        guard fstat(directory, &directoryStatus) == 0,
+              (directoryStatus.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR),
+              directoryStatus.st_uid == geteuid(),
+              Int(directoryStatus.st_mode & mode_t(0o777)) == 0o700 else {
+            _ = close(directory)
+            throw SwanError.unavailable(
+                "existing account key-store root failed ownership or permission validation"
+            )
+        }
+        let lock = openat(
+            directory,
+            Self.lockFilename,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard lock >= 0 else {
+            _ = close(directory)
+            throw SwanError.unavailable("existing account key-store lock is unavailable")
+        }
+        var lockStatus = stat()
+        guard fstat(lock, &lockStatus) == 0,
+              (lockStatus.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+              lockStatus.st_uid == geteuid(),
+              lockStatus.st_nlink == 1,
+              Int(lockStatus.st_mode & mode_t(0o777)) == 0o600 else {
+            _ = close(lock)
+            _ = close(directory)
+            throw SwanError.unavailable("existing account key-store lock failed validation")
+        }
+        while flock(lock, LOCK_SH) != 0 {
+            guard errno == EINTR else {
+                _ = close(lock)
+                _ = close(directory)
+                throw SwanError.unavailable("could not acquire account key-store reader lock")
+            }
+        }
+        directoryDescriptor = directory
+        lockDescriptor = lock
+        self.configuration = configuration
+    }
+
     deinit {
         while flock(lockDescriptor, LOCK_UN) != 0, errno == EINTR {}
         _ = close(lockDescriptor)

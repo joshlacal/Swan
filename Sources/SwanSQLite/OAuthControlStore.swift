@@ -27,6 +27,8 @@ actor ControlSQLiteConnectionGate {
 public enum SQLiteControlDatabaseOpenMode: Sendable, Equatable {
     case managed
     case existingPortableExportSource
+    @_spi(PortableRestore) case descriptorBackedOperatorRestore(rootDescriptor: Int32)
+    @_spi(PortableRestore) case descriptorBackedOperatorRestoreSource(rootDescriptor: Int32)
 }
 
 /// Durable OAuth control-plane state backed by `control.sqlite`. Repository
@@ -48,6 +50,8 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
     let connection: SQLiteConnection
     let connectionGate = ControlSQLiteConnectionGate()
     private var dataDirectoryDescriptor: Int32
+    private var databaseFileDescriptor: Int32
+    private let descriptorBackedRestore: Bool
     private var activeWriteTransactions = 0
 
     public init(
@@ -59,61 +63,107 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
             try SQLiteProtectedPaths.openRoot(dataDirectory)
         case .existingPortableExportSource:
             try SQLiteProtectedPaths.openExistingRoot(dataDirectory)
+        case let .descriptorBackedOperatorRestore(descriptor),
+             let .descriptorBackedOperatorRestoreSource(descriptor):
+            try SQLiteProtectedPaths.duplicateOwnerOnlyDirectory(descriptor)
         }
         let databasePath: String
+        var heldDatabaseDescriptor: Int32 = -1
         do {
             let resolvedPath = SQLiteLayout.controlDatabase(in: dataDirectory)
                 .standardizedFileURL.path
-            databasePath = switch openMode {
+            switch openMode {
             case .managed:
-                try SQLiteProtectedPaths.openDatabaseFile(
+                databasePath = try SQLiteProtectedPaths.openDatabaseFile(
                     parentDescriptor: rootDescriptor,
                     name: "control.sqlite",
                     resolvedPath: resolvedPath
                 )
             case .existingPortableExportSource:
-                try SQLiteProtectedPaths.openExistingDatabaseFile(
+                databasePath = try SQLiteProtectedPaths.openExistingDatabaseFile(
                     parentDescriptor: rootDescriptor,
                     name: "control.sqlite",
                     resolvedPath: resolvedPath
                 )
+            case .descriptorBackedOperatorRestore:
+                heldDatabaseDescriptor = try SQLiteProtectedPaths.openDatabaseFileDescriptor(
+                    parentDescriptor: rootDescriptor,
+                    name: "control.sqlite",
+                    create: true
+                )
+                databasePath = try SQLiteProtectedPaths.databasePath(
+                    for: heldDatabaseDescriptor
+                )
+            case .descriptorBackedOperatorRestoreSource:
+                heldDatabaseDescriptor = try SQLiteProtectedPaths.openDatabaseFileDescriptor(
+                    parentDescriptor: rootDescriptor,
+                    name: "control.sqlite",
+                    create: false
+                )
+                databasePath = try SQLiteProtectedPaths.databasePath(
+                    for: heldDatabaseDescriptor
+                )
             }
         } catch {
+            SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
             SQLiteProtectedPaths.closeDirectory(rootDescriptor)
             throw error
         }
+        let readOnly: Bool
+        let descriptorBacked: Bool
+        switch openMode {
+        case .managed:
+            readOnly = false
+            descriptorBacked = false
+        case .existingPortableExportSource:
+            readOnly = true
+            descriptorBacked = false
+        case .descriptorBackedOperatorRestore:
+            readOnly = false
+            descriptorBacked = true
+        case .descriptorBackedOperatorRestoreSource:
+            readOnly = true
+            descriptorBacked = true
+        }
         let openedConnection: SQLiteConnection
         do {
-            let connectionPath = try openMode == .existingPortableExportSource
+            let connectionPath = try readOnly
                 ? SQLiteLayout.readOnlyURI(for: databasePath)
                 : databasePath
             openedConnection = try await SQLiteConnection.open(
                 storage: .file(path: connectionPath)
             )
         } catch {
+            SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
             SQLiteProtectedPaths.closeDirectory(rootDescriptor)
             throw error
         }
         connection = openedConnection
         dataDirectoryDescriptor = rootDescriptor
+        databaseFileDescriptor = heldDatabaseDescriptor
+        descriptorBackedRestore = descriptorBacked
         switch openMode {
-        case .managed:
+        case .managed, .descriptorBackedOperatorRestore:
             do {
                 try await migrateWithBusyRetry()
-                try SQLiteProtectedPaths.hardenSQLiteFiles(
-                    parentDescriptor: rootDescriptor,
-                    databaseName: "control.sqlite"
-                )
+                if !descriptorBacked {
+                    try SQLiteProtectedPaths.hardenSQLiteFiles(
+                        parentDescriptor: rootDescriptor,
+                        databaseName: "control.sqlite"
+                    )
+                }
             } catch {
                 try? await openedConnection.close()
+                SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
                 SQLiteProtectedPaths.closeDirectory(rootDescriptor)
                 throw error
             }
-        case .existingPortableExportSource:
+        case .existingPortableExportSource, .descriptorBackedOperatorRestoreSource:
             do {
                 _ = try await openedConnection.query("PRAGMA query_only=ON")
             } catch {
                 try? await openedConnection.close()
+                SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
                 SQLiteProtectedPaths.closeDirectory(rootDescriptor)
                 throw error
             }
@@ -125,8 +175,13 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
     public func close() async throws {
         try await withConnectionGate {
             let descriptor = dataDirectoryDescriptor
+            let databaseDescriptor = databaseFileDescriptor
             dataDirectoryDescriptor = -1
-            defer { SQLiteProtectedPaths.closeDirectory(descriptor) }
+            databaseFileDescriptor = -1
+            defer {
+                SQLiteProtectedPaths.closeDirectory(databaseDescriptor)
+                SQLiteProtectedPaths.closeDirectory(descriptor)
+            }
             try await connection.close()
         }
     }
@@ -736,7 +791,10 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         // index work below is one `BEGIN IMMEDIATE` transaction so two Swan
         // processes cold-starting an old control DB cannot race an additive
         // column migration.
-        for statement in SQLiteLayout.controlConnectionPragmas {
+        let pragmas = descriptorBackedRestore
+            ? ["PRAGMA busy_timeout=5000", "PRAGMA journal_mode=MEMORY", "PRAGMA foreign_keys=ON"]
+            : SQLiteLayout.controlConnectionPragmas
+        for statement in pragmas {
             _ = try await connection.query(statement)
         }
         try await transaction {

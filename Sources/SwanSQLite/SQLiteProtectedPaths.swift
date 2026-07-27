@@ -59,6 +59,20 @@ enum SQLiteProtectedPaths {
         }
     }
 
+    static func duplicateOwnerOnlyDirectory(_ descriptor: Int32) throws -> Int32 {
+        let duplicate = fcntl(descriptor, F_DUPFD_CLOEXEC, 0)
+        guard duplicate >= 0 else {
+            throw SwanError.unavailable("SQLite directory descriptor is unavailable")
+        }
+        do {
+            try requireOwnerOnlyDirectory(duplicate)
+            return duplicate
+        } catch {
+            _ = close(duplicate)
+            throw error
+        }
+    }
+
     static func openAccountDirectory(rootDescriptor: Int32, did: String) throws -> Int32 {
         let digest = Hex.encode(SHA256.hash(data: Data(did.utf8)))
         let actors = try openOrCreateDirectory(parent: rootDescriptor, name: "actors")
@@ -127,6 +141,51 @@ enum SQLiteProtectedPaths {
         defer { _ = close(descriptor) }
         try requireOwnerOnlyRegularFile(descriptor)
         return resolvedPath
+    }
+
+    /// Opens the database inode through its pinned parent and returns a held
+    /// descriptor. Restore staging connects through the platform's exact-file
+    /// descriptor alias, so renaming the unpublished root cannot redirect the
+    /// main database open.
+    static func openDatabaseFileDescriptor(
+        parentDescriptor: Int32,
+        name: String,
+        create: Bool
+    ) throws -> Int32 {
+        guard validDatabaseFilename(name) else {
+            throw SwanError.unavailable("SQLite database path is unavailable")
+        }
+        let flags = create
+            ? O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW
+            : O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+        let descriptor = name.withCString {
+            openat(parentDescriptor, $0, flags, ownerOnlyFileMode)
+        }
+        guard descriptor >= 0 else {
+            throw SwanError.unavailable("SQLite database path is unavailable")
+        }
+        do {
+            try requireOwnerOnlyRegularFile(descriptor)
+            return descriptor
+        } catch {
+            _ = close(descriptor)
+            throw error
+        }
+    }
+
+    static func databasePath(for descriptor: Int32) throws -> String {
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_uid == geteuid(),
+              metadata.st_nlink == 1 else {
+            throw SwanError.unavailable("SQLite database descriptor is unavailable")
+        }
+        #if canImport(Darwin)
+        return "/dev/fd/\(descriptor)"
+        #else
+        return "/proc/self/fd/\(descriptor)"
+        #endif
     }
 
     /// SQLite creates its WAL and shared-memory sidecars itself. They still

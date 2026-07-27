@@ -5,7 +5,7 @@ import Darwin
 import Glibc
 #endif
 import Foundation
-import SwanAccounts
+@_spi(OperatorRestore) import SwanAccounts
 import SwanPublicRepository
 @_spi(PortableRestore) import SwanSQLite
 import SwanSpaces
@@ -53,24 +53,34 @@ public struct SwanOperatorAccountRestoreResult: Codable, Sendable, Equatable {
 /// root. Permissioned repository payloads are preserved but remain
 /// HTTP-closed because V1 carries no authenticated authority policy.
 public struct SwanOperatorAccountRestorer: Sendable {
-    private let afterStagingBeforeInstall: (@Sendable (URL) throws -> Void)?
+    private let afterStagingBeforeInstall: (@Sendable () throws -> Void)?
+    private let afterStagingPathValidatedBeforeStorageOpen: (@Sendable () throws -> Void)?
     private let afterStagingBeforeValidation: (@Sendable () throws -> Void)?
     private let afterRenameBeforeParentSync: (@Sendable () throws -> Void)?
+    private let afterCleanupEntryResolvedBeforeRemoval: (@Sendable (String) throws -> Void)?
 
     public init() {
         afterStagingBeforeInstall = nil
+        afterStagingPathValidatedBeforeStorageOpen = nil
         afterStagingBeforeValidation = nil
         afterRenameBeforeParentSync = nil
+        afterCleanupEntryResolvedBeforeRemoval = nil
     }
 
     init(
-        afterStagingBeforeInstall: (@Sendable (URL) throws -> Void)? = nil,
+        afterStagingBeforeInstall: (@Sendable () throws -> Void)? = nil,
+        afterStagingPathValidatedBeforeStorageOpen: (@Sendable () throws -> Void)? = nil,
         afterStagingBeforeValidation: (@Sendable () throws -> Void)? = nil,
-        afterRenameBeforeParentSync: (@Sendable () throws -> Void)? = nil
+        afterRenameBeforeParentSync: (@Sendable () throws -> Void)? = nil,
+        afterCleanupEntryResolvedBeforeRemoval: (@Sendable (String) throws -> Void)? = nil
     ) {
         self.afterStagingBeforeInstall = afterStagingBeforeInstall
+        self.afterStagingPathValidatedBeforeStorageOpen =
+            afterStagingPathValidatedBeforeStorageOpen
         self.afterStagingBeforeValidation = afterStagingBeforeValidation
         self.afterRenameBeforeParentSync = afterRenameBeforeParentSync
+        self.afterCleanupEntryResolvedBeforeRemoval =
+            afterCleanupEntryResolvedBeforeRemoval
     }
 
     public func restore(
@@ -153,13 +163,8 @@ public struct SwanOperatorAccountRestorer: Sendable {
             ) else {
                 throw SwanOperatorAccountRestoreError.failed
             }
-            var stagingURL = try SwanPortableExportFilesystem.currentURL(
-                for: stagingDescriptor
-            )
-            try afterStagingBeforeInstall?(stagingURL)
-            stagingURL = try SwanPortableExportFilesystem.currentURL(
-                for: stagingDescriptor
-            )
+            try afterStagingBeforeInstall?()
+            try afterStagingPathValidatedBeforeStorageOpen?()
 
             let signingPrivateKey = try P256.Signing.PrivateKey(
                 rawRepresentation: payload.secrets.signingPrivateScalar
@@ -172,30 +177,26 @@ public struct SwanOperatorAccountRestorer: Sendable {
                 throw SwanOperatorAccountRestoreError.failed
             }
 
+            let keysDirectory = try SwanPortableExportFilesystem
+                .openOrCreateOwnerOnlyDirectory(
+                    parent: stagingDescriptor,
+                    name: "keys"
+                ).descriptor
+            defer { _ = close(keysDirectory) }
             try await installKeys(
-                at: stagingURL.appending(path: "keys", directoryHint: .isDirectory),
-                stagingRoot: stagingURL,
-                expectedStagingDescriptor: stagingDescriptor,
+                directoryDescriptor: keysDirectory,
                 configuration: configuration,
                 secrets: payload.secrets
             )
-            try SwanPortableExportFilesystem.requireCurrentOwnerOnlyDirectory(
-                stagingURL,
-                matches: stagingDescriptor
-            )
 
-            stagingURL = try SwanPortableExportFilesystem.currentURL(
-                for: stagingDescriptor
-            )
             let database = try await SQLiteAccountDatabase(
-                dataDirectory: stagingURL,
-                did: payload.secrets.did
+                dataDirectory: destination.url,
+                did: payload.secrets.did,
+                openMode: .descriptorBackedOperatorRestore(
+                    rootDescriptor: stagingDescriptor
+                )
             )
             do {
-                try SwanPortableExportFilesystem.requireCurrentOwnerOnlyDirectory(
-                    stagingURL,
-                    matches: stagingDescriptor
-                )
                 _ = try await database.installPublicRepositoryGenesis(
                     artifacts.publicGenesis,
                     signingPublicKey: signingPrivateKey.publicKey,
@@ -220,24 +221,18 @@ public struct SwanOperatorAccountRestorer: Sendable {
                     throw SwanOperatorAccountRestoreError.failed
                 }
                 try await database.close()
-                try SwanPortableExportFilesystem.requireCurrentOwnerOnlyDirectory(
-                    stagingURL,
-                    matches: stagingDescriptor
-                )
             } catch {
                 try? await database.close()
                 throw error
             }
 
-            stagingURL = try SwanPortableExportFilesystem.currentURL(
-                for: stagingDescriptor
-            )
-            let control = try await SQLiteControlDatabase(dataDirectory: stagingURL)
-            do {
-                try SwanPortableExportFilesystem.requireCurrentOwnerOnlyDirectory(
-                    stagingURL,
-                    matches: stagingDescriptor
+            let control = try await SQLiteControlDatabase(
+                dataDirectory: destination.url,
+                openMode: .descriptorBackedOperatorRestore(
+                    rootDescriptor: stagingDescriptor
                 )
+            )
+            do {
                 let account = try await control.createAccount(
                     AccountControlRegistration(
                         did: payload.secrets.did,
@@ -258,10 +253,6 @@ public struct SwanOperatorAccountRestorer: Sendable {
                     did: payload.secrets.did
                 )
                 try await control.close()
-                try SwanPortableExportFilesystem.requireCurrentOwnerOnlyDirectory(
-                    stagingURL,
-                    matches: stagingDescriptor
-                )
             } catch {
                 try? await control.close()
                 throw error
@@ -276,20 +267,15 @@ public struct SwanOperatorAccountRestorer: Sendable {
             ) else {
                 throw SwanOperatorAccountRestoreError.failed
             }
-            stagingURL = try SwanPortableExportFilesystem.currentURL(
-                for: stagingDescriptor
-            )
             try await validateReopenedStaging(
-                at: stagingURL,
+                rootDescriptor: stagingDescriptor,
+                keyDirectoryDescriptor: keysDirectory,
+                displayURL: destination.url,
                 payload: payload,
                 artifacts: artifacts,
                 configuration: configuration,
                 expectedSigningPublicKey: signingPrivateKey.publicKey,
                 expectedRotationPublicKey: rotationPrivateKey.publicKey
-            )
-            try SwanPortableExportFilesystem.requireCurrentOwnerOnlyDirectory(
-                stagingURL,
-                matches: stagingDescriptor
             )
             try SwanPortableExportFilesystem.synchronizeTree(root: stagingDescriptor)
             try destination.requireCurrentParentAndAbsentTarget()
@@ -324,7 +310,9 @@ public struct SwanOperatorAccountRestorer: Sendable {
             do {
                 try SwanPortableExportFilesystem.removeTree(
                     parent: destination.parentDescriptor,
-                    matching: stagingDescriptor
+                    matching: stagingDescriptor,
+                    afterEntryResolvedBeforeRemoval:
+                        afterCleanupEntryResolvedBeforeRemoval
                 )
                 try SwanPortableExportFilesystem.synchronizeParent(
                     destination.parentDescriptor
@@ -458,19 +446,13 @@ public struct SwanOperatorAccountRestorer: Sendable {
     }
 
     private func installKeys(
-        at root: URL,
-        stagingRoot: URL,
-        expectedStagingDescriptor: Int32,
+        directoryDescriptor: Int32,
         configuration: AccountKeyEncryptionConfiguration,
         secrets: SwanOperatorAccountSecrets
     ) async throws {
         let keyStore = try FileAccountKeyStore(
-            root: root,
+            operatorRestoreDirectoryDescriptor: directoryDescriptor,
             configuration: configuration
-        )
-        try SwanPortableExportFilesystem.requireCurrentOwnerOnlyDirectory(
-            stagingRoot,
-            matches: expectedStagingDescriptor
         )
         try await keyStore.createBatch([
             AccountKeyMaterial(
@@ -490,14 +472,12 @@ public struct SwanOperatorAccountRestorer: Sendable {
                 key: secrets.rotationPrivateScalar
             ),
         ])
-        try SwanPortableExportFilesystem.requireCurrentOwnerOnlyDirectory(
-            stagingRoot,
-            matches: expectedStagingDescriptor
-        )
     }
 
     private func validateReopenedStaging(
-        at root: URL,
+        rootDescriptor: Int32,
+        keyDirectoryDescriptor: Int32,
+        displayURL: URL,
         payload: SwanOperatorVerifiedBackupPayload,
         artifacts: Artifacts,
         configuration: AccountKeyEncryptionConfiguration,
@@ -505,8 +485,10 @@ public struct SwanOperatorAccountRestorer: Sendable {
         expectedRotationPublicKey: P256.Signing.PublicKey
     ) async throws {
         let control = try await SQLiteControlDatabase(
-            dataDirectory: root,
-            openMode: .existingPortableExportSource
+            dataDirectory: displayURL,
+            openMode: .descriptorBackedOperatorRestoreSource(
+                rootDescriptor: rootDescriptor
+            )
         )
         do {
             let account = try await control.account(did: payload.secrets.did)
@@ -542,7 +524,7 @@ public struct SwanOperatorAccountRestorer: Sendable {
             generation: payload.secrets.rotationKeyReference.generation
         )
         let keyReader = try ExistingFileAccountKeyReader(
-            root: root.appending(path: "keys", directoryHint: .isDirectory),
+            operatorRestoreDirectoryDescriptor: keyDirectoryDescriptor,
             configuration: configuration
         )
         let signing = try P256.Signing.PrivateKey(
@@ -559,9 +541,11 @@ public struct SwanOperatorAccountRestorer: Sendable {
         }
 
         let database = try await SQLiteAccountDatabase(
-            dataDirectory: root,
+            dataDirectory: displayURL,
             did: payload.secrets.did,
-            openMode: .existingPortableExportSource
+            openMode: .descriptorBackedOperatorRestoreSource(
+                rootDescriptor: rootDescriptor
+            )
         )
         do {
             let genesis = try await database.loadPublicRepositoryGenesis(

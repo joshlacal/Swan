@@ -970,6 +970,8 @@ private struct LoadedSimpleSpaceAuthority: Sendable {
 public enum SQLiteAccountDatabaseOpenMode: Sendable, Equatable {
     case managed
     case existingPortableExportSource
+    @_spi(PortableRestore) case descriptorBackedOperatorRestore(rootDescriptor: Int32)
+    @_spi(PortableRestore) case descriptorBackedOperatorRestoreSource(rootDescriptor: Int32)
 }
 
 public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
@@ -986,7 +988,9 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     let accountDID: String
     private let oplogRetention: Int
     private let portableExportReadOnly: Bool
+    private let descriptorBackedRestore: Bool
     private var accountDirectoryDescriptor: Int32
+    private var databaseFileDescriptor: Int32
     private var testingHooks = SQLiteTestingHooks()
     private var activeWriteTransactions = 0
 
@@ -1009,6 +1013,9 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             try SQLiteProtectedPaths.openRoot(dataDirectory)
         case .existingPortableExportSource:
             try SQLiteProtectedPaths.openExistingRoot(dataDirectory)
+        case let .descriptorBackedOperatorRestore(descriptor),
+             let .descriptorBackedOperatorRestoreSource(descriptor):
+            try SQLiteProtectedPaths.duplicateOwnerOnlyDirectory(descriptor)
         }
         let accountDescriptor: Int32
         do {
@@ -1023,68 +1030,118 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                     rootDescriptor: rootDescriptor,
                     did: did
                 )
+            case .descriptorBackedOperatorRestore:
+                try SQLiteProtectedPaths.openAccountDirectory(
+                    rootDescriptor: rootDescriptor,
+                    did: did
+                )
+            case .descriptorBackedOperatorRestoreSource:
+                try SQLiteProtectedPaths.openExistingAccountDirectory(
+                    rootDescriptor: rootDescriptor,
+                    did: did
+                )
             }
         } catch {
             SQLiteProtectedPaths.closeDirectory(rootDescriptor)
             throw error
         }
         let databasePath: String
+        var heldDatabaseDescriptor: Int32 = -1
         do {
             let name = "\(Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite"
             let path = SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
                 .standardizedFileURL.path
-            databasePath = switch openMode {
+            switch openMode {
             case .managed:
-                try SQLiteProtectedPaths.openDatabaseFile(
+                databasePath = try SQLiteProtectedPaths.openDatabaseFile(
                     parentDescriptor: accountDescriptor,
                     name: name,
                     resolvedPath: path
                 )
             case .existingPortableExportSource:
-                try SQLiteProtectedPaths.openExistingDatabaseFile(
+                databasePath = try SQLiteProtectedPaths.openExistingDatabaseFile(
                     parentDescriptor: accountDescriptor,
                     name: name,
                     resolvedPath: path
                 )
+            case .descriptorBackedOperatorRestore:
+                heldDatabaseDescriptor = try SQLiteProtectedPaths.openDatabaseFileDescriptor(
+                    parentDescriptor: accountDescriptor,
+                    name: name,
+                    create: true
+                )
+                databasePath = try SQLiteProtectedPaths.databasePath(
+                    for: heldDatabaseDescriptor
+                )
+            case .descriptorBackedOperatorRestoreSource:
+                heldDatabaseDescriptor = try SQLiteProtectedPaths.openDatabaseFileDescriptor(
+                    parentDescriptor: accountDescriptor,
+                    name: name,
+                    create: false
+                )
+                databasePath = try SQLiteProtectedPaths.databasePath(
+                    for: heldDatabaseDescriptor
+                )
             }
         } catch {
+            SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
             SQLiteProtectedPaths.closeDirectory(accountDescriptor)
             SQLiteProtectedPaths.closeDirectory(rootDescriptor)
             throw error
         }
-        // The account directory descriptor remains live for the database
-        // lifetime. SQLite opens a revalidated absolute path because macOS
-        // does not support SQLite paths through `/dev/fd`; its owner-only
-        // parent directory prevents another local user from swapping it.
+        let readOnly: Bool
+        let descriptorBacked: Bool
+        switch openMode {
+        case .managed:
+            readOnly = false
+            descriptorBacked = false
+        case .existingPortableExportSource:
+            readOnly = true
+            descriptorBacked = false
+        case .descriptorBackedOperatorRestore:
+            readOnly = false
+            descriptorBacked = true
+        case .descriptorBackedOperatorRestoreSource:
+            readOnly = true
+            descriptorBacked = true
+        }
         SQLiteProtectedPaths.closeDirectory(rootDescriptor)
-        self.dataDirectory = dataDirectory.standardizedFileURL
+        self.dataDirectory = descriptorBacked
+            ? URL(fileURLWithPath: "/descriptor-backed-operator-restore")
+            : dataDirectory.standardizedFileURL
         self.accountDID = did
         self.oplogRetention = oplogRetention
-        portableExportReadOnly = openMode == .existingPortableExportSource
+        portableExportReadOnly = readOnly
+        descriptorBackedRestore = descriptorBacked
         let openedConnection: SQLiteConnection
         do {
-            let connectionPath = try openMode == .existingPortableExportSource
+            let connectionPath = try readOnly
                 ? SQLiteLayout.readOnlyURI(for: databasePath)
                 : databasePath
             openedConnection = try await SQLiteConnection.open(
                 storage: .file(path: connectionPath)
             )
         } catch {
+            SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
             SQLiteProtectedPaths.closeDirectory(accountDescriptor)
             throw error
         }
         connection = openedConnection
         accountDirectoryDescriptor = accountDescriptor
-        if openMode == .managed {
+        databaseFileDescriptor = heldDatabaseDescriptor
+        if !readOnly {
             do {
                 try await migrateWithoutGate()
                 try await recoverPrivateBlobLifecycle()
-                try SQLiteProtectedPaths.hardenSQLiteFiles(
-                    parentDescriptor: accountDescriptor,
-                    databaseName: "\(Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite"
-                )
+                if !descriptorBacked {
+                    try SQLiteProtectedPaths.hardenSQLiteFiles(
+                        parentDescriptor: accountDescriptor,
+                        databaseName: "\(Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite"
+                    )
+                }
             } catch {
                 try? await openedConnection.close()
+                SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
                 SQLiteProtectedPaths.closeDirectory(accountDescriptor)
                 throw error
             }
@@ -1093,6 +1150,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                 _ = try await openedConnection.query("PRAGMA query_only=ON")
             } catch {
                 try? await openedConnection.close()
+                SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
                 SQLiteProtectedPaths.closeDirectory(accountDescriptor)
                 throw error
             }
@@ -1104,8 +1162,13 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     public func close() async throws {
         try await withConnectionGate {
             let descriptor = accountDirectoryDescriptor
+            let databaseDescriptor = databaseFileDescriptor
             accountDirectoryDescriptor = -1
-            defer { SQLiteProtectedPaths.closeDirectory(descriptor) }
+            databaseFileDescriptor = -1
+            defer {
+                SQLiteProtectedPaths.closeDirectory(databaseDescriptor)
+                SQLiteProtectedPaths.closeDirectory(descriptor)
+            }
             try await connection.close()
         }
     }
@@ -1131,7 +1194,10 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     private func migrateWithoutGate() async throws {
         // Keep connection-local PRAGMAs outside the transaction, then make
         // schema installation and data upgrades one cross-process write.
-        for statement in SQLiteLayout.accountConnectionPragmas {
+        let pragmas = descriptorBackedRestore
+            ? ["PRAGMA journal_mode=MEMORY", "PRAGMA foreign_keys=ON"]
+            : SQLiteLayout.accountConnectionPragmas
+        for statement in pragmas {
             _ = try await connection.query(statement)
         }
         try await transaction {

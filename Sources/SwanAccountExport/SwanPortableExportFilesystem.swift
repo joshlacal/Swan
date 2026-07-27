@@ -161,41 +161,6 @@ enum SwanPortableExportFilesystem {
         }
     }
 
-    /// Resolves the kernel's current path for a pinned directory descriptor.
-    /// Callers must still revalidate the returned path immediately around any
-    /// API that cannot accept a directory descriptor.
-    static func currentURL(for descriptor: Int32) throws -> URL {
-        #if canImport(Darwin)
-        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-        guard fcntl(descriptor, F_GETPATH, &buffer) == 0 else {
-            throw SwanPortableExportError.publicationFailed
-        }
-        let end = buffer.firstIndex(of: 0) ?? buffer.endIndex
-        let path = String(
-            decoding: buffer[..<end].map { UInt8(bitPattern: $0) },
-            as: UTF8.self
-        )
-        #elseif canImport(Glibc)
-        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
-        let link = "/proc/self/fd/\(descriptor)"
-        let count = buffer.withUnsafeMutableBufferPointer { output in
-            link.withCString {
-                readlink($0, output.baseAddress!, output.count - 1)
-            }
-        }
-        guard count > 0, count < buffer.count else {
-            throw SwanPortableExportError.publicationFailed
-        }
-        let path = String(
-            decoding: buffer[..<Int(count)].map { UInt8(bitPattern: $0) },
-            as: UTF8.self
-        )
-        #endif
-        let url = URL(fileURLWithPath: path, isDirectory: true)
-        try requireCurrentOwnerOnlyDirectory(url, matches: descriptor)
-        return url
-    }
-
     /// Rejects a destination parent that is the verified source directory or
     /// one of its descendants. The target itself is required absent, so this
     /// is the only possible source/target ancestry after collision checks.
@@ -575,12 +540,14 @@ enum SwanPortableExportFilesystem {
         try requireAbsent(parent: parent, name: name)
     }
 
-    /// Removes the entry that still names `expectedDescriptor` below the
-    /// pinned parent. It never removes a same-name replacement. If the pinned
-    /// inode was moved outside that parent, cleanup fails closed.
+    /// Scrubs the pinned tree through its descriptor and moves its active name
+    /// to a random inert tombstone. POSIX has no conditional rmdir-by-inode;
+    /// retaining an empty tombstone is the only way to ensure a same-UID
+    /// replacement is never unlinked after a name check.
     static func removeTree(
         parent: Int32,
-        matching expectedDescriptor: Int32
+        matching expectedDescriptor: Int32,
+        afterEntryResolvedBeforeRemoval: (@Sendable (String) throws -> Void)? = nil
     ) throws {
         var expected = stat()
         guard fstat(expectedDescriptor, &expected) == 0,
@@ -588,6 +555,7 @@ enum SwanPortableExportFilesystem {
               expected.st_uid == geteuid() else {
             throw SwanPortableExportError.publicationFailed
         }
+        try scrubTree(root: expectedDescriptor)
         var matchingNames: [String] = []
         for name in try directoryEntryNames(parent) {
             var current = stat()
@@ -604,7 +572,92 @@ enum SwanPortableExportFilesystem {
         guard matchingNames.count == 1 else {
             throw SwanPortableExportError.publicationFailed
         }
-        try removeTree(parent: parent, name: matchingNames[0])
+        try afterEntryResolvedBeforeRemoval?(matchingNames[0])
+
+        // Re-resolve after the adversarial interval. The exact pinned inode,
+        // not the previously observed name, is the only cleanup target.
+        matchingNames.removeAll(keepingCapacity: true)
+        for name in try directoryEntryNames(parent) {
+            var current = stat()
+            guard name.withCString({
+                fstatat(parent, $0, &current, AT_SYMLINK_NOFOLLOW)
+            }) == 0 else {
+                throw SwanPortableExportError.publicationFailed
+            }
+            if current.st_dev == expected.st_dev,
+               current.st_ino == expected.st_ino {
+                matchingNames.append(name)
+            }
+        }
+        guard matchingNames.count == 1 else {
+            throw SwanPortableExportError.publicationFailed
+        }
+        let sourceName = matchingNames[0]
+        let tombstoneName = ".swan-scrubbed-restore-\(UUID().uuidString.lowercased())"
+        try renameExclusively(
+            parent: parent,
+            source: sourceName,
+            destination: tombstoneName
+        )
+        guard try currentChildDirectoryMatches(
+            parent: parent,
+            name: tombstoneName,
+            expectedDescriptor: expectedDescriptor
+        ) else {
+            throw SwanPortableExportError.publicationFailed
+        }
+    }
+
+    private static func scrubTree(root: Int32) throws {
+        try requireOwnerOnlyDirectory(root)
+        for name in try directoryEntryNames(root) {
+            var metadata = stat()
+            guard name.withCString({
+                fstatat(root, $0, &metadata, AT_SYMLINK_NOFOLLOW)
+            }) == 0,
+            metadata.st_uid == geteuid() else {
+                throw SwanPortableExportError.publicationFailed
+            }
+            if (metadata.st_mode & S_IFMT) == S_IFDIR {
+                let child = name.withCString {
+                    openat(root, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+                }
+                guard child >= 0 else {
+                    throw SwanPortableExportError.publicationFailed
+                }
+                do {
+                    try scrubTree(root: child)
+                    _ = close(child)
+                } catch {
+                    _ = close(child)
+                    throw error
+                }
+            } else {
+                guard (metadata.st_mode & S_IFMT) == S_IFREG else {
+                    throw SwanPortableExportError.publicationFailed
+                }
+                let file = name.withCString {
+                    openat(root, $0, O_WRONLY | O_CLOEXEC | O_NOFOLLOW)
+                }
+                guard file >= 0 else {
+                    throw SwanPortableExportError.publicationFailed
+                }
+                var opened = stat()
+                guard fstat(file, &opened) == 0,
+                      (opened.st_mode & S_IFMT) == S_IFREG,
+                      opened.st_uid == geteuid(),
+                      opened.st_nlink == 1,
+                      ftruncate(file, 0) == 0,
+                      fsync(file) == 0 else {
+                    _ = close(file)
+                    throw SwanPortableExportError.publicationFailed
+                }
+                _ = close(file)
+            }
+        }
+        guard fsync(root) == 0 else {
+            throw SwanPortableExportError.publicationFailed
+        }
     }
 
     static func renameExclusively(
