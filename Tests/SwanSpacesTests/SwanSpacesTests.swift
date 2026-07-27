@@ -173,6 +173,45 @@ final class SwanSpacesTests: XCTestCase {
             space: managedSpace, user: "did:plc:bob", allowed: true, by: "did:web:app.example#space"
         )
         _ = try await authority.issueReadCredential(space: managedSpace, user: "did:plc:bob", clientID: nil)
+
+        // Preserve a configured app through a policy-only transition, but
+        // never retain its old allow decision when that policy is restored.
+        let preservedAppPublic = try SimpleSpaceConfiguration(
+            policy: .public,
+            appAccess: .open,
+            managingApp: "did:web:app.example#space"
+        )
+        try await authority.update(
+            space: managedSpace,
+            configuration: preservedAppPublic,
+            by: "did:plc:alice"
+        )
+        let publicState = await authority.space(managedSpace)
+        XCTAssertEqual(publicState?.configuration.managingApp, "did:web:app.example#space")
+        await XCTAssertThrowsErrorAsync(
+            try await authority.setManagingAppAccess(
+                space: managedSpace,
+                user: "did:plc:bob",
+                allowed: true,
+                by: "did:web:app.example#space"
+            )
+        )
+        try await authority.update(
+            space: managedSpace,
+            configuration: try .init(
+                policy: .managingApp,
+                appAccess: .open,
+                managingApp: "did:web:app.example#space"
+            ),
+            by: "did:plc:alice"
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await authority.issueReadCredential(
+                space: managedSpace,
+                user: "did:plc:bob",
+                clientID: nil
+            )
+        )
     }
 
     func testTwoRootCARAuthenticatesIndexAndRecordBlocks() async throws {

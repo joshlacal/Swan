@@ -2112,6 +2112,138 @@ final class SwanSQLiteTests: XCTestCase {
         try await reopened.close()
     }
 
+    func testSimpleSpaceAuthoritySchemaMigrationPreservesPolicyOnlyManagingAppAndAllowsClear() async throws {
+        let fixture = try Fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let initial = try await fixture.open()
+        try await initial.close()
+
+        let path = SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.author).path
+        let legacy = try await SQLiteConnection.open(storage: .file(path: path))
+        do {
+            _ = try await legacy.query("PRAGMA foreign_keys = OFF")
+            for table in [
+                "permissioned_simple_space_managing_app_decisions",
+                "permissioned_simple_space_clients",
+                "permissioned_simple_space_members",
+                "permissioned_simple_space_authorities",
+            ] {
+                _ = try await legacy.query("DROP TABLE \(table)")
+            }
+            _ = try await legacy.query(
+                """
+                CREATE TABLE permissioned_simple_space_authorities (
+                    space_uri TEXT PRIMARY KEY,
+                    owner_did TEXT NOT NULL,
+                    policy TEXT NOT NULL CHECK(policy IN ('public', 'member-list', 'managing-app')),
+                    app_access TEXT NOT NULL CHECK(app_access IN ('open', 'allow-list')),
+                    managing_app TEXT,
+                    is_deleted INTEGER NOT NULL CHECK(is_deleted IN (0, 1)),
+                    revision INTEGER NOT NULL CHECK(revision > 0),
+                    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+                    updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+                    CHECK(
+                        (policy = 'managing-app' AND managing_app IS NOT NULL AND length(managing_app) > 0)
+                        OR (policy != 'managing-app' AND managing_app IS NULL)
+                    )
+                )
+                """
+            )
+            _ = try await legacy.query(
+                """
+                CREATE TABLE permissioned_simple_space_members (
+                    space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
+                    member_did TEXT NOT NULL,
+                    PRIMARY KEY(space_uri, member_did)
+                )
+                """
+            )
+            _ = try await legacy.query(
+                """
+                CREATE TABLE permissioned_simple_space_clients (
+                    space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
+                    client_id TEXT NOT NULL,
+                    PRIMARY KEY(space_uri, client_id)
+                )
+                """
+            )
+            _ = try await legacy.query(
+                """
+                CREATE TABLE permissioned_simple_space_managing_app_decisions (
+                    space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
+                    user_did TEXT NOT NULL,
+                    PRIMARY KEY(space_uri, user_did)
+                )
+                """
+            )
+            _ = try await legacy.query(
+                """
+                INSERT INTO permissioned_simple_space_authorities(
+                    space_uri, owner_did, policy, app_access, managing_app,
+                    is_deleted, revision, created_at, updated_at
+                ) VALUES (?, ?, 'managing-app', 'open', ?, 0, 1, 1, 1)
+                """,
+                [.text(fixture.space.rawValue), .text(fixture.author), .text("did:web:manager.example")]
+            )
+            _ = try await legacy.query(
+                "INSERT INTO permissioned_simple_space_members(space_uri, member_did) VALUES (?, ?)",
+                [.text(fixture.space.rawValue), .text(fixture.author)]
+            )
+            // Version 3 is the only marker absent from this v1/v2-shaped
+            // account database; reopening must rebuild the old CHECK rather
+            // than relying on the new-create DDL.
+            _ = try await legacy.query(
+                "DELETE FROM permissioned_repository_migrations WHERE version = 3"
+            )
+            _ = try await legacy.query("PRAGMA foreign_keys = ON")
+            try await legacy.close()
+        } catch {
+            try? await legacy.close()
+            throw error
+        }
+
+        let migrated = try await fixture.open()
+        try await withClosedAccountDatabase(migrated) { database in
+            let authorization: AuthorizationContext = .accountOAuth(
+                subject: fixture.author,
+                scopes: ["atproto"]
+            )
+            let authority = DurableSimpleSpaceAuthority(lifecycleDatabase: database)
+            let policyOnly = try await authority.update(
+                space: fixture.space,
+                patch: .init(policy: .public),
+                authorization: authorization
+            )
+            XCTAssertEqual(policyOnly.space.configuration.policy, .public)
+            XCTAssertEqual(policyOnly.space.configuration.managingApp, "did:web:manager.example")
+
+            let cleared = try await authority.update(
+                space: fixture.space,
+                patch: .init(managingApp: .set(nil)),
+                authorization: authorization
+            )
+            XCTAssertEqual(cleared.space.configuration.policy, .public)
+            XCTAssertNil(cleared.space.configuration.managingApp)
+        }
+
+        let inspected = try await SQLiteConnection.open(storage: .file(path: path))
+        do {
+            let schemaRows = try await inspected.query(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'permissioned_simple_space_authorities'"
+            )
+            let schema = try XCTUnwrap(schemaRows.first?.column("sql")?.string)
+            XCTAssertFalse(schema.contains("policy = 'managing-app' AND managing_app IS NOT NULL"))
+            let marker = try await inspected.query(
+                "SELECT 1 FROM permissioned_repository_migrations WHERE version = 3"
+            )
+            XCTAssertEqual(marker.count, 1)
+            try await inspected.close()
+        } catch {
+            try? await inspected.close()
+            throw error
+        }
+    }
+
     func testSQLiteCreatesOwnerOnlyRootDirectoriesAndDatabaseFiles() async throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "SwanSQLiteProtectedPathsTests-\(UUID().uuidString)")

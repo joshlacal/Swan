@@ -134,6 +134,49 @@ public enum SQLiteLayout {
         "PRAGMA foreign_keys=ON",
     ]
 
+    /// Authority-owned `com.atproto.simplespace` facts. These stay in the
+    /// authority's account database, never in a member repository database or
+    /// the cross-account control store. Keep these statements together because
+    /// the v3 schema migration must rebuild the parent and all FK children as
+    /// one unit when relaxing the original policy/managing-app CHECK.
+    static let simpleSpaceAuthoritySchemaStatements = [
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_simple_space_authorities (
+            space_uri TEXT PRIMARY KEY,
+            owner_did TEXT NOT NULL,
+            policy TEXT NOT NULL CHECK(policy IN ('public', 'member-list', 'managing-app')),
+            app_access TEXT NOT NULL CHECK(app_access IN ('open', 'allow-list')),
+            managing_app TEXT,
+            is_deleted INTEGER NOT NULL CHECK(is_deleted IN (0, 1)),
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+            CHECK(managing_app IS NULL OR length(managing_app) > 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_simple_space_members (
+            space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
+            member_did TEXT NOT NULL,
+            PRIMARY KEY(space_uri, member_did)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_simple_space_clients (
+            space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
+            client_id TEXT NOT NULL,
+            PRIMARY KEY(space_uri, client_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_simple_space_managing_app_decisions (
+            space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
+            user_did TEXT NOT NULL,
+            PRIMARY KEY(space_uri, user_did)
+        )
+        """,
+    ]
+
     public static let accountMigrations = accountConnectionPragmas + [
         // These four tables are retained for compatibility with the initial
         // alpha sketch. Durable repository APIs below use the explicitly
@@ -247,46 +290,7 @@ public enum SQLiteLayout {
         CREATE INDEX IF NOT EXISTS permissioned_space_outbox_pending
         ON permissioned_space_outbox(created_at, id)
         """,
-        /// Authority-owned `com.atproto.simplespace` facts.  These stay in
-        /// the authority's account database, never in a member's repository
-        /// database or the cross-account control store.
-        """
-        CREATE TABLE IF NOT EXISTS permissioned_simple_space_authorities (
-            space_uri TEXT PRIMARY KEY,
-            owner_did TEXT NOT NULL,
-            policy TEXT NOT NULL CHECK(policy IN ('public', 'member-list', 'managing-app')),
-            app_access TEXT NOT NULL CHECK(app_access IN ('open', 'allow-list')),
-            managing_app TEXT,
-            is_deleted INTEGER NOT NULL CHECK(is_deleted IN (0, 1)),
-            revision INTEGER NOT NULL CHECK(revision > 0),
-            created_at INTEGER NOT NULL CHECK(created_at >= 0),
-            updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
-            CHECK(
-                policy = 'managing-app' OR managing_app IS NULL
-            )
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS permissioned_simple_space_members (
-            space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
-            member_did TEXT NOT NULL,
-            PRIMARY KEY(space_uri, member_did)
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS permissioned_simple_space_clients (
-            space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
-            client_id TEXT NOT NULL,
-            PRIMARY KEY(space_uri, client_id)
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS permissioned_simple_space_managing_app_decisions (
-            space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
-            user_did TEXT NOT NULL,
-            PRIMARY KEY(space_uri, user_did)
-        )
-        """,
+    ] + simpleSpaceAuthoritySchemaStatements + [
         """
         CREATE TABLE IF NOT EXISTS blob_payloads (
             cid TEXT PRIMARY KEY,
@@ -600,6 +604,7 @@ private struct LoadedSimpleSpaceAuthority: Sendable {
 public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     private static let permissionedRepositoryStorageMigrationVersion = 1
     private static let permissionedOutboxLeaseMigrationVersion = 2
+    private static let simpleSpaceAuthoritySchemaMigrationVersion = 3
 
     private let connection: SQLiteConnection
     private let connectionGate = SQLiteConnectionGate()
@@ -718,6 +723,11 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             try await migratePermissionedRepositoryStorageIfNeeded()
             try await migratePermissionedOutboxLeasesIfNeeded()
         }
+        // SQLite cannot replace a CHECK constraint in place. This migration
+        // rebuilds the simple-space parent and its FK children after the base
+        // schema transaction so foreign-key enforcement can be disabled only
+        // for that tightly scoped copy.
+        try await migrateSimpleSpaceAuthoritySchemaIfNeeded()
     }
 
     /// Upgrades rows written before the persistence API owned its state marker
@@ -898,6 +908,122 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                 .integer(version),
                 .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
             ]
+        )
+    }
+
+    /// Replaces the original schema constraint which tied `managing_app` to
+    /// `managing-app` policy. The pinned TypeScript `updateSpace` procedure
+    /// patches those fields independently, so a policy-only change must retain
+    /// a configured app and an empty update must be able to clear it. SQLite
+    /// has no `ALTER CHECK`; copy the parent and every child table in one
+    /// immediate transaction while foreign keys are disabled, then validate
+    /// the reconstructed graph before recording the migration sentinel.
+    private func migrateSimpleSpaceAuthoritySchemaIfNeeded() async throws {
+        let version = Self.simpleSpaceAuthoritySchemaMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        _ = try await connection.query("PRAGMA foreign_keys = OFF")
+        do {
+            try await transaction {
+                try await renameSimpleSpaceAuthorityTablesForMigration()
+                for statement in SQLiteLayout.simpleSpaceAuthoritySchemaStatements {
+                    _ = try await connection.query(statement)
+                }
+                try await copySimpleSpaceAuthorityTablesFromMigration()
+                try await dropSimpleSpaceAuthorityMigrationTables()
+
+                let violations = try await connection.query("PRAGMA foreign_key_check")
+                guard violations.isEmpty else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "simple-space schema migration violated foreign keys"
+                    )
+                }
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_repository_migrations(version, applied_at)
+                    VALUES (?, ?)
+                    """,
+                    [
+                        .integer(version),
+                        .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+                    ]
+                )
+            }
+            _ = try await connection.query("PRAGMA foreign_keys = ON")
+        } catch {
+            _ = try? await connection.query("PRAGMA foreign_keys = ON")
+            throw error
+        }
+    }
+
+    private func renameSimpleSpaceAuthorityTablesForMigration() async throws {
+        _ = try await connection.query(
+            "ALTER TABLE permissioned_simple_space_authorities RENAME TO permissioned_simple_space_authorities_schema_v2"
+        )
+        _ = try await connection.query(
+            "ALTER TABLE permissioned_simple_space_members RENAME TO permissioned_simple_space_members_schema_v2"
+        )
+        _ = try await connection.query(
+            "ALTER TABLE permissioned_simple_space_clients RENAME TO permissioned_simple_space_clients_schema_v2"
+        )
+        _ = try await connection.query(
+            "ALTER TABLE permissioned_simple_space_managing_app_decisions RENAME TO permissioned_simple_space_managing_app_decisions_schema_v2"
+        )
+    }
+
+    private func copySimpleSpaceAuthorityTablesFromMigration() async throws {
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_simple_space_authorities(
+                space_uri, owner_did, policy, app_access, managing_app,
+                is_deleted, revision, created_at, updated_at
+            )
+            SELECT space_uri, owner_did, policy, app_access, managing_app,
+                   is_deleted, revision, created_at, updated_at
+            FROM permissioned_simple_space_authorities_schema_v2
+            """
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_simple_space_members(space_uri, member_did)
+            SELECT space_uri, member_did
+            FROM permissioned_simple_space_members_schema_v2
+            """
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_simple_space_clients(space_uri, client_id)
+            SELECT space_uri, client_id
+            FROM permissioned_simple_space_clients_schema_v2
+            """
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_simple_space_managing_app_decisions(space_uri, user_did)
+            SELECT space_uri, user_did
+            FROM permissioned_simple_space_managing_app_decisions_schema_v2
+            """
+        )
+    }
+
+    private func dropSimpleSpaceAuthorityMigrationTables() async throws {
+        // Drop children before their old parent. The new child tables already
+        // reference the replacement parent, so this cannot hide a violation.
+        _ = try await connection.query(
+            "DROP TABLE permissioned_simple_space_managing_app_decisions_schema_v2"
+        )
+        _ = try await connection.query(
+            "DROP TABLE permissioned_simple_space_clients_schema_v2"
+        )
+        _ = try await connection.query(
+            "DROP TABLE permissioned_simple_space_members_schema_v2"
+        )
+        _ = try await connection.query(
+            "DROP TABLE permissioned_simple_space_authorities_schema_v2"
         )
     }
 
@@ -2510,15 +2636,12 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                 try validateSimpleSpaceAppIdentifier(client)
             }
         }
-        switch configuration.policy {
-        case .managingApp:
-            if let managingApp = configuration.managingApp {
-                try validateSimpleSpaceAppIdentifier(managingApp)
-            }
-        case .public, .memberList:
-            guard configuration.managingApp == nil else {
-                throw SwanError.malformed("only managing-app spaces may name a managing app")
-            }
+        // `updateSpace` patches policy and managingApp independently. Retain
+        // a valid configured app through a policy-only transition exactly as
+        // the pinned TypeScript store does; policy evaluation consults it only
+        // for `managing-app`. Its syntax remains fail-closed in every state.
+        if let managingApp = configuration.managingApp {
+            try validateSimpleSpaceAppIdentifier(managingApp)
         }
     }
 

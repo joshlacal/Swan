@@ -765,13 +765,15 @@ public struct SimpleSpaceConfiguration: Sendable, Codable, Equatable {
     public let managingApp: String?
 
     public init(policy: SimpleSpacePolicy = .memberList, appAccess: SimpleSpaceAppAccess = .open, managingApp: String? = nil) throws {
-        guard policy == .managingApp || managingApp == nil else {
-            throw SwanError.malformed("only managing-app spaces may name a managing app")
+        guard managingApp?.isEmpty != true else {
+            throw SwanError.malformed("managing app must not be empty")
         }
-        // The pinned `updateSpace` handler treats an empty `managingApp` as
-        // an explicit clear. A managing-app policy with no configured app is
-        // therefore a valid (but fail-closed) state, not malformed authority
-        // data. No app can submit managing-app decisions until one is set.
+        // The pinned `updateSpace` handler patches each property independently:
+        // a policy-only update must preserve an omitted `managingApp`, even
+        // when the policy becomes non-managing. An empty wire update is first
+        // translated to nil by `SimpleSpaceConfigurationPatch`, so it remains
+        // a valid explicit clear. The policy evaluator consults this property
+        // only while policy is `managing-app`.
         self.policy = policy
         self.appAccess = appAccess
         self.managingApp = managingApp
@@ -909,8 +911,16 @@ public actor SimpleSpaceAuthority {
     public func update(space: SpaceURI, configuration: SimpleSpaceConfiguration, by subject: String) throws {
         var state = try activeSpace(space)
         try requireOwner(state, subject: subject)
+        let previous = state.configuration
         state.configuration = configuration
         spaces[space] = state
+        // Decisions are scoped to one managing-app identity. Preserve them
+        // only when that identity remains actively governing the space.
+        if previous.policy != .managingApp
+            || configuration.policy != .managingApp
+            || previous.managingApp != configuration.managingApp {
+            managingAppDecisions[space] = []
+        }
     }
 
     public func addMember(space: SpaceURI, member: String, by subject: String) throws {
@@ -940,7 +950,10 @@ public actor SimpleSpaceAuthority {
     /// check. The authority consults this only for `managing-app` spaces.
     public func setManagingAppAccess(space: SpaceURI, user: String, allowed: Bool, by app: String) throws {
         let state = try activeSpace(space)
-        guard state.configuration.managingApp == app else { throw SwanError.unauthorized("wrong managing app") }
+        guard state.configuration.policy == .managingApp,
+              state.configuration.managingApp == app else {
+            throw SwanError.unauthorized("wrong managing app")
+        }
         if allowed { managingAppDecisions[space, default: []].insert(user) }
         else { managingAppDecisions[space, default: []].remove(user) }
     }

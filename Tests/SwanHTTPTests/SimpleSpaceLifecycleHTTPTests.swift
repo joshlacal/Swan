@@ -68,6 +68,23 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                         XCTAssertEqual(config["managingApp"] as? String, "did:web:manager.example")
                     }
 
+                    // Pinned updateSpace patches each property independently:
+                    // changing policy must not erase an omitted managingApp.
+                    let policyOnly = #"{"space":"\#(uri)","policy":"public"}"#
+                    try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(fixture, path: Self.updatePath, jti: "policy-only-public"), body: ByteBuffer(string: policyOnly)) { response in
+                        XCTAssertEqual(response.status, .ok)
+                    }
+                    try await client.execute(uri: getPath, method: .get, headers: try self.getHeaders(fixture, path: "/xrpc/com.atproto.space.getSpace", jti: "get-policy-only-public")) { response in
+                        XCTAssertEqual(response.status, .ok)
+                        let config = try XCTUnwrap((try self.jsonObject(response.body))["config"] as? [String: Any])
+                        XCTAssertEqual(config["policy"] as? String, "public")
+                        XCTAssertEqual(config["managingApp"] as? String, "did:web:manager.example")
+                    }
+                    let restoreManagingPolicy = #"{"space":"\#(uri)","policy":"managing-app"}"#
+                    try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(fixture, path: Self.updatePath, jti: "policy-only-managing"), body: ByteBuffer(string: restoreManagingPolicy)) { response in
+                        XCTAssertEqual(response.status, .ok)
+                    }
+
                     // Match the pinned TypeScript handler: an empty
                     // managingApp is an explicit clear rather than an
                     // omitted-field reset, and it does not rewrite policy.
@@ -148,6 +165,18 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(createToken, fixture: fixture, path: Self.createPath, jti: "scoped-create"), body: ByteBuffer(string: create)) { response in
                     XCTAssertEqual(response.status, .ok)
                 }
+                let member = #"{"space":"\#(space.rawValue)","did":"\#(Self.bob)"}"#
+                try await client.execute(uri: Self.addPath, method: .post, headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.addPath, jti: "update-scope-add"), body: ByteBuffer(string: member)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                let memberList = "\(Self.listPath)?space=\(self.percentEncode(space.rawValue))"
+                try await client.execute(uri: memberList, method: .get, headers: try self.getHeaders(updateToken, fixture: fixture, path: Self.listPath, jti: "update-scope-list")) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(((try self.jsonObject(response.body))["members"] as? [[String: String]])?.map { $0["did"] }, [Self.alice, Self.bob])
+                }
+                try await client.execute(uri: Self.removePath, method: .post, headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.removePath, jti: "update-scope-remove"), body: ByteBuffer(string: member)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
                 let update = #"{"space":"\#(space.rawValue)","policy":"public"}"#
                 try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(createToken, fixture: fixture, path: Self.updatePath, jti: "wrong-manage"), body: ByteBuffer(string: update)) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -155,6 +184,14 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 }
                 try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(updateToken, fixture: fixture, path: Self.updatePath, jti: "right-manage"), body: ByteBuffer(string: update)) { response in
                     XCTAssertEqual(response.status, .ok)
+                }
+                let replayHeaders = try self.postHeaders(updateToken, fixture: fixture, path: Self.addPath, jti: "add-replay")
+                try await client.execute(uri: Self.addPath, method: .post, headers: replayHeaders, body: ByteBuffer(string: member)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                try await client.execute(uri: Self.addPath, method: .post, headers: replayHeaders, body: ByteBuffer(string: member)) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try self.errorCode(response.body), "Unauthorized")
                 }
                 let delete = #"{"space":"\#(space.rawValue)"}"#
                 try await client.execute(uri: Self.deletePath, method: .post, headers: try self.postHeaders(deleteToken, fixture: fixture, path: Self.deletePath, jti: "delete-manage"), body: ByteBuffer(string: delete)) { response in
@@ -173,6 +210,14 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 var oversized = try self.postHeaders(fixture, path: Self.createPath, jti: "oversized")
                 oversized[.contentLength] = "1048577"
                 try await client.execute(uri: Self.createPath, method: .post, headers: oversized, body: ByteBuffer(string: create)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                }
+                // Hummingbird's router test client fragments large bodies in
+                // 32 KiB chunks. This exercises the streaming body limit with
+                // a real oversized payload, rather than only trusting a
+                // forged Content-Length header.
+                let chunkedOversized = String(repeating: " ", count: 1_048_577)
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "chunked-oversized"), body: ByteBuffer(string: chunkedOversized)) { response in
                     XCTAssertEqual(response.status, .badRequest)
                 }
                 let malformedQuery = "\(Self.listPath)?space=\(self.percentEncode(space.rawValue))&space=\(self.percentEncode(space.rawValue))"
@@ -312,6 +357,10 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
 
     private func getHeaders(_ fixture: SimpleSpaceFixture, path: String, jti: String, method: String = "GET") throws -> HTTPFields {
         try signedHeaders(fixture.alice, fixture: fixture, path: path, jti: jti, method: method)
+    }
+
+    private func getHeaders(_ token: SimpleSpaceTokenMaterial, fixture: SimpleSpaceFixture, path: String, jti: String) throws -> HTTPFields {
+        try signedHeaders(token, fixture: fixture, path: path, jti: jti, method: "GET")
     }
 
     private func signedHeaders(_ token: SimpleSpaceTokenMaterial, fixture: SimpleSpaceFixture, path: String, jti: String, method: String) throws -> HTTPFields {

@@ -80,8 +80,11 @@ checksum-verified way to populate the ignored reference cache.
   startup-preopened DPoP/OAuth capability. They are intentionally limited to
   local authority state; managing-app service auth, credentials,
   notifications, remote delegation, and synchronization remain closed pending
-  their dedicated capability work. This is not evidence of cross-host
-  SimpleSpace interoperability.
+  their dedicated capability work. SQLite migration v3 rebuilds legacy
+  simple-space authority CHECK constraints and preserves all FK child facts,
+  so a policy-only patch retains its omitted managing-app value and an empty
+  wire value clears it. This is not evidence of cross-host SimpleSpace
+  interoperability.
 
 ## Completion gates
 

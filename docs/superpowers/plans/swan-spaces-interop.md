@@ -79,7 +79,13 @@ Catbird UI work.
   explicitly closed. Focused tests use durable SQLite accounts, opaque OAuth
   tokens, and signed DPoP proofs for create/update/delete scopes, owner-removal
   rejection, malformed body/query closure, deactivation, vanished preopened
-  DBs, and public-route isolation.
+  DBs, and public-route isolation. Configuration patches retain an omitted
+  managing-app identifier across policy-only transitions, as the pinned
+  TypeScript handler does; SQLite migration v3 rebuilds the original
+  policy-coupled CHECK (plus FK children) before allowing that valid state or
+  an explicit empty-string clear. Focused tests cover the old-schema upgrade,
+  `manage=update` membership/list operations, DPoP replay, and an oversized
+  body delivered in streaming chunks.
 - All unimplemented HTTP endpoints intentionally return generic authorization
   errors or `profile_endpoint_pending`; they are not interop evidence. The
   pinned TypeScript `com.atproto.space.getSpace` exception is now a typed,
