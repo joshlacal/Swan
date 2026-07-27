@@ -61,7 +61,11 @@ let package = Package(
         .target(name: "SwanSpacesWire", dependencies: ["SwanCore", .product(name: "Petrel", package: "Petrel")]),
         .target(
             name: "SwanPublicRepository",
-            dependencies: ["SwanCore", .product(name: "Petrel", package: "Petrel")]
+            dependencies: [
+                "SwanCore",
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "Petrel", package: "Petrel"),
+            ]
         ),
         .target(
             name: "SwanSpaces",
@@ -173,6 +177,14 @@ let package = Package(
             dependencies: [
                 "SwanInterop",
                 .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
+        .testTarget(
+            name: "SwanPublicRepositoryTests",
+            dependencies: [
+                "SwanPublicRepository",
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "Petrel", package: "Petrel"),
             ]
         ),
     ]
