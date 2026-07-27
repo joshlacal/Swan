@@ -6,6 +6,7 @@ import Glibc
 #endif
 import Foundation
 import SwanCore
+import SwanPublicRepository
 
 public enum AccountKeyPurpose: String, Codable, Sendable, CaseIterable {
     case signing = "account-signing"
@@ -128,6 +129,47 @@ public protocol AccountKeyStore: Sendable {
     func key(for reference: AccountKeyReference) async throws -> Data
 }
 
+/// The only pre-DID private-material persistence surface. It is purpose-bound
+/// to PLC genesis preparation and cannot store arbitrary values.
+public protocol PLCAccountIdentityStagingKeyStore: AccountKeyStore {
+    func stagePLCAccountIdentity(
+        requestID: String,
+        canonicalHandle: String,
+        pdsOrigin: URL,
+        repositoryRevision: String
+    ) async throws -> StagedPLCAccountIdentity
+
+    func stagedPLCAccountIdentity(
+        requestID: String,
+        canonicalHandle: String,
+        pdsOrigin: URL,
+        repositoryRevision: String
+    ) async throws -> StagedPLCAccountIdentity?
+
+    func reclaimStagedPLCAccountIdentity(
+        requestID: String,
+        expectedDID: String,
+        canonicalHandle: String,
+        pdsOrigin: URL,
+        repositoryRevision: String
+    ) async throws
+}
+
+public struct StagedPLCAccountIdentity: Sendable {
+    public let requestID: String
+    public let did: String
+    public let canonicalHandle: String
+    public let pdsOrigin: String
+    public let repositoryRevision: String
+    public let operation: PLCSignedOperation
+    let signingKey: P256.Signing.PrivateKey
+    let rotationKey: P256.Signing.PrivateKey
+
+    public var operationCID: String {
+        get throws { try operation.cid.string }
+    }
+}
+
 /// Exposes authenticated P-256 public-key metadata without making an account
 /// private scalar readable. Callers that only verify signatures should depend
 /// on this capability rather than on ``AccountKeyStore``.
@@ -140,7 +182,11 @@ public protocol AccountKeyPublicKeyStore: Sendable {
 
 /// Purpose-bound encrypted file storage anchored to a pinned directory
 /// descriptor. KEKs are deployment configuration and are never serialized.
-public actor FileAccountKeyStore: AccountKeyStore, AccountKeyPublicKeyStore {
+public actor FileAccountKeyStore:
+    AccountKeyStore,
+    AccountKeyPublicKeyStore,
+    PLCAccountIdentityStagingKeyStore
+{
     public static let envelopeFormat = "swan-key-envelope-v1"
 
     private static let journalFormat = "swan-key-provisioning-journal-v1"
@@ -150,6 +196,8 @@ public actor FileAccountKeyStore: AccountKeyStore, AccountKeyPublicKeyStore {
     private static let maximumEnvelopeBytes = 16 * 1_024
     private static let maximumJournalBytes = 128 * 1_024
     private static let maximumMarkerBytes = 128
+    private static let plcStagingFormat = "swan-plc-account-staging-v1"
+    private static let maximumPLCStagingBytes = 64 * 1_024
 
     private struct Envelope: Codable {
         let format: String
@@ -179,6 +227,20 @@ public actor FileAccountKeyStore: AccountKeyStore, AccountKeyPublicKeyStore {
         let filename: String
         let envelope: Envelope
         let reference: AccountKeyReference
+    }
+
+    private struct PLCStagingEnvelope: Codable {
+        let format: String
+        let kid: String
+        let requestDigest: Data
+        let sealedPayload: Data
+    }
+
+    private struct PLCStagingPayload: Codable {
+        let signingKey: Data
+        let rotationKey: Data
+        let did: String
+        let operationJSON: Data
     }
 
     private let directoryDescriptor: Int32
@@ -275,6 +337,255 @@ public actor FileAccountKeyStore: AccountKeyStore, AccountKeyPublicKeyStore {
             try requireActiveWriterKey()
             try createBatchUnlocked(materials)
         }
+    }
+
+    public func stagePLCAccountIdentity(
+        requestID: String,
+        canonicalHandle: String,
+        pdsOrigin: URL,
+        repositoryRevision: String
+    ) throws -> StagedPLCAccountIdentity {
+        try withExclusiveLock {
+            try requireActiveWriterKey()
+            if let existing = try loadStagedPLCAccountIdentity(
+                requestID: requestID,
+                canonicalHandle: canonicalHandle,
+                pdsOrigin: pdsOrigin,
+                repositoryRevision: repositoryRevision
+            ) {
+                return existing
+            }
+            let signingKey = P256.Signing.PrivateKey()
+            let rotationKey = P256.Signing.PrivateKey()
+            guard signingKey.rawRepresentation != rotationKey.rawRepresentation else {
+                throw SwanError.unavailable("P-256 key generation returned duplicate account keys")
+            }
+            let unsigned = try PLCATProfile.regularOperation(
+                handle: canonicalHandle,
+                signingPublicKey: signingKey.publicKey,
+                rotationPublicKeys: [rotationKey.publicKey],
+                pdsOrigin: pdsOrigin,
+                prev: nil
+            )
+            let operation = try PLCOperationCodec.sign(.regular(unsigned), using: rotationKey)
+            let did = try PLCOperationCodec.genesisDID(for: operation)
+            guard let origin = operation.regular?.services["atproto_pds"]?.endpoint else {
+                throw SwanError.malformed("PLC staging origin is unavailable")
+            }
+            let payload = PLCStagingPayload(
+                signingKey: signingKey.rawRepresentation,
+                rotationKey: rotationKey.rawRepresentation,
+                did: did,
+                operationJSON: try operation.canonicalJSON
+            )
+            let payloadData = try JSONEncoder().encode(payload)
+            let keyID = configuration.activeKeyID
+            guard let keyData = configuration.key(for: keyID) else {
+                throw SwanError.unavailable("active account KEK is unavailable")
+            }
+            let sealed = try AES.GCM.seal(
+                payloadData,
+                using: SymmetricKey(data: keyData),
+                authenticating: Self.plcStagingAAD(
+                    requestID: requestID,
+                    canonicalHandle: canonicalHandle,
+                    pdsOrigin: origin,
+                    repositoryRevision: repositoryRevision,
+                    keyID: keyID
+                )
+            )
+            guard let combined = sealed.combined else {
+                throw SwanError.unavailable("PLC staging encryption is unavailable")
+            }
+            let envelope = PLCStagingEnvelope(
+                format: Self.plcStagingFormat,
+                kid: keyID,
+                requestDigest: Data(SHA256.hash(data: Data(requestID.utf8))),
+                sealedPayload: combined
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            do {
+                try Self.installCreateOnly(
+                    encoder.encode(envelope),
+                    named: Self.plcStagingFilename(requestID: requestID),
+                    directoryDescriptor: directoryDescriptor
+                )
+            } catch let error as SwanError where error == .conflict(expected: 0, actual: 1) {
+                guard let existing = try loadStagedPLCAccountIdentity(
+                    requestID: requestID,
+                    canonicalHandle: canonicalHandle,
+                    pdsOrigin: pdsOrigin,
+                    repositoryRevision: repositoryRevision
+                ) else {
+                    throw SwanError.unavailable("PLC staging race is unavailable")
+                }
+                return existing
+            }
+            return StagedPLCAccountIdentity(
+                requestID: requestID,
+                did: did,
+                canonicalHandle: canonicalHandle,
+                pdsOrigin: origin,
+                repositoryRevision: repositoryRevision,
+                operation: operation,
+                signingKey: signingKey,
+                rotationKey: rotationKey
+            )
+        }
+    }
+
+    public func stagedPLCAccountIdentity(
+        requestID: String,
+        canonicalHandle: String,
+        pdsOrigin: URL,
+        repositoryRevision: String
+    ) throws -> StagedPLCAccountIdentity? {
+        try withExclusiveLock {
+            try loadStagedPLCAccountIdentity(
+                requestID: requestID,
+                canonicalHandle: canonicalHandle,
+                pdsOrigin: pdsOrigin,
+                repositoryRevision: repositoryRevision
+            )
+        }
+    }
+
+    public func reclaimStagedPLCAccountIdentity(
+        requestID: String,
+        expectedDID: String,
+        canonicalHandle: String,
+        pdsOrigin: URL,
+        repositoryRevision: String
+    ) throws {
+        try withExclusiveLock {
+            let filename = try Self.plcStagingFilename(requestID: requestID)
+            guard try Self.entryExists(
+                named: filename,
+                directoryDescriptor: directoryDescriptor
+            ) else { return }
+            guard let staged = try loadStagedPLCAccountIdentity(
+                requestID: requestID,
+                canonicalHandle: canonicalHandle,
+                pdsOrigin: pdsOrigin,
+                repositoryRevision: repositoryRevision
+            ), staged.did == expectedDID else {
+                throw SwanError.unauthorized("PLC account staging reclamation is invalid")
+            }
+            let signingReference = try AccountKeyReference(
+                accountDID: expectedDID,
+                purpose: .signing,
+                generation: 1
+            )
+            let rotationReference = try AccountKeyReference(
+                accountDID: expectedDID,
+                purpose: .rotation,
+                generation: 1
+            )
+            // The authenticated staging record is loaded with its immutable
+            // request binding by the service immediately before reclamation.
+            // Here the DID-bound envelopes must both exist and belong to the
+            // expected DID before the only request locator is removed.
+            let signingEnvelope = try loadEnvelope(
+                named: Self.filename(for: signingReference),
+                expectedReference: signingReference
+            )
+            let rotationEnvelope = try loadEnvelope(
+                named: Self.filename(for: rotationReference),
+                expectedReference: rotationReference
+            )
+            guard try decrypt(signingEnvelope.envelope, reference: signingReference)
+                    == staged.signingKey.rawRepresentation,
+                  try decrypt(rotationEnvelope.envelope, reference: rotationReference)
+                    == staged.rotationKey.rawRepresentation else {
+                throw SwanError.unauthorized("PLC account staging promotion is invalid")
+            }
+            try Self.remove(named: filename, directoryDescriptor: directoryDescriptor)
+        }
+    }
+
+    private func loadStagedPLCAccountIdentity(
+        requestID: String,
+        canonicalHandle: String,
+        pdsOrigin: URL,
+        repositoryRevision: String
+    ) throws -> StagedPLCAccountIdentity? {
+        try Self.validatePLCStagingRequestID(requestID)
+        try PublicRepositoryGenesisCodec.validateRevision(repositoryRevision)
+        let canonical = try PLCATProfile.regularOperation(
+            handle: canonicalHandle,
+            signingPublicKey: P256.Signing.PrivateKey().publicKey,
+            rotationPublicKeys: [P256.Signing.PrivateKey().publicKey],
+            pdsOrigin: pdsOrigin,
+            prev: nil
+        ).services["atproto_pds"]!.endpoint
+        let filename = try Self.plcStagingFilename(requestID: requestID)
+        guard try Self.entryExists(named: filename, directoryDescriptor: directoryDescriptor) else {
+            return nil
+        }
+        let encoded = try Self.readProtected(
+            named: filename,
+            maximumBytes: Self.maximumPLCStagingBytes,
+            directoryDescriptor: directoryDescriptor
+        )
+        let envelope: PLCStagingEnvelope
+        do {
+            envelope = try JSONDecoder().decode(PLCStagingEnvelope.self, from: encoded)
+        } catch {
+            throw SwanError.malformed("invalid PLC account staging envelope")
+        }
+        guard envelope.format == Self.plcStagingFormat,
+              envelope.requestDigest == Data(SHA256.hash(data: Data(requestID.utf8))),
+              let keyData = configuration.key(for: envelope.kid) else {
+            throw SwanError.unauthorized("PLC account staging binding is invalid")
+        }
+        let plaintext: Data
+        do {
+            plaintext = try AES.GCM.open(
+                AES.GCM.SealedBox(combined: envelope.sealedPayload),
+                using: SymmetricKey(data: keyData),
+                authenticating: Self.plcStagingAAD(
+                    requestID: requestID,
+                    canonicalHandle: canonicalHandle,
+                    pdsOrigin: canonical,
+                    repositoryRevision: repositoryRevision,
+                    keyID: envelope.kid
+                )
+            )
+        } catch {
+            throw SwanError.unauthorized("PLC account staging authentication failed")
+        }
+        let payload: PLCStagingPayload
+        do {
+            payload = try JSONDecoder().decode(PLCStagingPayload.self, from: plaintext)
+        } catch {
+            throw SwanError.malformed("invalid PLC account staging payload")
+        }
+        let signingKey = try P256.Signing.PrivateKey(rawRepresentation: payload.signingKey)
+        let rotationKey = try P256.Signing.PrivateKey(rawRepresentation: payload.rotationKey)
+        guard payload.signingKey != payload.rotationKey else {
+            throw SwanError.malformed("PLC account staging keys are not distinct")
+        }
+        let operation = try PLCOperationCodec.decodeSignedJSON(payload.operationJSON)
+        try PLCOperationCodec.verifyGenesis(operation, expectedDID: payload.did)
+        guard let regular = operation.regular,
+              regular.verificationMethods["atproto"]
+                == P256DIDKey(publicKey: signingKey.publicKey).value,
+              regular.rotationKeys == [P256DIDKey(publicKey: rotationKey.publicKey).value],
+              regular.alsoKnownAs == ["at://\(canonicalHandle)"],
+              regular.services["atproto_pds"]?.endpoint == canonical else {
+            throw SwanError.unauthorized("PLC account staging identity is invalid")
+        }
+        return StagedPLCAccountIdentity(
+            requestID: requestID,
+            did: payload.did,
+            canonicalHandle: canonicalHandle,
+            pdsOrigin: canonical,
+            repositoryRevision: repositoryRevision,
+            operation: operation,
+            signingKey: signingKey,
+            rotationKey: rotationKey
+        )
     }
 
     private func createBatchUnlocked(_ materials: [AccountKeyMaterial]) throws {
@@ -407,6 +718,16 @@ public actor FileAccountKeyStore: AccountKeyStore, AccountKeyPublicKeyStore {
                     || configuration.key(for: writerKeyID) != nil else {
                 throw SwanError.unavailable(
                     "active account KEK migration requires the currently active KEK"
+                )
+            }
+            if writerKeyID != configuration.activeKeyID,
+               try Self.directoryEntryNames(directoryDescriptor: directoryDescriptor)
+                   .contains(where: { $0.hasSuffix(".plcstage") }) {
+                // Staging AAD includes request inputs which deliberately are
+                // not exposed in the outer envelope. Finish or reclaim the
+                // pending preparation before retiring its writer KEK.
+                throw SwanError.unavailable(
+                    "pending PLC account staging blocks account KEK migration"
                 )
             }
 
@@ -614,6 +935,43 @@ public actor FileAccountKeyStore: AccountKeyStore, AccountKeyPublicKeyStore {
         return filename.dropLast(4).utf8.allSatisfy {
             ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
         }
+    }
+
+    private static func validatePLCStagingRequestID(_ requestID: String) throws {
+        guard !requestID.isEmpty, requestID.utf8.count <= 128,
+              requestID.utf8.allSatisfy({
+                  ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90)
+                      || ($0 >= 97 && $0 <= 122) || [45, 46, 58, 95].contains($0)
+              }) else {
+            throw SwanError.invalidIdentifier("PLC account staging request")
+        }
+    }
+
+    private static func plcStagingFilename(requestID: String) throws -> String {
+        try validatePLCStagingRequestID(requestID)
+        let digest = Hex.encode(SHA256.hash(
+            data: Data("\(plcStagingFormat)\u{0}\(requestID)".utf8)
+        ))
+        return "\(digest).plcstage"
+    }
+
+    private static func plcStagingAAD(
+        requestID: String,
+        canonicalHandle: String,
+        pdsOrigin: String,
+        repositoryRevision: String,
+        keyID: String
+    ) -> Data {
+        var data = Data()
+        for value in [
+            plcStagingFormat, keyID, requestID, canonicalHandle,
+            pdsOrigin, repositoryRevision,
+        ] {
+            var length = UInt64(value.utf8.count).bigEndian
+            withUnsafeBytes(of: &length) { data.append(contentsOf: $0) }
+            data.append(contentsOf: value.utf8)
+        }
+        return data
     }
 
     private static func additionalAuthenticatedData(

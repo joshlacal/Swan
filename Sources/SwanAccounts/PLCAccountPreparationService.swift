@@ -23,7 +23,9 @@ public enum PLCAccountPreparationError: Error, Sendable, Equatable {
 }
 
 struct PLCAccountPreparationHooks: Sendable {
+    var afterKeysStaged: (@Sendable () async throws -> Void)?
     var afterIntentReserved: (@Sendable () async throws -> Void)?
+    var afterDIDEnvelopesPromoted: (@Sendable () async throws -> Void)?
     var afterRepositoryInstalled: (@Sendable () async throws -> Void)?
     var afterPLCSubmitted: (@Sendable () async throws -> Void)?
 }
@@ -36,14 +38,14 @@ public actor PLCAccountPreparationService {
     private let intentStore: any PLCAccountPreparationIntentStore
     private let accountStoreOpener: any PLCAccountPreparationAccountStoreOpener
     private let keyProvisioner: AccountKeyProvisioner
-    private let keyStore: any AccountKeyStore
+    private let keyStore: any PLCAccountIdentityStagingKeyStore
     private let plcClient: any PLCClient
     private let hooks: PLCAccountPreparationHooks
 
     public init(
         intentStore: any PLCAccountPreparationIntentStore,
         accountStoreOpener: any PLCAccountPreparationAccountStoreOpener,
-        keyStore: any AccountKeyStore,
+        keyStore: any PLCAccountIdentityStagingKeyStore,
         plcClient: any PLCClient
     ) {
         self.intentStore = intentStore
@@ -57,7 +59,7 @@ public actor PLCAccountPreparationService {
     init(
         intentStore: any PLCAccountPreparationIntentStore,
         accountStoreOpener: any PLCAccountPreparationAccountStoreOpener,
-        keyStore: any AccountKeyStore,
+        keyStore: any PLCAccountIdentityStagingKeyStore,
         plcClient: any PLCClient,
         hooks: PLCAccountPreparationHooks
     ) {
@@ -92,6 +94,7 @@ public actor PLCAccountPreparationService {
         }
 
         let intent: PLCAccountPreparationIntent
+        let stagedIdentity: StagedPLCAccountIdentity?
         if let existing = try await loadIntent(requestID: requestID) {
             try requireSameInputs(
                 existing,
@@ -101,17 +104,36 @@ public actor PLCAccountPreparationService {
                 repositoryRevision: repositoryRevision
             )
             intent = existing
-        } else {
-            intent = try await createInitialPreparation(
+            stagedIdentity = try await loadStagedIdentity(
                 requestID: requestID,
                 handle: handle,
                 pdsOrigin: rawPDSOrigin,
                 repositoryRevision: repositoryRevision
             )
+            if let stagedIdentity {
+                try requireStagedIdentity(stagedIdentity, matches: intent)
+            }
+        } else {
+            let staged = try await stageIdentity(
+                requestID: requestID,
+                handle: handle,
+                pdsOrigin: rawPDSOrigin,
+                repositoryRevision: repositoryRevision
+            )
+            try await hooks.afterKeysStaged?()
+            intent = try await reserveInitialIntent(staged)
+            stagedIdentity = staged
         }
 
         try await hooks.afterIntentReserved?()
         let store = try await openStore(did: intent.did)
+        if let stagedIdentity {
+            try await promoteAndJournal(
+                stagedIdentity,
+                intent: intent,
+                store: store
+            )
+        }
         var journal = try await requireJournal(store: store, intent: intent)
         let keys = try await loadAndVerifyKeys(journal: journal)
         let signedOperation = try verifiedOperation(journal: journal, keys: keys)
@@ -186,110 +208,125 @@ public actor PLCAccountPreparationService {
         )
     }
 
-    private func createInitialPreparation(
+    private func stageIdentity(
         requestID: String,
         handle: String,
         pdsOrigin: URL,
         repositoryRevision: String
-    ) async throws -> PLCAccountPreparationIntent {
-        let signingKey = P256.Signing.PrivateKey()
-        let rotationKey = P256.Signing.PrivateKey()
-        guard signingKey.rawRepresentation != rotationKey.rawRepresentation else {
+    ) async throws -> StagedPLCAccountIdentity {
+        do {
+            return try await keyStore.stagePLCAccountIdentity(
+                requestID: requestID,
+                canonicalHandle: handle,
+                pdsOrigin: pdsOrigin,
+                repositoryRevision: repositoryRevision
+            )
+        } catch {
             throw PLCAccountPreparationError.unavailable
         }
-        let unsigned: PLCUnsignedRegularOperation
-        let operation: PLCSignedOperation
-        let did: String
+    }
+
+    private func loadStagedIdentity(
+        requestID: String,
+        handle: String,
+        pdsOrigin: URL,
+        repositoryRevision: String
+    ) async throws -> StagedPLCAccountIdentity? {
         do {
-            unsigned = try PLCATProfile.regularOperation(
-                handle: handle,
-                signingPublicKey: signingKey.publicKey,
-                rotationPublicKeys: [rotationKey.publicKey],
+            return try await keyStore.stagedPLCAccountIdentity(
+                requestID: requestID,
+                canonicalHandle: handle,
                 pdsOrigin: pdsOrigin,
-                prev: nil
+                repositoryRevision: repositoryRevision
             )
-            operation = try PLCOperationCodec.sign(.regular(unsigned), using: rotationKey)
-            did = try PLCOperationCodec.genesisDID(for: operation)
+        } catch {
+            throw PLCAccountPreparationError.unavailable
+        }
+    }
+
+    private func reserveInitialIntent(
+        _ staged: StagedPLCAccountIdentity
+    ) async throws -> PLCAccountPreparationIntent {
+        let intent: PLCAccountPreparationIntent
+        do {
+            intent = try PLCAccountPreparationIntent(
+                requestID: staged.requestID,
+                did: staged.did,
+                canonicalHandle: staged.canonicalHandle,
+                pdsOrigin: staged.pdsOrigin,
+                repositoryRevision: staged.repositoryRevision,
+                operationCID: staged.operationCID,
+                stage: .keysStored
+            )
         } catch {
             throw PLCAccountPreparationError.conflict
         }
-        guard let regular = operation.regular,
-              let canonicalOrigin = regular.services["atproto_pds"]?.endpoint else {
-            throw PLCAccountPreparationError.unavailable
-        }
-        let operationCID = try operation.cid.string
-        let keys: ProvisionedAccountKeys
         do {
-            keys = try await keyProvisioner.installInitial(
-                accountDID: did,
-                signingKey: signingKey,
-                rotationKey: rotationKey
-            )
+            switch try await intentStore.reservePLCAccountPreparationIntent(intent) {
+            case .created:
+                return intent
+            case let .existing(existing):
+                try requireStagedIdentity(staged, matches: existing)
+                return existing
+            }
         } catch {
             throw PLCAccountPreparationError.unavailable
         }
-        let intent: PLCAccountPreparationIntent
-        let journal: PLCAccountPreparationJournal
+    }
+
+    private func promoteAndJournal(
+        _ staged: StagedPLCAccountIdentity,
+        intent: PLCAccountPreparationIntent,
+        store: any PLCAccountPreparationAccountStore
+    ) async throws {
+        try requireStagedIdentity(staged, matches: intent)
+        let keys: ProvisionedAccountKeys
         do {
-            intent = try PLCAccountPreparationIntent(
-                requestID: requestID,
-                did: did,
-                canonicalHandle: handle,
-                pdsOrigin: canonicalOrigin,
-                repositoryRevision: repositoryRevision,
-                operationCID: operationCID,
-                stage: .keysStored
+            keys = try await keyProvisioner.installInitial(
+                accountDID: staged.did,
+                signingKey: staged.signingKey,
+                rotationKey: staged.rotationKey
             )
-            journal = try PLCAccountPreparationJournal(
-                requestID: requestID,
-                did: did,
-                canonicalHandle: handle,
-                pdsOrigin: canonicalOrigin,
-                repositoryRevision: repositoryRevision,
-                operationCID: operationCID,
-                signedOperationJSON: operation.canonicalJSON,
+            try await hooks.afterDIDEnvelopesPromoted?()
+            let journal = try PLCAccountPreparationJournal(
+                requestID: staged.requestID,
+                did: staged.did,
+                canonicalHandle: staged.canonicalHandle,
+                pdsOrigin: staged.pdsOrigin,
+                repositoryRevision: staged.repositoryRevision,
+                operationCID: staged.operationCID,
+                signedOperationJSON: staged.operation.canonicalJSON,
                 signingKey: try controlReference(keys.signingReference),
                 rotationKey: try controlReference(keys.rotationReference),
                 publicGenesisCommitCID: nil,
                 stage: .keysStored
             )
-        } catch {
-            throw PLCAccountPreparationError.conflict
-        }
-
-        let store = try await openStore(did: did)
-        do {
             _ = try await store.installPLCAccountPreparationJournal(journal)
-            switch try await intentStore.reservePLCAccountPreparationIntent(intent) {
-            case .created:
-                return intent
-            case let .existing(existing):
-                try requireSameInputs(
-                    existing,
-                    requestID: requestID,
-                    handle: handle,
-                    pdsOrigin: pdsOrigin,
-                    repositoryRevision: repositoryRevision
-                )
-                return existing
-            }
-        } catch let error as PLCAccountPreparationError {
-            throw error
-        } catch let error as PLCAccountPreparationStoreError
-            where error == .conflict {
-            guard let existing = try await loadIntent(requestID: requestID) else {
-                throw PLCAccountPreparationError.conflict
-            }
-            try requireSameInputs(
-                existing,
-                requestID: requestID,
-                handle: handle,
-                pdsOrigin: pdsOrigin,
-                repositoryRevision: repositoryRevision
+            try await keyStore.reclaimStagedPLCAccountIdentity(
+                requestID: staged.requestID,
+                expectedDID: staged.did,
+                canonicalHandle: staged.canonicalHandle,
+                pdsOrigin: URL(string: staged.pdsOrigin)!,
+                repositoryRevision: staged.repositoryRevision
             )
-            return existing
+        } catch let error as PLCAccountPreparationStoreError where error == .conflict {
+            throw PLCAccountPreparationError.conflict
         } catch {
             throw PLCAccountPreparationError.unavailable
+        }
+    }
+
+    private func requireStagedIdentity(
+        _ staged: StagedPLCAccountIdentity,
+        matches intent: PLCAccountPreparationIntent
+    ) throws {
+        guard staged.requestID == intent.requestID,
+              staged.did == intent.did,
+              staged.canonicalHandle == intent.canonicalHandle,
+              staged.pdsOrigin == intent.pdsOrigin,
+              staged.repositoryRevision == intent.repositoryRevision,
+              try staged.operationCID == intent.operationCID else {
+            throw PLCAccountPreparationError.conflict
         }
     }
 

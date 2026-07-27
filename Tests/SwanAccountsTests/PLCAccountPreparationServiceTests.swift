@@ -134,8 +134,12 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
             let failHook: @Sendable () async throws -> Void = { throw failure }
             let hooks: PLCAccountPreparationHooks
             switch failure {
+            case .staged:
+                hooks = .init(afterKeysStaged: failHook)
             case .intent:
                 hooks = .init(afterIntentReserved: failHook)
+            case .promoted:
+                hooks = .init(afterDIDEnvelopesPromoted: failHook)
             case .repository:
                 hooks = .init(afterRepositoryInstalled: failHook)
             case .submitted:
@@ -150,7 +154,43 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
                     repositoryRevision: "3lqby3xuo4k2e"
                 )
             )
-            let recovered = try await fixture.service().prepare(
+            let interruptedIntent = try await fixture.control
+                .plcAccountPreparationIntent(requestID: "request-\(failure.rawValue)")
+            let retainedStage = try await fixture.keyStore.stagedPLCAccountIdentity(
+                requestID: "request-\(failure.rawValue)",
+                canonicalHandle: "\(failure.rawValue).example.com",
+                pdsOrigin: URL(string: "https://pds.example.com")!,
+                repositoryRevision: "3lqby3xuo4k2e"
+            )
+            let interruptedInventory = try await fixture.keyStore.inventory()
+            switch failure {
+            case .staged:
+                XCTAssertNil(interruptedIntent)
+                XCTAssertNotNil(retainedStage)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 0)
+            case .intent:
+                XCTAssertEqual(interruptedIntent?.stage, .keysStored)
+                XCTAssertNotNil(retainedStage)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 0)
+            case .promoted:
+                XCTAssertEqual(interruptedIntent?.stage, .keysStored)
+                XCTAssertNotNil(retainedStage)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                let account = try await fixture.opener.openPLCAccountPreparationStore(
+                    did: try XCTUnwrap(interruptedIntent?.did)
+                )
+                let journal = try await account.plcAccountPreparationJournal()
+                XCTAssertNil(journal)
+            case .repository, .submitted:
+                XCTAssertNotNil(interruptedIntent)
+                XCTAssertNil(retainedStage)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+            }
+            let reloadedKeyStore = try FileAccountKeyStore(
+                root: fixture.keyRoot,
+                configuration: fixture.keyConfiguration
+            )
+            let recovered = try await fixture.service(keyStore: reloadedKeyStore).prepare(
                 requestID: "request-\(failure.rawValue)",
                 handle: "\(failure.rawValue).example.com",
                 pdsOrigin: URL(string: "https://pds.example.com")!,
@@ -158,15 +198,133 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
             )
             XCTAssertEqual(recovered.signingReference.generation, 1)
             XCTAssertEqual(recovered.rotationReference.generation, 1)
-            let inventory = try await fixture.keyStore.inventory()
+            let inventory = try await reloadedKeyStore.inventory()
             let submissionCount = await fixture.plc.submitCount()
             let recoveredIntent = try await fixture.control
                 .plcAccountPreparationIntent(requestID: "request-\(failure.rawValue)")
+            let remainingStage = try await reloadedKeyStore.stagedPLCAccountIdentity(
+                requestID: "request-\(failure.rawValue)",
+                canonicalHandle: "\(failure.rawValue).example.com",
+                pdsOrigin: URL(string: "https://pds.example.com")!,
+                repositoryRevision: "3lqby3xuo4k2e"
+            )
             XCTAssertEqual(inventory.totalEnvelopeCount, 2)
             XCTAssertEqual(submissionCount, 1)
             XCTAssertEqual(recoveredIntent?.stage, .submitted)
+            XCTAssertNil(remainingStage)
             try await fixture.close()
         }
+    }
+
+    func testPreIntentStageSurvivesRestartWithExactIdentityAndOwnerOnlyEnvelope() async throws {
+        let fixture = try await PreparationFixture()
+        defer { fixture.removeFiles() }
+        let fail: @Sendable () async throws -> Void = { throw PreparationFailure.staged }
+        await XCTAssertThrowsErrorAsync(
+            try await fixture.service(hooks: .init(afterKeysStaged: fail)).prepare(
+                requestID: "request-pre-intent",
+                handle: "Pre-Intent.Example.com",
+                pdsOrigin: URL(string: "https://pds.example.com")!,
+                repositoryRevision: "3lqby3xuo4k2j"
+            )
+        )
+
+        let preIntent = try await fixture.control
+            .plcAccountPreparationIntent(requestID: "request-pre-intent")
+        XCTAssertNil(preIntent)
+        let preIntentInventory = try await fixture.keyStore.inventory()
+        XCTAssertEqual(preIntentInventory.totalEnvelopeCount, 0)
+        let loadedStage = try await fixture.keyStore.stagedPLCAccountIdentity(
+            requestID: "request-pre-intent",
+            canonicalHandle: "pre-intent.example.com",
+            pdsOrigin: URL(string: "https://pds.example.com")!,
+            repositoryRevision: "3lqby3xuo4k2j"
+        )
+        let staged = try XCTUnwrap(loadedStage)
+        await XCTAssertThrowsErrorAsync(
+            try await fixture.keyStore.stagedPLCAccountIdentity(
+                requestID: "request-pre-intent",
+                canonicalHandle: "changed.example.com",
+                pdsOrigin: URL(string: "https://pds.example.com")!,
+                repositoryRevision: "3lqby3xuo4k2j"
+            )
+        )
+        let stageURLs = try FileManager.default.contentsOfDirectory(
+            at: fixture.keyRoot,
+            includingPropertiesForKeys: nil
+        ).filter { $0.pathExtension == "plcstage" }
+        XCTAssertEqual(stageURLs.count, 1)
+        let permissions = try FileManager.default.attributesOfItem(
+            atPath: try XCTUnwrap(stageURLs.first).path
+        )[.posixPermissions] as? NSNumber
+        XCTAssertEqual(permissions?.intValue, 0o600)
+        let stagedEnvelopeBytes = try Data(contentsOf: try XCTUnwrap(stageURLs.first))
+        let stagedEnvelopeText = try XCTUnwrap(
+            String(data: stagedEnvelopeBytes, encoding: .utf8)
+        )
+        XCTAssertFalse(
+            stagedEnvelopeText.contains(staged.signingKey.rawRepresentation.base64EncodedString())
+        )
+        XCTAssertFalse(
+            stagedEnvelopeText.contains(staged.rotationKey.rawRepresentation.base64EncodedString())
+        )
+        XCTAssertFalse(stagedEnvelopeText.contains(staged.did))
+        let rotatingConfiguration = try AccountKeyEncryptionConfiguration(
+            activeKeyID: "next-kek",
+            activeKey: Data(repeating: 0xB8, count: 32),
+            decryptOnlyKeys: ["test-kek": Data(repeating: 0xA7, count: 32)]
+        )
+        let rotatingStore = try FileAccountKeyStore(
+            root: fixture.keyRoot,
+            configuration: rotatingConfiguration
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await rotatingStore.migrateAllEnvelopesToActiveKey()
+        )
+
+        let restarted = try FileAccountKeyStore(
+            root: fixture.keyRoot,
+            configuration: fixture.keyConfiguration
+        )
+        let loadedRestartedStage = try await restarted.stagedPLCAccountIdentity(
+            requestID: "request-pre-intent",
+            canonicalHandle: "pre-intent.example.com",
+            pdsOrigin: URL(string: "https://pds.example.com")!,
+            repositoryRevision: "3lqby3xuo4k2j"
+        )
+        let restartedStage = try XCTUnwrap(loadedRestartedStage)
+        XCTAssertEqual(restartedStage.did, staged.did)
+        XCTAssertEqual(try restartedStage.operationCID, try staged.operationCID)
+        XCTAssertEqual(
+            restartedStage.signingKey.rawRepresentation,
+            staged.signingKey.rawRepresentation
+        )
+        XCTAssertEqual(
+            restartedStage.rotationKey.rawRepresentation,
+            staged.rotationKey.rawRepresentation
+        )
+
+        let recovered = try await fixture.service(keyStore: restarted).prepare(
+            requestID: "request-pre-intent",
+            handle: "pre-intent.example.com",
+            pdsOrigin: URL(string: "https://pds.example.com")!,
+            repositoryRevision: "3lqby3xuo4k2j"
+        )
+        XCTAssertEqual(recovered.did, staged.did)
+        XCTAssertEqual(recovered.plcOperationCID, try staged.operationCID)
+        let remainingStage = try await restarted.stagedPLCAccountIdentity(
+            requestID: "request-pre-intent",
+            canonicalHandle: "pre-intent.example.com",
+            pdsOrigin: URL(string: "https://pds.example.com")!,
+            repositoryRevision: "3lqby3xuo4k2j"
+        )
+        XCTAssertNil(remainingStage)
+        let activeAccount = try await fixture.control.account(did: recovered.did)
+        XCTAssertNil(activeAccount)
+        let migration = try await rotatingStore.migrateAllEnvelopesToActiveKey()
+        XCTAssertEqual(migration.migratedEnvelopeCount, 2)
+        XCTAssertTrue(migration.inventory.isMigrationComplete)
+        try await fixture.close()
     }
 
     func testConcurrentSameRequestConvergesOnOneVisibleIdentity() async throws {
@@ -285,7 +443,9 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
 }
 
 private enum PreparationFailure: String, Error, CaseIterable, Sendable {
+    case staged
     case intent
+    case promoted
     case repository
     case submitted
 }
@@ -321,12 +481,13 @@ private final class PreparationFixture: @unchecked Sendable {
     }
 
     func service(
+        keyStore: FileAccountKeyStore? = nil,
         hooks: PLCAccountPreparationHooks = .init()
     ) -> PLCAccountPreparationService {
         PLCAccountPreparationService(
             intentStore: control,
             accountStoreOpener: opener,
-            keyStore: keyStore,
+            keyStore: keyStore ?? self.keyStore,
             plcClient: plc,
             hooks: hooks
         )
@@ -355,6 +516,10 @@ private actor TestingPreparationStoreOpener: PLCAccountPreparationAccountStoreOp
     ) async throws -> any PLCAccountPreparationAccountStore {
         if let database = databases[did] { return database }
         let database = try await SQLiteAccountDatabase(dataDirectory: dataDirectory, did: did)
+        if let winner = databases[did] {
+            try await database.close()
+            return winner
+        }
         databases[did] = database
         return database
     }
