@@ -141,6 +141,19 @@ public struct SwanSpaceCredentialHTTPConfiguration: Sendable {
     }
 }
 
+/// Narrow credential-verification input for a capability that must accept a
+/// space credential without thereby enabling credential reads everywhere.
+/// In particular, a local interop server uses this only for repository sync;
+/// record and blob routes remain OAuth-only unless the broader legacy
+/// ``SwanSpaceCredentialHTTPConfiguration`` is explicitly supplied.
+public struct SwanSpaceCredentialVerificationHTTPConfiguration: Sendable {
+    let credentialPublicKeys: any SpaceCredentialPublicKeyResolver
+
+    public init(credentialPublicKeys: any SpaceCredentialPublicKeyResolver) {
+        self.credentialPublicKeys = credentialPublicKeys
+    }
+}
+
 /// The explicit key-backed dependency required for a user PDS to mint a
 /// proposal-0016 delegation.  This is intentionally separate from authority
 /// credential exchange configuration: a user PDS does not consult authority
@@ -279,8 +292,10 @@ public struct SwanHTTPServer: Sendable {
         authenticatedGetSpaceDirectory: (any AuthorizedSimpleSpaceDirectory)? = nil,
         accountControlStore: (any AccountControlStore)? = nil,
         spaceCredentialConfiguration: SwanSpaceCredentialHTTPConfiguration? = nil,
+        spaceCredentialExchangeConfiguration: SwanSpaceCredentialHTTPConfiguration? = nil,
         spaceDelegationConfiguration: SwanSpaceDelegationHTTPConfiguration? = nil,
         spaceRepositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration? = nil,
+        spaceRepositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration? = nil,
         spaceNotificationConfiguration: SwanSpaceNotificationHTTPConfiguration? = nil,
         simpleSpaceCheckUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration? = nil
     ) {
@@ -386,18 +401,24 @@ public struct SwanHTTPServer: Sendable {
             } else {
                 authenticatedSimpleSpaceLifecycle = nil
             }
+            // The exchange can be enabled independently of broad credential
+            // reads.  Retain the pre-existing global configuration as the
+            // fallback for callers that deliberately opted into every legacy
+            // credential-bearing capability.
+            let exchangeCredentialConfiguration =
+                spaceCredentialExchangeConfiguration ?? spaceCredentialConfiguration
             if let credentialDirectory = authenticatedGetSpaceDirectory
                 as? any AuthorizedSimpleSpaceCredentialDirectory,
-               let spaceCredentialConfiguration {
+               let exchangeCredentialConfiguration {
                 authenticatedSpaceCredentialExchange = SwanSpaceCredentialExchangeCapability(
                     delegationAuthorizer: DurableSpaceDelegationVerifier(
-                        publicKeys: spaceCredentialConfiguration.delegationPublicKeys
+                        publicKeys: exchangeCredentialConfiguration.delegationPublicKeys
                     ),
                     delegationReplayStore: oauthRuntime.spaceDelegationReplayStore,
                     credentialIssuer: DurableSpaceCredentialAuthority(
                         policyDirectory: credentialDirectory,
-                        signingKeys: spaceCredentialConfiguration.authoritySigningKeys,
-                        clientAttestationPolicy: spaceCredentialConfiguration.clientAttestationPolicy
+                        signingKeys: exchangeCredentialConfiguration.authoritySigningKeys,
+                        clientAttestationPolicy: exchangeCredentialConfiguration.clientAttestationPolicy
                     )
                 )
             } else {
@@ -418,7 +439,11 @@ public struct SwanHTTPServer: Sendable {
                 as? any AuthorizedSpaceRepositoryDirectory,
                let spaceRepositorySyncConfiguration {
                 let credentialVerifier: (any SpaceCredentialAuthorizationVerifier)?
-                if let spaceCredentialConfiguration {
+                if let spaceRepositoryCredentialConfiguration {
+                    credentialVerifier = DurableSpaceCredentialVerifier(
+                        publicKeys: spaceRepositoryCredentialConfiguration.credentialPublicKeys
+                    )
+                } else if let spaceCredentialConfiguration {
                     credentialVerifier = DurableSpaceCredentialVerifier(
                         publicKeys: spaceCredentialConfiguration.credentialPublicKeys
                     )

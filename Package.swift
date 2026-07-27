@@ -240,7 +240,7 @@ let package = Package(
         .testTarget(
             name: "SwanHTTPTests",
             dependencies: [
-                "SwanAccounts", "SwanHTTP", "SwanOAuth", "SwanSQLite", "SwanSpacesWire",
+                "swan", "SwanAccounts", "SwanHTTP", "SwanOAuth", "SwanSQLite", "SwanSpacesWire",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
                 .product(name: "Logging", package: "swift-log"),

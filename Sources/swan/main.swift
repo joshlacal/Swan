@@ -291,10 +291,11 @@ private struct ServeUnavailableCredentialSigningKeyResolver:
 /// `FileAccountKeyStore` is retained only by fixed-purpose protocol adapters.
 /// In particular, this type never hands a database, scalar, or general signing
 /// closure to the HTTP layer.
-private struct ServeLocalSpaceRuntime {
-    let credentialConfiguration: SwanSpaceCredentialHTTPConfiguration
+struct ServeLocalSpaceRuntime {
+    let credentialExchangeConfiguration: SwanSpaceCredentialHTTPConfiguration
     let delegationConfiguration: SwanSpaceDelegationHTTPConfiguration
     let repositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration
+    let repositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration
 
     static func make(
         keyDirectory: URL,
@@ -337,7 +338,7 @@ private struct ServeLocalSpaceRuntime {
         }
 
         return .init(
-            credentialConfiguration: .init(
+            credentialExchangeConfiguration: .init(
                 authoritySigningKeys: LocalAccountSpaceCredentialSigningKeyResolver(
                     accounts: accounts,
                     keyStore: keyStore
@@ -361,6 +362,12 @@ private struct ServeLocalSpaceRuntime {
                 commitSigner: LocalAccountSpaceRepositoryCommitSigner(
                     accounts: accounts,
                     keyStore: keyStore
+                )
+            ),
+            repositoryCredentialConfiguration: .init(
+                credentialPublicKeys: LocalAccountSpaceCredentialPublicKeyResolver(
+                    accounts: accounts,
+                    publicKeyStore: keyStore
                 )
             )
         )
@@ -1136,10 +1143,14 @@ extension SwanCommand {
                     authorizationServerConfiguration: authorizationServerConfiguration,
                     authenticatedGetSpaceDirectory: directory,
                     accountControlStore: controlDatabase,
-                    spaceCredentialConfiguration: localSpaceRuntime?.credentialConfiguration
-                        ?? notificationRuntime?.credentialConfiguration,
+                    // Local interop activates only exchange and sync
+                    // credential verification. It must not turn on the
+                    // broader record/blob credential read surfaces.
+                    spaceCredentialConfiguration: notificationRuntime?.credentialConfiguration,
+                    spaceCredentialExchangeConfiguration: localSpaceRuntime?.credentialExchangeConfiguration,
                     spaceDelegationConfiguration: localSpaceRuntime?.delegationConfiguration,
                     spaceRepositorySyncConfiguration: localSpaceRuntime?.repositorySyncConfiguration,
+                    spaceRepositoryCredentialConfiguration: localSpaceRuntime?.repositoryCredentialConfiguration,
                     spaceNotificationConfiguration: notificationRuntime?.notificationConfiguration
                 )
                 guard server.authenticatedGetSpace != nil else {

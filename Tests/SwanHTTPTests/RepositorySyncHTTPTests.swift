@@ -11,6 +11,7 @@ import XCTest
 @testable import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
+@testable import swan
 import SwanSQLite
 import SwanSpaces
 import SwanStorage
@@ -23,6 +24,101 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
     private static let oplogPath = "/xrpc/com.atproto.space.listRepoOps"
     private static let repoPath = "/xrpc/com.atproto.space.getRepo"
     private static let blobPath = "/xrpc/com.atproto.space.getBlob"
+
+    func testExchangeAndSyncOnlyCredentialCompositionLeavesRecordAndBlobOAuthOnly() async throws {
+        let fixture = try await Fixture.make()
+        defer { try? await fixture.close() }
+
+        let server = try makeExchangeAndSyncOnlyServer(fixture)
+
+        XCTAssertNotNil(server.authenticatedSpaceCredentialExchange)
+        XCTAssertNotNil(server.authenticatedSpaceRepositorySync?.credentialAuthorizer)
+        XCTAssertNil(server.authenticatedSpaceRecords?.credentialAuthorizer)
+        XCTAssertNil(server.authenticatedSpaceBlobs?.credentialAuthorizer)
+    }
+
+    func testActualLocalServeRuntimeMountsKeysForDelegationExchangeAndSyncOnly() async throws {
+        let fixture = try await Fixture.make()
+        defer { try? await fixture.close() }
+        let mountedKEK = fixture.root.appending(path: "mounted-space-kek")
+        try Data(repeating: 0x45, count: 32).base64URLEncodedString().data(using: .utf8)!
+            .write(to: mountedKEK)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: mountedKEK.path)
+
+        let local = try await ServeLocalSpaceRuntime.make(
+            keyDirectory: fixture.root.appending(path: "keys"),
+            kekFile: mountedKEK,
+            kekID: "sync-kek",
+            controlStore: fixture.control
+        )
+        let profile = try ProtocolProfile.load(
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")
+        )
+        let server = SwanHTTPServer(
+            profile: profile,
+            configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: Self.publicURL),
+            oauthRuntime: fixture.runtime,
+            authenticatedGetSpaceDirectory: fixture.directory,
+            accountControlStore: fixture.control,
+            spaceCredentialExchangeConfiguration: local.credentialExchangeConfiguration,
+            spaceDelegationConfiguration: local.delegationConfiguration,
+            spaceRepositorySyncConfiguration: local.repositorySyncConfiguration,
+            spaceRepositoryCredentialConfiguration: local.repositoryCredentialConfiguration
+        )
+        let closed = SwanHTTPServer(
+            profile: profile,
+            configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: Self.publicURL),
+            oauthRuntime: fixture.runtime,
+            authenticatedGetSpaceDirectory: fixture.directory,
+            accountControlStore: fixture.control
+        )
+        let exactScope = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read"
+        let oauth = try await issueToken(runtime: fixture.runtime, subject: Self.bob, scopes: [exactScope])
+        let delegationPath = "/xrpc/com.atproto.space.getDelegationToken"
+        let credentialPath = "/xrpc/com.atproto.space.getSpaceCredential"
+
+        let app = server.buildApplication(logger: Logger(label: "RepositorySyncHTTPTests.localRuntime"))
+        try await app.test(.router) { client in
+            let delegationHeaders = try self.dpopHeaders(
+                token: oauth.token,
+                key: oauth.key,
+                jwk: oauth.jwk,
+                nonce: fixture.runtime.dpopNonceService.issue(),
+                jti: "local-runtime-delegation",
+                path: delegationPath
+            )
+            let delegationURI = "\(delegationPath)?space=\(self.percentEncode(fixture.space.rawValue))"
+            var delegationToken = ""
+            try await client.execute(uri: delegationURI, method: .get, headers: delegationHeaders) { response in
+                XCTAssertEqual(response.status, .ok)
+                delegationToken = try XCTUnwrap(self.jsonObject(response.body)["token"] as? String)
+            }
+            var exchangeHeaders = HTTPFields()
+            exchangeHeaders[.authorization] = "Bearer \(delegationToken)"
+            exchangeHeaders[.contentType] = "application/json"
+            let exchangeBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\"}")
+            var credential = ""
+            try await client.execute(uri: credentialPath, method: .post, headers: exchangeHeaders, body: exchangeBody) { response in
+                XCTAssertEqual(response.status, .ok)
+                credential = try XCTUnwrap(self.jsonObject(response.body)["credential"] as? String)
+            }
+            try await client.execute(uri: credentialPath, method: .post, headers: exchangeHeaders, body: exchangeBody) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+            let bearer = self.bearerHeaders(credential)
+            try await client.execute(uri: self.latestURI(space: fixture.space, repo: Self.alice), method: .get, headers: bearer) { XCTAssertEqual($0.status, .ok) }
+            try await client.execute(uri: self.oplogURI(space: fixture.space, repo: Self.alice), method: .get, headers: bearer) { XCTAssertEqual($0.status, .ok) }
+            try await client.execute(uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: bearer) { XCTAssertEqual($0.status, .ok) }
+            try await client.execute(uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID), method: .get, headers: bearer) { XCTAssertEqual($0.status, .unauthorized) }
+        }
+        let closedApp = closed.buildApplication(logger: Logger(label: "RepositorySyncHTTPTests.localRuntimeClosed"))
+        try await closedApp.test(.router) { client in
+            try await client.execute(uri: credentialPath, method: .post) { response in
+                XCTAssertEqual(response.status, .serviceUnavailable)
+                XCTAssertEqual(try self.errorCode(response.body), "permissioned_data_pending")
+            }
+        }
+    }
 
     func testGetBlobStreamsPrivateCASForOAuthAndSpaceCredential() async throws {
         let fixture = try await Fixture.make()
@@ -805,6 +901,45 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         )
     }
 
+    /// Mirrors Task 27's local serve composition: exchange and sync receive
+    /// their narrow credential dependencies, while record/blob credential
+    /// reads stay unavailable unless a caller explicitly asks for the broad
+    /// legacy credential configuration.
+    private func makeExchangeAndSyncOnlyServer(_ fixture: Fixture) throws -> SwanHTTPServer {
+        let profile = try ProtocolProfile.load(
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")
+        )
+        let credentials = SwanSpaceCredentialHTTPConfiguration(
+            authoritySigningKeys: LocalAccountSpaceCredentialSigningKeyResolver(
+                accounts: fixture.accounts, keyStore: fixture.keyStore
+            ),
+            delegationPublicKeys: LocalAccountSpaceDelegationPublicKeyResolver(
+                accounts: fixture.accounts, publicKeyStore: fixture.keyStore
+            ),
+            credentialPublicKeys: LocalAccountSpaceCredentialPublicKeyResolver(
+                accounts: fixture.accounts, publicKeyStore: fixture.keyStore
+            )
+        )
+        return SwanHTTPServer(
+            profile: profile,
+            configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: Self.publicURL),
+            oauthRuntime: fixture.runtime,
+            authenticatedGetSpaceDirectory: fixture.directory,
+            accountControlStore: fixture.control,
+            spaceCredentialExchangeConfiguration: credentials,
+            spaceRepositorySyncConfiguration: .init(
+                commitSigner: LocalAccountSpaceRepositoryCommitSigner(
+                    accounts: fixture.accounts, keyStore: fixture.keyStore
+                )
+            ),
+            spaceRepositoryCredentialConfiguration: .init(
+                credentialPublicKeys: LocalAccountSpaceCredentialPublicKeyResolver(
+                    accounts: fixture.accounts, publicKeyStore: fixture.keyStore
+                )
+            )
+        )
+    }
+
     private func latestURI(space: SpaceURI, repo: String) -> String {
         "\(Self.latestPath)?space=\(percentEncode(space.rawValue))&repo=\(repo)"
     }
@@ -1115,6 +1250,12 @@ private struct Fixture: Sendable {
                 scopes: ["atproto"]
             )
             let aliceDatabase = try await SQLiteAccountDatabase(dataDirectory: root, did: RepositorySyncHTTPTests.alice, oplogRetention: retention)
+            _ = try await aliceDatabase.createSimpleSpace(
+                space: space,
+                owner: RepositorySyncHTTPTests.alice,
+                configuration: .init(policy: .public, appAccess: .open),
+                authorization: authorization
+            )
             let aliceRepository = try DurableSpaceRepository(database: aliceDatabase, space: space, author: RepositorySyncHTTPTests.alice)
             let first = try SpaceRecordURI(space: space, author: RepositorySyncHTTPTests.alice, collection: "app.bsky.feed.post", rkey: "first")
             let second = try SpaceRecordURI(space: space, author: RepositorySyncHTTPTests.alice, collection: "app.bsky.feed.post", rkey: "second")
