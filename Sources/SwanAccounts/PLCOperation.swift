@@ -233,6 +233,40 @@ public enum PLCATProfile {
 public enum PLCOperationCodec {
     public static let maximumDAGCBORBytes = 7_500
 
+    /// Reconstructs the one regular `prev: null` operation shape persisted by
+    /// account preparation. Validation here is the same Task 13 codec path
+    /// used for decoded and freshly signed PLC operations.
+    public static func reconstructGenesis(
+        signingDIDKey: String,
+        rotationDIDKey: String,
+        canonicalHandle: String,
+        pdsOrigin: String,
+        signature: String
+    ) throws -> PLCSignedOperation {
+        let unsigned = try PLCUnsignedRegularOperation(
+            rotationKeys: [rotationDIDKey],
+            verificationMethods: ["atproto": signingDIDKey],
+            alsoKnownAs: ["at://\(canonicalHandle)"],
+            services: [
+                "atproto_pds": PLCService(
+                    type: "AtprotoPersonalDataServer",
+                    endpoint: pdsOrigin
+                ),
+            ],
+            prev: nil
+        )
+        let operation = PLCSignedOperation.regularOperation(.init(
+            rotationKeys: unsigned.rotationKeys,
+            verificationMethods: unsigned.verificationMethods,
+            alsoKnownAs: unsigned.alsoKnownAs,
+            services: unsigned.services,
+            prev: nil,
+            signature: signature
+        ))
+        try validateSigned(operation)
+        return operation
+    }
+
     public static func sign(
         _ operation: PLCUnsignedOperation,
         using key: P256.Signing.PrivateKey

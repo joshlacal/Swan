@@ -23,11 +23,16 @@ public enum PLCAccountPreparationError: Error, Sendable, Equatable {
 }
 
 struct PLCAccountPreparationHooks: Sendable {
-    var afterKeysStaged: (@Sendable () async throws -> Void)?
+    var afterKeysStaged: (@Sendable (StagedPLCAccountIdentity) async throws -> Void)?
     var afterIntentReserved: (@Sendable () async throws -> Void)?
     var afterDIDEnvelopesPromoted: (@Sendable () async throws -> Void)?
+    var afterJournalInstalledBeforeStagingReclaim: (@Sendable () async throws -> Void)?
+    var afterStagingReclaimed: (@Sendable () async throws -> Void)?
     var afterRepositoryInstalled: (@Sendable () async throws -> Void)?
     var afterPLCSubmitted: (@Sendable () async throws -> Void)?
+    var afterRemoteIdentityVerified: (@Sendable () async throws -> Void)?
+    var afterJournalStageAdvanced:
+        (@Sendable (PLCAccountPreparationStage) async throws -> Void)?
 }
 
 /// Creates a durable, remotely authenticated identity package without adding
@@ -120,7 +125,7 @@ public actor PLCAccountPreparationService {
                 pdsOrigin: rawPDSOrigin,
                 repositoryRevision: repositoryRevision
             )
-            try await hooks.afterKeysStaged?()
+            try await hooks.afterKeysStaged?(staged)
             intent = try await reserveInitialIntent(staged)
             stagedIdentity = staged
         }
@@ -135,12 +140,17 @@ public actor PLCAccountPreparationService {
             )
         }
         var journal = try await requireJournal(store: store, intent: intent)
-        let keys = try await loadAndVerifyKeys(journal: journal)
-        let signedOperation = try verifiedOperation(journal: journal, keys: keys)
+        let keys = try await loadAndVerifyKeys(journal: journal, intent: intent)
+        let signedOperation = try verifiedOperation(
+            journal: journal,
+            intent: intent,
+            keys: keys
+        )
 
         let genesis = try await installOrVerifyPublicGenesis(
             store: store,
             journal: journal,
+            intent: intent,
             keys: keys,
             now: now
         )
@@ -152,6 +162,7 @@ public actor PLCAccountPreparationService {
             to: .repositoryInstalled,
             publicGenesisCommitCID: genesis.genesis.commitCID.string
         )
+        try await hooks.afterJournalStageAdvanced?(.repositoryInstalled)
         var currentIntent = try await advanceIntent(
             intent,
             to: .repositoryInstalled
@@ -162,12 +173,14 @@ public actor PLCAccountPreparationService {
             to: .submissionPending,
             publicGenesisCommitCID: genesis.genesis.commitCID.string
         )
+        try await hooks.afterJournalStageAdvanced?(.submissionPending)
         currentIntent = try await advanceIntent(currentIntent, to: .submissionPending)
 
         if let audit = try await plcClient.fetchAuditIfPresent(did: intent.did) {
             try await verifyRemoteIdentity(
                 audit: audit,
                 journal: journal,
+                intent: intent,
                 operation: signedOperation,
                 keys: keys,
                 publicGenesis: genesis.genesis
@@ -179,11 +192,13 @@ public actor PLCAccountPreparationService {
             try await verifyRemoteIdentity(
                 audit: audit,
                 journal: journal,
+                intent: intent,
                 operation: signedOperation,
                 keys: keys,
                 publicGenesis: genesis.genesis
             )
         }
+        try await hooks.afterRemoteIdentityVerified?()
 
         journal = try await advanceJournal(
             journal,
@@ -191,6 +206,7 @@ public actor PLCAccountPreparationService {
             to: .submitted,
             publicGenesisCommitCID: genesis.genesis.commitCID.string
         )
+        try await hooks.afterJournalStageAdvanced?(.submitted)
         currentIntent = try await advanceIntent(currentIntent, to: .submitted)
         guard journal.stage == .submitted, currentIntent.stage == .submitted else {
             throw PLCAccountPreparationError.unavailable
@@ -290,18 +306,17 @@ public actor PLCAccountPreparationService {
             try await hooks.afterDIDEnvelopesPromoted?()
             let journal = try PLCAccountPreparationJournal(
                 requestID: staged.requestID,
-                did: staged.did,
                 canonicalHandle: staged.canonicalHandle,
                 pdsOrigin: staged.pdsOrigin,
                 repositoryRevision: staged.repositoryRevision,
-                operationCID: staged.operationCID,
-                signedOperationJSON: staged.operation.canonicalJSON,
+                operation: try operationFacts(staged.operation),
                 signingKey: try controlReference(keys.signingReference),
                 rotationKey: try controlReference(keys.rotationReference),
                 publicGenesisCommitCID: nil,
                 stage: .keysStored
             )
             _ = try await store.installPLCAccountPreparationJournal(journal)
+            try await hooks.afterJournalInstalledBeforeStagingReclaim?()
             try await keyStore.reclaimStagedPLCAccountIdentity(
                 requestID: staged.requestID,
                 expectedDID: staged.did,
@@ -309,6 +324,7 @@ public actor PLCAccountPreparationService {
                 pdsOrigin: URL(string: staged.pdsOrigin)!,
                 repositoryRevision: staged.repositoryRevision
             )
+            try await hooks.afterStagingReclaimed?()
         } catch let error as PLCAccountPreparationStoreError where error == .conflict {
             throw PLCAccountPreparationError.conflict
         } catch {
@@ -365,11 +381,9 @@ public actor PLCAccountPreparationService {
         do {
             guard let journal = try await store.plcAccountPreparationJournal(),
                   journal.requestID == intent.requestID,
-                  journal.did == intent.did,
                   journal.canonicalHandle == intent.canonicalHandle,
                   journal.pdsOrigin == intent.pdsOrigin,
-                  journal.repositoryRevision == intent.repositoryRevision,
-                  journal.operationCID == intent.operationCID else {
+                  journal.repositoryRevision == intent.repositoryRevision else {
                 throw PLCAccountPreparationError.conflict
             }
             return journal
@@ -381,11 +395,12 @@ public actor PLCAccountPreparationService {
     }
 
     private func loadAndVerifyKeys(
-        journal: PLCAccountPreparationJournal
+        journal: PLCAccountPreparationJournal,
+        intent: PLCAccountPreparationIntent
     ) async throws -> ProvisionedAccountKeys {
         do {
             let keys = try await keyProvisioner.resumeProvisioning(
-                accountDID: journal.did,
+                accountDID: intent.did,
                 generation: 1
             )
             guard try controlReference(keys.signingReference) == journal.signingKey,
@@ -402,12 +417,19 @@ public actor PLCAccountPreparationService {
 
     private func verifiedOperation(
         journal: PLCAccountPreparationJournal,
+        intent: PLCAccountPreparationIntent,
         keys: ProvisionedAccountKeys
     ) throws -> PLCSignedOperation {
         do {
-            let operation = try PLCOperationCodec.decodeSignedJSON(journal.signedOperationJSON)
-            try PLCOperationCodec.verifyGenesis(operation, expectedDID: journal.did)
-            guard try operation.cid.string == journal.operationCID,
+            let operation = try PLCOperationCodec.reconstructGenesis(
+                signingDIDKey: journal.operation.signingDIDKey,
+                rotationDIDKey: journal.operation.rotationDIDKey,
+                canonicalHandle: journal.canonicalHandle,
+                pdsOrigin: journal.pdsOrigin,
+                signature: journal.operation.signature
+            )
+            try PLCOperationCodec.verifyGenesis(operation, expectedDID: intent.did)
+            guard try operation.cid.string == intent.operationCID,
                   let regular = operation.regular,
                   regular.verificationMethods["atproto"]
                     == P256DIDKey(publicKey: try P256.Signing.PublicKey(
@@ -439,6 +461,7 @@ public actor PLCAccountPreparationService {
     private func installOrVerifyPublicGenesis(
         store: any PLCAccountPreparationAccountStore,
         journal: PLCAccountPreparationJournal,
+        intent: PLCAccountPreparationIntent,
         keys: ProvisionedAccountKeys,
         now: Date
     ) async throws -> PersistedPublicRepositoryGenesis {
@@ -452,7 +475,7 @@ public actor PLCAccountPreparationService {
         }
         do {
             if let existing = try await store.loadPublicRepositoryGenesis(
-                did: journal.did,
+                did: intent.did,
                 signingPublicKey: signingKey.publicKey
             ) {
                 guard existing.genesis.revision == journal.repositoryRevision,
@@ -463,7 +486,7 @@ public actor PLCAccountPreparationService {
                 return existing
             }
             let candidate = try PublicRepositoryGenesisCodec.create(
-                did: journal.did,
+                did: intent.did,
                 revision: journal.repositoryRevision,
                 signingKey: signingKey
             )
@@ -476,7 +499,7 @@ public actor PLCAccountPreparationService {
             } catch let error as PublicRepositoryGenesisStoreError
                 where error == .conflictingGenesis {
                 guard let existing = try await store.loadPublicRepositoryGenesis(
-                    did: journal.did,
+                    did: intent.did,
                     signingPublicKey: signingKey.publicKey
                 ), existing.genesis.revision == journal.repositoryRevision else {
                     throw PLCAccountPreparationError.remoteMismatch
@@ -493,27 +516,28 @@ public actor PLCAccountPreparationService {
     private func verifyRemoteIdentity(
         audit: [PLCAuditEntry],
         journal: PLCAccountPreparationJournal,
+        intent: PLCAccountPreparationIntent,
         operation: PLCSignedOperation,
         keys: ProvisionedAccountKeys,
         publicGenesis: PublicRepositoryGenesis
     ) async throws {
         do {
             guard !audit.isEmpty,
-                  audit.allSatisfy({ $0.did == journal.did }),
+                  audit.allSatisfy({ $0.did == intent.did }),
                   let terminal = audit.last(where: { !$0.nullified }),
-                  terminal.cid == journal.operationCID,
+                  terminal.cid == intent.operationCID,
                   terminal.operation == operation,
                   terminal.operation.regular != nil,
                   try operation.cid.string == terminal.cid,
-                  publicGenesis.did == journal.did,
+                  publicGenesis.did == intent.did,
                   publicGenesis.revision == journal.repositoryRevision,
                   publicGenesis.commitCID.string == journal.publicGenesisCommitCID else {
                 throw PLCAccountPreparationError.remoteMismatch
             }
-            try PLCOperationCodec.verifyGenesis(terminal.operation, expectedDID: journal.did)
-            let state = try await plcClient.fetchState(did: journal.did)
+            try PLCOperationCodec.verifyGenesis(terminal.operation, expectedDID: intent.did)
+            let state = try await plcClient.fetchState(did: intent.did)
             let regular = try requireRegular(operation)
-            guard state.did == journal.did,
+            guard state.did == intent.did,
                   state.rotationKeys == regular.rotationKeys,
                   state.verificationMethods == regular.verificationMethods,
                   state.alsoKnownAs == regular.alsoKnownAs,
@@ -618,6 +642,22 @@ public actor PLCAccountPreparationService {
         try AccountControlKeyReference(
             purpose: reference.purpose == .signing ? .signing : .rotation,
             generation: reference.generation
+        )
+    }
+
+    private func operationFacts(
+        _ operation: PLCSignedOperation
+    ) throws -> PLCAccountPreparationOperationFacts {
+        guard let regular = operation.regular,
+              let signingDIDKey = regular.verificationMethods["atproto"],
+              regular.verificationMethods.count == 1,
+              regular.rotationKeys.count == 1 else {
+            throw PLCAccountPreparationError.remoteMismatch
+        }
+        return try PLCAccountPreparationOperationFacts(
+            signingDIDKey: signingDIDKey,
+            rotationDIDKey: regular.rotationKeys[0],
+            signature: regular.signature
         )
     }
 

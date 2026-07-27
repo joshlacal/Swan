@@ -316,13 +316,12 @@ public enum SQLiteLayout {
         CREATE TABLE IF NOT EXISTS plc_account_preparation_journal (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             request_id TEXT NOT NULL UNIQUE,
-            did TEXT NOT NULL UNIQUE,
             canonical_handle TEXT NOT NULL,
             pds_origin TEXT NOT NULL,
             repository_revision TEXT NOT NULL,
-            operation_cid TEXT NOT NULL UNIQUE,
-            signed_operation_json BLOB NOT NULL
-                CHECK(length(signed_operation_json) BETWEEN 1 AND 32768),
+            operation_signing_did_key TEXT NOT NULL,
+            operation_rotation_did_key TEXT NOT NULL,
+            operation_signature TEXT NOT NULL,
             signing_key_reference TEXT NOT NULL,
             rotation_key_reference TEXT NOT NULL,
             public_genesis_commit_cid TEXT,

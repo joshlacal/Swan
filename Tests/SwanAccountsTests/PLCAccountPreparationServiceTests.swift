@@ -36,12 +36,17 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
         let loadedJournal = try await account.plcAccountPreparationJournal()
         let journal = try XCTUnwrap(loadedJournal)
         XCTAssertEqual(journal.stage, .submitted)
-        XCTAssertEqual(journal.operationCID, identity.plcOperationCID)
         XCTAssertEqual(journal.publicGenesisCommitCID, identity.publicGenesisCommitCID)
         XCTAssertEqual(journal.signingKey.generation, 1)
         XCTAssertEqual(journal.rotationKey.generation, 1)
 
-        let operation = try PLCOperationCodec.decodeSignedJSON(journal.signedOperationJSON)
+        let operation = try PLCOperationCodec.reconstructGenesis(
+            signingDIDKey: journal.operation.signingDIDKey,
+            rotationDIDKey: journal.operation.rotationDIDKey,
+            canonicalHandle: journal.canonicalHandle,
+            pdsOrigin: journal.pdsOrigin,
+            signature: journal.operation.signature
+        )
         try PLCOperationCodec.verifyGenesis(operation, expectedDID: identity.did)
         XCTAssertEqual(try operation.cid.string, identity.plcOperationCID)
         let signingData = try await fixture.keyStore.key(for: identity.signingReference)
@@ -54,8 +59,15 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
         XCTAssertEqual(genesis.genesis.commitCID.string, identity.publicGenesisCommitCID)
         XCTAssertEqual(genesis.genesis.did, identity.did)
         XCTAssertEqual(genesis.genesis.revision, identity.repositoryRevision)
-        XCTAssertLessThan(journal.signedOperationJSON.count, 32 * 1_024)
-        XCTAssertFalse(String(data: journal.signedOperationJSON, encoding: .utf8)!.contains("PRIVATE"))
+        for value in [
+            journal.operation.signingDIDKey,
+            journal.operation.rotationDIDKey,
+            journal.operation.signature,
+        ] {
+            XCTAssertFalse(value.lowercased().contains("private"))
+            XCTAssertFalse(value.lowercased().contains("password"))
+            XCTAssertFalse(value.lowercased().contains("verifier"))
+        }
         let submissionCount = await fixture.plc.submitCount()
         XCTAssertEqual(submissionCount, 1)
         try await fixture.close()
@@ -131,19 +143,42 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
         for failure in PreparationFailure.allCases {
             let fixture = try await PreparationFixture()
             defer { fixture.removeFiles() }
+            let capture = StagedIdentityCapture()
             let failHook: @Sendable () async throws -> Void = { throw failure }
-            let hooks: PLCAccountPreparationHooks
+            var hooks = PLCAccountPreparationHooks()
+            hooks.afterKeysStaged = { staged in
+                try await capture.record(staged)
+                if failure == .staged { throw failure }
+            }
             switch failure {
             case .staged:
-                hooks = .init(afterKeysStaged: failHook)
+                break
             case .intent:
-                hooks = .init(afterIntentReserved: failHook)
+                hooks.afterIntentReserved = failHook
             case .promoted:
-                hooks = .init(afterDIDEnvelopesPromoted: failHook)
+                hooks.afterDIDEnvelopesPromoted = failHook
+            case .journalInstalled:
+                hooks.afterJournalInstalledBeforeStagingReclaim = failHook
+            case .reclaimed:
+                hooks.afterStagingReclaimed = failHook
             case .repository:
-                hooks = .init(afterRepositoryInstalled: failHook)
-            case .submitted:
-                hooks = .init(afterPLCSubmitted: failHook)
+                hooks.afterRepositoryInstalled = failHook
+            case .journalRepositoryInstalled:
+                hooks.afterJournalStageAdvanced = { stage in
+                    if stage == .repositoryInstalled { throw failure }
+                }
+            case .journalSubmissionPending:
+                hooks.afterJournalStageAdvanced = { stage in
+                    if stage == .submissionPending { throw failure }
+                }
+            case .plcSubmitted:
+                hooks.afterPLCSubmitted = failHook
+            case .remoteVerified:
+                hooks.afterRemoteIdentityVerified = failHook
+            case .journalSubmitted:
+                hooks.afterJournalStageAdvanced = { stage in
+                    if stage == .submitted { throw failure }
+                }
             }
             let interrupted = fixture.service(hooks: hooks)
             await XCTAssertThrowsErrorAsync(
@@ -163,6 +198,15 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
                 repositoryRevision: "3lqby3xuo4k2e"
             )
             let interruptedInventory = try await fixture.keyStore.inventory()
+            let interruptedJournalStage: PLCAccountPreparationStage?
+            switch failure {
+            case .staged, .intent:
+                interruptedJournalStage = nil
+            default:
+                interruptedJournalStage = try await fixture.preparationJournal(
+                    did: try XCTUnwrap(interruptedIntent?.did)
+                )?.stage
+            }
             switch failure {
             case .staged:
                 XCTAssertNil(interruptedIntent)
@@ -176,15 +220,43 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
                 XCTAssertEqual(interruptedIntent?.stage, .keysStored)
                 XCTAssertNotNil(retainedStage)
                 XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                XCTAssertNil(interruptedJournalStage)
                 let account = try await fixture.opener.openPLCAccountPreparationStore(
                     did: try XCTUnwrap(interruptedIntent?.did)
                 )
                 let journal = try await account.plcAccountPreparationJournal()
                 XCTAssertNil(journal)
-            case .repository, .submitted:
+            case .journalInstalled:
+                XCTAssertEqual(interruptedIntent?.stage, .keysStored)
+                XCTAssertNotNil(retainedStage)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                XCTAssertEqual(interruptedJournalStage, .keysStored)
+            case .reclaimed, .repository:
+                XCTAssertEqual(interruptedIntent?.stage, .keysStored)
+                XCTAssertNil(retainedStage)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                XCTAssertEqual(interruptedJournalStage, .keysStored)
+            case .journalRepositoryInstalled:
+                XCTAssertEqual(interruptedIntent?.stage, .keysStored)
+                XCTAssertNil(retainedStage)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                XCTAssertEqual(interruptedJournalStage, .repositoryInstalled)
+            case .journalSubmissionPending:
+                XCTAssertEqual(interruptedIntent?.stage, .repositoryInstalled)
+                XCTAssertNil(retainedStage)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                XCTAssertEqual(interruptedJournalStage, .submissionPending)
+            case .plcSubmitted, .remoteVerified:
+                XCTAssertEqual(interruptedIntent?.stage, .submissionPending)
+                XCTAssertNil(retainedStage)
+                XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                XCTAssertEqual(interruptedJournalStage, .submissionPending)
+            case .journalSubmitted:
+                XCTAssertEqual(interruptedIntent?.stage, .submissionPending)
                 XCTAssertNotNil(interruptedIntent)
                 XCTAssertNil(retainedStage)
                 XCTAssertEqual(interruptedInventory.totalEnvelopeCount, 2)
+                XCTAssertEqual(interruptedJournalStage, .submitted)
             }
             let reloadedKeyStore = try FileAccountKeyStore(
                 root: fixture.keyRoot,
@@ -198,6 +270,31 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
             )
             XCTAssertEqual(recovered.signingReference.generation, 1)
             XCTAssertEqual(recovered.rotationReference.generation, 1)
+            let expected = try await capture.requiredSnapshot()
+            XCTAssertEqual(recovered.did, expected.did)
+            XCTAssertEqual(recovered.plcOperationCID, expected.operationCID)
+            let recoveredSigningKey = try await reloadedKeyStore.key(
+                for: recovered.signingReference
+            )
+            let recoveredRotationKey = try await reloadedKeyStore.key(
+                for: recovered.rotationReference
+            )
+            XCTAssertEqual(recoveredSigningKey, expected.signingKey)
+            XCTAssertEqual(recoveredRotationKey, expected.rotationKey)
+            let recoveredStore = try await fixture.opener.openPLCAccountPreparationStore(
+                did: recovered.did
+            )
+            let loadedRecoveredJournal = try await recoveredStore
+                .plcAccountPreparationJournal()
+            let recoveredJournal = try XCTUnwrap(loadedRecoveredJournal)
+            let recoveredOperation = try PLCOperationCodec.reconstructGenesis(
+                signingDIDKey: recoveredJournal.operation.signingDIDKey,
+                rotationDIDKey: recoveredJournal.operation.rotationDIDKey,
+                canonicalHandle: recoveredJournal.canonicalHandle,
+                pdsOrigin: recoveredJournal.pdsOrigin,
+                signature: recoveredJournal.operation.signature
+            )
+            XCTAssertEqual(try recoveredOperation.canonicalJSON, expected.operationJSON)
             let inventory = try await reloadedKeyStore.inventory()
             let submissionCount = await fixture.plc.submitCount()
             let recoveredIntent = try await fixture.control
@@ -212,6 +309,8 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
             XCTAssertEqual(submissionCount, 1)
             XCTAssertEqual(recoveredIntent?.stage, .submitted)
             XCTAssertNil(remainingStage)
+            let activeAccount = try await fixture.control.account(did: recovered.did)
+            XCTAssertNil(activeAccount)
             try await fixture.close()
         }
     }
@@ -221,7 +320,9 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
         defer { fixture.removeFiles() }
         let fail: @Sendable () async throws -> Void = { throw PreparationFailure.staged }
         await XCTAssertThrowsErrorAsync(
-            try await fixture.service(hooks: .init(afterKeysStaged: fail)).prepare(
+            try await fixture.service(
+                hooks: .init(afterKeysStaged: { _ in try await fail() })
+            ).prepare(
                 requestID: "request-pre-intent",
                 handle: "Pre-Intent.Example.com",
                 pdsOrigin: URL(string: "https://pds.example.com")!,
@@ -446,8 +547,54 @@ private enum PreparationFailure: String, Error, CaseIterable, Sendable {
     case staged
     case intent
     case promoted
+    case journalInstalled = "journal-installed"
+    case reclaimed
     case repository
-    case submitted
+    case journalRepositoryInstalled = "journal-repository-installed"
+    case journalSubmissionPending = "journal-submission-pending"
+    case plcSubmitted = "plc-submitted"
+    case remoteVerified = "remote-verified"
+    case journalSubmitted = "journal-submitted"
+}
+
+private struct StagedIdentitySnapshot: Sendable {
+    let did: String
+    let operationCID: String
+    let operationJSON: Data
+    let signingKey: Data
+    let rotationKey: Data
+}
+
+private actor StagedIdentityCapture {
+    private var snapshot: StagedIdentitySnapshot?
+
+    func record(_ staged: StagedPLCAccountIdentity) throws {
+        let operationCID = try staged.operationCID
+        let operationJSON = try staged.operation.canonicalJSON
+        let candidate = StagedIdentitySnapshot(
+            did: staged.did,
+            operationCID: operationCID,
+            operationJSON: operationJSON,
+            signingKey: staged.signingKey.rawRepresentation,
+            rotationKey: staged.rotationKey.rawRepresentation
+        )
+        if let snapshot {
+            guard snapshot.did == candidate.did,
+                  snapshot.operationCID == candidate.operationCID,
+                  snapshot.operationJSON == candidate.operationJSON,
+                  snapshot.signingKey == candidate.signingKey,
+                  snapshot.rotationKey == candidate.rotationKey else {
+                throw PLCAccountPreparationError.conflict
+            }
+        } else {
+            snapshot = candidate
+        }
+    }
+
+    func requiredSnapshot() throws -> StagedIdentitySnapshot {
+        guard let snapshot else { throw PLCAccountPreparationError.unavailable }
+        return snapshot
+    }
 }
 
 private final class PreparationFixture: @unchecked Sendable {
@@ -496,6 +643,13 @@ private final class PreparationFixture: @unchecked Sendable {
     func close() async throws {
         try await opener.close()
         try await control.close()
+    }
+
+    func preparationJournal(
+        did: String
+    ) async throws -> PLCAccountPreparationJournal? {
+        let store = try await opener.openPLCAccountPreparationStore(did: did)
+        return try await store.plcAccountPreparationJournal()
     }
 
     func removeFiles() {

@@ -6,10 +6,13 @@ extension SQLiteControlDatabase: PLCAccountPreparationIntentStore {
     public func reservePLCAccountPreparationIntent(
         _ intent: PLCAccountPreparationIntent
     ) async throws -> PLCAccountPreparationReservation {
-        try await withConnectionGate {
+        guard intent.stage == .keysStored else {
+            throw PLCAccountPreparationStoreError.invalidTransition
+        }
+        return try await withConnectionGate {
             try await transaction {
                 if let existing = try await loadIntentLocked(requestID: intent.requestID) {
-                    return .existing(existing)
+                    return PLCAccountPreparationReservation.existing(existing)
                 }
                 let conflicts = try await connection.query(
                     """
@@ -43,7 +46,7 @@ extension SQLiteControlDatabase: PLCAccountPreparationIntentStore {
                 } catch {
                     throw PLCAccountPreparationStoreError.conflict
                 }
-                return .created
+                return PLCAccountPreparationReservation.created
             }
         }
     }
@@ -64,7 +67,7 @@ extension SQLiteControlDatabase: PLCAccountPreparationIntentStore {
         expectedStage: PLCAccountPreparationStage,
         to stage: PLCAccountPreparationStage
     ) async throws -> PLCAccountPreparationIntent {
-        guard stage > expectedStage else {
+        guard expectedStage.next == stage else {
             throw PLCAccountPreparationStoreError.invalidTransition
         }
         return try await withConnectionGate {
@@ -134,8 +137,8 @@ extension SQLiteAccountDatabase:
     public func installPLCAccountPreparationJournal(
         _ journal: PLCAccountPreparationJournal
     ) async throws -> PLCAccountPreparationJournal {
-        guard journal.did == accountDID else {
-            throw PLCAccountPreparationStoreError.conflict
+        guard journal.stage == .keysStored, journal.publicGenesisCommitCID == nil else {
+            throw PLCAccountPreparationStoreError.invalidTransition
         }
         return try await withConnectionGate {
             try await transaction {
@@ -149,17 +152,19 @@ extension SQLiteAccountDatabase:
                     _ = try await connection.query(
                         """
                         INSERT INTO plc_account_preparation_journal(
-                            singleton, request_id, did, canonical_handle, pds_origin,
-                            repository_revision, operation_cid, signed_operation_json,
+                            singleton, request_id, canonical_handle, pds_origin,
+                            repository_revision, operation_signing_did_key,
+                            operation_rotation_did_key, operation_signature,
                             signing_key_reference, rotation_key_reference,
                             public_genesis_commit_cid, stage
                         ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         [
-                            .text(journal.requestID), .text(journal.did),
-                            .text(journal.canonicalHandle), .text(journal.pdsOrigin),
-                            .text(journal.repositoryRevision), .text(journal.operationCID),
-                            journal.signedOperationJSON.sqliteData!,
+                            .text(journal.requestID), .text(journal.canonicalHandle),
+                            .text(journal.pdsOrigin), .text(journal.repositoryRevision),
+                            .text(journal.operation.signingDIDKey),
+                            .text(journal.operation.rotationDIDKey),
+                            .text(journal.operation.signature),
                             .text(journal.signingKey.reference),
                             .text(journal.rotationKey.reference),
                             journal.publicGenesisCommitCID.map { SQLiteData.text($0) } ?? .null,
@@ -188,7 +193,7 @@ extension SQLiteAccountDatabase:
         to stage: PLCAccountPreparationStage,
         publicGenesisCommitCID: String?
     ) async throws -> PLCAccountPreparationJournal {
-        guard stage > expectedStage else {
+        guard expectedStage.next == stage else {
             throw PLCAccountPreparationStoreError.invalidTransition
         }
         return try await withConnectionGate {
@@ -236,8 +241,9 @@ extension SQLiteAccountDatabase:
     private func loadJournalLocked() async throws -> PLCAccountPreparationJournal? {
         let rows = try await connection.query(
             """
-            SELECT request_id, did, canonical_handle, pds_origin,
-                   repository_revision, operation_cid, signed_operation_json,
+            SELECT request_id, canonical_handle, pds_origin,
+                   repository_revision, operation_signing_did_key,
+                   operation_rotation_did_key, operation_signature,
                    signing_key_reference, rotation_key_reference,
                    public_genesis_commit_cid, stage
             FROM plc_account_preparation_journal
@@ -250,12 +256,14 @@ extension SQLiteAccountDatabase:
         do {
             return try PLCAccountPreparationJournal(
                 requestID: try requiredText(row, "request_id"),
-                did: try requiredText(row, "did"),
                 canonicalHandle: try requiredText(row, "canonical_handle"),
                 pdsOrigin: try requiredText(row, "pds_origin"),
                 repositoryRevision: try requiredText(row, "repository_revision"),
-                operationCID: try requiredText(row, "operation_cid"),
-                signedOperationJSON: try requiredBlob(row, "signed_operation_json"),
+                operation: try PLCAccountPreparationOperationFacts(
+                    signingDIDKey: try requiredText(row, "operation_signing_did_key"),
+                    rotationDIDKey: try requiredText(row, "operation_rotation_did_key"),
+                    signature: try requiredText(row, "operation_signature")
+                ),
                 signingKey: try AccountControlKeyReference(
                     purpose: .signing,
                     generation: 1,
@@ -336,15 +344,6 @@ private func optionalText(_ row: SQLiteRow, _ column: String) throws -> String? 
         throw PLCAccountPreparationStoreError.malformedRecord
     }
     return string
-}
-
-private func requiredBlob(_ row: SQLiteRow, _ column: String) throws -> Data {
-    guard let value = row.column(column),
-          case let .blob(blob) = value,
-          blob.readableBytes > 0 else {
-        throw PLCAccountPreparationStoreError.malformedRecord
-    }
-    return Data(buffer: blob)
 }
 
 private func requiredStage(_ row: SQLiteRow) throws -> PLCAccountPreparationStage {

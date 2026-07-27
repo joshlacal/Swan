@@ -14,6 +14,10 @@ public enum PLCAccountPreparationStage: Int, Codable, Sendable, CaseIterable, Co
     public var isCanonicalValue: Bool {
         Self(rawValue: rawValue) == self
     }
+
+    public var next: Self? {
+        Self(rawValue: rawValue + 1)
+    }
 }
 
 public enum PLCAccountPreparationStoreError: Error, Sendable, Equatable {
@@ -64,7 +68,7 @@ public struct PLCAccountPreparationIntent: Sendable, Equatable {
     }
 
     public func advancing(to stage: PLCAccountPreparationStage) throws -> Self {
-        guard stage > self.stage else {
+        guard self.stage.next == stage else {
             throw PLCAccountPreparationStoreError.invalidTransition
         }
         return try Self(
@@ -79,17 +83,68 @@ public struct PLCAccountPreparationIntent: Sendable, Equatable {
     }
 }
 
+/// Strictly shaped public fields needed to reconstruct one PLC genesis.
+/// Arbitrary JSON or opaque byte payloads cannot enter the journal.
+public struct PLCAccountPreparationOperationFacts: Sendable, Equatable {
+    public let signingDIDKey: String
+    public let rotationDIDKey: String
+    public let signature: String
+
+    public init(
+        signingDIDKey: String,
+        rotationDIDKey: String,
+        signature: String
+    ) throws {
+        guard Self.isP256DIDKey(signingDIDKey),
+              Self.isP256DIDKey(rotationDIDKey),
+              signingDIDKey != rotationDIDKey,
+              Self.isCanonicalP256Signature(signature) else {
+            throw PLCAccountPreparationStoreError.invalidInput
+        }
+        self.signingDIDKey = signingDIDKey
+        self.rotationDIDKey = rotationDIDKey
+        self.signature = signature
+    }
+
+    private static func isP256DIDKey(_ value: String) -> Bool {
+        let prefix = "did:key:z"
+        let alphabet = Set("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".utf8)
+        return value.hasPrefix(prefix) && value.utf8.count == 57
+            && value.dropFirst(prefix.count).utf8.allSatisfy(alphabet.contains)
+    }
+
+    private static func isCanonicalP256Signature(_ value: String) -> Bool {
+        guard value.utf8.count == 86, value.utf8.allSatisfy({
+            ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)
+                || ($0 >= 48 && $0 <= 57) || $0 == 45 || $0 == 95
+        }) else {
+            return false
+        }
+
+        var standard = value
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        standard += String(repeating: "=", count: (4 - standard.utf8.count % 4) % 4)
+        guard let decoded = Data(base64Encoded: standard), decoded.count == 64 else {
+            return false
+        }
+        return decoded.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "") == value
+    }
+}
+
 /// Public identity facts stored beside the repository truth for one DID. The
-/// signed operation is bounded canonical JSON; the public repository remains
-/// in its existing verified CAR table and is referenced only by commit CID.
+/// operation is represented only by shaped public fields and must be
+/// reconstructed and authenticated by the PLC codec before use. The public
+/// repository remains in its verified CAR table and is referenced by CID.
 public struct PLCAccountPreparationJournal: Sendable, Equatable {
     public let requestID: String
-    public let did: String
     public let canonicalHandle: String
     public let pdsOrigin: String
     public let repositoryRevision: String
-    public let operationCID: String
-    public let signedOperationJSON: Data
+    public let operation: PLCAccountPreparationOperationFacts
     public let signingKey: AccountControlKeyReference
     public let rotationKey: AccountControlKeyReference
     public let publicGenesisCommitCID: String?
@@ -97,25 +152,19 @@ public struct PLCAccountPreparationJournal: Sendable, Equatable {
 
     public init(
         requestID: String,
-        did: String,
         canonicalHandle: String,
         pdsOrigin: String,
         repositoryRevision: String,
-        operationCID: String,
-        signedOperationJSON: Data,
+        operation: PLCAccountPreparationOperationFacts,
         signingKey: AccountControlKeyReference,
         rotationKey: AccountControlKeyReference,
         publicGenesisCommitCID: String?,
         stage: PLCAccountPreparationStage
     ) throws {
         guard PLCAccountPreparationValidation.isRequestID(requestID),
-              PLCAccountPreparationValidation.isDID(did),
               PLCAccountPreparationValidation.isCanonicalHandle(canonicalHandle),
               PLCAccountPreparationValidation.isOrigin(pdsOrigin),
               PLCAccountPreparationValidation.isRevision(repositoryRevision),
-              PLCAccountPreparationValidation.isCID(operationCID),
-              !signedOperationJSON.isEmpty,
-              signedOperationJSON.count <= 32 * 1_024,
               signingKey.isCanonicalValue,
               rotationKey.isCanonicalValue,
               signingKey.purpose == .signing,
@@ -128,12 +177,10 @@ public struct PLCAccountPreparationJournal: Sendable, Equatable {
             throw PLCAccountPreparationStoreError.invalidInput
         }
         self.requestID = requestID
-        self.did = did
         self.canonicalHandle = canonicalHandle
         self.pdsOrigin = pdsOrigin
         self.repositoryRevision = repositoryRevision
-        self.operationCID = operationCID
-        self.signedOperationJSON = signedOperationJSON
+        self.operation = operation
         self.signingKey = signingKey
         self.rotationKey = rotationKey
         self.publicGenesisCommitCID = publicGenesisCommitCID
@@ -144,18 +191,16 @@ public struct PLCAccountPreparationJournal: Sendable, Equatable {
         to stage: PLCAccountPreparationStage,
         publicGenesisCommitCID: String?
     ) throws -> Self {
-        guard stage > self.stage else {
+        guard self.stage.next == stage else {
             throw PLCAccountPreparationStoreError.invalidTransition
         }
         let resolvedCommitCID = publicGenesisCommitCID ?? self.publicGenesisCommitCID
         return try Self(
             requestID: requestID,
-            did: did,
             canonicalHandle: canonicalHandle,
             pdsOrigin: pdsOrigin,
             repositoryRevision: repositoryRevision,
-            operationCID: operationCID,
-            signedOperationJSON: signedOperationJSON,
+            operation: operation,
             signingKey: signingKey,
             rotationKey: rotationKey,
             publicGenesisCommitCID: resolvedCommitCID,
@@ -250,7 +295,6 @@ enum PLCAccountPreparationValidation {
     }
 
     static func isCID(_ value: String) -> Bool {
-        !value.isEmpty && value.utf8.count <= 256
-            && value.utf8.allSatisfy { $0 >= 0x21 && $0 <= 0x7e }
+        AccountControlIdentifiers.isPublicGenesisCommitCID(value)
     }
 }

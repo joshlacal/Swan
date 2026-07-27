@@ -164,7 +164,8 @@ let package = Package(
         .testTarget(
             name: "SwanSQLiteTests",
             dependencies: [
-                "SwanCore", "SwanPublicRepository", "SwanSQLite", "SwanStorage",
+                "SwanAccounts", "SwanCore", "SwanPublicRepository", "SwanSQLite", "SwanStorage",
+                .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Petrel", package: "Petrel"),
                 .product(name: "SQLiteNIO", package: "sqlite-nio"),
             ]
