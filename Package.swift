@@ -101,6 +101,9 @@ let package = Package(
             dependencies: [
                 "CLibsodium", "SwanCore", "SwanPublicRepository", "SwanStorage",
                 .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "Petrel", package: "Petrel"),
             ]
         ),
         .target(
@@ -176,6 +179,8 @@ let package = Package(
             name: "SwanAccountsTests",
             dependencies: [
                 "SwanAccounts", "SwanCore", "SwanPublicRepository", "SwanStorage", "SwanSQLite",
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "Petrel", package: "Petrel"),
                 .product(name: "SQLiteNIO", package: "sqlite-nio"),
             ]
         ),
