@@ -1,0 +1,520 @@
+import Crypto
+import Foundation
+import XCTest
+@testable import SwanAccounts
+@testable import SwanOAuth
+@testable import SwanSQLite
+import SwanCore
+import SwanSpaces
+import SwanStorage
+
+final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
+    private let authority = "did:plc:abcdefghijklmnopqrstuvwx"
+    private let member = "did:plc:bcdefghijklmnopqrstuvwxy"
+    private let outsider = "did:plc:cdefghijklmnopqrstuvwxyz"
+    private let now = Date(timeIntervalSince1970: 1_750_000_000)
+
+    func testLocalAuthorityIssuesAndVerifiesPinnedCredentialWithoutSQLiteSecrets() async throws {
+        let fixture = try await Fixture(authority: authority)
+        defer { fixture.cleanup() }
+        do {
+            let space = try await fixture.installSpace(
+                skey: "public",
+                configuration: try .init(policy: .public, appAccess: .open)
+            )
+            let issuer = fixture.authorityIssuer()
+            let token = try await issuer.issueSpaceCredential(
+                space: space,
+                user: member,
+                authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
+                now: now
+            )
+            let inspection = try PermissionedDataJWT.inspectSpaceCredential(token)
+            XCTAssertEqual(inspection.header.typ, PermissionedDataJWT.credentialType)
+            XCTAssertEqual(inspection.header.kid, PermissionedDataJWT.spaceCredentialKeyID)
+            XCTAssertEqual(inspection.claims.iss, authority)
+            XCTAssertEqual(inspection.claims.sub, space.rawValue)
+            XCTAssertEqual(inspection.claims.exp - inspection.claims.iat, 7_200)
+            XCTAssertNotNil(UUID(uuidString: inspection.claims.jti))
+
+            let verifier = DurableSpaceCredentialVerifier(
+                publicKeys: fixture.localKeyResolver
+            )
+            let authorization = try await verifier.authorization(
+                for: token,
+                expectedSpace: space,
+                now: now.addingTimeInterval(1)
+            )
+            guard case let .spaceCredential(grant) = authorization else {
+                return XCTFail("verified credential must produce a space grant")
+            }
+            XCTAssertEqual(grant.space, space)
+            XCTAssertEqual(grant.permissions, [.read])
+            try grant.allows(.read, now: now.addingTimeInterval(1))
+            XCTAssertThrowsError(try grant.allows(.create, now: now.addingTimeInterval(1)))
+
+            try await fixture.assertNoCredentialOrPrivateKeyPersistence(
+                forbidden: [token, fixture.signingPrivateKey]
+            )
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    func testVerifierRejectsWrongSpaceExpiredTamperedMalformedAndUnknownKeys() async throws {
+        let fixture = try await Fixture(authority: authority)
+        defer { fixture.cleanup() }
+        do {
+            let space = try await fixture.installSpace(
+                skey: "verify",
+                configuration: try .init(policy: .public, appAccess: .open)
+            )
+            let token = try await fixture.authorityIssuer().issueSpaceCredential(
+                space: space,
+                user: member,
+                authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
+                now: now
+            )
+            let verifier = DurableSpaceCredentialVerifier(publicKeys: fixture.localKeyResolver)
+            let otherSpace = try SpaceURI(
+                authority: authority,
+                spaceType: space.spaceType,
+                skey: "other"
+            )
+            let foreignSpace = try SpaceURI(
+                authority: outsider,
+                spaceType: space.spaceType,
+                skey: space.skey
+            )
+            await XCTAssertThrowsErrorAsync(
+                try await verifier.authorization(
+                    for: token,
+                    expectedSpace: otherSpace,
+                    now: now.addingTimeInterval(1)
+                )
+            )
+            await XCTAssertThrowsErrorAsync(
+                try await verifier.authorization(
+                    for: token,
+                    expectedSpace: foreignSpace,
+                    now: now.addingTimeInterval(1)
+                )
+            )
+            await XCTAssertThrowsErrorAsync(
+                try await verifier.authorization(
+                    for: token,
+                    expectedSpace: space,
+                    now: now.addingTimeInterval(7_261)
+                )
+            )
+            var tampered = token
+            let changed = tampered.index(tampered.startIndex, offsetBy: tampered.count - 12)
+            tampered.replaceSubrange(changed ... changed, with: tampered[changed] == "A" ? "B" : "A")
+            await XCTAssertThrowsErrorAsync(
+                try await verifier.authorization(
+                    for: tampered,
+                    expectedSpace: space,
+                    now: now.addingTimeInterval(1)
+                )
+            )
+            for malformed in ["not-a-jwt", "a..b", String(repeating: "a", count: PermissionedDataJWT.maximumCompactSpaceCredentialBytes + 1)] {
+                await XCTAssertThrowsErrorAsync(
+                    try await verifier.authorization(
+                        for: malformed,
+                        expectedSpace: space,
+                        now: now.addingTimeInterval(1)
+                    )
+                )
+            }
+            let unavailable = DurableSpaceCredentialVerifier(
+                publicKeys: UnavailableSpaceCredentialPublicKeyResolver()
+            )
+            await XCTAssertThrowsErrorAsync(
+                try await unavailable.authorization(
+                    for: token,
+                    expectedSpace: space,
+                    now: now.addingTimeInterval(1)
+                )
+            )
+            let key = P256.Signing.PrivateKey()
+            XCTAssertThrowsError(try PermissionedDataJWT.createSpaceCredential(
+                issuer: authority,
+                space: space,
+                key: key,
+                now: now,
+                lifetime: PermissionedDataJWT.spaceCredentialLifetime + 1
+            ))
+            XCTAssertThrowsError(try PermissionedDataJWT.createSpaceCredential(
+                issuer: authority,
+                space: space,
+                key: key,
+                now: now,
+                kid: "#atproto"
+            ))
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    func testPinnedResolverSelectsLatestKeyGenerationForRotation() async throws {
+        let space = try SpaceURI(
+            authority: authority,
+            spaceType: "app.bsky.bookmarks",
+            skey: "rotation"
+        )
+        let oldKey = P256.Signing.PrivateKey()
+        let newKey = P256.Signing.PrivateKey()
+        let token = try PermissionedDataJWT.createSpaceCredential(
+            issuer: authority,
+            space: space,
+            key: newKey,
+            now: now
+        )
+        let resolver = try PinnedSpaceCredentialPublicKeyResolver(pins: [
+            try .init(authority: authority, generation: 1, publicKey: oldKey.publicKey),
+            try .init(authority: authority, generation: 2, publicKey: newKey.publicKey),
+        ])
+        let verifier = DurableSpaceCredentialVerifier(publicKeys: resolver)
+        _ = try await verifier.authorization(
+            for: token,
+            expectedSpace: space,
+            now: now.addingTimeInterval(1)
+        )
+
+        let staleToken = try PermissionedDataJWT.createSpaceCredential(
+            issuer: authority,
+            space: space,
+            key: oldKey,
+            now: now
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await verifier.authorization(
+                for: staleToken,
+                expectedSpace: space,
+                now: now.addingTimeInterval(1)
+            )
+        )
+    }
+
+    func testDurablePolicyBindsRequesterAndFailsClosedForMembersAppsAndManagingApps() async throws {
+        let fixture = try await Fixture(authority: authority)
+        defer { fixture.cleanup() }
+        do {
+            let memberSpace = try await fixture.installSpace(
+                skey: "members",
+                configuration: try .init(policy: .memberList, appAccess: .open),
+                members: [member]
+            )
+            let issuer = fixture.authorityIssuer()
+            _ = try await issuer.issueSpaceCredential(
+                space: memberSpace,
+                user: member,
+                authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
+                now: now
+            )
+            await XCTAssertThrowsErrorAsync(
+                try await issuer.issueSpaceCredential(
+                    space: memberSpace,
+                    user: outsider,
+                    authorization: .accountOAuth(subject: outsider, scopes: ["atproto"]),
+                    now: now
+                )
+            )
+            await XCTAssertThrowsErrorAsync(
+                try await issuer.issueSpaceCredential(
+                    space: memberSpace,
+                    user: member,
+                    authorization: .accountOAuth(subject: authority, scopes: ["atproto"]),
+                    now: now
+                )
+            )
+
+            let allowListed = try await fixture.installSpace(
+                skey: "allow-listed",
+                configuration: try .init(
+                    policy: .public,
+                    appAccess: .allowList(["https://reader.example/client-metadata.json"])
+                )
+            )
+            await XCTAssertThrowsErrorAsync(
+                try await issuer.issueSpaceCredential(
+                    space: allowListed,
+                    user: member,
+                    authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
+                    now: now
+                )
+            )
+            await XCTAssertThrowsErrorAsync(
+                try await issuer.issueSpaceCredential(
+                    space: allowListed,
+                    user: member,
+                    authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
+                    clientAttestation: "unverified-attestation",
+                    now: now
+                )
+            )
+            let verifiedAppIssuer = fixture.authorityIssuer(
+                attestationPolicy: StaticAttestationPolicy(
+                    attestation: "test-signed-attestation",
+                    clientID: "https://reader.example/client-metadata.json"
+                )
+            )
+            _ = try await verifiedAppIssuer.issueSpaceCredential(
+                space: allowListed,
+                user: member,
+                authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
+                clientAttestation: "test-signed-attestation",
+                now: now
+            )
+
+            let managing = try await fixture.installSpace(
+                skey: "managed",
+                configuration: try .init(
+                    policy: .managingApp,
+                    appAccess: .open,
+                    managingApp: "did:web:app.example#space"
+                )
+            )
+            await XCTAssertThrowsErrorAsync(
+                try await issuer.issueSpaceCredential(
+                    space: managing,
+                    user: member,
+                    authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
+                    now: now
+                )
+            )
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    func testConcurrentIssuanceUsesFreshJTIsAndPersistsNoCredentials() async throws {
+        let fixture = try await Fixture(authority: authority)
+        defer { fixture.cleanup() }
+        do {
+            let space = try await fixture.installSpace(
+                skey: "concurrent",
+                configuration: try .init(policy: .public, appAccess: .open)
+            )
+            let issuer = fixture.authorityIssuer()
+            let tokens = try await withThrowingTaskGroup(
+                of: String.self,
+                returning: [String].self
+            ) { group in
+                for _ in 0 ..< 24 {
+                    group.addTask {
+                        try await issuer.issueSpaceCredential(
+                            space: space,
+                            user: self.member,
+                            authorization: .accountOAuth(subject: self.member, scopes: ["atproto"]),
+                            now: self.now
+                        )
+                    }
+                }
+                var tokens: [String] = []
+                for try await token in group { tokens.append(token) }
+                return tokens
+            }
+            XCTAssertEqual(tokens.count, 24)
+            let jtIs = try Set(tokens.map { try PermissionedDataJWT.inspectSpaceCredential($0).claims.jti })
+            XCTAssertEqual(jtIs.count, tokens.count)
+            try await fixture.assertNoCredentialOrPrivateKeyPersistence(
+                forbidden: tokens + [fixture.signingPrivateKey]
+            )
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+}
+
+private struct StaticAttestationPolicy: SpaceCredentialClientAttestationPolicy {
+    let attestation: String
+    let clientID: String
+
+    func verifiedClientID(
+        for clientAttestation: String?,
+        authority _: String,
+        now _: Date
+    ) async throws -> String? {
+        guard clientAttestation == attestation else {
+            throw SwanError.unauthorized("test client attestation was not verified")
+        }
+        return clientID
+    }
+}
+
+private struct Fixture: Sendable {
+    let root: URL
+    let control: SQLiteControlDatabase
+    let accountDatabase: SQLiteAccountDatabase
+    let keyStore: FileAccountKeyStore
+    let accountDirectory: DurableAccountDirectory
+    let localKeyResolver: LocalAccountSpaceCredentialKeyResolver
+    let preopenedDirectory: SQLitePreMigratedAccountDirectory
+    let authority: String
+    let signingReference: AccountKeyReference
+
+    init(authority: String) async throws {
+        self.authority = authority
+        root = FileManager.default.temporaryDirectory
+            .appending(path: "SpaceCredentialAuthorityTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o700)],
+            ofItemAtPath: root.path
+        )
+        control = try await SQLiteControlDatabase(dataDirectory: root)
+        accountDatabase = try await SQLiteAccountDatabase(dataDirectory: root, did: authority)
+        keyStore = try FileAccountKeyStore(
+            root: root.appending(path: "keys"),
+            configuration: try AccountKeyEncryptionConfiguration(
+                activeKeyID: "credential-test-kek",
+                activeKey: Data(repeating: 0x51, count: 32)
+            )
+        )
+        let provisioner = AccountKeyProvisioner(keyStore: keyStore)
+        let keys = try await provisioner.provisionInitial(accountDID: authority)
+        signingReference = keys.signingReference
+        _ = try await control.createAccount(
+            AccountControlRegistration(
+                did: authority,
+                canonicalHandle: "credential-authority.example.com",
+                passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                signingKey: try .init(purpose: .signing, generation: keys.signingReference.generation),
+                rotationKey: try .init(purpose: .rotation, generation: keys.rotationReference.generation),
+                createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+            )
+        )
+        let hasher = try LibsodiumArgon2idHasher(policy: .interactive)
+        accountDirectory = DurableAccountDirectory(
+            store: control,
+            passwordHasher: hasher,
+            verificationExecutor: try Argon2idVerificationExecutor(
+                hasher: hasher,
+                maximumConcurrentVerifications: 1,
+                maximumQueuedVerifications: 1
+            )
+        )
+        localKeyResolver = LocalAccountSpaceCredentialKeyResolver(
+            accounts: accountDirectory,
+            keyStore: keyStore
+        )
+        try await accountDatabase.close()
+        preopenedDirectory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+            dataDirectory: root,
+            controlStore: control
+        )
+    }
+
+    func authorityIssuer(
+        attestationPolicy: any SpaceCredentialClientAttestationPolicy = UnavailableSpaceCredentialClientAttestationPolicy()
+    ) -> DurableSpaceCredentialAuthority {
+        DurableSpaceCredentialAuthority(
+            policyDirectory: preopenedDirectory,
+            signingKeys: localKeyResolver,
+            clientAttestationPolicy: attestationPolicy
+        )
+    }
+
+    func installSpace(
+        skey: String,
+        configuration: SimpleSpaceConfiguration,
+        members: [String] = []
+    ) async throws -> SpaceURI {
+        let space = try SpaceURI(
+            authority: authority,
+            spaceType: "app.bsky.bookmarks",
+            skey: skey
+        )
+        let authorization: AuthorizationContext = .accountOAuth(
+            subject: authority,
+            scopes: ["atproto"]
+        )
+        let database = try await activeDatabase()
+        do {
+            _ = try await database.createSimpleSpace(
+                space: space,
+                owner: authority,
+                configuration: configuration,
+                authorization: authorization,
+                now: Date(timeIntervalSince1970: 1_750_000_000)
+            )
+            for member in members {
+                _ = try await database.addSimpleSpaceMember(
+                    space: space,
+                    member: member,
+                    authorization: authorization,
+                    now: Date(timeIntervalSince1970: 1_750_000_001)
+                )
+            }
+            try await database.close()
+        } catch {
+            try? await database.close()
+            throw error
+        }
+        return space
+    }
+
+    var signingPrivateKey: String {
+        // A stable, non-secret sentinel scanned alongside JWTs. The test also
+        // scans the actual raw key bytes below before any fixture is removed.
+        "raw-space-signing-key-must-not-appear-in-sqlite"
+    }
+
+    func assertNoCredentialOrPrivateKeyPersistence(forbidden: [String]) async throws {
+        let signing = try await keyStore.key(for: signingReference)
+        let enumerator = try XCTUnwrap(
+            FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )
+        )
+        let sqliteFiles = enumerator.compactMap { $0 as? URL }.filter {
+            $0.lastPathComponent.contains(".sqlite")
+                && !$0.pathComponents.contains("keys")
+        }
+        for file in sqliteFiles {
+            let bytes = try Data(contentsOf: file)
+            for value in forbidden {
+                XCTAssertNil(bytes.range(of: Data(value.utf8)), "credential leaked to \(file.lastPathComponent)")
+            }
+            XCTAssertNil(bytes.range(of: signing), "private key leaked to \(file.lastPathComponent)")
+        }
+    }
+
+    func close() async throws {
+        try await preopenedDirectory.close()
+        try await control.close()
+    }
+
+    func cleanup() {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private func activeDatabase() async throws -> SQLiteAccountDatabase {
+        // The bootstrap directory owns the account handle after fixture setup.
+        // Opening a second handle here would violate its own startup contract,
+        // so install spaces through a short-lived isolated setup connection.
+        try await SQLiteAccountDatabase(dataDirectory: root, did: authority)
+    }
+}
+
+private func XCTAssertThrowsErrorAsync<T>(
+    _ expression: @autoclosure () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("expected an error", file: file, line: line)
+    } catch {}
+}

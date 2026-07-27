@@ -11,6 +11,7 @@ import SwanStorage
 public actor SQLitePreMigratedAccountDirectory:
     AuthorizedSimpleSpaceDirectory,
     AuthorizedSimpleSpaceLifecycleDirectory,
+    AuthorizedSimpleSpaceCredentialDirectory,
     AuthorizedSpaceRepositoryDirectory
 {
     private let controlStore: any AccountControlStore
@@ -244,6 +245,37 @@ public actor SQLitePreMigratedAccountDirectory:
             members: selected,
             cursor: selected.last
         )
+    }
+
+    // MARK: Authority credential policy
+
+    /// Runs the authority's durable user/app policy only against the
+    /// authority database that was opened during startup. This method cannot
+    /// obtain an account key or create a credential; those capabilities live
+    /// in SwanOAuth and are intentionally sequenced *after* this read-only
+    /// policy transaction commits.
+    public func authorizeSimpleSpaceCredentialRead(
+        space: SpaceURI,
+        user: String,
+        clientID: String?,
+        authorization: AuthorizationContext
+    ) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        do {
+            try await database.authorizeSimpleSpaceRead(
+                space: space,
+                user: user,
+                clientID: clientID,
+                authorization: authorization
+            )
+            try await requireCredentialAuthorityStillAvailable(space.authority)
+        } catch let error as SwanError {
+            throw error
+        } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
     }
 
     /// Reads one record only from a database which was opened during startup.
@@ -482,7 +514,48 @@ public actor SQLitePreMigratedAccountDirectory:
         return database
     }
 
+    /// Selects the authority account independently of the requesting user.
+    /// Unlike lifecycle endpoints, credential issuance is normally requested
+    /// by a reader account, so requiring that reader to equal the authority
+    /// would both reject valid membership checks and tempt handlers to bypass
+    /// this preopened-directory boundary. The durable SQLite method performs
+    /// the separate requester-equals-user check before policy evaluation.
+    private func preopenedCredentialAuthorityDatabase(
+        for space: SpaceURI
+    ) async throws -> SQLiteAccountDatabase {
+        guard !isClosed else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard try await isActiveAccount(space.authority) else {
+            throw SwanError.unauthorized("authority account is unavailable")
+        }
+        do {
+            try Self.requireExistingRegularDatabase(
+                SQLiteLayout.accountDatabase(in: dataDirectory, did: space.authority)
+            )
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard !isClosed, let database = databases[space.authority] else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        return database
+    }
+
     private func requireLifecycleAuthorityStillAvailable(_ did: String) async throws {
+        guard try await isActiveAccount(did), !isClosed else {
+            throw SwanError.unauthorized("authority account is unavailable")
+        }
+        do {
+            try Self.requireExistingRegularDatabase(
+                SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
+            )
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    private func requireCredentialAuthorityStillAvailable(_ did: String) async throws {
         guard try await isActiveAccount(did), !isClosed else {
             throw SwanError.unauthorized("authority account is unavailable")
         }

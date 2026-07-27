@@ -95,7 +95,7 @@ let package = Package(
         .target(
             name: "SwanOAuth",
             dependencies: [
-                "SwanCore", "SwanSpaces", "SwanStorage",
+                "SwanAccounts", "SwanCore", "SwanSpaces", "SwanStorage",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
             ]
@@ -146,7 +146,7 @@ let package = Package(
         .testTarget(
             name: "SwanOAuthTests",
             dependencies: [
-                "SwanOAuth", "SwanSQLite", "SwanStorage", "SwanSpaces",
+                "SwanAccounts", "SwanOAuth", "SwanSQLite", "SwanStorage", "SwanSpaces",
                 .product(name: "Crypto", package: "swift-crypto"),
             ]
         ),

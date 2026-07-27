@@ -85,11 +85,24 @@ checksum-verified way to populate the ignored reference cache.
   so a policy-only patch retains its omitted managing-app value and an empty
   wire value clears it. This is not evidence of cross-host SimpleSpace
   interoperability.
+- Authority-issued space credentials now have a closed core/storage boundary.
+  The pinned ES256 compact JWT is limited to
+  `typ=atproto-space-credential+jwt`, `kid=#atproto_space`, a fresh UUID JTI,
+  and a two-hour maximum lifetime. Issuance first runs the durable
+  startup-preopened `authorizeSimpleSpaceRead` policy, then resolves the
+  active authority signing material only through `AccountKeyStore`; neither
+  private key bytes nor reader-specific credential artifacts enter SQLite.
+  Verification performs bounded compact-JWT inspection, exact issuer/space
+  binding, pinned/local public-key selection, low-S signature validation, and
+  clock checks before creating `AuthorizationContext.spaceCredential`. Remote
+  DID/PLC key lookup and client-attestation JWKS validation are explicitly
+  unavailable, so unverified app identity and unknown remote keys fail closed.
+  No credential or delegation XRPC endpoint is enabled by this evidence.
 
 ## Completion gates
 
 Completion still requires the full pinned XRPC surface, signed delegation and
-space credential JWTs, durable repositories/CARs/blobs, OAuth and account
+credential *exchange* routes, durable repositories/CARs/blobs, OAuth and account
 lifecycle, generated wire sources, Compose reference PDS/PLC/Caddy matrix,
 and macOS/Linux verification. The public-genesis vector is a narrow
 cross-language gate; it is not evidence that the complete matrix has passed.

@@ -117,6 +117,25 @@ public protocol AuthorizedSimpleSpaceLifecycleDirectory: Sendable {
     ) async throws -> AuthorizedSimpleSpaceMemberPage
 }
 
+/// Startup-preopened authority policy projection used only while an
+/// authority credential is being minted. It deliberately returns no space
+/// state, members, keys, or credential material: after the durable policy
+/// transaction succeeds, the caller may ask its separate key resolver to
+/// sign a transient JWT.
+///
+/// Implementations must not perform network I/O inside their policy
+/// transaction. In particular, client-attestation/JWKS resolution belongs to
+/// a caller-supplied policy component which has completed before this method
+/// is invoked.
+public protocol AuthorizedSimpleSpaceCredentialDirectory: Sendable {
+    func authorizeSimpleSpaceCredentialRead(
+        space: SpaceURI,
+        user: String,
+        clientID: String?,
+        authorization: AuthorizationContext
+    ) async throws
+}
+
 /// Privacy-safe page returned only after the caller has passed the exact
 /// authority account and lifecycle-scope checks.  Member identities are
 /// intentionally unavailable from the generic `getSpace` projection.

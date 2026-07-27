@@ -161,6 +161,15 @@ public enum PermissionedDataJWT {
     public static let delegationType = "atproto-space-delegation+jwt"
     public static let credentialType = "atproto-space-credential+jwt"
     public static let clientAttestationType = "atproto-client-attestation+jwt"
+    /// Proposal 0016 assigns a dedicated DID verification method to space
+    /// credentials. Swan's authority boundary does not silently fall back to
+    /// another account key: a future DID resolver can make that fallback an
+    /// explicit, profile-reviewed decision instead.
+    public static let spaceCredentialKeyID = "#atproto_space"
+    public static let spaceCredentialLifetime: TimeInterval = 2 * 60 * 60
+    public static let maximumCompactSpaceCredentialBytes = 8 * 1_024
+    private static let maximumSpaceCredentialComponentBytes = 4 * 1_024
+    private static let maximumSpaceCredentialJSONBytes = 4 * 1_024
 
     public struct Header: Codable, Sendable, Equatable {
         public let alg: String
@@ -183,6 +192,19 @@ public enum PermissionedDataJWT {
         public let iat: Int64
         public let exp: Int64
         public let jti: String
+    }
+
+    /// The unsigned, bounded metadata needed to select a verification key.
+    /// Callers must never treat this inspection result as authorization: the
+    /// signature is checked by ``verifySpaceCredential(_:publicKey:expectedSpace:now:clockSkew:)``.
+    public struct SpaceCredentialInspection: Sendable, Equatable {
+        public let header: Header
+        public let claims: SpaceCredentialClaims
+
+        public init(header: Header, claims: SpaceCredentialClaims) {
+            self.header = header
+            self.claims = claims
+        }
     }
 
     public struct ClientAttestationClaims: Codable, Sendable, Equatable {
@@ -235,9 +257,16 @@ public enum PermissionedDataJWT {
         space: SpaceURI,
         key: P256.Signing.PrivateKey,
         now: Date = Date(),
-        lifetime: TimeInterval = 2 * 60 * 60,
-        kid: String = "#atproto_space"
+        lifetime: TimeInterval = spaceCredentialLifetime,
+        kid: String = spaceCredentialKeyID
     ) throws -> String {
+        guard issuer == space.authority,
+              kid == spaceCredentialKeyID,
+              lifetime > 0,
+              lifetime <= spaceCredentialLifetime,
+              lifetime.rounded(.towardZero) == lifetime else {
+            throw SwanError.malformed("invalid space credential issuer, key ID, or lifetime")
+        }
         let issuedAt = Int64(now.timeIntervalSince1970)
         return try sign(
             type: credentialType,
@@ -253,16 +282,51 @@ public enum PermissionedDataJWT {
     public static func verifySpaceCredential(
         _ token: String,
         publicKey: P256.Signing.PublicKey,
+        expectedSpace: SpaceURI? = nil,
         now: Date = Date(),
         clockSkew: TimeInterval = 60
     ) throws -> SpaceCredentialClaims {
-        let parsed = try verify(token, expectedType: credentialType, publicKey: publicKey)
+        guard clockSkew >= 0, clockSkew <= 5 * 60 else {
+            throw SwanError.malformed("invalid space credential clock skew")
+        }
+        let parsed = try verifySpaceCredentialStructure(token, publicKey: publicKey)
         let claims = try decode(SpaceCredentialClaims.self, from: parsed.payload)
-        guard let space = try? SpaceURI(claims.sub), space.authority == claims.iss else {
+        guard let space = try? SpaceURI(claims.sub),
+              space.authority == claims.iss,
+              claims.jti.isCanonicalCredentialJTI,
+              expectedSpace.map({ $0 == space }) ?? true else {
             throw SwanError.unauthorized("space credential issuer or subject is invalid")
         }
-        try validateTimes(iat: claims.iat, exp: claims.exp, now: now, clockSkew: clockSkew)
+        try validateTimes(
+            iat: claims.iat,
+            exp: claims.exp,
+            now: now,
+            clockSkew: clockSkew,
+            maximumLifetime: Int64(spaceCredentialLifetime)
+        )
         return claims
+    }
+
+    /// Inspects a compact space credential before DID/public-key resolution.
+    /// The hard byte and base64url grammar limits are applied before JSON
+    /// decoding so an untrusted bearer value cannot turn key selection into a
+    /// whole-body parser or an oversized allocation.
+    public static func inspectSpaceCredential(
+        _ token: String
+    ) throws -> SpaceCredentialInspection {
+        let parsed = try parseSpaceCredential(token)
+        guard parsed.header.typ == credentialType,
+              parsed.header.alg == "ES256",
+              parsed.header.kid == spaceCredentialKeyID else {
+            throw SwanError.unauthorized("JWT type, algorithm, or key ID is invalid")
+        }
+        let claims = try decode(SpaceCredentialClaims.self, from: parsed.payload)
+        guard let space = try? SpaceURI(claims.sub),
+              space.authority == claims.iss,
+              claims.jti.isCanonicalCredentialJTI else {
+            throw SwanError.unauthorized("space credential issuer or subject is invalid")
+        }
+        return SpaceCredentialInspection(header: parsed.header, claims: claims)
     }
 
     /// Parses structural attestation claims before the metadata/JWKS component
@@ -309,6 +373,23 @@ public enum PermissionedDataJWT {
         return parsed
     }
 
+    private static func verifySpaceCredentialStructure(
+        _ token: String,
+        publicKey: P256.Signing.PublicKey
+    ) throws -> ParsedJWT {
+        let parsed = try parseSpaceCredential(token)
+        guard parsed.header.typ == credentialType,
+              parsed.header.alg == "ES256",
+              parsed.header.kid == spaceCredentialKeyID else {
+            throw SwanError.unauthorized("JWT type, algorithm, or key ID is invalid")
+        }
+        let signature = try P256WireSignature.decodeCanonical(parsed.signature)
+        guard publicKey.isValidSignature(signature, for: parsed.signingInput) else {
+            throw SwanError.unauthorized("JWT signature is invalid")
+        }
+        return parsed
+    }
+
     private static func parse(_ token: String) throws -> ParsedJWT {
         let pieces = token.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
         guard pieces.count == 3,
@@ -321,16 +402,67 @@ public enum PermissionedDataJWT {
         return ParsedJWT(header: header, payload: payload, signingInput: Data("\(pieces[0]).\(pieces[1])".utf8), signature: signature)
     }
 
+    private static func parseSpaceCredential(_ token: String) throws -> ParsedJWT {
+        guard token.utf8.count <= maximumCompactSpaceCredentialBytes else {
+            throw SwanError.malformed("space credential is too large")
+        }
+        let pieces = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard pieces.count == 3,
+              pieces.allSatisfy({
+                  !$0.isEmpty
+                      && $0.utf8.count <= maximumSpaceCredentialComponentBytes
+                      && $0.utf8.allSatisfy(isBase64URLByte)
+              }),
+              let headerData = Data(base64URLEncoded: String(pieces[0])),
+              let payload = Data(base64URLEncoded: String(pieces[1])),
+              let signature = Data(base64URLEncoded: String(pieces[2])),
+              headerData.count <= maximumSpaceCredentialJSONBytes,
+              payload.count <= maximumSpaceCredentialJSONBytes,
+              signature.count == 64 else {
+            throw SwanError.malformed("malformed space credential")
+        }
+        let header = try decode(Header.self, from: headerData)
+        return ParsedJWT(
+            header: header,
+            payload: payload,
+            signingInput: Data("\(pieces[0]).\(pieces[1])".utf8),
+            signature: signature
+        )
+    }
+
     private static func decode<Decoded: Decodable>(_ type: Decoded.Type, from data: Data) throws -> Decoded {
         do { return try JSONDecoder().decode(type, from: data) }
         catch { throw SwanError.malformed("malformed JWT JSON") }
     }
 
-    private static func validateTimes(iat: Int64, exp: Int64, now: Date, clockSkew: TimeInterval) throws {
+    private static func validateTimes(
+        iat: Int64,
+        exp: Int64,
+        now: Date,
+        clockSkew: TimeInterval,
+        maximumLifetime: Int64? = nil
+    ) throws {
         let current = Int64(now.timeIntervalSince1970)
-        guard exp >= iat, exp >= current - Int64(clockSkew), iat <= current + Int64(clockSkew) else {
+        guard exp >= iat,
+              maximumLifetime.map({ exp - iat <= $0 }) ?? true,
+              exp >= current - Int64(clockSkew),
+              iat <= current + Int64(clockSkew) else {
             throw SwanError.expired
         }
+    }
+}
+
+private func isBase64URLByte(_ byte: UInt8) -> Bool {
+    (48 ... 57).contains(byte)
+        || (65 ... 90).contains(byte)
+        || (97 ... 122).contains(byte)
+        || byte == 45
+        || byte == 95
+}
+
+private extension String {
+    var isCanonicalCredentialJTI: Bool {
+        UUID(uuidString: self)?.uuidString.lowercased() == lowercased()
     }
 }
 

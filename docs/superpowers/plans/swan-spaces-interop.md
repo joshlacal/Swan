@@ -86,6 +86,22 @@ Catbird UI work.
   an explicit empty-string clear. Focused tests cover the old-schema upgrade,
   `manage=update` membership/list operations, DPoP replay, and an oversized
   body delivered in streaming chunks.
+- The credential foundation is now a closed SwanOAuth/storage boundary, not
+  an XRPC route. `DurableSpaceCredentialAuthority` evaluates the authority's
+  startup-preopened SQLite `authorizeSimpleSpaceRead` policy before obtaining
+  the active account signing key through `AccountKeyStore`; it emits only a
+  transient ES256 `atproto-space-credential+jwt` with `#atproto_space`, a
+  fresh UUID JTI, and a two-hour maximum lifetime. The verifier bounds compact
+  JWT parsing, requires the exact type/algorithm/key ID and authority/space
+  binding, resolves only configured local or static pinned public keys, and
+  returns `AuthorizationContext.spaceCredential` only after signature and
+  clock checks. Remote DID/PLC key retrieval, client metadata/JWKS attestation
+  verification, delegation exchange, and all credential HTTP endpoints remain
+  unavailable; an allow-listed app therefore fails closed until a signed
+  attestation policy is implemented. Focused tests cover durable public/member
+  policy, app and managing-app denial, requester binding, key-generation
+  selection, malformed/tampered/expired credentials, concurrent unique JTIs,
+  and scans that reject token/private-key persistence in SQLite.
 - All unimplemented HTTP endpoints intentionally return generic authorization
   errors or `profile_endpoint_pending`; they are not interop evidence. The
   pinned TypeScript `com.atproto.space.getSpace` exception is now a typed,
