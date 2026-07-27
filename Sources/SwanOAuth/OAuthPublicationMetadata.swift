@@ -121,11 +121,13 @@ private enum OAuthPublishedURL {
     /// The AT Protocol authorization-server issuer is an origin identifier,
     /// not a base URL. Keeping this separate from generic endpoint/resource
     /// validation prevents a path-bearing issuer from changing the advertised
-    /// endpoint or the confidential-client assertion audience.
+    /// endpoint or the confidential-client assertion audience. An explicit
+    /// HTTPS default port is also forbidden by the AT OAuth issuer profile.
     static func validateIssuer(_ url: URL) throws -> URL {
         let validated = try validate(url, role: "issuer")
         guard let components = URLComponents(url: validated, resolvingAgainstBaseURL: false),
-              components.path.isEmpty || components.path == "/" else {
+              (components.path.isEmpty || components.path == "/"),
+              components.port != 443 else {
             throw SwanError.malformed("OAuth issuer URL must be an origin")
         }
         return validated

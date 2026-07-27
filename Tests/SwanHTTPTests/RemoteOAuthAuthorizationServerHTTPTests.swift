@@ -296,6 +296,7 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
       "https://swan.example/?query=1",
       "https://swan.example/#fragment",
       "https://operator@swan.example",
+      "https://swan.example:443",
     ] {
       XCTAssertThrowsError(try OAuthAuthorizationServerMetadata(issuer: try XCTUnwrap(URL(string: value))))
     }
@@ -307,6 +308,28 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
       resource: issuer,
       authorizationServer: URL(string: "https://swan.example/oauth")!
     ))
+  }
+
+  func testCompleteOAuthConfigurationRejectsDefaultHTTPSIssuerPort() async throws {
+    let fixture = try await makeFixture(metadata: try publicMetadata())
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let defaultHTTPSPort = URL(string: "https://swan.example:443")!
+    do {
+      XCTAssertThrowsError(try OAuthMetadataPublication(
+        resource: issuer,
+        issuer: defaultHTTPSPort
+      ))
+      XCTAssertThrowsError(try SwanOAuthAuthorizationServerConfiguration(
+        issuer: defaultHTTPSPort,
+        protectedResource: issuer,
+        accounts: fixture.accounts,
+        clientMetadataLoader: fixture.completeConfiguration.clientMetadataLoader
+      ))
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
   }
 
   func testConfidentialPAREnforcesIssuerAudienceAndAssertionReplay() async throws {
