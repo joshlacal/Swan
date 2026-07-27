@@ -130,9 +130,11 @@ Catbird UI work.
   `AccountKeyStore`-backed signer; the ordinary/default server still returns a
   no-store 503, with a no-store 404 for wrong methods. Its singleton `space`
   query is decoded before authorization, and the user can mint only with
-  broad `atproto` or an exact whole-space `action=read` scope—collection,
-  `read_self`, foreign, malformed, or decoded-duplicate grants cannot be
-  amplified. The issuer reads the encrypted account signing key immediately
+  broad `atproto` or a whole-space `action=read` scope. The latter follows the
+  pinned TypeScript tuple matcher: type, authority, and skey each permit their
+  exact requested value or `*`. Collection, `read_self`, foreign, malformed,
+  or decoded-duplicate grants cannot be amplified. The issuer reads the
+  encrypted account signing key immediately
   before producing the fixed ES256 60-second `#atproto` delegation; it never
   consults remote authority membership or policy. Focused HTTP tests use real
   durable OAuth/DPoP and encrypted key storage to verify the emitted token

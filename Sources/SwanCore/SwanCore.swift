@@ -188,9 +188,11 @@ public enum PermissionedSpaceScopeSyntax {
     /// member repository.
     ///
     /// The broad `atproto` scope remains the one explicit whole-account
-    /// grant.  Every profile-specific grant must name exactly the requested
-    /// type, authority, skey, and `action=read`; extra or duplicate decoded
-    /// query members fail closed.
+    /// grant. Profile-specific grants follow the pinned TypeScript matcher's
+    /// tuple comparison: each of type, authority, and skey may name the
+    /// requested value or `*`. They must still name exactly `action=read` and
+    /// have no collection parameter; extra or duplicate decoded query members
+    /// fail closed.
     public static func permitsWholeSpaceRead(
         _ scopes: Set<String>,
         spaceType: String,
@@ -202,18 +204,46 @@ public enum PermissionedSpaceScopeSyntax {
         }
         if scopes.contains("atproto") { return true }
 
-        let prefix = "space:\(spaceType)?"
         return scopes.contains { scope in
-            guard scope.hasPrefix(prefix),
+            guard let type = strictSpaceType(scope),
+                  (type == spaceType || type == "*"),
                   let parameters = strictQualifiedParameters(scope),
                   parameters.count == 3,
-                  parameters["authority"] == authority,
-                  parameters["skey"] == skey,
+                  tupleElement(parameters["authority"], matches: authority),
+                  tupleElement(parameters["skey"], matches: skey),
                   parameters["action"] == "read" else {
                 return false
             }
             return Set(parameters.keys) == ["authority", "skey", "action"]
         }
+    }
+
+    /// The pinned `SpacePermission.matches` compares each tuple element to
+    /// its target and treats a literal `*` as an overlap.  `self` is resolved
+    /// by the reference authorization server before its runtime matcher sees
+    /// a grant; this resource server has no issuance-time authority context,
+    /// so it deliberately does not synthesize that resolution here.
+    private static func tupleElement(_ grant: String?, matches target: String) -> Bool {
+        grant == target || grant == "*"
+    }
+
+    /// This endpoint accepts the positional TypeScript `space:<type>` form.
+    /// The request target is an already-validated concrete `SpaceURI`, so an
+    /// unmatched type cannot convey authority; only its exact value or the
+    /// reference matcher's literal wildcard may satisfy the tuple.
+    private static func strictSpaceType(_ scope: String) -> String? {
+        let prefix = "space:"
+        guard scope.hasPrefix(prefix),
+              let queryStart = scope.firstIndex(of: "?"),
+              queryStart > scope.index(scope.startIndex, offsetBy: prefix.count) else {
+            return nil
+        }
+        let type = scope[scope.index(scope.startIndex, offsetBy: prefix.count) ..< queryStart]
+        guard !type.isEmpty,
+              type.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+            return nil
+        }
+        return String(type)
     }
 
     /// Decodes the already-qualified permissioned-space query with a

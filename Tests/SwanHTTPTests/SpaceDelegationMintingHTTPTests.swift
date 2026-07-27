@@ -34,6 +34,7 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
             let scopes = [
                 Set(["atproto"]),
                 Set([wholeSpaceReadScope(for: fixture.space)]),
+                Set([wildcardWholeSpaceReadScope()]),
             ]
 
             try await app.test(.router) { client in
@@ -98,11 +99,18 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
                 logger: Logger(label: "SpaceDelegationMintingHTTPTests.scope")
             )
             let narrowCollection = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=app.bsky.feed.post"
-            let wildcardCollection = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=*"
+            // This is intentionally stricter than the reference matcher for
+            // delegation minting: collection constraints cannot be amplified
+            // into a credential which reads every member repository.
+            let wildcardCollection = "space:*?authority=*&skey=*&action=read&collection=*"
             let readSelf = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read_self&collection=app.bsky.feed.post"
             let foreign = "space:\(fixture.space.spaceType)?authority=\(Self.unknown)&skey=\(fixture.space.skey)&action=read"
+            let wildcardForeign = "space:*?authority=\(Self.unknown)&skey=*&action=read"
             let percentDuplicate = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&%61uthority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read"
-            for (index, scope) in [narrowCollection, wildcardCollection, readSelf, foreign, percentDuplicate].enumerated() {
+            for (index, scope) in [
+                narrowCollection, wildcardCollection, readSelf, foreign,
+                wildcardForeign, percentDuplicate,
+            ].enumerated() {
                 let access = try await issueToken(
                     runtime: fixture.runtime,
                     subject: Self.user,
@@ -374,6 +382,14 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
 
     private func wholeSpaceReadScope(for space: SpaceURI) -> String {
         "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&action=read"
+    }
+
+    /// Matches the TypeScript `SpacePermission.matches` tuple semantics for a
+    /// whole-space read: each tuple member may be broad while `action=read`
+    /// remains explicit. The endpoint must mint for this reference-valid
+    /// OAuth grant.
+    private func wildcardWholeSpaceReadScope() -> String {
+        "space:*?authority=*&skey=*&action=read"
     }
 
     private func delegationURI(_ space: SpaceURI) -> String {
