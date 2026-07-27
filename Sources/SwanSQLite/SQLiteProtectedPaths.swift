@@ -113,6 +113,54 @@ enum SQLiteProtectedPaths {
         }
     }
 
+    /// Allocates a single owner-only regular file below a dedicated private
+    /// directory for permissioned CAR recovery spools. The generated name is
+    /// not derived from a DID, space, record, or CID, and `O_EXCL|O_NOFOLLOW`
+    /// prevents accidental reuse or symlink traversal. The caller owns
+    /// deletion once the response completes or fails.
+    static func makePrivateCARSpoolURL(in dataDirectory: URL) throws -> URL {
+        let root = try openRoot(dataDirectory)
+        defer { _ = close(root) }
+        let spoolDirectory = try openOrCreateDirectory(
+            parent: root,
+            name: "permissioned-car-spool"
+        )
+        defer { _ = close(spoolDirectory) }
+
+        for _ in 0 ..< 16 {
+            let name = "car-\(UUID().uuidString.lowercased()).spool"
+            let descriptor = name.withCString { path in
+                openat(
+                    spoolDirectory,
+                    path,
+                    O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                    ownerOnlyFileMode
+                )
+            }
+            if descriptor < 0 {
+                guard errno == EEXIST else {
+                    throw SwanError.unavailable("permissioned CAR spool is unavailable")
+                }
+                continue
+            }
+            do {
+                try requireOwnerOnlyRegularFile(descriptor)
+                guard fchmod(descriptor, ownerOnlyFileMode) == 0 else {
+                    throw SwanError.unavailable("permissioned CAR spool is unavailable")
+                }
+                _ = close(descriptor)
+                return dataDirectory.standardizedFileURL
+                    .appending(path: "permissioned-car-spool")
+                    .appending(path: name)
+            } catch {
+                _ = close(descriptor)
+                _ = name.withCString { unlinkat(spoolDirectory, $0, 0) }
+                throw error
+            }
+        }
+        throw SwanError.unavailable("permissioned CAR spool is unavailable")
+    }
+
     static func closeDirectory(_ descriptor: Int32) {
         guard descriptor >= 0 else { return }
         _ = close(descriptor)

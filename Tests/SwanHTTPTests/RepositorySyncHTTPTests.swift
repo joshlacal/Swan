@@ -21,6 +21,98 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
     private static let publicURL = URL(string: "https://swan.example")!
     private static let latestPath = "/xrpc/com.atproto.space.getLatestCommit"
     private static let oplogPath = "/xrpc/com.atproto.space.listRepoOps"
+    private static let repoPath = "/xrpc/com.atproto.space.getRepo"
+
+    func testGetRepoStreamsFreshTwoRootCARForOAuthSelfAndCredentialCrossRepository() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let app = try makeServer(fixture, enabled: true).buildApplication(
+                logger: Logger(label: "RepositorySyncHTTPTests.getRepo")
+            )
+            let oauth = try await issueToken(
+                runtime: fixture.runtime,
+                subject: Self.alice,
+                scopes: ["atproto"]
+            )
+            let credential = try await fixture.credential(for: fixture.space)
+            let firstIKM = DataBox()
+            try await app.test(.router) { client in
+                let firstHeaders = try self.dpopHeaders(
+                    token: oauth.token,
+                    key: oauth.key,
+                    jwk: oauth.jwk,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "repo-oauth-first",
+                    path: Self.repoPath
+                )
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.alice),
+                    method: .get,
+                    headers: firstHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    self.assertCARNoStore(response)
+                    XCTAssertNil(response.headers[.contentLength])
+                    let car = Data(buffer: response.body)
+                    let verified = try self.assertRecoveryCAR(
+                        car,
+                        fixture: fixture,
+                        author: Self.alice
+                    )
+                    await firstIKM.set(try self.commitIKM(in: car))
+                    let blockCIDs = try self.carBlockCIDs(car)
+                    XCTAssertEqual(blockCIDs.count, verified.count + 2)
+                    XCTAssertEqual(
+                        Array(blockCIDs.dropFirst(2)),
+                        [
+                            CID.fromDAGCBOR(try XCTUnwrap(verified["app.bsky.feed.post/first"])),
+                            CID.fromDAGCBOR(try XCTUnwrap(verified["app.bsky.feed.post/fourth"])),
+                            CID.fromDAGCBOR(try XCTUnwrap(verified["app.bsky.feed.post/third"])),
+                        ]
+                    )
+                }
+
+                let secondHeaders = try self.dpopHeaders(
+                    token: oauth.token,
+                    key: oauth.key,
+                    jwk: oauth.jwk,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "repo-oauth-second",
+                    path: Self.repoPath
+                )
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.alice),
+                    method: .get,
+                    headers: secondHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    self.assertCARNoStore(response)
+                    let initialIKM = await firstIKM.value
+                    let secondIKM = try self.commitIKM(in: Data(buffer: response.body))
+                    XCTAssertNotEqual(secondIKM, initialIKM)
+                }
+
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.bob),
+                    method: .get,
+                    headers: self.bearerHeaders(credential, dpop: "not-a-dpop-proof")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    self.assertCARNoStore(response)
+                    _ = try self.assertRecoveryCAR(
+                        Data(buffer: response.body),
+                        fixture: fixture,
+                        author: Self.bob
+                    )
+                }
+            }
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
 
     func testOAuthSelfAndCredentialCrossRepositoryReturnFreshVerifiableCommitsAndReferencePages() async throws {
         let fixture = try await Fixture.make()
@@ -237,7 +329,9 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             try await app.test(.router) { client in
                 for uri in [
                     Self.latestPath,
+                    Self.repoPath,
                     "\(Self.latestPath)?space=at%3A%2F%2Fbad&space=at%3A%2F%2Fbad&repo=\(Self.alice)",
+                    "\(Self.repoPath)?space=\(self.percentEncode(fixture.space.rawValue))&space=\(self.percentEncode(fixture.space.rawValue))&repo=\(Self.alice)",
                     "\(Self.oplogPath)?space=\(self.percentEncode(fixture.space.rawValue))&repo=\(Self.alice)&limit=0",
                     "\(Self.oplogPath)?space=\(self.percentEncode(fixture.space.rawValue))&repo=\(Self.alice)&since=not-a-tid",
                     "\(Self.oplogPath)?space=\(self.percentEncode(fixture.space.rawValue))&repo=\(Self.alice)&extra=x",
@@ -273,6 +367,19 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(try self.errorCode(response.body), "SpaceNotFound")
                 }
 
+                let foreignCARHeaders = try self.dpopHeaders(
+                    token: bob.token, key: bob.key, jwk: bob.jwk,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "foreign-repo-car", path: Self.repoPath
+                )
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: foreignCARHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(try self.errorCode(response.body), "SpaceNotFound")
+                }
+
                 let narrowHeaders = try self.dpopHeaders(
                     token: narrow.token, key: narrow.key, jwk: narrow.jwk,
                     nonce: fixture.runtime.dpopNonceService.issue(),
@@ -285,8 +392,29 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     self.assertNoStore(response)
                 }
 
+                let narrowCARHeaders = try self.dpopHeaders(
+                    token: narrow.token, key: narrow.key, jwk: narrow.jwk,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "narrow-car", path: Self.repoPath
+                )
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: narrowCARHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    self.assertNoStore(response)
+                }
+
                 try await client.execute(
                     uri: self.latestURI(space: fixture.space, repo: Self.bob), method: .get,
+                    headers: self.bearerHeaders(wrongCredential)
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    self.assertNoStore(response)
+                    XCTAssertNil(response.headers[HTTPField.Name("DPoP-Nonce")!])
+                }
+
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.bob), method: .get,
                     headers: self.bearerHeaders(wrongCredential)
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
@@ -309,8 +437,43 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     self.assertNoStore(response)
                 }
 
+                var missingProof = HTTPFields()
+                missingProof[.authorization] = "DPoP \(alice.token)"
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: missingProof
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    self.assertNoStore(response)
+                    XCTAssertNotNil(response.headers[HTTPField.Name("DPoP-Nonce")!])
+                }
+
+                let carReplayHeaders = try self.dpopHeaders(
+                    token: alice.token, key: alice.key, jwk: alice.jwk,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "repo-car-replay", path: Self.repoPath
+                )
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: carReplayHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    self.assertCARNoStore(response)
+                }
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: carReplayHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    self.assertNoStore(response)
+                }
+
                 try await client.execute(
                     uri: Self.latestPath, method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(try self.errorCode(response.body), "permissioned_endpoint_unavailable")
+                }
+                try await client.execute(
+                    uri: Self.repoPath, method: .post
                 ) { response in
                     XCTAssertEqual(response.status, .notFound)
                     self.assertNoStore(response)
@@ -329,6 +492,17 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             try await app.test(.router) { client in
                 try await client.execute(
                     uri: self.latestURI(space: fixture.space, repo: Self.alice), method: .get, headers: inactiveHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    self.assertNoStore(response)
+                }
+                let inactiveCARHeaders = try self.dpopHeaders(
+                    token: alice.token, key: alice.key, jwk: alice.jwk,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "inactive-car", path: Self.repoPath
+                )
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: inactiveCARHeaders
                 ) { response in
                     XCTAssertEqual(response.status, .unauthorized)
                     self.assertNoStore(response)
@@ -380,6 +554,18 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     self.assertNoStore(response)
                     XCTAssertEqual(try self.errorCode(response.body), "temporarily_unavailable")
                 }
+                let missingCARHeaders = try self.dpopHeaders(
+                    token: access.token, key: access.key, jwk: access.jwk,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "missing-preopened-car", path: Self.repoPath
+                )
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: missingCARHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(try self.errorCode(response.body), "temporarily_unavailable")
+                }
             }
             try await fixture.close()
         } catch {
@@ -413,6 +599,19 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(try self.errorCode(response.body), "temporarily_unavailable")
                     XCTAssertFalse(String(decoding: response.body.readableBytesView, as: UTF8.self).contains("secret"))
                 }
+                let carHeaders = try self.dpopHeaders(
+                    token: access.token, key: access.key, jwk: access.jwk,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "corrupt-car", path: Self.repoPath
+                )
+                try await client.execute(
+                    uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: carHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(try self.errorCode(response.body), "temporarily_unavailable")
+                    XCTAssertFalse(String(decoding: response.body.readableBytesView, as: UTF8.self).contains("secret"))
+                }
             }
 
             let closed = try makeServer(fixture, enabled: false).buildApplication(
@@ -420,6 +619,11 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             )
             try await closed.test(.router) { client in
                 try await client.execute(uri: Self.latestPath, method: .get) { response in
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(try self.errorCode(response.body), "permissioned_data_pending")
+                }
+                try await client.execute(uri: Self.repoPath, method: .get) { response in
                     XCTAssertEqual(response.status, .serviceUnavailable)
                     self.assertNoStore(response)
                     XCTAssertEqual(try self.errorCode(response.body), "permissioned_data_pending")
@@ -468,6 +672,10 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
 
     private func latestURI(space: SpaceURI, repo: String) -> String {
         "\(Self.latestPath)?space=\(percentEncode(space.rawValue))&repo=\(repo)"
+    }
+
+    private func repoURI(space: SpaceURI, repo: String) -> String {
+        "\(Self.repoPath)?space=\(percentEncode(space.rawValue))&repo=\(repo)"
     }
 
     private func oplogURI(
@@ -604,6 +812,84 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(response.headers[.cacheControl], "no-store", file: file, line: line)
     }
 
+    private func assertCARNoStore(_ response: TestResponse, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(response.headers[.contentType], "application/vnd.ipld.car", file: file, line: line)
+        XCTAssertEqual(response.headers[.cacheControl], "no-store", file: file, line: line)
+    }
+
+    private func assertRecoveryCAR(
+        _ data: Data,
+        fixture: Fixture,
+        author: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> [String: Data] {
+        let reader = try CARReader(data: data)
+        XCTAssertEqual(reader.roots.count, 2, file: file, line: line)
+        let publicKey = try P256.Signing.PublicKey(
+            x963Representation: try XCTUnwrap(fixture.publicKeys[author])
+        )
+        return try SpaceCARCodec.verify(
+            data,
+            space: fixture.space,
+            author: author,
+            publicKey: publicKey
+        )
+    }
+
+    private func commitIKM(in car: Data) throws -> Data {
+        let reader = try CARReader(data: car)
+        let commitCID = try XCTUnwrap(reader.roots.first)
+        let commit = try XCTUnwrap(
+            try reader.decodeBlock(for: CARReader.cidHex(from: commitCID)) as? [String: Any]
+        )
+        return try XCTUnwrap(commit["ikm"] as? Data)
+    }
+
+    /// CARReader deliberately indexes by CID, so this small test-only parser
+    /// preserves physical block order for the proposal's lexical record-block
+    /// assertion. Swan's CIDs are all the fixed one-byte-varint SHA-256 CIDv1
+    /// form used by the pinned profile.
+    private func carBlockCIDs(_ car: Data) throws -> [CID] {
+        var offset = 0
+        let headerLength = try carVarint(car, offset: &offset)
+        guard headerLength >= 0, offset + headerLength <= car.count else {
+            throw SwanError.malformed("invalid CAR header")
+        }
+        offset += headerLength
+        var cids: [CID] = []
+        while offset < car.count {
+            let blockLength = try carVarint(car, offset: &offset)
+            guard blockLength >= 4, offset + blockLength <= car.count,
+                  car[offset] == 0x01
+            else { throw SwanError.malformed("invalid CAR block") }
+            let digestLength = Int(car[offset + 3])
+            let cidLength = 4 + digestLength
+            guard cidLength <= blockLength else {
+                throw SwanError.malformed("invalid CAR CID")
+            }
+            cids.append(try CID(bytes: Data(car[offset ..< offset + cidLength])))
+            offset += blockLength
+        }
+        return cids
+    }
+
+    private func carVarint(_ data: Data, offset: inout Int) throws -> Int {
+        var value: UInt64 = 0
+        var shift: UInt64 = 0
+        while offset < data.count {
+            let byte = data[offset]
+            offset += 1
+            value |= UInt64(byte & 0x7f) << shift
+            if byte & 0x80 == 0, value <= UInt64(Int.max) {
+                return Int(value)
+            }
+            shift += 7
+            if shift > 63 { break }
+        }
+        throw SwanError.malformed("invalid CAR varint")
+    }
+
     private func packageRoot() -> URL {
         URL(filePath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
     }
@@ -613,6 +899,14 @@ private struct AccessTokenMaterial: Sendable {
     let token: String
     let key: P256.Signing.PrivateKey
     let jwk: OAuthJSONWebKey
+}
+
+private actor DataBox {
+    private(set) var value: Data?
+
+    func set(_ value: Data) {
+        self.value = value
+    }
 }
 
 private struct Fixture: Sendable {
@@ -778,6 +1072,9 @@ private actor CorruptSyncDirectory: AuthorizedSimpleSpaceDirectory, AuthorizedSp
             state: .init(space: space, author: author, wireRevision: "2222222222222", commitment: Data(repeating: 0x01, count: 32)),
             entries: [.init(wireRevision: "2222222222222", collection: "app.bsky.feed.post", rkey: "secret", cid: "not-a-cid", previousCID: nil, value: Data("secret".utf8))]
         )
+    }
+    func repositoryCARSnapshot(space _: SpaceURI, author _: String, authorization _: AuthorizationContext) async throws -> AuthorizedSpaceRepositoryCARSnapshot? {
+        throw SwanError.unavailable("corrupt repository projection")
     }
     func apply(space _: SpaceURI, author _: String, writes _: [AuthorizedSpaceRepositoryWrite], requestID _: UUID, wireRevision _: String, authorization _: AuthorizationContext) async throws -> [AuthorizedSpaceRepositoryWriteResult] { [] }
 }

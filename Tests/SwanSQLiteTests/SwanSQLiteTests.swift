@@ -353,6 +353,82 @@ final class SwanSQLiteTests: XCTestCase {
         )
     }
 
+    func testFullCARPreparationRejectsCorruptCIDValueAndRepositoryStateBeforeSpooling() async throws {
+        let fixture = try Fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await fixture.open()
+        let validCID = CID.fromDAGCBOR(fixture.firstValue).string
+        _ = try await database.apply(
+            space: fixture.space,
+            author: fixture.author,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(0),
+            writes: [.put(uri: fixture.first, value: fixture.firstValue, cid: validCID)]
+        )
+        let prepared = try await database.prepareRepositoryCARSnapshot(
+            space: fixture.space,
+            author: fixture.author
+        )
+        XCTAssertNotNil(prepared)
+        prepared?.spool.cleanup()
+        try await database.close()
+
+        let databasePath = SQLiteLayout.accountDatabase(
+            in: fixture.root,
+            did: fixture.author
+        ).path
+        let wrongCID = CID.fromDAGCBOR(fixture.secondValue).string
+        let rawCID = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        _ = try await rawCID.query(
+            "UPDATE permissioned_space_records SET cid = ? WHERE space_uri = ? AND author_did = ?",
+            [.text(wrongCID), .text(fixture.space.rawValue), .text(fixture.author)]
+        )
+        try await rawCID.close()
+
+        let cidCorrupt = try await fixture.open()
+        await XCTAssertThrowsErrorAsync(
+            try await cidCorrupt.prepareRepositoryCARSnapshot(
+                space: fixture.space,
+                author: fixture.author
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SQLiteRepositoryError,
+                .corruptDatabase("permissioned CAR record CID does not match value")
+            )
+        }
+        try await cidCorrupt.close()
+
+        let rawState = try await SQLiteConnection.open(storage: .file(path: databasePath))
+        _ = try await rawState.query(
+            "UPDATE permissioned_space_records SET cid = ? WHERE space_uri = ? AND author_did = ?",
+            [.text(validCID), .text(fixture.space.rawValue), .text(fixture.author)]
+        )
+        _ = try await rawState.query(
+            "UPDATE permissioned_repository_state SET current_commit = ? WHERE space_uri = ? AND author_did = ?",
+            [
+                Data("reader-specific-IKM-must-not-persist".utf8).sqliteData!,
+                .text(fixture.space.rawValue), .text(fixture.author),
+            ]
+        )
+        try await rawState.close()
+
+        let stateCorrupt = try await fixture.open()
+        await XCTAssertThrowsErrorAsync(
+            try await stateCorrupt.prepareRepositoryCARSnapshot(
+                space: fixture.space,
+                author: fixture.author
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? SQLiteRepositoryError,
+                .corruptDatabase("invalid deterministic repository state marker")
+            )
+        }
+        try await stateCorrupt.close()
+    }
+
     func testOutboxRejectsTamperedPayloadAfterReopen() async throws {
         let fixture = try Fixture()
         let database = try await fixture.open()
@@ -1030,6 +1106,58 @@ final class SwanSQLiteTests: XCTestCase {
         )
         XCTAssertEqual(current?.state.revision, 2)
         XCTAssertEqual(current?.records.count, 2)
+    }
+
+    func testFullCARSpoolUsesOneStableSQLiteReadTransaction() async throws {
+        let fixture = try Fixture()
+        let reader = try await fixture.open()
+        let writer = try await fixture.open()
+        defer {
+            Task {
+                try? await reader.close()
+                try? await writer.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let firstCID = CID.fromDAGCBOR(fixture.firstValue).string
+        _ = try await reader.apply(
+            space: fixture.space,
+            author: fixture.author,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(0),
+            writes: [.put(uri: fixture.first, value: fixture.firstValue, cid: firstCID)]
+        )
+
+        let barrier = SnapshotReadBarrier()
+        await reader.installTestingHooks(
+            SQLiteTestingHooks(afterSnapshotStateRead: { await barrier.pause() })
+        )
+        let snapshotTask = Task {
+            try await reader.prepareRepositoryCARSnapshot(
+                space: fixture.space,
+                author: fixture.author
+            )
+        }
+        await barrier.waitUntilPaused()
+
+        let secondCID = CID.fromDAGCBOR(fixture.secondValue).string
+        _ = try await writer.apply(
+            space: fixture.space,
+            author: fixture.author,
+            expectedRevision: 1,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(1),
+            writes: [.put(uri: fixture.second, value: fixture.secondValue, cid: secondCID)]
+        )
+        await barrier.release()
+
+        let preparedResult = try await snapshotTask.value
+        let prepared = try XCTUnwrap(preparedResult)
+        XCTAssertEqual(prepared.state.wireRevision, try fixture.tid(0).toString())
+        XCTAssertEqual(prepared.state.commitment.count, 32)
+        prepared.spool.cleanup()
+        XCTAssertTrue(prepared.spool.isCleanedUp)
     }
 
     func testOplogPreservesWireRevisionActionAndPreviousCID() async throws {

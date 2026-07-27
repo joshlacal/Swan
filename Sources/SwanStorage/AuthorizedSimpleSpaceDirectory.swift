@@ -68,6 +68,23 @@ public struct AuthorizedSpaceRepositoryCommitState: Sendable, Equatable {
     }
 }
 
+/// A validated, immutable permissioned-repository snapshot prepared for
+/// full-CAR recovery. The private spool contains only the index and record
+/// blocks. Its reader-specific signed commit is created later by the narrow
+/// account-key signer and is never written to SQLite or a spool.
+public struct AuthorizedSpaceRepositoryCARSnapshot: Sendable {
+    public let state: AuthorizedSpaceRepositoryCommitState
+    public let spool: SpaceCARBodySpool
+
+    public init(
+        state: AuthorizedSpaceRepositoryCommitState,
+        spool: SpaceCARBodySpool
+    ) {
+        self.state = state
+        self.spool = spool
+    }
+}
+
 /// One privacy-safe permissioned oplog row for the incremental-sync XRPC
 /// surface.  `value` is present only when the current live record still has
 /// this row's CID; historic values and SQLite implementation details never
@@ -282,6 +299,16 @@ public protocol AuthorizedSpaceRepositoryDirectory: Sendable {
         includeValues: Bool,
         authorization: AuthorizationContext
     ) async throws -> AuthorizedSpaceRepositoryOplogRead
+
+    /// Prepares a fully validated, consistent permissioned repository
+    /// snapshot for the streaming full-CAR recovery endpoint. Implementations
+    /// may return `nil` only when this account has no repository state; they
+    /// must never open or migrate a database in response to this call.
+    func repositoryCARSnapshot(
+        space: SpaceURI,
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositoryCARSnapshot?
 
     /// Applies an ordered, all-or-nothing mutation batch through an account
     /// database that was opened during startup. Implementations must retain

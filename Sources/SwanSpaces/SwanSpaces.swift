@@ -537,6 +537,91 @@ public struct SpaceCAR: Sendable, Equatable {
     public let indexCID: CID
 }
 
+/// An owner-only, private spool containing the index and record-block suffix
+/// of a full-recovery CAR.  It deliberately never contains the request's
+/// reader-specific commit envelope: fresh IKM, the context signature, and the
+/// deniable binding stay in the small HTTP response prefix until the response
+/// is written.
+///
+/// `SwanSQLite` is the sole producer. It creates the file below a
+/// descriptor-validated owner-only data directory after validating an
+/// immutable SQLite snapshot. Consumers cannot obtain the path; they can only
+/// drain bounded chunks, which also removes the file on normal completion,
+/// write failure, or task cancellation.
+public final class SpaceCARBodySpool: @unchecked Sendable {
+    /// A deliberately small maximum for a single Hummingbird body write. It
+    /// bounds response-side buffering independently of the CAR size.
+    public static let maximumChunkBytes = 64 * 1_024
+
+    public let indexCID: CID
+    private let bodyURL: URL
+    private let cleanupLock = NSLock()
+    private var cleanedUp = false
+
+    public init(indexCID: CID, bodyURL: URL) {
+        self.indexCID = indexCID
+        self.bodyURL = bodyURL
+    }
+
+    deinit {
+        cleanup()
+    }
+
+    /// An observable cleanup state is intentionally useful for deterministic
+    /// storage/transport tests. It reveals no repository path or data.
+    public var isCleanedUp: Bool {
+        cleanupLock.lock()
+        defer { cleanupLock.unlock() }
+        return cleanedUp
+    }
+
+    /// Drains the private CAR suffix through fixed-size chunks. The caller is
+    /// expected to write each chunk directly to a streaming response body.
+    /// This method owns cleanup even when the consumer throws or the request
+    /// is cancelled.
+    public func streamBody(
+        maximumChunkBytes: Int = SpaceCARBodySpool.maximumChunkBytes,
+        consume: (Data) async throws -> Void
+    ) async throws {
+        guard (1 ... Self.maximumChunkBytes).contains(maximumChunkBytes) else {
+            cleanup()
+            throw SwanError.malformed("permissioned CAR chunk size is invalid")
+        }
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forReadingFrom: bodyURL)
+        } catch {
+            cleanup()
+            throw SwanError.unavailable("permissioned CAR spool is unavailable")
+        }
+        defer {
+            try? handle.close()
+            cleanup()
+        }
+
+        while true {
+            try Task.checkCancellation()
+            guard let chunk = try handle.read(upToCount: maximumChunkBytes),
+                  !chunk.isEmpty
+            else { return }
+            try await consume(chunk)
+        }
+    }
+
+    /// Removes the private spool idempotently. It is safe to call before a
+    /// response begins, after a failed write, or more than once.
+    public func cleanup() {
+        cleanupLock.lock()
+        guard !cleanedUp else {
+            cleanupLock.unlock()
+            return
+        }
+        cleanedUp = true
+        cleanupLock.unlock()
+        try? FileManager.default.removeItem(at: bodyURL)
+    }
+}
+
 /// CAR v1 full-recovery encoding for a permissioned repository. Its roots are
 /// exactly `[signedCommit, index]`; records are neither public-repository CAR
 /// data nor blobs and therefore cannot be passed to public export surfaces.
@@ -571,6 +656,73 @@ public enum SpaceCARCodec {
             appendBlock(cid: CID.fromDAGCBOR(record.value), data: record.value, to: &output)
         }
         return SpaceCAR(data: output, commitCID: commitCID, indexCID: indexCID)
+    }
+
+    /// Produces the short CAR prefix for a bounded-memory recovery response.
+    /// The caller appends the already validated index+record suffix from a
+    /// private spool. The root order is fixed by proposal 0016: signed commit,
+    /// then DRISL index.
+    public static func recoveryPrefix(
+        commit: SpaceCommitEnvelope,
+        indexCID: CID
+    ) throws -> Data {
+        let commitBlock = try encodeCommit(commit)
+        let commitCID = CID.fromDAGCBOR(commitBlock)
+        let header = OrderedCBORMap(entries: [
+            (key: "roots", value: [ATProtoLink(cid: commitCID), ATProtoLink(cid: indexCID)]),
+            (key: "version", value: 1),
+        ])
+        let headerBlock = try DAGCBOR.encodeValue(header)
+        var output = Data()
+        appendVarint(headerBlock.count, to: &output)
+        output.append(headerBlock)
+        appendBlock(cid: commitCID, data: commitBlock, to: &output)
+        return output
+    }
+
+    /// Starts a canonical DAG-CBOR DRISL index map without retaining the map
+    /// or its values in memory. Entries must follow Petrel's canonical
+    /// length-then-byte key order; record blocks themselves remain in the
+    /// proposal's lexicographic `collection/rkey` order.
+    public static func streamingIndexPrefix(recordCount: Int) throws -> Data {
+        guard recordCount >= 0 else {
+            throw SwanError.malformed("permissioned CAR record count is invalid")
+        }
+        return cborMajorHeader(major: 5, argument: UInt64(recordCount))
+    }
+
+    /// Encodes exactly one canonical DRISL map entry. Keeping this operation
+    /// in the space domain avoids exposing a generic CBOR/CAR writer to the
+    /// SQLite adapter.
+    public static func streamingIndexEntry(path: String, cid: CID) throws -> Data {
+        guard isRecordPath(path), cid.bytes.count <= Int(UInt16.max) else {
+            throw SwanError.malformed("permissioned CAR index entry is invalid")
+        }
+        let key = Data(path.utf8)
+        var output = cborMajorHeader(major: 3, argument: UInt64(key.count))
+        output.append(key)
+        // DAG-CBOR CID links are tag 42 around a byte string whose leading
+        // zero distinguishes the CID binary representation from a raw byte
+        // string. Petrel's `ATProtoLink` emits this same representation.
+        output.append(0xd8)
+        output.append(0x2a)
+        output.append(cborMajorHeader(major: 2, argument: UInt64(cid.bytes.count + 1)))
+        output.append(0)
+        output.append(cid.bytes)
+        return output
+    }
+
+    /// The CAR block framing for a previously validated block. This is kept
+    /// separate from `encode` so storage can copy a large value directly to a
+    /// private spool rather than assembling a response-wide `Data` value.
+    public static func streamingBlockPrefix(cid: CID, dataLength: Int) throws -> Data {
+        guard dataLength >= 0, dataLength <= Int.max - cid.bytes.count else {
+            throw SwanError.malformed("permissioned CAR block length is invalid")
+        }
+        var output = Data()
+        appendVarint(cid.bytes.count + dataLength, to: &output)
+        output.append(cid.bytes)
+        return output
     }
 
     /// Verifies both roots, the deniable commit binding, the index-derived
@@ -680,6 +832,32 @@ public enum SpaceCARCodec {
             if remaining != 0 { byte |= 0x80 }
             output.append(byte)
         } while remaining != 0
+    }
+
+    private static func cborMajorHeader(major: UInt8, argument: UInt64) -> Data {
+        precondition(major <= 7)
+        let prefix = major << 5
+        var output = Data()
+        switch argument {
+        case 0 ..< 24:
+            output.append(prefix | UInt8(argument))
+        case 24 ... UInt64(UInt8.max):
+            output.append(prefix | 24)
+            output.append(UInt8(argument))
+        case (UInt64(UInt8.max) + 1) ... UInt64(UInt16.max):
+            output.append(prefix | 25)
+            var value = UInt16(argument).bigEndian
+            withUnsafeBytes(of: &value) { output.append(contentsOf: $0) }
+        case (UInt64(UInt16.max) + 1) ... UInt64(UInt32.max):
+            output.append(prefix | 26)
+            var value = UInt32(argument).bigEndian
+            withUnsafeBytes(of: &value) { output.append(contentsOf: $0) }
+        default:
+            output.append(prefix | 27)
+            var value = argument.bigEndian
+            withUnsafeBytes(of: &value) { output.append(contentsOf: $0) }
+        }
+        return output
     }
 
     private static func recordPath(_ record: SpaceRecord) -> String {

@@ -651,6 +651,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
 
     private let connection: SQLiteConnection
     private let connectionGate = SQLiteConnectionGate()
+    private let dataDirectory: URL
     private let accountDID: String
     private let oplogRetention: Int
     private var accountDirectoryDescriptor: Int32
@@ -699,6 +700,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         // does not support SQLite paths through `/dev/fd`; its owner-only
         // parent directory prevents another local user from swapping it.
         SQLiteProtectedPaths.closeDirectory(rootDescriptor)
+        self.dataDirectory = dataDirectory.standardizedFileURL
         self.accountDID = did
         self.oplogRetention = oplogRetention
         let openedConnection: SQLiteConnection
@@ -1569,6 +1571,320 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                     author: author
                 )
             }
+        }
+    }
+
+    /// Builds a private, bounded-memory CAR suffix from one SQLite read
+    /// snapshot. The spool contains only the validated DRISL index and record
+    /// blocks: a reader-specific signed commit is intentionally created later
+    /// by the OAuth/account-key layer and never reaches disk here.
+    ///
+    /// The read transaction is held only while SQLite is read and private
+    /// files are written. It is released before Hummingbird can write a byte
+    /// to a client, so a slow/disconnected client cannot hold a database
+    /// transaction open.
+    public func prepareRepositoryCARSnapshot(
+        space: SpaceURI,
+        author: String
+    ) async throws -> AuthorizedSpaceRepositoryCARSnapshot? {
+        try requireAccount(author)
+        let bodyURL = try SQLiteProtectedPaths.makePrivateCARSpoolURL(in: dataDirectory)
+        do {
+            let prepared = try await withConnectionGate {
+                try await readTransaction {
+                    try await prepareRepositoryCARSnapshotWithoutTransaction(
+                        space: space,
+                        author: author,
+                        bodyURL: bodyURL
+                    )
+                }
+            }
+            guard let prepared else {
+                try? FileManager.default.removeItem(at: bodyURL)
+                return nil
+            }
+            return prepared
+        } catch {
+            try? FileManager.default.removeItem(at: bodyURL)
+            throw error
+        }
+    }
+
+    private func prepareRepositoryCARSnapshotWithoutTransaction(
+        space: SpaceURI,
+        author: String,
+        bodyURL: URL
+    ) async throws -> AuthorizedSpaceRepositoryCARSnapshot? {
+        guard let state = try await loadState(space: space, author: author) else {
+            return nil
+        }
+        // Shared with the ordinary snapshot test hook so the CAR path proves
+        // it remains one stable read transaction even while another WAL
+        // connection commits a newer revision.
+        await testingHooks.afterSnapshotStateRead?()
+        let indexURL = try SQLiteProtectedPaths.makePrivateCARSpoolURL(in: dataDirectory)
+        defer { try? FileManager.default.removeItem(at: indexURL) }
+
+        let indexHandle: FileHandle
+        do {
+            indexHandle = try FileHandle(forWritingTo: indexURL)
+        } catch {
+            throw SwanError.unavailable("permissioned CAR spool is unavailable")
+        }
+        var indexClosed = false
+        defer {
+            if !indexClosed { try? indexHandle.close() }
+        }
+
+        let recordCount = try await repositoryCARRecordCount(space: space, author: author)
+        var indexHash = SHA256()
+        let indexPrefix = try SpaceCARCodec.streamingIndexPrefix(recordCount: recordCount)
+        try writeCARSpoolData(indexPrefix, to: indexHandle)
+        indexHash.update(data: indexPrefix)
+
+        var calculatedLtHash = LtHash()
+        var canonicalCursor: (length: Int, path: String)?
+        var indexedCount = 0
+        while let record = try await nextRepositoryCARIndexRecord(
+            space: space,
+            author: author,
+            after: canonicalCursor
+        ) {
+            let path = "\(record.uri.collection)/\(record.uri.rkey)"
+            let length = path.utf8.count
+            if let cursor = canonicalCursor,
+               length < cursor.length || (length == cursor.length && !cursor.path.utf8.lexicographicallyPrecedes(path.utf8)) {
+                throw SQLiteRepositoryError.corruptDatabase("permissioned CAR index order is invalid")
+            }
+            let cid = try validatedRepositoryCARCID(for: record)
+            let entry = try SpaceCARCodec.streamingIndexEntry(path: path, cid: cid)
+            try writeCARSpoolData(entry, to: indexHandle)
+            indexHash.update(data: entry)
+            calculatedLtHash.add(element: "\(path)/\(cid.string)")
+            canonicalCursor = (length, path)
+            indexedCount += 1
+        }
+        guard indexedCount == recordCount,
+              calculatedLtHash.commitment == state.commitment
+        else {
+            throw SQLiteRepositoryError.corruptDatabase("permissioned CAR snapshot does not match repository state")
+        }
+
+        try indexHandle.close()
+        indexClosed = true
+        let indexCID = CID(
+            codec: .dagCBOR,
+            multihash: .init(
+                algorithm: Multihash.sha256Code,
+                length: Multihash.sha256Length,
+                digest: Data(indexHash.finalize())
+            )
+        )
+        let indexSize = try repositoryCARFileSize(indexURL)
+
+        let bodyHandle: FileHandle
+        do {
+            bodyHandle = try FileHandle(forWritingTo: bodyURL)
+        } catch {
+            throw SwanError.unavailable("permissioned CAR spool is unavailable")
+        }
+        var bodyClosed = false
+        defer {
+            if !bodyClosed { try? bodyHandle.close() }
+        }
+
+        try writeCARSpoolData(
+            try SpaceCARCodec.streamingBlockPrefix(cid: indexCID, dataLength: indexSize),
+            to: bodyHandle
+        )
+        try copyCARSpoolFile(indexURL, to: bodyHandle)
+
+        var lexicalCursor: (collection: String, rkey: String)?
+        var emittedCount = 0
+        while let record = try await nextRepositoryCARRecord(
+            space: space,
+            author: author,
+            after: lexicalCursor
+        ) {
+            if let cursor = lexicalCursor,
+               record.uri.collection < cursor.collection ||
+               (record.uri.collection == cursor.collection && record.uri.rkey <= cursor.rkey) {
+                throw SQLiteRepositoryError.corruptDatabase("permissioned CAR record order is invalid")
+            }
+            let cid = try validatedRepositoryCARCID(for: record)
+            try writeCARSpoolData(
+                try SpaceCARCodec.streamingBlockPrefix(cid: cid, dataLength: record.value.count),
+                to: bodyHandle
+            )
+            try writeCARSpoolData(record.value, to: bodyHandle)
+            lexicalCursor = (record.uri.collection, record.uri.rkey)
+            emittedCount += 1
+        }
+        guard emittedCount == recordCount else {
+            throw SQLiteRepositoryError.corruptDatabase("permissioned CAR record count changed during snapshot")
+        }
+        try bodyHandle.close()
+        bodyClosed = true
+
+        return AuthorizedSpaceRepositoryCARSnapshot(
+            state: AuthorizedSpaceRepositoryCommitState(
+                space: state.space,
+                author: state.author,
+                wireRevision: state.wireRevision.toString(),
+                commitment: state.commitment
+            ),
+            spool: SpaceCARBodySpool(indexCID: indexCID, bodyURL: bodyURL)
+        )
+    }
+
+    private func repositoryCARRecordCount(
+        space: SpaceURI,
+        author: String
+    ) async throws -> Int {
+        let rows = try await connection.query(
+            """
+            SELECT COUNT(*) AS record_count
+            FROM permissioned_space_records
+            WHERE space_uri = ? AND author_did = ?
+            """,
+            [.text(space.rawValue), .text(author)]
+        )
+        guard let row = rows.first else {
+            throw SQLiteRepositoryError.corruptDatabase("permissioned CAR count is unavailable")
+        }
+        let count = try requiredRevision(row, "record_count")
+        guard count <= UInt64(Int.max) else {
+            throw SQLiteRepositoryError.corruptDatabase("permissioned CAR record count is invalid")
+        }
+        return Int(count)
+    }
+
+    /// Fetches one row at a time rather than retaining an array of repository
+    /// values. Canonical DAG-CBOR map order is length then UTF-8 bytes.
+    private func nextRepositoryCARIndexRecord(
+        space: SpaceURI,
+        author: String,
+        after cursor: (length: Int, path: String)?
+    ) async throws -> PersistedSpaceRecord? {
+        let rows: [SQLiteRow]
+        if let cursor {
+            rows = try await connection.query(
+                """
+                SELECT collection, rkey, value, cid, revision
+                FROM permissioned_space_records
+                WHERE space_uri = ? AND author_did = ?
+                  AND (
+                    length(CAST(collection || '/' || rkey AS BLOB)) > ?
+                    OR (
+                      length(CAST(collection || '/' || rkey AS BLOB)) = ?
+                      AND collection || '/' || rkey > ?
+                    )
+                  )
+                ORDER BY length(CAST(collection || '/' || rkey AS BLOB)), collection || '/' || rkey
+                LIMIT 1
+                """,
+                [
+                    .text(space.rawValue), .text(author),
+                    .integer(cursor.length), .integer(cursor.length), .text(cursor.path),
+                ]
+            )
+        } else {
+            rows = try await connection.query(
+                """
+                SELECT collection, rkey, value, cid, revision
+                FROM permissioned_space_records
+                WHERE space_uri = ? AND author_did = ?
+                ORDER BY length(CAST(collection || '/' || rkey AS BLOB)), collection || '/' || rkey
+                LIMIT 1
+                """,
+                [.text(space.rawValue), .text(author)]
+            )
+        }
+        guard let row = rows.first else { return nil }
+        return try decodeRecord(row, space: space, author: author)
+    }
+
+    /// The proposal requires record blocks to follow lexicographic
+    /// `collection/rkey` order, which is intentionally distinct from the
+    /// canonical map-key order used for the DRISL index.
+    private func nextRepositoryCARRecord(
+        space: SpaceURI,
+        author: String,
+        after cursor: (collection: String, rkey: String)?
+    ) async throws -> PersistedSpaceRecord? {
+        let rows: [SQLiteRow]
+        if let cursor {
+            rows = try await connection.query(
+                """
+                SELECT collection, rkey, value, cid, revision
+                FROM permissioned_space_records
+                WHERE space_uri = ? AND author_did = ?
+                  AND (collection > ? OR (collection = ? AND rkey > ?))
+                ORDER BY collection, rkey
+                LIMIT 1
+                """,
+                [
+                    .text(space.rawValue), .text(author),
+                    .text(cursor.collection), .text(cursor.collection), .text(cursor.rkey),
+                ]
+            )
+        } else {
+            rows = try await connection.query(
+                """
+                SELECT collection, rkey, value, cid, revision
+                FROM permissioned_space_records
+                WHERE space_uri = ? AND author_did = ?
+                ORDER BY collection, rkey
+                LIMIT 1
+                """,
+                [.text(space.rawValue), .text(author)]
+            )
+        }
+        guard let row = rows.first else { return nil }
+        return try decodeRecord(row, space: space, author: author)
+    }
+
+    private func validatedRepositoryCARCID(
+        for record: PersistedSpaceRecord
+    ) throws -> CID {
+        let stored = try CID.parse(record.cid)
+        guard CID.fromDAGCBOR(record.value) == stored else {
+            throw SQLiteRepositoryError.corruptDatabase("permissioned CAR record CID does not match value")
+        }
+        return stored
+    }
+
+    private func repositoryCARFileSize(_ url: URL) throws -> Int {
+        let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+        guard values.isRegularFile == true,
+              let size = values.fileSize,
+              size >= 0
+        else {
+            throw SwanError.unavailable("permissioned CAR spool is unavailable")
+        }
+        return size
+    }
+
+    private func writeCARSpoolData(_ data: Data, to handle: FileHandle) throws {
+        var offset = 0
+        while offset < data.count {
+            let end = min(offset + SpaceCARBodySpool.maximumChunkBytes, data.count)
+            try handle.write(contentsOf: data[offset ..< end])
+            offset = end
+        }
+    }
+
+    private func copyCARSpoolFile(_ source: URL, to destination: FileHandle) throws {
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forReadingFrom: source)
+        } catch {
+            throw SwanError.unavailable("permissioned CAR spool is unavailable")
+        }
+        defer { try? handle.close() }
+        while let chunk = try handle.read(upToCount: SpaceCARBodySpool.maximumChunkBytes),
+              !chunk.isEmpty {
+            try destination.write(contentsOf: chunk)
         }
     }
 
@@ -3976,6 +4292,20 @@ public actor DurableSpaceRepository {
             author: author,
             wireRevision: nil,
             commitment: LtHash().commitment
+        )
+    }
+
+    /// Creates a private, immutable full-recovery snapshot after applying the
+    /// same aggregate read policy used by the repository endpoints. In
+    /// particular, a collection-qualified OAuth scope cannot downgrade this
+    /// into a partial repository export.
+    public func prepareCARSnapshot(
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositoryCARSnapshot? {
+        try requireRead(uri: nil, authorization: authorization)
+        return try await database.prepareRepositoryCARSnapshot(
+            space: space,
+            author: author
         )
     }
 

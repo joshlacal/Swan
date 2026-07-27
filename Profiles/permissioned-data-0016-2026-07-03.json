@@ -18,6 +18,13 @@
   "lexiconManifestSHA256": "9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f",
   "generatedWireManifest": "permissioned-data-0016-2026-07-03.generated-wire.sha256",
   "generatedWireManifestSHA256": "c1d5697f351a4209c7f8a9faaf460d423f9f44f37845ae2c92e150e78c552609",
+  "intentionalDivergences": [
+    {
+      "endpoint": "com.atproto.space.getRepo",
+      "referenceBehavior": "Pinned TypeScript handler throws MethodNotImplementedError and its generated Swift contract exposes a whole Data output.",
+      "swanBehavior": "Streams proposal-0016 two-root full-recovery CARs from a private bounded-memory spool; the generated handler is retained for typed parameter/context semantics but its Data-returning method is never used by the transport."
+    }
+  ],
   "endpoints": [
     "com.atproto.space.applyWrites",
     "com.atproto.space.createRecord",

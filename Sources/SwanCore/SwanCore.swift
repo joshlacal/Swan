@@ -32,6 +32,16 @@ public struct ProtocolProfile: Codable, Sendable, Equatable {
         public let contentBinding: String
     }
 
+    /// A pinned upstream implementation gap that Swan deliberately fills for
+    /// interop testing. Keeping these in the immutable profile prevents a
+    /// locally implemented endpoint from being mistaken for behavior that was
+    /// executable in the reference checkout at the pinned SHA.
+    public struct IntentionalDivergence: Codable, Sendable, Equatable {
+        public let endpoint: String
+        public let referenceBehavior: String
+        public let swanBehavior: String
+    }
+
     public let id: String
     public let proposalCommit: String
     public let referenceImplementationCommit: String
@@ -48,6 +58,7 @@ public struct ProtocolProfile: Codable, Sendable, Equatable {
     public let referenceArchiveSHA256: String?
     public let lexiconManifest: String?
     public let lexiconManifestSHA256: String?
+    public let intentionalDivergences: [IntentionalDivergence]
 
     public init(data: Data) throws {
         do {
@@ -73,6 +84,9 @@ public struct ProtocolProfile: Codable, Sendable, Equatable {
             }) else {
                 throw SwanError.invalidProfile("invalid SHA-256 pin")
             }
+        }
+        guard intentionalDivergences.allSatisfy({ endpoints.contains($0.endpoint) }) else {
+            throw SwanError.invalidProfile("divergence references an endpoint outside the profile")
         }
     }
 

@@ -446,6 +446,12 @@ public struct SwanHTTPServer: Sendable {
                     on: router,
                     capability: authenticatedSpaceRepositorySync
                 )
+            } else if descriptor.nsid == ComAtprotoSpaceGetRepo.typeIdentifier,
+                      let authenticatedSpaceRepositorySync {
+                registerAuthenticatedGetRepoEndpoint(
+                    on: router,
+                    capability: authenticatedSpaceRepositorySync
+                )
             } else if let authenticatedSimpleSpaceLifecycle,
                       Self.isSimpleSpaceLifecycleMethod(descriptor.nsid) {
                 if !installedSimpleSpaceLifecycle {

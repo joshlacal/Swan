@@ -1070,6 +1070,99 @@ final class SwanSpacesTests: XCTestCase {
         try await aliceDatabase.close()
         try await bobDatabase.close()
     }
+
+    func testPrivateCARSpoolBoundsChunksAndCleansUpOnSuccessAndFailure() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanCARSpoolTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let successURL = root.appending(path: "success.spool")
+        FileManager.default.createFile(
+            atPath: successURL.path,
+            contents: nil,
+            attributes: [.posixPermissions: NSNumber(value: 0o600)]
+        )
+        let expectedBytes = SpaceCARBodySpool.maximumChunkBytes * 3 + 19
+        let successHandle = try FileHandle(forWritingTo: successURL)
+        let sourceChunk = Data(repeating: 0x5a, count: SpaceCARBodySpool.maximumChunkBytes)
+        for _ in 0 ..< 3 { try successHandle.write(contentsOf: sourceChunk) }
+        try successHandle.write(contentsOf: Data(repeating: 0xa5, count: 19))
+        try successHandle.close()
+
+        let spool = SpaceCARBodySpool(
+            indexCID: CID.fromDAGCBOR(Data([0xa0])),
+            bodyURL: successURL
+        )
+        let collector = CARChunkCollector()
+        try await spool.streamBody { chunk in
+            await collector.append(chunk.count)
+        }
+        let streamedTotal = await collector.total
+        let maximumChunk = await collector.maximum
+        XCTAssertEqual(streamedTotal, expectedBytes)
+        XCTAssertEqual(maximumChunk, SpaceCARBodySpool.maximumChunkBytes)
+        XCTAssertTrue(spool.isCleanedUp)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: successURL.path))
+
+        let failureURL = root.appending(path: "failure.spool")
+        try Data(repeating: 0x3c, count: SpaceCARBodySpool.maximumChunkBytes + 1)
+            .write(to: failureURL, options: .atomic)
+        let failingSpool = SpaceCARBodySpool(
+            indexCID: CID.fromDAGCBOR(Data([0xa0])),
+            bodyURL: failureURL
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await failingSpool.streamBody { _ in throw CARSpoolTestError.stop }
+        )
+        XCTAssertTrue(failingSpool.isCleanedUp)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: failureURL.path))
+    }
+
+    func testPrivateCARSpool256MiBStressWhenExplicitlyEnabled() async throws {
+        guard ProcessInfo.processInfo.environment["SWAN_CAR_256M_STRESS"] == "1" else {
+            throw XCTSkip("set SWAN_CAR_256M_STRESS=1 to run the 256 MiB CAR streaming stress harness")
+        }
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanCARSpoolStress-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let url = root.appending(path: "car.spool")
+        FileManager.default.createFile(
+            atPath: url.path,
+            contents: nil,
+            attributes: [.posixPermissions: NSNumber(value: 0o600)]
+        )
+        let handle = try FileHandle(forWritingTo: url)
+        let chunk = Data(repeating: 0x91, count: SpaceCARBodySpool.maximumChunkBytes)
+        for _ in 0 ..< (256 * 1_024 * 1_024 / SpaceCARBodySpool.maximumChunkBytes) {
+            try handle.write(contentsOf: chunk)
+        }
+        try handle.close()
+
+        let spool = SpaceCARBodySpool(indexCID: CID.fromDAGCBOR(Data([0xa0])), bodyURL: url)
+        let collector = CARChunkCollector()
+        try await spool.streamBody { bodyChunk in
+            await collector.append(bodyChunk.count)
+        }
+        let streamedTotal = await collector.total
+        let maximumChunk = await collector.maximum
+        XCTAssertEqual(streamedTotal, 256 * 1_024 * 1_024)
+        XCTAssertEqual(maximumChunk, SpaceCARBodySpool.maximumChunkBytes)
+        XCTAssertTrue(spool.isCleanedUp)
+    }
+}
+
+private enum CARSpoolTestError: Error { case stop }
+
+private actor CARChunkCollector {
+    private(set) var total = 0
+    private(set) var maximum = 0
+
+    func append(_ count: Int) {
+        total += count
+        maximum = max(maximum, count)
+    }
 }
 
 private func highSVariant(of canonicalSignature: Data) -> Data {

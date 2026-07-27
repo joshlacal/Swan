@@ -35,10 +35,113 @@ public struct SwanAuthenticatedSpaceRepositorySyncCapability: Sendable {
 private enum AuthenticatedSpaceRepositorySyncFailure: Error {
     case invalidRequest
     case spaceNotFound
+    case repoNotFound
     case denied
     case nonceChallenge
     case fullRecoveryRequired
     case unavailable
+}
+
+/// The generated contract's `Output` currently contains a whole `Data`
+/// payload even though its lexicon output is `application/vnd.ipld.car`. The
+/// semantic handler therefore conforms to the generated contract for its
+/// typed parameter/context boundary, while the Hummingbird adapter invokes
+/// `prepare` and streams the resulting suffix. Calling `handle` would force
+/// an unsafe response-wide allocation and is intentionally unavailable.
+private struct AuthenticatedGetRepoHandler:
+    ComAtprotoSpaceGetRepo.ServerHandler
+{
+    typealias Context = Request
+    let capability: SwanAuthenticatedSpaceRepositorySyncCapability
+
+    struct PreparedResponse: Sendable {
+        let prefix: Data
+        let spool: SpaceCARBodySpool
+    }
+
+    func prepare(
+        parameters: ComAtprotoSpaceGetRepo.Parameters,
+        context request: Request
+    ) async throws -> PreparedResponse {
+        let target = try syncTarget(parameters.space, parameters.repo)
+        let authorization = try await authorizeRepositorySyncRead(
+            capability,
+            request: request,
+            expectedSpace: target.space,
+            fixedPath: "/xrpc/com.atproto.space.getRepo"
+        )
+        try requireRepositoryReadAuthorization(authorization, author: target.author)
+        let snapshot: AuthorizedSpaceRepositoryCARSnapshot?
+        do {
+            snapshot = try await capability.directory.repositoryCARSnapshot(
+                space: target.space,
+                author: target.author,
+                authorization: authorization
+            )
+        } catch let error as SwanError {
+            if case .unauthorized = error {
+                throw AuthenticatedSpaceRepositorySyncFailure.denied
+            }
+            if case .malformed = error {
+                throw AuthenticatedSpaceRepositorySyncFailure.invalidRequest
+            }
+            throw AuthenticatedSpaceRepositorySyncFailure.unavailable
+        } catch {
+            throw AuthenticatedSpaceRepositorySyncFailure.unavailable
+        }
+        guard let snapshot else {
+            throw AuthenticatedSpaceRepositorySyncFailure.repoNotFound
+        }
+
+        do {
+            guard snapshot.state.space == target.space,
+                  snapshot.state.author == target.author,
+                  snapshot.state.commitment.count == 32,
+                  let revision = snapshot.state.wireRevision
+            else {
+                throw AuthenticatedSpaceRepositorySyncFailure.unavailable
+            }
+            _ = try TID(tidString: revision)
+            let envelope = try await capability.commitSigner.signRepositoryCommit(
+                space: target.space,
+                author: target.author,
+                wireRevision: revision,
+                commitment: snapshot.state.commitment
+            )
+            guard envelope.ver == 1,
+                  envelope.context.space == target.space,
+                  envelope.context.author == target.author,
+                  envelope.context.rev == revision,
+                  envelope.commitment == snapshot.state.commitment,
+                  SpaceCommitCodec.verifyContentBinding(envelope)
+            else {
+                throw AuthenticatedSpaceRepositorySyncFailure.unavailable
+            }
+            return PreparedResponse(
+                prefix: try SpaceCARCodec.recoveryPrefix(
+                    commit: envelope,
+                    indexCID: snapshot.spool.indexCID
+                ),
+                spool: snapshot.spool
+            )
+        } catch {
+            snapshot.spool.cleanup()
+            if let failure = error as? AuthenticatedSpaceRepositorySyncFailure {
+                throw failure
+            }
+            throw AuthenticatedSpaceRepositorySyncFailure.unavailable
+        }
+    }
+
+    func handle(
+        parameters: ComAtprotoSpaceGetRepo.Parameters,
+        input _: Void,
+        context request: Request
+    ) async throws -> ComAtprotoSpaceGetRepo.Output {
+        let prepared = try await prepare(parameters: parameters, context: request)
+        prepared.spool.cleanup()
+        throw AuthenticatedSpaceRepositorySyncFailure.unavailable
+    }
 }
 
 private struct AuthenticatedGetLatestCommitHandler:
@@ -399,6 +502,47 @@ func registerAuthenticatedListRepoOpsEndpoint(
     registerAuthenticatedRepositorySyncWrongMethods(on: router, path: path)
 }
 
+func registerAuthenticatedGetRepoEndpoint(
+    on router: Router<BasicRequestContext>,
+    capability: SwanAuthenticatedSpaceRepositorySyncCapability
+) {
+    let handler = AuthenticatedGetRepoHandler(capability: capability)
+    let path: RouterPath = "/xrpc/com.atproto.space.getRepo"
+    router.get(path) { request, _ async -> Response in
+        let parameters: ComAtprotoSpaceGetRepo.Parameters
+        do {
+            parameters = try parseAuthenticatedGetRepoParameters(request)
+        } catch {
+            return authenticatedRepositorySyncError(.badRequest, code: "InvalidRequest")
+        }
+        do {
+            let prepared = try await handler.prepare(parameters: parameters, context: request)
+            // No content length is supplied: writing directly from the private
+            // spool is the deliberate bounded-memory transport contract.
+            return Response(
+                status: .ok,
+                headers: [
+                    .contentType: "application/vnd.ipld.car",
+                    .cacheControl: "no-store",
+                ],
+                body: .init { writer in
+                    defer { prepared.spool.cleanup() }
+                    try await writer.write(ByteBuffer(data: prepared.prefix))
+                    try await prepared.spool.streamBody { chunk in
+                        try await writer.write(ByteBuffer(data: chunk))
+                    }
+                    try await writer.finish(nil)
+                }
+            )
+        } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
+            return authenticatedRepositorySyncResponse(for: failure, capability: capability)
+        } catch {
+            return authenticatedRepositorySyncError(.serviceUnavailable, code: "temporarily_unavailable")
+        }
+    }
+    registerAuthenticatedRepositorySyncWrongMethods(on: router, path: path)
+}
+
 private func parseAuthenticatedGetLatestCommitParameters(
     _ request: Request
 ) throws -> ComAtprotoSpaceGetLatestCommit.Parameters {
@@ -447,6 +591,24 @@ private func parseAuthenticatedListRepoOpsParameters(
     )
 }
 
+private func parseAuthenticatedGetRepoParameters(
+    _ request: Request
+) throws -> ComAtprotoSpaceGetRepo.Parameters {
+    let query = try strictAuthenticatedRecordQuery(
+        request,
+        required: ["space", "repo"],
+        optional: []
+    )
+    let space = try ATProtocolURI(
+        uriString: try requiredQueryValue("space", in: query, maximumBytes: 2_048)
+    )
+    let repo = try DID(
+        didString: try requiredQueryValue("repo", in: query, maximumBytes: 2_048)
+    )
+    _ = try syncTarget(space, repo)
+    return .init(space: space, repo: repo)
+}
+
 private func strictRepositoryOplogLimit(_ value: String) throws -> Int {
     guard !value.isEmpty,
           value.utf8.allSatisfy({ $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }),
@@ -482,6 +644,8 @@ private func authenticatedRepositorySyncResponse(
         authenticatedRepositorySyncError(.badRequest, code: "InvalidRequest")
     case .spaceNotFound:
         authenticatedRepositorySyncError(.notFound, code: "SpaceNotFound")
+    case .repoNotFound:
+        authenticatedRepositorySyncError(.notFound, code: "RepoNotFound")
     case .denied:
         authenticatedRepositorySyncError(.unauthorized, code: "Unauthorized")
     case .nonceChallenge:

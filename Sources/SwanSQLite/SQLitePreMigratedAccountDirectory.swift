@@ -451,6 +451,47 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
+    /// Creates the bounded-memory full-recovery spool only through a database
+    /// that was opened at startup. The durable repository applies aggregate
+    /// read policy before it can read any record, and this facade rechecks
+    /// account lifecycle/path validity before returning the opaque spool.
+    public func repositoryCARSnapshot(
+        space: SpaceURI,
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositoryCARSnapshot? {
+        let database = try await preopenedRepositoryDatabase(
+            for: author,
+            authorization: authorization
+        )
+        guard let database else {
+            throw SwanError.unauthorized("account repository is unavailable")
+        }
+        do {
+            let repository = try DurableSpaceRepository(
+                database: database,
+                space: space,
+                author: author
+            )
+            let snapshot = try await repository.prepareCARSnapshot(
+                authorization: authorization
+            )
+            guard try await isActiveAccount(author) else {
+                snapshot?.spool.cleanup()
+                throw SwanError.unauthorized("account repository is unavailable")
+            }
+            guard !isClosed else {
+                snapshot?.spool.cleanup()
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return snapshot
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
     /// Writes only through a database that was opened and migrated before the
     /// listener accepted traffic. The actor rechecks lifecycle, terminal
     /// shutdown, and the resolved database path around the durable operation;
