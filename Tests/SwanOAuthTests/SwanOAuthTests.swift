@@ -918,6 +918,65 @@ final class SwanOAuthTests: XCTestCase {
         XCTAssertThrowsError(try ambiguous.select(keyID: nil))
         try await database.close()
     }
+
+    func testBoundedJSONPosterRejectsPrivateDNSAndRebinding() async throws {
+        let url = URL(string: "https://notify.example/xrpc/com.atproto.space.notifyWrite")!
+        let publicAddress = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+        let privateAddress = try XCTUnwrap(OAuthIPAddress(literal: "10.0.0.7"))
+        let policy = try OAuthRemoteFetchPolicy(maximumBodyBytes: 1_024, timeout: 2)
+        let body = Data("{\"space\":\"at://did:plc:alice/app.bsky.bookmarks/self\"}".utf8)
+
+        let safeTransport = TestPostTransport(response: .init(
+            status: 204,
+            headers: ["content-length": ["0"]],
+            body: Data(),
+            responseURL: url
+        ))
+        let safePoster = OAuthBoundedJSONPoster(
+            policy: policy,
+            resolver: TestResolver(answers: [[publicAddress], [publicAddress]]),
+            transport: safeTransport
+        )
+        try await safePoster.postJSON(
+            to: url,
+            headers: ["content-type": "application/json"],
+            body: body
+        )
+        let safeRequests = await safeTransport.requestCount()
+        XCTAssertEqual(safeRequests, 1)
+
+        let privateTransport = TestPostTransport(response: .init(
+            status: 204, headers: [:], body: Data(), responseURL: url
+        ))
+        let privatePoster = OAuthBoundedJSONPoster(
+            policy: policy,
+            resolver: TestResolver(answers: [[privateAddress]]),
+            transport: privateTransport
+        )
+        await XCTAssertThrowsErrorAsync(try await privatePoster.postJSON(
+            to: url,
+            headers: ["content-type": "application/json"],
+            body: body
+        ))
+        let privateRequests = await privateTransport.requestCount()
+        XCTAssertEqual(privateRequests, 0)
+
+        let rebindingTransport = TestPostTransport(response: .init(
+            status: 204, headers: [:], body: Data(), responseURL: url
+        ))
+        let rebindingPoster = OAuthBoundedJSONPoster(
+            policy: policy,
+            resolver: TestResolver(answers: [[publicAddress], [privateAddress]]),
+            transport: rebindingTransport
+        )
+        await XCTAssertThrowsErrorAsync(try await rebindingPoster.postJSON(
+            to: url,
+            headers: ["content-type": "application/json"],
+            body: body
+        ))
+        let rebindingRequests = await rebindingTransport.requestCount()
+        XCTAssertEqual(rebindingRequests, 1)
+    }
 }
 
 private func publicOAuthSession(
@@ -1072,6 +1131,28 @@ private actor TestTransport: OAuthRemoteTransport {
         guard let response = responses[url.absoluteString] else {
             throw SwanError.unavailable("test transport has no response")
         }
+        return response
+    }
+
+    func requestCount() -> Int { requests }
+}
+
+private actor TestPostTransport: OAuthRemotePostTransport {
+    private let response: OAuthRemoteHTTPResponse
+    private var requests = 0
+
+    init(response: OAuthRemoteHTTPResponse) {
+        self.response = response
+    }
+
+    func post(
+        url _: URL,
+        headers _: [String: String],
+        body _: Data,
+        timeout _: TimeInterval,
+        maximumResponseBodyBytes _: Int
+    ) async throws -> OAuthRemoteHTTPResponse {
+        requests += 1
         return response
     }
 

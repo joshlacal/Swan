@@ -54,7 +54,7 @@ public enum OAuthIPAddress: Hashable, Sendable, Equatable, CustomStringConvertib
         }
     }
 
-    fileprivate var isLoopback: Bool {
+    public var isLoopback: Bool {
         switch self {
         case let .ipv4(value): (value >> 24) == 127
         case let .ipv6(bytes): bytes == Data(repeating: 0, count: 15) + Data([1])
@@ -64,7 +64,7 @@ public enum OAuthIPAddress: Hashable, Sendable, Equatable, CustomStringConvertib
     /// True only for globally routable addresses. The intentional deny list
     /// includes private, loopback, link-local, CGNAT, documentation, multicast,
     /// and other reserved/special-purpose ranges rather than merely RFC1918.
-    fileprivate var isPublicInternetAddress: Bool {
+    public var isPublicInternetAddress: Bool {
         switch self {
         case let .ipv4(value):
             let first = UInt8((value >> 24) & 0xFF)
@@ -134,7 +134,7 @@ public struct OAuthRemoteFetchPolicy: Sendable, Equatable {
         self.timeout = timeout
     }
 
-    fileprivate func validateURL(_ url: URL) throws -> String {
+    public func validateURL(_ url: URL) throws -> String {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let scheme = components.scheme?.lowercased(), let host = components.host,
               components.user == nil, components.password == nil, components.fragment == nil else {
@@ -153,14 +153,14 @@ public struct OAuthRemoteFetchPolicy: Sendable, Equatable {
         return host
     }
 
-    fileprivate func validateResolved(_ addresses: [OAuthIPAddress], host: String) throws {
+    public func validateResolved(_ addresses: [OAuthIPAddress], host: String) throws {
         guard !addresses.isEmpty, addresses.count <= 32,
               addresses.allSatisfy({ permits($0, forHost: host) }) else {
             throw SwanError.unauthorized("OAuth remote host resolved to a forbidden address")
         }
     }
 
-    fileprivate func permits(_ address: OAuthIPAddress, forHost host: String) -> Bool {
+    public func permits(_ address: OAuthIPAddress, forHost host: String) -> Bool {
         if networkAllowlist.addresses.contains(address) { return true }
         if allowLocalhostDevelopment && host == "localhost" && address.isLoopback { return true }
         return address.isPublicInternetAddress
@@ -408,4 +408,163 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         guard !value.isEmpty, value.utf8.allSatisfy({ (48 ... 57).contains($0) }) else { return nil }
         return Int(value)
     }
+}
+
+/// A bounded POST transport for service-to-service control-plane traffic.
+/// This is separate from `OAuthRemoteTransport` so existing metadata fetch
+/// fakes cannot accidentally gain a request-body capability.
+public protocol OAuthRemotePostTransport: Sendable {
+    func post(
+        url: URL,
+        headers: [String: String],
+        body: Data,
+        timeout: TimeInterval,
+        maximumResponseBodyBytes: Int
+    ) async throws -> OAuthRemoteHTTPResponse
+}
+
+/// AsyncHTTPClient adapter for the narrow outbound service-notification path.
+/// Redirects and decompression remain disabled, and callers must still use
+/// `OAuthBoundedJSONPoster` for URL and DNS policy before invoking it.
+public final class AsyncHTTPClientOAuthPostTransport: OAuthRemotePostTransport {
+    private let client: HTTPClient
+    private let maximumTransportTimeout: TimeInterval
+
+    public init(maximumTransportTimeout: TimeInterval = 5) throws {
+        guard maximumTransportTimeout > 0,
+              maximumTransportTimeout <= 30,
+              maximumTransportTimeout.isFinite else {
+            throw SwanError.malformed("OAuth POST transport timeout is invalid")
+        }
+        self.maximumTransportTimeout = maximumTransportTimeout
+        let timeout = HTTPClient.Configuration.Timeout(
+            connect: .milliseconds(Int64(maximumTransportTimeout * 1_000)),
+            read: .milliseconds(Int64(maximumTransportTimeout * 1_000))
+        )
+        client = HTTPClient(configuration: .init(
+            redirectConfiguration: .disallow,
+            timeout: timeout,
+            decompression: .disabled
+        ))
+    }
+
+    deinit {
+        client.shutdown { _ in }
+    }
+
+    public func post(
+        url: URL,
+        headers: [String: String],
+        body: Data,
+        timeout: TimeInterval,
+        maximumResponseBodyBytes: Int
+    ) async throws -> OAuthRemoteHTTPResponse {
+        guard timeout <= maximumTransportTimeout,
+              body.count <= 64 * 1_024 else {
+            throw SwanError.unavailable("OAuth POST transport bounds exceeded")
+        }
+        var request = HTTPClientRequest(url: url.absoluteString)
+        request.method = .POST
+        for (name, value) in headers {
+            request.headers.add(name: name, value: value)
+        }
+        request.body = .bytes(body)
+        let response = try await client.execute(
+            request,
+            timeout: .milliseconds(Int64(timeout * 1_000))
+        )
+        let buffer = try await response.body.collect(upTo: maximumResponseBodyBytes)
+        let bytes = buffer.getBytes(at: buffer.readerIndex, length: buffer.readableBytes) ?? []
+        var responseHeaders: [String: [String]] = [:]
+        for header in response.headers {
+            responseHeaders[header.name.lowercased(), default: []].append(header.value)
+        }
+        return OAuthRemoteHTTPResponse(
+            status: Int(response.status.code),
+            headers: responseHeaders,
+            body: Data(bytes),
+            responseURL: response.url ?? url,
+            redirectCount: max(0, response.history.count - 1),
+            connectedPeerAddress: nil
+        )
+    }
+}
+
+/// Applies the same URL, DNS re-resolution, peer-address, redirect, timeout,
+/// and response-size policy as OAuth metadata discovery to a small JSON POST.
+/// It intentionally does not inspect a success body: service notifications
+/// have no response payload contract and must not become a data-fetch path.
+public struct OAuthBoundedJSONPoster: Sendable {
+    public let policy: OAuthRemoteFetchPolicy
+    private let resolver: any OAuthHostnameResolving
+    private let transport: any OAuthRemotePostTransport
+
+    public init(
+        policy: OAuthRemoteFetchPolicy,
+        resolver: any OAuthHostnameResolving = SystemOAuthHostnameResolver(),
+        transport: any OAuthRemotePostTransport
+    ) {
+        self.policy = policy
+        self.resolver = resolver
+        self.transport = transport
+    }
+
+    public func postJSON(
+        to url: URL,
+        headers: [String: String],
+        body: Data
+    ) async throws {
+        guard !body.isEmpty, body.count <= min(policy.maximumBodyBytes, 64 * 1_024) else {
+            throw SwanError.malformed("outbound JSON body is out of bounds")
+        }
+        let host = try policy.validateURL(url)
+        try policy.validateResolved(try await resolver.resolve(host: host), host: host)
+        let response: OAuthRemoteHTTPResponse
+        do {
+            response = try await transport.post(
+                url: url,
+                headers: headers,
+                body: body,
+                timeout: policy.timeout,
+                maximumResponseBodyBytes: policy.maximumBodyBytes
+            )
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("outbound notification request failed")
+        }
+        // Re-resolve after the request. Deployments that require a strict
+        // final-peer proof must inject a transport that reports that peer.
+        try policy.validateResolved(try await resolver.resolve(host: host), host: host)
+        guard response.redirectCount == 0,
+              response.responseURL.absoluteString == url.absoluteString,
+              (200 ... 299).contains(response.status),
+              response.body.count <= policy.maximumBodyBytes else {
+            throw SwanError.unauthorized("outbound notification response is invalid")
+        }
+        if let peer = response.connectedPeerAddress {
+            guard policy.permits(peer, forHost: host) else {
+                throw SwanError.unauthorized("outbound notification peer is forbidden")
+            }
+        }
+        let normalized = response.headers.reduce(into: [String: [String]]()) { output, item in
+            output[item.key.lowercased(), default: []].append(contentsOf: item.value)
+        }
+        if let lengths = normalized["content-length"] {
+            guard lengths.count == 1,
+                  let declared = strictOutboundDecimal(lengths[0]),
+                  declared == response.body.count,
+                  declared <= policy.maximumBodyBytes else {
+                throw SwanError.unauthorized("outbound notification response length is invalid")
+            }
+        }
+    }
+}
+
+private func strictOutboundDecimal(_ value: String) -> Int? {
+    guard !value.isEmpty,
+          value.utf8.allSatisfy({ (48 ... 57).contains($0) }) else {
+        return nil
+    }
+    return Int(value)
 }

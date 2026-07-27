@@ -384,13 +384,16 @@ public enum OAuthCompactJWT {
 /// names before Foundation's Codable decoder sees an untrusted document.
 /// Duplicate names are otherwise accepted by JSONDecoder with last-value-wins
 /// behavior, which is unsuitable for signed JOSE headers and metadata.
-enum StrictJSON {
-    static func validate(_ data: Data) throws {
+/// Duplicate-member-free JSON validation shared by the OAuth and narrowly
+/// generated XRPC adapters. It validates complete UTF-8 JSON before Codable
+/// would otherwise accept duplicate keys with last-value-wins semantics.
+public enum StrictJSON {
+    public static func validate(_ data: Data) throws {
         var parser = Parser(bytes: Array(data))
         try parser.parseDocument()
     }
 
-    static func decode<Value: Decodable>(_ type: Value.Type, from data: Data) throws -> Value {
+    public static func decode<Value: Decodable>(_ type: Value.Type, from data: Data) throws -> Value {
         try validate(data)
         do {
             return try JSONDecoder().decode(type, from: data)

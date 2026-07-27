@@ -189,6 +189,82 @@ public enum SQLiteLayout {
         """,
     ]
 
+    /// The authority-owned synchronisation registry. These rows contain only
+    /// DIDs, TIDs, LtHash commitments, opaque service-event IDs, and delivery
+    /// endpoints. They never contain a record CID/value, CAR, credential, or
+    /// private blob reference. Keep this separate from the member tables:
+    /// writer discovery is explicitly not an access-control list.
+    static let spaceNotificationSchemaStatements = [
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_space_writers (
+            space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
+            repo_did TEXT NOT NULL,
+            wire_revision TEXT NOT NULL,
+            commitment BLOB NOT NULL CHECK(length(commitment) = 32),
+            updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+            PRIMARY KEY(space_uri, repo_did)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_space_notification_registrations (
+            space_uri TEXT NOT NULL REFERENCES permissioned_simple_space_authorities(space_uri) ON DELETE CASCADE,
+            endpoint TEXT NOT NULL,
+            repo_did TEXT,
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+            updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+            PRIMARY KEY(space_uri, endpoint),
+            CHECK(length(endpoint) > 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_space_notification_receipts (
+            issuer TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            space_uri TEXT NOT NULL,
+            received_at INTEGER NOT NULL CHECK(received_at >= 0),
+            PRIMARY KEY(issuer, event_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_space_notification_fanout (
+            id TEXT PRIMARY KEY,
+            source_issuer TEXT NOT NULL,
+            source_event_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('write', 'deleted')),
+            space_uri TEXT NOT NULL,
+            repo_did TEXT,
+            wire_revision TEXT,
+            commitment BLOB,
+            endpoint TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            available_at INTEGER NOT NULL CHECK(available_at >= 0),
+            lease_token TEXT,
+            lease_expires_at INTEGER,
+            UNIQUE(source_issuer, source_event_id, kind, endpoint),
+            CHECK(
+                (kind = 'write' AND repo_did IS NOT NULL AND wire_revision IS NOT NULL
+                    AND commitment IS NOT NULL AND length(commitment) = 32)
+                OR (kind = 'deleted' AND repo_did IS NULL AND wire_revision IS NULL
+                    AND commitment IS NULL)
+            ),
+            CHECK(
+                (lease_token IS NULL AND lease_expires_at IS NULL)
+                OR (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL
+                    AND lease_expires_at >= 0)
+            )
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS permissioned_space_writers_page
+        ON permissioned_space_writers(space_uri, repo_did)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS permissioned_space_notification_fanout_available
+        ON permissioned_space_notification_fanout(available_at, created_at, id)
+        """,
+    ]
+
     public static let accountMigrations = accountConnectionPragmas + [
         // These four tables are retained for compatibility with the initial
         // alpha sketch. Durable repository APIs below use the explicitly
@@ -629,6 +705,67 @@ public struct PersistedOutboxLease: Sendable, Equatable {
     }
 }
 
+/// A durable authority fanout intent. It is deliberately independent from
+/// the writer PDS outbox: the former is created while accepting an incoming
+/// service announcement, whereas the latter is created atomically with a
+/// local repository commit. Neither carries any permissioned record content.
+public struct PersistedSpaceNotificationFanout: Sendable, Equatable {
+    public enum Kind: String, Sendable, Equatable {
+        case write
+        case deleted
+    }
+
+    public let id: UUID
+    public let sourceIssuer: String
+    public let sourceEventID: String
+    public let kind: Kind
+    public let space: SpaceURI
+    public let repository: String?
+    public let wireRevision: String?
+    public let commitment: Data?
+    public let endpoint: String
+    public let attempts: Int
+
+    public init(
+        id: UUID,
+        sourceIssuer: String,
+        sourceEventID: String,
+        kind: Kind,
+        space: SpaceURI,
+        repository: String?,
+        wireRevision: String?,
+        commitment: Data?,
+        endpoint: String,
+        attempts: Int
+    ) {
+        self.id = id
+        self.sourceIssuer = sourceIssuer
+        self.sourceEventID = sourceEventID
+        self.kind = kind
+        self.space = space
+        self.repository = repository
+        self.wireRevision = wireRevision
+        self.commitment = commitment
+        self.endpoint = endpoint
+        self.attempts = attempts
+    }
+}
+
+/// A lease for one authority fanout intent. The endpoint is exposed only to a
+/// transport after it has been validated by that transport's SSRF policy; it
+/// is never rendered by a public XRPC response or stored in an error string.
+public struct PersistedSpaceNotificationFanoutLease: Sendable, Equatable {
+    public let event: PersistedSpaceNotificationFanout
+    public let token: UUID
+    public let expiresAt: Date
+
+    public init(event: PersistedSpaceNotificationFanout, token: UUID, expiresAt: Date) {
+        self.event = event
+        self.token = token
+        self.expiresAt = expiresAt
+    }
+}
+
 private actor SQLiteConnectionGate {
     private var isHeld = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -855,6 +992,15 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         // schema transaction so foreign-key enforcement can be disabled only
         // for that tightly scoped copy.
         try await migrateSimpleSpaceAuthoritySchemaIfNeeded()
+        // These tables reference the current v3 authority parent. Install
+        // them only after any old simple-space parent has been rebuilt; doing
+        // it in the base transaction would make SQLite retarget their foreign
+        // keys to the temporary v2 parent during an upgrade.
+        try await transaction {
+            for statement in SQLiteLayout.spaceNotificationSchemaStatements {
+                _ = try await connection.query(statement)
+            }
+        }
     }
 
     /// Upgrades rows written before the persistence API owned its state marker
@@ -2960,7 +3106,374 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                         .text(space.rawValue),
                     ]
                 )
+                // The lifecycle tombstone and every registered-recipient
+                // notification intent commit together.  Delivery happens
+                // later through the lease worker; endpoint strings stay
+                // opaque here and no record/CAR data enters the queue.
+                let deletionEventID = UUID().uuidString.lowercased()
+                let recipients = try await connection.query(
+                    """
+                    SELECT endpoint FROM permissioned_space_notification_registrations
+                    WHERE space_uri = ? AND expires_at > ?
+                    ORDER BY endpoint ASC
+                    """,
+                    [.text(space.rawValue), .integer(timestamp)]
+                )
+                for row in recipients {
+                    let endpoint = try validNotificationEndpoint(
+                        try requiredText(row, "endpoint")
+                    )
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO permissioned_space_notification_fanout(
+                            id, source_issuer, source_event_id, kind, space_uri,
+                            repo_did, wire_revision, commitment, endpoint,
+                            attempts, created_at, available_at,
+                            lease_token, lease_expires_at
+                        ) VALUES (?, ?, ?, 'deleted', ?, NULL, NULL, NULL, ?, 0, ?, ?, NULL, NULL)
+                        ON CONFLICT(source_issuer, source_event_id, kind, endpoint) DO NOTHING
+                        """,
+                        [
+                            .text(UUID().uuidString), .text(space.authority),
+                            .text(deletionEventID), .text(space.rawValue),
+                            .text(endpoint), .integer(timestamp), .integer(timestamp),
+                        ]
+                    )
+                }
                 return try await requiredSimpleSpace(space).state
+            }
+        }
+    }
+
+    // MARK: Authority writer set and notification registry
+
+    /// Lists only the authority's durable writer hint after a verified space
+    /// credential has bound the request to this exact space. This is not a
+    /// member-list read and must never become an OAuth/public discovery path.
+    public func spaceWriters(
+        space: SpaceURI,
+        limit: Int,
+        cursor: String?,
+        authorization: AuthorizationContext
+    ) async throws -> [AuthorizedSpaceWriter] {
+        guard (1 ... 1_000).contains(limit) else {
+            throw SwanError.malformed("invalid writer page limit")
+        }
+        if let cursor {
+            guard isValidSimpleSpaceDID(cursor) else {
+                throw SwanError.malformed("invalid writer cursor")
+            }
+        }
+        try requireAuthorityAccount(space: space)
+        guard case let .spaceCredential(grant) = authorization,
+              grant.space == space else {
+            throw SwanError.unauthorized("space credential is required")
+        }
+        try grant.allows(.read)
+        return try await withConnectionGate {
+            try await readTransaction {
+                let state = try await requiredSimpleSpace(space)
+                try requireActiveSimpleSpace(state.state)
+                var values: [SQLiteData] = [.text(space.rawValue)]
+                var cursorClause = ""
+                if let cursor {
+                    cursorClause = " AND repo_did > ?"
+                    values.append(.text(cursor))
+                }
+                values.append(.integer(limit))
+                let rows = try await connection.query(
+                    """
+                    SELECT repo_did, wire_revision, commitment
+                    FROM permissioned_space_writers
+                    WHERE space_uri = ?\(cursorClause)
+                    ORDER BY repo_did ASC
+                    LIMIT ?
+                    """,
+                    values
+                )
+                return try rows.map { row in
+                    let repository = try requiredText(row, "repo_did")
+                    guard isValidSimpleSpaceDID(repository) else {
+                        throw SQLiteRepositoryError.corruptDatabase("invalid writer repository")
+                    }
+                    let wireRevision = try requiredTID(row, "wire_revision").toString()
+                    let commitment = try requiredBlob(row, "commitment")
+                    guard commitment.count == 32 else {
+                        throw SQLiteRepositoryError.corruptDatabase("invalid writer commitment")
+                    }
+                    return AuthorizedSpaceWriter(
+                        space: space,
+                        repository: repository,
+                        wireRevision: wireRevision,
+                        commitment: commitment
+                    )
+                }
+            }
+        }
+    }
+
+    /// Replaces one endpoint's subscription atomically. A registration is
+    /// keyed by the delivery endpoint, matching the pinned PDS. Re-registering
+    /// with a different optional repo replaces it; expiry cleanup below acts
+    /// as removal without accepting a broad administration endpoint.
+    public func registerSpaceNotification(
+        _ registration: AuthorizedSpaceNotificationRegistration,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws {
+        let endpoint = try validNotificationEndpoint(registration.endpoint)
+        if let repository = registration.repository {
+            guard isValidSimpleSpaceDID(repository) else {
+                throw SwanError.invalidIdentifier("notification repository")
+            }
+        }
+        let timestamp = try simpleSpaceTimestamp(now)
+        let expiry = try simpleSpaceTimestamp(registration.expiresAt)
+        guard expiry > timestamp,
+              expiry - timestamp <= 24 * 60 * 60 * 1_000_000 else {
+            throw SwanError.malformed("notification registration lifetime is invalid")
+        }
+        try requireAuthorityAccount(space: registration.space)
+        guard case let .spaceCredential(grant) = authorization,
+              grant.space == registration.space else {
+            throw SwanError.unauthorized("space credential is required")
+        }
+        try grant.allows(.read)
+        try await withConnectionGate {
+            try await transaction {
+                let state = try await requiredSimpleSpace(registration.space)
+                try requireActiveSimpleSpace(state.state)
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_space_notification_registrations(
+                        space_uri, endpoint, repo_did, expires_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(space_uri, endpoint) DO UPDATE SET
+                        repo_did = excluded.repo_did,
+                        expires_at = excluded.expires_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    [
+                        .text(registration.space.rawValue), .text(endpoint),
+                        registration.repository.map(SQLiteData.text) ?? .null,
+                        .integer(expiry), .integer(timestamp),
+                    ]
+                )
+                // A naturally expired row is a removed registration. Keep
+                // cleanup inside the same transaction so a later fanout never
+                // chooses a known-expired recipient.
+                _ = try await connection.query(
+                    "DELETE FROM permissioned_space_notification_registrations WHERE expires_at <= ?",
+                    [.integer(timestamp)]
+                )
+            }
+        }
+    }
+
+    /// Checks the durable registration immediately before a fanout transport
+    /// uses it. A replaced, expired, or future removed registration turns a
+    /// leased fanout row into a safe no-op rather than allowing a stale queue
+    /// entry to keep sending to an endpoint after policy has changed.
+    public func isSpaceNotificationRegistrationActive(
+        space: SpaceURI,
+        endpoint: String,
+        repository: String?,
+        now: Date = Date()
+    ) async throws -> Bool {
+        let endpoint = try validNotificationEndpoint(endpoint)
+        if let repository {
+            guard isValidSimpleSpaceDID(repository) else {
+                throw SwanError.invalidIdentifier("notification repository")
+            }
+        }
+        let timestamp = try simpleSpaceTimestamp(now)
+        try requireAuthorityAccount(space: space)
+        return try await withConnectionGate {
+            try await readTransaction {
+                let rows = try await connection.query(
+                    """
+                    SELECT repo_did, expires_at
+                    FROM permissioned_space_notification_registrations
+                    WHERE space_uri = ? AND endpoint = ?
+                    """,
+                    [.text(space.rawValue), .text(endpoint)]
+                )
+                guard let row = rows.first,
+                      try requiredNonnegativeInteger(row, "expires_at") > timestamp else {
+                    return false
+                }
+                let selectedRepository = row.column("repo_did")?.string
+                // A repo-specific registration receives matching writes;
+                // deletions (`repository == nil`) notify every still-active
+                // recipient because the authority is no longer available to
+                // send a later lifecycle signal.
+                return repository == nil || selectedRepository == nil || selectedRepository == repository
+            }
+        }
+    }
+
+    /// Accepts a service-authenticated write announcement at the authority.
+    /// Duplicate receipt IDs and stale TIDs are successful no-ops; an equal
+    /// TID with a different commitment is a fail-closed conflict. The durable
+    /// writer state and all fanout intents commit before any network delivery.
+    public func receiveSpaceWriteNotification(
+        _ notification: AuthorizedSpaceWriteNotification,
+        now: Date = Date()
+    ) async throws {
+        guard notification.issuer == notification.repository,
+              notification.audience == notification.space.authority,
+              isValidSimpleSpaceDID(notification.repository),
+              isValidSimpleSpaceDID(notification.issuer),
+              (try? TID(tidString: notification.wireRevision)) != nil,
+              notification.commitment.count == 32 else {
+            throw SwanError.unauthorized("invalid write notification")
+        }
+        let eventID = try validServiceEventID(notification.eventID)
+        let timestamp = try simpleSpaceTimestamp(now)
+        try requireAuthorityAccount(space: notification.space)
+        try await withConnectionGate {
+            try await transaction {
+                let state = try await requiredSimpleSpace(notification.space)
+                try requireActiveSimpleSpace(state.state)
+                guard state.state.space.members.contains(notification.repository) else {
+                    throw SwanError.unauthorized("writer is not a space member")
+                }
+
+                let receipt = try await connection.query(
+                    """
+                    SELECT 1 FROM permissioned_space_notification_receipts
+                    WHERE issuer = ? AND event_id = ?
+                    """,
+                    [.text(notification.issuer), .text(eventID)]
+                )
+                guard receipt.isEmpty else { return }
+
+                let existing = try await connection.query(
+                    """
+                    SELECT wire_revision, commitment
+                    FROM permissioned_space_writers
+                    WHERE space_uri = ? AND repo_did = ?
+                    """,
+                    [.text(notification.space.rawValue), .text(notification.repository)]
+                )
+                var advancesWriter = true
+                if let row = existing.first {
+                    let currentRevision = try requiredTID(row, "wire_revision").toString()
+                    let currentCommitment = try requiredBlob(row, "commitment")
+                    guard currentCommitment.count == 32 else {
+                        throw SQLiteRepositoryError.corruptDatabase("invalid writer commitment")
+                    }
+                    if notification.wireRevision < currentRevision {
+                        advancesWriter = false
+                    } else if notification.wireRevision == currentRevision {
+                        guard currentCommitment == notification.commitment else {
+                            throw SwanError.conflict(expected: 0, actual: 1)
+                        }
+                        advancesWriter = false
+                    }
+                }
+
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_space_notification_receipts(
+                        issuer, event_id, space_uri, received_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        .text(notification.issuer), .text(eventID),
+                        .text(notification.space.rawValue), .integer(timestamp),
+                    ]
+                )
+                guard advancesWriter else { return }
+
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_space_writers(
+                        space_uri, repo_did, wire_revision, commitment, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(space_uri, repo_did) DO UPDATE SET
+                        wire_revision = excluded.wire_revision,
+                        commitment = excluded.commitment,
+                        updated_at = excluded.updated_at
+                    """,
+                    [
+                        .text(notification.space.rawValue), .text(notification.repository),
+                        .text(notification.wireRevision), blob(notification.commitment),
+                        .integer(timestamp),
+                    ]
+                )
+
+                let recipients = try await connection.query(
+                    """
+                    SELECT endpoint FROM permissioned_space_notification_registrations
+                    WHERE space_uri = ? AND expires_at > ?
+                      AND (repo_did IS NULL OR repo_did = ?)
+                    ORDER BY endpoint ASC
+                    """,
+                    [
+                        .text(notification.space.rawValue), .integer(timestamp),
+                        .text(notification.repository),
+                    ]
+                )
+                for row in recipients {
+                    let endpoint = try validNotificationEndpoint(
+                        try requiredText(row, "endpoint")
+                    )
+                    let fanoutID = UUID()
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO permissioned_space_notification_fanout(
+                            id, source_issuer, source_event_id, kind, space_uri,
+                            repo_did, wire_revision, commitment, endpoint,
+                            attempts, created_at, available_at,
+                            lease_token, lease_expires_at
+                        ) VALUES (?, ?, ?, 'write', ?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL)
+                        ON CONFLICT(source_issuer, source_event_id, kind, endpoint) DO NOTHING
+                        """,
+                        [
+                            .text(fanoutID.uuidString), .text(notification.issuer),
+                            .text(eventID), .text(notification.space.rawValue),
+                            .text(notification.repository), .text(notification.wireRevision),
+                            blob(notification.commitment), .text(endpoint),
+                            .integer(timestamp), .integer(timestamp),
+                        ]
+                    )
+                }
+            }
+        }
+    }
+
+    /// Records a verified deletion only on the selected local recipient
+    /// account. This alpha intentionally does not invent a remote-space row:
+    /// the tombstone is an isolated receipt used to reject later fanout state,
+    /// not a substitute for remote operation application.
+    public func receiveSpaceDeletionNotification(
+        space: SpaceURI,
+        issuer: String,
+        audience: String,
+        eventID: String,
+        now: Date = Date()
+    ) async throws {
+        guard issuer == space.authority, audience == accountDID,
+              isValidSimpleSpaceDID(issuer) else {
+            throw SwanError.unauthorized("invalid space deletion notification")
+        }
+        let eventID = try validServiceEventID(eventID)
+        let timestamp = try simpleSpaceTimestamp(now)
+        try await withConnectionGate {
+            try await transaction {
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_space_notification_receipts(
+                        issuer, event_id, space_uri, received_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(issuer, event_id) DO NOTHING
+                    """,
+                    [.text(issuer), .text(eventID), .text(space.rawValue), .integer(timestamp)]
+                )
+                // If this account is itself the (already-deleted) authority,
+                // no additional state is needed. A local writer repository has
+                // no authority table to mutate in this alpha.
             }
         }
     }
@@ -3987,6 +4500,149 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         }
     }
 
+    /// Claims one durable authority fanout intent. It deliberately mirrors the
+    /// commit outbox lease API rather than sharing its table: registrations are
+    /// authority-owned, while a commit outbox is owned by the writer PDS.
+    public func leaseNextNotificationFanout(
+        now: Date = Date(),
+        leaseDuration: TimeInterval
+    ) async throws -> PersistedSpaceNotificationFanoutLease? {
+        let nowTimestamp = try outboxTimestamp(now)
+        let leaseExpiry = try outboxTimestamp(
+            now.addingTimeInterval(try validOutboxInterval(leaseDuration, name: "lease duration"))
+        )
+        return try await withConnectionGate {
+            try await transaction {
+                let token = UUID()
+                let rows = try await connection.query(
+                    """
+                    SELECT id, source_issuer, source_event_id, kind, space_uri,
+                           repo_did, wire_revision, commitment, endpoint, attempts,
+                           lease_token, lease_expires_at
+                    FROM permissioned_space_notification_fanout
+                    WHERE available_at <= ?
+                      AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                    ORDER BY available_at, created_at, id
+                    LIMIT 1
+                    """,
+                    [.integer(nowTimestamp), .integer(nowTimestamp)]
+                )
+                guard let row = rows.first else { return nil }
+                let event = try decodeNotificationFanout(row)
+                _ = try decodeNotificationFanoutLease(row)
+                _ = try await connection.query(
+                    """
+                    UPDATE permissioned_space_notification_fanout
+                    SET lease_token = ?, lease_expires_at = ?
+                    WHERE id = ?
+                    """,
+                    [.text(token.uuidString), .integer(leaseExpiry), .text(event.id.uuidString)]
+                )
+                return PersistedSpaceNotificationFanoutLease(
+                    event: event,
+                    token: token,
+                    expiresAt: Date(timeIntervalSince1970: Double(leaseExpiry) / 1_000_000)
+                )
+            }
+        }
+    }
+
+    @discardableResult
+    public func completeNotificationFanoutLease(
+        eventID: UUID,
+        token: UUID
+    ) async throws -> Bool {
+        try await withConnectionGate {
+            try await transaction {
+                let rows = try await connection.query(
+                    """
+                    SELECT id, source_issuer, source_event_id, kind, space_uri,
+                           repo_did, wire_revision, commitment, endpoint, attempts,
+                           lease_token, lease_expires_at
+                    FROM permissioned_space_notification_fanout WHERE id = ?
+                    """,
+                    [.text(eventID.uuidString)]
+                )
+                guard let row = rows.first else { return false }
+                _ = try decodeNotificationFanout(row)
+                let lease = try decodeNotificationFanoutLease(row)
+                guard lease.token == token else { return false }
+                _ = try await connection.query(
+                    "DELETE FROM permissioned_space_notification_fanout WHERE id = ? AND lease_token = ?",
+                    [.text(eventID.uuidString), .text(token.uuidString)]
+                )
+                return true
+            }
+        }
+    }
+
+    @discardableResult
+    public func failNotificationFanoutLease(
+        eventID: UUID,
+        token: UUID,
+        retryAt: Date
+    ) async throws -> Int? {
+        let retryTimestamp = try outboxTimestamp(retryAt)
+        return try await withConnectionGate {
+            try await transaction {
+                let rows = try await connection.query(
+                    """
+                    SELECT id, source_issuer, source_event_id, kind, space_uri,
+                           repo_did, wire_revision, commitment, endpoint, attempts,
+                           lease_token, lease_expires_at
+                    FROM permissioned_space_notification_fanout WHERE id = ?
+                    """,
+                    [.text(eventID.uuidString)]
+                )
+                guard let row = rows.first else { return nil }
+                let event = try decodeNotificationFanout(row)
+                let lease = try decodeNotificationFanoutLease(row)
+                guard lease.token == token else { return nil }
+                guard event.attempts < Int.max else {
+                    throw SQLiteRepositoryError.corruptDatabase("notification fanout attempts overflow")
+                }
+                let nextAttempts = event.attempts + 1
+                _ = try await connection.query(
+                    """
+                    UPDATE permissioned_space_notification_fanout
+                    SET attempts = ?, available_at = ?,
+                        lease_token = NULL, lease_expires_at = NULL
+                    WHERE id = ? AND lease_token = ?
+                    """,
+                    [
+                        .integer(nextAttempts), .integer(retryTimestamp),
+                        .text(eventID.uuidString), .text(token.uuidString),
+                    ]
+                )
+                return nextAttempts
+            }
+        }
+    }
+
+    public func pendingNotificationFanout(
+        limit: Int = 100
+    ) async throws -> [PersistedSpaceNotificationFanout] {
+        guard (0 ... 10_000).contains(limit) else {
+            throw SwanError.malformed("notification fanout limit is invalid")
+        }
+        return try await withConnectionGate {
+            let rows = try await connection.query(
+                """
+                SELECT id, source_issuer, source_event_id, kind, space_uri,
+                       repo_did, wire_revision, commitment, endpoint, attempts,
+                       lease_token, lease_expires_at
+                FROM permissioned_space_notification_fanout
+                ORDER BY created_at, id LIMIT ?
+                """,
+                [.integer(limit)]
+            )
+            return try rows.map { row in
+                _ = try decodeNotificationFanoutLease(row)
+                return try decodeNotificationFanout(row)
+            }
+        }
+    }
+
     // MARK: Transaction and decoding helpers
 
     private func withConnectionGate<T: Sendable>(
@@ -4170,6 +4826,34 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             throw SwanError.malformed("simple-space timestamp is out of range")
         }
         return Int(microseconds)
+    }
+
+    /// SQLite owns only a bounded opaque endpoint string. The HTTP transport
+    /// performs the authoritative scheme/DNS/redirect policy immediately
+    /// before use; keeping the lexical guard here prevents corrupt rows from
+    /// becoming unbounded or control-character-bearing transport input.
+    private func validNotificationEndpoint(_ value: String) throws -> String {
+        guard !value.isEmpty,
+              value.utf8.count <= 4_096,
+              value.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }),
+              let components = URLComponents(string: value),
+              components.scheme != nil,
+              components.host != nil,
+              components.user == nil,
+              components.password == nil,
+              components.fragment == nil else {
+            throw SwanError.malformed("notification endpoint is invalid")
+        }
+        return value
+    }
+
+    private func validServiceEventID(_ value: String) throws -> String {
+        guard !value.isEmpty,
+              value.utf8.count <= 256,
+              value.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+            throw SwanError.malformed("service notification event is invalid")
+        }
+        return value
     }
 
     private func simpleSpaceAppAccessName(
@@ -4735,6 +5419,78 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             return (token, rawExpiry)
         default:
             throw SQLiteRepositoryError.corruptDatabase("invalid outbox lease")
+        }
+    }
+
+    private func decodeNotificationFanout(
+        _ row: SQLiteRow
+    ) throws -> PersistedSpaceNotificationFanout {
+        guard let id = row.column("id")?.string.flatMap(UUID.init(uuidString:)),
+              let issuer = row.column("source_issuer")?.string,
+              let eventID = row.column("source_event_id")?.string,
+              let kindRaw = row.column("kind")?.string,
+              let kind = PersistedSpaceNotificationFanout.Kind(rawValue: kindRaw),
+              let spaceRaw = row.column("space_uri")?.string,
+              let space = try? SpaceURI(spaceRaw),
+              space.rawValue == spaceRaw,
+              let endpoint = row.column("endpoint")?.string else {
+            throw SQLiteRepositoryError.corruptDatabase("invalid notification fanout row")
+        }
+        _ = try validServiceEventID(eventID)
+        _ = try validNotificationEndpoint(endpoint)
+        guard isValidSimpleSpaceDID(issuer) else {
+            throw SQLiteRepositoryError.corruptDatabase("invalid notification fanout issuer")
+        }
+        let repository = row.column("repo_did")?.string
+        let wireRevision = row.column("wire_revision")?.string
+        let commitment = row.column("commitment").flatMap { column -> Data? in
+            if case let .blob(data) = column { return Data(buffer: data) }
+            return nil
+        }
+        switch kind {
+        case .write:
+            guard let repository,
+                  isValidSimpleSpaceDID(repository),
+                  let wireRevision,
+                  (try? TID(tidString: wireRevision)) != nil,
+                  let commitment,
+                  commitment.count == 32 else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid write notification fanout")
+            }
+        case .deleted:
+            guard repository == nil, wireRevision == nil, commitment == nil else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid deletion notification fanout")
+            }
+        }
+        return PersistedSpaceNotificationFanout(
+            id: id,
+            sourceIssuer: issuer,
+            sourceEventID: eventID,
+            kind: kind,
+            space: space,
+            repository: repository,
+            wireRevision: wireRevision,
+            commitment: commitment,
+            endpoint: endpoint,
+            attempts: try requiredNonnegativeInteger(row, "attempts")
+        )
+    }
+
+    private func decodeNotificationFanoutLease(
+        _ row: SQLiteRow
+    ) throws -> (token: UUID?, expiresAt: Int?) {
+        let token = row.column("lease_token")
+        let expiry = row.column("lease_expires_at")
+        switch (token, expiry) {
+        case (.some(.null), .some(.null)):
+            return (nil, nil)
+        case let (.some(.text(rawToken)), .some(.integer(rawExpiry))):
+            guard let token = UUID(uuidString: rawToken), rawExpiry >= 0 else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid notification fanout lease")
+            }
+            return (token, rawExpiry)
+        default:
+            throw SQLiteRepositoryError.corruptDatabase("invalid notification fanout lease")
         }
     }
 

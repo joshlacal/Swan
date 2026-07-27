@@ -14,7 +14,11 @@ public enum PermissionedDataJWTVerificationKey: Sendable {
     case p256(P256.Signing.PublicKey)
     case secp256k1PublicKey(Data)
 
-    fileprivate func verifies(
+    /// Internal shared verifier for the bounded proposal JWT and service-JWT
+    /// parsers. The key enum itself still exposes no signing material and the
+    /// caller must select it from a local/pinned resolver before this method
+    /// is reached.
+    func verifies(
         signature: Data,
         signingInput: Data,
         algorithm: String

@@ -14,7 +14,8 @@ public actor SQLitePreMigratedAccountDirectory:
     AuthorizedSimpleSpaceLifecycleDirectory,
     AuthorizedSimpleSpaceCredentialDirectory,
     AuthorizedSpaceRepositoryDirectory,
-    AuthorizedSpaceBlobDirectory
+    AuthorizedSpaceBlobDirectory,
+    AuthorizedSpaceNotificationDirectory
 {
     private let controlStore: any AccountControlStore
     private let dataDirectory: URL
@@ -128,6 +129,32 @@ public actor SQLitePreMigratedAccountDirectory:
             space: state.space.uri,
             configuration: state.space.configuration
         )
+    }
+
+    /// Returns the currently active, startup-preopened account databases for
+    /// the notification recovery service. This is intentionally a lifecycle
+    /// API, not an HTTP lookup: it neither accepts a request-selected DID nor
+    /// opens, creates, or migrates a database after startup.
+    public func notificationRecoveryDatabases() async throws -> [SQLiteAccountDatabase] {
+        guard !isClosed else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        var active: [SQLiteAccountDatabase] = []
+        for did in databases.keys.sorted() {
+            guard try await isActiveAccount(did) else { continue }
+            do {
+                try Self.requireExistingRegularDatabase(
+                    SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
+                )
+            } catch {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            guard !isClosed, let database = databases[did] else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            active.append(database)
+        }
+        return active
     }
 
     // MARK: Authenticated simple-space lifecycle
@@ -274,6 +301,99 @@ public actor SQLitePreMigratedAccountDirectory:
         } catch let error as SwanError {
             throw error
         } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    // MARK: Authority writer discovery and notifications
+
+    public func listSpaceWriters(
+        space: SpaceURI,
+        limit: Int,
+        cursor: String?,
+        authorization: AuthorizationContext
+    ) async throws -> [AuthorizedSpaceWriter] {
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        do {
+            let writers = try await database.spaceWriters(
+                space: space,
+                limit: limit,
+                cursor: cursor,
+                authorization: authorization
+            )
+            try await requireCredentialAuthorityStillAvailable(space.authority)
+            return writers
+        } catch let error as SwanError {
+            throw error
+        } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    public func registerSpaceNotification(
+        _ registration: AuthorizedSpaceNotificationRegistration,
+        authorization: AuthorizationContext
+    ) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(
+            for: registration.space
+        )
+        do {
+            try await database.registerSpaceNotification(
+                registration,
+                authorization: authorization
+            )
+            try await requireCredentialAuthorityStillAvailable(
+                registration.space.authority
+            )
+        } catch let error as SwanError {
+            throw error
+        } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    public func receiveSpaceWriteNotification(
+        _ notification: AuthorizedSpaceWriteNotification
+    ) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(
+            for: notification.space
+        )
+        do {
+            try await database.receiveSpaceWriteNotification(notification)
+            try await requireCredentialAuthorityStillAvailable(
+                notification.space.authority
+            )
+        } catch let error as SwanError {
+            throw error
+        } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    public func receiveSpaceDeletionNotification(
+        space: SpaceURI,
+        issuer: String,
+        audience: String,
+        eventID: String
+    ) async throws {
+        let database = try await preopenedServiceRecipientDatabase(for: audience)
+        do {
+            try await database.receiveSpaceDeletionNotification(
+                space: space,
+                issuer: issuer,
+                audience: audience,
+                eventID: eventID
+            )
+            try await requireLifecycleAuthorityStillAvailable(audience)
+        } catch let error as SwanError {
             throw error
         } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")
@@ -749,6 +869,30 @@ public actor SQLitePreMigratedAccountDirectory:
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
         guard !isClosed, let database = databases[space.authority] else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        return database
+    }
+
+    /// Service notifications select their recipient from the signed `aud`
+    /// claim only after the service-JWT verifier has bound it to this route.
+    /// This retains the same active/preopened/path checks as every other
+    /// account database projection and never constructs remote-space state.
+    private func preopenedServiceRecipientDatabase(
+        for did: String
+    ) async throws -> SQLiteAccountDatabase {
+        guard !isClosed,
+              try await isActiveAccount(did) else {
+            throw SwanError.unauthorized("service notification recipient is unavailable")
+        }
+        do {
+            try Self.requireExistingRegularDatabase(
+                SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
+            )
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard !isClosed, let database = databases[did] else {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
         return database

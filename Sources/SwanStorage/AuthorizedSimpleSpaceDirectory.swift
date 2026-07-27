@@ -207,6 +207,120 @@ public protocol AuthorizedSpaceBlobDirectory: Sendable {
     ) async throws -> AuthorizedSpaceBlob?
 }
 
+// MARK: - Writer discovery and notification routing
+
+/// The small, non-content-bearing synchronisation hint maintained by a space
+/// authority. A writer entry never grants access: membership and credentials
+/// remain separate authority policy. `commitment` is the SHA-256 LtHash
+/// commitment reported by the writer PDS, not a CAR, record CID, or value.
+public struct AuthorizedSpaceWriter: Sendable, Equatable {
+    public let space: SpaceURI
+    public let repository: String
+    public let wireRevision: String
+    public let commitment: Data
+
+    public init(
+        space: SpaceURI,
+        repository: String,
+        wireRevision: String,
+        commitment: Data
+    ) {
+        self.space = space
+        self.repository = repository
+        self.wireRevision = wireRevision
+        self.commitment = commitment
+    }
+}
+
+/// A bounded recipient registered to receive future write notifications. The
+/// endpoint is intentionally opaque at this layer: URL/SSRF validation belongs
+/// to the HTTP transport and no notification route may serialize its value in
+/// an error response.
+public struct AuthorizedSpaceNotificationRegistration: Sendable, Equatable {
+    public let space: SpaceURI
+    public let endpoint: String
+    public let repository: String?
+    public let expiresAt: Date
+
+    public init(
+        space: SpaceURI,
+        endpoint: String,
+        repository: String?,
+        expiresAt: Date
+    ) {
+        self.space = space
+        self.endpoint = endpoint
+        self.repository = repository
+        self.expiresAt = expiresAt
+    }
+}
+
+/// A signed service announcement after its HTTP/JWT boundary has completed.
+/// `eventID` is a stable opaque service-JWT JTI and is consumed transactionally
+/// by the authority. It is never an authorization credential.
+public struct AuthorizedSpaceWriteNotification: Sendable, Equatable {
+    public let eventID: String
+    public let space: SpaceURI
+    public let repository: String
+    public let wireRevision: String
+    public let commitment: Data
+    public let issuer: String
+    public let audience: String
+
+    public init(
+        eventID: String,
+        space: SpaceURI,
+        repository: String,
+        wireRevision: String,
+        commitment: Data,
+        issuer: String,
+        audience: String
+    ) {
+        self.eventID = eventID
+        self.space = space
+        self.repository = repository
+        self.wireRevision = wireRevision
+        self.commitment = commitment
+        self.issuer = issuer
+        self.audience = audience
+    }
+}
+
+/// A startup-preopened authority projection for the writer-set and recipient
+/// registry. It intentionally does not expose a SQLite handle or any record
+/// material. Every method operates on the authority account selected by the
+/// parsed `SpaceURI`; request-selected accounts are never opened or migrated.
+public protocol AuthorizedSpaceNotificationDirectory: Sendable {
+    func listSpaceWriters(
+        space: SpaceURI,
+        limit: Int,
+        cursor: String?,
+        authorization: AuthorizationContext
+    ) async throws -> [AuthorizedSpaceWriter]
+
+    func registerSpaceNotification(
+        _ registration: AuthorizedSpaceNotificationRegistration,
+        authorization: AuthorizationContext
+    ) async throws
+
+    /// Records an incoming service-authenticated writer announcement and
+    /// atomically creates durable fanout intents for matching registrations.
+    /// Duplicate or older/reordered events are idempotent no-ops.
+    func receiveSpaceWriteNotification(
+        _ notification: AuthorizedSpaceWriteNotification
+    ) async throws
+
+    /// Marks a local non-authority space deleted when an authenticated space
+    /// authority announces deletion. Unknown/non-hosted targets are a
+    /// best-effort no-op and must not create local state.
+    func receiveSpaceDeletionNotification(
+        space: SpaceURI,
+        issuer: String,
+        audience: String,
+        eventID: String
+    ) async throws
+}
+
 /// A deliberately narrow lifecycle/membership projection for a simple-space
 /// authority account that was opened at service startup.  It names domain
 /// operations rather than exposing a SQLite handle or mutable authority

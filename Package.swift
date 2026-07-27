@@ -109,7 +109,7 @@ let package = Package(
         .target(
             name: "SwanHTTP",
             dependencies: [
-                "SwanAccounts", "SwanCore", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth",
+                "SwanAccounts", "SwanCore", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth", "SwanSQLite",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "Petrel", package: "Petrel"),
                 .product(name: "Logging", package: "swift-log"),

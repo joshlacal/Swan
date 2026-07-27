@@ -1,0 +1,295 @@
+import Foundation
+import Petrel
+import SwanCore
+import SwanOAuth
+import SwanSQLite
+import SwanSpaces
+import SwanSpacesWire
+import SwanStorage
+
+/// One operator-configured service destination. The endpoint is selected from
+/// a static allowlist, never directly from a registered URL or an incoming
+/// service JWT. `audience` is the remote service DID used for the service JWT.
+public struct SwanSpaceNotificationDestination: Sendable, Equatable {
+    public let endpoint: URL
+    public let audience: String
+
+    public init(endpoint: URL, audience: String) throws {
+        guard let components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
+              components.scheme != nil,
+              components.host != nil,
+              components.user == nil,
+              components.password == nil,
+              components.fragment == nil,
+              (try? DID(didString: audience)) != nil else {
+            throw SwanError.malformed("notification destination is invalid")
+        }
+        self.endpoint = endpoint
+        self.audience = audience
+    }
+}
+
+/// Maps an authority DID to the one configured endpoint that accepts its
+/// `notifyWrite` request. An outbox event with no mapping fails and retries;
+/// it never falls back to a request-controlled URL.
+public protocol SwanSpaceAuthorityNotificationDestinationResolving: Sendable {
+    func destination(forAuthority authority: String) async throws -> SwanSpaceNotificationDestination?
+}
+
+/// Maps an *exact registered endpoint string* to an operator-configured
+/// endpoint and service audience. A registration only acts as a key into this
+/// map; it cannot select an audience or make a new network destination live.
+public protocol SwanRegisteredSpaceNotificationDestinationResolving: Sendable {
+    func destination(
+        forRegisteredEndpoint endpoint: String
+    ) async throws -> SwanSpaceNotificationDestination?
+}
+
+/// Immutable lab configuration for both writer-to-authority and
+/// authority-to-recipient notification paths. Empty maps are a safe default:
+/// delivery remains durably pending until the operator configures a mapping.
+public struct StaticSwanSpaceNotificationDestinations:
+    SwanSpaceAuthorityNotificationDestinationResolving,
+    SwanRegisteredSpaceNotificationDestinationResolving
+{
+    private let authorities: [String: SwanSpaceNotificationDestination]
+    private let registrations: [String: SwanSpaceNotificationDestination]
+
+    public init(
+        authorityDestinations: [String: SwanSpaceNotificationDestination] = [:],
+        registrationDestinations: [String: SwanSpaceNotificationDestination] = [:]
+    ) throws {
+        for authority in authorityDestinations.keys {
+            guard (try? DID(didString: authority)) != nil else {
+                throw SwanError.malformed("notification authority mapping is invalid")
+            }
+        }
+        for endpoint in registrationDestinations.keys {
+            guard validConfiguredNotificationEndpoint(endpoint) else {
+                throw SwanError.malformed("notification registration mapping is invalid")
+            }
+        }
+        authorities = authorityDestinations
+        registrations = registrationDestinations
+    }
+
+    public func destination(
+        forAuthority authority: String
+    ) async throws -> SwanSpaceNotificationDestination? {
+        authorities[authority]
+    }
+
+    public func destination(
+        forRegisteredEndpoint endpoint: String
+    ) async throws -> SwanSpaceNotificationDestination? {
+        registrations[endpoint]
+    }
+}
+
+/// Looks up the latest durable repository state only after the outbox lease
+/// has committed. It returns commitment metadata, not records, CAR bytes,
+/// CIDs, credentials, or a database connection. A coalesced older event may
+/// therefore announce a newer current commit, which is safe because the
+/// receiver keeps the highest TID and converges on the current writer state.
+public struct SQLiteSpaceWriteAnnouncementSource: Sendable {
+    private let database: SQLiteAccountDatabase
+
+    public init(database: SQLiteAccountDatabase) {
+        self.database = database
+    }
+
+    public func currentAnnouncement(
+        for notification: PermissionedSpaceOutboxNotification
+    ) async throws -> AuthorizedSpaceWriter {
+        guard let state = try await database.repositoryState(
+            space: notification.space,
+            author: notification.author
+        ), state.commitment.count == 32 else {
+            throw SwanError.unavailable("notification repository state is unavailable")
+        }
+        return AuthorizedSpaceWriter(
+            space: notification.space,
+            repository: notification.author,
+            wireRevision: state.wireRevision.toString(),
+            commitment: state.commitment
+        )
+    }
+}
+
+/// Sends an atomically-created local commit outbox event to the configured
+/// space authority. Its only body fields are the proposal's writer hint:
+/// space, repo, wire TID, and 32-byte LtHash commitment.
+public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTransport {
+    private let destinations: any SwanSpaceAuthorityNotificationDestinationResolving
+    private let announcements: SQLiteSpaceWriteAnnouncementSource
+    private let serviceAuthentication: any SpaceServiceAuthenticationIssuer
+    private let poster: OAuthBoundedJSONPoster
+
+    public init(
+        destinations: any SwanSpaceAuthorityNotificationDestinationResolving,
+        announcements: SQLiteSpaceWriteAnnouncementSource,
+        serviceAuthentication: any SpaceServiceAuthenticationIssuer,
+        poster: OAuthBoundedJSONPoster
+    ) {
+        self.destinations = destinations
+        self.announcements = announcements
+        self.serviceAuthentication = serviceAuthentication
+        self.poster = poster
+    }
+
+    public func deliver(_ notification: PermissionedSpaceOutboxNotification) async throws {
+        guard let destination = try await destinations.destination(
+            forAuthority: notification.space.authority
+        ) else {
+            throw SwanError.unavailable("space authority notification destination is unavailable")
+        }
+        let announcement = try await announcements.currentAnnouncement(for: notification)
+        let body = try notificationJSON(
+            space: announcement.space,
+            repository: announcement.repository,
+            wireRevision: announcement.wireRevision,
+            commitment: announcement.commitment
+        )
+        let token = try await serviceAuthentication.issue(
+            issuer: notification.author,
+            audience: destination.audience,
+            method: ComAtprotoSpaceNotifyWrite.typeIdentifier,
+            eventID: notification.id.uuidString,
+            now: Date()
+        )
+        try await poster.postJSON(
+            to: destination.endpoint,
+            headers: notificationHeaders(token),
+            body: body
+        )
+    }
+}
+
+/// Delivers authority-created fanout rows after confirming their registration
+/// remains current. The configured resolver maps an opaque registered string
+/// to an allowlisted endpoint and audience, so a malicious registration can
+/// never steer service traffic or JWT claims.
+public struct HTTPPermissionedSpaceNotificationFanoutTransport:
+    PermissionedSpaceNotificationFanoutTransport
+{
+    private let database: SQLiteAccountDatabase
+    private let destinations: any SwanRegisteredSpaceNotificationDestinationResolving
+    private let serviceAuthentication: any SpaceServiceAuthenticationIssuer
+    private let poster: OAuthBoundedJSONPoster
+
+    public init(
+        database: SQLiteAccountDatabase,
+        destinations: any SwanRegisteredSpaceNotificationDestinationResolving,
+        serviceAuthentication: any SpaceServiceAuthenticationIssuer,
+        poster: OAuthBoundedJSONPoster
+    ) {
+        self.database = database
+        self.destinations = destinations
+        self.serviceAuthentication = serviceAuthentication
+        self.poster = poster
+    }
+
+    public func deliver(_ notification: PersistedSpaceNotificationFanout) async throws {
+        // A replacement, expiry, or future explicit removal wins over a row
+        // that was already queued. Treat the stale delivery as a successful
+        // no-op; the lease worker will acknowledge it without network I/O.
+        guard try await database.isSpaceNotificationRegistrationActive(
+            space: notification.space,
+            endpoint: notification.endpoint,
+            repository: notification.repository,
+            now: Date()
+        ) else {
+            return
+        }
+        guard let destination = try await destinations.destination(
+            forRegisteredEndpoint: notification.endpoint
+        ) else {
+            throw SwanError.unavailable("registered notification destination is unavailable")
+        }
+        let method: String
+        let body: Data
+        switch notification.kind {
+        case .write:
+            guard let repository = notification.repository,
+                  let wireRevision = notification.wireRevision,
+                  let commitment = notification.commitment,
+                  commitment.count == 32 else {
+                throw SwanError.malformed("durable write fanout is invalid")
+            }
+            method = ComAtprotoSpaceNotifyWrite.typeIdentifier
+            body = try notificationJSON(
+                space: notification.space,
+                repository: repository,
+                wireRevision: wireRevision,
+                commitment: commitment
+            )
+        case .deleted:
+            method = ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier
+            body = try deletionJSON(space: notification.space)
+        }
+        let token = try await serviceAuthentication.issue(
+            issuer: notification.space.authority,
+            audience: destination.audience,
+            method: method,
+            eventID: notification.id.uuidString,
+            now: Date()
+        )
+        try await poster.postJSON(
+            to: destination.endpoint,
+            headers: notificationHeaders(token),
+            body: body
+        )
+    }
+}
+
+private func notificationJSON(
+    space: SpaceURI,
+    repository: String,
+    wireRevision: String,
+    commitment: Data
+) throws -> Data {
+    guard commitment.count == 32,
+          (try? TID(tidString: wireRevision)) != nil else {
+        throw SwanError.malformed("writer notification is invalid")
+    }
+    let input = try ComAtprotoSpaceNotifyWrite.Input(
+        space: ATProtocolURI(uriString: space.rawValue),
+        repo: DID(didString: repository),
+        rev: wireRevision,
+        hash: Bytes(data: commitment)
+    )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    return try encoder.encode(input)
+}
+
+private func deletionJSON(space: SpaceURI) throws -> Data {
+    let input = try ComAtprotoSpaceNotifySpaceDeleted.Input(
+        space: ATProtocolURI(uriString: space.rawValue)
+    )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    return try encoder.encode(input)
+}
+
+private func notificationHeaders(_ token: String) -> [String: String] {
+    [
+        "authorization": "Bearer \(token)",
+        "content-type": "application/json",
+        "accept": "application/json",
+    ]
+}
+
+private func validConfiguredNotificationEndpoint(_ raw: String) -> Bool {
+    guard raw.utf8.count <= 4_096,
+          raw.unicodeScalars.allSatisfy({ $0.value > 0x1f && $0.value != 0x7f }),
+          let components = URLComponents(string: raw),
+          components.scheme != nil,
+          components.host != nil,
+          components.user == nil,
+          components.password == nil,
+          components.fragment == nil else {
+        return false
+    }
+    return true
+}

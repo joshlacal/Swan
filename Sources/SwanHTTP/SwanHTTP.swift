@@ -128,6 +128,17 @@ public struct SwanSpaceRepositorySyncHTTPConfiguration: Sendable {
     }
 }
 
+/// Explicitly enables only the local/pinned service-JWT verification needed
+/// by the writer notification endpoints. It contains no remote DID resolver;
+/// service claims can never turn an XRPC request into a network lookup.
+public struct SwanSpaceNotificationHTTPConfiguration: Sendable {
+    let serviceAuthentication: any SpaceServiceAuthenticationVerifier
+
+    public init(serviceAuthentication: any SpaceServiceAuthenticationVerifier) {
+        self.serviceAuthentication = serviceAuthentication
+    }
+}
+
 public struct SwanHTTPServer: Sendable {
     public let profile: ProtocolProfile
     public let configuration: SwanHTTPConfiguration
@@ -175,6 +186,10 @@ public struct SwanHTTPServer: Sendable {
     /// closed unless the startup directory exposes the dedicated blob
     /// projection; it is intentionally independent of public blob routes.
     public let authenticatedSpaceBlobs: SwanAuthenticatedSpaceBlobCapability?
+    /// Credential-only writer discovery/registration and service-authenticated
+    /// notification receivers. It is closed unless both an exact preopened
+    /// notification directory and local/pinned service verifier are supplied.
+    public let authenticatedSpaceNotifications: SwanAuthenticatedSpaceNotificationsCapability?
 
     public init(
         profile: ProtocolProfile,
@@ -188,7 +203,8 @@ public struct SwanHTTPServer: Sendable {
         accountControlStore: (any AccountControlStore)? = nil,
         spaceCredentialConfiguration: SwanSpaceCredentialHTTPConfiguration? = nil,
         spaceDelegationConfiguration: SwanSpaceDelegationHTTPConfiguration? = nil,
-        spaceRepositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration? = nil
+        spaceRepositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration? = nil,
+        spaceNotificationConfiguration: SwanSpaceNotificationHTTPConfiguration? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -325,6 +341,20 @@ public struct SwanHTTPServer: Sendable {
             } else {
                 authenticatedSpaceBlobs = nil
             }
+            if let notificationDirectory = authenticatedGetSpaceDirectory
+                as? any AuthorizedSpaceNotificationDirectory,
+               let spaceCredentialConfiguration,
+               let spaceNotificationConfiguration {
+                authenticatedSpaceNotifications = SwanAuthenticatedSpaceNotificationsCapability(
+                    directory: notificationDirectory,
+                    credentialAuthorizer: DurableSpaceCredentialVerifier(
+                        publicKeys: spaceCredentialConfiguration.credentialPublicKeys
+                    ),
+                    serviceAuthentication: spaceNotificationConfiguration.serviceAuthentication
+                )
+            } else {
+                authenticatedSpaceNotifications = nil
+            }
         } else {
             authenticatedGetSpace = nil
             authenticatedSpaceRecords = nil
@@ -333,6 +363,7 @@ public struct SwanHTTPServer: Sendable {
             authenticatedSpaceDelegationMinting = nil
             authenticatedSpaceRepositorySync = nil
             authenticatedSpaceBlobs = nil
+            authenticatedSpaceNotifications = nil
         }
     }
 
@@ -480,6 +511,30 @@ public struct SwanHTTPServer: Sendable {
                 registerAuthenticatedGetSpaceBlobEndpoint(
                     on: router,
                     capability: authenticatedSpaceBlobs
+                )
+            } else if descriptor.nsid == ComAtprotoSpaceListRepos.typeIdentifier,
+                      let authenticatedSpaceNotifications {
+                registerAuthenticatedListSpaceReposEndpoint(
+                    on: router,
+                    capability: authenticatedSpaceNotifications
+                )
+            } else if descriptor.nsid == ComAtprotoSpaceRegisterNotify.typeIdentifier,
+                      let authenticatedSpaceNotifications {
+                registerAuthenticatedRegisterSpaceNotifyEndpoint(
+                    on: router,
+                    capability: authenticatedSpaceNotifications
+                )
+            } else if descriptor.nsid == ComAtprotoSpaceNotifyWrite.typeIdentifier,
+                      let authenticatedSpaceNotifications {
+                registerAuthenticatedNotifySpaceWriteEndpoint(
+                    on: router,
+                    capability: authenticatedSpaceNotifications
+                )
+            } else if descriptor.nsid == ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier,
+                      let authenticatedSpaceNotifications {
+                registerAuthenticatedNotifySpaceDeletedEndpoint(
+                    on: router,
+                    capability: authenticatedSpaceNotifications
                 )
             } else if let authenticatedSimpleSpaceLifecycle,
                       Self.isSimpleSpaceLifecycleMethod(descriptor.nsid) {

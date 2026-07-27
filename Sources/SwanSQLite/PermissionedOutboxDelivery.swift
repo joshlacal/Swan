@@ -210,3 +210,85 @@ public actor PermissionedSpaceOutboxDeliveryWorker {
         UInt64((interval * 1_000_000_000).rounded(.up))
     }
 }
+
+/// Delivers the authority's registered-recipient fanout queue. It is separate
+/// from ``PermissionedSpaceOutboxDeliveryWorker`` because an incoming writer
+/// announcement has no right to select or acknowledge the writer PDS's
+/// commit outbox. Both queues use the same post-transaction lease discipline.
+public protocol PermissionedSpaceNotificationFanoutTransport: Sendable {
+    func deliver(_ notification: PersistedSpaceNotificationFanout) async throws
+}
+
+public enum PermissionedSpaceNotificationFanoutDeliveryResult: Sendable, Equatable {
+    case idle
+    case delivered(eventID: UUID)
+    case failed(eventID: UUID, attempts: Int)
+    case leaseLost(eventID: UUID)
+}
+
+public actor PermissionedSpaceNotificationFanoutDeliveryWorker {
+    private let database: SQLiteAccountDatabase
+    private let transport: any PermissionedSpaceNotificationFanoutTransport
+    private let configuration: PermissionedSpaceOutboxDeliveryConfiguration
+
+    public init(
+        database: SQLiteAccountDatabase,
+        transport: any PermissionedSpaceNotificationFanoutTransport,
+        configuration: PermissionedSpaceOutboxDeliveryConfiguration = .standard
+    ) {
+        self.database = database
+        self.transport = transport
+        self.configuration = configuration
+    }
+
+    public func deliverNext(
+        now: Date = Date()
+    ) async throws -> PermissionedSpaceNotificationFanoutDeliveryResult {
+        guard let lease = try await database.leaseNextNotificationFanout(
+            now: now,
+            leaseDuration: configuration.leaseDuration
+        ) else {
+            return .idle
+        }
+        guard lease.event.attempts < Int.max else {
+            throw SQLiteRepositoryError.corruptDatabase("notification fanout attempts overflow")
+        }
+        do {
+            // Network I/O is intentionally after the durable lease commit.
+            try await transport.deliver(lease.event)
+            let completed = try await database.completeNotificationFanoutLease(
+                eventID: lease.event.id,
+                token: lease.token
+            )
+            return completed ? .delivered(eventID: lease.event.id) : .leaseLost(eventID: lease.event.id)
+        } catch {
+            let retryAt = now.addingTimeInterval(
+                configuration.retryDelay(afterFailureAttempt: lease.event.attempts + 1)
+            )
+            guard let attempts = try await database.failNotificationFanoutLease(
+                eventID: lease.event.id,
+                token: lease.token,
+                retryAt: retryAt
+            ) else {
+                return .leaseLost(eventID: lease.event.id)
+            }
+            return .failed(eventID: lease.event.id, attempts: attempts)
+        }
+    }
+
+    public func runUntilCancelled() async {
+        while !Task.isCancelled {
+            do {
+                if case .idle = try await deliverNext() {
+                    try await Task.sleep(nanoseconds: nanoseconds(configuration.idlePollInterval))
+                }
+            } catch {
+                try? await Task.sleep(nanoseconds: nanoseconds(configuration.idlePollInterval))
+            }
+        }
+    }
+
+    private func nanoseconds(_ interval: TimeInterval) -> UInt64 {
+        UInt64((interval * 1_000_000_000).rounded(.up))
+    }
+}
