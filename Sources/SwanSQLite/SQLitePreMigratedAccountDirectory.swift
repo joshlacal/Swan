@@ -9,13 +9,16 @@ import SwanStorage
 /// successfully preopened for an active account at bootstrap.
 public actor SQLitePreMigratedAccountDirectory: AuthorizedSimpleSpaceDirectory {
     private let controlStore: any AccountControlStore
+    private let dataDirectory: URL
     private var databases: [String: SQLiteAccountDatabase]
     private var isClosed = false
 
     private init(
+        dataDirectory: URL,
         controlStore: any AccountControlStore,
         databases: [String: SQLiteAccountDatabase]
     ) {
+        self.dataDirectory = dataDirectory
         self.controlStore = controlStore
         self.databases = databases
     }
@@ -46,6 +49,7 @@ public actor SQLitePreMigratedAccountDirectory: AuthorizedSimpleSpaceDirectory {
                 )
             }
             return SQLitePreMigratedAccountDirectory(
+                dataDirectory: dataDirectory,
                 controlStore: controlStore,
                 databases: opened
             )
@@ -73,6 +77,16 @@ public actor SQLitePreMigratedAccountDirectory: AuthorizedSimpleSpaceDirectory {
 
         guard try await isActiveAccount(space.authority) else { return nil }
         guard !isClosed else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        do {
+            // An already-open SQLite handle may continue serving an unlinked
+            // file on POSIX. Refuse that stale state rather than treating a
+            // vanished/replaced path as permission to recreate it.
+            try Self.requireExistingRegularDatabase(
+                SQLiteLayout.accountDatabase(in: dataDirectory, did: space.authority)
+            )
+        } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
         guard let database = databases[space.authority] else {

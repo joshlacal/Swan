@@ -207,6 +207,34 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         try await control.close()
     }
 
+    func testVanishedPreopenedDatabaseFailsUnavailableWithoutRecreation() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let space = try makeSpace(authority: alice)
+        try await installAccountDatabase(root: root, did: alice, space: space)
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        _ = try await control.createAccount(registration(did: alice, handle: "alice.example.com"))
+        let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+            dataDirectory: root,
+            controlStore: control
+        )
+        let databaseURL = SQLiteLayout.accountDatabase(in: root, did: alice)
+        try FileManager.default.removeItem(at: databaseURL)
+
+        await XCTAssertSwanUnavailableAsync(
+            try await directory.space(
+                space,
+                authorization: .accountOAuth(subject: alice, scopes: ["atproto"])
+            )
+        )
+        // The existing preopened connection may retain its original WAL/SHM
+        // sidecars until shutdown, but the primary path must stay absent: the
+        // request was denied instead of recreating the account database.
+        XCTAssertFalse(FileManager.default.fileExists(atPath: databaseURL.path))
+        try await directory.close()
+        try await control.close()
+    }
+
     func testWrongCallerScopeAndCorruptConfigurationFailClosed() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
