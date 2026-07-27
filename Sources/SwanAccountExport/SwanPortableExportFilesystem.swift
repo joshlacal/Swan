@@ -161,6 +161,95 @@ enum SwanPortableExportFilesystem {
         }
     }
 
+    /// Resolves the kernel's current path for a pinned directory descriptor.
+    /// Callers must still revalidate the returned path immediately around any
+    /// API that cannot accept a directory descriptor.
+    static func currentURL(for descriptor: Int32) throws -> URL {
+        #if canImport(Darwin)
+        var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard fcntl(descriptor, F_GETPATH, &buffer) == 0 else {
+            throw SwanPortableExportError.publicationFailed
+        }
+        let end = buffer.firstIndex(of: 0) ?? buffer.endIndex
+        let path = String(
+            decoding: buffer[..<end].map { UInt8(bitPattern: $0) },
+            as: UTF8.self
+        )
+        #elseif canImport(Glibc)
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX) + 1)
+        let link = "/proc/self/fd/\(descriptor)"
+        let count = buffer.withUnsafeMutableBufferPointer { output in
+            link.withCString {
+                readlink($0, output.baseAddress!, output.count - 1)
+            }
+        }
+        guard count > 0, count < buffer.count else {
+            throw SwanPortableExportError.publicationFailed
+        }
+        let path = String(
+            decoding: buffer[..<Int(count)].map { UInt8(bitPattern: $0) },
+            as: UTF8.self
+        )
+        #endif
+        let url = URL(fileURLWithPath: path, isDirectory: true)
+        try requireCurrentOwnerOnlyDirectory(url, matches: descriptor)
+        return url
+    }
+
+    /// Rejects a destination parent that is the verified source directory or
+    /// one of its descendants. The target itself is required absent, so this
+    /// is the only possible source/target ancestry after collision checks.
+    static func requireNotWithin(
+        directory: Int32,
+        ancestor: Int32
+    ) throws {
+        var ancestorMetadata = stat()
+        guard fstat(ancestor, &ancestorMetadata) == 0 else {
+            throw SwanPortableExportError.invalidPlacement
+        }
+        var current = openat(
+            directory,
+            ".",
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard current >= 0 else {
+            throw SwanPortableExportError.invalidPlacement
+        }
+        defer { _ = close(current) }
+
+        for _ in 0 ..< 1_024 {
+            var currentMetadata = stat()
+            guard fstat(current, &currentMetadata) == 0 else {
+                throw SwanPortableExportError.invalidPlacement
+            }
+            guard currentMetadata.st_dev != ancestorMetadata.st_dev
+                    || currentMetadata.st_ino != ancestorMetadata.st_ino else {
+                throw SwanPortableExportError.invalidPlacement
+            }
+            let parent = openat(
+                current,
+                "..",
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+            )
+            guard parent >= 0 else {
+                throw SwanPortableExportError.invalidPlacement
+            }
+            var parentMetadata = stat()
+            guard fstat(parent, &parentMetadata) == 0 else {
+                _ = close(parent)
+                throw SwanPortableExportError.invalidPlacement
+            }
+            if currentMetadata.st_dev == parentMetadata.st_dev,
+               currentMetadata.st_ino == parentMetadata.st_ino {
+                _ = close(parent)
+                return
+            }
+            _ = close(current)
+            current = parent
+        }
+        throw SwanPortableExportError.invalidPlacement
+    }
+
     static func openOwnerOnlyDirectory(parent: Int32, name: String) throws -> Int32 {
         try openDirectory(parent: parent, name: name)
     }
@@ -484,6 +573,38 @@ enum SwanPortableExportFilesystem {
             throw SwanPortableExportError.publicationFailed
         }
         try requireAbsent(parent: parent, name: name)
+    }
+
+    /// Removes the entry that still names `expectedDescriptor` below the
+    /// pinned parent. It never removes a same-name replacement. If the pinned
+    /// inode was moved outside that parent, cleanup fails closed.
+    static func removeTree(
+        parent: Int32,
+        matching expectedDescriptor: Int32
+    ) throws {
+        var expected = stat()
+        guard fstat(expectedDescriptor, &expected) == 0,
+              (expected.st_mode & S_IFMT) == S_IFDIR,
+              expected.st_uid == geteuid() else {
+            throw SwanPortableExportError.publicationFailed
+        }
+        var matchingNames: [String] = []
+        for name in try directoryEntryNames(parent) {
+            var current = stat()
+            guard name.withCString({
+                fstatat(parent, $0, &current, AT_SYMLINK_NOFOLLOW)
+            }) == 0 else {
+                throw SwanPortableExportError.publicationFailed
+            }
+            if current.st_dev == expected.st_dev,
+               current.st_ino == expected.st_ino {
+                matchingNames.append(name)
+            }
+        }
+        guard matchingNames.count == 1 else {
+            throw SwanPortableExportError.publicationFailed
+        }
+        try removeTree(parent: parent, name: matchingNames[0])
     }
 
     static func renameExclusively(

@@ -302,6 +302,10 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
         defer { fixture.remove() }
         let backup = try await fixture.completedBackup(named: "restore-source")
         let sourceBefore = try treeSnapshot(backup)
+        let sourceEnvelopePlaintext = try decryptedEnvelope(
+            in: backup,
+            key: fixture.backupKey
+        )
         let target = fixture.root.appending(path: "restored-data")
         let restoredKEK = try SwanOperatorAccountKEK(
             rawBytes: Data(repeating: 0xD4, count: 32)
@@ -484,6 +488,8 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
         for sentinel in fixture.secretSentinels.prefix(4) {
             XCTAssertNil(targetBytes.range(of: sentinel))
         }
+        XCTAssertNil(targetBytes.range(of: restoredKEK.bytes))
+        XCTAssertNil(targetBytes.range(of: sourceEnvelopePlaintext))
     }
 
     func testSourceFailureAndDestinationCollisionNeverCreateOrMergeTarget() async throws {
@@ -615,6 +621,280 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
             using: fixture.backupKey,
             accountKEK: accountKEK,
             to: postRenameTarget
+        )
+    }
+
+    func testStageReplacementBeforeInstallCannotRedirectWritesAndCleanupFindsPinnedInode()
+        async throws
+    {
+        let fixture = try await OperatorBackupFixture()
+        defer { fixture.remove() }
+        let backup = try await fixture.completedBackup(named: "replacement-source")
+        let accountKEK = try SwanOperatorAccountKEK(
+            rawBytes: Data(repeating: 0xD4, count: 32)
+        )
+        let parent = fixture.root.appending(path: "replacement-parent")
+        try FileManager.default.createDirectory(
+            at: parent,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let target = parent.appending(path: "data")
+        let displaced = parent.appending(path: "displaced-pinned-stage")
+        let replacementSentinel = Data("replacement-owned".utf8)
+        let originalName = UnsafeSendableBox<String?>(nil)
+        let replacing = SwanOperatorAccountRestorer(
+            afterStagingBeforeInstall: { _ in
+                let name = try XCTUnwrap(
+                    FileManager.default.contentsOfDirectory(atPath: parent.path)
+                        .first { $0.hasPrefix(".swan-account-restore-") }
+                )
+                originalName.value = name
+                try FileManager.default.moveItem(
+                    at: parent.appending(path: name),
+                    to: displaced
+                )
+                let replacement = parent.appending(path: name)
+                try FileManager.default.createDirectory(
+                    at: replacement,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                try protectedWrite(
+                    replacementSentinel,
+                    to: replacement.appending(path: "sentinel")
+                )
+            }
+        )
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await replacing.restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: target
+            )
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: displaced.path))
+        let replacement = parent.appending(
+            path: try XCTUnwrap(originalName.value)
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: replacement.appending(path: "sentinel")),
+            replacementSentinel
+        )
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: replacement.path),
+            ["sentinel"]
+        )
+        try FileManager.default.removeItem(at: replacement)
+        _ = try await SwanOperatorAccountRestorer().restore(
+            backupAt: backup,
+            using: fixture.backupKey,
+            accountKEK: accountKEK,
+            to: target
+        )
+    }
+
+    func testDestinationInsideSourceIsRejectedWithoutMutatingSource() async throws {
+        let fixture = try await OperatorBackupFixture()
+        defer { fixture.remove() }
+        let backup = try await fixture.completedBackup(named: "overlap-source")
+        let sourceBefore = try treeSnapshot(backup)
+        let target = backup.appending(path: "restored-data")
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await SwanOperatorAccountRestorer().restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: try SwanOperatorAccountKEK(
+                    rawBytes: Data(repeating: 0xD4, count: 32)
+                ),
+                to: target
+            )
+        }
+
+        XCTAssertEqual(try treeSnapshot(backup), sourceBefore)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: backup.path)
+                .contains { $0.hasPrefix(".swan-account-restore-") }
+        )
+    }
+
+    func testAuthenticatedSourceMutationMatrixFailsBeforeDestinationAndCanRetry()
+        async throws
+    {
+        let fixture = try await OperatorBackupFixture()
+        defer { fixture.remove() }
+        let accountKEK = try SwanOperatorAccountKEK(
+            rawBytes: Data(repeating: 0xD4, count: 32)
+        )
+        let mutations: [(String, (URL) throws -> Void)] = [
+            ("outer-manifest", { root in
+                let url = root.appending(path: "manifest.json")
+                try (Data(" ".utf8) + Data(contentsOf: url)).write(to: url)
+            }),
+            ("inner-manifest", { root in
+                let url = root.appending(path: "portable/manifest.json")
+                try (Data(" ".utf8) + Data(contentsOf: url)).write(to: url)
+            }),
+            ("envelope", { root in
+                try flipFirstByte(
+                    at: root.appending(path: "operator/secrets.aesgcm")
+                )
+            }),
+            ("plc", { root in
+                try flipFirstByte(
+                    at: root.appending(path: "portable/plc/history.json")
+                )
+            }),
+            ("public-blob", { root in
+                let path = try XCTUnwrap(
+                    regularFiles(under: root).first {
+                        $0.hasPrefix("portable/blobs/public/")
+                    }
+                )
+                try flipFirstByte(at: root.appending(path: path))
+            }),
+            ("space-car", { root in
+                let path = try XCTUnwrap(
+                    regularFiles(under: root).first {
+                        $0.hasPrefix("portable/spaces/") && $0.hasSuffix(".car")
+                    }
+                )
+                try flipFirstByte(at: root.appending(path: path))
+            }),
+            ("scalar-binding", { root in
+                try rewriteEnvelope(in: root, key: fixture.backupKey) { plaintext in
+                    var object = try XCTUnwrap(
+                        JSONSerialization.jsonObject(with: plaintext)
+                            as? [String: Any]
+                    )
+                    object["signingPrivateScalar"] =
+                        Data(repeating: 0x6A, count: 32).base64URLEncoded
+                    return try JSONSerialization.data(
+                        withJSONObject: object,
+                        options: [.sortedKeys, .withoutEscapingSlashes]
+                    )
+                }
+            }),
+            ("reference-binding", { root in
+                try rewriteEnvelope(in: root, key: fixture.backupKey) { plaintext in
+                    var object = try XCTUnwrap(
+                        JSONSerialization.jsonObject(with: plaintext)
+                            as? [String: Any]
+                    )
+                    var reference = try XCTUnwrap(
+                        object["rotationKeyReference"] as? [String: Any]
+                    )
+                    reference["generation"] = 2
+                    reference["reference"] = "account-rotation:2"
+                    object["rotationKeyReference"] = reference
+                    return try JSONSerialization.data(
+                        withJSONObject: object,
+                        options: [.sortedKeys, .withoutEscapingSlashes]
+                    )
+                }
+            }),
+        ]
+
+        for (index, namedMutation) in mutations.enumerated() {
+            let (name, mutate) = namedMutation
+            let backup = try await fixture.completedBackup(
+                named: "negative-\(index)-\(name)"
+            )
+            try mutate(backup)
+            let sourceBefore = try treeSnapshot(backup)
+            let target = fixture.root.appending(path: "negative-target-\(index)")
+            await XCTAssertThrowsErrorAsync {
+                _ = try await SwanOperatorAccountRestorer().restore(
+                    backupAt: backup,
+                    using: fixture.backupKey,
+                    accountKEK: accountKEK,
+                    to: target
+                )
+            }
+            XCTAssertEqual(try treeSnapshot(backup), sourceBefore, name)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: target.path), name)
+            XCTAssertFalse(
+                try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
+                    .contains { $0.hasPrefix(".swan-account-restore-") },
+                name
+            )
+
+            let valid = try await fixture.completedBackup(
+                named: "negative-retry-\(index)"
+            )
+            _ = try await SwanOperatorAccountRestorer().restore(
+                backupAt: valid,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: target
+            )
+            try FileManager.default.removeItem(at: target)
+        }
+    }
+
+    func testDestinationLinkAndNestedWriteFailureLeaveNoTaskStateAndCanRetry()
+        async throws
+    {
+        let fixture = try await OperatorBackupFixture()
+        defer { fixture.remove() }
+        let backup = try await fixture.completedBackup(named: "nested-failure-source")
+        let accountKEK = try SwanOperatorAccountKEK(
+            rawBytes: Data(repeating: 0xD4, count: 32)
+        )
+        let linkedTarget = fixture.root.appending(path: "linked-target")
+        try FileManager.default.createSymbolicLink(
+            at: linkedTarget,
+            withDestinationURL: backup
+        )
+        await XCTAssertThrowsErrorAsync {
+            _ = try await SwanOperatorAccountRestorer().restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: linkedTarget
+            )
+        }
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(
+                atPath: linkedTarget.path
+            ),
+            backup.path
+        )
+        try FileManager.default.removeItem(at: linkedTarget)
+
+        let target = fixture.root.appending(path: "nested-failure-target")
+        let interrupted = SwanOperatorAccountRestorer(
+            afterStagingBeforeInstall: { anchoredStage in
+                try protectedWrite(
+                    Data("blocks-key-directory".utf8),
+                    to: anchoredStage.appending(path: "keys")
+                )
+            }
+        )
+        await XCTAssertThrowsErrorAsync {
+            _ = try await interrupted.restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: target
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
+                .contains { $0.hasPrefix(".swan-account-restore-") }
+        )
+        _ = try await SwanOperatorAccountRestorer().restore(
+            backupAt: backup,
+            using: fixture.backupKey,
+            accountKEK: accountKEK,
+            to: target
         )
     }
 }
@@ -815,6 +1095,14 @@ private struct OperatorBackupFixture {
     }
 }
 
+private final class UnsafeSendableBox<Value>: @unchecked Sendable {
+    var value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+}
+
 private func rewriteEnvelope(
     in root: URL,
     key: SwanOperatorBackupKey,
@@ -849,6 +1137,41 @@ private func rewriteEnvelope(
     )
     try sealed.write(to: envelopeURL)
     try replaceEnvelopeDigest(sealed, in: root)
+}
+
+private func decryptedEnvelope(
+    in root: URL,
+    key: SwanOperatorBackupKey
+) throws -> Data {
+    let manifestURL = root.appending(path: "manifest.json")
+    let object = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL))
+            as? [String: Any]
+    )
+    let portableDigest = try XCTUnwrap(
+        object["portableManifestSHA256"] as? String
+    )
+    return try AES.GCM.open(
+        AES.GCM.SealedBox(
+            combined: Data(
+                contentsOf: root.appending(path: "operator/secrets.aesgcm")
+            )
+        ),
+        using: SymmetricKey(data: key.bytes),
+        authenticating: Data(
+            [
+                "swan-operator-account-backup-v1",
+                "permissioned-data-0016-2026-07-03",
+                portableDigest,
+            ].joined(separator: "\u{0}").utf8
+        )
+    )
+}
+
+private func flipFirstByte(at url: URL) throws {
+    var bytes = try Data(contentsOf: url)
+    bytes[bytes.startIndex] ^= 0x01
+    try bytes.write(to: url)
 }
 
 private func replaceEnvelopeDigest(_ data: Data, in root: URL) throws {
