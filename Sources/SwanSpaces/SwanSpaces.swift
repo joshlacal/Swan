@@ -259,14 +259,17 @@ public enum SpaceAuthorizationPolicy {
         if scopes.contains("atproto") { return true }
         let action = permission.rawValue
         let base = "space:\(space.spaceType)"
-        guard scopes.contains(where: { $0 == base || $0.hasPrefix(base + "?") }) else {
+        guard scopes.contains(where: { $0.hasPrefix(base + "?") }) else {
             return false
         }
-        // A full OAuth scope parser lives in SwanOAuth. This narrow matcher is
-        // fail-closed: only an unqualified space scope or one explicitly
-        // covering this authority/skey/action/collection is accepted.
-        return scopes.contains(base) || scopes.contains { scope in
+        // Shared OAuth boundaries reject unqualified grants. This domain
+        // matcher is also fail-closed: a qualified grant must explicitly
+        // cover this authority/skey/action/collection. A bare `space:<type>`
+        // grant has no trusted authority or action context, and is not
+        // normalized here.
+        return scopes.contains { scope in
             guard scope.hasPrefix(base + "?"),
+                  PermissionedSpaceScopeSyntax.isQualified(scope),
                   let parameters = strictQueryParameters(
                     String(scope.dropFirst(base.count + 1))
                   ),

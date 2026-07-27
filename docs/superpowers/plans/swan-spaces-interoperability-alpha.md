@@ -70,9 +70,11 @@ checksum-verified way to populate the ignored reference cache.
   startup-preopened SQLite directory. It implements the pinned list ordering,
   cursor, and `excludeValues` behavior, but does not yet implement
   credentials, cross-host reads, writes, CAR/blob transfer, or other profile
-  endpoints. A profile-specific `space:` OAuth scope can now be issued as a
-  narrow resource grant without adding the broad `atproto` token scope; the
-  domain policy remains the exact space/collection authorization decision.
+  endpoints. A profile-specific qualified
+  `space:<type>?authority=...&skey=...&action=...` OAuth scope can now be
+  issued as a narrow resource grant without adding the broad `atproto` token
+  scope. Bare/default type scopes are rejected; the domain policy remains the
+  exact space/collection authorization decision.
 
 ## Completion gates
 

@@ -84,14 +84,12 @@ public struct OAuthValidatedSession: Sendable, Equatable {
     /// A complete client metadata document must still advertise `atproto`,
     /// but an issued access token may carry only one profile-specific
     /// permissioned-space grant. The resource boundary and SwanSpaces parse
-    /// its exact authority/skey/action/collection later; this layer only
-    /// admits a bounded, printable scope representation rather than forcing
-    /// an unrelated broad grant onto that token.
+    /// its exact authority/skey/action/collection later; this layer admits
+    /// only a qualified tuple, rather than accepting a bare type grant with
+    /// no trusted authority or action binding.
     private static func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
         scopes.contains("atproto") || scopes.contains { scope in
-            scope.hasPrefix("space:")
-                && (7 ... 4_096).contains(scope.utf8.count)
-                && scope.utf8.allSatisfy { $0 >= 0x21 && $0 <= 0x7e }
+            PermissionedSpaceScopeSyntax.isQualified(scope)
         }
     }
 }

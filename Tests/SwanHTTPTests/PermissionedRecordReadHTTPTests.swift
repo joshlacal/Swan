@@ -136,6 +136,14 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                 nonce: fixture.runtime.dpopNonceService.issue(),
                 jti: "narrow-other"
             )
+            let narrowForeignAuthority = try signedHeaders(
+                token: narrow.token,
+                key: narrow.key,
+                jwk: narrow.jwk,
+                path: Self.getPath,
+                nonce: fixture.runtime.dpopNonceService.issue(),
+                jti: "narrow-foreign-authority"
+            )
 
             try await app.test(.router) { client in
                 try await client.execute(
@@ -172,6 +180,79 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .unauthorized)
                     self.assertNoStore(response)
                     XCTAssertEqual(try self.errorCode(response.body), "Unauthorized")
+                }
+                // The record exists in Alice's opened repository, but an
+                // exact grant for Alice's space cannot be replayed against a
+                // space with Bob as authority.
+                try await client.execute(
+                    uri: self.getURI(
+                        fixture,
+                        space: fixture.foreignSpace,
+                        collection: Self.collection,
+                        rkey: "foreign"
+                    ),
+                    method: .get,
+                    headers: narrowForeignAuthority
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(try self.errorCode(response.body), "Unauthorized")
+                }
+            }
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
+    func testBareAndActionUnqualifiedSpaceScopesCannotBecomeDurableTokens() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let exactScope = "space:app.bsky.bookmarks?authority=\(Self.alice)&skey=record-read&action=read&collection=\(Self.collection)"
+            _ = try await issueToken(fixture.runtime, subject: Self.alice, scopes: [exactScope])
+
+            let invalidScopes = [
+                "space:app.bsky.bookmarks",
+                "space:app.bsky.bookmarks?authority=\(Self.alice)&skey=record-read",
+            ]
+            for scope in invalidScopes {
+                do {
+                    _ = try await issueToken(fixture.runtime, subject: Self.alice, scopes: [scope])
+                    XCTFail("OAuth issuance accepted an unqualified space scope: \(scope)")
+                } catch {
+                    // The validated-session boundary rejects this before a
+                    // token can be minted.
+                }
+
+                let now = Date()
+                let binding = OAuthClientBinding(
+                    issuer: Self.publicURL.absoluteString,
+                    clientID: "https://client.example/metadata",
+                    redirectURI: "https://client.example/callback",
+                    scopes: [scope],
+                    dpopJKT: String(repeating: "a", count: 43)
+                )
+                let family = OAuthTokenFamily(
+                    familyID: UUID(),
+                    subject: Self.alice,
+                    binding: binding,
+                    expiresAt: now.addingTimeInterval(3_600)
+                )
+                let tokens = OAuthIssuedTokenDigests(
+                    familyID: family.familyID,
+                    accessTokenDigest: Data(repeating: 0x01, count: 32),
+                    refreshTokenDigest: Data(repeating: 0x02, count: 32),
+                    accessExpiresAt: now.addingTimeInterval(300),
+                    refreshExpiresAt: now.addingTimeInterval(3_000)
+                )
+                do {
+                    try await fixture.control.issueTokenPair(family: family, tokens: tokens, now: now)
+                    XCTFail("durable OAuth store accepted an unqualified space scope: \(scope)")
+                } catch {
+                    // SQLite validates the same tuple shape so a malformed
+                    // legacy binding cannot bypass the issuance boundary.
                 }
             }
             try await close(fixture)
@@ -365,11 +446,12 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "PermissionedRecordReadHTTPTests-\(UUID().uuidString)")
         let space = try SpaceURI(authority: Self.alice, spaceType: "app.bsky.bookmarks", skey: "record-read")
+        let foreignSpace = try SpaceURI(authority: Self.bob, spaceType: "app.bsky.bookmarks", skey: "record-read")
         let control = try await SQLiteControlDatabase(dataDirectory: root)
         do {
             _ = try await control.createAccount(registration(did: Self.alice, handle: "alice.example.com"))
             _ = try await control.createAccount(registration(did: Self.bob, handle: "bob.example.com"))
-            let records = try await installRecords(root: root, space: space)
+            let records = try await installRecords(root: root, space: space, foreignSpace: foreignSpace)
             try await installEmptyAccountDatabase(root: root, did: Self.bob)
             let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(dataDirectory: root, controlStore: control)
             let runtime = try SwanOAuthRuntime(controlStore: control, serverKey: Data(repeating: 0xB7, count: 32))
@@ -378,6 +460,7 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
             return Fixture(
                 root: root,
                 space: space,
+                foreignSpace: foreignSpace,
                 control: control,
                 directory: directory,
                 runtime: runtime,
@@ -396,7 +479,11 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    private func installRecords(root: URL, space: SpaceURI) async throws -> [SpaceRecordURI] {
+    private func installRecords(
+        root: URL,
+        space: SpaceURI,
+        foreignSpace: SpaceURI
+    ) async throws -> [SpaceRecordURI] {
         let database = try await SQLiteAccountDatabase(dataDirectory: root, did: Self.alice)
         do {
             let repository = try DurableSpaceRepository(database: database, space: space, author: Self.alice)
@@ -415,6 +502,24 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                     authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"])
                 )
             }
+            let foreignRepository = try DurableSpaceRepository(
+                database: database,
+                space: foreignSpace,
+                author: Self.alice
+            )
+            let foreignRecord = try SpaceRecordURI(
+                space: foreignSpace,
+                author: Self.alice,
+                collection: Self.collection,
+                rkey: "foreign"
+            )
+            _ = try await foreignRepository.apply(
+                .put(uri: foreignRecord, value: recordCBOR("foreign")),
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try tid(0),
+                authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"])
+            )
             try await database.close()
             return records
         } catch {
@@ -546,8 +651,13 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         return headers
     }
 
-    private func getURI(_ fixture: Fixture, collection: String, rkey: String) -> String {
-        "\(Self.getPath)?space=\(percentEncode(fixture.space.rawValue))&repo=\(Self.alice)&collection=\(collection)&rkey=\(rkey)"
+    private func getURI(
+        _ fixture: Fixture,
+        space: SpaceURI? = nil,
+        collection: String,
+        rkey: String
+    ) -> String {
+        "\(Self.getPath)?space=\(percentEncode((space ?? fixture.space).rawValue))&repo=\(Self.alice)&collection=\(collection)&rkey=\(rkey)"
     }
 
     private func listURI(
@@ -627,6 +737,7 @@ private struct TokenMaterial: Sendable {
 private struct Fixture: Sendable {
     let root: URL
     let space: SpaceURI
+    let foreignSpace: SpaceURI
     let control: SQLiteControlDatabase
     let directory: SQLitePreMigratedAccountDirectory
     let runtime: SwanOAuthRuntime

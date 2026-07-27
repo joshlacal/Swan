@@ -119,6 +119,59 @@ public enum Hex {
     }
 }
 
+/// Structural validation for a permissioned-data OAuth grant.
+///
+/// This deliberately validates only the scope envelope shared by the OAuth
+/// control/resource planes. The resource domain performs the authoritative
+/// comparison of the type, authority, `skey`, action, and collection against
+/// the requested operation. Keeping that comparison there means an OAuth
+/// token cannot turn a syntactically valid scope for one space into access to
+/// another one.
+///
+/// In particular, the proposal's shorthand `space:<type>` is not accepted at
+/// this boundary. Swan has no trusted generic issuer-side context from which
+/// to normalize it into an authority, `skey`, and action, so accepting it
+/// would make the grant broader than the pinned TypeScript tuple check.
+public enum PermissionedSpaceScopeSyntax {
+    public static func isQualified(_ scope: String) -> Bool {
+        let prefix = "space:"
+        guard scope.hasPrefix(prefix),
+              (7 ... 4_096).contains(scope.utf8.count),
+              scope.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e })
+        else {
+            return false
+        }
+
+        let typeStart = scope.index(scope.startIndex, offsetBy: prefix.count)
+        guard let queryStart = scope[typeStart...].firstIndex(of: "?"),
+              queryStart > typeStart,
+              queryStart < scope.index(before: scope.endIndex)
+        else {
+            return false
+        }
+
+        var keys = Set<String>()
+        var requiredKeys = Set<String>()
+        for component in scope[scope.index(after: queryStart)...].split(separator: "&", omittingEmptySubsequences: false) {
+            let pair = component.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard pair.count == 2,
+                  !pair[0].isEmpty,
+                  !pair[1].isEmpty,
+                  keys.insert(String(pair[0])).inserted
+            else {
+                return false
+            }
+            switch pair[0] {
+            case "authority", "skey", "action":
+                requiredKeys.insert(String(pair[0]))
+            default:
+                break
+            }
+        }
+        return requiredKeys == ["authority", "skey", "action"]
+    }
+}
+
 /// Canonical raw P-256 signatures used by Swan wire protocols.
 ///
 /// P-256 ECDSA admits a second, equally valid signature for every message:

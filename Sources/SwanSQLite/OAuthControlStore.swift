@@ -1,5 +1,6 @@
 import Foundation
 import SQLiteNIO
+import SwanCore
 import SwanStorage
 
 actor ControlSQLiteConnectionGate {
@@ -1233,7 +1234,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
 
     private func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
         scopes.contains("atproto") || scopes.contains { scope in
-            scope.hasPrefix("space:") && validScope(scope)
+            PermissionedSpaceScopeSyntax.isQualified(scope)
         }
     }
 

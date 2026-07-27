@@ -754,9 +754,7 @@ public actor DurableOAuthTokenService {
 
     private static func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
         scopes.contains("atproto") || scopes.contains { scope in
-            scope.hasPrefix("space:")
-                && (7 ... 4_096).contains(scope.utf8.count)
-                && scope.utf8.allSatisfy { $0 >= 0x21 && $0 <= 0x7e }
+            PermissionedSpaceScopeSyntax.isQualified(scope)
         }
     }
 

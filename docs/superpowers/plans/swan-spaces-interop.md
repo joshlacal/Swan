@@ -45,11 +45,13 @@ Catbird UI work.
   `(collection,rkey)` pagination plus tolerant semantic cursor parsing.
   They expose no credential, service-auth, remote-repository, or cross-host
   behavior. Account OAuth is self-only; `atproto` is accepted as a broad
-  grant and a bounded `space:` scope is passed to the domain policy for exact
-  authority/skey/read/collection enforcement. The focused HTTP tests exercise
-  SQLite-backed values, real durable OAuth tokens and signed DPoP proofs,
-  narrow grants, foreign-repository opacity, lifecycle closure, replay, and
-  no public-repository fallback.
+  grant and only a qualified `space:<type>?authority=...&skey=...&action=...`
+  scope is passed to the domain policy for exact authority/skey/read/collection
+  enforcement. Bare/default type scopes are rejected rather than normalized.
+  The focused HTTP tests exercise SQLite-backed values, real durable OAuth
+  tokens and signed DPoP proofs, narrow grants, cross-authority denial,
+  foreign-repository opacity, lifecycle closure, replay, and no
+  public-repository fallback.
 - All unimplemented HTTP endpoints intentionally return generic authorization
   errors or `profile_endpoint_pending`; they are not interop evidence. The
   pinned TypeScript `com.atproto.space.getSpace` exception is now a typed,
