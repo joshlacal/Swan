@@ -79,15 +79,18 @@ public struct SwanManagementHTTPServer: Sendable {
     public let configuration: SwanManagementHTTPConfiguration
     private let accounts: AccountOperatorService
     private let operatorSecretVerifier: OperatorSecretVerifier
+    private let plcProvisioning: (any SwanManagementPLCProvisioning)?
 
     public init(
         configuration: SwanManagementHTTPConfiguration,
         controlStore: any AccountControlStore,
-        operatorSecretVerifier: OperatorSecretVerifier
+        operatorSecretVerifier: OperatorSecretVerifier,
+        plcProvisioning: (any SwanManagementPLCProvisioning)? = nil
     ) {
         self.configuration = configuration
         accounts = AccountOperatorService(store: controlStore)
         self.operatorSecretVerifier = operatorSecretVerifier
+        self.plcProvisioning = plcProvisioning
     }
 
     /// The management router has its own request context and is never merged
@@ -96,6 +99,7 @@ public struct SwanManagementHTTPServer: Sendable {
         let router = Router(context: SwanManagementRequestContext.self)
         let accounts = accounts
         let verifier = operatorSecretVerifier
+        let plcProvisioning = plcProvisioning
 
         router.get("/v1/accounts") { request, context async -> Response in
             guard authorize(request: request, context: context, verifier: verifier) != nil else {
@@ -153,10 +157,51 @@ public struct SwanManagementHTTPServer: Sendable {
             }
         }
 
+        if let plcProvisioning {
+            router.post("/v1/accounts/plc/prepare") { request, context async -> Response in
+                guard authorize(request: request, context: context, verifier: verifier) != nil else {
+                    return managementError(.unauthorized)
+                }
+                do {
+                    let requestBody: ManagementPLCPrepareRequest =
+                        try await decodeManagementJSON(from: request)
+                    let input = try requestBody.validatedInput()
+                    let result = try await plcProvisioning.prepare(input)
+                    return managementJSON(.ok, result)
+                } catch {
+                    return managementError(status(for: error))
+                }
+            }
+
+            router.post("/v1/accounts/plc/activate") { request, context async -> Response in
+                guard authorize(request: request, context: context, verifier: verifier) != nil else {
+                    return managementError(.unauthorized)
+                }
+                do {
+                    let requestBody: ManagementPLCActivateRequest =
+                        try await decodeManagementJSON(from: request)
+                    let input = try requestBody.validatedInput()
+                    let result = try await plcProvisioning.activate(input)
+                    return managementJSON(.ok, result)
+                } catch {
+                    return managementError(status(for: error))
+                }
+            }
+        } else {
+            // Keep disabled provisioning indistinguishable from any other
+            // unavailable management path while retaining the management
+            // listener's no-store error closure.
+            registerDisabledPLCProvisioningGuards(on: router)
+        }
+
         // Make wrong verbs and unknown management paths return the same small,
         // no-store JSON closure as every other management error. The public
         // router intentionally has no corresponding fallback.
-        registerMethodGuards(on: router, verifier: verifier)
+        registerMethodGuards(
+            on: router,
+            verifier: verifier,
+            plcProvisioningEnabled: plcProvisioning != nil
+        )
         registerUnknownManagementGuards(on: router)
         return router
     }
@@ -208,6 +253,115 @@ private struct ManagementDeleteRequest: Decodable {
     }
 }
 
+private struct ManagementPLCPrepareRequest: Decodable {
+    let requestID: String
+    let handle: String
+    let pdsOrigin: String
+    let repositoryRevision: String
+    let plcOrigin: String?
+    let plcLaboratory: Bool
+    let plcReferenceCompatibility: String?
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: ManagementCodingKey.self)
+        try validateKeys(container, allowed: [
+            "requestId", "handle", "pdsOrigin", "repositoryRevision",
+            "plcOrigin", "plcLaboratory", "plcReferenceCompatibility",
+        ])
+        requestID = try container.decode(String.self, forKey: .init("requestId"))
+        handle = try container.decode(String.self, forKey: .init("handle"))
+        pdsOrigin = try container.decode(String.self, forKey: .init("pdsOrigin"))
+        repositoryRevision = try container.decode(String.self, forKey: .init("repositoryRevision"))
+        plcOrigin = try container.decodeIfPresent(String.self, forKey: .init("plcOrigin"))
+        plcLaboratory = try container.decodeIfPresent(Bool.self, forKey: .init("plcLaboratory"))
+            ?? false
+        plcReferenceCompatibility = try container.decodeIfPresent(
+            String.self,
+            forKey: .init("plcReferenceCompatibility")
+        )
+    }
+
+    func validatedInput() throws -> SwanManagementPLCPrepareInput {
+        let pdsURL = try validatedHTTPSOrigin(pdsOrigin)
+        let plcConfiguration = try validatedPLCConfiguration(
+            origin: plcOrigin,
+            laboratory: plcLaboratory,
+            compatibility: plcReferenceCompatibility,
+            allowsCompatibility: true
+        )
+        guard !requestID.isEmpty, requestID.utf8.count <= 128,
+              !handle.isEmpty, handle.utf8.count <= 2_048,
+              !repositoryRevision.isEmpty, repositoryRevision.utf8.count <= 128 else {
+            throw ManagementRequestError.malformed
+        }
+        return .init(
+            requestID: requestID,
+            handle: handle,
+            pdsOrigin: pdsURL,
+            repositoryRevision: repositoryRevision,
+            plcConfiguration: plcConfiguration
+        )
+    }
+}
+
+private struct ManagementPLCActivateRequest: Decodable {
+    let requestID: String
+    let password: String
+    let plcOrigin: String?
+    let plcLaboratory: Bool
+    let handleLaboratoryOrigin: String?
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: ManagementCodingKey.self)
+        try validateKeys(container, allowed: [
+            "requestId", "password", "plcOrigin", "plcLaboratory",
+            "handleLaboratoryOrigin",
+        ])
+        requestID = try container.decode(String.self, forKey: .init("requestId"))
+        password = try container.decode(String.self, forKey: .init("password"))
+        plcOrigin = try container.decodeIfPresent(String.self, forKey: .init("plcOrigin"))
+        plcLaboratory = try container.decodeIfPresent(Bool.self, forKey: .init("plcLaboratory"))
+            ?? false
+        handleLaboratoryOrigin = try container.decodeIfPresent(
+            String.self,
+            forKey: .init("handleLaboratoryOrigin")
+        )
+    }
+
+    func validatedInput() throws -> SwanManagementPLCActivateInput {
+        guard !requestID.isEmpty, requestID.utf8.count <= 128,
+              !password.isEmpty, password.utf8.count <= 4 * 1_024,
+              !password.utf8.contains(0) else {
+            throw ManagementRequestError.malformed
+        }
+        let plcConfiguration = try validatedPLCConfiguration(
+            origin: plcOrigin,
+            laboratory: plcLaboratory,
+            compatibility: nil,
+            allowsCompatibility: false
+        )
+        let handlePolicy: ATHandleResolutionPolicy
+        if plcLaboratory {
+            guard let handleLaboratoryOrigin,
+                  let origin = URL(string: handleLaboratoryOrigin) else {
+                throw ManagementRequestError.malformed
+            }
+            handlePolicy = try ATHandleResolutionPolicy.laboratory(origin: origin)
+        } else {
+            guard handleLaboratoryOrigin == nil else {
+                throw ManagementRequestError.malformed
+            }
+            handlePolicy = try ATHandleResolutionPolicy.production()
+        }
+        return .init(
+            requestID: requestID,
+            password: password,
+            plcConfiguration: plcConfiguration,
+            handlePolicy: handlePolicy
+        )
+    }
+}
+
 private struct ManagementCodingKey: CodingKey, Hashable {
     let stringValue: String
     let intValue: Int? = nil
@@ -230,6 +384,74 @@ private func validateKeys(
     allowed: Set<String>
 ) throws {
     guard Set(container.allKeys.map(\.stringValue)).isSubset(of: allowed) else {
+        throw ManagementRequestError.malformed
+    }
+}
+
+private func validatedHTTPSOrigin(_ rawValue: String) throws -> URL {
+    guard rawValue.utf8.count <= 4_096,
+          let url = URL(string: rawValue),
+          let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+          components.scheme?.lowercased() == "https",
+          let host = components.host,
+          !host.isEmpty,
+          components.user == nil,
+          components.password == nil,
+          components.query == nil,
+          components.fragment == nil,
+          components.path.isEmpty || components.path == "/",
+          components.port == nil || components.port == 443 else {
+        throw ManagementRequestError.malformed
+    }
+    do {
+        let canonical = try PLCATProfile.canonicalPDSOrigin(url)
+        guard let result = URL(string: canonical) else {
+            throw ManagementRequestError.malformed
+        }
+        return result
+    } catch {
+        throw ManagementRequestError.malformed
+    }
+}
+
+private func validatedPLCConfiguration(
+    origin rawOrigin: String?,
+    laboratory: Bool,
+    compatibility rawCompatibility: String?,
+    allowsCompatibility: Bool
+) throws -> PLCClientConfiguration {
+    do {
+        let originText = rawOrigin
+            ?? PLCClientConfiguration.defaultProductionOrigin.absoluteString
+        guard originText.utf8.count <= 4_096,
+              let origin = URL(string: originText) else {
+            throw ManagementRequestError.malformed
+        }
+        let compatibility: PLCSubmitSuccessResponsePolicy
+        switch rawCompatibility {
+        case nil:
+            compatibility = .strict
+        case PLCSubmitSuccessResponsePolicy.didPLCServer001.rawValue:
+            guard allowsCompatibility, laboratory else {
+                throw ManagementRequestError.malformed
+            }
+            compatibility = .didPLCServer001
+        case .some:
+            throw ManagementRequestError.malformed
+        }
+        if laboratory {
+            return try .laboratory(
+                origin: origin,
+                submitSuccessResponsePolicy: compatibility
+            )
+        }
+        guard compatibility == .strict else {
+            throw ManagementRequestError.malformed
+        }
+        return try .production(origin: origin)
+    } catch is ManagementRequestError {
+        throw ManagementRequestError.malformed
+    } catch {
         throw ManagementRequestError.malformed
     }
 }
@@ -318,14 +540,19 @@ private func decodeManagementJSON<Value: Decodable>(from request: Request) async
 
 private func registerMethodGuards(
     on router: Router<SwanManagementRequestContext>,
-    verifier: OperatorSecretVerifier
+    verifier: OperatorSecretVerifier,
+    plcProvisioningEnabled: Bool
 ) {
-    let routes: [(RouterPath, Set<HTTPRequest.Method>)] = [
+    var routes: [(RouterPath, Set<HTTPRequest.Method>)] = [
         ("/v1/accounts", [.get]),
         ("/v1/accounts/deactivate", [.post]),
         ("/v1/accounts/reactivate", [.post]),
         ("/v1/accounts/delete", [.post]),
     ]
+    if plcProvisioningEnabled {
+        routes.append(("/v1/accounts/plc/prepare", [.post]))
+        routes.append(("/v1/accounts/plc/activate", [.post]))
+    }
     let methods: [HTTPRequest.Method] = [.get, .head, .post, .put, .patch, .delete, .options, .connect, .trace]
     for (path, allowed) in routes {
         for method in methods where !allowed.contains(method) {
@@ -339,10 +566,26 @@ private func registerMethodGuards(
     }
 }
 
+private func registerDisabledPLCProvisioningGuards(
+    on router: Router<SwanManagementRequestContext>
+) {
+    let methods: [HTTPRequest.Method] = [.get, .head, .post, .put, .patch, .delete, .options, .connect, .trace]
+    for path: RouterPath in ["/v1/accounts/plc/prepare", "/v1/accounts/plc/activate"] {
+        for method in methods {
+            router.on(path, method: method) { _, _ -> Response in
+                managementError(.notFound)
+            }
+        }
+    }
+}
+
 private func registerUnknownManagementGuards(on router: Router<SwanManagementRequestContext>) {
     let methods: [HTTPRequest.Method] = [.get, .head, .post, .put, .patch, .delete, .options, .connect, .trace]
     for method in methods {
         router.on("/v1/*", method: method) { _, _ -> Response in
+            managementError(.notFound)
+        }
+        router.on("/v1/*/*", method: method) { _, _ -> Response in
             managementError(.notFound)
         }
     }
@@ -357,7 +600,14 @@ private func status(for error: any Error) -> HTTPResponse.Status {
         return .badRequest
     case let error as AccountOperatorError where error == .unknownAccount:
         return .notFound
-    case is AccountControlStoreError, is SwanError:
+    case let error as PLCAccountPreparationError:
+        return error == .unavailable ? .serviceUnavailable : .badRequest
+    case let error as PLCAccountActivationError:
+        return error == .unavailable ? .serviceUnavailable : .badRequest
+    case let error as SwanError:
+        if case .unavailable = error { return .serviceUnavailable }
+        return .badRequest
+    case is AccountControlStoreError:
         return .badRequest
     default:
         return .internalServerError
@@ -373,6 +623,20 @@ private func managementJSON(_ status: HTTPResponse.Status, _ body: AccountOperat
     )
 }
 
+private func managementJSON(
+    _ status: HTTPResponse.Status,
+    _ body: some Encodable
+) -> Response {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    let data = (try? encoder.encode(body)) ?? Data("{}".utf8)
+    return Response(
+        status: status,
+        headers: [.contentType: "application/json", .cacheControl: "no-store"],
+        body: .init(byteBuffer: ByteBuffer(data: data))
+    )
+}
+
 private func managementError(_ status: HTTPResponse.Status) -> Response {
     struct ErrorBody: Encodable { let error: String }
     let code = switch status {
@@ -381,6 +645,7 @@ private func managementError(_ status: HTTPResponse.Status) -> Response {
     case .notFound: "not_found"
     case .contentTooLarge: "request_too_large"
     case .methodNotAllowed: "method_not_allowed"
+    case .serviceUnavailable: "temporarily_unavailable"
     default: "internal_error"
     }
     let encoder = JSONEncoder()

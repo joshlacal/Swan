@@ -1,0 +1,202 @@
+import Foundation
+import SwanAccounts
+import SwanSQLite
+
+public struct SwanManagementPLCPrepareInput: Sendable {
+    public let requestID: String
+    public let handle: String
+    public let pdsOrigin: URL
+    public let repositoryRevision: String
+    public let plcConfiguration: PLCClientConfiguration
+
+    public init(
+        requestID: String,
+        handle: String,
+        pdsOrigin: URL,
+        repositoryRevision: String,
+        plcConfiguration: PLCClientConfiguration
+    ) {
+        self.requestID = requestID
+        self.handle = handle
+        self.pdsOrigin = pdsOrigin
+        self.repositoryRevision = repositoryRevision
+        self.plcConfiguration = plcConfiguration
+    }
+}
+
+public struct SwanManagementPLCActivateInput: Sendable {
+    public let requestID: String
+    public let password: String
+    public let plcConfiguration: PLCClientConfiguration
+    public let handlePolicy: ATHandleResolutionPolicy
+
+    public init(
+        requestID: String,
+        password: String,
+        plcConfiguration: PLCClientConfiguration,
+        handlePolicy: ATHandleResolutionPolicy
+    ) {
+        self.requestID = requestID
+        self.password = password
+        self.plcConfiguration = plcConfiguration
+        self.handlePolicy = handlePolicy
+    }
+}
+
+public struct SwanManagementPLCPrepareResult: Codable, Sendable, Equatable {
+    public let requestId: String
+    public let did: String
+    public let canonicalHandle: String
+    public let pdsOrigin: String
+    public let repositoryRevision: String
+    public let plcOperationCID: String
+    public let publicGenesisCommitCID: String
+
+    public init(identity: PreparedPLCAccountIdentity) {
+        requestId = identity.requestID
+        did = identity.did
+        canonicalHandle = identity.canonicalHandle
+        pdsOrigin = identity.pdsOrigin
+        repositoryRevision = identity.repositoryRevision
+        plcOperationCID = identity.plcOperationCID
+        publicGenesisCommitCID = identity.publicGenesisCommitCID
+    }
+
+    public init(
+        requestId: String,
+        did: String,
+        canonicalHandle: String,
+        pdsOrigin: String,
+        repositoryRevision: String,
+        plcOperationCID: String,
+        publicGenesisCommitCID: String
+    ) {
+        self.requestId = requestId
+        self.did = did
+        self.canonicalHandle = canonicalHandle
+        self.pdsOrigin = pdsOrigin
+        self.repositoryRevision = repositoryRevision
+        self.plcOperationCID = plcOperationCID
+        self.publicGenesisCommitCID = publicGenesisCommitCID
+    }
+}
+
+public struct SwanManagementPLCActivateResult: Codable, Sendable, Equatable {
+    public let did: String
+    public let canonicalHandle: String
+    public let status: String
+    public let publicGenesisCommitCID: String
+    public let publicGenesisRevision: String
+    public let recovered: Bool
+
+    public init(installation: LocalAccountInstallation) {
+        did = installation.account.did
+        canonicalHandle = installation.account.canonicalHandle
+        status = installation.account.status.rawValue
+        publicGenesisCommitCID = installation.publicGenesis.genesis.commitCID.string
+        publicGenesisRevision = installation.publicGenesis.genesis.revision
+        recovered = installation.registrationWasRecovered
+    }
+
+    public init(
+        did: String,
+        canonicalHandle: String,
+        status: String,
+        publicGenesisCommitCID: String,
+        publicGenesisRevision: String,
+        recovered: Bool
+    ) {
+        self.did = did
+        self.canonicalHandle = canonicalHandle
+        self.status = status
+        self.publicGenesisCommitCID = publicGenesisCommitCID
+        self.publicGenesisRevision = publicGenesisRevision
+        self.recovered = recovered
+    }
+}
+
+/// Narrow seam used by the management router. Production construction uses
+/// `SwanManagementPLCProvisioningRuntime`; the protocol keeps HTTP validation
+/// and authorization independently testable without weakening either.
+public protocol SwanManagementPLCProvisioning: Sendable {
+    func prepare(
+        _ input: SwanManagementPLCPrepareInput
+    ) async throws -> SwanManagementPLCPrepareResult
+
+    func activate(
+        _ input: SwanManagementPLCActivateInput
+    ) async throws -> SwanManagementPLCActivateResult
+}
+
+/// The single process-local composition root for both the CLI and management
+/// PLC workflows. Domain services own the durable state machine. This runtime
+/// only selects a validated remote policy and wires those services together.
+public final class SwanManagementPLCProvisioningRuntime:
+    SwanManagementPLCProvisioning
+{
+    private let controlDatabase: SQLiteControlDatabase
+    private let opener: SQLitePLCAccountPreparationStoreOpener
+    private let keyStore: FileAccountKeyStore
+    private let directory: DurableAccountDirectory
+
+    public init(
+        controlDatabase: SQLiteControlDatabase,
+        dataDirectory: URL,
+        keyStore: FileAccountKeyStore
+    ) throws {
+        let passwordHasher = try LibsodiumArgon2idHasher()
+        self.controlDatabase = controlDatabase
+        opener = SQLitePLCAccountPreparationStoreOpener(dataDirectory: dataDirectory)
+        self.keyStore = keyStore
+        directory = DurableAccountDirectory(
+            store: controlDatabase,
+            passwordHasher: passwordHasher,
+            verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher),
+            keyProvisioner: AccountKeyProvisioner(keyStore: keyStore)
+        )
+    }
+
+    public func prepare(
+        _ input: SwanManagementPLCPrepareInput
+    ) async throws -> SwanManagementPLCPrepareResult {
+        let service = PLCAccountPreparationService(
+            intentStore: controlDatabase,
+            accountStoreOpener: opener,
+            keyStore: keyStore,
+            plcClient: try PLCDirectoryClient(configuration: input.plcConfiguration)
+        )
+        let identity = try await service.prepare(
+            requestID: input.requestID,
+            handle: input.handle,
+            pdsOrigin: input.pdsOrigin,
+            repositoryRevision: input.repositoryRevision
+        )
+        return .init(identity: identity)
+    }
+
+    public func activate(
+        _ input: SwanManagementPLCActivateInput
+    ) async throws -> SwanManagementPLCActivateResult {
+        let handleVerifier = ATProtocolHandleVerifier(
+            policy: input.handlePolicy,
+            http: try NIOPeerPinnedATHandleHTTPTransport()
+        )
+        let service = PLCAccountActivationService(
+            intentStore: controlDatabase,
+            accountStoreOpener: opener,
+            keyStore: keyStore,
+            plcClient: try PLCDirectoryClient(configuration: input.plcConfiguration),
+            handleVerifier: handleVerifier,
+            directory: directory
+        )
+        let installation = try await service.activate(
+            requestID: input.requestID,
+            password: input.password
+        )
+        return .init(installation: installation)
+    }
+
+    public func close() async throws {
+        try await opener.close()
+    }
+}

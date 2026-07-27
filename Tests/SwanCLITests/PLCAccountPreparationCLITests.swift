@@ -355,6 +355,52 @@ final class PLCAccountPreparationCLITests: XCTestCase {
         }
     }
 
+    func testServeManagementPLCProvisioningOptionsFailClosedBeforeListener() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+
+        let missingPort = try runServe(
+            fixture: fixture,
+            arguments: ["--enable-management-plc-provisioning"]
+        )
+        XCTAssertNotEqual(missingPort.status, 0)
+        XCTAssertTrue(
+            missingPort.error.contains(
+                "--enable-management-plc-provisioning requires --management-port"
+            )
+        )
+
+        let optionWithoutCapability = try runServe(
+            fixture: fixture,
+            arguments: [
+                "--management-account-kek-file", fixture.kekFile.path,
+            ]
+        )
+        XCTAssertNotEqual(optionWithoutCapability.status, 0)
+        XCTAssertTrue(
+            optionWithoutCapability.error.contains(
+                "management account KEK options require --enable-management-plc-provisioning"
+            )
+        )
+
+        let missingRuntimeSecret = try runServe(
+            fixture: fixture,
+            arguments: [
+                "--management-port", "40123",
+                "--enable-management-plc-provisioning",
+                "--management-account-kek-file",
+                fixture.secrets.appending(path: "missing-kek").path,
+            ]
+        )
+        XCTAssertNotEqual(missingRuntimeSecret.status, 0)
+        XCTAssertTrue(
+            missingRuntimeSecret.error.contains(
+                "management PLC provisioning runtime is unavailable"
+            )
+        )
+        XCTAssertFalse(missingRuntimeSecret.error.contains(fixture.encodedKEK))
+    }
+
     private func runPrepare(
         fixture: Fixture,
         server: TestPLCDirectory? = nil,
@@ -459,6 +505,41 @@ final class PLCAccountPreparationCLITests: XCTestCase {
         )
     }
 
+    private func runServe(
+        fixture: Fixture,
+        arguments: [String]
+    ) throws -> ProcessResult {
+        let process = Process()
+        process.executableURL = try XCTUnwrap(executableURL())
+        process.arguments = [
+            "serve", "--data-directory", fixture.data.path,
+        ] + arguments
+        var environment = ProcessInfo.processInfo.environment
+        environment["SWAN_OAUTH_SERVER_KEY"] = Self.base64URLEncoded(
+            Data(repeating: 0x31, count: 32)
+        )
+        environment.removeValue(forKey: "SWAN_OPERATOR_SECRET")
+        environment.removeValue(forKey: "SWAN_ACCOUNT_KEK")
+        process.environment = environment
+        let output = Pipe()
+        let error = Pipe()
+        process.standardOutput = output
+        process.standardError = error
+        try process.run()
+        process.waitUntilExit()
+        return ProcessResult(
+            status: process.terminationStatus,
+            output: String(
+                decoding: output.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            ),
+            error: String(
+                decoding: error.fileHandleForReading.readDataToEndOfFile(),
+                as: UTF8.self
+            )
+        )
+    }
+
     private func executableURL() -> URL? {
         let testBundleProduct = Bundle(for: PLCAccountPreparationCLITests.self)
             .bundleURL
@@ -493,6 +574,13 @@ final class PLCAccountPreparationCLITests: XCTestCase {
         try XCTUnwrap(
             JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any]
         )
+    }
+
+    private static func base64URLEncoded(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 
     private func assertPersistedData(under root: URL, excludes needles: [Data]) throws {

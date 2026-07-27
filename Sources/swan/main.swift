@@ -329,6 +329,18 @@ extension SwanCommand {
         @Option(name: .long, help: "Mounted operator-secret file for the enabled management listener")
         var managementOperatorSecretFile: String?
 
+        @Flag(name: .customLong("enable-management-plc-provisioning"), help: "Enable authenticated PLC prepare/activate routes on the separate management listener")
+        var enableManagementPLCProvisioning = false
+
+        @Option(name: .customLong("management-account-kek-file"), help: "Owner-only mounted account-KEK file for management PLC provisioning; SWAN_ACCOUNT_KEK is the alternative")
+        var managementAccountKEKFile: String?
+
+        @Option(name: .customLong("management-account-kek-id"), help: "Active account-KEK identifier for management PLC provisioning")
+        var managementAccountKEKID: String = "primary"
+
+        @Option(name: .customLong("management-account-key-directory"), help: "Protected account key-envelope directory for management PLC provisioning; defaults to <data-directory>/keys")
+        var managementAccountKeyDirectory: String?
+
         @Option(name: .customLong("notification-config"), help: "Owner-supplied JSON with ES256/ES256K public pins, peer-pinned destinations, and receiver service-identity bindings")
         var notificationConfig: String?
 
@@ -345,6 +357,25 @@ extension SwanCommand {
         var notificationAccountKeyDirectory: String?
 
         func run() async throws {
+            guard !enableManagementPLCProvisioning || managementPort != nil else {
+                throw ValidationError("--enable-management-plc-provisioning requires --management-port")
+            }
+            if !enableManagementPLCProvisioning {
+                guard managementAccountKEKFile == nil,
+                      managementAccountKeyDirectory == nil,
+                      managementAccountKEKID == "primary"
+                else {
+                    throw ValidationError("management account KEK options require --enable-management-plc-provisioning")
+                }
+            } else {
+                guard !managementAccountKEKID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      managementAccountKeyDirectory.map({
+                          !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      }) ?? true
+                else {
+                    throw ValidationError("management account key-store options are invalid")
+                }
+            }
             let loadedProfile = try ProtocolProfile.load(from: URL(fileURLWithPath: profile))
             let baseURL = try publicURL.map { value in
                 guard let url = URL(string: value) else { throw ValidationError("--public-url must be a URL") }
@@ -354,6 +385,7 @@ extension SwanCommand {
             let serverKey = try loadOAuthServerKey()
             let controlDatabase = try await SQLiteControlDatabase(dataDirectory: dataURL)
             var preopenedAccountDirectory: SQLitePreMigratedAccountDirectory?
+            var preopenedManagementProvisioning: SwanManagementPLCProvisioningRuntime?
             do {
                 // Permissioned lookup never creates or migrates an account
                 // database during a request. Build the complete active set
@@ -537,6 +569,32 @@ extension SwanCommand {
                 } else {
                     notificationRecoveryService = nil
                 }
+                let managementPLCProvisioning: SwanManagementPLCProvisioningRuntime?
+                if enableManagementPLCProvisioning {
+                    do {
+                        let keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                            activeKeyID: managementAccountKEKID,
+                            secretFile: managementAccountKEKFile.map { URL(fileURLWithPath: $0) }
+                        )
+                        let keyDirectory = managementAccountKeyDirectory.map {
+                            URL(fileURLWithPath: $0)
+                        } ?? dataURL.appending(path: "keys")
+                        let keyStore = try FileAccountKeyStore(
+                            root: keyDirectory,
+                            configuration: keyConfiguration
+                        )
+                        managementPLCProvisioning = try .init(
+                            controlDatabase: controlDatabase,
+                            dataDirectory: dataURL,
+                            keyStore: keyStore
+                        )
+                        preopenedManagementProvisioning = managementPLCProvisioning
+                    } catch {
+                        throw ValidationError("management PLC provisioning runtime is unavailable")
+                    }
+                } else {
+                    managementPLCProvisioning = nil
+                }
                 let server = SwanHTTPServer(
                     profile: loadedProfile,
                     configuration: .init(host: host, port: port, publicURL: baseURL),
@@ -584,7 +642,8 @@ extension SwanCommand {
                     let managementServer = SwanManagementHTTPServer(
                         configuration: managementConfiguration,
                         controlStore: controlDatabase,
-                        operatorSecretVerifier: verifier
+                        operatorSecretVerifier: verifier,
+                        plcProvisioning: managementPLCProvisioning
                     )
                     managementApplication = managementServer.buildApplication(
                         logger: Logger(label: "swan.management")
@@ -615,9 +674,13 @@ extension SwanCommand {
                     logger: logger
                 )
                 try await serviceGroup.run()
+                try await managementPLCProvisioning?.close()
                 try await directory.close()
                 try await controlDatabase.close()
             } catch {
+                if let preopenedManagementProvisioning {
+                    try? await preopenedManagementProvisioning.close()
+                }
                 if let preopenedAccountDirectory {
                     try? await preopenedAccountDirectory.close()
                 }
@@ -917,36 +980,32 @@ extension SwanCommand {
                 } catch {
                     throw ValidationError("unable to open Swan control database")
                 }
-                let opener = SQLitePLCAccountPreparationStoreOpener(
-                    dataDirectory: preparedConfiguration.dataURL
-                )
+                var runtime: SwanManagementPLCProvisioningRuntime?
                 do {
                     let keyStore = try FileAccountKeyStore(
                         root: keyURL,
                         configuration: keyConfiguration
                     )
-                    let plcClient = try PLCDirectoryClient(
-                        configuration: preparedConfiguration.plc
+                    let createdRuntime = try SwanManagementPLCProvisioningRuntime(
+                        controlDatabase: control,
+                        dataDirectory: preparedConfiguration.dataURL,
+                        keyStore: keyStore
                     )
-                    let service = PLCAccountPreparationService(
-                        intentStore: control,
-                        accountStoreOpener: opener,
-                        keyStore: keyStore,
-                        plcClient: plcClient
-                    )
-                    let prepared = try await service.prepare(
+                    runtime = createdRuntime
+                    let prepared = try await createdRuntime.prepare(.init(
                         requestID: requestID,
                         handle: handle,
                         pdsOrigin: preparedConfiguration.pdsOrigin,
-                        repositoryRevision: repositoryRevision
-                    )
-                    try await opener.close()
+                        repositoryRevision: repositoryRevision,
+                        plcConfiguration: preparedConfiguration.plc
+                    ))
+                    try await createdRuntime.close()
                     try await control.close()
                     try AccountCommandSupport.write(
-                        PreparedPLCAccountIdentityView(identity: prepared)
+                        PreparedPLCAccountIdentityView(result: prepared)
                     )
                 } catch {
-                    try? await opener.close()
+                    try? await runtime?.close()
                     try? await control.close()
                     throw AccountCommandSupport.validationError(for: error)
                 }
@@ -1085,51 +1144,29 @@ extension SwanCommand {
                 } catch {
                     throw ValidationError("unable to open Swan control database")
                 }
-                let opener = SQLitePLCAccountPreparationStoreOpener(
-                    dataDirectory: preparedConfiguration.dataURL
-                )
+                var runtime: SwanManagementPLCProvisioningRuntime?
                 do {
                     let keyStore = try FileAccountKeyStore(
                         root: keyURL,
                         configuration: keyConfiguration
                     )
-                    let plcClient = try PLCDirectoryClient(
-                        configuration: preparedConfiguration.plc
+                    let createdRuntime = try SwanManagementPLCProvisioningRuntime(
+                        controlDatabase: control,
+                        dataDirectory: preparedConfiguration.dataURL,
+                        keyStore: keyStore
                     )
-                    let handleTransport = try NIOPeerPinnedATHandleHTTPTransport()
-                    let handleVerifier = ATProtocolHandleVerifier(
-                        policy: preparedConfiguration.handle,
-                        http: handleTransport
-                    )
-                    let passwordHasher = try LibsodiumArgon2idHasher()
-                    let verificationExecutor = try Argon2idVerificationExecutor(
-                        hasher: passwordHasher
-                    )
-                    let directory = DurableAccountDirectory(
-                        store: control,
-                        passwordHasher: passwordHasher,
-                        verificationExecutor: verificationExecutor,
-                        keyProvisioner: AccountKeyProvisioner(keyStore: keyStore)
-                    )
-                    let service = PLCAccountActivationService(
-                        intentStore: control,
-                        accountStoreOpener: opener,
-                        keyStore: keyStore,
-                        plcClient: plcClient,
-                        handleVerifier: handleVerifier,
-                        directory: directory
-                    )
-                    let installation = try await service.activate(
+                    runtime = createdRuntime
+                    let installation = try await createdRuntime.activate(.init(
                         requestID: requestID,
-                        password: password
-                    )
-                    try await opener.close()
+                        password: password,
+                        plcConfiguration: preparedConfiguration.plc,
+                        handlePolicy: preparedConfiguration.handle
+                    ))
+                    try await createdRuntime.close()
                     try await control.close()
-                    try AccountCommandSupport.write(
-                        LocalAccountInstallationView(installation: installation)
-                    )
+                    try AccountCommandSupport.write(installation)
                 } catch {
-                    try? await opener.close()
+                    try? await runtime?.close()
                     try? await control.close()
                     throw AccountCommandSupport.validationError(for: error)
                 }
@@ -1366,6 +1403,16 @@ private struct PreparedPLCAccountIdentityView: Encodable {
         repositoryRevision = identity.repositoryRevision
         plcOperationCID = identity.plcOperationCID
         publicGenesisCommitCID = identity.publicGenesisCommitCID
+    }
+
+    init(result: SwanManagementPLCPrepareResult) {
+        requestID = result.requestId
+        did = result.did
+        canonicalHandle = result.canonicalHandle
+        pdsOrigin = result.pdsOrigin
+        repositoryRevision = result.repositoryRevision
+        plcOperationCID = result.plcOperationCID
+        publicGenesisCommitCID = result.publicGenesisCommitCID
     }
 }
 
