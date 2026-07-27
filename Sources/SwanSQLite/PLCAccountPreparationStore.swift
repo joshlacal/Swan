@@ -286,6 +286,20 @@ extension SQLiteAccountDatabase:
     }
 }
 
+/// An opaque, single-use lifecycle transfer from the management preparation
+/// opener to the live account directory. Only SwanSQLite can create or inspect
+/// this value, so HTTP code cannot manufacture an admission from a
+/// request-selected database.
+public struct SQLiteActivatedAccountAdmission: Sendable {
+    let did: String
+    let database: SQLiteAccountDatabase
+
+    init(did: String, database: SQLiteAccountDatabase) {
+        self.did = did
+        self.database = database
+    }
+}
+
 /// Caches per-account actors for one preparation service lifetime. This opener
 /// creates no account registry row and therefore cannot make a pending
 /// identity reachable through normal authorization lookup.
@@ -315,6 +329,19 @@ public actor SQLitePLCAccountPreparationStoreOpener:
         } catch {
             throw PLCAccountPreparationStoreError.unavailable
         }
+    }
+
+    /// Transfers an already-opened, already-migrated preparation database to
+    /// the live account directory after activation has durably registered the
+    /// account. This never opens a request-selected path and removes the
+    /// database from this opener so exactly one lifecycle owner closes it.
+    public func takeActivatedAccountAdmission(
+        did: String
+    ) throws -> SQLiteActivatedAccountAdmission {
+        guard !closed, let database = databases.removeValue(forKey: did) else {
+            throw PLCAccountPreparationStoreError.unavailable
+        }
+        return SQLiteActivatedAccountAdmission(did: did, database: database)
     }
 
     public func close() async throws {

@@ -131,23 +131,26 @@ public protocol SwanManagementPLCProvisioning: Sendable {
 /// The single process-local composition root for both the CLI and management
 /// PLC workflows. Domain services own the durable state machine. This runtime
 /// only selects a validated remote policy and wires those services together.
-public final class SwanManagementPLCProvisioningRuntime:
+public actor SwanManagementPLCProvisioningRuntime:
     SwanManagementPLCProvisioning
 {
     private let controlDatabase: SQLiteControlDatabase
     private let opener: SQLitePLCAccountPreparationStoreOpener
     private let keyStore: FileAccountKeyStore
     private let directory: DurableAccountDirectory
+    private let liveAccountDirectory: SQLitePreMigratedAccountDirectory?
 
     public init(
         controlDatabase: SQLiteControlDatabase,
         dataDirectory: URL,
-        keyStore: FileAccountKeyStore
+        keyStore: FileAccountKeyStore,
+        liveAccountDirectory: SQLitePreMigratedAccountDirectory? = nil
     ) throws {
         let passwordHasher = try LibsodiumArgon2idHasher()
         self.controlDatabase = controlDatabase
         opener = SQLitePLCAccountPreparationStoreOpener(dataDirectory: dataDirectory)
         self.keyStore = keyStore
+        self.liveAccountDirectory = liveAccountDirectory
         directory = DurableAccountDirectory(
             store: controlDatabase,
             passwordHasher: passwordHasher,
@@ -193,6 +196,21 @@ public final class SwanManagementPLCProvisioningRuntime:
             requestID: input.requestID,
             password: input.password
         )
+        if let liveAccountDirectory {
+            let admission: SQLiteActivatedAccountAdmission
+            do {
+                admission = try await opener.takeActivatedAccountAdmission(
+                    did: installation.account.did
+                )
+            } catch {
+                throw PLCAccountActivationError.unavailable
+            }
+            do {
+                try await liveAccountDirectory.admitActivatedAccount(admission)
+            } catch {
+                throw PLCAccountActivationError.unavailable
+            }
+        }
         return .init(installation: installation)
     }
 

@@ -336,7 +336,7 @@ extension SwanCommand {
         var managementAccountKEKFile: String?
 
         @Option(name: .customLong("management-account-kek-id"), help: "Active account-KEK identifier for management PLC provisioning")
-        var managementAccountKEKID: String = "primary"
+        var managementAccountKEKID: String?
 
         @Option(name: .customLong("management-account-key-directory"), help: "Protected account key-envelope directory for management PLC provisioning; defaults to <data-directory>/keys")
         var managementAccountKeyDirectory: String?
@@ -363,12 +363,14 @@ extension SwanCommand {
             if !enableManagementPLCProvisioning {
                 guard managementAccountKEKFile == nil,
                       managementAccountKeyDirectory == nil,
-                      managementAccountKEKID == "primary"
+                      managementAccountKEKID == nil
                 else {
                     throw ValidationError("management account KEK options require --enable-management-plc-provisioning")
                 }
             } else {
-                guard !managementAccountKEKID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                guard managementAccountKEKID.map({
+                          !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      }) ?? true,
                       managementAccountKeyDirectory.map({
                           !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                       }) ?? true
@@ -573,7 +575,7 @@ extension SwanCommand {
                 if enableManagementPLCProvisioning {
                     do {
                         let keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
-                            activeKeyID: managementAccountKEKID,
+                            activeKeyID: managementAccountKEKID ?? "primary",
                             secretFile: managementAccountKEKFile.map { URL(fileURLWithPath: $0) }
                         )
                         let keyDirectory = managementAccountKeyDirectory.map {
@@ -586,7 +588,8 @@ extension SwanCommand {
                         managementPLCProvisioning = try .init(
                             controlDatabase: controlDatabase,
                             dataDirectory: dataURL,
-                            keyStore: keyStore
+                            keyStore: keyStore,
+                            liveAccountDirectory: directory
                         )
                         preopenedManagementProvisioning = managementPLCProvisioning
                     } catch {

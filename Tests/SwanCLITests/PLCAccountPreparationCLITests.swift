@@ -383,6 +383,19 @@ final class PLCAccountPreparationCLITests: XCTestCase {
             )
         )
 
+        let explicitDefaultWithoutCapability = try runServe(
+            fixture: fixture,
+            arguments: [
+                "--management-account-kek-id", "primary",
+            ]
+        )
+        XCTAssertNotEqual(explicitDefaultWithoutCapability.status, 0)
+        XCTAssertTrue(
+            explicitDefaultWithoutCapability.error.contains(
+                "management account KEK options require --enable-management-plc-provisioning"
+            )
+        )
+
         let missingRuntimeSecret = try runServe(
             fixture: fixture,
             arguments: [

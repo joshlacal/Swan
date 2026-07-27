@@ -157,6 +157,54 @@ public actor SQLitePreMigratedAccountDirectory:
         return active
     }
 
+    /// Admits one database only after the loopback management activation flow
+    /// has opened/migrated it and durably installed an active control row.
+    /// Public HTTP paths have no access to this API and retain their strict
+    /// preopened-only selection behavior.
+    public func admitActivatedAccount(
+        _ admission: SQLiteActivatedAccountAdmission
+    ) async throws {
+        let did = admission.did
+        let database = admission.database
+        guard !isClosed,
+              AccountControlIdentifiers.isDID(did) else {
+            try? await database.close()
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        let isActive: Bool
+        do {
+            isActive = try await isActiveAccount(did)
+        } catch {
+            try? await database.close()
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard isActive, !isClosed else {
+            try? await database.close()
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        do {
+            try Self.requireExistingRegularDatabase(
+                SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
+            )
+        } catch {
+            try? await database.close()
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard !isClosed else {
+            try? await database.close()
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        if databases[did] != nil {
+            do {
+                try await database.close()
+            } catch {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return
+        }
+        databases[did] = database
+    }
+
     // MARK: Authenticated simple-space lifecycle
 
     /// Every lifecycle operation selects only the authority's preopened
