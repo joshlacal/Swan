@@ -13,19 +13,14 @@ notifications`). The report is included when the change is finalized; use
   declared authority/registration endpoint, audience, and final-peer facts.
   Only with that configuration are the four notification receiver routes
   installed. The key file contains public verification material only.
-- `--enable-notification-delivery` currently exits before serving. The bundled
-  AsyncHTTPClient POST adapter cannot observe the final connected peer and is
-  explicitly unavailable as a notification transport; it must not be used to
-  start the recovery worker. A hosting application may construct
-  `SwanNotificationRecoveryService` with an injected peer-reporting transport,
-  but live executable egress remains a required follow-up gate.
-- Direct writer-to-authority notifications use `iss == repo` and
-  `aud == space.authority`. Authority-to-recipient fanout uses
-  `iss == space.authority`, retains the original writer in `repo`, and has the
-  explicit configured recipient service DID as `aud`. A recipient that does
-  not host the authority (or the named account) returns a successful no-op and
-  never applies a remote operation, matching the pinned branch's intended
-  best-effort behavior.
+- `--enable-notification-delivery` now starts the recovery worker only with
+  an operator-pinned NIO peer transport and the encrypted account signing-key
+  configuration. The unsafe AsyncHTTPClient adapter remains unavailable for
+  notification delivery because it cannot prove the final connected peer.
+- Direct writer-to-authority notifications use `iss == repo` and an exact
+  configured authority service identity as `aud`. Swan deliberately does not
+  emit or accept authority-to-recipient `notifyWrite` fanout; authority-signed
+  `notifySpaceDeleted` remains the separate recipient tombstone control plane.
 - A verified deletion now atomically stores a per-recipient tombstone and
   removes stale local writer outbox rows. Local repository apply, state,
   record, CAR, oplog, and private-blob entry points fail closed on that
@@ -123,17 +118,14 @@ All commands ran from
 
 The expected local Petrel `libsecret-1` pkg-config warning remains non-fatal.
 
-## Remaining executable integration gate
+## Current executable delivery boundary
 
-`SwanNotificationRecoveryService` is fully configurable and tested with
-injected transports, but the stock `swan serve` does **not** register it yet.
-Its prior AsyncHTTPClient POST adapter could not report a final peer, so using
-it would make a DNS-rebinding check advisory after network I/O. The repair
-makes that adapter fail before a notification request and makes
-`--enable-notification-delivery` a startup error. A concrete connector that
-reports/pins the actual peer and feeds it through `OAuthBoundedJSONPoster` is
-required before the executable may claim live cross-host delivery or attach
-the background recovery service.
+`swan serve --enable-notification-delivery` registers
+`SwanNotificationRecoveryService` with the peer-pinned NIO transport when the
+operator supplies notification configuration and encrypted account-key
+material. It remains deliberately limited to direct writer-to-authority write
+notifications and authority-signed deletion/tombstone fanout; it does not
+claim the incompatible authority-signed cross-host `notifyWrite` behavior.
 
 ## Boundary retained
 

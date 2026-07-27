@@ -303,9 +303,11 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
         authorization: AuthorizationContext
     ) async throws
 
-    /// Records an incoming service-authenticated writer announcement and
-    /// atomically creates durable fanout intents for matching registrations.
-    /// Duplicate or older/reordered events are idempotent no-ops.
+    /// Records a direct writer-to-authority service-authenticated announcement
+    /// and atomically advances only the authority writer-set state. It does
+    /// not create cross-host write-fanout intents: the pinned receiver
+    /// requires `iss == repo`, which an authority cannot produce for another
+    /// writer. Duplicate or older/reordered events are idempotent no-ops.
     func receiveSpaceWriteNotification(
         _ notification: AuthorizedSpaceWriteNotification
     ) async throws
