@@ -28,6 +28,10 @@ public actor OAuthClientMetadataLoader {
     private let fetcher: OAuthRemoteDocumentFetcher
     private let controlStore: any OAuthControlStore
     private let cacheLifetime: TimeInterval
+    /// Immutable construction evidence for HTTP assembly. It is safe to read
+    /// without entering the actor because the value-type policy never changes
+    /// after initialization; the loader remains the fetch capability.
+    public nonisolated let fetchPolicy: OAuthRemoteFetchPolicy
 
     public init(
         fetcher: OAuthRemoteDocumentFetcher,
@@ -40,6 +44,7 @@ public actor OAuthClientMetadataLoader {
         self.fetcher = fetcher
         self.controlStore = controlStore
         self.cacheLifetime = cacheLifetime
+        fetchPolicy = fetcher.policy
     }
 
     public func load(clientID: URL, now: Date = Date()) async throws -> OAuthResolvedClientMetadata {

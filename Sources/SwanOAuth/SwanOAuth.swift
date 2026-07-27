@@ -117,6 +117,19 @@ public struct OAuthTokenPair: Sendable, Equatable {
     public let familyID: UUID
 }
 
+/// Token endpoint output paired with the scopes stored in the durable
+/// authorization binding. The HTTP layer never reconstructs scope from a
+/// current client document or form input.
+public struct OAuthTokenGrantResult: Sendable, Equatable {
+    public let pair: OAuthTokenPair
+    public let scopes: Set<String>
+
+    public init(pair: OAuthTokenPair, scopes: Set<String>) {
+        self.pair = pair
+        self.scopes = scopes
+    }
+}
+
 private struct StoredToken: Sendable {
     let subject: String
     let scopes: Set<String>

@@ -326,6 +326,85 @@ public actor DurableOAuthTokenService {
         return pair
     }
 
+    /// Redeems a code after the token endpoint freshly validates the client
+    /// document. Requested scopes come only from the durable code record, and
+    /// the form redirect URI must exactly equal that record.
+    public func redeemAuthorizationCodeForClient(
+        _ code: String,
+        verifier: String,
+        redirectURI: URL,
+        authorizationServerIssuer: String,
+        client: OAuthResolvedClientMetadata,
+        dpopProof: OAuthValidatedDPoPProof,
+        clientAssertion: OAuthValidatedClientAssertion?,
+        accessLifetime: TimeInterval = 300,
+        now: Date = Date()
+    ) async throws -> OAuthTokenGrantResult {
+        let codeDigest = digest(code, purpose: .authorizationCode)
+        let record: OAuthAuthorizationCode
+        do {
+            guard let loaded = try await controlStore.authorizationCode(
+                codeDigest: codeDigest,
+                now: now
+            ) else {
+                throw OAuthControlStoreError.notFound
+            }
+            record = loaded
+        } catch {
+            throw secureControlError(error)
+        }
+
+        do {
+            try validateCurrentClient(
+                client,
+                assertion: clientAssertion,
+                against: record.binding,
+                authorizationServerIssuer: authorizationServerIssuer,
+                now: now
+            )
+            guard redirectURI.absoluteString == record.binding.redirectURI else {
+                throw OAuthControlStoreError.bindingMismatch
+            }
+            let family = OAuthTokenFamily(
+                familyID: record.familyID,
+                subject: record.subject,
+                binding: record.binding,
+                expiresAt: record.familyExpiresAt
+            )
+            try requirePresentedBindings(
+                family: family,
+                dpopProof: dpopProof,
+                clientAssertion: clientAssertion,
+                requireClientAssertionKey: true
+            )
+            guard PKCE.verifyS256(verifier: verifier, challenge: record.codeChallengeS256) else {
+                throw OAuthControlStoreError.bindingMismatch
+            }
+        } catch {
+            throw secureControlError(error)
+        }
+
+        let refreshLifetime = record.familyExpiresAt.timeIntervalSince(now)
+        let pair: OAuthTokenPair
+        do {
+            pair = try makeTokenPair(
+                familyID: record.familyID,
+                accessLifetime: min(accessLifetime, refreshLifetime),
+                refreshLifetime: refreshLifetime,
+                now: now
+            )
+            try await controlStore.redeemAuthorizationCode(
+                codeDigest: codeDigest,
+                binding: record.binding,
+                issuedTokens: tokenDigests(for: pair),
+                now: now
+            )
+        } catch {
+            throw secureControlError(error)
+        }
+        return OAuthTokenGrantResult(pair: pair, scopes: record.binding.scopes)
+    }
+
     public func validateAccess(
         _ token: String,
         proof: OAuthValidatedDPoPProof,
@@ -402,6 +481,47 @@ public actor DurableOAuthTokenService {
             throw secureControlError(error)
         }
         return pair
+    }
+
+    /// Authorization-server refresh adapter. It reuses the existing durable
+    /// rotation/reuse-revocation transaction while returning the persisted
+    /// scope set for the token response.
+    public func redeemRefreshForClient(
+        _ refreshToken: String,
+        client: OAuthResolvedClientMetadata,
+        authorizationServerIssuer: String,
+        dpopProof: OAuthValidatedDPoPProof,
+        clientAssertion: OAuthValidatedClientAssertion?,
+        metadataLoader: OAuthClientMetadataLoader,
+        accessLifetime: TimeInterval = 300,
+        now: Date = Date()
+    ) async throws -> OAuthTokenGrantResult {
+        let refreshDigest = digest(refreshToken, purpose: .refreshToken)
+        let family: OAuthTokenFamily
+        do {
+            family = try await controlStore.refreshTokenFamily(
+                refreshTokenDigest: refreshDigest,
+                now: now
+            )
+            try validateCurrentClient(
+                client,
+                assertion: clientAssertion,
+                against: family.binding,
+                authorizationServerIssuer: authorizationServerIssuer,
+                now: now
+            )
+        } catch {
+            throw secureControlError(error)
+        }
+        let pair = try await redeemRefresh(
+            refreshToken,
+            dpopProof: dpopProof,
+            clientAssertion: clientAssertion,
+            metadataLoader: metadataLoader,
+            accessLifetime: accessLifetime,
+            now: now
+        )
+        return OAuthTokenGrantResult(pair: pair, scopes: family.binding.scopes)
     }
 
     /// Rotates a token family belonging to the AT Protocol localhost
@@ -501,6 +621,68 @@ public actor DurableOAuthTokenService {
             // A wrong proof or caller ID must not reveal that the family was
             // present, and must never revoke a token it did not bind.
             if error is OAuthControlStoreError { return false }
+            throw secureControlError(error)
+        }
+    }
+
+    /// Revokes an opaque token only after its durable client, DPoP, and (for
+    /// confidential clients) freshly revalidated key binding have all been
+    /// checked. An absent or differently-bound token returns `false` so the
+    /// HTTP adapter can remain an oracle-free RFC 7009 response.
+    public func revokeTokenForClient(
+        _ token: String,
+        kind: OAuthOpaqueTokenKind,
+        client: OAuthResolvedClientMetadata,
+        authorizationServerIssuer: String,
+        dpopProof: OAuthValidatedDPoPProof,
+        clientAssertion: OAuthValidatedClientAssertion?,
+        metadataLoader: OAuthClientMetadataLoader,
+        now: Date = Date()
+    ) async throws -> Bool {
+        let purpose: DigestPurpose = kind == .accessToken ? .accessToken : .refreshToken
+        let family: OAuthTokenFamily?
+        do {
+            family = try await controlStore.tokenFamily(
+                tokenDigest: digest(token, purpose: purpose),
+                kind: kind,
+                now: now
+            )
+        } catch {
+            throw secureControlError(error)
+        }
+        guard let family else { return false }
+        do {
+            try validateCurrentClient(
+                client,
+                assertion: clientAssertion,
+                against: family.binding,
+                authorizationServerIssuer: authorizationServerIssuer,
+                now: now
+            )
+            try await requireFreshConfidentialClientBinding(
+                family: family,
+                clientAssertion: clientAssertion,
+                metadataLoader: metadataLoader,
+                now: now
+            )
+            try requirePresentedBindings(
+                family: family,
+                dpopProof: dpopProof,
+                clientAssertion: clientAssertion,
+                requireClientAssertionKey: true
+            )
+            try await controlStore.revokeTokenFamily(familyID: family.familyID, now: now)
+            return true
+        } catch let error as OAuthControlStoreError {
+            // A wrong sender constraint must neither reveal a family nor
+            // revoke a token it did not bind.
+            switch error {
+            case .bindingMismatch, .notFound, .expired, .alreadyConsumed, .replayDetected:
+                return false
+            case .invalidInput, .malformedRecord:
+                throw secureControlError(error)
+            }
+        } catch {
             throw secureControlError(error)
         }
     }
@@ -656,6 +838,51 @@ public actor DurableOAuthTokenService {
         case .notFound, .bindingMismatch, .alreadyConsumed, .replayDetected,
                 .invalidInput, .malformedRecord:
             return SwanError.unauthorized("OAuth credential rejected")
+        }
+    }
+
+    /// Validates the complete durable tuple before an authorization-server
+    /// token operation. Redirects, granted scopes, DPoP, and confidential key
+    /// material are durable authorization facts and cannot be replaced by a
+    /// current browser or form value.
+    private func validateCurrentClient(
+        _ client: OAuthResolvedClientMetadata,
+        assertion: OAuthValidatedClientAssertion?,
+        against binding: OAuthClientBinding,
+        authorizationServerIssuer: String,
+        now: Date
+    ) throws {
+        guard binding.issuer == authorizationServerIssuer,
+              binding.clientID == client.metadata.clientID.absoluteString,
+              let redirectURI = URL(string: binding.redirectURI),
+              redirectURI.absoluteString == binding.redirectURI,
+              client.metadata.matchesRedirectURI(redirectURI),
+              !binding.scopes.isEmpty,
+              binding.scopes.isSubset(of: client.metadata.scopes) else {
+            throw OAuthControlStoreError.bindingMismatch
+        }
+        switch client.metadata.tokenEndpointAuthMethod {
+        case .none:
+            guard binding.confidentialClientKey == nil, assertion == nil else {
+                throw OAuthControlStoreError.bindingMismatch
+            }
+        case .privateKeyJWT:
+            guard let assertion,
+                  assertion.clientID == binding.clientID,
+                  assertion.algorithm == "ES256",
+                  assertion.expiresAt > now,
+                  let persisted = binding.confidentialClientKey,
+                  persisted.keyID == assertion.selectedKeyID,
+                  persisted.algorithm == assertion.algorithm,
+                  constantTimeTextEqual(persisted.keyThumbprint, assertion.keyThumbprint),
+                  let keys = client.keySet else {
+                throw OAuthControlStoreError.bindingMismatch
+            }
+            let selected = try keys.select(keyID: assertion.selectedKeyID)
+            guard selected.algorithm == nil || selected.algorithm == "ES256",
+                  constantTimeTextEqual(selected.thumbprint(), assertion.keyThumbprint) else {
+                throw OAuthControlStoreError.bindingMismatch
+            }
         }
     }
 

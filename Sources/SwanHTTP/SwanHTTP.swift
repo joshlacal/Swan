@@ -78,6 +78,40 @@ public struct SwanLocalhostOAuthConfiguration: Sendable {
     }
 }
 
+/// The complete, explicitly assembled authorization-server surface. This is
+/// intentionally not a bag of optional route dependencies: it requires the
+/// durable account authenticator, remote client-metadata loader, hardened
+/// fetch policy, and the exact publication pair before Hummingbird can build
+/// any authorization-server route.
+public struct SwanOAuthAuthorizationServerConfiguration: Sendable {
+    public let issuer: URL
+    public let publication: OAuthMetadataPublication
+    public let accounts: DurableAccountDirectory
+    public let clientMetadataLoader: OAuthClientMetadataLoader
+    public let remoteFetchPolicy: OAuthRemoteFetchPolicy
+
+    public init(
+        issuer: URL,
+        protectedResource: URL,
+        accounts: DurableAccountDirectory,
+        clientMetadataLoader: OAuthClientMetadataLoader,
+        scopesSupported: [String] = ["atproto"]
+    ) throws {
+        let metadata = try OAuthAuthorizationServerMetadata(issuer: issuer)
+        self.issuer = metadata.issuer
+        publication = try OAuthMetadataPublication(
+            resource: protectedResource,
+            issuer: metadata.issuer,
+            scopesSupported: scopesSupported
+        )
+        self.accounts = accounts
+        self.clientMetadataLoader = clientMetadataLoader
+        // This immutable policy is retained as construction evidence only;
+        // the loader remains the sole remote-fetch capability.
+        remoteFetchPolicy = clientMetadataLoader.fetchPolicy
+    }
+}
+
 /// The explicit, offline-only dependencies that enable the permissioned
 /// delegation exchange and Bearer credential read paths. The server combines
 /// these with the exact startup-preopened directory supplied to its
@@ -163,6 +197,10 @@ public struct SwanHTTPServer: Sendable {
     /// separate from PAR-only mode so a caller cannot make password pages
     /// appear merely by enabling the lower-risk PAR endpoint.
     public let localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration?
+    /// The complete remote/public and confidential authorization server. It
+    /// cannot coexist with the narrower localhost bridge because both own the
+    /// same PAR, browser, token, and revocation paths.
+    public let authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration?
     /// The one authenticated authority `getSpace` query. It is unavailable by
     /// default and only constructed from this server's runtime and canonical
     /// public URL after account databases have been preopened at startup.
@@ -204,6 +242,7 @@ public struct SwanHTTPServer: Sendable {
         oauthPublicationGate: OAuthPublicationGate = .unavailable,
         localhostPARConfiguration: SwanLocalhostPARConfiguration? = nil,
         localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration? = nil,
+        authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration? = nil,
         authenticatedGetSpaceDirectory: (any AuthorizedSimpleSpaceDirectory)? = nil,
         accountControlStore: (any AccountControlStore)? = nil,
         spaceCredentialConfiguration: SwanSpaceCredentialHTTPConfiguration? = nil,
@@ -215,14 +254,30 @@ public struct SwanHTTPServer: Sendable {
         self.configuration = configuration
         self.repositories = repositories
         self.oauthRuntime = oauthRuntime
-        self.oauthPublicationGate = oauthPublicationGate
+        // A caller may not smuggle metadata publication through a partial
+        // assembly. Only the complete remote authorization-server config can
+        // publish discovery; all other inputs remain closed by default.
+        if let authorizationServerConfiguration,
+           authorizationServerConfiguration.issuer.absoluteString == configuration.publicURL.absoluteString,
+           authorizationServerConfiguration.publication.protectedResource.resource.absoluteString == configuration.publicURL.absoluteString {
+            self.authorizationServerConfiguration = authorizationServerConfiguration
+            self.oauthPublicationGate = OAuthPublicationGate(
+                completePublication: authorizationServerConfiguration.publication
+            )
+        } else {
+            self.authorizationServerConfiguration = nil
+            self.oauthPublicationGate = .unavailable
+        }
         // A mismatched issuer would produce a DPoP target different from the
         // process's public identity. There is no best-effort normalization:
         // retain the default 404 closure instead.
         let matchesPublicIdentity: (URL) -> Bool = {
             $0.absoluteString == configuration.publicURL.absoluteString
         }
-        if let localhostOAuthConfiguration,
+        if self.authorizationServerConfiguration != nil {
+            self.localhostOAuthConfiguration = nil
+            self.localhostPARConfiguration = nil
+        } else if let localhostOAuthConfiguration,
            matchesPublicIdentity(localhostOAuthConfiguration.issuer) {
             self.localhostOAuthConfiguration = localhostOAuthConfiguration
             // The complete local bridge includes PAR. Do not permit a second
@@ -416,7 +471,18 @@ public struct SwanHTTPServer: Sendable {
             return jsonResponse(metadata)
         }
 
-        if let localhostOAuthConfiguration {
+        if let authorizationServerConfiguration {
+            registerOAuthAuthorizationServerEndpoints(
+                on: router,
+                configuration: authorizationServerConfiguration,
+                runtime: oauthRuntime
+            )
+            registerOAuthAuthorizationServerPAREndpoint(
+                on: router,
+                configuration: authorizationServerConfiguration,
+                runtime: oauthRuntime
+            )
+        } else if let localhostOAuthConfiguration {
             registerLocalhostOAuthEndpoints(
                 on: router,
                 configuration: localhostOAuthConfiguration,
@@ -431,7 +497,9 @@ public struct SwanHTTPServer: Sendable {
         // This narrow development bridge stores a durable PAR only. It does
         // not publish discovery and cannot lead to login, consent, codes, or
         // tokens until a complete OAuth HTTP assembly is separately enabled.
-        if let localhostOAuthConfiguration {
+        if authorizationServerConfiguration != nil {
+            // Registered above as one inseparable authorization-server bundle.
+        } else if let localhostOAuthConfiguration {
             registerLocalhostPAREndpoint(
                 on: router,
                 issuer: localhostOAuthConfiguration.issuer,

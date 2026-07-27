@@ -91,8 +91,29 @@ production deployment.
   retrieve only its live, unconsumed bound request, and final approval
   consumes that exact binding before issuing a code. This preserves the
   original DPoP, PKCE, redirect, and scope facts without reconstructing a DPoP
-  proof from form input. The remote-metadata/confidential-client path remains
-  separately fail-closed until its own full HTTP negative suite is complete.
+  proof from form input.
+- `--enable-oauth-authorization-server` is the separately opt-in complete
+  authorization-server assembly. It constructs only when a durable account
+  directory and hardened remote client-metadata loader are available, and it
+  publishes both OAuth metadata documents only when its issuer and protected
+  resource exactly match Swan's public URL. It registers PAR, browser
+  login/consent, token, and revocation as one route bundle; a partial or
+  mismatched assembly leaves discovery and every remote OAuth route closed.
+- The complete server uses the durable metadata/JWKS cache and fresh hardened
+  revalidation for token and revocation operations. Remote clients require
+  HTTPS (apart from the explicit localhost lab exception), re-resolved and
+  filtered DNS, bounded document reads, and no redirect following. The CLI
+  exposes the localhost exception and literal network allowlist only as
+  explicit authorization-server lab options.
+- Remote public-client HTTP coverage proves metadata publication, PAR,
+  browser approval, PKCE code exchange, exact redirect matching, refresh
+  rotation/reuse family revocation, revocation, and deactivated-account
+  refusal. Confidential HTTP coverage proves ES256 `private_key_jwt` requires
+  the token endpoint as its exact audience and rejects replay. The durable
+  OAuth suite additionally proves a same-`kid` JWK rekey/removal invalidates
+  the confidential family before refresh. In-process resolver/transport
+  fixtures prove private-address metadata is rejected before any outbound
+  transport call; no test fetches an external endpoint.
 
 ## Acceptance gates
 

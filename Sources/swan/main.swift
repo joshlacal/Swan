@@ -307,6 +307,15 @@ extension SwanCommand {
         @Flag(name: .customLong("enable-localhost-oauth"), help: "Enable the localhost-development-client PAR, browser authorization, token, refresh, and revocation bridge; requires an HTTPS public issuer")
         var enableLocalhostOAuth = false
 
+        @Flag(name: .customLong("enable-oauth-authorization-server"), help: "Enable the complete remote/public and private_key_jwt OAuth authorization server; requires an HTTPS public issuer and durable account/password support")
+        var enableOAuthAuthorizationServer = false
+
+        @Flag(name: .customLong("oauth-allow-localhost-development-client"), help: "Permit only AT Protocol's exact http://localhost development client metadata exception in the complete OAuth server")
+        var oauthAllowLocalhostDevelopmentClient = false
+
+        @Option(name: .customLong("oauth-allow-metadata-ip"), help: "Explicit literal IP allowlist for laboratory OAuth client metadata/JWKS retrieval; repeat for each address")
+        var oauthMetadataAllowedIPs: [String] = []
+
         @Option(name: .long, help: "Reserved root for control/account databases and blobs")
         var dataDirectory: String = ".swan-data"
 
@@ -369,8 +378,10 @@ extension SwanCommand {
                 )
                 var logger = Logger(label: "swan")
                 logger.logLevel = .info
-                guard !(enableLocalhostPAR && enableLocalhostOAuth) else {
-                    throw ValidationError("--enable-localhost-par and --enable-localhost-oauth are mutually exclusive")
+                let enabledOAuthModes = [enableLocalhostPAR, enableLocalhostOAuth, enableOAuthAuthorizationServer]
+                    .filter { $0 }.count
+                guard enabledOAuthModes <= 1 else {
+                    throw ValidationError("--enable-localhost-par, --enable-localhost-oauth, and --enable-oauth-authorization-server are mutually exclusive")
                 }
                 let localhostPARConfiguration: SwanLocalhostPARConfiguration?
                 if enableLocalhostPAR {
@@ -400,6 +411,53 @@ extension SwanCommand {
                     }
                 } else {
                     localhostOAuthConfiguration = nil
+                }
+                let authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration?
+                if enableOAuthAuthorizationServer {
+                    do {
+                        var allowlistedIPs = Set<OAuthIPAddress>()
+                        for text in oauthMetadataAllowedIPs {
+                            guard let address = OAuthIPAddress(literal: text) else {
+                                throw ValidationError("--oauth-allow-metadata-ip must be a literal IPv4 or IPv6 address")
+                            }
+                            allowlistedIPs.insert(address)
+                        }
+                        let passwordHasher = try LibsodiumArgon2idHasher()
+                        let accounts = DurableAccountDirectory(
+                            store: controlDatabase,
+                            passwordHasher: passwordHasher,
+                            verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher)
+                        )
+                        let fetchPolicy = try OAuthRemoteFetchPolicy(
+                            allowLocalhostDevelopment: oauthAllowLocalhostDevelopmentClient,
+                            networkAllowlist: .init(addresses: allowlistedIPs)
+                        )
+                        let fetcher = OAuthRemoteDocumentFetcher(
+                            policy: fetchPolicy,
+                            transport: try AsyncHTTPClientOAuthTransport(
+                                maximumTransportTimeout: fetchPolicy.timeout
+                            )
+                        )
+                        let metadataLoader = try OAuthClientMetadataLoader(
+                            fetcher: fetcher,
+                            controlStore: controlDatabase
+                        )
+                        authorizationServerConfiguration = try SwanOAuthAuthorizationServerConfiguration(
+                            issuer: baseURL,
+                            protectedResource: baseURL,
+                            accounts: accounts,
+                            clientMetadataLoader: metadataLoader
+                        )
+                    } catch let error as ValidationError {
+                        throw error
+                    } catch {
+                        throw ValidationError("--enable-oauth-authorization-server requires an HTTPS issuer, durable password verification, and a hardened metadata fetch runtime")
+                    }
+                } else {
+                    guard !oauthAllowLocalhostDevelopmentClient, oauthMetadataAllowedIPs.isEmpty else {
+                        throw ValidationError("OAuth metadata fetch options require --enable-oauth-authorization-server")
+                    }
+                    authorizationServerConfiguration = nil
                 }
                 let notificationRuntime: ServeNotificationRuntime?
                 if let notificationConfig {
@@ -484,6 +542,7 @@ extension SwanCommand {
                     oauthRuntime: oauthRuntime,
                     localhostPARConfiguration: localhostPARConfiguration,
                     localhostOAuthConfiguration: localhostOAuthConfiguration,
+                    authorizationServerConfiguration: authorizationServerConfiguration,
                     authenticatedGetSpaceDirectory: directory,
                     accountControlStore: controlDatabase,
                     spaceCredentialConfiguration: notificationRuntime?.credentialConfiguration,
