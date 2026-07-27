@@ -41,6 +41,11 @@ extension SQLiteControlDatabase {
         )
         try await addColumnIfMissing(
             table: "accounts",
+            column: "public_genesis_commit_cid",
+            definition: "TEXT"
+        )
+        try await addColumnIfMissing(
+            table: "accounts",
             column: "tombstone_declared_at",
             definition: "INTEGER"
         )
@@ -157,9 +162,10 @@ extension SQLiteControlDatabase {
                         password_verifier,
                         signing_key_generation, signing_key_reference,
                         rotation_key_generation, rotation_key_reference,
+                        public_genesis_commit_cid,
                         tombstone_declared_at, tombstone_reason,
                         export_declared_at, export_reference
-                    ) VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)
+                    ) VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL)
                     """,
                     [
                         .text(registration.did), .text(registration.canonicalHandle),
@@ -169,6 +175,7 @@ extension SQLiteControlDatabase {
                         .text(registration.signingKey.reference),
                         .integer(try controlGeneration(registration.rotationKey.generation)),
                         .text(registration.rotationKey.reference),
+                        optionalText(registration.publicGenesisCommitCID),
                     ]
                 )
                 return try await requiredAccount(did: registration.did)
@@ -377,6 +384,7 @@ extension SQLiteControlDatabase {
         SELECT did, handle, status, created_at, updated_at, password_verifier,
                signing_key_generation, signing_key_reference,
                rotation_key_generation, rotation_key_reference,
+               public_genesis_commit_cid,
                tombstone_declared_at, tombstone_reason,
                export_declared_at, export_reference
         FROM accounts
@@ -412,6 +420,7 @@ extension SQLiteControlDatabase {
             referenceColumn: "rotation_key_reference",
             purpose: .rotation
         )
+        let publicGenesisCommitCID = try optionalText(row, "public_genesis_commit_cid")
         let tombstone = try decodeTombstone(row)
         let export = try decodeExport(row)
         let credentialState: AccountCredentialState
@@ -431,6 +440,7 @@ extension SQLiteControlDatabase {
                 credentialState: credentialState,
                 signingKey: signingKey,
                 rotationKey: rotationKey,
+                publicGenesisCommitCID: publicGenesisCommitCID,
                 tombstone: tombstone,
                 export: export
             )
@@ -496,7 +506,8 @@ extension SQLiteControlDatabase {
               registration.rotationKey.isCanonicalValue,
               registration.signingKey.generation == registration.rotationKey.generation,
               registration.signingKey.purpose == .signing,
-              registration.rotationKey.purpose == .rotation else {
+              registration.rotationKey.purpose == .rotation,
+              registration.publicGenesisCommitCID.map(AccountControlIdentifiers.isPublicGenesisCommitCID) ?? true else {
             throw AccountControlStoreError.invalidInput
         }
         _ = try controlTimestamp(registration.createdAt)

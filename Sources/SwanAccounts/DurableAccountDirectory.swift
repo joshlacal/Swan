@@ -70,6 +70,7 @@ public actor DurableAccountDirectory {
         password: String,
         signingReference: AccountKeyReference,
         rotationReference: AccountKeyReference,
+        publicGenesisCommitCID: String? = nil,
         now: Date = Date()
     ) async throws -> AccountControlAccount {
         let did = try AccountIdentifiers.validateDID(did)
@@ -88,6 +89,7 @@ public actor DurableAccountDirectory {
             passwordVerifier: verifier,
             signingKey: try controlReference(for: signingReference),
             rotationKey: try controlReference(for: rotationReference),
+            publicGenesisCommitCID: publicGenesisCommitCID,
             createdAt: now
         )
         return try await store.createAccount(registration)

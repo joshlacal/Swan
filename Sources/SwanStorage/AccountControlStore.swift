@@ -310,6 +310,10 @@ public struct AccountControlAccount: Sendable, Equatable {
     public let credentialState: AccountCredentialState
     public let signingKey: AccountControlKeyReference?
     public let rotationKey: AccountControlKeyReference?
+    /// Immutable public commitment to the verified empty public repository
+    /// genesis which authorized this local registration. Legacy rows may lack
+    /// it; callers requiring local-install provenance must reject that case.
+    public let publicGenesisCommitCID: String?
     public let tombstone: AccountTombstoneMetadata?
     public let export: AccountExportMetadata?
 
@@ -322,6 +326,7 @@ public struct AccountControlAccount: Sendable, Equatable {
         credentialState: AccountCredentialState,
         signingKey: AccountControlKeyReference?,
         rotationKey: AccountControlKeyReference?,
+        publicGenesisCommitCID: String? = nil,
         tombstone: AccountTombstoneMetadata? = nil,
         export: AccountExportMetadata? = nil
     ) throws {
@@ -342,6 +347,7 @@ public struct AccountControlAccount: Sendable, Equatable {
               rotationKey?.isCanonicalValue ?? true,
               signingKey?.purpose == .signing || signingKey == nil,
               rotationKey?.purpose == .rotation || rotationKey == nil,
+              publicGenesisCommitCID.map(AccountControlMetadata.isPublicGenesisCommitCID) ?? true,
               tombstone?.isCanonicalValue ?? true,
               export?.isCanonicalValue ?? true else {
             throw AccountControlStoreError.invalidInput
@@ -354,6 +360,7 @@ public struct AccountControlAccount: Sendable, Equatable {
         self.credentialState = credentialState
         self.signingKey = signingKey
         self.rotationKey = rotationKey
+        self.publicGenesisCommitCID = publicGenesisCommitCID
         self.tombstone = tombstone
         self.export = export
     }
@@ -367,6 +374,9 @@ public struct AccountControlRegistration: Sendable {
     public let passwordVerifier: String
     public let signingKey: AccountControlKeyReference
     public let rotationKey: AccountControlKeyReference
+    /// Optional only to keep legacy non-local registration paths explicit.
+    /// `LocalAccountProvisioner` always supplies this verified public CID.
+    public let publicGenesisCommitCID: String?
     public let createdAt: Date
 
     public init(
@@ -375,6 +385,7 @@ public struct AccountControlRegistration: Sendable {
         passwordVerifier: String,
         signingKey: AccountControlKeyReference,
         rotationKey: AccountControlKeyReference,
+        publicGenesisCommitCID: String? = nil,
         createdAt: Date = Date()
     ) throws {
         guard signingKey.generation == rotationKey.generation,
@@ -384,7 +395,8 @@ public struct AccountControlRegistration: Sendable {
               signingKey.isCanonicalValue,
               rotationKey.isCanonicalValue,
               signingKey.purpose == .signing,
-              rotationKey.purpose == .rotation else {
+              rotationKey.purpose == .rotation,
+              publicGenesisCommitCID.map(AccountControlMetadata.isPublicGenesisCommitCID) ?? true else {
             throw AccountControlStoreError.invalidInput
         }
         self.did = did
@@ -392,6 +404,7 @@ public struct AccountControlRegistration: Sendable {
         self.passwordVerifier = passwordVerifier
         self.signingKey = signingKey
         self.rotationKey = rotationKey
+        self.publicGenesisCommitCID = publicGenesisCommitCID
         self.createdAt = createdAt
     }
 }
@@ -487,6 +500,10 @@ public enum AccountControlIdentifiers {
     public static func isCanonicalHandle(_ value: String) -> Bool {
         AccountControlMetadata.isCanonicalHandle(value)
     }
+
+    public static func isPublicGenesisCommitCID(_ value: String) -> Bool {
+        AccountControlMetadata.isPublicGenesisCommitCID(value)
+    }
 }
 
 enum AccountControlMetadata {
@@ -507,6 +524,18 @@ enum AccountControlMetadata {
         let microseconds = seconds * 1_000_000
         return seconds.isFinite && seconds >= 0 &&
             microseconds.isFinite && microseconds <= Double(Int.max)
+    }
+
+    /// A public repository commit CID is Swan's canonical CIDv1 dag-cbor
+    /// SHA-256 base32 representation. Full CAR/CID verification is owned by
+    /// SwanPublicRepository; this control-plane boundary prevents arbitrary
+    /// text from becoming a provenance marker.
+    static func isPublicGenesisCommitCID(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        let alphabet = Set("abcdefghijklmnopqrstuvwxyz234567".utf8)
+        return bytes.count == 59
+            && value.hasPrefix("bafyrei")
+            && bytes.allSatisfy(alphabet.contains)
     }
 
     static func isVerifier(_ value: String) -> Bool {

@@ -3,6 +3,7 @@ import Foundation
 import Petrel
 import SQLiteNIO
 import SwanCore
+import SwanPublicRepository
 import SwanSpaces
 import SwanStorage
 
@@ -148,6 +149,15 @@ public enum SQLiteLayout {
             value BLOB NOT NULL,
             cid TEXT NOT NULL,
             revision INTEGER NOT NULL CHECK(revision >= 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS public_repository_genesis (
+            did TEXT PRIMARY KEY,
+            revision TEXT NOT NULL,
+            commit_cid TEXT NOT NULL,
+            car BLOB NOT NULL,
+            installed_at INTEGER NOT NULL CHECK(installed_at >= 0)
         )
         """,
         """
@@ -585,7 +595,7 @@ private struct LoadedSimpleSpaceAuthority: Sendable {
 /// The concrete SQLite/WAL boundary. Its actor is a coordination aid, while
 /// `BEGIN IMMEDIATE` makes the oplog/outbox write atomic even if another Swan
 /// process later opens the same file.
-public actor SQLiteAccountDatabase: BlobStore {
+public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     private static let permissionedRepositoryStorageMigrationVersion = 1
     private static let permissionedOutboxLeaseMigrationVersion = 2
 
@@ -931,6 +941,109 @@ public actor SQLiteAccountDatabase: BlobStore {
                 value: try requiredBlob(row, "value"),
                 cid: try requiredText(row, "cid"),
                 revision: try requiredRevision(row, "revision")
+            )
+        }
+    }
+
+    // MARK: Public repository genesis
+
+    /// Installs the one immutable empty public-repository genesis for this
+    /// account database. The candidate is re-derived from its CAR before any
+    /// write, so callers cannot smuggle inconsistent cached fields alongside a
+    /// valid byte payload. Existing state is verified again under the supplied
+    /// public key before it is returned.
+    public func installPublicRepositoryGenesis(
+        _ candidate: PublicRepositoryGenesis,
+        signingPublicKey: P256.Signing.PublicKey,
+        installedAt: Date
+    ) async throws -> PublicRepositoryGenesisInstallation {
+        let verifiedCandidate = try verifiedPublicGenesis(
+            car: candidate.car,
+            signingPublicKey: signingPublicKey
+        )
+        let timestamp = try publicGenesisTimestamp(installedAt)
+        let persistedAt = Date(timeIntervalSince1970: Double(timestamp) / 1_000_000)
+        let candidateState = try PersistedPublicRepositoryGenesis(
+            genesis: verifiedCandidate,
+            installedAt: persistedAt
+        )
+
+        return try await withConnectionGate {
+            try await transaction {
+                let rows = try await connection.query(
+                    """
+                    SELECT did, revision, commit_cid, car, installed_at
+                    FROM public_repository_genesis
+                    """
+                )
+                guard rows.count <= 1 else {
+                    throw PublicRepositoryGenesisStoreError.corruptStoredGenesis
+                }
+                guard let row = rows.first else {
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO public_repository_genesis(
+                            did, revision, commit_cid, car, installed_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        [
+                            .text(verifiedCandidate.did),
+                            .text(verifiedCandidate.revision),
+                            .text(verifiedCandidate.commitCID.string),
+                            blob(verifiedCandidate.car),
+                            .integer(timestamp),
+                        ]
+                    )
+                    return PublicRepositoryGenesisInstallation(
+                        persisted: candidateState,
+                        wasAlreadyInstalled: false
+                    )
+                }
+
+                let stored = try decodeStoredPublicRepositoryGenesis(
+                    row,
+                    signingPublicKey: signingPublicKey
+                )
+                guard stored.genesis == verifiedCandidate else {
+                    throw PublicRepositoryGenesisStoreError.conflictingGenesis
+                }
+                return PublicRepositoryGenesisInstallation(
+                    persisted: stored,
+                    wasAlreadyInstalled: true
+                )
+            }
+        }
+    }
+
+    /// Loading is deliberately validation work, not a best-effort cache read:
+    /// any tampered row rejects the whole operation and is never repaired from
+    /// a caller-provided candidate.
+    public func loadPublicRepositoryGenesis(
+        did: String,
+        signingPublicKey: P256.Signing.PublicKey
+    ) async throws -> PersistedPublicRepositoryGenesis? {
+        guard did == accountDID else {
+            throw PublicRepositoryGenesisStoreError.ownershipMismatch
+        }
+        do {
+            try PublicRepositoryGenesisCodec.validateDID(did)
+        } catch {
+            throw PublicRepositoryGenesisStoreError.ownershipMismatch
+        }
+        return try await withConnectionGate {
+            let rows = try await connection.query(
+                """
+                SELECT did, revision, commit_cid, car, installed_at
+                FROM public_repository_genesis
+                """
+            )
+            guard rows.count <= 1 else {
+                throw PublicRepositoryGenesisStoreError.corruptStoredGenesis
+            }
+            guard let row = rows.first else { return nil }
+            return try decodeStoredPublicRepositoryGenesis(
+                row,
+                signingPublicKey: signingPublicKey
             )
         }
     }
@@ -2836,6 +2949,69 @@ public actor SQLiteAccountDatabase: BlobStore {
 
     private func blobCID(_ payload: Data) -> String {
         "sha256:\(Hex.encode(SHA256.hash(data: payload)))"
+    }
+
+    private func verifiedPublicGenesis(
+        car: Data,
+        signingPublicKey: P256.Signing.PublicKey
+    ) throws -> PublicRepositoryGenesis {
+        let verified: PublicRepositoryGenesis
+        do {
+            verified = try PublicRepositoryGenesisCodec.verify(
+                car: car,
+                publicKey: signingPublicKey
+            )
+        } catch {
+            throw PublicRepositoryGenesisStoreError.corruptStoredGenesis
+        }
+        guard verified.did == accountDID else {
+            throw PublicRepositoryGenesisStoreError.ownershipMismatch
+        }
+        return verified
+    }
+
+    private func decodeStoredPublicRepositoryGenesis(
+        _ row: SQLiteRow,
+        signingPublicKey: P256.Signing.PublicKey
+    ) throws -> PersistedPublicRepositoryGenesis {
+        do {
+            let did = try requiredText(row, "did")
+            let revision = try requiredText(row, "revision")
+            let commitCID = try requiredText(row, "commit_cid")
+            let car = try requiredBlob(row, "car")
+            let timestamp = try requiredNonnegativeInteger(row, "installed_at")
+            guard did == accountDID else {
+                throw PublicRepositoryGenesisStoreError.ownershipMismatch
+            }
+            let verified = try verifiedPublicGenesis(
+                car: car,
+                signingPublicKey: signingPublicKey
+            )
+            guard verified.did == did,
+                  verified.revision == revision,
+                  verified.commitCID.string == commitCID else {
+                throw PublicRepositoryGenesisStoreError.corruptStoredGenesis
+            }
+            return try PersistedPublicRepositoryGenesis(
+                genesis: verified,
+                installedAt: Date(timeIntervalSince1970: Double(timestamp) / 1_000_000)
+            )
+        } catch let error as PublicRepositoryGenesisStoreError {
+            throw error
+        } catch {
+            throw PublicRepositoryGenesisStoreError.corruptStoredGenesis
+        }
+    }
+
+    private func publicGenesisTimestamp(_ date: Date) throws -> Int {
+        let microseconds = date.timeIntervalSince1970 * 1_000_000
+        guard microseconds.isFinite,
+              microseconds >= 0,
+              microseconds <= Double(Int.max)
+        else {
+            throw PublicRepositoryGenesisStoreError.invalidTimestamp
+        }
+        return Int(microseconds.rounded(.down))
     }
 
     private func sqliteRevision(_ revision: UInt64) throws -> Int {
