@@ -1,4 +1,5 @@
 import ArgumentParser
+import Crypto
 import Foundation
 import Logging
 import SwanAccounts
@@ -8,6 +9,152 @@ import SwanCore
 import SwanOAuth
 import SwanSQLite
 import ServiceLifecycle
+
+/// Offline operator configuration for the inbound half of the space
+/// notification laboratory. All key material is public verification data;
+/// private account scalars remain only in the encrypted account key store.
+///
+/// The destination declarations are validated now, but are deliberately not
+/// made live by `swan serve`: the stock AsyncHTTPClient adapter cannot prove
+/// a final connected peer. A hosting application that supplies a hardened
+/// transport can reuse the same pins/destinations to construct
+/// `SwanNotificationRecoveryService` explicitly.
+private struct ServeNotificationRuntime {
+    let credentialConfiguration: SwanSpaceCredentialHTTPConfiguration
+    let notificationConfiguration: SwanSpaceNotificationHTTPConfiguration
+
+    private struct Configuration: Decodable {
+        let credentialPublicKeys: [CredentialKey]
+        let servicePublicKeys: [ServiceKey]
+        let authorityDestinations: [Destination]
+        let registrationDestinations: [Destination]
+    }
+
+    private struct CredentialKey: Decodable {
+        let issuer: String
+        let keyID: String?
+        let generation: UInt64
+        let p256X963: String
+    }
+
+    private struct ServiceKey: Decodable {
+        let issuer: String
+        let generation: UInt64
+        let p256X963: String
+    }
+
+    /// `key` is either an authority DID or an exact registered endpoint. The
+    /// peer pin is required even though stock `serve` does not dispatch yet:
+    /// this prevents an operator configuration from being mistaken for a
+    /// complete delivery configuration without an explicit final-peer proof.
+    private struct Destination: Decodable {
+        let key: String
+        let endpoint: String
+        let audience: String
+        let finalPeer: String
+    }
+
+    static func load(from url: URL) throws -> ServeNotificationRuntime {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        } catch {
+            throw ValidationError("--notification-config is unavailable")
+        }
+        guard data.count > 0, data.count <= 256 * 1_024 else {
+            throw ValidationError("--notification-config has invalid size")
+        }
+        let configuration: Configuration
+        do {
+            configuration = try JSONDecoder().decode(Configuration.self, from: data)
+        } catch {
+            throw ValidationError("--notification-config is invalid JSON")
+        }
+        do {
+            let credentialPins = try configuration.credentialPublicKeys.map { pin in
+                guard let bytes = Data(base64URLEncoded: pin.p256X963) else {
+                    throw SwanError.malformed("notification credential key is invalid")
+                }
+                return try PinnedSpaceCredentialPublicKey(
+                    authority: pin.issuer,
+                    keyID: pin.keyID ?? PermissionedDataJWT.spaceCredentialKeyID,
+                    generation: pin.generation,
+                    publicKey: P256.Signing.PublicKey(x963Representation: bytes)
+                )
+            }
+            let servicePins = try configuration.servicePublicKeys.map { pin in
+                guard let bytes = Data(base64URLEncoded: pin.p256X963) else {
+                    throw SwanError.malformed("notification service key is invalid")
+                }
+                return try PinnedSpaceServicePublicKey(
+                    issuer: pin.issuer,
+                    generation: pin.generation,
+                    publicKey: P256.Signing.PublicKey(x963Representation: bytes)
+                )
+            }
+            // Validate every declared destination/audience/peer now. These
+            // are not used as transport authority in the stock executable;
+            // they are a required complete operator declaration for a future
+            // peer-verifying transport, not a URL learned from registration.
+            for destination in configuration.authorityDestinations {
+                try validate(destination: destination, authorityKey: true)
+            }
+            for destination in configuration.registrationDestinations {
+                try validate(destination: destination, authorityKey: false)
+            }
+            return ServeNotificationRuntime(
+                credentialConfiguration: .init(
+                    authoritySigningKeys: ServeUnavailableCredentialSigningKeyResolver(),
+                    delegationPublicKeys: UnavailableSpaceDelegationPublicKeyResolver(),
+                    credentialPublicKeys: try PinnedSpaceCredentialPublicKeyResolver(pins: credentialPins)
+                ),
+                notificationConfiguration: .init(
+                    serviceAuthentication: DurableSpaceServiceAuthenticationVerifier(
+                        publicKeys: try PinnedSpaceServicePublicKeyResolver(pins: servicePins)
+                    )
+                )
+            )
+        } catch {
+            throw ValidationError("--notification-config contains invalid pinned notification material")
+        }
+    }
+
+    private static func validate(
+        destination: Destination,
+        authorityKey: Bool
+    ) throws {
+        guard let url = URL(string: destination.endpoint),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host?.lowercased(),
+              scheme == "https" || (scheme == "http" && host == "localhost") else {
+            throw SwanError.malformed("notification endpoint is invalid")
+        }
+        _ = try SwanSpaceNotificationDestination(endpoint: url, audience: destination.audience)
+        guard let peer = OAuthIPAddress(literal: destination.finalPeer),
+              (host == "localhost" ? peer.isLoopback : peer.isPublicInternetAddress) else {
+            throw SwanError.malformed("notification final peer is invalid")
+        }
+        if authorityKey {
+            guard (try? AccountIdentifiers.validateDID(destination.key)) != nil else {
+                throw SwanError.malformed("notification authority key is invalid")
+            }
+        } else {
+            guard destination.key.utf8.count <= 4_096,
+                  URLComponents(string: destination.key)?.host != nil else {
+                throw SwanError.malformed("notification registration key is invalid")
+            }
+        }
+    }
+}
+
+private struct ServeUnavailableCredentialSigningKeyResolver:
+    SpaceCredentialSigningKeyResolver
+{
+    func signingKey(for _: String) async throws -> SpaceCredentialAuthoritySigningKey? {
+        nil
+    }
+}
 
 @main
 struct SwanCommand: AsyncParsableCommand {
@@ -52,6 +199,12 @@ extension SwanCommand {
 
         @Option(name: .long, help: "Mounted operator-secret file for the enabled management listener")
         var managementOperatorSecretFile: String?
+
+        @Option(name: .customLong("notification-config"), help: "Owner-supplied JSON with pinned credential and service public keys for inbound space notifications")
+        var notificationConfig: String?
+
+        @Flag(name: .customLong("enable-notification-delivery"), help: "Request durable outbound notification delivery (unavailable until a final-peer-verifying transport is installed)")
+        var enableNotificationDelivery = false
 
         func run() async throws {
             let loadedProfile = try ProtocolProfile.load(from: URL(fileURLWithPath: profile))
@@ -120,6 +273,29 @@ extension SwanCommand {
                 } else {
                     localhostOAuthConfiguration = nil
                 }
+                let notificationRuntime: ServeNotificationRuntime?
+                if let notificationConfig {
+                    notificationRuntime = try ServeNotificationRuntime.load(
+                        from: URL(fileURLWithPath: notificationConfig)
+                    )
+                } else {
+                    notificationRuntime = nil
+                }
+                guard !enableNotificationDelivery || notificationRuntime != nil else {
+                    throw ValidationError("--enable-notification-delivery requires --notification-config")
+                }
+                // AsyncHTTPClient cannot report the final connected peer. Do
+                // not start a worker that might send a service JWT without a
+                // proof that its socket still matches approved re-resolved
+                // addresses. A caller embedding SwanHTTP may supply a
+                // peer-verifying transport and register the recovery service;
+                // the stock executable intentionally cannot advertise this
+                // unsafe partial mode.
+                guard !enableNotificationDelivery else {
+                    throw ValidationError(
+                        "outbound notification delivery requires a final-peer-verifying transport; the bundled AsyncHTTPClient adapter is unavailable for this purpose"
+                    )
+                }
                 let server = SwanHTTPServer(
                     profile: loadedProfile,
                     configuration: .init(host: host, port: port, publicURL: baseURL),
@@ -127,7 +303,9 @@ extension SwanCommand {
                     localhostPARConfiguration: localhostPARConfiguration,
                     localhostOAuthConfiguration: localhostOAuthConfiguration,
                     authenticatedGetSpaceDirectory: directory,
-                    accountControlStore: controlDatabase
+                    accountControlStore: controlDatabase,
+                    spaceCredentialConfiguration: notificationRuntime?.credentialConfiguration,
+                    spaceNotificationConfiguration: notificationRuntime?.notificationConfiguration
                 )
                 guard server.authenticatedGetSpace != nil else {
                     throw ValidationError(
@@ -177,6 +355,9 @@ extension SwanCommand {
                 }
                 logger.info("starting Swan", metadata: ["profile": .string(loadedProfile.id), "address": .string("\(host):\(port)")])
                 var services: [any Service] = [publicApplication]
+                if notificationRuntime != nil {
+                    logger.info("space notification receiver routes enabled; outbound delivery remains disabled pending peer-verifying transport")
+                }
                 if let managementApplication {
                     services.append(managementApplication)
                     logger.info("starting Swan management listener", metadata: [

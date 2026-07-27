@@ -30,7 +30,17 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             let writeBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"repo\":\"\(writer)\",\"rev\":\"2222222222222\",\"hash\":{\"$bytes\":\"\(commitment)\"}}")
             let serviceHeaders: HTTPFields = {
                 var fields: HTTPFields = [.contentType: "application/json"]
-                fields[.authorization] = "Bearer service-token"
+                fields[.authorization] = "Bearer writer-token"
+                return fields
+            }()
+            let authorityFanoutHeaders: HTTPFields = {
+                var fields: HTTPFields = [.contentType: "application/json"]
+                fields[.authorization] = "Bearer authority-fanout-token"
+                return fields
+            }()
+            let unknownRecipientHeaders: HTTPFields = {
+                var fields: HTTPFields = [.contentType: "application/json"]
+                fields[.authorization] = "Bearer authority-unknown-recipient-token"
                 return fields
             }()
 
@@ -54,6 +64,36 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertEqual(response.headers[.cacheControl], "no-store")
+                }
+                // Authority fanout preserves the member writer in `repo` but
+                // is signed by the authority. A recipient PDS accepts this as
+                // a successful no-op rather than trying to apply a remote
+                // operation or treating it as a retryable failure.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.notifyWrite",
+                    method: .post,
+                    headers: authorityFanoutHeaders,
+                    body: writeBody
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                // A service may receive a best-effort fanout for an account
+                // it does not host; this is also an opaque successful no-op.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.notifyWrite",
+                    method: .post,
+                    headers: unknownRecipientHeaders,
+                    body: writeBody
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.notifySpaceDeleted",
+                    method: .post,
+                    headers: unknownRecipientHeaders,
+                    body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\"}")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
                 }
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.listRepos?space=\(encodedSpace)",
@@ -103,6 +143,41 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
             try? await fixture.close()
             throw error
         }
+    }
+
+    func testNotificationRecoveryServiceDrainsCommittedWriterAndAuthorityQueues() async throws {
+        let fixture = try NotificationRecoveryFixture()
+        let database = try await fixture.open()
+        defer {
+            Task { try? await database.close() }
+            fixture.cleanup()
+        }
+        try await fixture.prepareCommittedQueues(on: database)
+
+        let transport = NotificationRecoveryTransport()
+        let service = SwanNotificationRecoveryService(
+            databases: [database],
+            makeOutboxTransport: { _ in transport },
+            makeFanoutTransport: { _ in transport },
+            configuration: try notificationRecoveryConfiguration()
+        )
+        let running = Task { try? await service.run() }
+        defer { running.cancel() }
+
+        for _ in 0 ..< 100 {
+            let counts = await transport.counts()
+            if counts.outbox == 1, counts.fanout == 1 { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let counts = await transport.counts()
+        XCTAssertEqual(counts.outbox, 1)
+        XCTAssertEqual(counts.fanout, 1)
+        let remainingOutbox = try await database.pendingOutbox()
+        let remainingFanout = try await database.pendingNotificationFanout()
+        XCTAssertTrue(remainingOutbox.isEmpty)
+        XCTAssertTrue(remainingFanout.isEmpty)
+        running.cancel()
+        _ = await running.value
     }
 }
 
@@ -176,6 +251,109 @@ private struct NotificationHTTPFixture {
     }
 }
 
+private struct NotificationRecoveryFixture {
+    let root: URL
+    let authority = "did:plc:abcdefghijklmnopqrstuvwx"
+    let writer = "did:plc:bcdefghijklmnopqrstuvwxy"
+    let reader = "did:plc:cdefghijklmnopqrstuvwxyz"
+    let space: SpaceURI
+
+    init() throws {
+        root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanNotificationRecoveryServiceTests-\(UUID().uuidString)")
+        space = try SpaceURI(authority: authority, spaceType: "app.bsky.bookmarks", skey: "recovery")
+    }
+
+    func open() async throws -> SQLiteAccountDatabase {
+        try await SQLiteAccountDatabase(dataDirectory: root, did: authority)
+    }
+
+    func prepareCommittedQueues(on database: SQLiteAccountDatabase) async throws {
+        let lifecycle = DurableSimpleSpaceAuthority(lifecycleDatabase: database)
+        _ = try await lifecycle.create(
+            space: space,
+            owner: authority,
+            configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+            authorization: .accountOAuth(subject: authority, scopes: ["atproto"])
+        )
+        _ = try await lifecycle.addMember(
+            space: space,
+            member: writer,
+            authorization: .accountOAuth(subject: authority, scopes: ["atproto"])
+        )
+        let now = Date()
+        try await database.registerSpaceNotification(
+            .init(
+                space: space,
+                endpoint: "https://receiver.example/xrpc/com.atproto.space.notifyWrite",
+                repository: writer,
+                expiresAt: now.addingTimeInterval(3_600)
+            ),
+            authorization: .spaceCredential(.init(
+                subject: reader,
+                space: space,
+                permissions: [.read],
+                expiresAt: now.addingTimeInterval(3_600)
+            )),
+            now: now
+        )
+        _ = try await database.appendOplogAndOutbox(
+            space: space,
+            revision: 1,
+            operation: Data([0xA1, 0x61, 0x61, 0x01]),
+            commitment: Data(repeating: 0xA4, count: 32)
+        )
+        try await database.receiveSpaceWriteNotification(
+            .init(
+                eventID: "writer-recovery-event",
+                space: space,
+                repository: writer,
+                wireRevision: "2222222222223",
+                commitment: Data(repeating: 0xA5, count: 32),
+                issuer: writer,
+                audience: authority
+            ),
+            now: now
+        )
+    }
+
+    func cleanup() {
+        try? FileManager.default.removeItem(at: root)
+    }
+}
+
+private actor NotificationRecoveryTransport:
+    PermissionedSpaceOutboxTransport,
+    PermissionedSpaceNotificationFanoutTransport
+{
+    private var outboxCount = 0
+    private var fanoutCount = 0
+
+    func deliver(_ notification: PermissionedSpaceOutboxNotification) async throws {
+        XCTAssertFalse(notification.payload.isEmpty)
+        outboxCount += 1
+    }
+
+    func deliver(_ notification: PersistedSpaceNotificationFanout) async throws {
+        XCTAssertEqual(notification.kind, .write)
+        XCTAssertNil(String(describing: notification).range(of: "private record value"))
+        fanoutCount += 1
+    }
+
+    func counts() -> (outbox: Int, fanout: Int) {
+        (outboxCount, fanoutCount)
+    }
+}
+
+private func notificationRecoveryConfiguration() throws -> PermissionedSpaceOutboxDeliveryConfiguration {
+    try .init(
+        leaseDuration: 1,
+        idlePollInterval: 0.01,
+        initialFailureBackoff: 0.01,
+        maximumFailureBackoff: 0.01
+    )
+}
+
 private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, AuthorizedSpaceNotificationDirectory {
     private let authority: String
     private let writer: String
@@ -215,6 +393,11 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
     }
 
     func receiveSpaceWriteNotification(_ notification: AuthorizedSpaceWriteNotification) async throws {
+        // Fanout from the authority is deliberately not remote state
+        // application at a recipient host.
+        if notification.issuer == authority, notification.audience != authority {
+            return
+        }
         guard notification.space.authority == authority, notification.repository == writer else {
             throw SwanError.unauthorized("notification is invalid")
         }
@@ -248,18 +431,45 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
         expectedMethod: String,
         now _: Date
     ) async throws -> VerifiedSpaceServiceAuthentication {
-        guard compact == "service-token",
-              expectedAudience == authority,
-              expectedMethod == "com.atproto.space.notifyWrite" else {
+        guard expectedAudience == nil else {
             throw SwanError.unauthorized("service authentication is invalid")
         }
-        return .init(
-            issuer: writer,
-            audience: authority,
-            method: expectedMethod,
-            eventID: "service-event-1",
-            expiresAt: Date(timeIntervalSinceNow: 60)
-        )
+        switch (compact, expectedMethod) {
+        case ("writer-token", "com.atproto.space.notifyWrite"):
+            return .init(
+                issuer: writer,
+                audience: authority,
+                method: expectedMethod,
+                eventID: "service-event-1",
+                expiresAt: Date(timeIntervalSinceNow: 60)
+            )
+        case ("authority-fanout-token", "com.atproto.space.notifyWrite"):
+            return .init(
+                issuer: authority,
+                audience: "did:plc:recipientabcdefghijklmnop",
+                method: expectedMethod,
+                eventID: "service-event-2",
+                expiresAt: Date(timeIntervalSinceNow: 60)
+            )
+        case ("authority-unknown-recipient-token", "com.atproto.space.notifyWrite"):
+            return .init(
+                issuer: authority,
+                audience: "did:plc:unknownabcdefghijklmnopqr",
+                method: expectedMethod,
+                eventID: "service-event-3",
+                expiresAt: Date(timeIntervalSinceNow: 60)
+            )
+        case ("authority-unknown-recipient-token", "com.atproto.space.notifySpaceDeleted"):
+            return .init(
+                issuer: authority,
+                audience: "did:plc:unknownabcdefghijklmnopqr",
+                method: expectedMethod,
+                eventID: "service-event-4",
+                expiresAt: Date(timeIntervalSinceNow: 60)
+            )
+        default:
+            throw SwanError.unauthorized("service authentication is invalid")
+        }
     }
 }
 

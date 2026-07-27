@@ -226,6 +226,14 @@ public enum SQLiteLayout {
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS permissioned_space_recipient_tombstones (
+            space_uri TEXT PRIMARY KEY,
+            authority_did TEXT NOT NULL,
+            deletion_event_id TEXT NOT NULL,
+            closed_at INTEGER NOT NULL CHECK(closed_at >= 0)
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS permissioned_space_notification_fanout (
             id TEXT PRIMARY KEY,
             source_issuer TEXT NOT NULL,
@@ -1774,6 +1782,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
 
         return try await withConnectionGate {
             try await transaction {
+            try await requireLocalRepositorySpaceOpen(space)
             let duplicate = try await connection.query(
                 "SELECT 1 FROM permissioned_space_requests WHERE request_id = ?",
                 [.text(requestID.uuidString)]
@@ -2038,7 +2047,8 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         try requireAccount(author)
         return try await withConnectionGate {
             try await readTransaction {
-                try await repositorySnapshotWithoutTransaction(
+                try await requireLocalRepositorySpaceOpen(space)
+                return try await repositorySnapshotWithoutTransaction(
                     space: space,
                     author: author
                 )
@@ -2064,7 +2074,8 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         do {
             let prepared = try await withConnectionGate {
                 try await readTransaction {
-                    try await prepareRepositoryCARSnapshotWithoutTransaction(
+                    try await requireLocalRepositorySpaceOpen(space)
+                    return try await prepareRepositoryCARSnapshotWithoutTransaction(
                         space: space,
                         author: author,
                         bodyURL: bodyURL
@@ -2370,7 +2381,8 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         try requireAccount(author)
         return try await withConnectionGate {
             try await readTransaction {
-                try await loadState(space: space, author: author)
+                try await requireLocalRepositorySpaceOpen(space)
+                return try await loadState(space: space, author: author)
             }
         }
     }
@@ -2404,6 +2416,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         try requireAccount(uri.author)
         return try await withConnectionGate {
             try await readTransaction {
+                try await requireLocalRepositorySpaceOpen(uri.space)
                 guard try await loadState(space: uri.space, author: uri.author) != nil else {
                     return nil
                 }
@@ -2420,7 +2433,8 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         try requireAccount(author)
         return try await withConnectionGate {
             try await readTransaction {
-                try await spaceOplogWithoutTransaction(
+                try await requireLocalRepositorySpaceOpen(space)
+                return try await spaceOplogWithoutTransaction(
                     space: space,
                     author: author,
                     afterRevision: requestedRevision,
@@ -2452,7 +2466,8 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         }
         return try await withConnectionGate {
             try await readTransaction {
-                try await wireOplogWithoutTransaction(
+                try await requireLocalRepositorySpaceOpen(space)
+                return try await wireOplogWithoutTransaction(
                     space: space,
                     author: author,
                     since: since,
@@ -2588,7 +2603,8 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         try requireAccount(author)
         return try await withConnectionGate {
             try await readTransaction {
-                try await spaceOplogWithoutTransaction(
+                try await requireLocalRepositorySpaceOpen(space)
+                return try await spaceOplogWithoutTransaction(
                     space: space,
                     author: author,
                     afterRevision: cursor?.revision ?? 0,
@@ -3471,9 +3487,29 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                     """,
                     [.text(issuer), .text(eventID), .text(space.rawValue), .integer(timestamp)]
                 )
-                // If this account is itself the (already-deleted) authority,
-                // no additional state is needed. A local writer repository has
-                // no authority table to mutate in this alpha.
+                // A recipient may retain a local repository for its own
+                // writes in this remote space. Persist a closure rather than
+                // creating a synthetic remote authority row or applying any
+                // remote operation. All local repository read/write entry
+                // points consult this tombstone, and stale writer outbox rows
+                // are removed in the same transaction so a later restart
+                // cannot announce a deleted repository.
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_space_recipient_tombstones(
+                        space_uri, authority_did, deletion_event_id, closed_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(space_uri) DO NOTHING
+                    """,
+                    [
+                        .text(space.rawValue), .text(issuer), .text(eventID),
+                        .integer(timestamp),
+                    ]
+                )
+                _ = try await connection.query(
+                    "DELETE FROM permissioned_space_outbox WHERE space_uri = ?",
+                    [.text(space.rawValue)]
+                )
             }
         }
     }
@@ -3668,6 +3704,11 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         try requireAccount(author)
         guard author == accountDID else {
             throw SwanError.unauthorized("account database ownership mismatch")
+        }
+        try await withConnectionGate {
+            try await readTransaction {
+                try await requireLocalRepositorySpaceOpen(space)
+            }
         }
         _ = try canonicalRawBlobCID(cid)
         guard let stored = try await blobPayloadIfReachable(
@@ -4310,6 +4351,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         let createdAt = try outboxTimestamp(Date())
         try await withConnectionGate {
             try await transaction {
+                try await requireLocalRepositorySpaceOpen(space)
                 _ = try await connection.query(
                     "INSERT INTO space_oplog(space_uri, revision, operation, commitment) VALUES (?, ?, ?, ?)",
                     [
@@ -5109,6 +5151,22 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             throw SwanError.unauthorized(
                 "repository author belongs to another account"
             )
+        }
+    }
+
+    /// A verified authority deletion closes any local recipient repository
+    /// without manufacturing remote authority state or applying remote
+    /// operations. This helper is used only while an existing SQLite
+    /// transaction is held, so it cannot race a deletion into a stale read or
+    /// write. It intentionally does not reveal whether the receiver retained
+    /// records before the closure.
+    private func requireLocalRepositorySpaceOpen(_ space: SpaceURI) async throws {
+        let rows = try await connection.query(
+            "SELECT 1 FROM permissioned_space_recipient_tombstones WHERE space_uri = ?",
+            [.text(space.rawValue)]
+        )
+        guard rows.isEmpty else {
+            throw SwanError.unauthorized("permissioned space is closed")
         }
     }
 

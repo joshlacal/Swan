@@ -423,9 +423,12 @@ public protocol OAuthRemotePostTransport: Sendable {
     ) async throws -> OAuthRemoteHTTPResponse
 }
 
-/// AsyncHTTPClient adapter for the narrow outbound service-notification path.
-/// Redirects and decompression remain disabled, and callers must still use
-/// `OAuthBoundedJSONPoster` for URL and DNS policy before invoking it.
+/// Compatibility adapter for callers that need a bounded AsyncHTTPClient
+/// request but do *not* require final-peer proof. It is deliberately
+/// unavailable for notification delivery: AsyncHTTPClient's high-level API
+/// cannot report the connected peer, so sending a service JWT through it
+/// would create a DNS-rebinding escape hatch. Supply a transport that reports
+/// a concrete connected peer to ``OAuthBoundedJSONPoster`` instead.
 public final class AsyncHTTPClientOAuthPostTransport: OAuthRemotePostTransport {
     private let client: HTTPClient
     private let maximumTransportTimeout: TimeInterval
@@ -463,29 +466,9 @@ public final class AsyncHTTPClientOAuthPostTransport: OAuthRemotePostTransport {
               body.count <= 64 * 1_024 else {
             throw SwanError.unavailable("OAuth POST transport bounds exceeded")
         }
-        var request = HTTPClientRequest(url: url.absoluteString)
-        request.method = .POST
-        for (name, value) in headers {
-            request.headers.add(name: name, value: value)
-        }
-        request.body = .bytes(body)
-        let response = try await client.execute(
-            request,
-            timeout: .milliseconds(Int64(timeout * 1_000))
-        )
-        let buffer = try await response.body.collect(upTo: maximumResponseBodyBytes)
-        let bytes = buffer.getBytes(at: buffer.readerIndex, length: buffer.readableBytes) ?? []
-        var responseHeaders: [String: [String]] = [:]
-        for header in response.headers {
-            responseHeaders[header.name.lowercased(), default: []].append(header.value)
-        }
-        return OAuthRemoteHTTPResponse(
-            status: Int(response.status.code),
-            headers: responseHeaders,
-            body: Data(bytes),
-            responseURL: response.url ?? url,
-            redirectCount: max(0, response.history.count - 1),
-            connectedPeerAddress: nil
+        _ = (url, headers, body, maximumResponseBodyBytes)
+        throw SwanError.unavailable(
+            "AsyncHTTPClient notification transport cannot prove the final connected peer"
         )
     }
 }
@@ -518,7 +501,8 @@ public struct OAuthBoundedJSONPoster: Sendable {
             throw SwanError.malformed("outbound JSON body is out of bounds")
         }
         let host = try policy.validateURL(url)
-        try policy.validateResolved(try await resolver.resolve(host: host), host: host)
+        let initialAddresses = try await resolver.resolve(host: host)
+        try policy.validateResolved(initialAddresses, host: host)
         let response: OAuthRemoteHTTPResponse
         do {
             response = try await transport.post(
@@ -533,19 +517,22 @@ public struct OAuthBoundedJSONPoster: Sendable {
         } catch {
             throw SwanError.unavailable("outbound notification request failed")
         }
-        // Re-resolve after the request. Deployments that require a strict
-        // final-peer proof must inject a transport that reports that peer.
-        try policy.validateResolved(try await resolver.resolve(host: host), host: host)
+        // Re-resolve after the request and require the transport to prove the
+        // actual peer belongs to *both* approved answer sets. A nil peer is
+        // never a permissive fallback for service-to-service delivery.
+        let finalAddresses = try await resolver.resolve(host: host)
+        try policy.validateResolved(finalAddresses, host: host)
         guard response.redirectCount == 0,
               response.responseURL.absoluteString == url.absoluteString,
               (200 ... 299).contains(response.status),
               response.body.count <= policy.maximumBodyBytes else {
             throw SwanError.unauthorized("outbound notification response is invalid")
         }
-        if let peer = response.connectedPeerAddress {
-            guard policy.permits(peer, forHost: host) else {
-                throw SwanError.unauthorized("outbound notification peer is forbidden")
-            }
+        guard let peer = response.connectedPeerAddress,
+              initialAddresses.contains(peer),
+              finalAddresses.contains(peer),
+              policy.permits(peer, forHost: host) else {
+            throw SwanError.unauthorized("outbound notification peer is forbidden")
         }
         let normalized = response.headers.reduce(into: [String: [String]]()) { output, item in
             output[item.key.lowercased(), default: []].append(contentsOf: item.value)

@@ -361,14 +361,25 @@ public actor SQLitePreMigratedAccountDirectory:
     public func receiveSpaceWriteNotification(
         _ notification: AuthorizedSpaceWriteNotification
     ) async throws {
-        let database = try await preopenedCredentialAuthorityDatabase(
-            for: notification.space
-        )
+        // The direct writer->authority message is the only notifyWrite shape
+        // that this host may apply. Authority->recipient fanout is a delivery
+        // hint for a remote synchronizer, not remote operation application;
+        // it deliberately succeeds as a no-op here, matching the pinned PDS
+        // behavior for a host that does not own the space authority.
+        guard notification.audience == notification.space.authority,
+              notification.issuer == notification.repository else {
+            return
+        }
+        guard let database = try await preopenedActiveDatabaseIfHosted(
+            notification.space.authority
+        ) else {
+            return
+        }
         do {
             try await database.receiveSpaceWriteNotification(notification)
-            try await requireCredentialAuthorityStillAvailable(
-                notification.space.authority
-            )
+            guard try await isActiveAccount(notification.space.authority), !isClosed else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
         } catch let error as SwanError {
             throw error
         } catch let error as AuthorizedSimpleSpaceLifecycleError {
@@ -384,7 +395,12 @@ public actor SQLitePreMigratedAccountDirectory:
         audience: String,
         eventID: String
     ) async throws {
-        let database = try await preopenedServiceRecipientDatabase(for: audience)
+        // A notification addressed to a PDS that does not host this account
+        // is a successful best-effort no-op. Do not create/migrate an account
+        // database from an incoming audience claim.
+        guard let database = try await preopenedActiveDatabaseIfHosted(audience) else {
+            return
+        }
         do {
             try await database.receiveSpaceDeletionNotification(
                 space: space,
@@ -392,7 +408,9 @@ public actor SQLitePreMigratedAccountDirectory:
                 audience: audience,
                 eventID: eventID
             )
-            try await requireLifecycleAuthorityStillAvailable(audience)
+            guard try await isActiveAccount(audience), !isClosed else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
         } catch let error as SwanError {
             throw error
         } catch {
@@ -896,6 +914,30 @@ public actor SQLitePreMigratedAccountDirectory:
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
         return database
+    }
+
+    /// Returns an existing active account database for a best-effort service
+    /// delivery target. Unlike request authorization helpers, absence is not
+    /// an error: the signed audience may name an account hosted by another
+    /// PDS. This method never opens, creates, or migrates a database.
+    private func preopenedActiveDatabaseIfHosted(
+        _ did: String
+    ) async throws -> SQLiteAccountDatabase? {
+        guard !isClosed else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard try await isActiveAccount(did) else { return nil }
+        do {
+            try Self.requireExistingRegularDatabase(
+                SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
+            )
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard !isClosed else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        return databases[did]
     }
 
     private func requireLifecycleAuthorityStillAvailable(_ did: String) async throws {

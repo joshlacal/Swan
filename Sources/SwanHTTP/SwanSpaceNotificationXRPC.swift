@@ -151,11 +151,20 @@ private struct AuthenticatedNotifySpaceWriteHandler:
         let service = try await serviceAuthentication(
             capability,
             request: request,
-            expectedAudience: space.authority,
+            expectedAudience: nil,
             expectedMethod: ComAtprotoSpaceNotifyWrite.typeIdentifier
         )
-        guard service.issuer == input.repo.didString(),
-              service.audience == space.authority else {
+        let directWriterToAuthority = service.issuer == input.repo.didString()
+            && service.audience == space.authority
+        // The authority's durable fanout preserves the original writer in
+        // `repo`, but is signed by the authority and addressed to a configured
+        // recipient service. A recipient which does not host the authority
+        // accepts this as a successful no-op; it must never interpret it as a
+        // remote operation to apply locally.
+        let authorityFanoutToRecipient = service.issuer == space.authority
+            && service.audience != space.authority
+        guard directWriterToAuthority || authorityFanoutToRecipient,
+              (try? DID(didString: service.audience)) != nil else {
             throw AuthenticatedSpaceNotificationFailure.denied
         }
         do {

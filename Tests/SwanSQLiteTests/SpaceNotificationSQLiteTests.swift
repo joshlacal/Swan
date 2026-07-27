@@ -172,6 +172,70 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         XCTAssertNil(pending.first?.commitment)
         XCTAssertNil(String(describing: pending).range(of: "private record value"))
     }
+
+    func testRecipientDeletionDurablyClosesLocalRepositoryAndClearsStaleOutbox() async throws {
+        let fixture = try NotificationFixture()
+        let writerDatabase = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root,
+            did: fixture.writer
+        )
+        defer { Task { try? await writerDatabase.close() } }
+        let uri = try SpaceRecordURI(
+            space: fixture.space,
+            author: fixture.writer,
+            collection: "app.bsky.feed.post",
+            rkey: "local"
+        )
+        let revision = try fixture.tid(1)
+        _ = try await writerDatabase.apply(
+            space: fixture.space,
+            author: fixture.writer,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: revision,
+            writes: [.put(uri: uri, value: Data([0xA1, 0x61, 0x61, 0x01]), cid: "cid:local")]
+        )
+        let initialOutbox = try await writerDatabase.pendingOutbox()
+        XCTAssertEqual(initialOutbox.count, 1)
+
+        let now = Date(timeIntervalSince1970: 1_750_000_300)
+        try await writerDatabase.receiveSpaceDeletionNotification(
+            space: fixture.space,
+            issuer: fixture.authority,
+            audience: fixture.writer,
+            eventID: "space-delete-1",
+            now: now
+        )
+        // A duplicate delivery must preserve the durable closure rather than
+        // reopening it or reporting a retryable failure.
+        try await writerDatabase.receiveSpaceDeletionNotification(
+            space: fixture.space,
+            issuer: fixture.authority,
+            audience: fixture.writer,
+            eventID: "space-delete-1",
+            now: now.addingTimeInterval(1)
+        )
+        let remainingOutbox = try await writerDatabase.pendingOutbox()
+        XCTAssertTrue(remainingOutbox.isEmpty)
+        do {
+            _ = try await writerDatabase.repositoryState(
+                space: fixture.space,
+                author: fixture.writer
+            )
+            XCTFail("recipient tombstone must close repository state reads")
+        } catch {}
+        do {
+            _ = try await writerDatabase.apply(
+                space: fixture.space,
+                author: fixture.writer,
+                expectedRevision: 1,
+                requestID: UUID(),
+                wireRevision: try fixture.tid(2),
+                writes: [.put(uri: uri, value: Data([0xA1, 0x61, 0x61, 0x02]), cid: "cid:after-delete")]
+            )
+            XCTFail("recipient tombstone must close repository writes")
+        } catch {}
+    }
 }
 
 private struct NotificationFixture {

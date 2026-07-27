@@ -930,7 +930,8 @@ final class SwanOAuthTests: XCTestCase {
             status: 204,
             headers: ["content-length": ["0"]],
             body: Data(),
-            responseURL: url
+            responseURL: url,
+            connectedPeerAddress: publicAddress
         ))
         let safePoster = OAuthBoundedJSONPoster(
             policy: policy,
@@ -962,7 +963,11 @@ final class SwanOAuthTests: XCTestCase {
         XCTAssertEqual(privateRequests, 0)
 
         let rebindingTransport = TestPostTransport(response: .init(
-            status: 204, headers: [:], body: Data(), responseURL: url
+            status: 204,
+            headers: [:],
+            body: Data(),
+            responseURL: url,
+            connectedPeerAddress: publicAddress
         ))
         let rebindingPoster = OAuthBoundedJSONPoster(
             policy: policy,
@@ -976,6 +981,45 @@ final class SwanOAuthTests: XCTestCase {
         ))
         let rebindingRequests = await rebindingTransport.requestCount()
         XCTAssertEqual(rebindingRequests, 1)
+
+        // A still-public DNS answer is not sufficient: the actual connected
+        // peer must be pinned into the re-resolved approved answer set.
+        let alternatePublicAddress = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.35"))
+        let peerMismatchTransport = TestPostTransport(response: .init(
+            status: 204,
+            headers: [:],
+            body: Data(),
+            responseURL: url,
+            connectedPeerAddress: publicAddress
+        ))
+        let peerMismatchPoster = OAuthBoundedJSONPoster(
+            policy: policy,
+            resolver: TestResolver(answers: [[publicAddress], [alternatePublicAddress]]),
+            transport: peerMismatchTransport
+        )
+        await XCTAssertThrowsErrorAsync(try await peerMismatchPoster.postJSON(
+            to: url,
+            headers: ["content-type": "application/json"],
+            body: body
+        ))
+        let peerMismatchRequests = await peerMismatchTransport.requestCount()
+        XCTAssertEqual(peerMismatchRequests, 1)
+
+        let nilPeerTransport = TestPostTransport(response: .init(
+            status: 204, headers: [:], body: Data(), responseURL: url
+        ))
+        let nilPeerPoster = OAuthBoundedJSONPoster(
+            policy: policy,
+            resolver: TestResolver(answers: [[publicAddress], [publicAddress]]),
+            transport: nilPeerTransport
+        )
+        await XCTAssertThrowsErrorAsync(try await nilPeerPoster.postJSON(
+            to: url,
+            headers: ["content-type": "application/json"],
+            body: body
+        ))
+        let nilPeerRequests = await nilPeerTransport.requestCount()
+        XCTAssertEqual(nilPeerRequests, 1)
     }
 }
 
