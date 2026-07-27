@@ -2931,18 +2931,19 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                 // wins over a repository-state row.
                 let rows = try await connection.query(
                     """
-                    SELECT space_uri
+                    SELECT space_uri, MAX(is_local_authority) AS is_local_authority
                     FROM (
-                        SELECT a.space_uri AS space_uri
+                        SELECT a.space_uri AS space_uri, 1 AS is_local_authority
                         FROM permissioned_simple_space_authorities AS a
-                        WHERE a.is_deleted = 0
+                        WHERE a.owner_did = ?
+                          AND a.is_deleted = 0
                           AND NOT EXISTS (
                               SELECT 1
                               FROM permissioned_space_recipient_tombstones AS t
                               WHERE t.space_uri = a.space_uri
                           )
                         UNION
-                        SELECT r.space_uri AS space_uri
+                        SELECT r.space_uri AS space_uri, 0 AS is_local_authority
                         FROM permissioned_repository_state AS r
                         WHERE r.author_did = ?
                           AND NOT EXISTS (
@@ -2966,10 +2967,12 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                     WHERE (? IS NULL OR space_uri GLOB ?)
                       AND (? IS NULL OR substr(space_uri, 1, length(?)) = ?)
                       AND (? IS NULL OR space_uri > ?)
+                    GROUP BY space_uri
                     ORDER BY space_uri ASC
                     LIMIT ?
                     """,
                     [
+                        .text(accountDID),
                         .text(accountDID),
                         spaceType.map { "at://*/space/\($0)/*" }.map(SQLiteData.text) ?? .null,
                         spaceType.map { "at://*/space/\($0)/*" }.map(SQLiteData.text) ?? .null,
@@ -2995,6 +2998,12 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                     guard space.rawValue == raw else {
                         throw SQLiteRepositoryError.corruptDatabase(
                             "noncanonical hosted-space identity"
+                        )
+                    }
+                    guard try requiredInteger(row, "is_local_authority") == 0
+                        || space.authority == accountDID else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "invalid hosted-space authority ownership"
                         )
                     }
                     return space

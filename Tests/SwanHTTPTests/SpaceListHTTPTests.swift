@@ -10,7 +10,7 @@ import XCTest
 @testable import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
-import SwanSQLite
+@_spi(PortableRestore) import SwanSQLite
 import SwanSpaces
 import SwanStorage
 
@@ -21,7 +21,7 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
     private static let path = "/xrpc/com.atproto.space.listSpaces"
 
     func testOwnerAppearsBeforeWriteAndMemberAppearsOnlyAfterLocalRepositoryState() async throws {
-        let fixture = try await makeFixture()
+        let fixture = try await makeFixture(includeRemoteRepository: false)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         do {
             let app = try makeServer(fixture).buildApplication(logger: Logger(label: "SpaceListHTTPTests.success"))
@@ -32,13 +32,28 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
                     let body = try self.json(response.body)
                     XCTAssertEqual(Set(body.keys), ["cursor", "spaces"])
                     let spaces = try XCTUnwrap(body["spaces"] as? [[String: Any]])
-                    XCTAssertEqual(spaces.map { $0["uri"] as? String }, [fixture.owner.rawValue, fixture.remote.rawValue])
-                    XCTAssertEqual(spaces.map { $0["isOwner"] as? Bool }, [true, false])
+                    XCTAssertEqual(spaces.map { $0["uri"] as? String }, [fixture.owner.rawValue])
+                    XCTAssertEqual(spaces.map { $0["isOwner"] as? Bool }, [true])
                     XCTAssertTrue(spaces.allSatisfy { Set($0.keys) == ["uri", "isOwner"] })
                     let rendered = String(decoding: response.body.readableBytesView, as: UTF8.self)
                     for forbidden in ["cid", "blob", "policy", "member", "value", "record"] {
                         XCTAssertFalse(rendered.localizedCaseInsensitiveContains(forbidden), forbidden)
                     }
+                }
+            }
+            // A remote space is not inferred from membership or authority
+            // facts. It becomes visible only after this local PDS commits a
+            // repository row for its account.
+            let writer = try await SQLiteAccountDatabase(dataDirectory: fixture.root, did: Self.alice)
+            let repository = try DurableSpaceRepository(database: writer, space: fixture.remote, author: Self.alice)
+            let uri = try SpaceRecordURI(space: fixture.remote, author: Self.alice, collection: "app.example.records", rkey: "late")
+            _ = try await repository.apply(.put(uri: uri, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za2y"), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+            try await writer.close()
+            let afterWrite = try signedHeaders(fixture.token, path: Self.path, runtime: fixture.runtime, jti: "remote-after-local-write")
+            try await app.test(.router) { client in
+                try await client.execute(uri: Self.path, method: .get, headers: afterWrite) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(((try self.json(response.body))["spaces"] as? [[String: Any]])?.map { $0["uri"] as? String }, [fixture.owner.rawValue, fixture.remote.rawValue])
                 }
             }
             try await close(fixture)
@@ -94,12 +109,76 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(uri: Self.path, method: .post, headers: wrongMethod) { response in
                     XCTAssertEqual(response.status, .notFound)
                 }
+                // Missing proof challenges, a valid proof cannot replay, and
+                // a proof for another fixed XRPC target never authorizes list.
+                var noProof = HTTPFields(); noProof[.authorization] = "DPoP \(fixture.token.access)"
+                try await client.execute(uri: Self.path, method: .get, headers: noProof) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertNotNil(response.headers[HTTPField.Name("DPoP-Nonce")!])
+                }
+                let replay = try signedHeaders(fixture.token, path: Self.path, runtime: fixture.runtime, jti: "list-replay")
+                try await client.execute(uri: Self.path, method: .get, headers: replay) { XCTAssertEqual($0.status, .ok) }
+                try await client.execute(uri: Self.path, method: .get, headers: replay) { XCTAssertEqual($0.status, .unauthorized) }
+                let wrongTarget = try signedHeaders(fixture.token, path: "/xrpc/com.atproto.space.getRecord", runtime: fixture.runtime, jti: "list-wrong-target")
+                try await client.execute(uri: Self.path, method: .get, headers: wrongTarget) { XCTAssertEqual($0.status, .unauthorized) }
             }
             try await close(fixture)
         } catch { try? await close(fixture); throw error }
     }
 
-    private func makeFixture() async throws -> Fixture {
+    func testStorageProjectionDeduplicatesAndExcludesDeletedTombstonedAndRestoredClosureSpaces() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let duplicate = fixture.owner
+        let deleted = try SpaceURI(authority: Self.alice, spaceType: "app.example.space", skey: "deleted")
+        let tombstoned = fixture.remote
+        do {
+            let database = try await SQLiteAccountDatabase(dataDirectory: fixture.root, did: Self.alice)
+            let ownerRepository = try DurableSpaceRepository(database: database, space: duplicate, author: Self.alice)
+            let ownerRecord = try SpaceRecordURI(space: duplicate, author: Self.alice, collection: "app.example.records", rkey: "duplicate")
+            _ = try await ownerRepository.apply(.put(uri: ownerRecord, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za2z"), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+            _ = try await database.createSimpleSpace(space: deleted, owner: Self.alice, configuration: .init(policy: .public, appAccess: .open), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+            _ = try await database.deleteSimpleSpace(space: deleted, authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+            try await database.receiveSpaceDeletionNotification(space: tombstoned, issuer: Self.bob, audience: Self.alice, eventID: "tombstone-list")
+            let page = try await database.hostedSpaceURIs(spaceType: nil, authority: nil, cursor: nil, limit: 100)
+            XCTAssertEqual(page, [duplicate])
+            try await database.close()
+
+            let source = try await SQLiteAccountDatabase(dataDirectory: fixture.root.appending(path: "closure-source"), did: Self.alice)
+            let closureRepository = try DurableSpaceRepository(database: source, space: fixture.remote, author: Self.alice)
+            let closureRecord = try SpaceRecordURI(space: fixture.remote, author: Self.alice, collection: "app.example.records", rkey: "closure")
+            _ = try await closureRepository.apply(.put(uri: closureRecord, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za3a"), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+            let key = P256.Signing.PrivateKey()
+            let car = try await closureRepository.exportCAR(rev: "3k2l5u2q6za3b", signingKey: key, authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+            let recovery = try SpaceCARCodec.verifyRecovery(car.data, space: fixture.remote, author: Self.alice, publicKey: key.publicKey)
+            try await source.close()
+            let restored = try await SQLiteAccountDatabase(dataDirectory: fixture.root.appending(path: "closure-restored"), did: Self.alice)
+            try await restored.restorePortableRepositories([.init(space: fixture.remote, author: Self.alice, recovery: recovery)])
+            let restoredPage = try await restored.hostedSpaceURIs(spaceType: nil, authority: nil, cursor: nil, limit: 100)
+            XCTAssertTrue(restoredPage.isEmpty)
+            try await restored.close()
+            try await close(fixture)
+        } catch { try? await close(fixture); throw error }
+    }
+
+    func testAbsentCapabilityReturnsProfileClosedResponse() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let profile = try ProtocolProfile.load(from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json"))
+            let server = SwanHTTPServer(profile: profile, configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: Self.publicURL), oauthRuntime: fixture.runtime)
+            let app = server.buildApplication(logger: Logger(label: "SpaceListHTTPTests.closed"))
+            try await app.test(.router) { client in
+                try await client.execute(uri: Self.path, method: .get) { response in
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    XCTAssertEqual(try self.json(response.body)["error"] as? String, "permissioned_data_pending")
+                }
+            }
+            try await close(fixture)
+        } catch { try? await close(fixture); throw error }
+    }
+
+    private func makeFixture(includeRemoteRepository: Bool = true) async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory.appending(path: "SpaceListHTTPTests-\(UUID().uuidString)")
         let owner = try SpaceURI(authority: Self.alice, spaceType: "app.example.space", skey: "owner")
         let remote = try SpaceURI(authority: Self.bob, spaceType: "app.example.space", skey: "remote")
@@ -108,9 +187,11 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
             _ = try await control.createAccount(try registration(did: Self.alice, handle: "alice.example.com"))
             let database = try await SQLiteAccountDatabase(dataDirectory: root, did: Self.alice)
             _ = try await database.createSimpleSpace(space: owner, owner: Self.alice, configuration: .init(policy: .public, appAccess: .open), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
-            let repository = try DurableSpaceRepository(database: database, space: remote, author: Self.alice)
-            let uri = try SpaceRecordURI(space: remote, author: Self.alice, collection: "app.example.records", rkey: "one")
-            _ = try await repository.apply(.put(uri: uri, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za2y"), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+            if includeRemoteRepository {
+                let repository = try DurableSpaceRepository(database: database, space: remote, author: Self.alice)
+                let uri = try SpaceRecordURI(space: remote, author: Self.alice, collection: "app.example.records", rkey: "one")
+                _ = try await repository.apply(.put(uri: uri, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za2y"), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+            }
             try await database.close()
             let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(dataDirectory: root, controlStore: control)
             let runtime = try SwanOAuthRuntime(controlStore: control, serverKey: Data(repeating: 0xD1, count: 32))

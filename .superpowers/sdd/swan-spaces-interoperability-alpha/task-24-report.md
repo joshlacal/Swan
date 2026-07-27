@@ -45,6 +45,32 @@ fields in success JSON.
 - `CPATH=/opt/homebrew/include LIBRARY_PATH=/opt/homebrew/lib swift test` — passed (two existing opt-in 256 MiB stress tests skipped).
 - `./Scripts/verify-profile.sh` — passed.
 - `./Scripts/verify-interop-lab.sh` — passed static cache/topology invariants.
-- `PETREL_GENERATOR_ROOT=/Users/joshlacalamito/Developer/Catbird+Petrel/Petrel-swan-generator ./Scripts/verify-wire-generation.sh` reached verified source/checksum and generated-file inventory checks, then failed its existing `generated output lacks required ServerHandler contracts` gate. The checked-in wire contract used by this task does contain `ComAtprotoSpaceListSpaces.ServerHandler`; no generated source was changed in Task 24.
+- The isolated workspace's relative cache location does not satisfy the wire
+  verifier. The same read-only verifier succeeds from the canonical Swan
+  checkout, where the pinned cache is available.
 
 Docker and Linux were not run or claimed.
+
+## Review repair
+
+- The local-authority branch of `hostedSpaceURIs` now binds
+  `permissioned_simple_space_authorities.owner_did` to the opened account.
+  Rows marked as local authority must also have a `SpaceURI.authority` equal
+  to that account DID; malformed or stale cross-account authority rows fail
+  closed instead of exposing a foreign authority-owned space.
+- The HTTP coverage now proves that a remote space is absent until this PDS
+  persists its own repository state. It also checks DPoP proof absence,
+  replay, and wrong fixed target; and checks the profile's closed response
+  when the list capability is not provisioned.
+- Independent storage-projection coverage proves de-duplication, deleted
+  authority exclusion, recipient-tombstone exclusion, and the
+  `missing-authority-policy-v1` restored-repository closure.
+
+### Repair verification
+
+- `CPATH=/opt/homebrew/include LIBRARY_PATH=/opt/homebrew/lib swift test --filter SpaceListHTTPTests` — passed (4 tests).
+- `CPATH=/opt/homebrew/include LIBRARY_PATH=/opt/homebrew/lib swift test --filter SwanSQLiteTests` — passed.
+- `CPATH=/opt/homebrew/include LIBRARY_PATH=/opt/homebrew/lib swift test` — passed (the two existing opt-in 256 MiB stress tests skipped).
+- From the canonical Swan checkout: `./Scripts/verify-profile.sh`,
+  `./Scripts/verify-interop-lab.sh`, and
+  `PETREL_GENERATOR_ROOT=/Users/joshlacalamito/Developer/Catbird+Petrel/Petrel-swan-generator ./Scripts/verify-wire-generation.sh` — passed.
