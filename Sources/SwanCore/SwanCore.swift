@@ -42,6 +42,16 @@ public struct ProtocolProfile: Codable, Sendable, Equatable {
         public let swanBehavior: String
     }
 
+    /// A narrowly identified wire/runtime accommodation which is not an XRPC
+    /// endpoint divergence. Each entry names the pinned upstream component so
+    /// a laboratory exception cannot silently become production policy.
+    public struct CompatibilityException: Codable, Sendable, Equatable {
+        public let id: String
+        public let pinnedComponent: String
+        public let referenceBehavior: String
+        public let swanBehavior: String
+    }
+
     public let id: String
     public let proposalCommit: String
     public let referenceImplementationCommit: String
@@ -59,6 +69,7 @@ public struct ProtocolProfile: Codable, Sendable, Equatable {
     public let lexiconManifest: String?
     public let lexiconManifestSHA256: String?
     public let intentionalDivergences: [IntentionalDivergence]
+    public let compatibilityExceptions: [CompatibilityException]
 
     public init(data: Data) throws {
         do {
@@ -87,6 +98,12 @@ public struct ProtocolProfile: Codable, Sendable, Equatable {
         }
         guard intentionalDivergences.allSatisfy({ endpoints.contains($0.endpoint) }) else {
             throw SwanError.invalidProfile("divergence references an endpoint outside the profile")
+        }
+        guard compatibilityExceptions.allSatisfy({
+            !$0.id.isEmpty && !$0.pinnedComponent.isEmpty
+                && !$0.referenceBehavior.isEmpty && !$0.swanBehavior.isEmpty
+        }) else {
+            throw SwanError.invalidProfile("compatibility exception is incomplete")
         }
     }
 

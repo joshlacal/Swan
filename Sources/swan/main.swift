@@ -7,6 +7,7 @@ import SwanHTTP
 import SwanInterop
 import SwanCore
 import SwanOAuth
+import SwanPublicRepository
 import SwanSQLite
 import ServiceLifecycle
 
@@ -677,7 +678,10 @@ extension SwanCommand {
     struct Account: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
             abstract: "Inspect or manage a provisioned Swan account",
-            subcommands: [InstallLocal.self, Show.self, Deactivate.self, Reactivate.self, Delete.self]
+            subcommands: [
+                InstallLocal.self, PreparePLC.self, Show.self, Deactivate.self,
+                Reactivate.self, Delete.self,
+            ]
         )
 
         /// Installs the local, durable half of a Swan account. It deliberately
@@ -779,6 +783,170 @@ extension SwanCommand {
                     )
                 } catch {
                     try? await accountDatabase.close()
+                    try? await control.close()
+                    throw AccountCommandSupport.validationError(for: error)
+                }
+            }
+        }
+
+        /// Creates the durable, remotely submitted PLC identity package but
+        /// deliberately does not install an active account registry row.
+        struct PreparePLC: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "prepare-plc",
+                abstract: "Prepare and submit a recoverable PLC identity without activating it"
+            )
+
+            @Option(name: .long, help: "Swan data directory for control and pending per-account state")
+            var dataDirectory: String
+
+            @Option(name: .long, help: "Stable idempotency identifier for this preparation")
+            var requestID: String
+
+            @Option(name: .long, help: "Canonical account handle")
+            var handle: String
+
+            @Option(name: .long, help: "HTTPS PDS origin recorded in the PLC operation")
+            var pdsOrigin: String
+
+            @Option(name: .long, help: "Valid repository-v3 revision for the empty public genesis")
+            var repositoryRevision: String
+
+            @Option(name: .long, help: "PLC directory origin")
+            var plcOrigin: String = PLCClientConfiguration.defaultProductionOrigin.absoluteString
+
+            @Flag(name: .long, help: "Select explicit literal-loopback HTTP PLC laboratory policy")
+            var plcLaboratory = false
+
+            @Option(name: .long, help: "Pinned PLC submit compatibility; only did-plc-server-0.0.1 is supported")
+            var plcReferenceCompatibility: String?
+
+            @Option(name: .long, help: "Mounted operator-secret file; never accepted as a literal argument")
+            var operatorSecretFile: String?
+
+            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64); SWAN_ACCOUNT_KEK is the alternative")
+            var accountKEKFile: String?
+
+            @Option(name: .customLong("account-kek-id"), help: "Account-KEK identifier written into encrypted envelopes")
+            var accountKEKID: String = "primary"
+
+            @Option(name: .long, help: "Protected key-envelope directory; defaults to <data-directory>/keys")
+            var accountKeyDirectory: String?
+
+            func run() async throws {
+                let preparedConfiguration: (
+                    dataURL: URL,
+                    pdsOrigin: URL,
+                    plc: PLCClientConfiguration
+                )
+                do {
+                    guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw SwanError.malformed("--data-directory must not be empty")
+                    }
+                    guard let suppliedPDSOrigin = URL(string: pdsOrigin) else {
+                        throw SwanError.malformed("--pds-origin must be an HTTPS origin")
+                    }
+                    let canonicalPDSOrigin = try PLCATProfile.canonicalPDSOrigin(
+                        suppliedPDSOrigin
+                    )
+                    guard suppliedPDSOrigin.scheme?.lowercased() == "https",
+                          let canonicalPDSURL = URL(string: canonicalPDSOrigin) else {
+                        throw SwanError.malformed("--pds-origin must be an HTTPS origin")
+                    }
+                    try PublicRepositoryGenesisCodec.validateRevision(repositoryRevision)
+                    guard let directoryOrigin = URL(string: plcOrigin) else {
+                        throw SwanError.malformed("--plc-origin must be a URL")
+                    }
+                    let responsePolicy: PLCSubmitSuccessResponsePolicy
+                    switch plcReferenceCompatibility {
+                    case nil:
+                        responsePolicy = .strict
+                    case PLCSubmitSuccessResponsePolicy.didPLCServer001.rawValue:
+                        guard plcLaboratory else {
+                            throw SwanError.malformed(
+                                "--plc-reference-compatibility requires --plc-laboratory"
+                            )
+                        }
+                        responsePolicy = .didPLCServer001
+                    case .some:
+                        throw SwanError.malformed(
+                            "--plc-reference-compatibility is unsupported"
+                        )
+                    }
+                    let plcConfiguration: PLCClientConfiguration
+                    if plcLaboratory {
+                        plcConfiguration = try .laboratory(
+                            origin: directoryOrigin,
+                            submitSuccessResponsePolicy: responsePolicy
+                        )
+                    } else {
+                        plcConfiguration = try .production(origin: directoryOrigin)
+                    }
+                    preparedConfiguration = (
+                        URL(fileURLWithPath: dataDirectory),
+                        canonicalPDSURL,
+                        plcConfiguration
+                    )
+                } catch {
+                    throw AccountCommandSupport.validationError(for: error)
+                }
+
+                // Resolve the operator capability before opening either
+                // durable storage or the key-envelope store.
+                _ = try AccountCommandSupport.authorization(
+                    secretFilePath: operatorSecretFile
+                )
+
+                let keyConfiguration: AccountKeyEncryptionConfiguration
+                do {
+                    keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                        activeKeyID: accountKEKID,
+                        secretFile: accountKEKFile.map { URL(fileURLWithPath: $0) }
+                    )
+                } catch {
+                    throw AccountCommandSupport.validationError(for: error)
+                }
+                let keyURL = accountKeyDirectory.map { URL(fileURLWithPath: $0) }
+                    ?? preparedConfiguration.dataURL.appending(path: "keys")
+
+                let control: SQLiteControlDatabase
+                do {
+                    control = try await SQLiteControlDatabase(
+                        dataDirectory: preparedConfiguration.dataURL
+                    )
+                } catch {
+                    throw ValidationError("unable to open Swan control database")
+                }
+                let opener = SQLitePLCAccountPreparationStoreOpener(
+                    dataDirectory: preparedConfiguration.dataURL
+                )
+                do {
+                    let keyStore = try FileAccountKeyStore(
+                        root: keyURL,
+                        configuration: keyConfiguration
+                    )
+                    let plcClient = try PLCDirectoryClient(
+                        configuration: preparedConfiguration.plc
+                    )
+                    let service = PLCAccountPreparationService(
+                        intentStore: control,
+                        accountStoreOpener: opener,
+                        keyStore: keyStore,
+                        plcClient: plcClient
+                    )
+                    let prepared = try await service.prepare(
+                        requestID: requestID,
+                        handle: handle,
+                        pdsOrigin: preparedConfiguration.pdsOrigin,
+                        repositoryRevision: repositoryRevision
+                    )
+                    try await opener.close()
+                    try await control.close()
+                    try AccountCommandSupport.write(
+                        PreparedPLCAccountIdentityView(identity: prepared)
+                    )
+                } catch {
+                    try? await opener.close()
                     try? await control.close()
                     throw AccountCommandSupport.validationError(for: error)
                 }
@@ -995,6 +1163,26 @@ private struct LocalAccountInstallationView: Encodable {
         publicGenesisCommitCID = installation.publicGenesis.genesis.commitCID.string
         publicGenesisRevision = installation.publicGenesis.genesis.revision
         recovered = installation.registrationWasRecovered
+    }
+}
+
+private struct PreparedPLCAccountIdentityView: Encodable {
+    let requestID: String
+    let did: String
+    let canonicalHandle: String
+    let pdsOrigin: String
+    let repositoryRevision: String
+    let plcOperationCID: String
+    let publicGenesisCommitCID: String
+
+    init(identity: PreparedPLCAccountIdentity) {
+        requestID = identity.requestID
+        did = identity.did
+        canonicalHandle = identity.canonicalHandle
+        pdsOrigin = identity.pdsOrigin
+        repositoryRevision = identity.repositoryRevision
+        plcOperationCID = identity.plcOperationCID
+        publicGenesisCommitCID = identity.publicGenesisCommitCID
     }
 }
 

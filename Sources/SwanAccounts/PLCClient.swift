@@ -62,6 +62,16 @@ public protocol PLCHTTPTransport: Sendable {
     func execute(_ request: PLCHTTPRequest) async throws -> PLCHTTPResponse
 }
 
+/// Validation applied only to a successful `POST /:did` response.
+///
+/// The compatibility case is deliberately named after the one pinned package
+/// whose Express handler uses `sendStatus(200)`. It is not a general
+/// `text/plain` allowance and cannot be selected for a production origin.
+public enum PLCSubmitSuccessResponsePolicy: String, Sendable, Equatable {
+    case strict
+    case didPLCServer001 = "did-plc-server-0.0.1"
+}
+
 public final class AsyncHTTPClientPLCTransport: PLCHTTPTransport, @unchecked Sendable {
     private let client: HTTPClient
     private let maximumTimeout: TimeInterval
@@ -127,7 +137,9 @@ public final class AsyncHTTPClientPLCTransport: PLCHTTPTransport, @unchecked Sen
             headers: headers,
             body: Data(buffer: body),
             finalURL: response.url,
-            redirectCount: response.history.count
+            // AHC history contains the initial request plus each redirected
+            // request; it is not itself a redirect count.
+            redirectCount: max(0, response.history.count - 1)
         )
     }
 }
@@ -140,10 +152,12 @@ public struct PLCClientConfiguration: Sendable, Equatable {
     public let maximumStateBytes: Int
     public let maximumAuditBytes: Int
     public let maximumSubmitResponseBytes: Int
+    public let submitSuccessResponsePolicy: PLCSubmitSuccessResponsePolicy
 
     private init(
         origin: URL,
         laboratory: Bool,
+        submitSuccessResponsePolicy: PLCSubmitSuccessResponsePolicy,
         timeout: TimeInterval,
         maximumStateBytes: Int,
         maximumAuditBytes: Int,
@@ -155,11 +169,17 @@ public struct PLCClientConfiguration: Sendable, Equatable {
               (1 ... 1_048_576).contains(maximumSubmitResponseBytes) else {
             throw SwanError.malformed("PLC client bounds are invalid")
         }
+        guard laboratory || submitSuccessResponsePolicy == .strict else {
+            throw SwanError.malformed(
+                "PLC reference submit compatibility requires a laboratory origin"
+            )
+        }
         self.origin = try Self.validateOrigin(origin, laboratory: laboratory)
         self.timeout = timeout
         self.maximumStateBytes = maximumStateBytes
         self.maximumAuditBytes = maximumAuditBytes
         self.maximumSubmitResponseBytes = maximumSubmitResponseBytes
+        self.submitSuccessResponsePolicy = submitSuccessResponsePolicy
     }
 
     public static func production(
@@ -172,6 +192,7 @@ public struct PLCClientConfiguration: Sendable, Equatable {
         try .init(
             origin: origin,
             laboratory: false,
+            submitSuccessResponsePolicy: .strict,
             timeout: timeout,
             maximumStateBytes: maximumStateBytes,
             maximumAuditBytes: maximumAuditBytes,
@@ -181,6 +202,7 @@ public struct PLCClientConfiguration: Sendable, Equatable {
 
     public static func laboratory(
         origin: URL,
+        submitSuccessResponsePolicy: PLCSubmitSuccessResponsePolicy = .strict,
         timeout: TimeInterval = 5,
         maximumStateBytes: Int = 256 * 1_024,
         maximumAuditBytes: Int = 512 * 1_024,
@@ -189,6 +211,7 @@ public struct PLCClientConfiguration: Sendable, Equatable {
         try .init(
             origin: origin,
             laboratory: true,
+            submitSuccessResponsePolicy: submitSuccessResponsePolicy,
             timeout: timeout,
             maximumStateBytes: maximumStateBytes,
             maximumAuditBytes: maximumAuditBytes,
@@ -298,7 +321,7 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
             maximumResponseBytes: configuration.maximumSubmitResponseBytes
         )
         let response = try await transport.execute(request)
-        try validateResponse(response, for: request, permitsEmptyBody: true)
+        try validateSubmitResponse(response, for: request)
     }
 
     public func fetchState(did: String) async throws -> PLCDocumentData {
@@ -396,6 +419,41 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
               .lowercased() == "application/json" else {
             throw SwanError.malformed("PLC directory response is not JSON")
         }
+        try StrictJSON.validate(response.body)
+    }
+
+    private func validateSubmitResponse(
+        _ response: PLCHTTPResponse,
+        for request: PLCHTTPRequest
+    ) throws {
+        guard response.redirectCount == 0,
+              response.finalURL == request.url else {
+            throw SwanError.unauthorized("PLC directory redirects are forbidden")
+        }
+        guard response.body.count <= request.maximumResponseBytes else {
+            throw SwanError.unavailable("PLC directory response exceeded its bound")
+        }
+
+        if configuration.submitSuccessResponsePolicy == .didPLCServer001,
+           response.status == 200,
+           response.headers["content-type"] == "text/plain; charset=utf-8",
+           response.body == Data([0x4f, 0x4b]) {
+            return
+        }
+
+        guard (200 ... 299).contains(response.status) else {
+            throw SwanError.unavailable("PLC directory returned a non-success status")
+        }
+        if response.body.isEmpty {
+            return
+        }
+        guard let contentType = response.headers["content-type"],
+              contentType.split(separator: ";", maxSplits: 1).first?
+              .trimmingCharacters(in: .whitespacesAndNewlines)
+              .lowercased() == "application/json" else {
+            throw SwanError.malformed("PLC directory response is not JSON")
+        }
+        try StrictJSON.validate(response.body)
     }
 
     private func decodeState(_ data: Data, expectedDID: String) throws -> PLCDocumentData {

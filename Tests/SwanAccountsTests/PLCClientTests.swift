@@ -41,6 +41,77 @@ final class PLCClientTests: XCTestCase {
         XCTAssertEqual(request.maximumResponseBytes, 64 * 1_024)
     }
 
+    func testPinnedReferenceSubmitResponseRequiresExplicitLaboratoryCompatibility() async throws {
+        let fixture = try operationFixture()
+        let response = PLCHTTPResponse(
+            status: 200,
+            headers: ["content-type": "text/plain; charset=utf-8"],
+            body: Data([0x4f, 0x4b]),
+            finalURL: nil,
+            redirectCount: 0
+        )
+
+        for configuration in [
+            try PLCClientConfiguration.production(
+                origin: URL(string: "https://plc.example.com")!
+            ),
+            try PLCClientConfiguration.laboratory(
+                origin: URL(string: "http://127.0.0.1:2582")!
+            ),
+        ] {
+            let client = try PLCDirectoryClient(
+                configuration: configuration,
+                transport: RecordingPLCTransport(responses: [response])
+            )
+            await XCTAssertThrowsErrorAsync(
+                try await client.submit(did: fixture.did, operation: fixture.operation)
+            )
+        }
+
+        let compatible = try PLCDirectoryClient(
+            configuration: .laboratory(
+                origin: URL(string: "http://127.0.0.1:2582")!,
+                submitSuccessResponsePolicy: .didPLCServer001
+            ),
+            transport: RecordingPLCTransport(responses: [response])
+        )
+        try await compatible.submit(did: fixture.did, operation: fixture.operation)
+    }
+
+    func testPinnedReferenceSubmitResponseRejectsEveryNonExactShape() async throws {
+        let fixture = try operationFixture()
+        let requested = URL(string: "http://127.0.0.1:2582/\(fixture.did)")!
+        let cases: [PLCHTTPResponse] = [
+            .init(status: 201, headers: ["content-type": "text/plain; charset=utf-8"], body: Data("OK".utf8), finalURL: nil, redirectCount: 0),
+            .init(status: 200, headers: ["content-type": "text/plain; charset=utf-8"], body: Data("ok".utf8), finalURL: nil, redirectCount: 0),
+            .init(status: 200, headers: ["content-type": "text/plain; charset=utf-8"], body: Data("OK\n".utf8), finalURL: nil, redirectCount: 0),
+            .init(status: 200, headers: ["content-type": "text/plain"], body: Data("OK".utf8), finalURL: nil, redirectCount: 0),
+            .init(status: 200, headers: ["content-type": "text/plain; charset=UTF-8"], body: Data("OK".utf8), finalURL: nil, redirectCount: 0),
+            .init(status: 200, headers: ["content-type": "text/plain; charset=utf-8; version=1"], body: Data("OK".utf8), finalURL: nil, redirectCount: 0),
+            .init(status: 200, headers: ["content-type": "application/json"], body: Data("OK".utf8), finalURL: nil, redirectCount: 0),
+            .init(status: 200, headers: ["content-type": "text/plain; charset=utf-8"], body: Data("OK".utf8), finalURL: nil, redirectCount: 1),
+            .init(status: 200, headers: ["content-type": "text/plain; charset=utf-8"], body: Data("OK".utf8), finalURL: URL(string: "http://127.0.0.1:2582/elsewhere"), redirectCount: 0),
+            .init(status: 200, headers: ["content-type": "text/plain; charset=utf-8"], body: Data(repeating: 0x4f, count: 65), finalURL: nil, redirectCount: 0),
+        ]
+
+        for response in cases {
+            let configuration = try PLCClientConfiguration.laboratory(
+                origin: URL(string: "http://127.0.0.1:2582")!,
+                submitSuccessResponsePolicy: .didPLCServer001,
+                maximumSubmitResponseBytes: 64
+            )
+            let transport = RecordingPLCTransport(responses: [response])
+            let client = try PLCDirectoryClient(
+                configuration: configuration,
+                transport: transport
+            )
+            await XCTAssertThrowsErrorAsync(
+                try await client.submit(did: fixture.did, operation: fixture.operation)
+            )
+        }
+        XCTAssertEqual(requested.path, "/\(fixture.did)")
+    }
+
     func testFetchAuditUsesExactRouteAndVerifiesOperationCIDSignatureAndDID() async throws {
         let fixture = try operationFixture()
         let audit = try auditJSON(did: fixture.did, operation: fixture.operation)

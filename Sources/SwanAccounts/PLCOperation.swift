@@ -197,7 +197,10 @@ public enum PLCATProfile {
         )
     }
 
-    private static func canonicalPDSOrigin(_ url: URL) throws -> String {
+    /// Validates and canonicalizes the PDS service origin carried by a PLC
+    /// operation. Exposed so operator surfaces can reject malformed input
+    /// before opening durable storage or creating key envelopes.
+    public static func canonicalPDSOrigin(_ url: URL) throws -> String {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let scheme = components.scheme?.lowercased(),
               let host = components.host,

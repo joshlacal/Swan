@@ -1,4 +1,5 @@
 .build/
+.build-*/
 .swiftpm/
 .interop-cache/
 .swan-data/

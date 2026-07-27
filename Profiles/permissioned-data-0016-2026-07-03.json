@@ -30,6 +30,14 @@
       "swanBehavior": "Emits and accepts only direct writer-to-authority notifications with iss equal to repo and an exact configured authority service identity as aud. It intentionally does not emit or accept authority-signed cross-host write fanout; registrations remain discovery state and notifySpaceDeleted remains the separate authority-signed tombstone control plane."
     }
   ],
+  "compatibilityExceptions": [
+    {
+      "id": "did-plc-server-0.0.1-submit-status",
+      "pinnedComponent": "@did-plc/server@0.0.1 from reference implementation 3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
+      "referenceBehavior": "POST /:did ends in Express res.sendStatus(200), producing status 200, Content-Type text/plain; charset=utf-8, and the two ASCII bytes OK.",
+      "swanBehavior": "Only explicit laboratory policy did-plc-server-0.0.1 accepts that exact no-redirect response at the requested URL; production and all PLC JSON reads retain strict validation."
+    }
+  ],
   "endpoints": [
     "com.atproto.space.applyWrites",
     "com.atproto.space.createRecord",

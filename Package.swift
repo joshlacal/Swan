@@ -155,7 +155,8 @@ let package = Package(
         .executableTarget(
             name: "swan",
             dependencies: [
-                "SwanAccounts", "SwanHTTP", "SwanInterop", "SwanOAuth", "SwanSQLite",
+                "SwanAccounts", "SwanHTTP", "SwanInterop", "SwanOAuth",
+                "SwanPublicRepository", "SwanSQLite",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Logging", package: "swift-log"),
@@ -209,6 +210,9 @@ let package = Package(
             name: "SwanCLITests",
             dependencies: [
                 "SwanAccounts", "SwanSQLite", "SwanStorage",
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
             ]
         ),
         .testTarget(
