@@ -181,6 +181,98 @@ public protocol OAuthHostnameResolving: Sendable {
     func resolve(host: String) async throws -> [OAuthIPAddress]
 }
 
+/// Races DNS resolution against the same deadline used by the transport.
+/// `getaddrinfo` does not expose a cancellation handle on every supported
+/// platform, so this intentionally does not await a cancelled resolver task:
+/// an unresponsive resolver cannot hold the caller past policy.timeout before
+/// any network connection is attempted. The completion box is lock-protected
+/// because it bridges that detached resolver work back to structured async
+/// code exactly once.
+private final class OAuthDNSResolutionDeadline: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<[OAuthIPAddress], Error>?
+    private var result: Result<[OAuthIPAddress], Error>?
+
+    func install(_ continuation: CheckedContinuation<[OAuthIPAddress], Error>) {
+        lock.lock()
+        if let result {
+            lock.unlock()
+            resume(continuation, with: result)
+        } else {
+            self.continuation = continuation
+            lock.unlock()
+        }
+    }
+
+    func complete(_ result: Result<[OAuthIPAddress], Error>) {
+        lock.lock()
+        guard self.result == nil else {
+            lock.unlock()
+            return
+        }
+        self.result = result
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        if let continuation {
+            resume(continuation, with: result)
+        }
+    }
+
+    private func resume(
+        _ continuation: CheckedContinuation<[OAuthIPAddress], Error>,
+        with result: Result<[OAuthIPAddress], Error>
+    ) {
+        switch result {
+        case let .success(addresses):
+            continuation.resume(returning: addresses)
+        case let .failure(error):
+            continuation.resume(throwing: error)
+        }
+    }
+}
+
+private func resolveOAuthHostname(
+    _ resolver: any OAuthHostnameResolving,
+    host: String,
+    timeout: TimeInterval
+) async throws -> [OAuthIPAddress] {
+    let completion = OAuthDNSResolutionDeadline()
+    let resolutionTask = Task { @Sendable in
+        do {
+            completion.complete(.success(try await resolver.resolve(host: host)))
+        } catch {
+            completion.complete(.failure(error))
+        }
+    }
+    let timeoutNanoseconds = UInt64((timeout * 1_000_000_000).rounded(.up))
+    let timeoutTask = Task { @Sendable in
+        do {
+            try await Task.sleep(nanoseconds: timeoutNanoseconds)
+        } catch {
+            return
+        }
+        resolutionTask.cancel()
+        completion.complete(.failure(SwanError.unavailable("OAuth DNS resolution timed out")))
+    }
+    defer {
+        resolutionTask.cancel()
+        timeoutTask.cancel()
+    }
+    return try await withTaskCancellationHandler(
+        operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                completion.install(continuation)
+            }
+        },
+        onCancel: {
+            resolutionTask.cancel()
+            timeoutTask.cancel()
+            completion.complete(.failure(CancellationError()))
+        }
+    )
+}
+
 /// System DNS is kept behind this protocol so tests can simulate private A/AAAA
 /// answers and a future hardened connector can share the exact resolution path.
 public struct SystemOAuthHostnameResolver: OAuthHostnameResolving {
@@ -325,7 +417,9 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
 
     public func fetchJSON(from url: URL) async throws -> Data {
         let host = try policy.validateURL(url)
-        let preflightPeers = Set(try await resolver.resolve(host: host))
+        let preflightPeers = Set(try await resolveOAuthHostname(
+            resolver, host: host, timeout: policy.timeout
+        ))
         try policy.validateResolved(Array(preflightPeers), host: host)
         let response: OAuthRemoteHTTPResponse
         do {
@@ -343,7 +437,9 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         // Resolve again after the request, then require the observed socket
         // peer to be in *both* answer sets. A transport without a peer proof
         // is not a valid remote-document transport.
-        let postflightPeers = Set(try await resolver.resolve(host: host))
+        let postflightPeers = Set(try await resolveOAuthHostname(
+            resolver, host: host, timeout: policy.timeout
+        ))
         try policy.validateResolved(Array(postflightPeers), host: host)
         guard response.redirectCount == 0,
               response.responseURL.absoluteString == url.absoluteString,
@@ -481,7 +577,9 @@ public struct OAuthBoundedJSONPoster: Sendable {
             throw SwanError.malformed("outbound JSON body is out of bounds")
         }
         let host = try policy.validateURL(url)
-        let initialAddresses = try await resolver.resolve(host: host)
+        let initialAddresses = try await resolveOAuthHostname(
+            resolver, host: host, timeout: policy.timeout
+        )
         try policy.validateResolved(initialAddresses, host: host)
         let response: OAuthRemoteHTTPResponse
         do {
@@ -500,7 +598,9 @@ public struct OAuthBoundedJSONPoster: Sendable {
         // Re-resolve after the request and require the transport to prove the
         // actual peer belongs to *both* approved answer sets. A nil peer is
         // never a permissive fallback for service-to-service delivery.
-        let finalAddresses = try await resolver.resolve(host: host)
+        let finalAddresses = try await resolveOAuthHostname(
+            resolver, host: host, timeout: policy.timeout
+        )
         try policy.validateResolved(finalAddresses, host: host)
         guard response.redirectCount == 0,
               response.responseURL.absoluteString == url.absoluteString,

@@ -56,6 +56,7 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
               XCTAssertEqual(object["client_id_metadata_document_supported"] as? Bool, true)
               XCTAssertEqual(
                 object["token_endpoint_auth_signing_alg_values_supported"] as? [String], ["ES256"])
+              XCTAssertEqual(object["scopes_supported"] as? [String], ["atproto"])
             }
           }
         }
@@ -231,7 +232,84 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     }
   }
 
-  func testConfidentialPAREnforcesTokenEndpointAudienceAndAssertionReplay() async throws {
+  func testOAuthBrowserCORSIsNarrowAndNeverCredentialed() async throws {
+    let fixture = try await makeFixture(metadata: try publicMetadata())
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let origin = HTTPField.Name("Origin")!
+    let allowOrigin = HTTPField.Name("Access-Control-Allow-Origin")!
+    let allowMethods = HTTPField.Name("Access-Control-Allow-Methods")!
+    let allowHeaders = HTTPField.Name("Access-Control-Allow-Headers")!
+    let exposeHeaders = HTTPField.Name("Access-Control-Expose-Headers")!
+    let allowCredentials = HTTPField.Name("Access-Control-Allow-Credentials")!
+    var mutableBrowserHeaders: HTTPFields = [:]
+    mutableBrowserHeaders[origin] = "https://browser.example"
+    let browserHeaders = mutableBrowserHeaders
+    do {
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.cors"))
+      try await app.test(.router) { client in
+        for path in [
+          "/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server",
+        ] {
+          try await client.execute(uri: path, method: .get, headers: browserHeaders) { response in
+            XCTAssertEqual(response.status, .ok)
+            XCTAssertEqual(response.headers[allowOrigin], "*")
+            XCTAssertEqual(response.headers[allowMethods], "GET, OPTIONS")
+            XCTAssertEqual(response.headers[allowHeaders], "Content-Type, DPoP")
+            XCTAssertNil(response.headers[allowCredentials])
+          }
+          try await client.execute(uri: path, method: .options, headers: browserHeaders) { response in
+            XCTAssertEqual(response.status, .noContent)
+            XCTAssertEqual(response.headers[allowOrigin], "*")
+            XCTAssertEqual(response.headers[allowMethods], "GET, OPTIONS")
+            XCTAssertEqual(response.headers[allowHeaders], "Content-Type, DPoP")
+            XCTAssertNil(response.headers[allowCredentials])
+          }
+        }
+        for path in ["/oauth/par", "/oauth/token", "/oauth/revoke"] {
+          try await client.execute(uri: path, method: .options, headers: browserHeaders) { response in
+            XCTAssertEqual(response.status, .noContent)
+            XCTAssertEqual(response.headers[allowOrigin], "*")
+            XCTAssertEqual(response.headers[allowMethods], "POST, OPTIONS")
+            XCTAssertEqual(response.headers[allowHeaders], "Content-Type, DPoP")
+            XCTAssertEqual(response.headers[exposeHeaders], "DPoP-Nonce, WWW-Authenticate")
+            XCTAssertNil(response.headers[allowCredentials])
+          }
+        }
+        try await client.execute(uri: "/oauth/par", method: .post, headers: browserHeaders) { response in
+          XCTAssertEqual(response.status, .badRequest)
+          XCTAssertEqual(response.headers[allowOrigin], "*")
+          XCTAssertEqual(response.headers[exposeHeaders], "DPoP-Nonce, WWW-Authenticate")
+          XCTAssertNil(response.headers[allowCredentials])
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
+  func testOAuthMetadataRequiresOriginIssuerAndAtprotoScope() throws {
+    for value in [
+      "https://swan.example/oauth",
+      "https://swan.example/?query=1",
+      "https://swan.example/#fragment",
+      "https://operator@swan.example",
+    ] {
+      XCTAssertThrowsError(try OAuthAuthorizationServerMetadata(issuer: try XCTUnwrap(URL(string: value))))
+    }
+    let metadata = try OAuthAuthorizationServerMetadata(
+      issuer: issuer, scopesSupported: ["atproto", "space:did:plc:alice"])
+    XCTAssertEqual(metadata.scopesSupported, ["atproto", "space:did:plc:alice"])
+    XCTAssertThrowsError(try OAuthAuthorizationServerMetadata(issuer: issuer, scopesSupported: ["space:read"]))
+    XCTAssertThrowsError(try OAuthProtectedResourceMetadata(
+      resource: issuer,
+      authorizationServer: URL(string: "https://swan.example/oauth")!
+    ))
+  }
+
+  func testConfidentialPAREnforcesIssuerAudienceAndAssertionReplay() async throws {
     let clientKey = P256.Signing.PrivateKey()
     let clientJWK = try jwk(clientKey, keyID: "client-key")
     let metadata = try OAuthClientMetadata(
@@ -250,7 +328,7 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     let dpopKey = P256.Signing.PrivateKey()
     let dpopJWK = try jwk(dpopKey)
     let challenge = String(repeating: "a", count: 43)
-    let audience = issuer.appending(path: "oauth/token").absoluteString
+    let audience = issuer.absoluteString
     do {
       let app = fixture.server.buildApplication(
         logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.confidential"))
@@ -266,7 +344,7 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
         let target = try OAuthDPoPProofValidator.normalizedTarget(
           self.issuer.appending(path: "oauth/par"))
         let wrongAudience = try self.clientAssertion(
-          clientKey, keyID: "client-key", audience: self.issuer.absoluteString,
+          clientKey, keyID: "client-key", audience: self.issuer.appending(path: "oauth/token").absoluteString,
           jti: "wrong-audience")
         let badProof = try self.dpop(
           dpopKey, dpopJWK, jti: "conf-bad-aud", nonce: try XCTUnwrap(nonce), target: target)

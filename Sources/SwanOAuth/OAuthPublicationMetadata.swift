@@ -16,7 +16,7 @@ public struct OAuthProtectedResourceMetadata: Codable, Sendable, Equatable {
         scopesSupported: [String] = ["atproto"]
     ) throws {
         self.resource = try OAuthPublishedURL.validate(resource, role: "resource")
-        authorizationServers = [try OAuthPublishedURL.validate(authorizationServer, role: "issuer")]
+        authorizationServers = [try OAuthPublishedURL.validateIssuer(authorizationServer)]
         bearerMethodsSupported = ["header"]
         self.scopesSupported = try OAuthPublishedURL.validateScopes(scopesSupported)
     }
@@ -45,12 +45,13 @@ public struct OAuthAuthorizationServerMetadata: Codable, Sendable, Equatable {
     public let tokenEndpointAuthMethodsSupported: [String]
     public let tokenEndpointAuthSigningAlgValuesSupported: [String]
     public let dpopSigningAlgValuesSupported: [String]
+    public let scopesSupported: [String]
     public let authorizationResponseIssuerParameterSupported: Bool
     public let requirePushedAuthorizationRequests: Bool
     public let clientIDMetadataDocumentSupported: Bool
 
-    public init(issuer: URL) throws {
-        self.issuer = try OAuthPublishedURL.validate(issuer, role: "issuer")
+    public init(issuer: URL, scopesSupported: [String] = ["atproto"]) throws {
+        self.issuer = try OAuthPublishedURL.validateIssuer(issuer)
         authorizationEndpoint = try OAuthPublishedURL.endpoint(issuer: self.issuer, path: "oauth/authorize")
         tokenEndpoint = try OAuthPublishedURL.endpoint(issuer: self.issuer, path: "oauth/token")
         pushedAuthorizationRequestEndpoint = try OAuthPublishedURL.endpoint(issuer: self.issuer, path: "oauth/par")
@@ -61,6 +62,7 @@ public struct OAuthAuthorizationServerMetadata: Codable, Sendable, Equatable {
         tokenEndpointAuthMethodsSupported = ["none", "private_key_jwt"]
         tokenEndpointAuthSigningAlgValuesSupported = ["ES256"]
         dpopSigningAlgValuesSupported = ["ES256"]
+        self.scopesSupported = try OAuthPublishedURL.validateScopes(scopesSupported)
         authorizationResponseIssuerParameterSupported = true
         requirePushedAuthorizationRequests = true
         clientIDMetadataDocumentSupported = true
@@ -78,6 +80,7 @@ public struct OAuthAuthorizationServerMetadata: Codable, Sendable, Equatable {
         case tokenEndpointAuthMethodsSupported = "token_endpoint_auth_methods_supported"
         case tokenEndpointAuthSigningAlgValuesSupported = "token_endpoint_auth_signing_alg_values_supported"
         case dpopSigningAlgValuesSupported = "dpop_signing_alg_values_supported"
+        case scopesSupported = "scopes_supported"
         case authorizationResponseIssuerParameterSupported = "authorization_response_iss_parameter_supported"
         case requirePushedAuthorizationRequests = "require_pushed_authorization_requests"
         case clientIDMetadataDocumentSupported = "client_id_metadata_document_supported"
@@ -92,7 +95,10 @@ public struct OAuthMetadataPublication: Sendable, Equatable {
     public let authorizationServer: OAuthAuthorizationServerMetadata
 
     public init(resource: URL, issuer: URL, scopesSupported: [String] = ["atproto"]) throws {
-        let authorizationServer = try OAuthAuthorizationServerMetadata(issuer: issuer)
+        let authorizationServer = try OAuthAuthorizationServerMetadata(
+            issuer: issuer,
+            scopesSupported: scopesSupported
+        )
         protectedResource = try OAuthProtectedResourceMetadata(
             resource: resource,
             authorizationServer: authorizationServer.issuer,
@@ -112,6 +118,19 @@ public enum OAuthMetadataRenderer {
 }
 
 private enum OAuthPublishedURL {
+    /// The AT Protocol authorization-server issuer is an origin identifier,
+    /// not a base URL. Keeping this separate from generic endpoint/resource
+    /// validation prevents a path-bearing issuer from changing the advertised
+    /// endpoint or the confidential-client assertion audience.
+    static func validateIssuer(_ url: URL) throws -> URL {
+        let validated = try validate(url, role: "issuer")
+        guard let components = URLComponents(url: validated, resolvingAgainstBaseURL: false),
+              components.path.isEmpty || components.path == "/" else {
+            throw SwanError.malformed("OAuth issuer URL must be an origin")
+        }
+        return validated
+    }
+
     static func validate(_ url: URL, role: String) throws -> URL {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               components.scheme?.lowercased() == "https",
@@ -137,6 +156,7 @@ private enum OAuthPublishedURL {
 
     static func validateScopes(_ scopes: [String]) throws -> [String] {
         guard !scopes.isEmpty, scopes.count <= 64,
+              scopes.contains("atproto"),
               Set(scopes).count == scopes.count,
               scopes.allSatisfy({ scope in
                   !scope.isEmpty && scope.utf8.count <= 256

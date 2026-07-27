@@ -135,8 +135,14 @@ func registerOAuthAuthorizationServerEndpoints(
   router.post("/oauth/token") { request, _ async -> Response in
     await exchangeOAuthServerToken(request: request, configuration: configuration, runtime: runtime)
   }
+  router.on("/oauth/token", method: .options) { _, _ -> Response in
+    oauthAPICORSPreflightResponse()
+  }
   router.post("/oauth/revoke") { request, _ async -> Response in
     await revokeOAuthServerToken(request: request, configuration: configuration, runtime: runtime)
+  }
+  router.on("/oauth/revoke", method: .options) { _, _ -> Response in
+    oauthAPICORSPreflightResponse()
   }
 }
 
@@ -147,6 +153,9 @@ func registerOAuthAuthorizationServerPAREndpoint(
 ) {
   router.post("/oauth/par") { request, _ async -> Response in
     await handleOAuthServerPAR(request: request, configuration: configuration, runtime: runtime)
+  }
+  router.on("/oauth/par", method: .options) { _, _ -> Response in
+    oauthAPICORSPreflightResponse()
   }
 }
 
@@ -518,14 +527,18 @@ private func revokeOAuthServerToken(
         break
       }
     }
-    return Response(status: .ok, headers: [.cacheControl: "no-store"])
+    var headers: HTTPFields = [.cacheControl: "no-store"]
+    oauthAPICORSHeaders(&headers)
+    return Response(status: .ok, headers: headers)
   } catch let error as SwanError {
     if case .unavailable = error {
       return oauthServerTokenJSON(
         .serviceUnavailable, OAuthServerTokenError(error: "temporarily_unavailable"))
     }
     // RFC 7009 intentionally provides no token or family existence oracle.
-    return Response(status: .ok, headers: [.cacheControl: "no-store"])
+    var headers: HTTPFields = [.cacheControl: "no-store"]
+    oauthAPICORSHeaders(&headers)
+    return Response(status: .ok, headers: headers)
   } catch {
     return oauthServerTokenJSON(
       .serviceUnavailable, OAuthServerTokenError(error: "temporarily_unavailable"))
@@ -556,9 +569,9 @@ private func validateOAuthServerClientAssertion(
       value,
       assertionType: type,
       client: client,
-      // AT Protocol's confidential assertion audience is the token
-      // endpoint, not an issuer alias or the PAR endpoint.
-      authorizationServerIssuer: configuration.issuer.appending(path: "oauth/token").absoluteString
+      // AT Protocol binds confidential client assertions to the stable
+      // authorization-server issuer, not a particular endpoint.
+      authorizationServerIssuer: configuration.issuer.absoluteString
     )
   }
 }
@@ -963,6 +976,7 @@ private func oauthServerJSON<Body: Encodable>(
   var responseHeaders = headers ?? [.contentType: "application/json", .cacheControl: "no-store"]
   if responseHeaders[.contentType] == nil { responseHeaders[.contentType] = "application/json" }
   if responseHeaders[.cacheControl] == nil { responseHeaders[.cacheControl] = "no-store" }
+  oauthAPICORSHeaders(&responseHeaders)
   return Response(
     status: status, headers: responseHeaders, body: .init(byteBuffer: ByteBuffer(data: data)))
 }

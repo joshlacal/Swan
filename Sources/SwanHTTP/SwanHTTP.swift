@@ -1,5 +1,6 @@
 import Foundation
 import Hummingbird
+import HTTPTypes
 import Logging
 import ServiceLifecycle
 import SwanAccounts
@@ -97,7 +98,10 @@ public struct SwanOAuthAuthorizationServerConfiguration: Sendable {
         clientMetadataLoader: OAuthClientMetadataLoader,
         scopesSupported: [String] = ["atproto"]
     ) throws {
-        let metadata = try OAuthAuthorizationServerMetadata(issuer: issuer)
+        let metadata = try OAuthAuthorizationServerMetadata(
+            issuer: issuer,
+            scopesSupported: scopesSupported
+        )
         self.issuer = metadata.issuer
         publication = try OAuthMetadataPublication(
             resource: protectedResource,
@@ -462,13 +466,25 @@ public struct SwanHTTPServer: Sendable {
             guard let metadata = oauthPublicationGate.protectedResourceMetadata() else {
                 return oauthUnavailable()
             }
-            return jsonResponse(metadata)
+            return oauthMetadataJSONResponse(metadata)
+        }
+        router.on("/.well-known/oauth-protected-resource", method: .options) { _, _ -> Response in
+            guard oauthPublicationGate.protectedResourceMetadata() != nil else {
+                return oauthUnavailable()
+            }
+            return oauthMetadataCORSPreflightResponse()
         }
         router.get("/.well-known/oauth-authorization-server") { _, _ -> Response in
             guard let metadata = oauthPublicationGate.authorizationServerMetadata() else {
                 return oauthUnavailable()
             }
-            return jsonResponse(metadata)
+            return oauthMetadataJSONResponse(metadata)
+        }
+        router.on("/.well-known/oauth-authorization-server", method: .options) { _, _ -> Response in
+            guard oauthPublicationGate.authorizationServerMetadata() != nil else {
+                return oauthUnavailable()
+            }
+            return oauthMetadataCORSPreflightResponse()
         }
 
         if let authorizationServerConfiguration {
@@ -676,6 +692,44 @@ private func jsonResponse(_ body: some Encodable) -> Response {
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
     let data = (try? encoder.encode(body)) ?? Data("{}".utf8)
     return Response(status: .ok, headers: [.contentType: "application/json", .cacheControl: "no-store"], body: .init(byteBuffer: ByteBuffer(data: data)))
+}
+
+/// AT Protocol requires CORS on discovery and browser-capable PAR/token
+/// requests. These responses are never credentialed: the wildcard policy is
+/// safe because DPoP, PKCE, and the request body still authenticate the
+/// caller, and no `Access-Control-Allow-Credentials` header is emitted.
+func oauthMetadataCORSHeaders(_ headers: inout HTTPFields) {
+    headers[HTTPField.Name("Access-Control-Allow-Origin")!] = "*"
+    headers[HTTPField.Name("Access-Control-Allow-Methods")!] = "GET, OPTIONS"
+    headers[HTTPField.Name("Access-Control-Allow-Headers")!] = "Content-Type, DPoP"
+}
+
+func oauthAPICORSHeaders(_ headers: inout HTTPFields) {
+    headers[HTTPField.Name("Access-Control-Allow-Origin")!] = "*"
+    headers[HTTPField.Name("Access-Control-Allow-Methods")!] = "POST, OPTIONS"
+    headers[HTTPField.Name("Access-Control-Allow-Headers")!] = "Content-Type, DPoP"
+    headers[HTTPField.Name("Access-Control-Expose-Headers")!] = "DPoP-Nonce, WWW-Authenticate"
+}
+
+func oauthMetadataCORSPreflightResponse() -> Response {
+    var headers: HTTPFields = [.cacheControl: "no-store"]
+    oauthMetadataCORSHeaders(&headers)
+    return Response(status: .noContent, headers: headers)
+}
+
+func oauthAPICORSPreflightResponse() -> Response {
+    var headers: HTTPFields = [.cacheControl: "no-store"]
+    oauthAPICORSHeaders(&headers)
+    return Response(status: .noContent, headers: headers)
+}
+
+private func oauthMetadataJSONResponse(_ body: some Encodable) -> Response {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    let data = (try? encoder.encode(body)) ?? Data("{}".utf8)
+    var headers: HTTPFields = [.contentType: "application/json", .cacheControl: "no-store"]
+    oauthMetadataCORSHeaders(&headers)
+    return Response(status: .ok, headers: headers, body: .init(byteBuffer: ByteBuffer(data: data)))
 }
 
 private func oauthUnavailable() -> Response {

@@ -866,6 +866,46 @@ final class SwanOAuthTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(try await nilPeerFetcher.fetchJSON(from: url))
     }
 
+    func testHardenedRemoteFetcherBoundsPreAndPostDNSResolution() async throws {
+        let url = URL(string: "https://metadata.example/client.json")!
+        let publicAddress = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+        let body = Data("{}".utf8)
+        let policy = try OAuthRemoteFetchPolicy(maximumBodyBytes: 1_024, timeout: 0.05)
+        let response = OAuthRemoteHTTPResponse(
+            status: 200,
+            headers: ["content-type": ["application/json"]],
+            body: body,
+            responseURL: url,
+            connectedPeerAddress: publicAddress
+        )
+
+        let slowPreflightTransport = TestTransport(responses: [url.absoluteString: response])
+        let slowPreflight = OAuthRemoteDocumentFetcher(
+            policy: policy,
+            resolver: DelayedTestResolver(
+                address: publicAddress, delay: 0.75, delayFirstResolution: true),
+            transport: slowPreflightTransport
+        )
+        let preflightStart = Date()
+        await XCTAssertThrowsErrorAsync(try await slowPreflight.fetchJSON(from: url))
+        XCTAssertLessThan(Date().timeIntervalSince(preflightStart), 0.4)
+        let preflightRequests = await slowPreflightTransport.requestCount()
+        XCTAssertEqual(preflightRequests, 0)
+
+        let slowPostflightTransport = TestTransport(responses: [url.absoluteString: response])
+        let slowPostflight = OAuthRemoteDocumentFetcher(
+            policy: policy,
+            resolver: DelayedTestResolver(
+                address: publicAddress, delay: 0.75, delayFirstResolution: false),
+            transport: slowPostflightTransport
+        )
+        let postflightStart = Date()
+        await XCTAssertThrowsErrorAsync(try await slowPostflight.fetchJSON(from: url))
+        XCTAssertLessThan(Date().timeIntervalSince(postflightStart), 0.4)
+        let postflightRequests = await slowPostflightTransport.requestCount()
+        XCTAssertEqual(postflightRequests, 1)
+    }
+
     func testMetadataLoaderValidatesJWKSAndUsesDurableCache() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1258,6 +1298,36 @@ private actor TestResolver: OAuthHostnameResolving {
         guard !answers.isEmpty else { throw SwanError.unavailable("test DNS has no answer") }
         defer { index += 1 }
         return answers[min(index, answers.count - 1)]
+    }
+}
+
+/// Deliberately ignores task cancellation while waiting, matching the worst
+/// case for a resolver backed by a platform API without cancellation support.
+/// The fetcher must still return on its policy deadline rather than awaiting
+/// this eventual callback.
+private actor DelayedTestResolver: OAuthHostnameResolving {
+    private let address: OAuthIPAddress
+    private let delay: TimeInterval
+    private let delayFirstResolution: Bool
+    private var resolutionCount = 0
+
+    init(address: OAuthIPAddress, delay: TimeInterval, delayFirstResolution: Bool) {
+        self.address = address
+        self.delay = delay
+        self.delayFirstResolution = delayFirstResolution
+    }
+
+    func resolve(host _: String) async throws -> [OAuthIPAddress] {
+        resolutionCount += 1
+        let shouldDelay = delayFirstResolution ? resolutionCount == 1 : resolutionCount > 1
+        guard shouldDelay else { return [address] }
+        let address = address
+        let delay = delay
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                continuation.resume(returning: [address])
+            }
+        }
     }
 }
 
