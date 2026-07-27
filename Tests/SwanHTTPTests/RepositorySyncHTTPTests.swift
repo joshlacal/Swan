@@ -16,6 +16,15 @@ import SwanSQLite
 import SwanSpaces
 import SwanStorage
 
+private actor RuntimeTokenCapture {
+    private var delegation = ""
+    private var credential = ""
+
+    func setDelegation(_ value: String) { delegation = value }
+    func setCredential(_ value: String) { credential = value }
+    func tokens() -> (delegation: String, credential: String) { (delegation, credential) }
+}
+
 final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
     static let alice = "did:plc:abcdefghijklmnopqrstuvwx"
     static let bob = "did:plc:bcdefghijklmnopqrstuvwxy"
@@ -24,6 +33,8 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
     private static let oplogPath = "/xrpc/com.atproto.space.listRepoOps"
     private static let repoPath = "/xrpc/com.atproto.space.getRepo"
     private static let blobPath = "/xrpc/com.atproto.space.getBlob"
+    fileprivate static let runtimeVerifierSentinel =
+        "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuvw$TASK27VERIFIERSECRETMUSTNOTLEAKABCDEFGHIJKLMNO"
 
     func testExchangeAndSyncOnlyCredentialCompositionLeavesRecordAndBlobOAuthOnly() async throws {
         let fixture = try await Fixture.make()
@@ -41,7 +52,8 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         let fixture = try await Fixture.make()
         defer { try? await fixture.close() }
         let mountedKEK = fixture.root.appending(path: "mounted-space-kek")
-        try Data(repeating: 0x45, count: 32).base64URLEncodedString().data(using: .utf8)!
+        let mountedKEKText = Data(repeating: 0x45, count: 32).base64URLEncodedString()
+        try mountedKEKText.data(using: .utf8)!
             .write(to: mountedKEK)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: mountedKEK.path)
 
@@ -78,6 +90,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         let credentialPath = "/xrpc/com.atproto.space.getSpaceCredential"
 
         let app = server.buildApplication(logger: Logger(label: "RepositorySyncHTTPTests.localRuntime"))
+        let observedTokens = RuntimeTokenCapture()
         try await app.test(.router) { client in
             let delegationHeaders = try self.dpopHeaders(
                 token: oauth.token,
@@ -88,34 +101,68 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 path: delegationPath
             )
             let delegationURI = "\(delegationPath)?space=\(self.percentEncode(fixture.space.rawValue))"
-            var delegationToken = ""
             try await client.execute(uri: delegationURI, method: .get, headers: delegationHeaders) { response in
                 XCTAssertEqual(response.status, .ok)
-                delegationToken = try XCTUnwrap(self.jsonObject(response.body)["token"] as? String)
+                await observedTokens.setDelegation(
+                    try XCTUnwrap(self.jsonObject(response.body)["token"] as? String)
+                )
             }
+            let delegation = await observedTokens.tokens().delegation
             var exchangeHeaders = HTTPFields()
-            exchangeHeaders[.authorization] = "Bearer \(delegationToken)"
+            exchangeHeaders[.authorization] = "Bearer \(delegation)"
             exchangeHeaders[.contentType] = "application/json"
             let exchangeBody = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\"}")
-            var credential = ""
             try await client.execute(uri: credentialPath, method: .post, headers: exchangeHeaders, body: exchangeBody) { response in
                 XCTAssertEqual(response.status, .ok)
-                credential = try XCTUnwrap(self.jsonObject(response.body)["credential"] as? String)
+                await observedTokens.setCredential(
+                    try XCTUnwrap(self.jsonObject(response.body)["credential"] as? String)
+                )
             }
+            let credential = await observedTokens.tokens().credential
             try await client.execute(uri: credentialPath, method: .post, headers: exchangeHeaders, body: exchangeBody) { response in
                 XCTAssertEqual(response.status, .unauthorized)
+                self.assertRuntimeSecretsAbsent(
+                    response.body,
+                    mountedKEK: mountedKEKText,
+                    mountedPath: mountedKEK.path,
+                    delegation: delegation,
+                    credential: credential
+                )
             }
             let bearer = self.bearerHeaders(credential)
             try await client.execute(uri: self.latestURI(space: fixture.space, repo: Self.alice), method: .get, headers: bearer) { XCTAssertEqual($0.status, .ok) }
             try await client.execute(uri: self.oplogURI(space: fixture.space, repo: Self.alice), method: .get, headers: bearer) { XCTAssertEqual($0.status, .ok) }
-            try await client.execute(uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: bearer) { XCTAssertEqual($0.status, .ok) }
-            try await client.execute(uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID), method: .get, headers: bearer) { XCTAssertEqual($0.status, .unauthorized) }
+            try await client.execute(uri: self.repoURI(space: fixture.space, repo: Self.alice), method: .get, headers: bearer) { response in
+                XCTAssertEqual(response.status, .ok)
+                self.assertCARNoStore(response)
+                _ = try self.assertRecoveryCAR(
+                    Data(buffer: response.body), fixture: fixture, author: Self.alice
+                )
+            }
+            try await client.execute(uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID), method: .get, headers: bearer) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+                self.assertRuntimeSecretsAbsent(
+                    response.body,
+                    mountedKEK: mountedKEKText,
+                    mountedPath: mountedKEK.path,
+                    delegation: delegation,
+                    credential: credential
+                )
+            }
         }
+        let tokens = await observedTokens.tokens()
         let closedApp = closed.buildApplication(logger: Logger(label: "RepositorySyncHTTPTests.localRuntimeClosed"))
         try await closedApp.test(.router) { client in
             try await client.execute(uri: credentialPath, method: .post) { response in
                 XCTAssertEqual(response.status, .serviceUnavailable)
                 XCTAssertEqual(try self.errorCode(response.body), "permissioned_data_pending")
+                self.assertRuntimeSecretsAbsent(
+                    response.body,
+                    mountedKEK: mountedKEKText,
+                    mountedPath: mountedKEK.path,
+                    delegation: tokens.delegation,
+                    credential: tokens.credential
+                )
             }
         }
     }
@@ -1086,6 +1133,24 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(response.headers[.cacheControl], "no-store", file: file, line: line)
     }
 
+    private func assertRuntimeSecretsAbsent(
+        _ body: ByteBuffer,
+        mountedKEK: String,
+        mountedPath: String,
+        delegation: String,
+        credential: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let text = String(decoding: body.readableBytesView, as: UTF8.self)
+        for secret in [
+            mountedKEK, mountedPath, Self.runtimeVerifierSentinel,
+            delegation, credential,
+        ] {
+            XCTAssertFalse(text.contains(secret), file: file, line: line)
+        }
+    }
+
     private func assertCARNoStore(_ response: TestResponse, file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertEqual(response.headers[.contentType], "application/vnd.ipld.car", file: file, line: line)
         XCTAssertEqual(response.headers[.cacheControl], "no-store", file: file, line: line)
@@ -1338,7 +1403,7 @@ private struct Fixture: Sendable {
         try .init(
             did: did,
             canonicalHandle: handle,
-            passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+            passwordVerifier: RepositorySyncHTTPTests.runtimeVerifierSentinel,
             signingKey: .init(purpose: .signing, generation: keys.signingReference.generation),
             rotationKey: .init(purpose: .rotation, generation: keys.rotationReference.generation),
             createdAt: Date(timeIntervalSince1970: 1_750_000_000)
