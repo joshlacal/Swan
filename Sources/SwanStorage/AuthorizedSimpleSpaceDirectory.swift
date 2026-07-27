@@ -164,6 +164,67 @@ public protocol AuthorizedPreopenedAccountDirectory: Sendable {
     func requireActivePreopenedAccount(_ did: String) async throws
 }
 
+/// A value-free local-PDS projection for `com.atproto.space.listSpaces`.
+/// This is deliberately not a membership or repository inspection API: its
+/// only durable facts are canonical space identities and whether the selected
+/// local account owns the authority.  In particular, it cannot carry record
+/// values, CIDs, blob references, policy, members, or another account's
+/// inventory.
+public struct AuthorizedHostedSpace: Sendable, Equatable {
+    public let space: SpaceURI
+    public let isOwner: Bool
+
+    public init(space: SpaceURI, isOwner: Bool) {
+        self.space = space
+        self.isOwner = isOwner
+    }
+}
+
+/// Typed and already-validated request dimensions for a local hosted-space
+/// projection. A nil dimension means the caller requested the aggregate
+/// wildcard; cursor is a canonical `SpaceURI`, never an opaque SQL cursor.
+public struct AuthorizedHostedSpaceListQuery: Sendable, Equatable {
+    public let subject: String
+    public let spaceType: String?
+    public let authority: String?
+    public let cursor: SpaceURI?
+    public let limit: Int
+
+    public init(
+        subject: String,
+        spaceType: String?,
+        authority: String?,
+        cursor: SpaceURI?,
+        limit: Int
+    ) {
+        self.subject = subject
+        self.spaceType = spaceType
+        self.authority = authority
+        self.cursor = cursor
+        self.limit = limit
+    }
+}
+
+public struct AuthorizedHostedSpacePage: Sendable, Equatable {
+    public let spaces: [AuthorizedHostedSpace]
+    public let cursor: SpaceURI?
+
+    public init(spaces: [AuthorizedHostedSpace], cursor: SpaceURI?) {
+        self.spaces = spaces
+        self.cursor = cursor
+    }
+}
+
+/// The local hosted-space view. Implementations must select only the
+/// authenticated subject's startup-preopened active account database; this
+/// API deliberately cannot select an arbitrary account or enumerate members.
+public protocol AuthorizedHostedSpaceDirectory: Sendable {
+    func hostedSpaces(
+        _ query: AuthorizedHostedSpaceListQuery,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedHostedSpacePage
+}
+
 /// An opaque, already-verified permissioned blob body.  The storage adapter
 /// owns the underlying descriptor and never exposes a path or a `Data` value,
 /// so an HTTP route cannot accidentally buffer a private blob or retarget a

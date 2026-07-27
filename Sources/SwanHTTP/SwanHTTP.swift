@@ -213,6 +213,9 @@ public struct SwanHTTPServer: Sendable {
     /// unavailable unless the supplied startup-preopened directory also
     /// implements the deliberately narrower repository projection.
     public let authenticatedSpaceRecords: SwanAuthenticatedSpaceRecordsCapability?
+    /// Authenticated local-PDS space inventory. This remains distinct from
+    /// record access and accepts only sender-constrained account OAuth.
+    public let authenticatedSpaceList: SwanAuthenticatedSpaceListCapability?
     /// Authority-owned SimpleSpace lifecycle and membership endpoints. They
     /// remain closed unless the same startup-preopened directory explicitly
     /// exposes the narrower lifecycle projection.
@@ -330,6 +333,15 @@ public struct SwanHTTPServer: Sendable {
             } else {
                 authenticatedSpaceRecords = nil
             }
+            if let hostedSpaceDirectory = authenticatedGetSpaceDirectory
+                as? any AuthorizedHostedSpaceDirectory {
+                authenticatedSpaceList = SwanAuthenticatedSpaceListCapability(
+                    authorizer: authorizer,
+                    directory: hostedSpaceDirectory
+                )
+            } else {
+                authenticatedSpaceList = nil
+            }
             if let lifecycleDirectory = authenticatedGetSpaceDirectory
                 as? any AuthorizedSimpleSpaceLifecycleDirectory {
                 authenticatedSimpleSpaceLifecycle = SwanAuthenticatedSimpleSpaceLifecycleCapability(
@@ -423,6 +435,7 @@ public struct SwanHTTPServer: Sendable {
         } else {
             authenticatedGetSpace = nil
             authenticatedSpaceRecords = nil
+            authenticatedSpaceList = nil
             authenticatedSimpleSpaceLifecycle = nil
             authenticatedSpaceCredentialExchange = nil
             authenticatedSpaceDelegationMinting = nil
@@ -566,6 +579,9 @@ public struct SwanHTTPServer: Sendable {
             } else if descriptor.nsid == ComAtprotoSpaceListRecords.typeIdentifier,
                       let authenticatedSpaceRecords {
                 registerAuthenticatedListRecordsEndpoint(on: router, capability: authenticatedSpaceRecords)
+            } else if descriptor.nsid == ComAtprotoSpaceListSpaces.typeIdentifier,
+                      let authenticatedSpaceList {
+                registerAuthenticatedListSpacesEndpoint(on: router, capability: authenticatedSpaceList)
             } else if descriptor.nsid == ComAtprotoSpaceCreateRecord.typeIdentifier,
                       let authenticatedSpaceRecords {
                 registerAuthenticatedCreateRecordEndpoint(on: router, capability: authenticatedSpaceRecords)

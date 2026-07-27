@@ -249,6 +249,37 @@ public enum PermissionedSpaceScopeSyntax {
         }
     }
 
+    /// Returns whether a grant can enumerate the authenticated account's
+    /// *local* hosted-space identities for exactly the requested aggregate
+    /// dimensions.  Unlike a record read, this cannot safely broaden a
+    /// type/authority filter after storage has listed rows: an omitted
+    /// request dimension is therefore the literal `*` target and requires a
+    /// literal wildcard grant in that dimension.  The `skey` must always be
+    /// `*`, so a grant for one concrete space never becomes a membership or
+    /// repository inventory capability.
+    public static func permitsAggregateSpaceList(
+        _ scopes: Set<String>,
+        spaceType: String?,
+        authority: String?
+    ) -> Bool {
+        if scopes.contains("atproto") { return true }
+        let requestedType = spaceType ?? "*"
+        let requestedAuthority = authority ?? "*"
+        return scopes.contains { scope in
+            guard let grantType = strictSpaceType(scope),
+                  let parameters = strictQualifiedParameters(scope),
+                  Set(parameters.keys) == ["authority", "skey", "action"],
+                  parameters["skey"] == "*",
+                  parameters["action"] == "read",
+                  aggregateDimension(grantType, covers: requestedType),
+                  aggregateDimension(parameters["authority"], covers: requestedAuthority)
+            else {
+                return false
+            }
+            return true
+        }
+    }
+
     /// The pinned `SpacePermission.matches` compares each tuple element to
     /// its target and treats a literal `*` as an overlap.  `self` is resolved
     /// by the reference authorization server before its runtime matcher sees
@@ -256,6 +287,15 @@ public enum PermissionedSpaceScopeSyntax {
     /// so it deliberately does not synthesize that resolution here.
     private static func tupleElement(_ grant: String?, matches target: String) -> Bool {
         grant == target || grant == "*"
+    }
+
+    /// A wildcard request cannot be satisfied by a concrete grant because
+    /// the list route intentionally does not fetch a broad result and then
+    /// hide rows. For a concrete requested dimension, the pinned literal
+    /// wildcard still covers it.
+    private static func aggregateDimension(_ grant: String?, covers requested: String) -> Bool {
+        if requested == "*" { return grant == "*" }
+        return grant == requested || grant == "*"
     }
 
     /// This endpoint accepts the positional TypeScript `space:<type>` form.

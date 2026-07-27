@@ -2907,6 +2907,107 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         }
     }
 
+    /// Enumerates the small, value-free local-PDS hosted-space projection for
+    /// this account.  This intentionally reads only `space_uri` identity
+    /// columns: it never touches record values, CIDs, blob references, or
+    /// simple-space policy/member state.  Request authorization and active
+    /// account/path admission belong to `SQLitePreMigratedAccountDirectory`;
+    /// this account-local primitive cannot select another database.
+    public func hostedSpaceURIs(
+        spaceType: String?,
+        authority: String?,
+        cursor: SpaceURI?,
+        limit: Int
+    ) async throws -> [SpaceURI] {
+        guard (1 ... 100).contains(limit) else {
+            throw SwanError.malformed("invalid hosted-space page limit")
+        }
+        return try await withConnectionGate {
+            try await readTransaction {
+                // `UNION` de-duplicates exact identity rows before Swift
+                // validates their canonical `SpaceURI` spelling and applies
+                // type/authority/cursor paging.  A local authority deletion,
+                // recipient tombstone, or v1 restored-policy closure always
+                // wins over a repository-state row.
+                let rows = try await connection.query(
+                    """
+                    SELECT space_uri
+                    FROM (
+                        SELECT a.space_uri AS space_uri
+                        FROM permissioned_simple_space_authorities AS a
+                        WHERE a.is_deleted = 0
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM permissioned_space_recipient_tombstones AS t
+                              WHERE t.space_uri = a.space_uri
+                          )
+                        UNION
+                        SELECT r.space_uri AS space_uri
+                        FROM permissioned_repository_state AS r
+                        WHERE r.author_did = ?
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM permissioned_simple_space_authorities AS a
+                              WHERE a.space_uri = r.space_uri AND a.is_deleted != 0
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM permissioned_space_recipient_tombstones AS t
+                              WHERE t.space_uri = r.space_uri
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM permissioned_restored_repository_closures AS c
+                              WHERE c.space_uri = r.space_uri
+                                AND c.author_did = r.author_did
+                                AND c.reason = 'missing-authority-policy-v1'
+                          )
+                    )
+                    WHERE (? IS NULL OR space_uri GLOB ?)
+                      AND (? IS NULL OR substr(space_uri, 1, length(?)) = ?)
+                      AND (? IS NULL OR space_uri > ?)
+                    ORDER BY space_uri ASC
+                    LIMIT ?
+                    """,
+                    [
+                        .text(accountDID),
+                        spaceType.map { "at://*/space/\($0)/*" }.map(SQLiteData.text) ?? .null,
+                        spaceType.map { "at://*/space/\($0)/*" }.map(SQLiteData.text) ?? .null,
+                        authority.map { "at://\($0)/space/" }.map(SQLiteData.text) ?? .null,
+                        authority.map { "at://\($0)/space/" }.map(SQLiteData.text) ?? .null,
+                        authority.map { "at://\($0)/space/" }.map(SQLiteData.text) ?? .null,
+                        cursor.map { SQLiteData.text($0.rawValue) } ?? .null,
+                        cursor.map { SQLiteData.text($0.rawValue) } ?? .null,
+                        .integer(limit),
+                    ]
+                )
+
+                let validated = try rows.map { row -> SpaceURI in
+                    let raw = try requiredText(row, "space_uri")
+                    let space: SpaceURI
+                    do {
+                        space = try SpaceURI(raw)
+                    } catch {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "invalid hosted-space identity"
+                        )
+                    }
+                    guard space.rawValue == raw else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "noncanonical hosted-space identity"
+                        )
+                    }
+                    return space
+                }
+                return Array(validated.lazy.filter { space in
+                    (spaceType == nil || space.spaceType == spaceType)
+                        && (authority == nil || space.authority == authority)
+                        && (cursor == nil || space.rawValue > cursor!.rawValue)
+                }.prefix(limit))
+            }
+        }
+    }
+
     private func repositorySnapshotWithoutTransaction(
         space: SpaceURI,
         author: String

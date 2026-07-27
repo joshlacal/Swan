@@ -15,7 +15,8 @@ public actor SQLitePreMigratedAccountDirectory:
     AuthorizedSimpleSpaceCredentialDirectory,
     AuthorizedSpaceRepositoryDirectory,
     AuthorizedSpaceBlobDirectory,
-    AuthorizedSpaceNotificationDirectory
+    AuthorizedSpaceNotificationDirectory,
+    AuthorizedHostedSpaceDirectory
 {
     private let controlStore: any AccountControlStore
     private let dataDirectory: URL
@@ -810,6 +811,55 @@ public actor SQLitePreMigratedAccountDirectory:
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
         guard databases[did] != nil else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    /// Lists only canonical local hosted-space identities for the authenticated
+    /// subject. The directory repeats the active/startup-preopened/path checks
+    /// used by request-time repository projections, so a stale account path
+    /// can never become authority to reopen or migrate SQLite.
+    public func hostedSpaces(
+        _ query: AuthorizedHostedSpaceListQuery,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedHostedSpacePage {
+        guard (1 ... 100).contains(query.limit),
+              case let .accountOAuth(subject, _) = authorization,
+              subject == query.subject else {
+            throw SwanError.unauthorized("account OAuth is required for hosted-space listing")
+        }
+        guard let database = try await preopenedRepositoryDatabase(
+            for: query.subject,
+            authorization: authorization
+        ) else {
+            throw SwanError.unauthorized("account repository is unavailable")
+        }
+        do {
+            let spaces = try await database.hostedSpaceURIs(
+                spaceType: query.spaceType,
+                authority: query.authority,
+                cursor: query.cursor,
+                limit: query.limit
+            )
+            guard try await isActiveAccount(query.subject) else {
+                throw SwanError.unauthorized("account repository is unavailable")
+            }
+            guard !isClosed else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            let projected = spaces.map {
+                AuthorizedHostedSpace(
+                    space: $0,
+                    isOwner: $0.authority == query.subject
+                )
+            }
+            return AuthorizedHostedSpacePage(
+                spaces: projected,
+                cursor: projected.last?.space
+            )
+        } catch let error as SwanError {
+            throw error
+        } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
     }

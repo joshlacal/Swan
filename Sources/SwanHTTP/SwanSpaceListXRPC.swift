@@ -1,0 +1,248 @@
+import Foundation
+import Hummingbird
+import HTTPTypes
+import Petrel
+import SwanCore
+import SwanSpaces
+import SwanSpacesWire
+import SwanStorage
+
+/// The distinct authenticated capability for local `listSpaces`. It has no
+/// credential verifier by design: a bearer space credential is a cross-space
+/// record read grant, never an account inventory grant.
+public struct SwanAuthenticatedSpaceListCapability: Sendable {
+    let authorizer: SwanOAuthResourceAuthorizer
+    let directory: any AuthorizedHostedSpaceDirectory
+
+    init(
+        authorizer: SwanOAuthResourceAuthorizer,
+        directory: any AuthorizedHostedSpaceDirectory
+    ) {
+        self.authorizer = authorizer
+        self.directory = directory
+    }
+}
+
+private enum AuthenticatedSpaceListFailure: Error {
+    case invalidRequest
+    case denied
+    case nonceChallenge
+    case unavailable
+}
+
+private struct AuthenticatedListSpacesHandler: ComAtprotoSpaceListSpaces.ServerHandler {
+    typealias Context = Request
+
+    let capability: SwanAuthenticatedSpaceListCapability
+
+    func handle(
+        parameters: ComAtprotoSpaceListSpaces.Parameters,
+        input: Void,
+        context request: Request
+    ) async throws -> ComAtprotoSpaceListSpaces.Output {
+        let spaceType = parameters.type?.nsidString()
+        let authority = parameters.did?.didString()
+        let cursor: SpaceURI?
+        do {
+            cursor = try parameters.cursor.map(SpaceURI.init)
+            if let cursor {
+                guard cursor.rawValue == parameters.cursor,
+                      (spaceType == nil || cursor.spaceType == spaceType),
+                      (authority == nil || cursor.authority == authority) else {
+                    throw AuthenticatedSpaceListFailure.invalidRequest
+                }
+            }
+        } catch let failure as AuthenticatedSpaceListFailure {
+            throw failure
+        } catch {
+            throw AuthenticatedSpaceListFailure.invalidRequest
+        }
+
+        let authorization: AuthorizationContext
+        do {
+            authorization = try await capability.authorizer.authorize(
+                request: request,
+                method: "GET",
+                fixedPath: "/xrpc/com.atproto.space.listSpaces"
+            )
+        } catch let failure as SwanResourceAuthorizationFailure {
+            switch failure {
+            case .nonceChallengeRequired:
+                throw AuthenticatedSpaceListFailure.nonceChallenge
+            case .denied:
+                throw AuthenticatedSpaceListFailure.denied
+            case .unavailable:
+                throw AuthenticatedSpaceListFailure.unavailable
+            }
+        } catch {
+            throw AuthenticatedSpaceListFailure.unavailable
+        }
+        guard case let .accountOAuth(subject, scopes) = authorization,
+              PermissionedSpaceScopeSyntax.permitsAggregateSpaceList(
+                  scopes,
+                  spaceType: spaceType,
+                  authority: authority
+              ) else {
+            throw AuthenticatedSpaceListFailure.denied
+        }
+
+        let page: AuthorizedHostedSpacePage
+        do {
+            page = try await capability.directory.hostedSpaces(
+                .init(
+                    subject: subject,
+                    spaceType: spaceType,
+                    authority: authority,
+                    cursor: cursor,
+                    limit: parameters.limit ?? 50
+                ),
+                authorization: authorization
+            )
+        } catch let error as SwanError {
+            if case .unauthorized = error {
+                throw AuthenticatedSpaceListFailure.denied
+            }
+            throw AuthenticatedSpaceListFailure.unavailable
+        } catch {
+            throw AuthenticatedSpaceListFailure.unavailable
+        }
+
+        do {
+            return ComAtprotoSpaceListSpaces.Output(
+                cursor: page.cursor?.rawValue,
+                spaces: try page.spaces.map {
+                    ComAtprotoSpaceListSpaces.SpaceView(
+                        uri: try ATProtocolURI(uriString: $0.space.rawValue),
+                        isOwner: $0.isOwner
+                    )
+                }
+            )
+        } catch {
+            throw AuthenticatedSpaceListFailure.unavailable
+        }
+    }
+}
+
+func registerAuthenticatedListSpacesEndpoint(
+    on router: Router<BasicRequestContext>,
+    capability: SwanAuthenticatedSpaceListCapability
+) {
+    let handler = AuthenticatedListSpacesHandler(capability: capability)
+    let path: RouterPath = "/xrpc/com.atproto.space.listSpaces"
+    router.get(path) { request, _ async -> Response in
+        let parameters: ComAtprotoSpaceListSpaces.Parameters
+        do {
+            parameters = try parseAuthenticatedListSpacesParameters(request)
+        } catch {
+            return authenticatedGetSpaceJSON(.badRequest, ["error": "InvalidRequest"])
+        }
+        do {
+            let output = try await handler.handle(parameters: parameters, input: (), context: request)
+            return authenticatedListSpacesJSON(.ok, output)
+        } catch let failure as AuthenticatedSpaceListFailure {
+            return authenticatedListSpacesResponse(failure, capability: capability)
+        } catch {
+            return authenticatedGetSpaceJSON(.serviceUnavailable, ["error": "temporarily_unavailable"])
+        }
+    }
+    for method: HTTPRequest.Method in [.head, .post, .put, .patch, .delete, .options, .connect, .trace] {
+        router.on(path, method: method) { _, _ -> Response in
+            authenticatedGetSpaceJSON(.notFound, ["error": "permissioned_endpoint_unavailable"])
+        }
+    }
+}
+
+private func parseAuthenticatedListSpacesParameters(
+    _ request: Request
+) throws -> ComAtprotoSpaceListSpaces.Parameters {
+    guard !request.uri.string.contains("#") else {
+        throw AuthenticatedSpaceListFailure.invalidRequest
+    }
+    let query = request.uri.query
+    guard query?.utf8.count ?? 0 <= 8 * 1_024 else {
+        throw AuthenticatedSpaceListFailure.invalidRequest
+    }
+    var values: [String: String] = [:]
+    if let query, !query.isEmpty {
+        for segment in query.split(separator: "&", omittingEmptySubsequences: false) {
+            let pair = segment.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard pair.count == 2,
+                  let key = String(bytes: pair[0].utf8, encoding: .utf8),
+                  ["type", "did", "limit", "cursor"].contains(key),
+                  !pair[1].isEmpty,
+                  values[key] == nil else {
+                throw AuthenticatedSpaceListFailure.invalidRequest
+            }
+            values[key] = try strictQueryDecode(pair[1])
+        }
+    } else if query != nil {
+        throw AuthenticatedSpaceListFailure.invalidRequest
+    }
+
+    let type = try values["type"].map { try NSID(nsidString: bounded($0, maximumBytes: 317)) }
+    let did = try values["did"].map { try DID(didString: bounded($0, maximumBytes: 2_048)) }
+    let limit: Int?
+    if let raw = values["limit"] {
+        guard raw.utf8.allSatisfy({ $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }),
+              let parsed = Int(raw), (1 ... 100).contains(parsed) else {
+            throw AuthenticatedSpaceListFailure.invalidRequest
+        }
+        limit = parsed
+    } else {
+        limit = nil
+    }
+    let cursor = try values["cursor"].map { try bounded($0, maximumBytes: 2_048) }
+    if let cursor {
+        let parsed = try SpaceURI(cursor)
+        guard parsed.rawValue == cursor,
+              (type == nil || parsed.spaceType == type?.nsidString()),
+              (did == nil || parsed.authority == did?.didString()) else {
+            throw AuthenticatedSpaceListFailure.invalidRequest
+        }
+    }
+    return .init(type: type, did: did, limit: limit, cursor: cursor)
+}
+
+private func authenticatedListSpacesResponse(
+    _ failure: AuthenticatedSpaceListFailure,
+    capability: SwanAuthenticatedSpaceListCapability
+) -> Response {
+    switch failure {
+    case .invalidRequest:
+        authenticatedGetSpaceJSON(.badRequest, ["error": "InvalidRequest"])
+    case .denied:
+        authenticatedGetSpaceJSON(.unauthorized, ["error": "Unauthorized"])
+    case .nonceChallenge:
+        authenticatedGetSpaceNonceChallenge(authorizer: capability.authorizer)
+    case .unavailable:
+        authenticatedGetSpaceJSON(.serviceUnavailable, ["error": "temporarily_unavailable"])
+    }
+}
+
+/// `SpaceView` is a generated generic lexicon value and its generic encoder
+/// adds `$type`; this query's pinned JSON schema is a plain object. The
+/// handler above still uses the exact generated input/output contracts. This
+/// private route-only projection removes the generator framing without
+/// adding any public fields or exposing storage data.
+private struct ListSpacesWireOutput: Encodable {
+    struct Space: Encodable {
+        let uri: String
+        let isOwner: Bool
+    }
+
+    let cursor: String?
+    let spaces: [Space]
+}
+
+private func authenticatedListSpacesJSON(
+    _ status: HTTPResponse.Status,
+    _ output: ComAtprotoSpaceListSpaces.Output
+) -> Response {
+    authenticatedGetSpaceJSON(
+        status,
+        ListSpacesWireOutput(
+            cursor: output.cursor,
+            spaces: output.spaces.map { .init(uri: $0.uri.uriString(), isOwner: $0.isOwner) }
+        )
+    )
+}
