@@ -67,6 +67,34 @@ final class SwanOAuthTests: XCTestCase {
         ))
     }
 
+    func testES256JWTsEmitAndRejectMalleableHighSValues() throws {
+        let key = P256.Signing.PrivateKey()
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let space = try SpaceURI(
+            authority: "did:plc:alice", spaceType: "app.bsky.bookmarks", skey: "shared"
+        )
+        let token = try PermissionedDataJWT.createSpaceCredential(
+            issuer: "did:plc:alice", space: space, key: key, now: now
+        )
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+        XCTAssertEqual(parts.count, 3)
+        let signature = try XCTUnwrap(Data(base64URLEncoded: parts[2]))
+        XCTAssertTrue(P256WireSignature.isCanonicalLowS(signature))
+
+        let highS = highSVariant(of: signature).base64URLEncodedString()
+        let malleated = "\(parts[0]).\(parts[1]).\(highS)"
+        XCTAssertThrowsError(try PermissionedDataJWT.verifySpaceCredential(
+            malleated,
+            publicKey: key.publicKey,
+            now: now
+        ))
+        XCTAssertThrowsError(try OAuthCompactJWT.verify(
+            malleated,
+            publicKey: key.publicKey,
+            expectedType: PermissionedDataJWT.credentialType
+        ))
+    }
+
     func testRemoteMetadataPolicyRejectsAllPrivateLiteralRanges() throws {
         XCTAssertThrowsError(try OAuthRemoteURLPolicy.validate(URL(string: "https://172.31.1.1/metadata")!))
         XCTAssertThrowsError(try OAuthRemoteURLPolicy.validate(URL(string: "https://169.254.169.254/latest/meta-data")!))
@@ -1045,8 +1073,33 @@ private func testCompactJWT<Header: Encodable, Claims: Encodable>(
     let headerPart = try encoder.encode(header).base64URLEncodedString()
     let claimsPart = try encoder.encode(claims).base64URLEncodedString()
     let signingInput = "\(headerPart).\(claimsPart)"
-    let signature = try key.signature(for: Data(signingInput.utf8)).rawRepresentation.base64URLEncodedString()
+    let signature = try P256WireSignature.sign(Data(signingInput.utf8), using: key).base64URLEncodedString()
     return "\(signingInput).\(signature)"
+}
+
+private func highSVariant(of canonicalSignature: Data) -> Data {
+    precondition(canonicalSignature.count == 64)
+    let order: [UInt8] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84,
+        0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
+    ]
+    let lowS = Array(canonicalSignature.suffix(32))
+    var highS = Array(repeating: UInt8.zero, count: 32)
+    var borrow = 0
+    for index in stride(from: 31, through: 0, by: -1) {
+        var value = Int(order[index]) - Int(lowS[index]) - borrow
+        if value < 0 {
+            value += 256
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        highS[index] = UInt8(value)
+    }
+    precondition(borrow == 0)
+    return Data(canonicalSignature.prefix(32)) + Data(highS)
 }
 
 private func XCTAssertThrowsErrorAsync<T>(_ expression: @autoclosure () async throws -> T, file: StaticString = #filePath, line: UInt = #line) async {

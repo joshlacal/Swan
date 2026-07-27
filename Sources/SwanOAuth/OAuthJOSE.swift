@@ -293,12 +293,7 @@ public enum OAuthCompactJWT {
         guard parsed.header.algorithm == "ES256", parsed.header.type == expectedType || expectedType == nil else {
             throw SwanError.unauthorized("JWT type or algorithm is invalid")
         }
-        let signature: P256.Signing.ECDSASignature
-        do {
-            signature = try P256.Signing.ECDSASignature(rawRepresentation: parsed.signature)
-        } catch {
-            throw SwanError.malformed("JWT ES256 signature is malformed")
-        }
+        let signature = try P256WireSignature.decodeCanonical(parsed.signature)
         guard publicKey.isValidSignature(signature, for: parsed.signingInput) else {
             throw SwanError.unauthorized("JWT signature is invalid")
         }

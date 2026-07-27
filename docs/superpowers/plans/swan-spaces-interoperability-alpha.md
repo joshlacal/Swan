@@ -44,11 +44,21 @@ checksum-verified way to populate the ignored reference cache.
   oplog/outbox insertion and outbox recovery operations share one transaction.
 - The local simple authority covers member-list, managing-app, public, and app
   allow-list decisions without granting credentials write power.
+- `28c35493` installs a locally provisioned account only after its verified
+  empty public-repository genesis is durable. The immutable public commit CID
+  binds the separate control-plane row; interrupted installation recovers,
+  legacy unbound control rows fail closed, and independent SQLite connections
+  race to one registration without persisting password or private-key bytes.
+- `aa1c6cc5` records a sanitized fixed public-genesis vector under this
+  profile. Swift verifies the pinned TypeScript CAR and the TypeScript
+  `verifyRepoCar` path verifies Swan's CAR. This also enforces canonical
+  low-S ES256 repository signatures, because the pinned verifier rejects the
+  mathematically valid high-S encoding accepted by Swift Crypto.
 
 ## Completion gates
 
 Completion still requires the full pinned XRPC surface, signed delegation and
 space credential JWTs, durable repositories/CARs/blobs, OAuth and account
 lifecycle, generated wire sources, Compose reference PDS/PLC/Caddy matrix,
-and macOS/Linux verification. This document deliberately does not mark those
-gates complete based on scaffolding or unit-only evidence.
+and macOS/Linux verification. The public-genesis vector is a narrow
+cross-language gate; it is not evidence that the complete matrix has passed.

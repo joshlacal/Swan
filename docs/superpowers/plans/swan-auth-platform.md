@@ -29,6 +29,15 @@ production deployment.
 - `c8775f33` provides account identifier validation, Argon2id verification,
   encrypted key envelopes, create-only provisioning, explicit rotation, and
   crash-recoverable key installation.
+- `28c35493` adds the local, non-PLC account installation half: deterministic
+  key references are paired with a verified empty public repository in the
+  account's WAL database before an active control-plane row is written. Its
+  commit-CID binding makes duplicate recovery and legacy-state rejection
+  explicit without treating a matching timestamp as provenance.
+- `5eb0d957` adds the separate bearer-authenticated loopback management
+  listener and process lifecycle wiring. It does not make public OAuth routes
+  available; those remain deliberately fail-closed pending the full HTTP
+  authorization flow.
 - The account suite passes locally. Its native-library portability remains an
   explicit gate: local macOS testing uses Homebrew libsodium include/library
   paths, and Linux plus the minimum supported macOS have not yet been run.

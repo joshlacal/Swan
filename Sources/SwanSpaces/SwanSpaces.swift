@@ -425,7 +425,7 @@ public enum SpaceCommitCodec {
     ) throws -> SpaceCommitEnvelope {
         guard commitment.count == 32 else { throw SwanError.malformed("commitment must be SHA-256 bytes") }
         let payload = try encodedContext(context)
-        let signature = try key.signature(for: payload).rawRepresentation
+        let signature = try P256WireSignature.sign(payload, using: key)
         let binding = contentBinding(ikm: context.ikm, context: payload, commitment: commitment)
         return SpaceCommitEnvelope(context: context, contextSignature: signature, contentBinding: binding, commitment: commitment)
     }
@@ -434,7 +434,7 @@ public enum SpaceCommitCodec {
     /// It intentionally does not claim that the author signed repository data.
     public static func verifyContextSignature(_ envelope: SpaceCommitEnvelope, publicKey: P256.Signing.PublicKey) throws -> Bool {
         guard envelope.ver == 1 else { return false }
-        let signature = try P256.Signing.ECDSASignature(rawRepresentation: envelope.contextSignature)
+        let signature = try P256WireSignature.decodeCanonical(envelope.contextSignature)
         return publicKey.isValidSignature(signature, for: try encodedContext(envelope.context))
     }
 

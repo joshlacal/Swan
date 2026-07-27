@@ -95,6 +95,31 @@ final class SwanSpacesTests: XCTestCase {
         XCTAssertNotEqual(firstReaderEnvelope.contentBinding, secondReaderEnvelope.contentBinding)
     }
 
+    func testContextSignaturesEmitAndRequireCanonicalLowSValues() throws {
+        let space = try SpaceURI(authority: "did:plc:alice", spaceType: "app.bsky.bookmarks", skey: "shared")
+        let key = P256.Signing.PrivateKey()
+        let context = try SpaceCommitContext(
+            space: space,
+            author: "did:plc:alice",
+            rev: "3m2q2l5w2kq",
+            ikm: Data(repeating: 8, count: 32)
+        )
+        let envelope = try SpaceCommitCodec.sign(
+            context: context,
+            commitment: Data(repeating: 3, count: 32),
+            key: key
+        )
+        XCTAssertTrue(P256WireSignature.isCanonicalLowS(envelope.contextSignature))
+
+        let malleated = SpaceCommitEnvelope(
+            context: context,
+            contextSignature: highSVariant(of: envelope.contextSignature),
+            contentBinding: envelope.contentBinding,
+            commitment: envelope.commitment
+        )
+        XCTAssertThrowsError(try SpaceCommitCodec.verifyContextSignature(malleated, publicKey: key.publicKey))
+    }
+
     func testApplyWritesIsAtomicWhenOneWriteIsInvalid() async throws {
         let space = try SpaceURI(authority: "did:plc:alice", spaceType: "app.bsky.bookmarks", skey: "self")
         let first = try SpaceRecordURI(space: space, author: "did:plc:alice", collection: "app.bsky.feed.post", rkey: "one")
@@ -1006,6 +1031,31 @@ final class SwanSpacesTests: XCTestCase {
         try await aliceDatabase.close()
         try await bobDatabase.close()
     }
+}
+
+private func highSVariant(of canonicalSignature: Data) -> Data {
+    precondition(canonicalSignature.count == 64)
+    let order: [UInt8] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84,
+        0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
+    ]
+    let lowS = Array(canonicalSignature.suffix(32))
+    var highS = Array(repeating: UInt8.zero, count: 32)
+    var borrow = 0
+    for index in stride(from: 31, through: 0, by: -1) {
+        var value = Int(order[index]) - Int(lowS[index]) - borrow
+        if value < 0 {
+            value += 256
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        highS[index] = UInt8(value)
+    }
+    precondition(borrow == 0)
+    return Data(canonicalSignature.prefix(32)) + Data(highS)
 }
 
 private func XCTAssertThrowsErrorAsync<T>(_ expression: @autoclosure () async throws -> T, file: StaticString = #filePath, line: UInt = #line) async {

@@ -293,7 +293,7 @@ public enum PermissionedDataJWT {
         let headerPart = try encoder.encode(header).base64URLEncodedString()
         let payloadPart = try encoder.encode(claims).base64URLEncodedString()
         let signingInput = "\(headerPart).\(payloadPart)"
-        let signature = try key.signature(for: Data(signingInput.utf8)).rawRepresentation.base64URLEncodedString()
+        let signature = try P256WireSignature.sign(Data(signingInput.utf8), using: key).base64URLEncodedString()
         return "\(signingInput).\(signature)"
     }
 
@@ -302,7 +302,7 @@ public enum PermissionedDataJWT {
         guard parsed.header.typ == expectedType, parsed.header.alg == "ES256" else {
             throw SwanError.unauthorized("JWT type or algorithm is invalid")
         }
-        let signature = try P256.Signing.ECDSASignature(rawRepresentation: parsed.signature)
+        let signature = try P256WireSignature.decodeCanonical(parsed.signature)
         guard publicKey.isValidSignature(signature, for: parsed.signingInput) else {
             throw SwanError.unauthorized("JWT signature is invalid")
         }
