@@ -920,15 +920,20 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     /// the reconstructed graph before recording the migration sentinel.
     private func migrateSimpleSpaceAuthoritySchemaIfNeeded() async throws {
         let version = Self.simpleSpaceAuthoritySchemaMigrationVersion
-        let applied = try await connection.query(
-            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
-            [.integer(version)]
-        )
-        guard applied.isEmpty else { return }
-
         _ = try await connection.query("PRAGMA foreign_keys = OFF")
         do {
             try await transaction {
+                // This must be the first operation after BEGIN IMMEDIATE.
+                // A different process can finish the rebuild after this
+                // connection's base-schema transaction and before it reaches
+                // here. Checking outside this transaction would let both
+                // openers decide to rebuild the same tables.
+                let applied = try await connection.query(
+                    "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+                    [.integer(version)]
+                )
+                guard applied.isEmpty else { return }
+
                 try await renameSimpleSpaceAuthorityTablesForMigration()
                 for statement in SQLiteLayout.simpleSpaceAuthoritySchemaStatements {
                     _ = try await connection.query(statement)
