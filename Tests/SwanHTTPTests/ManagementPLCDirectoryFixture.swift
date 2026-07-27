@@ -16,6 +16,28 @@ final class ManagementPLCDirectoryFixture: @unchecked Sendable {
         state.setWellKnownResponse(response)
     }
 
+    func armAuditResponseBarrier() {
+        state.armAuditResponseBarrier()
+    }
+
+    func waitForAuditResponseBarrier(
+        timeout: Duration = .seconds(5)
+    ) async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if state.auditResponseBarrierWasEntered() {
+                return true
+            }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        return state.auditResponseBarrierWasEntered()
+    }
+
+    func releaseAuditResponseBarrier() {
+        state.releaseAuditResponseBarrier()
+    }
+
     init(submitBody: Data = Data("OK".utf8)) throws {
         group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let sharedState = ManagementPLCFixtureState(submitBody: submitBody)
@@ -43,12 +65,16 @@ final class ManagementPLCFixtureState: @unchecked Sendable {
     static let proofBodySentinel = "did=did:plc:zyxwvutsrqponmlkjihgfedc"
 
     private let lock = NSLock()
+    private let auditBarrier = NSCondition()
     private let submitBody: Data
     private var audit: Data?
     private var document: Data?
     private var submittedDID: String?
     private var wellKnownResponse = ManagementPLCWellKnownResponse.automatic
     private var count = 0
+    private var auditBarrierArmed = false
+    private var auditBarrierEntered = false
+    private var auditBarrierReleased = false
 
     init(submitBody: Data) {
         self.submitBody = submitBody
@@ -93,6 +119,39 @@ final class ManagementPLCFixtureState: @unchecked Sendable {
 
     func currentAudit() -> Data? {
         locked { audit }
+    }
+
+    func armAuditResponseBarrier() {
+        auditBarrier.lock()
+        auditBarrierArmed = true
+        auditBarrierEntered = false
+        auditBarrierReleased = false
+        auditBarrier.unlock()
+    }
+
+    func auditResponseBarrierWasEntered() -> Bool {
+        auditBarrier.lock()
+        defer { auditBarrier.unlock() }
+        return auditBarrierEntered
+    }
+
+    func pauseAuditResponseIfArmed() {
+        auditBarrier.lock()
+        defer { auditBarrier.unlock() }
+        guard auditBarrierArmed else { return }
+        auditBarrierEntered = true
+        auditBarrier.broadcast()
+        while !auditBarrierReleased {
+            auditBarrier.wait()
+        }
+        auditBarrierArmed = false
+    }
+
+    func releaseAuditResponseBarrier() {
+        auditBarrier.lock()
+        auditBarrierReleased = true
+        auditBarrier.broadcast()
+        auditBarrier.unlock()
     }
 
     func currentDocument() -> Data? {
@@ -203,6 +262,7 @@ private final class ManagementPLCFixtureHandler: ChannelInboundHandler, @uncheck
                   components[1] == "log",
                   components[2] == "audit",
                   let audit = state.currentAudit() {
+            state.pauseAuditResponseIfArmed()
             write(
                 status: .ok,
                 body: audit,

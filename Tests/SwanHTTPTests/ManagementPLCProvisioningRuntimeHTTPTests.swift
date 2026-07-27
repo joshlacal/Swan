@@ -11,6 +11,100 @@ import SwanStorage
 import XCTest
 
 final class ManagementPLCProvisioningRuntimeHTTPTests: XCTestCase {
+    func testConcreteRuntimeSingleFlightForcesRealOverlappingActivation() async throws {
+        let plc = try ManagementPLCDirectoryFixture()
+        defer { plc.shutdown() }
+        let fixture = try await ConcreteManagementFixture(plc: plc)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        do {
+            let plcOrigin = try XCTUnwrap(URL(
+                string: "http://127.0.0.1:\(plc.port)"
+            ))
+            let plcConfiguration = try PLCClientConfiguration.laboratory(
+                origin: plcOrigin,
+                submitSuccessResponsePolicy: .didPLCServer001
+            )
+            let handlePolicy = try ATHandleResolutionPolicy.laboratory(
+                origin: plcOrigin
+            )
+            let prepared = try await fixture.runtime.prepare(.init(
+                requestID: fixture.requestID,
+                handle: "alice.test",
+                pdsOrigin: try XCTUnwrap(URL(string: "https://pds.example")),
+                repositoryRevision: "3lqby3xuo4k2a",
+                plcConfiguration: plcConfiguration
+            ))
+            let activation = SwanManagementPLCActivateInput(
+                requestID: fixture.requestID,
+                password: fixture.password,
+                plcConfiguration: plcConfiguration,
+                handlePolicy: handlePolicy
+            )
+
+            plc.armAuditResponseBarrier()
+            defer { plc.releaseAuditResponseBarrier() }
+            async let first = fixture.runtime.activate(activation)
+            guard try await plc.waitForAuditResponseBarrier() else {
+                XCTFail("first activation never reached the forced network overlap")
+                plc.releaseAuditResponseBarrier()
+                _ = try? await first
+                try await fixture.close()
+                return
+            }
+
+            async let second = fixture.runtime.activate(activation)
+            guard try await Self.waitForActivationWaiters(
+                runtime: fixture.runtime,
+                requestID: fixture.requestID,
+                count: 2
+            ) else {
+                XCTFail("second activation did not join the in-flight attempt")
+                plc.releaseAuditResponseBarrier()
+                _ = try? await (first, second)
+                try await fixture.close()
+                return
+            }
+
+            let mismatched = SwanManagementPLCActivateInput(
+                requestID: fixture.requestID,
+                password: fixture.password + "-different",
+                plcConfiguration: plcConfiguration,
+                handlePolicy: handlePolicy
+            )
+            do {
+                _ = try await fixture.runtime.activate(mismatched)
+                XCTFail("different input must not join an in-flight request ID")
+            } catch let error as PLCAccountActivationError {
+                XCTAssertEqual(error, .conflict)
+            }
+
+            plc.releaseAuditResponseBarrier()
+            let (firstResult, secondResult) = try await (first, second)
+            XCTAssertEqual(firstResult, secondResult)
+            XCTAssertEqual(firstResult.did, prepared.did)
+            XCTAssertEqual(firstResult.status, "active")
+            XCTAssertTrue(firstResult.recovered)
+            let remainingWaiters = await fixture.runtime
+                .activationWaiterCountForTesting(
+                    requestID: fixture.requestID
+                )
+            XCTAssertEqual(remainingWaiters, 0)
+            try await fixture.liveDirectory.requireActivePreopenedAccount(prepared.did)
+            let active = try await fixture.control.account(did: prepared.did)
+            XCTAssertEqual(active?.status, .active)
+            let recoveryCount = try await fixture.liveDirectory
+                .notificationRecoveryDatabases().count
+            XCTAssertEqual(recoveryCount, 1)
+
+            try await fixture.close()
+        } catch {
+            plc.releaseAuditResponseBarrier()
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     func testConcreteManagementRoutesPrepareActivateRetryAndAdmitWithoutRestart() async throws {
         let plc = try ManagementPLCDirectoryFixture()
         defer { plc.shutdown() }
@@ -63,47 +157,9 @@ final class ManagementPLCProvisioningRuntimeHTTPTests: XCTestCase {
                 XCTAssertNil(accountAfterConflict)
                 XCTAssertEqual(plc.submitCount, 1)
 
-                let concurrentActivations = await withTaskGroup(
-                    of: ManagementHTTPOutcome.self,
-                    returning: [ManagementHTTPOutcome].self
-                ) { group in
-                    for _ in 0 ..< 2 {
-                        group.addTask {
-                            do {
-                                return try await client.execute(
-                                    uri: "/v1/accounts/plc/activate",
-                                    method: .post,
-                                    headers: fixture.authorizationHeaders,
-                                    body: ByteBuffer(data: fixture.activateBody)
-                                ) { response in
-                                    ManagementHTTPOutcome(
-                                        status: response.status.code,
-                                        body: Data(buffer: response.body)
-                                    )
-                                }
-                            } catch {
-                                return .init(status: -1, body: Data())
-                            }
-                        }
-                    }
-                    return await group.reduce(into: []) { $0.append($1) }
-                }
-                XCTAssertEqual(concurrentActivations.count, 2)
-                for outcome in concurrentActivations {
-                    XCTAssertEqual(outcome.status, 200)
-                    let object = try JSONDecoder().decode(
-                        ManagementActivatedResponse.self,
-                        from: outcome.body
-                    )
-                    XCTAssertEqual(object.did, did)
-                    XCTAssertEqual(object.status, "active")
-                    XCTAssertTrue(object.recovered)
-                    try await capture.recordActivation(object, body: outcome.body)
-                }
-
-                // A later exact retry must remain successful after the
-                // preparation opener transferred lifecycle ownership.
-                for _ in 0 ..< 1 {
+                // Exact HTTP retries remain successful after the preparation
+                // opener transfers lifecycle ownership.
+                for _ in 0 ..< 2 {
                     try await client.execute(
                         uri: "/v1/accounts/plc/activate",
                         method: .post,
@@ -276,6 +332,27 @@ final class ManagementPLCProvisioningRuntimeHTTPTests: XCTestCase {
         ], options: [.sortedKeys])
     }
 
+    private static func waitForActivationWaiters(
+        runtime: SwanManagementPLCProvisioningRuntime,
+        requestID: String,
+        count: Int,
+        timeout: Duration = .seconds(5)
+    ) async throws -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await runtime.activationWaiterCountForTesting(
+                requestID: requestID
+            ) == count {
+                return true
+            }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        return await runtime.activationWaiterCountForTesting(
+            requestID: requestID
+        ) == count
+    }
+
     private static func assertNoProjection(
         renderedBodies: [Data],
         persistedUnder root: URL,
@@ -422,11 +499,6 @@ private struct ManagementActivatedResponse: Codable, Sendable, Equatable {
     let publicGenesisCommitCID: String
     let publicGenesisRevision: String
     let recovered: Bool
-}
-
-private struct ManagementHTTPOutcome: Sendable {
-    let status: Int
-    let body: Data
 }
 
 private actor ManagementHTTPTestCapture {

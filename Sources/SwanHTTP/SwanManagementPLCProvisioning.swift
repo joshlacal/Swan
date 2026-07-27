@@ -134,11 +134,31 @@ public protocol SwanManagementPLCProvisioning: Sendable {
 public actor SwanManagementPLCProvisioningRuntime:
     SwanManagementPLCProvisioning
 {
+    private struct ActivationAttempt: Sendable, Equatable {
+        let password: String
+        let plcConfiguration: PLCClientConfiguration
+        let handlePolicy: ATHandleResolutionPolicy
+
+        init(_ input: SwanManagementPLCActivateInput) {
+            password = input.password
+            plcConfiguration = input.plcConfiguration
+            handlePolicy = input.handlePolicy
+        }
+    }
+
+    private struct InFlightActivation: Sendable {
+        let token: UUID
+        let attempt: ActivationAttempt
+        let task: Task<SwanManagementPLCActivateResult, any Error>
+        var waiterCount: Int
+    }
+
     private let controlDatabase: SQLiteControlDatabase
     private let opener: SQLitePLCAccountPreparationStoreOpener
     private let keyStore: FileAccountKeyStore
     private let directory: DurableAccountDirectory
     private let liveAccountDirectory: SQLitePreMigratedAccountDirectory?
+    private var inFlightActivations: [String: InFlightActivation] = [:]
 
     public init(
         controlDatabase: SQLiteControlDatabase,
@@ -180,6 +200,39 @@ public actor SwanManagementPLCProvisioningRuntime:
     public func activate(
         _ input: SwanManagementPLCActivateInput
     ) async throws -> SwanManagementPLCActivateResult {
+        let attempt = ActivationAttempt(input)
+        if var inFlight = inFlightActivations[input.requestID] {
+            guard inFlight.attempt == attempt else {
+                throw PLCAccountActivationError.conflict
+            }
+            inFlight.waiterCount += 1
+            inFlightActivations[input.requestID] = inFlight
+            return try await inFlight.task.value
+        }
+
+        let token = UUID()
+        let task = Task {
+            try await self.performActivation(input)
+        }
+        inFlightActivations[input.requestID] = InFlightActivation(
+            token: token,
+            attempt: attempt,
+            task: task,
+            waiterCount: 1
+        )
+        do {
+            let result = try await task.value
+            clearInFlightActivation(requestID: input.requestID, token: token)
+            return result
+        } catch {
+            clearInFlightActivation(requestID: input.requestID, token: token)
+            throw error
+        }
+    }
+
+    private func performActivation(
+        _ input: SwanManagementPLCActivateInput
+    ) async throws -> SwanManagementPLCActivateResult {
         let handleVerifier = ATProtocolHandleVerifier(
             policy: input.handlePolicy,
             http: try NIOPeerPinnedATHandleHTTPTransport()
@@ -212,6 +265,15 @@ public actor SwanManagementPLCProvisioningRuntime:
             }
         }
         return .init(installation: installation)
+    }
+
+    private func clearInFlightActivation(requestID: String, token: UUID) {
+        guard inFlightActivations[requestID]?.token == token else { return }
+        inFlightActivations.removeValue(forKey: requestID)
+    }
+
+    func activationWaiterCountForTesting(requestID: String) -> Int {
+        inFlightActivations[requestID]?.waiterCount ?? 0
     }
 
     public func close() async throws {
