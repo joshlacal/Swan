@@ -248,6 +248,13 @@ public protocol PLCClient: Sendable {
     func submit(did: String, operation: PLCSignedOperation) async throws
     func fetchState(did: String) async throws -> PLCDocumentData
     func fetchAudit(did: String) async throws -> [PLCAuditEntry]
+    func fetchAuditIfPresent(did: String) async throws -> [PLCAuditEntry]?
+}
+
+public extension PLCClient {
+    func fetchAuditIfPresent(did: String) async throws -> [PLCAuditEntry]? {
+        try await fetchAudit(did: did)
+    }
 }
 
 public struct PLCDirectoryClient: PLCClient, Sendable {
@@ -320,6 +327,13 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
     }
 
     public func fetchAudit(did: String) async throws -> [PLCAuditEntry] {
+        guard let audit = try await fetchAuditIfPresent(did: did) else {
+            throw SwanError.unavailable("PLC identity is not registered")
+        }
+        return audit
+    }
+
+    public func fetchAuditIfPresent(did: String) async throws -> [PLCAuditEntry]? {
         try PLCOperationCodec.validateCanonicalDID(did)
         let request = PLCHTTPRequest(
             method: .get,
@@ -330,6 +344,14 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
             maximumResponseBytes: configuration.maximumAuditBytes
         )
         let response = try await transport.execute(request)
+        if response.status == 404 {
+            guard response.redirectCount == 0,
+                  response.finalURL == request.url,
+                  response.body.count <= request.maximumResponseBytes else {
+                throw SwanError.unauthorized("PLC directory missing response is invalid")
+            }
+            return nil
+        }
         try validateResponse(response, for: request, permitsEmptyBody: false)
         return try decodeAndVerifyAudit(response.body, expectedDID: did)
     }

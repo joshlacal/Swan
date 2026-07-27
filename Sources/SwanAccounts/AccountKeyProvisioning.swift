@@ -20,6 +20,55 @@ public struct AccountKeyProvisioner: Sendable {
         try await provision(accountDID: accountDID, generation: 1)
     }
 
+    /// Installs an already generated initial pair. PLC genesis preparation
+    /// must derive the DID from the public keys before the encrypted envelopes
+    /// can be named under that DID. A create-only collision resumes and
+    /// verifies the stored generation rather than replacing it.
+    public func installInitial(
+        accountDID: String,
+        signingKey: P256.Signing.PrivateKey,
+        rotationKey: P256.Signing.PrivateKey
+    ) async throws -> ProvisionedAccountKeys {
+        guard signingKey.rawRepresentation != rotationKey.rawRepresentation else {
+            throw SwanError.malformed("account provisioning keys are not distinct")
+        }
+        let signingReference = try AccountKeyReference(
+            accountDID: accountDID,
+            purpose: .signing,
+            generation: 1
+        )
+        let rotationReference = try AccountKeyReference(
+            accountDID: accountDID,
+            purpose: .rotation,
+            generation: 1
+        )
+        do {
+            try await keyStore.createBatch([
+                try AccountKeyMaterial(
+                    reference: signingReference,
+                    key: signingKey.rawRepresentation
+                ),
+                try AccountKeyMaterial(
+                    reference: rotationReference,
+                    key: rotationKey.rawRepresentation
+                ),
+            ])
+        } catch let error as SwanError where error == .conflict(expected: 0, actual: 1) {
+            let resumed = try await resumeProvisioning(accountDID: accountDID, generation: 1)
+            guard resumed.signingPublicKey == signingKey.publicKey.x963Representation,
+                  resumed.rotationPublicKey == rotationKey.publicKey.x963Representation else {
+                throw SwanError.conflict(expected: 0, actual: 1)
+            }
+            return resumed
+        }
+        return ProvisionedAccountKeys(
+            signingReference: signingReference,
+            rotationReference: rotationReference,
+            signingPublicKey: signingKey.publicKey.x963Representation,
+            rotationPublicKey: rotationKey.publicKey.x963Representation
+        )
+    }
+
     public func provisionRotation(
         accountDID: String,
         generation: UInt64

@@ -138,6 +138,17 @@ public enum SQLiteLayout {
             expires_at INTEGER NOT NULL CHECK(expires_at >= 0)
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS plc_account_preparation_intents (
+            request_id TEXT PRIMARY KEY,
+            did TEXT NOT NULL UNIQUE,
+            canonical_handle TEXT NOT NULL UNIQUE,
+            pds_origin TEXT NOT NULL,
+            repository_revision TEXT NOT NULL,
+            operation_cid TEXT NOT NULL UNIQUE,
+            stage INTEGER NOT NULL CHECK(stage BETWEEN 1 AND 4)
+        )
+        """,
         "CREATE INDEX IF NOT EXISTS oauth_control_access_token_expiry ON oauth_control_access_tokens(expires_at)",
         "CREATE INDEX IF NOT EXISTS oauth_control_refresh_token_expiry ON oauth_control_refresh_tokens(expires_at)",
         "CREATE INDEX IF NOT EXISTS oauth_control_family_expiry ON oauth_control_token_families(expires_at)",
@@ -299,6 +310,27 @@ public enum SQLiteLayout {
             commit_cid TEXT NOT NULL,
             car BLOB NOT NULL,
             installed_at INTEGER NOT NULL CHECK(installed_at >= 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS plc_account_preparation_journal (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            request_id TEXT NOT NULL UNIQUE,
+            did TEXT NOT NULL UNIQUE,
+            canonical_handle TEXT NOT NULL,
+            pds_origin TEXT NOT NULL,
+            repository_revision TEXT NOT NULL,
+            operation_cid TEXT NOT NULL UNIQUE,
+            signed_operation_json BLOB NOT NULL
+                CHECK(length(signed_operation_json) BETWEEN 1 AND 32768),
+            signing_key_reference TEXT NOT NULL,
+            rotation_key_reference TEXT NOT NULL,
+            public_genesis_commit_cid TEXT,
+            stage INTEGER NOT NULL CHECK(stage BETWEEN 1 AND 4),
+            CHECK(
+                (stage = 1 AND public_genesis_commit_cid IS NULL)
+                OR (stage > 1 AND public_genesis_commit_cid IS NOT NULL)
+            )
         )
         """,
         """
@@ -776,7 +808,7 @@ public struct PersistedSpaceNotificationFanoutLease: Sendable, Equatable {
     }
 }
 
-private actor SQLiteConnectionGate {
+actor SQLiteConnectionGate {
     private var isHeld = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
@@ -873,10 +905,10 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     private static let fileBackedBlobLifecycleMigrationVersion = 5
     private static let physicalBlobCASLifecycleMigrationVersion = 6
 
-    private let connection: SQLiteConnection
-    private let connectionGate = SQLiteConnectionGate()
+    let connection: SQLiteConnection
+    let connectionGate = SQLiteConnectionGate()
     private let dataDirectory: URL
-    private let accountDID: String
+    let accountDID: String
     private let oplogRetention: Int
     private var accountDirectoryDescriptor: Int32
     private var testingHooks = SQLiteTestingHooks()
@@ -4660,7 +4692,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
 
     // MARK: Transaction and decoding helpers
 
-    private func withConnectionGate<T: Sendable>(
+    func withConnectionGate<T: Sendable>(
         _ body: () async throws -> T
     ) async throws -> T {
         await connectionGate.acquire()
@@ -4674,7 +4706,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         }
     }
 
-    private func transaction<T: Sendable>(
+    func transaction<T: Sendable>(
         _ body: () async throws -> T
     ) async throws -> T {
         _ = try await connection.query("BEGIN IMMEDIATE")

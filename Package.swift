@@ -86,7 +86,13 @@ let package = Package(
                 .product(name: "Petrel", package: "Petrel"),
             ]
         ),
-        .target(name: "SwanStorage", dependencies: ["SwanCore", "SwanSpaces", .product(name: "Crypto", package: "swift-crypto")]),
+        .target(
+            name: "SwanStorage",
+            dependencies: [
+                "SwanCore", "SwanPublicRepository", "SwanSpaces",
+                .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
         .target(
             name: "SwanSQLite",
             dependencies: [
