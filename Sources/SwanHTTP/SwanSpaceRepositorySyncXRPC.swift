@@ -131,7 +131,11 @@ private struct AuthenticatedListRepoOpsHandler:
             let commit: ComAtprotoSpaceDefs.SignedCommit?
             // This is deliberately the reference condition, not `ops.isEmpty`:
             // an exactly-full final page does not bind a head commit until the
-            // caller asks again and receives the short/empty page.
+            // caller asks again and receives the short/empty page. Storage can
+            // extend the terminal revision beyond `limit` rather than split a
+            // same-TID atomic batch that this endpoint's `since` cursor could
+            // not resume; that conservative overflow likewise gets its commit
+            // on the following empty page.
             if operations.count < limit {
                 commit = try await signedCommit(
                     state: state,

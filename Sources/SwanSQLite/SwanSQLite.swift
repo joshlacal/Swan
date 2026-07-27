@@ -1642,11 +1642,15 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         }
     }
 
-    /// Returns a bounded incremental page after an XRPC wire-TID cursor.
+    /// Returns an incremental page after an XRPC wire-TID cursor.
     /// The reference PDS treats TIDs as its protocol cursor, while its
     /// operation ordering is still `(commit revision, operation index)`.
     /// Keep that distinction here: a batch may deliberately contain multiple
-    /// operations with the same wire TID.
+    /// operations with the same wire TID. `since` cannot resume inside that
+    /// batch, so `limit` selects a terminal revision and the returned page is
+    /// extended to include every operation with that revision. A page can
+    /// therefore contain more than `limit` entries, but it can never silently
+    /// split a batch that the next `since` cursor would skip.
     public func wireOplog(
         space: SpaceURI,
         author: String,
@@ -1708,6 +1712,32 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             }
         }
 
+        // A wire TID is the only public cursor. Find the final revision in the
+        // requested prefix first, then return the entire equivalence class for
+        // that TID. Applying LIMIT directly to the projection would split an
+        // atomic batch and make its remaining rows unreachable once a client
+        // sends the last returned TID as `since`.
+        let boundaryRows = try await connection.query(
+            """
+            SELECT wire_revision
+            FROM permissioned_space_oplog
+            WHERE space_uri = ? AND author_did = ?
+              AND (? IS NULL OR wire_revision > ?)
+            ORDER BY revision, operation_index
+            LIMIT ?
+            """,
+            [
+                .text(space.rawValue), .text(author),
+                since.map { .text($0.toString()) } ?? .null,
+                since.map { .text($0.toString()) } ?? .null,
+                .integer(limit),
+            ]
+        )
+        guard let boundaryRow = boundaryRows.last else {
+            return .incremental(state: state, entries: [])
+        }
+        let boundary = try requiredTID(boundaryRow, "wire_revision")
+
         let rows: [SQLiteRow]
         if includeValues {
             rows = try await connection.query(
@@ -1724,14 +1754,14 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                  AND live.cid = oplog.cid
                 WHERE oplog.space_uri = ? AND oplog.author_did = ?
                   AND (? IS NULL OR oplog.wire_revision > ?)
+                  AND oplog.wire_revision <= ?
                 ORDER BY oplog.revision, oplog.operation_index
-                LIMIT ?
                 """,
                 [
                     .text(space.rawValue), .text(author),
                     since.map { .text($0.toString()) } ?? .null,
                     since.map { .text($0.toString()) } ?? .null,
-                    .integer(limit),
+                    .text(boundary.toString()),
                 ]
             )
         } else {
@@ -1742,14 +1772,14 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                 FROM permissioned_space_oplog
                 WHERE space_uri = ? AND author_did = ?
                   AND (? IS NULL OR wire_revision > ?)
+                  AND wire_revision <= ?
                 ORDER BY revision, operation_index
-                LIMIT ?
                 """,
                 [
                     .text(space.rawValue), .text(author),
                     since.map { .text($0.toString()) } ?? .null,
                     since.map { .text($0.toString()) } ?? .null,
-                    .integer(limit),
+                    .text(boundary.toString()),
                 ]
             )
         }

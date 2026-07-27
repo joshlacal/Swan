@@ -141,6 +141,64 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     )
                 }
 
+                // `since` is a TID, not a `(TID, operation-index)` cursor.
+                // A limit boundary through the two-operation atomic batch at
+                // tids[4] must include both rows; otherwise a consumer that
+                // advances `since` to tids[4] could never retrieve the
+                // omitted sibling. The next empty page is where the existing
+                // reference caught-up rule supplies the head commit.
+                let boundaryHeaders = try self.dpopHeaders(
+                    token: oauth.token, key: oauth.key, jwk: oauth.jwk,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "oplog-shared-tid-boundary", path: Self.oplogPath
+                )
+                try await client.execute(
+                    uri: self.oplogURI(
+                        space: fixture.space,
+                        repo: Self.alice,
+                        since: fixture.tids[0],
+                        limit: 4
+                    ),
+                    method: .get,
+                    headers: boundaryHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let body = try self.jsonObject(response.body)
+                    let entries = try XCTUnwrap(body["ops"] as? [[String: Any]])
+                    XCTAssertEqual(entries.count, 5)
+                    XCTAssertEqual(
+                        entries.map { $0["rev"] as? String },
+                        Array(fixture.tids.dropFirst()) + [fixture.tids[4]]
+                    )
+                    XCTAssertEqual(entries.suffix(2).map { $0["rkey"] as? String }, ["third", "fourth"])
+                    XCTAssertNil(body["commit"])
+                }
+
+                let afterBatchHeaders = try self.dpopHeaders(
+                    token: oauth.token, key: oauth.key, jwk: oauth.jwk,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "oplog-after-shared-tid", path: Self.oplogPath
+                )
+                try await client.execute(
+                    uri: self.oplogURI(
+                        space: fixture.space,
+                        repo: Self.alice,
+                        since: fixture.tids[4],
+                        limit: 4
+                    ),
+                    method: .get,
+                    headers: afterBatchHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let body = try self.jsonObject(response.body)
+                    XCTAssertEqual((try XCTUnwrap(body["ops"] as? [[String: Any]])).count, 0)
+                    try self.assertCommit(
+                        try XCTUnwrap(body["commit"] as? [String: Any]),
+                        fixture: fixture,
+                        author: Self.alice
+                    )
+                }
+
                 let excludedHeaders = try self.dpopHeaders(
                     token: oauth.token, key: oauth.key, jwk: oauth.jwk,
                     nonce: fixture.runtime.dpopNonceService.issue(),
