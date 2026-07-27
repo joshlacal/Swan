@@ -141,6 +141,81 @@ enum SwanPortableExportFilesystem {
         }
     }
 
+    static func openExistingOwnerOnlyDirectory(_ url: URL) throws -> Int32 {
+        try openArchiveRoot(url)
+    }
+
+    static func requireCurrentOwnerOnlyDirectory(
+        _ url: URL,
+        matches expectedDescriptor: Int32
+    ) throws {
+        let currentDescriptor = try openExistingOwnerOnlyDirectory(url)
+        defer { _ = close(currentDescriptor) }
+        var expected = stat()
+        var current = stat()
+        guard fstat(expectedDescriptor, &expected) == 0,
+              fstat(currentDescriptor, &current) == 0,
+              expected.st_dev == current.st_dev,
+              expected.st_ino == current.st_ino else {
+            throw SwanPortableExportError.publicationFailed
+        }
+    }
+
+    static func openOwnerOnlyDirectory(parent: Int32, name: String) throws -> Int32 {
+        try openDirectory(parent: parent, name: name)
+    }
+
+    static func openOrCreateOwnerOnlyDirectory(
+        parent: Int32,
+        name: String
+    ) throws -> (descriptor: Int32, created: Bool) {
+        guard isSafeComponent(name) else {
+            throw SwanPortableExportError.invalidPlacement
+        }
+        var metadata = stat()
+        if name.withCString({
+            fstatat(parent, $0, &metadata, AT_SYMLINK_NOFOLLOW)
+        }) == 0 {
+            return (try openDirectory(parent: parent, name: name), false)
+        }
+        guard errno == ENOENT else {
+            throw SwanPortableExportError.invalidPlacement
+        }
+        if name.withCString({ mkdirat(parent, $0, 0o700) }) == 0 {
+            do {
+                return (try openDirectory(parent: parent, name: name), true)
+            } catch {
+                _ = name.withCString { unlinkat(parent, $0, AT_REMOVEDIR) }
+                throw error
+            }
+        }
+        guard errno == EEXIST else {
+            throw SwanPortableExportError.publicationFailed
+        }
+        return (try openDirectory(parent: parent, name: name), false)
+    }
+
+    static func entryExists(parent: Int32, name: String) throws -> Bool {
+        guard isSafeComponent(name) else {
+            throw SwanPortableExportError.invalidPlacement
+        }
+        var metadata = stat()
+        if name.withCString({
+            fstatat(parent, $0, &metadata, AT_SYMLINK_NOFOLLOW)
+        }) == 0 {
+            return true
+        }
+        guard errno == ENOENT else {
+            throw SwanPortableExportError.invalidPlacement
+        }
+        return false
+    }
+
+    static func removeEmptyDirectory(parent: Int32, name: String) {
+        guard isSafeComponent(name) else { return }
+        _ = name.withCString { unlinkat(parent, $0, AT_REMOVEDIR) }
+    }
+
     static func createStagingDirectory(parent: Int32, name: String) throws -> Int32 {
         guard isSafeComponent(name),
               name.withCString({ mkdirat(parent, $0, 0o700) }) == 0 else {

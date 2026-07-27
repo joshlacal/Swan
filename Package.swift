@@ -228,10 +228,13 @@ let package = Package(
         .testTarget(
             name: "SwanCLITests",
             dependencies: [
-                "SwanAccounts", "SwanSQLite", "SwanStorage",
+                "SwanAccountExport", "SwanAccounts", "SwanPublicRepository",
+                "SwanSQLite", "SwanSpaces", "SwanStorage",
+                .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "Petrel", package: "Petrel"),
             ]
         ),
         .testTarget(

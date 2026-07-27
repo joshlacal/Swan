@@ -203,6 +203,14 @@ public enum SwanPortableExportManifestCodec {
 
 public enum SwanPortableExportVerifier {
     public static func verifyArchive(
+        at root: URL
+    ) throws -> SwanPortableArchiveVerification {
+        let descriptor = try SwanPortableExportFilesystem.openArchiveRoot(root)
+        defer { _ = close(descriptor) }
+        return try verifySelfContainedArchive(directoryDescriptor: descriptor)
+    }
+
+    public static func verifyArchive(
         at root: URL,
         signingPublicKey: P256.Signing.PublicKey
     ) throws -> SwanPortableExportManifest {
@@ -304,6 +312,52 @@ public enum SwanPortableExportVerifier {
         return manifest
     }
 
+    static func verifySelfContainedArchive(
+        directoryDescriptor: Int32
+    ) throws -> SwanPortableArchiveVerification {
+        try SwanPortableExportFilesystem.requireOwnerOnlyDirectory(directoryDescriptor)
+        let manifestData = try SwanPortableExportFilesystem.read(
+            path: "manifest.json",
+            root: directoryDescriptor,
+            maximumBytes: 4 * 1_024 * 1_024
+        )
+        let manifest = try SwanPortableExportManifestCodec.decode(manifestData)
+        guard manifest.includesPrivateKeys == false,
+              let historyEntry = manifest.files.first(where: {
+                  $0.type == .plcHistory && $0.path == "plc/history.json"
+              }),
+              manifest.files.filter({ $0.type == .plcHistory }).count == 1,
+              historyEntry.byteCount <= 64 * 1_024 else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        let historyData = try SwanPortableExportFilesystem.read(
+            path: historyEntry.path,
+            root: directoryDescriptor,
+            maximumBytes: 64 * 1_024
+        )
+        guard historyData.count == historyEntry.byteCount,
+              SwanPortableExportDigest.hex(historyData) == historyEntry.sha256 else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        let signingPublicKey = try bootstrapSigningPublicKey(
+            from: historyData,
+            expectedDID: manifest.did
+        )
+        let verifiedManifest = try verifyArchive(
+            directoryDescriptor: directoryDescriptor,
+            signingPublicKey: signingPublicKey
+        )
+        guard verifiedManifest == manifest,
+              verifiedManifest.includesPrivateKeys == false else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        return SwanPortableArchiveVerification(
+            manifest: verifiedManifest,
+            manifestSHA256: "sha256:\(SwanPortableExportDigest.hex(manifestData))",
+            signingPublicKey: signingPublicKey
+        )
+    }
+
     private static func validatePlacement(
         _ entry: SwanPortableExportFile,
         manifest: SwanPortableExportManifest
@@ -402,6 +456,67 @@ public enum SwanPortableExportVerifier {
         }
     }
 
+    private static func bootstrapSigningPublicKey(
+        from data: Data,
+        expectedDID: String
+    ) throws -> P256.Signing.PublicKey {
+        let expectedKeys = Set([
+            "format", "scope", "did", "operationCID", "operation",
+            "canonicalHandle", "pdsOrigin", "repositoryRevision",
+            "publicGenesisCommitCID", "signingKeyBinding",
+        ])
+        guard data.count <= 64 * 1_024,
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(object.keys) == expectedKeys,
+              object["format"] as? String == "swan-plc-history-v1",
+              object["scope"] as? String
+                == SwanPortableExportManifest.plcHistoryScopeValue,
+              object["signingKeyBinding"] as? String
+                == SwanPortableExportPLC.signingKeyBindingValue,
+              object["did"] as? String == expectedDID,
+              let operationObject = object["operation"] else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        let canonicalHistory = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        guard canonicalHistory == data else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        let operationData = try JSONSerialization.data(
+            withJSONObject: operationObject,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        let operation = try PLCOperationCodec.decodeSignedJSON(operationData)
+        try PLCOperationCodec.verifyGenesis(operation, expectedDID: expectedDID)
+        guard let regular = operation.regular,
+              let signingDIDKey = regular.verificationMethods["atproto"] else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        let canonicalDIDKey = try P256DIDKey(signingDIDKey)
+        guard canonicalDIDKey.value == signingDIDKey else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        return try canonicalDIDKey.publicKey
+    }
+
+}
+
+public struct SwanPortableArchiveVerification: Sendable {
+    public let manifest: SwanPortableExportManifest
+    public let manifestSHA256: String
+    public let signingPublicKey: P256.Signing.PublicKey
+
+    init(
+        manifest: SwanPortableExportManifest,
+        manifestSHA256: String,
+        signingPublicKey: P256.Signing.PublicKey
+    ) {
+        self.manifest = manifest
+        self.manifestSHA256 = manifestSHA256
+        self.signingPublicKey = signingPublicKey
+    }
 }
 
 public struct SwanPortableExportResult: Codable, Sendable, Equatable {

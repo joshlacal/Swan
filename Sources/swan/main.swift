@@ -282,12 +282,50 @@ struct SwanCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "swan",
         abstract: "Swift-native AT Protocol permissioned-data interoperability laboratory",
-        subcommands: [Serve.self, Account.self, Export.self, Verify.self, Lab.self],
+        subcommands: [
+            Serve.self, Account.self, Export.self, Restore.self, Verify.self, Lab.self,
+        ],
         defaultSubcommand: Verify.self
     )
 }
 
 extension SwanCommand {
+    struct Restore: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Verify and stage a portable logical account archive"
+        )
+
+        @Option(name: .long, help: "Existing owner-only Swan data directory")
+        var dataDirectory: String
+
+        @Option(name: .long, help: "Portable archive directory to verify and stage")
+        var inputDirectory: String
+
+        @Option(name: .long, help: "Owner-only mounted operator-secret file")
+        var operatorSecretFile: String
+
+        func run() async throws {
+            // Operator authority is resolved before either supplied directory
+            // is validated, standardized, opened, or otherwise probed.
+            _ = try AccountCommandSupport.authorization(
+                secretFilePath: operatorSecretFile
+            )
+            guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !inputDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ValidationError("portable restore failed")
+            }
+            do {
+                let result = try SwanPortableAccountRestoreStager().stage(
+                    archiveAt: URL(fileURLWithPath: inputDirectory),
+                    dataDirectory: URL(fileURLWithPath: dataDirectory)
+                )
+                try AccountCommandSupport.write(result)
+            } catch {
+                throw ValidationError("portable restore failed")
+            }
+        }
+    }
+
     struct Export: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
             abstract: "Write a checksummed portable logical export for one active account"

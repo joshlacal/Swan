@@ -577,6 +577,360 @@ final class SwanPortableExportTests: XCTestCase {
     }
 }
 
+final class SwanPortableRestoreTests: XCTestCase {
+    func testSelfContainedVerificationDerivesPLCSigningKeyAndRejectsCorruption() async throws {
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+
+        let verified = try SwanPortableExportVerifier.verifyArchive(at: fixture.root)
+        XCTAssertEqual(verified.manifest.did, fixture.did)
+        XCTAssertEqual(
+            verified.signingPublicKey.compressedRepresentation,
+            fixture.key.publicKey.compressedRepresentation
+        )
+        let manifestData = try Data(
+            contentsOf: fixture.root.appending(path: "manifest.json")
+        )
+        XCTAssertEqual(
+            verified.manifestSHA256,
+            "sha256:\(SwanPortableExportDigest.hex(manifestData))"
+        )
+
+        let crossed = try ArchiveFixture(crossedPLCSigningKey: true)
+        defer { crossed.remove() }
+        XCTAssertThrowsError(try SwanPortableExportVerifier.verifyArchive(at: crossed.root))
+
+        for type in [
+            SwanPortableExportFileType.publicCAR,
+            .spaceCAR,
+        ] {
+            let archive = try copiedArchive(fixture.root, named: type.rawValue)
+            defer { try? FileManager.default.removeItem(at: archive) }
+            let manifest = try manifest(at: archive)
+            let entry = try XCTUnwrap(manifest.files.first { $0.type == type })
+            let corrupted = Data("corrupted-\(type.rawValue)".utf8)
+            try corrupted.write(to: archive.appending(path: entry.path))
+            try rewriteManifestEntry(entry, data: corrupted, archive: archive)
+            XCTAssertThrowsError(
+                try SwanPortableExportVerifier.verifyArchive(at: archive),
+                "\(type.rawValue) corruption must fail after its checksum is replaced"
+            )
+        }
+
+        let exportedFixture = try await ExporterFixture()
+        defer { exportedFixture.remove() }
+        let exported = try await exportedFixture.export(named: "restore-source")
+        let exportedManifest = try manifest(at: exported.output)
+        let blobEntry = try XCTUnwrap(
+            exportedManifest.files.first { $0.type == .publicBlob }
+        )
+        let badBlob = Data("corrupted-blob".utf8)
+        try badBlob.write(to: exported.output.appending(path: blobEntry.path))
+        try rewriteManifestEntry(blobEntry, data: badBlob, archive: exported.output)
+        XCTAssertThrowsError(
+            try SwanPortableExportVerifier.verifyArchive(at: exported.output)
+        )
+
+        let noncanonical = try copiedArchive(fixture.root, named: "noncanonical")
+        defer { try? FileManager.default.removeItem(at: noncanonical) }
+        let manifestURL = noncanonical.appending(path: "manifest.json")
+        try (try Data(contentsOf: manifestURL) + Data("\n".utf8)).write(to: manifestURL)
+        XCTAssertThrowsError(try SwanPortableExportVerifier.verifyArchive(at: noncanonical))
+
+        let privateIndication = try copiedArchive(fixture.root, named: "private")
+        defer { try? FileManager.default.removeItem(at: privateIndication) }
+        let privateManifestURL = privateIndication.appending(path: "manifest.json")
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: privateManifestURL)
+            ) as? [String: Any]
+        )
+        object["includesPrivateKeys"] = true
+        try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        ).write(to: privateManifestURL)
+        XCTAssertThrowsError(
+            try SwanPortableExportVerifier.verifyArchive(at: privateIndication)
+        )
+    }
+
+    func testStagingCopiesExactVerifiedTreeWithOwnerOnlyModesAndNoActivationState() throws {
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+        let dataDirectory = try temporaryDirectory(named: "data")
+        defer { try? FileManager.default.removeItem(at: dataDirectory.deletingLastPathComponent()) }
+        let verification = try SwanPortableExportVerifier.verifyArchive(at: fixture.root)
+
+        let result = try SwanPortableAccountRestoreStager().stage(
+            archiveAt: fixture.root,
+            dataDirectory: dataDirectory
+        )
+
+        XCTAssertEqual(result.status, .staged)
+        XCTAssertEqual(result.did, verification.manifest.did)
+        XCTAssertEqual(result.canonicalHandle, verification.manifest.canonicalHandle)
+        XCTAssertEqual(result.fileCount, verification.manifest.files.count)
+        XCTAssertFalse(result.includesPrivateKeys)
+        XCTAssertEqual(result.manifestSHA256, verification.manifestSHA256)
+        XCTAssertEqual(result.profileID, "permissioned-data-0016-2026-07-03")
+        let staged = URL(fileURLWithPath: result.stagingDirectory)
+        XCTAssertEqual(try treeSnapshot(fixture.root), try treeSnapshot(staged))
+        _ = try SwanPortableExportVerifier.verifyArchive(at: staged)
+        XCTAssertEqual(try directoryMode(dataDirectory), 0o700)
+        XCTAssertEqual(
+            try directoryMode(dataDirectory.appending(path: "restore-staging")),
+            0o700
+        )
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dataDirectory.appending(path: "control.sqlite").path
+        ))
+        for forbidden in ["actors", "keys", "oauth", "sessions"] {
+            XCTAssertFalse(FileManager.default.fileExists(
+                atPath: dataDirectory.appending(path: forbidden).path
+            ))
+        }
+    }
+
+    func testInvalidSourceCreatesNoStateAndExistingStageIsIdempotentButOccupiedTargetsFail()
+        throws
+    {
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+        let root = try temporaryDirectory(named: "root")
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let invalid = try copiedArchive(fixture.root, named: "invalid-source")
+        defer { try? FileManager.default.removeItem(at: invalid) }
+        try Data("bad".utf8).write(to: invalid.appending(path: "public/repository.car"))
+
+        XCTAssertThrowsError(
+            try SwanPortableAccountRestoreStager().stage(
+                archiveAt: invalid,
+                dataDirectory: root
+            )
+        )
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appending(path: "restore-staging").path
+        ))
+
+        let first = try SwanPortableAccountRestoreStager().stage(
+            archiveAt: fixture.root,
+            dataDirectory: root
+        )
+        let before = try treeSnapshot(URL(fileURLWithPath: first.stagingDirectory))
+        let second = try SwanPortableAccountRestoreStager().stage(
+            archiveAt: fixture.root,
+            dataDirectory: root
+        )
+        XCTAssertEqual(second.status, .alreadyStaged)
+        XCTAssertEqual(
+            try treeSnapshot(URL(fileURLWithPath: second.stagingDirectory)),
+            before
+        )
+
+        try FileManager.default.removeItem(at: URL(fileURLWithPath: first.stagingDirectory))
+        try Data("occupied".utf8).write(to: URL(fileURLWithPath: first.stagingDirectory))
+        XCTAssertThrowsError(
+            try SwanPortableAccountRestoreStager().stage(
+                archiveAt: fixture.root,
+                dataDirectory: root
+            )
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: URL(fileURLWithPath: first.stagingDirectory)),
+            Data("occupied".utf8)
+        )
+
+        try FileManager.default.removeItem(at: URL(fileURLWithPath: first.stagingDirectory))
+        let symlinkTarget = root.appending(path: "symlink-target")
+        try FileManager.default.createDirectory(
+            at: symlinkTarget,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try FileManager.default.createSymbolicLink(
+            atPath: first.stagingDirectory,
+            withDestinationPath: symlinkTarget.path
+        )
+        XCTAssertThrowsError(
+            try SwanPortableAccountRestoreStager().stage(
+                archiveAt: fixture.root,
+                dataDirectory: root
+            )
+        )
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: symlinkTarget.path), [])
+    }
+
+    func testPostRenamePreSyncFailureCleansInstalledStageAndAllowsRetry() throws {
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+        let dataDirectory = try temporaryDirectory(named: "fault-data")
+        defer { try? FileManager.default.removeItem(at: dataDirectory.deletingLastPathComponent()) }
+        let verification = try SwanPortableExportVerifier.verifyArchive(at: fixture.root)
+        let hash = String(verification.manifestSHA256.dropFirst("sha256:".count))
+        let installed = dataDirectory
+            .appending(path: "restore-staging")
+            .appending(path: hash)
+
+        XCTAssertThrowsError(
+            try SwanPortableAccountRestoreStager(afterRenameBeforeParentSync: {
+                throw SwanPortableExportError.publicationFailed
+            }).stage(archiveAt: fixture.root, dataDirectory: dataDirectory)
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: installed.path))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dataDirectory.appending(path: "restore-staging").path
+        ))
+
+        let retried = try SwanPortableAccountRestoreStager().stage(
+            archiveAt: fixture.root,
+            dataDirectory: dataDirectory
+        )
+        XCTAssertEqual(retried.status, .staged)
+        _ = try SwanPortableExportVerifier.verifyArchive(
+            at: URL(fileURLWithPath: retried.stagingDirectory)
+        )
+    }
+
+    func testDataDirectoryMustAlreadyBeAnOwnerOnlyUnlinkedDirectory() throws {
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+        let parent = try temporaryDirectory(named: "placement-parent")
+        defer { try? FileManager.default.removeItem(at: parent.deletingLastPathComponent()) }
+        let missing = parent.appending(path: "missing")
+        XCTAssertThrowsError(
+            try SwanPortableAccountRestoreStager().stage(
+                archiveAt: fixture.root,
+                dataDirectory: missing
+            )
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path))
+
+        let broad = parent.appending(path: "broad")
+        try FileManager.default.createDirectory(
+            at: broad,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o755]
+        )
+        XCTAssertThrowsError(
+            try SwanPortableAccountRestoreStager().stage(
+                archiveAt: fixture.root,
+                dataDirectory: broad
+            )
+        )
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: broad.path), [])
+
+        let target = parent.appending(path: "target")
+        let linked = parent.appending(path: "linked")
+        try FileManager.default.createDirectory(
+            at: target,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try FileManager.default.createSymbolicLink(
+            atPath: linked.path,
+            withDestinationPath: target.path
+        )
+        XCTAssertThrowsError(
+            try SwanPortableAccountRestoreStager().stage(
+                archiveAt: fixture.root,
+                dataDirectory: linked
+            )
+        )
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: target.path), [])
+    }
+
+    private func temporaryDirectory(named name: String) throws -> URL {
+        let parent = FileManager.default.temporaryDirectory
+            .appending(path: "SwanPortableRestore-\(UUID().uuidString)")
+        let directory = parent.appending(path: name)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: parent.path
+        )
+        return directory
+    }
+
+    private func copiedArchive(_ source: URL, named name: String) throws -> URL {
+        let output = source.deletingLastPathComponent()
+            .appending(path: "SwanPortableRestore-\(name)-\(UUID().uuidString)")
+        try FileManager.default.copyItem(at: source, to: output)
+        return output
+    }
+
+    private func manifest(at archive: URL) throws -> SwanPortableExportManifest {
+        try SwanPortableExportManifestCodec.decode(
+            Data(contentsOf: archive.appending(path: "manifest.json"))
+        )
+    }
+
+    private func rewriteManifestEntry(
+        _ replaced: SwanPortableExportFile,
+        data: Data,
+        archive: URL
+    ) throws {
+        let current = try manifest(at: archive)
+        let files = try current.files.map { entry in
+            guard entry.path == replaced.path else { return entry }
+            return try SwanPortableExportFile(
+                path: entry.path,
+                byteCount: data.count,
+                sha256: SwanPortableExportDigest.hex(data),
+                type: entry.type
+            )
+        }
+        let rewritten = try SwanPortableExportManifest(
+            profileID: current.profileID,
+            did: current.did,
+            canonicalHandle: current.canonicalHandle,
+            createdAt: current.createdAt,
+            files: files
+        )
+        try SwanPortableExportManifestCodec.encode(rewritten).write(
+            to: archive.appending(path: "manifest.json")
+        )
+    }
+
+    private func directoryMode(_ url: URL) throws -> UInt16 {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        return (attributes[.posixPermissions] as? NSNumber)?.uint16Value ?? 0
+    }
+
+    private func treeSnapshot(_ root: URL) throws -> [String: Data] {
+        var output: [String: Data] = [:]
+        try collectTree(root: root, relative: "", output: &output)
+        return output
+    }
+
+    private func collectTree(
+        root: URL,
+        relative: String,
+        output: inout [String: Data]
+    ) throws {
+        for name in try FileManager.default.contentsOfDirectory(atPath: root.path).sorted() {
+            let url = root.appending(path: name)
+            let childRelative = relative.isEmpty ? name : "\(relative)/\(name)"
+            let values = try url.resourceValues(
+                forKeys: [.isDirectoryKey, .isRegularFileKey]
+            )
+            let mode = try directoryMode(url)
+            if values.isDirectory == true {
+                output[childRelative] = Data("directory:\(mode)".utf8)
+                try collectTree(root: url, relative: childRelative, output: &output)
+            } else if values.isRegularFile == true {
+                var value = Data("file:\(mode):".utf8)
+                value.append(try Data(contentsOf: url))
+                output[childRelative] = value
+            }
+        }
+    }
+}
+
 private struct ExporterFixture {
     let root: URL
     let database: SQLiteAccountDatabase
