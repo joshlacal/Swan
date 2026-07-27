@@ -140,30 +140,213 @@ final class PLCClientTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(try await client.fetchAudit(did: fixture.did))
     }
 
-    private func operationFixture() throws -> (did: String, operation: PLCSignedOperation) {
+    func testAuditReconstructsHigherPriorityRecoveryWithoutTrustingNullifiedFlags() async throws {
+        let highAuthority = rotationKey
+        let lowAuthority = try P256.Signing.PrivateKey(
+            rawRepresentation: Data(repeating: 10, count: 32)
+        )
+        let fixture = try operationFixture(rotationKeys: [highAuthority, lowAuthority])
+        let disputed = try update(
+            previous: fixture.operation,
+            signer: lowAuthority,
+            rotationKeys: [lowAuthority],
+            pdsOrigin: "https://disputed.example.com"
+        )
+        let recovered = try update(
+            previous: fixture.operation,
+            signer: highAuthority,
+            rotationKeys: [highAuthority],
+            pdsOrigin: "https://recovered.example.com"
+        )
+        let audit = try auditJSON(
+            did: fixture.did,
+            operations: [fixture.operation, disputed, recovered],
+            timestamps: [
+                "2026-07-20T12:00:00.000Z",
+                "2026-07-27T12:00:00.000Z",
+                "2026-07-27T13:00:00.000Z",
+            ],
+            claimedNullified: [true, false, true]
+        )
+        let stateData = try documentDataJSON(did: fixture.did, operation: recovered)
+        let transport = RecordingPLCTransport(responses: [
+            jsonResponse(audit),
+            jsonResponse(stateData), jsonResponse(audit),
+        ])
+        let client = try PLCDirectoryClient(
+            configuration: .production(origin: URL(string: "https://plc.example.com")!),
+            transport: transport
+        )
+
+        let entries = try await client.fetchAudit(did: fixture.did)
+        XCTAssertEqual(entries.map(\.nullified), [false, true, false])
+        let state = try await client.fetchState(did: fixture.did)
+        XCTAssertEqual(
+            state.services["atproto_pds"]?.endpoint,
+            "https://recovered.example.com"
+        )
+    }
+
+    func testAuditRejectsLowerPriorityForkEvenWhenDirectoryFlagsItCurrent() async throws {
+        let highAuthority = rotationKey
+        let lowAuthority = try P256.Signing.PrivateKey(
+            rawRepresentation: Data(repeating: 10, count: 32)
+        )
+        let fixture = try operationFixture(rotationKeys: [highAuthority, lowAuthority])
+        let highUpdate = try update(
+            previous: fixture.operation,
+            signer: highAuthority,
+            rotationKeys: [highAuthority],
+            pdsOrigin: "https://authoritative.example.com"
+        )
+        let lowerFork = try update(
+            previous: fixture.operation,
+            signer: lowAuthority,
+            rotationKeys: [lowAuthority],
+            pdsOrigin: "https://lower.example.com"
+        )
+        let audit = try auditJSON(
+            did: fixture.did,
+            operations: [fixture.operation, highUpdate, lowerFork],
+            timestamps: [
+                "2026-07-20T12:00:00.000Z",
+                "2026-07-27T12:00:00.000Z",
+                "2026-07-27T13:00:00.000Z",
+            ],
+            claimedNullified: [false, true, false]
+        )
+        let transport = RecordingPLCTransport(responses: [jsonResponse(audit)])
+        let client = try PLCDirectoryClient(
+            configuration: .production(origin: URL(string: "https://plc.example.com")!),
+            transport: transport
+        )
+
+        await XCTAssertThrowsErrorAsync(try await client.fetchAudit(did: fixture.did))
+    }
+
+    func testAuditEnforcesRecoveryWindowExactTimestampsAndMonotonicOrder() async throws {
+        let highAuthority = rotationKey
+        let lowAuthority = try P256.Signing.PrivateKey(
+            rawRepresentation: Data(repeating: 10, count: 32)
+        )
+        let fixture = try operationFixture(rotationKeys: [highAuthority, lowAuthority])
+        let disputed = try update(
+            previous: fixture.operation,
+            signer: lowAuthority,
+            rotationKeys: [lowAuthority],
+            pdsOrigin: "https://disputed.example.com"
+        )
+        let recovered = try update(
+            previous: fixture.operation,
+            signer: highAuthority,
+            rotationKeys: [highAuthority],
+            pdsOrigin: "https://recovered.example.com"
+        )
+        let boundaryAudit = try auditJSON(
+            did: fixture.did,
+            operations: [fixture.operation, disputed, recovered],
+            timestamps: [
+                "2026-07-20T12:00:00.000Z",
+                "2026-07-23T12:00:00.000Z",
+                "2026-07-26T12:00:00.000Z",
+            ]
+        )
+        let boundaryTransport = RecordingPLCTransport(responses: [
+            jsonResponse(boundaryAudit),
+        ])
+        let boundaryClient = try PLCDirectoryClient(
+            configuration: .production(origin: URL(string: "https://plc.example.com")!),
+            transport: boundaryTransport
+        )
+        let boundaryEntries = try await boundaryClient.fetchAudit(did: fixture.did)
+        XCTAssertEqual(boundaryEntries.map(\.nullified), [false, true, false])
+
+        let invalidTimestamps = [
+            [
+                "2026-07-20T12:00:00.000Z",
+                "2026-07-23T12:00:00.000Z",
+                "2026-07-26T12:00:00.001Z",
+            ],
+            [
+                "2026-07-20T12:00:00.000Z",
+                "2026-07-23T12:00:00Z",
+                "2026-07-23T13:00:00.000Z",
+            ],
+            [
+                "2026-07-20T12:00:00.000Z",
+                "2026-07-23T12:00:01.000Z",
+                "2026-07-23T12:00:00.000Z",
+            ],
+        ]
+        for timestamps in invalidTimestamps {
+            let audit = try auditJSON(
+                did: fixture.did,
+                operations: [fixture.operation, disputed, recovered],
+                timestamps: timestamps
+            )
+            let transport = RecordingPLCTransport(responses: [jsonResponse(audit)])
+            let client = try PLCDirectoryClient(
+                configuration: .production(origin: URL(string: "https://plc.example.com")!),
+                transport: transport
+            )
+            await XCTAssertThrowsErrorAsync(try await client.fetchAudit(did: fixture.did))
+        }
+    }
+
+    private func operationFixture(
+        rotationKeys: [P256.Signing.PrivateKey]? = nil
+    ) throws -> (did: String, operation: PLCSignedOperation) {
+        let rotationKeys = rotationKeys ?? [rotationKey]
         let unsigned = try PLCATProfile.regularOperation(
             handle: "alice.example.com",
             signingPublicKey: signingKey.publicKey,
-            rotationPublicKeys: [rotationKey.publicKey],
+            rotationPublicKeys: rotationKeys.map(\.publicKey),
             pdsOrigin: URL(string: "https://pds.example.com")!,
             prev: nil
         )
-        let signed = try PLCOperationCodec.sign(.regular(unsigned), using: rotationKey)
+        let signed = try PLCOperationCodec.sign(.regular(unsigned), using: rotationKeys[0])
         return (try PLCOperationCodec.genesisDID(for: signed), signed)
+    }
+
+    private func update(
+        previous: PLCSignedOperation,
+        signer: P256.Signing.PrivateKey,
+        rotationKeys: [P256.Signing.PrivateKey],
+        pdsOrigin: String
+    ) throws -> PLCSignedOperation {
+        let unsigned = try PLCATProfile.regularOperation(
+            handle: "alice.example.com",
+            signingPublicKey: signingKey.publicKey,
+            rotationPublicKeys: rotationKeys.map(\.publicKey),
+            pdsOrigin: URL(string: pdsOrigin)!,
+            prev: previous.cid.string
+        )
+        return try PLCOperationCodec.sign(.regular(unsigned), using: signer)
     }
 
     private func auditJSON(did: String, operation: PLCSignedOperation) throws -> Data {
         try auditJSON(did: did, operations: [operation])
     }
 
-    private func auditJSON(did: String, operations: [PLCSignedOperation]) throws -> Data {
+    private func auditJSON(
+        did: String,
+        operations: [PLCSignedOperation],
+        timestamps: [String]? = nil,
+        claimedNullified: [Bool]? = nil
+    ) throws -> Data {
+        if let timestamps {
+            XCTAssertEqual(timestamps.count, operations.count)
+        }
+        if let claimedNullified {
+            XCTAssertEqual(claimedNullified.count, operations.count)
+        }
         let entries = try operations.enumerated().map { index, operation -> [String: Any] in
             [
                 "did": did,
                 "operation": try JSONSerialization.jsonObject(with: operation.canonicalJSON),
                 "cid": try operation.cid.string,
-                "nullified": false,
-                "createdAt": "2026-07-27T12:00:0\(index).000Z",
+                "nullified": claimedNullified?[index] ?? false,
+                "createdAt": timestamps?[index] ?? "2026-07-27T12:00:0\(index).000Z",
             ]
         }
         return try JSONSerialization.data(withJSONObject: entries, options: [.sortedKeys])

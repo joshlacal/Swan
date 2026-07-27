@@ -424,8 +424,14 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
               rawEntries.count <= 10_000 else {
             throw SwanError.malformed("PLC audit log is malformed")
         }
-        var entries = [PLCAuditEntry]()
-        var byCID = [String: PLCAuditEntry]()
+        struct ValidatedEntry {
+            let entry: PLCAuditEntry
+            let createdAt: Date
+        }
+
+        var entries = [ValidatedEntry]()
+        var seenCIDs = Set<String>()
+        var previousCreatedAt: Date?
         for raw in rawEntries {
             guard Set(raw.keys) == ["did", "operation", "cid", "nullified", "createdAt"],
                   let did = raw["did"] as? String,
@@ -433,9 +439,10 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
                   let operationObject = raw["operation"],
                   JSONSerialization.isValidJSONObject(operationObject),
                   let cidText = raw["cid"] as? String,
-                  let nullified = raw["nullified"] as? Bool,
+                  raw["nullified"] is Bool,
                   let createdAt = raw["createdAt"] as? String,
-                  isCanonicalTimestamp(createdAt) else {
+                  let createdAtDate = canonicalTimestampDate(createdAt),
+                  previousCreatedAt.map({ createdAtDate >= $0 }) ?? true else {
                 throw SwanError.malformed("PLC audit entry is malformed")
             }
             let operationData = try JSONSerialization.data(
@@ -449,48 +456,106 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
                   cid.multihash.algorithm == Multihash.sha256Code,
                   cid.multihash.length == Multihash.sha256Length,
                   try operation.cid.string == cidText,
-                  byCID[cidText] == nil else {
+                  seenCIDs.insert(cidText).inserted else {
                 throw SwanError.unauthorized("PLC audit operation CID is invalid")
             }
             let entry = PLCAuditEntry(
                 did: did,
                 operation: operation,
                 cid: cidText,
-                nullified: nullified,
+                nullified: false,
                 createdAt: createdAt
             )
-            if let prev = operation.prev {
-                guard let parent = byCID[prev],
-                      let rotationKeys = parent.operation.regular?.rotationKeys else {
-                    throw SwanError.unauthorized("PLC audit operation prev is invalid")
-                }
-                try PLCOperationCodec.verify(operation, authorizedRotationKeys: rotationKeys)
-            } else {
-                guard byCID.isEmpty else {
-                    throw SwanError.unauthorized("PLC audit contains multiple genesis operations")
+            if entries.isEmpty {
+                guard operation.prev == nil else {
+                    throw SwanError.unauthorized("PLC audit does not start with genesis")
                 }
                 try PLCOperationCodec.verifyGenesis(operation, expectedDID: expectedDID)
+            } else if operation.prev == nil {
+                throw SwanError.unauthorized("PLC audit contains multiple genesis operations")
             }
-            entries.append(entry)
-            byCID[cidText] = entry
+            entries.append(.init(entry: entry, createdAt: createdAtDate))
+            previousCreatedAt = createdAtDate
         }
-        let active = entries.filter { !$0.nullified }
-        guard !active.isEmpty else {
-            throw SwanError.unauthorized("PLC audit has no active operation")
-        }
-        for (previous, next) in zip(active, active.dropFirst()) {
-            guard next.operation.prev == previous.cid else {
-                throw SwanError.unauthorized("PLC active audit chain is discontinuous")
+
+        var activeIndices = [0]
+        for proposedIndex in entries.indices.dropFirst() {
+            let proposed = entries[proposedIndex]
+            guard let proposedPrev = proposed.entry.operation.prev,
+                  let parentPosition = activeIndices.firstIndex(where: {
+                      entries[$0].entry.cid == proposedPrev
+                  }),
+                  let parentOperation = entries[activeIndices[parentPosition]]
+                  .entry.operation.regular else {
+                throw SwanError.unauthorized("PLC audit operation prev is not active")
             }
+            let rotationKeys = parentOperation.rotationKeys
+            if parentPosition == activeIndices.count - 1 {
+                _ = try PLCOperationCodec.verify(
+                    proposed.entry.operation,
+                    authorizedRotationKeys: rotationKeys
+                )
+                activeIndices.append(proposedIndex)
+                continue
+            }
+
+            let firstDisputed = entries[activeIndices[parentPosition + 1]]
+            let disputedSignerIndex = try PLCOperationCodec.verify(
+                firstDisputed.entry.operation,
+                authorizedRotationKeys: rotationKeys
+            )
+            guard disputedSignerIndex > 0 else {
+                throw SwanError.unauthorized(
+                    "PLC recovery cannot supersede an equal-authority operation"
+                )
+            }
+            _ = try PLCOperationCodec.verify(
+                proposed.entry.operation,
+                authorizedRotationKeys: Array(rotationKeys[..<disputedSignerIndex])
+            )
+            let recoveryAge = proposed.createdAt.timeIntervalSince(firstDisputed.createdAt)
+            guard recoveryAge >= 0, recoveryAge <= 72 * 60 * 60 else {
+                throw SwanError.unauthorized("PLC recovery exceeds the 72-hour window")
+            }
+            activeIndices.removeSubrange((parentPosition + 1)...)
+            activeIndices.append(proposedIndex)
         }
-        return entries
+
+        let activeCIDs = Set(activeIndices.map { entries[$0].entry.cid })
+        return entries.map { validated in
+            PLCAuditEntry(
+                did: validated.entry.did,
+                operation: validated.entry.operation,
+                cid: validated.entry.cid,
+                nullified: !activeCIDs.contains(validated.entry.cid),
+                createdAt: validated.entry.createdAt
+            )
+        }
     }
 
-    private func isCanonicalTimestamp(_ value: String) -> Bool {
-        guard value.utf8.count <= 64, value.hasSuffix("Z") else { return false }
+    private func canonicalTimestampDate(_ value: String) -> Date? {
+        let bytes = Array(value.utf8)
+        guard bytes.count == 24,
+              bytes[4] == UInt8(ascii: "-"),
+              bytes[7] == UInt8(ascii: "-"),
+              bytes[10] == UInt8(ascii: "T"),
+              bytes[13] == UInt8(ascii: ":"),
+              bytes[16] == UInt8(ascii: ":"),
+              bytes[19] == UInt8(ascii: "."),
+              bytes[23] == UInt8(ascii: "Z"),
+              bytes.enumerated().allSatisfy({ index, byte in
+                  [4, 7, 10, 13, 16, 19, 23].contains(index) ||
+                      (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+              }) else {
+            return nil
+        }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: value) != nil
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        guard let date = formatter.date(from: value), formatter.string(from: date) == value else {
+            return nil
+        }
+        return date
     }
 }
 

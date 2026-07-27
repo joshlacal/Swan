@@ -7,7 +7,9 @@ public struct P256DIDKey: Sendable, Equatable, Hashable, Codable {
     public let value: String
 
     public init(publicKey: P256.Signing.PublicKey) {
-        value = "did:key:z" + Base58BTC.encode(Data([0x80, 0x24]) + publicKey.x963Representation)
+        value = "did:key:z" + Base58BTC.encode(
+            Data([0x80, 0x24]) + publicKey.compressedRepresentation
+        )
     }
 
     public init(_ value: String) throws {
@@ -17,12 +19,17 @@ public struct P256DIDKey: Sendable, Equatable, Hashable, Codable {
         let encoded = String(value.dropFirst("did:key:z".count))
         let decoded = try Base58BTC.decode(encoded)
         guard Base58BTC.encode(decoded) == encoded,
-              decoded.count == 67,
+              decoded.count == 35,
               decoded.prefix(2) == Data([0x80, 0x24]) else {
             throw SwanError.invalidIdentifier("P-256 did:key")
         }
         do {
-            _ = try P256.Signing.PublicKey(x963Representation: decoded.dropFirst(2))
+            let publicKey = try P256.Signing.PublicKey(
+                compressedRepresentation: decoded.dropFirst(2)
+            )
+            guard publicKey.compressedRepresentation == decoded.dropFirst(2) else {
+                throw SwanError.invalidIdentifier("P-256 did:key")
+            }
         } catch {
             throw SwanError.invalidIdentifier("P-256 did:key")
         }
@@ -32,7 +39,9 @@ public struct P256DIDKey: Sendable, Equatable, Hashable, Codable {
     public var publicKey: P256.Signing.PublicKey {
         get throws {
             let decoded = try Base58BTC.decode(String(value.dropFirst("did:key:z".count)))
-            return try P256.Signing.PublicKey(x963Representation: decoded.dropFirst(2))
+            return try P256.Signing.PublicKey(
+                compressedRepresentation: decoded.dropFirst(2)
+            )
         }
     }
 
@@ -266,13 +275,13 @@ public enum PLCOperationCodec {
               let regular = operation.regular else {
             throw SwanError.unauthorized("PLC genesis DID does not match operation")
         }
-        try verify(operation, authorizedRotationKeys: regular.rotationKeys)
+        _ = try verify(operation, authorizedRotationKeys: regular.rotationKeys)
     }
 
     public static func verify(
         _ operation: PLCSignedOperation,
         authorizedRotationKeys: [String]
-    ) throws {
+    ) throws -> Int {
         try validateSigned(operation)
         guard Set(authorizedRotationKeys).count == authorizedRotationKeys.count,
               !authorizedRotationKeys.isEmpty,
@@ -287,10 +296,10 @@ public enum PLCOperationCodec {
         let signatureBytes = try decodeCanonicalSignature(signatureText)
         let signature = try P256WireSignature.decodeCanonical(signatureBytes)
         let signingBytes = try operation.signingDAGCBOR
-        for keyText in authorizedRotationKeys {
+        for (index, keyText) in authorizedRotationKeys.enumerated() {
             let key = try P256DIDKey(keyText)
             if try key.publicKey.isValidSignature(signature, for: signingBytes) {
-                return
+                return index
             }
         }
         throw SwanError.unauthorized("PLC operation signature is invalid")

@@ -9,20 +9,24 @@ final class PLCOperationTests: XCTestCase {
     private let privateKey = try! P256.Signing.PrivateKey(rawRepresentation: Data(repeating: 7, count: 32))
     private let rotationKey = try! P256.Signing.PrivateKey(rawRepresentation: Data(repeating: 9, count: 32))
 
-    func testP256DIDKeyRoundTripsAnUncompressedPointCanonically() throws {
+    func testP256DIDKeyMatchesPinnedTypeScriptCompressedGoldenAndRoundTrips() throws {
         let encoded = P256DIDKey(publicKey: privateKey.publicKey)
-        XCTAssertTrue(encoded.value.hasPrefix("did:key:z"))
+        XCTAssertEqual(
+            encoded.value,
+            "did:key:zDnaejgmAHMLkBPMBWnkBxyGxpXx8LgE4WJAYDhwZzyoRAddF"
+        )
         XCTAssertEqual(try P256DIDKey(encoded.value).publicKey.x963Representation, privateKey.publicKey.x963Representation)
         XCTAssertEqual(try P256DIDKey(encoded.value).value, encoded.value)
     }
 
-    func testP256DIDKeyRejectsWrongCodecCompressedPointAndNonCanonicalBase58() throws {
+    func testP256DIDKeyRejectsWrongCodecUncompressedPointAndNonCanonicalBase58() throws {
         let valid = P256DIDKey(publicKey: privateKey.publicKey).value
         for malformed in [
             valid.replacingOccurrences(of: "did:key:z", with: "did:key:x"),
             "did:key:z\(String(valid.dropFirst("did:key:z".count)).uppercased())",
             "did:key:z1\(valid.dropFirst("did:key:z".count))",
             "did:key:z6MkiTBz1yXLP7QKgQDeq5DgxdBdXKvg8u3Yu1B7S5K6M2HTh",
+            "did:key:z4oJ8aP4p91UJupm9qqYqdmqYucG7LvoPBydLL1FY5JhmF6gqCeLRyBYB7vM7GXKPyhujKbVUqZh9gQ5rvuz49hchqusY",
         ] {
             XCTAssertThrowsError(try P256DIDKey(malformed), malformed)
         }
@@ -74,10 +78,10 @@ final class PLCOperationTests: XCTestCase {
             try PLCOperationCodec.decodeSignedJSON(signed.canonicalJSON).canonicalDAGCBOR
         )
         XCTAssertEqual(try signed.cid, CID.fromDAGCBOR(try signed.canonicalDAGCBOR))
-        XCTAssertEqual(try signed.cid.string, "bafyreiejo3xa7iuwoibp3avpa4p24mwn3izptepwieek52zokh4udor7mm")
+        XCTAssertEqual(try signed.cid.string, "bafyreig2iwkavnqsibui4muzj7bbs5rnpxf332w3fgdzyusjkaqoxp7xfq")
         XCTAssertEqual(try PLCOperationCodec.genesisDID(for: signed).count, 32)
-        XCTAssertEqual(try PLCOperationCodec.genesisDID(for: signed), "did:plc:rf3o4d5cszzaf7mcv4dr7lrs")
-        XCTAssertNoThrow(try PLCOperationCodec.verifyGenesis(signed, expectedDID: "did:plc:rf3o4d5cszzaf7mcv4dr7lrs"))
+        XCTAssertEqual(try PLCOperationCodec.genesisDID(for: signed), "did:plc:3jczicvwcjagrdrstfh4eglw")
+        XCTAssertNoThrow(try PLCOperationCodec.verifyGenesis(signed, expectedDID: "did:plc:3jczicvwcjagrdrstfh4eglw"))
     }
 
     func testSigningBytesOmitSignatureAndGenesisPrevIsExplicitNull() throws {
@@ -99,10 +103,13 @@ final class PLCOperationTests: XCTestCase {
             prev: genesis.cid.string
         )
         let signedUpdate = try PLCOperationCodec.sign(.regular(update), using: rotationKey)
-        XCTAssertNoThrow(try PLCOperationCodec.verify(
+        XCTAssertEqual(try PLCOperationCodec.verify(
             signedUpdate,
-            authorizedRotationKeys: [P256DIDKey(publicKey: rotationKey.publicKey).value]
-        ))
+            authorizedRotationKeys: [
+                P256DIDKey(publicKey: privateKey.publicKey).value,
+                P256DIDKey(publicKey: rotationKey.publicKey).value,
+            ]
+        ), 1)
         for invalid in [
             CID.fromBlob(Data("wrong-codec".utf8)).string,
             try genesis.cid.string.uppercased(),
@@ -201,7 +208,7 @@ final class PLCOperationTests: XCTestCase {
         )
     }
 
-    private static let goldenOperationJSON = #"{"alsoKnownAs":["at://alice.example.com"],"prev":null,"rotationKeys":["did:key:z4oJ8c3SwqK6YFxawzoJzpyj31PG4LjWV3KPQrsQsoMjnSYZnqgCPk6525x4Rxd3h7qzwDLooRzGSxt2SQ2HAnRDCfcCT"],"services":{"atproto_pds":{"endpoint":"https://pds.example.com","type":"AtprotoPersonalDataServer"}},"sig":"VuF50Qe68B6FlsZ0YXq7iZwSoO1Y-DUbCjKcs99SBJoVl6LHIPw4iIfaTEmyKkLfNoamzWBLqVP_3uCGa90iuw","type":"plc_operation","verificationMethods":{"atproto":"did:key:z4oJ8aP4p91UJupm9qqYqdmqYucG7LvoPBydLL1FY5JhmF6gqCeLRyBYB7vM7GXKPyhujKbVUqZh9gQ5rvuz49hchqusY"}}"#
+    private static let goldenOperationJSON = #"{"alsoKnownAs":["at://alice.example.com"],"prev":null,"rotationKeys":["did:key:zDnaeY3trVxVedZS1deaj8NG4QRMu5yrkGMAmcq4VWMckY7fA"],"services":{"atproto_pds":{"endpoint":"https://pds.example.com","type":"AtprotoPersonalDataServer"}},"sig":"9iRdVfzU6ADbVi3zm0V5Qephpl3Dae5odEdDhUBV8aA2TdS1kezQ_9E1YFevVRGE451G_Rdg514dat4ckLGVQg","type":"plc_operation","verificationMethods":{"atproto":"did:key:zDnaejgmAHMLkBPMBWnkBxyGxpXx8LgE4WJAYDhwZzyoRAddF"}}"#
 
     private func highSSignature(from canonical: Data) -> Data {
         let order = [UInt8]([
