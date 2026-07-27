@@ -171,6 +171,10 @@ public struct SwanHTTPServer: Sendable {
     /// closed until a startup-preopened repository directory and narrow
     /// account-key commit signer are both explicitly configured.
     public let authenticatedSpaceRepositorySync: SwanAuthenticatedSpaceRepositorySyncCapability?
+    /// Private, descriptor-streamed permissioned blob reads.  This remains
+    /// closed unless the startup directory exposes the dedicated blob
+    /// projection; it is intentionally independent of public blob routes.
+    public let authenticatedSpaceBlobs: SwanAuthenticatedSpaceBlobCapability?
 
     public init(
         profile: ProtocolProfile,
@@ -303,6 +307,24 @@ public struct SwanHTTPServer: Sendable {
             } else {
                 authenticatedSpaceRepositorySync = nil
             }
+            if let blobDirectory = authenticatedGetSpaceDirectory
+                as? any AuthorizedSpaceBlobDirectory {
+                let credentialVerifier: (any SpaceCredentialAuthorizationVerifier)?
+                if let spaceCredentialConfiguration {
+                    credentialVerifier = DurableSpaceCredentialVerifier(
+                        publicKeys: spaceCredentialConfiguration.credentialPublicKeys
+                    )
+                } else {
+                    credentialVerifier = nil
+                }
+                authenticatedSpaceBlobs = SwanAuthenticatedSpaceBlobCapability(
+                    authorizer: authorizer,
+                    directory: blobDirectory,
+                    credentialAuthorizer: credentialVerifier
+                )
+            } else {
+                authenticatedSpaceBlobs = nil
+            }
         } else {
             authenticatedGetSpace = nil
             authenticatedSpaceRecords = nil
@@ -310,6 +332,7 @@ public struct SwanHTTPServer: Sendable {
             authenticatedSpaceCredentialExchange = nil
             authenticatedSpaceDelegationMinting = nil
             authenticatedSpaceRepositorySync = nil
+            authenticatedSpaceBlobs = nil
         }
     }
 
@@ -451,6 +474,12 @@ public struct SwanHTTPServer: Sendable {
                 registerAuthenticatedGetRepoEndpoint(
                     on: router,
                     capability: authenticatedSpaceRepositorySync
+                )
+            } else if descriptor.nsid == ComAtprotoSpaceGetBlob.typeIdentifier,
+                      let authenticatedSpaceBlobs {
+                registerAuthenticatedGetSpaceBlobEndpoint(
+                    on: router,
+                    capability: authenticatedSpaceBlobs
                 )
             } else if let authenticatedSimpleSpaceLifecycle,
                       Self.isSimpleSpaceLifecycleMethod(descriptor.nsid) {

@@ -1,3 +1,4 @@
+import Crypto
 import Foundation
 import Petrel
 import SQLiteNIO
@@ -1295,6 +1296,19 @@ final class SwanSQLiteTests: XCTestCase {
             payload,
             namespace: .space(fixture.space)
         )
+        let canonical = try CID.parse(spaceReference.cid)
+        XCTAssertEqual(canonical.codec, .raw)
+        XCTAssertEqual(canonical, CID.fromBlob(payload))
+        let privateCASPath = SQLiteLayout.accountDatabase(
+            in: fixture.root,
+            did: fixture.author
+        )
+        .deletingLastPathComponent()
+        .appending(path: "permissioned-blob-cas")
+        .appending(path: Hex.encode(SHA256.hash(data: Data(fixture.author.utf8))))
+        .appending(path: String(Hex.encode(canonical.multihash.digest).prefix(2)))
+        .appending(path: "\(Hex.encode(canonical.multihash.digest)).blob")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: privateCASPath.path))
         let privateAsPublic = try await database!.publicBlobData(
             cid: spaceReference.cid
         )
@@ -1337,6 +1351,573 @@ final class SwanSQLiteTests: XCTestCase {
         XCTAssertNil(removedPublic)
         let retainedPrivate = try await blobStore.data(for: spaceReference)
         XCTAssertEqual(retainedPrivate, payload)
+
+        // The physical CAS entry is shared across namespace references but
+        // cannot be reclaimed while the permissioned reference remains.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: privateCASPath.path))
+        try await blobStore.remove(spaceReference)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: privateCASPath.path))
+    }
+
+    func testPrivateCASRefusesCorruptOrSymlinkedPayloadsAndReleasesCancelledStreams() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+
+        func casPath(_ cid: String) throws -> URL {
+            let parsed = try CID.parse(cid)
+            let digest = Hex.encode(parsed.multihash.digest)
+            return SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.author)
+                .deletingLastPathComponent()
+                .appending(path: "permissioned-blob-cas")
+                .appending(path: Hex.encode(SHA256.hash(data: Data(fixture.author.utf8))))
+                .appending(path: String(digest.prefix(2)))
+                .appending(path: "\(digest).blob")
+        }
+
+        let firstPayload = Data(repeating: 0x31, count: 128 * 1_024)
+        let first = try await database.putBlob(
+            firstPayload,
+            namespace: .space(fixture.space)
+        )
+        let firstPath = try casPath(first.cid)
+        let maybeFirstBody = try await database.permissionedBlob(
+            space: fixture.space, author: fixture.author, cid: first.cid
+        )
+        let firstBody = try XCTUnwrap(maybeFirstBody)
+        var maximumChunk = 0
+        enum ConsumerFailure: Error { case stop }
+        await XCTAssertThrowsErrorAsync(
+            try await firstBody.body.streamBody(maximumChunkBytes: 64 * 1_024) { chunk in
+                maximumChunk = max(maximumChunk, chunk.count)
+                throw ConsumerFailure.stop
+            }
+        )
+        XCTAssertLessThanOrEqual(maximumChunk, 64 * 1_024)
+        // The cancelled one-shot descriptor was closed, so a subsequent
+        // authorized open succeeds instead of inheriting stale stream state.
+        let maybeRetry = try await database.permissionedBlob(
+            space: fixture.space, author: fixture.author, cid: first.cid
+        )
+        let retry = try XCTUnwrap(maybeRetry)
+        var retryLength = 0
+        try await retry.body.streamBody(maximumChunkBytes: 64 * 1_024) { chunk in
+            retryLength += chunk.count
+        }
+        XCTAssertEqual(retryLength, firstPayload.count)
+
+        let corruptHandle = try FileHandle(forWritingTo: firstPath)
+        try corruptHandle.seek(toOffset: 0)
+        try corruptHandle.write(contentsOf: Data(repeating: 0x99, count: 64 * 1_024))
+        try corruptHandle.close()
+        await XCTAssertThrowsErrorAsync(
+            try await database.permissionedBlob(
+                space: fixture.space, author: fixture.author, cid: first.cid
+            )
+        )
+
+        let second = try await database.putBlob(
+            Data("second private payload".utf8),
+            namespace: .space(fixture.space)
+        )
+        let secondPath = try casPath(second.cid)
+        try FileManager.default.removeItem(at: secondPath)
+        try FileManager.default.createSymbolicLink(
+            at: secondPath,
+            withDestinationURL: firstPath
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await database.permissionedBlob(
+                space: fixture.space, author: fixture.author, cid: second.cid
+            )
+        )
+    }
+
+    func testLegacySQLiteBlobMigratesPrivatelyAndNeverBecomesAnXRPCBlobCID() async throws {
+        let fixture = try Fixture()
+        var database: SQLiteAccountDatabase? = try await fixture.open()
+        let payload = Data("legacy private blob".utf8)
+        let legacyCID = "sha256:\(Hex.encode(SHA256.hash(data: payload)))"
+        let reference = BlobReference(cid: legacyCID, namespace: .space(fixture.space))
+        try await database!.close()
+        database = nil
+
+        let connection = try await SQLiteConnection.open(
+            storage: .file(path: SQLiteLayout.accountDatabase(
+                in: fixture.root, did: fixture.author
+            ).path)
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO blob_payloads(cid, payload, storage_kind, byte_count)
+            VALUES (?, ?, 'legacy-sqlite', ?)
+            """,
+            [.text(legacyCID), payload.sqliteData!, .integer(payload.count)]
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO blob_namespace_references(cid, namespace_kind, space_uri)
+            VALUES (?, 'space', ?)
+            """,
+            [.text(legacyCID), .text(fixture.space.rawValue)]
+        )
+        try await connection.close()
+
+        database = try await fixture.open()
+        let migrated = try await database!.blobData(for: reference)
+        XCTAssertEqual(migrated, payload)
+        // A compatibility read is allowed to stage a private CAS file, but
+        // the legacy identifier remains unreachable from `getBlob`'s strict
+        // raw-CID path even after that media migration.
+        await XCTAssertThrowsErrorAsync(
+            try await database!.permissionedBlob(
+                space: fixture.space,
+                author: fixture.author,
+                cid: legacyCID
+            )
+        )
+        try await database!.close()
+        database = nil
+
+        let reopened = try await fixture.open()
+        defer { Task { try? await reopened.close() } }
+        let reopenedPayload = try await reopened.blobData(for: reference)
+        XCTAssertEqual(reopenedPayload, payload)
+    }
+
+    func testLegacyAndRawCIDAliasesProtectOnePhysicalCASAcrossRemovalAndRestart() async throws {
+        let fixture = try Fixture()
+        var database: SQLiteAccountDatabase? = try await fixture.open()
+        let payload = Data("legacy and raw CID physical alias".utf8)
+        let legacyCID = "sha256:\(Hex.encode(SHA256.hash(data: payload)))"
+        let legacyReference = BlobReference(
+            cid: legacyCID,
+            namespace: .space(fixture.space)
+        )
+        try await database!.close()
+        database = nil
+        try await insertLegacyBlob(
+            fixture: fixture,
+            cid: legacyCID,
+            payload: payload,
+            byteCount: payload.count
+        )
+
+        database = try await fixture.open()
+        let migratedLegacy = try await database!.blobData(for: legacyReference)
+        XCTAssertEqual(migratedLegacy, payload)
+        let rawReference = try await database!.putBlob(payload, namespace: .public)
+        let rawCASPath = try privateCASPath(fixture: fixture, cid: rawReference.cid)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rawCASPath.path))
+
+        // Raw-first removal must leave the migrated legacy alias reachable.
+        try await database!.removeBlobReference(rawReference)
+        let legacyAfterRawRemoval = try await database!.blobData(for: legacyReference)
+        XCTAssertEqual(legacyAfterRawRemoval, payload)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rawCASPath.path))
+        try await database!.close()
+        database = nil
+
+        database = try await fixture.open()
+        let legacyAfterRestart = try await database!.blobData(for: legacyReference)
+        XCTAssertEqual(legacyAfterRestart, payload)
+        let rawAgain = try await database!.putBlob(payload, namespace: .public)
+
+        // The reverse removal must retain the canonical raw survivor. The
+        // restart path must not treat the old legacy CID's reclamation as an
+        // authority to unlink the shared digest.
+        try await database!.removeBlobReference(legacyReference)
+        let rawAfterLegacyRemoval = try await database!.publicBlobData(cid: rawAgain.cid)
+        XCTAssertEqual(rawAfterLegacyRemoval, payload)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rawCASPath.path))
+        try await database!.close()
+        database = nil
+
+        let reopened = try await fixture.open()
+        defer { Task { try? await reopened.close() } }
+        let reopenedRaw = try await reopened.publicBlobData(cid: rawAgain.cid)
+        XCTAssertEqual(reopenedRaw, payload)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rawCASPath.path))
+        try await reopened.removeBlobReference(rawAgain)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: rawCASPath.path))
+    }
+
+    func testBlobLifecycleSerializesReReferenceAgainstLastRemovalAcrossConnections() async throws {
+        let fixture = try Fixture()
+        let remover = try await fixture.open()
+        let writer = try await fixture.open()
+        defer {
+            Task {
+                try? await writer.close()
+                try? await remover.close()
+            }
+        }
+
+        let payload = Data("same private bytes, new namespace".utf8)
+        let original = try await remover.putBlob(
+            payload,
+            namespace: .space(fixture.space)
+        )
+        let barrier = BlobLifecycleBarrier()
+        await writer.installTestingHooks(
+            SQLiteTestingHooks(beforeBlobReferenceCommit: {
+                try await barrier.pause()
+            })
+        )
+
+        let reReference = Task {
+            try await writer.putBlob(payload, namespace: .public)
+        }
+        await barrier.waitUntilPaused()
+
+        let removalStarted = AsyncSignal()
+        let removeLastReference = Task {
+            await removalStarted.signal()
+            try await remover.removeBlobReference(original)
+        }
+        await removalStarted.wait()
+        for _ in 0 ..< 20 { await Task.yield() }
+
+        // The writer has already opened/adopted the CAS but has not yet
+        // committed its new reference.  Without the per-CID lifecycle lock,
+        // the remover can now unlink the file and delete metadata, leaving
+        // the writer to commit a reference to a missing path.
+        await barrier.release()
+        let publicReference = try await reReference.value
+        try await removeLastReference.value
+
+        XCTAssertEqual(publicReference.cid, original.cid)
+        let retainedPublic = try await writer.publicBlobData(cid: original.cid)
+        XCTAssertEqual(retainedPublic, payload)
+        await XCTAssertThrowsErrorAsync(
+            try await writer.blobData(for: original)
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: try privateCASPath(fixture: fixture, cid: original.cid).path
+            )
+        )
+    }
+
+    func testRestartReconcilesCommittedCASReclamationIntent() async throws {
+        let fixture = try Fixture()
+        var database: SQLiteAccountDatabase? = try await fixture.open()
+        let payload = Data("post-commit CAS reclamation".utf8)
+        let reference = try await database!.putBlob(
+            payload,
+            namespace: .space(fixture.space)
+        )
+        let casPath = try privateCASPath(fixture: fixture, cid: reference.cid)
+        await database!.installTestingHooks(
+            SQLiteTestingHooks(afterBlobReclaimCommit: {
+                throw InjectedTransactionFailure()
+            })
+        )
+
+        await XCTAssertThrowsErrorAsync(
+            try await database!.removeBlobReference(reference)
+        ) { error in
+            XCTAssertTrue(error is InjectedTransactionFailure)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: casPath.path))
+        let publicAfterReclaimIntent = try await database!.publicBlobData(cid: reference.cid)
+        XCTAssertNil(publicAfterReclaimIntent)
+        try await database!.close()
+        database = nil
+
+        // This models a process dying after the reachability transaction
+        // commits but before the unlink.  Reopen consumes only lifecycle
+        // metadata, sees no blob row, unlinks the private file, then clears
+        // the durable reclaiming intent.
+        let reopened = try await fixture.open()
+        defer { Task { try? await reopened.close() } }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: casPath.path))
+        let connection = try await SQLiteConnection.open(
+            storage: .file(path: SQLiteLayout.accountDatabase(
+                in: fixture.root, did: fixture.author
+            ).path)
+        )
+        let lifecycle = try await connection.query(
+            "SELECT 1 FROM blob_cas_lifecycle WHERE digest_hex = ?",
+            [.text(Hex.encode(try CID.parse(reference.cid).multihash.digest))]
+        )
+        XCTAssertTrue(lifecycle.isEmpty)
+        try await connection.close()
+    }
+
+    func testLegacyMigrationSerializesWithLastReferenceRemoval() async throws {
+        let fixture = try Fixture()
+        var seeded: SQLiteAccountDatabase? = try await fixture.open()
+        let payload = Data("legacy lifecycle interleave".utf8)
+        let legacyCID = "sha256:\(Hex.encode(SHA256.hash(data: payload)))"
+        let reference = BlobReference(cid: legacyCID, namespace: .space(fixture.space))
+        try await seeded!.close()
+        seeded = nil
+        try await insertLegacyBlob(
+            fixture: fixture,
+            cid: legacyCID,
+            payload: payload,
+            byteCount: payload.count
+        )
+
+        let migrator = try await fixture.open()
+        let remover = try await fixture.open()
+        defer {
+            Task {
+                try? await remover.close()
+                try? await migrator.close()
+            }
+        }
+        let barrier = BlobLifecycleBarrier()
+        await migrator.installTestingHooks(
+            SQLiteTestingHooks(beforeLegacyBlobMigrationCommit: {
+                try await barrier.pause()
+            })
+        )
+
+        let migration = Task { try await migrator.blobData(for: reference) }
+        await barrier.waitUntilPaused()
+        let removalStarted = AsyncSignal()
+        let removeLastReference = Task {
+            await removalStarted.signal()
+            try await remover.removeBlobReference(reference)
+        }
+        await removalStarted.wait()
+        for _ in 0 ..< 20 { await Task.yield() }
+        await barrier.release()
+
+        let migratedPayload = try await migration.value
+        XCTAssertEqual(migratedPayload, payload)
+        try await removeLastReference.value
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: try privateCASPath(
+                    fixture: fixture,
+                    digestHex: Hex.encode(SHA256.hash(data: payload))
+                ).path
+            )
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await migrator.blobData(for: reference)
+        )
+    }
+
+    func testFailedCASStagingLeavesNoLifecycleOrPrivateFile() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        let payload = Data("rollback private CAS stage".utf8)
+        let cid = CID.fromBlob(payload).string
+        let casPath = try privateCASPath(fixture: fixture, cid: cid)
+        await database.installTestingHooks(
+            SQLiteTestingHooks(beforeBlobReferenceCommit: {
+                throw InjectedTransactionFailure()
+            })
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await database.putBlob(payload, namespace: .space(fixture.space))
+        ) { error in
+            XCTAssertTrue(error is InjectedTransactionFailure)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: casPath.path))
+        await database.installTestingHooks(SQLiteTestingHooks())
+        let recovered = try await database.putBlob(
+            payload,
+            namespace: .space(fixture.space)
+        )
+        XCTAssertEqual(recovered.cid, cid)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: casPath.path))
+    }
+
+    func testPreV4BlobSchemaRestartDefersLegacyBodyMaterialization() async throws {
+        let fixture = try Fixture()
+        var seeded: SQLiteAccountDatabase? = try await fixture.open()
+        try await seeded!.close()
+        seeded = nil
+
+        let payload = Data(repeating: 0x61, count: 2 * 1_024 * 1_024)
+        let legacyCID = "sha256:\(Hex.encode(SHA256.hash(data: payload)))"
+        let reference = BlobReference(cid: legacyCID, namespace: .space(fixture.space))
+        try await installPreV4BlobSchema(
+            fixture: fixture,
+            cid: legacyCID,
+            payload: payload
+        )
+
+        let upgraded = try await fixture.open()
+        let metadataConnection = try await SQLiteConnection.open(
+            storage: .file(path: SQLiteLayout.accountDatabase(
+                in: fixture.root, did: fixture.author
+            ).path)
+        )
+        let beforeRead = try await metadataConnection.query(
+            "SELECT storage_kind, byte_count FROM blob_payloads WHERE cid = ?",
+            [.text(legacyCID)]
+        )
+        let preRead = try XCTUnwrap(beforeRead.first)
+        XCTAssertEqual(preRead.column("storage_kind")?.string, "legacy-sqlite")
+        XCTAssertTrue(preRead.column("byte_count")?.isNull == true)
+        try await metadataConnection.close()
+
+        // No startup migration read has materialized or validated this body.
+        // The exact authorized compatibility read performs that work and
+        // preserves private-only reachability during CAS conversion.
+        let authorizedLegacyRead = try await upgraded.blobData(for: reference)
+        XCTAssertEqual(authorizedLegacyRead, payload)
+        let legacyPublicRead = try await upgraded.publicBlobData(cid: legacyCID)
+        XCTAssertNil(legacyPublicRead)
+        try await upgraded.close()
+
+        let afterConnection = try await SQLiteConnection.open(
+            storage: .file(path: SQLiteLayout.accountDatabase(
+                in: fixture.root, did: fixture.author
+            ).path)
+        )
+        let afterRead = try await afterConnection.query(
+            "SELECT storage_kind, byte_count, length(payload) AS payload_size FROM blob_payloads WHERE cid = ?",
+            [.text(legacyCID)]
+        )
+        let postRead = try XCTUnwrap(afterRead.first)
+        XCTAssertEqual(postRead.column("storage_kind")?.string, "cas-v1")
+        XCTAssertEqual(postRead.column("byte_count")?.integer, payload.count)
+        XCTAssertEqual(postRead.column("payload_size")?.integer, 0)
+        try await afterConnection.close()
+    }
+
+    private func privateCASPath(
+        fixture: Fixture,
+        cid: String
+    ) throws -> URL {
+        let parsed = try CID.parse(cid)
+        return try privateCASPath(
+            fixture: fixture,
+            digestHex: Hex.encode(parsed.multihash.digest)
+        )
+    }
+
+    private func privateCASPath(
+        fixture: Fixture,
+        digestHex: String
+    ) throws -> URL {
+        XCTAssertEqual(digestHex.count, 64)
+        return SQLiteLayout.accountDatabase(in: fixture.root, did: fixture.author)
+            .deletingLastPathComponent()
+            .appending(path: "permissioned-blob-cas")
+            .appending(path: Hex.encode(SHA256.hash(data: Data(fixture.author.utf8))))
+            .appending(path: String(digestHex.prefix(2)))
+            .appending(path: "\(digestHex).blob")
+    }
+
+    private func insertLegacyBlob(
+        fixture: Fixture,
+        cid: String,
+        payload: Data,
+        byteCount: Int
+    ) async throws {
+        let connection = try await SQLiteConnection.open(
+            storage: .file(path: SQLiteLayout.accountDatabase(
+                in: fixture.root, did: fixture.author
+            ).path)
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO blob_payloads(cid, payload, storage_kind, byte_count)
+            VALUES (?, ?, 'legacy-sqlite', ?)
+            """,
+            [.text(cid), payload.sqliteData!, .integer(byteCount)]
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO blob_namespace_references(cid, namespace_kind, space_uri)
+            VALUES (?, 'space', ?)
+            """,
+            [.text(cid), .text(fixture.space.rawValue)]
+        )
+        try await connection.close()
+    }
+
+    private func installPreV4BlobSchema(
+        fixture: Fixture,
+        cid: String,
+        payload: Data
+    ) async throws {
+        let connection = try await SQLiteConnection.open(
+            storage: .file(path: SQLiteLayout.accountDatabase(
+                in: fixture.root, did: fixture.author
+            ).path)
+        )
+        _ = try await connection.query("PRAGMA foreign_keys=OFF")
+        _ = try await connection.query("BEGIN IMMEDIATE")
+        do {
+            _ = try await connection.query("DROP TABLE blob_namespace_references")
+            _ = try await connection.query("DROP TABLE blob_payloads")
+            _ = try await connection.query("DROP TABLE blob_cas_lifecycle")
+            _ = try await connection.query(
+                "CREATE TABLE blob_payloads (cid TEXT PRIMARY KEY, payload BLOB NOT NULL)"
+            )
+            _ = try await connection.query(
+                """
+                CREATE TABLE blob_namespace_references (
+                    cid TEXT NOT NULL REFERENCES blob_payloads(cid) ON DELETE CASCADE,
+                    namespace_kind TEXT NOT NULL CHECK(namespace_kind IN ('public', 'space')),
+                    space_uri TEXT NOT NULL,
+                    PRIMARY KEY(cid, namespace_kind, space_uri),
+                    CHECK(
+                        (namespace_kind = 'public' AND space_uri = '')
+                        OR (namespace_kind = 'space' AND length(space_uri) > 0)
+                    )
+                )
+                """
+            )
+            _ = try await connection.query(
+                "INSERT INTO blob_payloads(cid, payload) VALUES (?, ?)",
+                [.text(cid), payload.sqliteData!]
+            )
+            _ = try await connection.query(
+                """
+                INSERT INTO blob_namespace_references(cid, namespace_kind, space_uri)
+                VALUES (?, 'space', ?)
+                """,
+                [.text(cid), .text(fixture.space.rawValue)]
+            )
+            _ = try await connection.query(
+                "DELETE FROM permissioned_repository_migrations WHERE version IN (4, 5, 6)"
+            )
+            _ = try await connection.query("COMMIT")
+        } catch {
+            _ = try? await connection.query("ROLLBACK")
+            try await connection.close()
+            throw error
+        }
+        _ = try await connection.query("PRAGMA foreign_keys=ON")
+        try await connection.close()
+    }
+
+    func testPrivateCASStreams256MiBInBoundedChunksWhenOptedIn() async throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["SWAN_BLOB_STRESS"] == "1",
+            "set SWAN_BLOB_STRESS=1 to run the 256 MiB bounded-stream harness"
+        )
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        let payload = Data(repeating: 0x5a, count: 256 * 1_024 * 1_024)
+        let reference = try await database.putBlob(
+            payload,
+            namespace: .space(fixture.space)
+        )
+        let maybeBlob = try await database.permissionedBlob(
+            space: fixture.space, author: fixture.author, cid: reference.cid
+        )
+        let blob = try XCTUnwrap(maybeBlob)
+        var received = 0
+        var maximumChunk = 0
+        try await blob.body.streamBody(maximumChunkBytes: 64 * 1_024) { chunk in
+            received += chunk.count
+            maximumChunk = max(maximumChunk, chunk.count)
+        }
+        XCTAssertEqual(received, payload.count)
+        XCTAssertLessThanOrEqual(maximumChunk, 64 * 1_024)
     }
 
     func testAtomicBatchUsesOneRevisionAndOrderedOperationIndexes() async throws {
@@ -2832,6 +3413,30 @@ private actor FailingApplyBarrier {
         pauseWaiters.removeAll()
         await withCheckedContinuation { releaseContinuation = $0 }
         throw InjectedTransactionFailure()
+    }
+
+    func waitUntilPaused() async {
+        guard !isPaused else { return }
+        await withCheckedContinuation { pauseWaiters.append($0) }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private actor BlobLifecycleBarrier {
+    private var isPaused = false
+    private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func pause() async throws {
+        guard !isPaused else { return }
+        isPaused = true
+        pauseWaiters.forEach { $0.resume() }
+        pauseWaiters.removeAll()
+        await withCheckedContinuation { releaseContinuation = $0 }
     }
 
     func waitUntilPaused() async {

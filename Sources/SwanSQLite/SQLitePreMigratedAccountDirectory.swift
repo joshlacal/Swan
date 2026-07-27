@@ -13,7 +13,8 @@ public actor SQLitePreMigratedAccountDirectory:
     AuthorizedPreopenedAccountDirectory,
     AuthorizedSimpleSpaceLifecycleDirectory,
     AuthorizedSimpleSpaceCredentialDirectory,
-    AuthorizedSpaceRepositoryDirectory
+    AuthorizedSpaceRepositoryDirectory,
+    AuthorizedSpaceBlobDirectory
 {
     private let controlStore: any AccountControlStore
     private let dataDirectory: URL
@@ -485,6 +486,48 @@ public actor SQLitePreMigratedAccountDirectory:
                 throw SwanError.unavailable("authenticated space directory is unavailable")
             }
             return snapshot
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    /// Returns a descriptor-backed private blob only from the startup-opened
+    /// account inventory.  The repository facade applies aggregate read
+    /// authorization before SQLite can inspect namespace metadata, and this
+    /// coordinator rechecks lifecycle/closure before the opaque body reaches
+    /// HTTP.  It deliberately has no database-open or public-blob fallback.
+    public func spaceBlob(
+        space: SpaceURI,
+        author: String,
+        cid: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceBlob? {
+        let database = try await preopenedRepositoryDatabase(
+            for: author,
+            authorization: authorization
+        )
+        guard let database else {
+            throw SwanError.unauthorized("account repository is unavailable")
+        }
+        do {
+            let repository = try DurableSpaceRepository(
+                database: database,
+                space: space,
+                author: author
+            )
+            let blob = try await repository.permissionedBlob(
+                cid: cid,
+                authorization: authorization
+            )
+            guard try await isActiveAccount(author) else {
+                throw SwanError.unauthorized("account repository is unavailable")
+            }
+            guard !isClosed else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return blob
         } catch let error as SwanError {
             throw error
         } catch {

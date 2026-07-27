@@ -164,6 +164,49 @@ public protocol AuthorizedPreopenedAccountDirectory: Sendable {
     func requireActivePreopenedAccount(_ did: String) async throws
 }
 
+/// An opaque, already-verified permissioned blob body.  The storage adapter
+/// owns the underlying descriptor and never exposes a path or a `Data` value,
+/// so an HTTP route cannot accidentally buffer a private blob or retarget a
+/// file after authorization has completed.
+public protocol AuthorizedSpaceBlobBody: Sendable {
+    /// File metadata was validated against the descriptor before this body was
+    /// returned.  It is therefore safe for the HTTP adapter to emit it as a
+    /// content length without looking the path up again.
+    var contentLength: Int { get }
+
+    /// Delivers at most `maximumChunkBytes` on each call.  Implementations
+    /// must close and clean up their descriptor on normal completion, writer
+    /// failure, or task cancellation.
+    func streamBody(
+        maximumChunkBytes: Int,
+        consume: (Data) async throws -> Void
+    ) async throws
+}
+
+/// The narrow durable projection required by `com.atproto.space.getBlob`.
+/// It deliberately has no public-blob fallback and no path, database, or
+/// mutable reference exposure.  Implementations select only startup-preopened
+/// account databases and apply aggregate repository-read authorization before
+/// opening the private content-addressed payload.
+public struct AuthorizedSpaceBlob: Sendable {
+    public let mimeType: String?
+    public let body: any AuthorizedSpaceBlobBody
+
+    public init(mimeType: String?, body: any AuthorizedSpaceBlobBody) {
+        self.mimeType = mimeType
+        self.body = body
+    }
+}
+
+public protocol AuthorizedSpaceBlobDirectory: Sendable {
+    func spaceBlob(
+        space: SpaceURI,
+        author: String,
+        cid: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceBlob?
+}
+
 /// A deliberately narrow lifecycle/membership projection for a simple-space
 /// authority account that was opened at service startup.  It names domain
 /// operations rather than exposing a SQLite handle or mutable authority

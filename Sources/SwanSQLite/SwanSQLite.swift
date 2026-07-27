@@ -7,6 +7,12 @@ import SwanPublicRepository
 import SwanSpaces
 import SwanStorage
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 /// Stable filesystem placement for per-account SQLite/WAL databases. The
 /// control database contains registry and OAuth control-plane data only;
 /// repository facts remain in the account database.
@@ -300,7 +306,17 @@ public enum SQLiteLayout {
         """
         CREATE TABLE IF NOT EXISTS blob_payloads (
             cid TEXT PRIMARY KEY,
-            payload BLOB NOT NULL
+            -- `payload` is retained only to migrate pre-CAS rows. New rows
+            -- carry a zero-length marker and are read from a private file.
+            payload BLOB NOT NULL,
+            storage_kind TEXT NOT NULL DEFAULT 'legacy-sqlite'
+                CHECK(storage_kind IN ('legacy-sqlite', 'cas-v1')),
+            -- Physical CAS lifecycle/reclamation is keyed by this digest,
+            -- not the logical CID. A legacy sha256 label and CIDv1/raw label
+            -- can legitimately name the same immutable file.
+            cas_digest TEXT CHECK(cas_digest IS NULL OR length(cas_digest) = 64),
+            byte_count INTEGER CHECK(byte_count >= 0),
+            mime_type TEXT
         )
         """,
         """
@@ -313,6 +329,17 @@ public enum SQLiteLayout {
                 (namespace_kind = 'public' AND space_uri = '')
                 OR (namespace_kind = 'space' AND length(space_uri) > 0)
             )
+        )
+        """,
+        // This table deliberately outlives `blob_payloads` while a private
+        // file is pending reclamation.  SQLite commits reachability changes
+        // before any unlink; startup can then complete a crash-interrupted
+        // unlink without ever restoring a reference to a missing file.
+        """
+        CREATE TABLE IF NOT EXISTS blob_cas_lifecycle (
+            cid TEXT PRIMARY KEY,
+            state TEXT NOT NULL CHECK(state IN ('creating', 'ready', 'reclaiming')),
+            updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
         )
         """,
     ]
@@ -623,16 +650,63 @@ private actor SQLiteConnectionGate {
     }
 }
 
+/// `flock` coordinates distinct processes, but advisory file locks do not
+/// reliably block independently opened descriptors in the same process on all
+/// supported platforms.  Keep a keyed async gate as the in-process half of
+/// the blob lifecycle lock.  Each operation takes at most one key, so this
+/// cannot form a lock-order cycle with SQLite's single writer.
+private actor SQLiteBlobLifecycleCoordinator {
+    struct Key: Hashable, Sendable {
+        let dataDirectory: String
+        let accountNamespace: String
+        let digestHex: String
+    }
+
+    private var held: Set<Key> = []
+    private var waiters: [Key: [CheckedContinuation<Void, Never>]] = [:]
+
+    func acquire(_ key: Key) async {
+        guard !held.contains(key) else {
+            await withCheckedContinuation { waiters[key, default: []].append($0) }
+            return
+        }
+        held.insert(key)
+    }
+
+    func release(_ key: Key) {
+        guard let next = waiters[key]?.first else {
+            held.remove(key)
+            return
+        }
+        waiters[key]?.removeFirst()
+        if waiters[key]?.isEmpty == true {
+            waiters.removeValue(forKey: key)
+        }
+        next.resume()
+    }
+}
+
+private let sqliteBlobLifecycleCoordinator = SQLiteBlobLifecycleCoordinator()
+
 struct SQLiteTestingHooks: Sendable {
     var beforeApplyCommit: (@Sendable () async throws -> Void)?
     var afterSnapshotStateRead: (@Sendable () async -> Void)?
+    var beforeBlobReferenceCommit: (@Sendable () async throws -> Void)?
+    var beforeLegacyBlobMigrationCommit: (@Sendable () async throws -> Void)?
+    var afterBlobReclaimCommit: (@Sendable () async throws -> Void)?
 
     init(
         beforeApplyCommit: (@Sendable () async throws -> Void)? = nil,
-        afterSnapshotStateRead: (@Sendable () async -> Void)? = nil
+        afterSnapshotStateRead: (@Sendable () async -> Void)? = nil,
+        beforeBlobReferenceCommit: (@Sendable () async throws -> Void)? = nil,
+        beforeLegacyBlobMigrationCommit: (@Sendable () async throws -> Void)? = nil,
+        afterBlobReclaimCommit: (@Sendable () async throws -> Void)? = nil
     ) {
         self.beforeApplyCommit = beforeApplyCommit
         self.afterSnapshotStateRead = afterSnapshotStateRead
+        self.beforeBlobReferenceCommit = beforeBlobReferenceCommit
+        self.beforeLegacyBlobMigrationCommit = beforeLegacyBlobMigrationCommit
+        self.afterBlobReclaimCommit = afterBlobReclaimCommit
     }
 }
 
@@ -648,6 +722,9 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     private static let permissionedRepositoryStorageMigrationVersion = 1
     private static let permissionedOutboxLeaseMigrationVersion = 2
     private static let simpleSpaceAuthoritySchemaMigrationVersion = 3
+    private static let fileBackedBlobSchemaMigrationVersion = 4
+    private static let fileBackedBlobLifecycleMigrationVersion = 5
+    private static let physicalBlobCASLifecycleMigrationVersion = 6
 
     private let connection: SQLiteConnection
     private let connectionGate = SQLiteConnectionGate()
@@ -714,6 +791,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         accountDirectoryDescriptor = accountDescriptor
         do {
             try await migrateWithoutGate()
+            try await recoverPrivateBlobLifecycle()
             try SQLiteProtectedPaths.hardenSQLiteFiles(
                 parentDescriptor: accountDescriptor,
                 databaseName: "\(Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite"
@@ -740,6 +818,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         try await withConnectionGate {
             try await migrateWithoutGate()
         }
+        try await recoverPrivateBlobLifecycle()
     }
 
     func installTestingHooks(_ hooks: SQLiteTestingHooks) {
@@ -767,6 +846,9 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             }
             try await migratePermissionedRepositoryStorageIfNeeded()
             try await migratePermissionedOutboxLeasesIfNeeded()
+            try await migrateFileBackedBlobSchemaIfNeeded()
+            try await migrateFileBackedBlobLifecycleIfNeeded()
+            try await migratePhysicalBlobCASLifecycleIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -953,6 +1035,250 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                 .integer(version),
                 .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
             ]
+        )
+    }
+
+    /// Adds only metadata to the existing blob table.  Historical bodies stay
+    /// in their legacy column until an authorized compatibility read can stage
+    /// and commit them into the private CAS.  This avoids a startup-wide read
+    /// of potentially very large blobs and, importantly, never changes their
+    /// namespace reachability while migrating storage media.
+    private func migrateFileBackedBlobSchemaIfNeeded() async throws {
+        let version = Self.fileBackedBlobSchemaMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        try await addAccountColumnIfMissing(
+            table: "blob_payloads",
+            column: "storage_kind",
+            definition: "TEXT NOT NULL DEFAULT 'legacy-sqlite'"
+        )
+        try await addAccountColumnIfMissing(
+            table: "blob_payloads",
+            column: "byte_count",
+            definition: "INTEGER"
+        )
+        try await addAccountColumnIfMissing(
+            table: "blob_payloads",
+            column: "mime_type",
+            definition: "TEXT"
+        )
+
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
+    /// Enrolls already-file-backed v4 rows in the durable lifecycle ledger
+    /// without reading a single legacy BLOB.  Legacy rows are deliberately
+    /// absent until an authorized compatibility read validates that exact
+    /// payload and starts its one-CID lifecycle.
+    private func migrateFileBackedBlobLifecycleIfNeeded() async throws {
+        let version = Self.fileBackedBlobLifecycleMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        let timestamp = Int(Date().timeIntervalSince1970 * 1_000_000)
+        let lifecycleColumns = try await connection.query(
+            "PRAGMA table_info(blob_cas_lifecycle)"
+        )
+        // A repaired/current database may already have the v6 physical-digest
+        // table while a manually restored migration marker is absent. Do not
+        // attempt a legacy-CID insert into that newer shape; v6 below will
+        // validate/reconcile it.
+        guard lifecycleColumns.contains(where: { $0.column("name")?.string == "cid" }) else {
+            _ = try await connection.query(
+                """
+                INSERT INTO permissioned_repository_migrations(version, applied_at)
+                VALUES (?, ?)
+                """,
+                [.integer(version), .integer(timestamp)]
+            )
+            return
+        }
+        _ = try await connection.query(
+            """
+            INSERT INTO blob_cas_lifecycle(cid, state, updated_at)
+            SELECT cid, 'ready', ?
+            FROM blob_payloads
+            WHERE storage_kind = 'cas-v1'
+            ON CONFLICT(cid) DO NOTHING
+            """,
+            [.integer(timestamp)]
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [.integer(version), .integer(timestamp)]
+        )
+    }
+
+    /// v5 keyed lifecycle rows by logical CID. That is insufficient because
+    /// the legacy `sha256:<digest>` compatibility name and the canonical raw
+    /// CID can name one physical CAS file. v6 records the digest beside every
+    /// CAS metadata row and rebuilds the lifecycle ledger around that physical
+    /// identity, without selecting any payload BLOB.
+    private func migratePhysicalBlobCASLifecycleIfNeeded() async throws {
+        let version = Self.physicalBlobCASLifecycleMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        try await addAccountColumnIfMissing(
+            table: "blob_payloads",
+            column: "cas_digest",
+            definition: "TEXT"
+        )
+
+        let casRows = try await connection.query(
+            "SELECT cid, cas_digest FROM blob_payloads WHERE storage_kind = 'cas-v1'"
+        )
+        var activeDigests = Set<String>()
+        for row in casRows {
+            let cid = try requiredText(row, "cid")
+            let digest: String
+            do {
+                digest = try blobDigestHex(cid: cid, allowLegacy: true)
+            } catch {
+                throw SQLiteRepositoryError.corruptDatabase("invalid CAS blob CID")
+            }
+            if let stored = row.column("cas_digest"), !stored.isNull {
+                guard stored.string == digest else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "CAS blob digest does not match CID"
+                    )
+                }
+            }
+            _ = try await connection.query(
+                "UPDATE blob_payloads SET cas_digest = ? WHERE cid = ?",
+                [.text(digest), .text(cid)]
+            )
+            activeDigests.insert(digest)
+        }
+
+        let lifecycleColumns = try await connection.query(
+            "PRAGMA table_info(blob_cas_lifecycle)"
+        )
+        let hasLegacyCIDKey = lifecycleColumns.contains {
+            $0.column("name")?.string == "cid"
+        }
+        var lifecycleByDigest: [String: BlobCASLifecycleState] = [:]
+        if hasLegacyCIDKey {
+            let lifecycleRows = try await connection.query(
+                "SELECT cid, state FROM blob_cas_lifecycle"
+            )
+            for row in lifecycleRows {
+                let cid = try requiredText(row, "cid")
+                let digest: String
+                do {
+                    digest = try blobDigestHex(cid: cid, allowLegacy: true)
+                } catch {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "invalid legacy CAS lifecycle CID"
+                    )
+                }
+                guard let state = BlobCASLifecycleState(
+                    rawValue: try requiredText(row, "state")
+                ) else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "invalid legacy CAS lifecycle state"
+                    )
+                }
+                lifecycleByDigest[digest] = lifecycleByDigest[digest] ?? state
+            }
+        } else {
+            let lifecycleRows = try await connection.query(
+                "SELECT digest_hex, state FROM blob_cas_lifecycle"
+            )
+            for row in lifecycleRows {
+                let digest = try requiredText(row, "digest_hex")
+                guard legacyBlobDigest("sha256:\(digest)") != nil,
+                      let state = BlobCASLifecycleState(
+                          rawValue: try requiredText(row, "state")
+                      )
+                else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "invalid CAS lifecycle row"
+                    )
+                }
+                lifecycleByDigest[digest] = state
+            }
+        }
+
+        // A durable CAS metadata row always wins over a stale reclaiming
+        // intent. Conversely, an old ready/creating row with no metadata is
+        // conservatively reclaimed on the next startup.
+        for digest in activeDigests {
+            lifecycleByDigest[digest] = .ready
+        }
+        let inactiveLifecycleDigests = lifecycleByDigest.keys.filter {
+            !activeDigests.contains($0)
+        }
+        for digest in inactiveLifecycleDigests {
+            lifecycleByDigest[digest] = .reclaiming
+        }
+
+        if hasLegacyCIDKey {
+            _ = try await connection.query(
+                """
+                CREATE TABLE blob_cas_lifecycle_v6 (
+                    digest_hex TEXT PRIMARY KEY CHECK(length(digest_hex) = 64),
+                    state TEXT NOT NULL CHECK(state IN ('creating', 'ready', 'reclaiming')),
+                    updated_at INTEGER NOT NULL CHECK(updated_at >= 0)
+                )
+                """
+            )
+            let timestamp = Int(Date().timeIntervalSince1970 * 1_000_000)
+            for (digest, state) in lifecycleByDigest {
+                _ = try await connection.query(
+                    """
+                    INSERT INTO blob_cas_lifecycle_v6(digest_hex, state, updated_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    [.text(digest), .text(state.rawValue), .integer(timestamp)]
+                )
+            }
+            _ = try await connection.query("DROP TABLE blob_cas_lifecycle")
+            _ = try await connection.query(
+                "ALTER TABLE blob_cas_lifecycle_v6 RENAME TO blob_cas_lifecycle"
+            )
+        } else {
+            let timestamp = Int(Date().timeIntervalSince1970 * 1_000_000)
+            _ = try await connection.query("DELETE FROM blob_cas_lifecycle")
+            for (digest, state) in lifecycleByDigest {
+                _ = try await connection.query(
+                    """
+                    INSERT INTO blob_cas_lifecycle(digest_hex, state, updated_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    [.text(digest), .text(state.rawValue), .integer(timestamp)]
+                )
+            }
+        }
+
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [.integer(version), .integer(Int(Date().timeIntervalSince1970 * 1_000_000))]
         )
     }
 
@@ -2711,115 +3037,747 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
 
     public func putBlob(
         _ data: Data,
-        namespace: BlobNamespace
+        namespace: BlobNamespace,
+        mimeType: String? = nil
     ) async throws -> BlobReference {
-        let cid = "sha256:\(Hex.encode(SHA256.hash(data: data)))"
+        let cid = CID.fromBlob(data).string
+        let digestHex = try blobDigestHex(cid: cid, allowLegacy: false)
+        let byteCount = try blobByteCount(data.count)
+        let storedMIMEType = safeBlobMIMEType(mimeType)
         let columns = blobNamespaceColumns(namespace)
-        try await withConnectionGate {
-            try await transaction {
-                _ = try await connection.query(
-                    """
-                    INSERT INTO blob_payloads(cid, payload)
-                    VALUES (?, ?)
-                    ON CONFLICT(cid) DO UPDATE SET payload = excluded.payload
-                    """,
-                    [.text(cid), blob(data)]
-                )
-                _ = try await connection.query(
-                    """
-                    INSERT INTO blob_namespace_references(
-                        cid, namespace_kind, space_uri
-                    ) VALUES (?, ?, ?)
-                    ON CONFLICT(cid, namespace_kind, space_uri) DO NOTHING
-                    """,
-                    [
-                        .text(cid), .text(columns.kind),
-                        .text(columns.spaceURI),
-                    ]
-                )
-            }
+        return try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
+            try await putBlobLocked(
+                data,
+                cid: cid,
+                digestHex: digestHex,
+                byteCount: byteCount,
+                namespace: namespace,
+                namespaceKind: columns.kind,
+                spaceURI: columns.spaceURI,
+                mimeType: storedMIMEType
+            )
         }
-        return BlobReference(cid: cid, namespace: namespace)
     }
 
     public func blobData(for reference: BlobReference) async throws -> Data {
         let columns = blobNamespaceColumns(reference.namespace)
-        return try await withConnectionGate {
-            let rows = try await connection.query(
-                """
-                SELECT payload
-                FROM blob_payloads
-                JOIN blob_namespace_references USING(cid)
-                WHERE cid = ? AND namespace_kind = ? AND space_uri = ?
-                """,
-                [
-                    .text(reference.cid), .text(columns.kind),
-                    .text(columns.spaceURI),
-                ]
-            )
-            guard let row = rows.first else {
-                throw SwanError.unauthorized(
-                    "blob is not reachable in this namespace"
-                )
-            }
-            let payload = try requiredBlob(row, "payload")
-            guard blobCID(payload) == reference.cid else {
-                throw SQLiteRepositoryError.corruptDatabase(
-                    "blob payload does not match CID"
-                )
-            }
-            return payload
-        }
+        let stored = try await blobPayload(
+            cid: reference.cid,
+            namespaceKind: columns.kind,
+            spaceURI: columns.spaceURI
+        )
+        return try await materializeBlobData(stored)
     }
 
     public func publicBlobData(cid: String) async throws -> Data? {
-        try await withConnectionGate {
-            let rows = try await connection.query(
-                """
-                SELECT payload
-                FROM blob_payloads
-                JOIN blob_namespace_references USING(cid)
-                WHERE cid = ? AND namespace_kind = 'public' AND space_uri = ''
-                """,
-                [.text(cid)]
-            )
-            guard let row = rows.first else { return nil }
-            let payload = try requiredBlob(row, "payload")
-            guard blobCID(payload) == cid else {
-                throw SQLiteRepositoryError.corruptDatabase(
-                    "blob payload does not match CID"
-                )
-            }
-            return payload
+        guard let stored = try await blobPayloadIfReachable(
+            cid: cid,
+            namespaceKind: "public",
+            spaceURI: ""
+        ) else {
+            return nil
         }
+        return try await materializeBlobData(stored)
     }
 
     public func removeBlobReference(_ reference: BlobReference) async throws {
         let columns = blobNamespaceColumns(reference.namespace)
-        try await withConnectionGate {
-            try await transaction {
-                _ = try await connection.query(
-                    """
-                    DELETE FROM blob_namespace_references
-                    WHERE cid = ? AND namespace_kind = ? AND space_uri = ?
-                    """,
-                    [
-                        .text(reference.cid), .text(columns.kind),
-                        .text(columns.spaceURI),
-                    ]
-                )
-                _ = try await connection.query(
-                    """
-                    DELETE FROM blob_payloads
-                    WHERE cid = ?
-                      AND NOT EXISTS (
-                        SELECT 1 FROM blob_namespace_references
-                        WHERE blob_namespace_references.cid = blob_payloads.cid
-                      )
-                    """,
-                    [.text(reference.cid)]
+        let digestHex = try blobDigestHex(cid: reference.cid, allowLegacy: true)
+        try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
+            let needsReclamation = try await withConnectionGate {
+                try await transaction {
+                    let metadata = try await blobPayloadIfReachableWithoutGate(
+                        cid: reference.cid,
+                        namespaceKind: columns.kind,
+                        spaceURI: columns.spaceURI
+                    )
+                    _ = try await connection.query(
+                        """
+                        DELETE FROM blob_namespace_references
+                        WHERE cid = ? AND namespace_kind = ? AND space_uri = ?
+                        """,
+                        [
+                            .text(reference.cid), .text(columns.kind),
+                            .text(columns.spaceURI),
+                        ]
+                    )
+                    let remaining = try await connection.query(
+                        "SELECT 1 FROM blob_namespace_references WHERE cid = ? LIMIT 1",
+                        [.text(reference.cid)]
+                    )
+                    guard remaining.isEmpty else { return false }
+
+                    // Reachability changes commit before a file unlink.  The
+                    // durable `reclaiming` intent survives a crash between
+                    // these two effects and is reconciled at startup or by
+                    // this request after COMMIT.
+                    _ = try await connection.query(
+                        "DELETE FROM blob_payloads WHERE cid = ?",
+                        [.text(reference.cid)]
+                    )
+                    guard metadata?.storageKind == .casV1 else { return false }
+                    if try await hasFileBackedPayloadWithoutGate(digestHex: digestHex) {
+                        // Another logical CID (for example a legacy sha256
+                        // alias) still reaches the same physical CAS file.
+                        try await setBlobLifecycleStateWithoutGate(
+                            digestHex: digestHex,
+                            state: .ready
+                        )
+                        return false
+                    }
+                    try await setBlobLifecycleStateWithoutGate(
+                        digestHex: digestHex,
+                        state: .reclaiming
+                    )
+                    return true
+                }
+            }
+            if needsReclamation {
+                if let hook = testingHooks.afterBlobReclaimCommit {
+                    try await hook()
+                }
+                try await reconcilePrivateBlobLifecycleLocked(
+                    digestHex: digestHex
                 )
             }
+        }
+    }
+
+    /// Opens only a private, exact namespace reference for the streaming
+    /// permissioned blob surface.  `getBlob` passes a canonical raw CID; a
+    /// legacy `sha256:` compatibility row is deliberately impossible to reach
+    /// here even if it has a valid private reference.
+    public func permissionedBlob(
+        space: SpaceURI,
+        author: String,
+        cid: String
+    ) async throws -> AuthorizedSpaceBlob? {
+        try requireAccount(author)
+        guard author == accountDID else {
+            throw SwanError.unauthorized("account database ownership mismatch")
+        }
+        _ = try canonicalRawBlobCID(cid)
+        guard let stored = try await blobPayloadIfReachable(
+            cid: cid,
+            namespaceKind: "space",
+            spaceURI: space.rawValue
+        ) else {
+            return nil
+        }
+        let body = try await fileBackedBlobBody(stored)
+        return AuthorizedSpaceBlob(mimeType: stored.mimeType, body: body)
+    }
+
+    private struct StoredBlobPayload: Sendable {
+        enum StorageKind: String, Sendable {
+            case legacySQLite = "legacy-sqlite"
+            case casV1 = "cas-v1"
+        }
+
+        let cid: String
+        let storageKind: StorageKind
+        let byteCount: Int
+        let mimeType: String?
+        let casDigest: String?
+        let legacyPayload: Data?
+    }
+
+    private enum BlobCASLifecycleState: String, Sendable {
+        case creating
+        case ready
+        case reclaiming
+    }
+
+    private enum BlobCASPreparation: Sendable {
+        case existingCAS
+        case staging
+    }
+
+    /// Holds both halves of the lifecycle lock over a file stage/adoption and
+    /// its SQLite commit.  The async coordinator is required even though a
+    /// descriptor `flock` is also held: same-process `flock` behavior for
+    /// independently opened descriptors is not sufficiently portable to be
+    /// the only exclusion mechanism.
+    private func withPrivateBlobLifecycleLock<T: Sendable>(
+        digestHex: String,
+        _ body: () async throws -> T
+    ) async throws -> T {
+        let key = SQLiteBlobLifecycleCoordinator.Key(
+            dataDirectory: dataDirectory.path,
+            accountNamespace: accountBlobNamespace,
+            digestHex: digestHex
+        )
+        await sqliteBlobLifecycleCoordinator.acquire(key)
+        let descriptor: Int32
+        do {
+            descriptor = try SQLiteProtectedPaths.openPrivateBlobLifecycleLock(
+                accountDirectoryDescriptor: accountDirectoryDescriptor,
+                accountNamespace: accountBlobNamespace,
+                digestHex: digestHex
+            )
+        } catch {
+            await sqliteBlobLifecycleCoordinator.release(key)
+            throw error
+        }
+        do {
+            let result = try await body()
+            SQLiteProtectedPaths.closePrivateBlobLifecycleLock(descriptor)
+            await sqliteBlobLifecycleCoordinator.release(key)
+            return result
+        } catch {
+            SQLiteProtectedPaths.closePrivateBlobLifecycleLock(descriptor)
+            await sqliteBlobLifecycleCoordinator.release(key)
+            throw error
+        }
+    }
+
+    private func putBlobLocked(
+        _ data: Data,
+        cid: String,
+        digestHex: String,
+        byteCount: Int,
+        namespace: BlobNamespace,
+        namespaceKind: String,
+        spaceURI: String,
+        mimeType: String?
+    ) async throws -> BlobReference {
+        let preparation: BlobCASPreparation = try await withConnectionGate {
+            try await transaction {
+                switch try await blobStorageKindWithoutGate(cid: cid) {
+                case .casV1:
+                    try await setBlobLifecycleStateWithoutGate(
+                        digestHex: digestHex,
+                        state: .ready
+                    )
+                    return .existingCAS
+                case .legacySQLite:
+                    // A valid v4 legacy row uses the historical sha256 label,
+                    // never a raw CID. Treat a collision as durable
+                    // corruption rather than overwriting it.
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "raw blob CID collides with legacy storage"
+                    )
+                case nil:
+                    // Persist the creation intent before touching the file.
+                    // A crash now has no reference and recovery can reclaim
+                    // either a missing or a partially staged CAS entry.
+                    try await setBlobLifecycleStateWithoutGate(
+                        digestHex: digestHex,
+                        state: .creating
+                    )
+                    return .staging
+                }
+            }
+        }
+
+        do {
+            switch preparation {
+            case .existingCAS:
+                try verifyPrivateBlobFile(
+                    digestHex: digestHex,
+                    expectedLength: byteCount
+                )
+            case .staging:
+                let created = try SQLiteProtectedPaths.createPrivateBlob(
+                    accountDirectoryDescriptor: accountDirectoryDescriptor,
+                    accountNamespace: accountBlobNamespace,
+                    digestHex: digestHex,
+                    payload: data
+                )
+                if !created {
+                    // An unreferenced orphan can be adopted only after a full
+                    // digest/length check while this CID lock is held.
+                    try verifyPrivateBlobFile(
+                        digestHex: digestHex,
+                        expectedLength: byteCount
+                    )
+                }
+            }
+
+            if let hook = testingHooks.beforeBlobReferenceCommit {
+                try await hook()
+            }
+            try await withConnectionGate {
+                try await transaction {
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO blob_payloads(
+                            cid, payload, storage_kind, cas_digest, byte_count, mime_type
+                        ) VALUES (?, zeroblob(0), 'cas-v1', ?, ?, ?)
+                        ON CONFLICT(cid) DO NOTHING
+                        """,
+                        [
+                            .text(cid), .text(digestHex), .integer(byteCount),
+                            mimeType.map(SQLiteData.text) ?? .null,
+                        ]
+                    )
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO blob_namespace_references(
+                            cid, namespace_kind, space_uri
+                        ) VALUES (?, ?, ?)
+                        ON CONFLICT(cid, namespace_kind, space_uri) DO NOTHING
+                        """,
+                        [.text(cid), .text(namespaceKind), .text(spaceURI)]
+                    )
+                    try await setBlobLifecycleStateWithoutGate(
+                        digestHex: digestHex,
+                        state: .ready
+                    )
+                }
+            }
+        } catch {
+            if preparation == .staging {
+                // Keep a durable reclaiming intent until the file has been
+                // safely unlinked. If the transaction outcome is uncertain,
+                // reconciliation rechecks metadata before deletion.
+                try? await abandonPrivateBlobCreationLocked(
+                    digestHex: digestHex
+                )
+            }
+            throw error
+        }
+        return BlobReference(cid: cid, namespace: namespace)
+    }
+
+    private func blobStorageKindWithoutGate(
+        cid: String
+    ) async throws -> StoredBlobPayload.StorageKind? {
+        let rows = try await connection.query(
+            "SELECT storage_kind FROM blob_payloads WHERE cid = ?",
+            [.text(cid)]
+        )
+        guard let row = rows.first else { return nil }
+        guard let storageKind = StoredBlobPayload.StorageKind(
+            rawValue: try requiredText(row, "storage_kind")
+        ) else {
+            throw SQLiteRepositoryError.corruptDatabase("invalid blob storage kind")
+        }
+        return storageKind
+    }
+
+    private func hasFileBackedPayloadWithoutGate(
+        digestHex: String
+    ) async throws -> Bool {
+        let rows = try await connection.query(
+            """
+            SELECT 1
+            FROM blob_payloads
+            WHERE storage_kind = 'cas-v1' AND cas_digest = ?
+            LIMIT 1
+            """,
+            [.text(digestHex)]
+        )
+        return !rows.isEmpty
+    }
+
+    private func blobLifecycleStateWithoutGate(
+        digestHex: String
+    ) async throws -> BlobCASLifecycleState? {
+        let rows = try await connection.query(
+            "SELECT state FROM blob_cas_lifecycle WHERE digest_hex = ?",
+            [.text(digestHex)]
+        )
+        guard let row = rows.first else { return nil }
+        guard let state = BlobCASLifecycleState(
+            rawValue: try requiredText(row, "state")
+        ) else {
+            throw SQLiteRepositoryError.corruptDatabase("invalid blob lifecycle state")
+        }
+        return state
+    }
+
+    private func setBlobLifecycleStateWithoutGate(
+        digestHex: String,
+        state: BlobCASLifecycleState
+    ) async throws {
+        _ = try await connection.query(
+            """
+            INSERT INTO blob_cas_lifecycle(digest_hex, state, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(digest_hex) DO UPDATE SET
+                state = excluded.state,
+                updated_at = excluded.updated_at
+            """,
+            [
+                .text(digestHex), .text(state.rawValue),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
+    private func abandonPrivateBlobCreationLocked(
+        digestHex: String
+    ) async throws {
+        let needsReclamation = try await withConnectionGate {
+            try await transaction {
+                if try await hasFileBackedPayloadWithoutGate(digestHex: digestHex) {
+                    try await setBlobLifecycleStateWithoutGate(
+                        digestHex: digestHex,
+                        state: .ready
+                    )
+                    return false
+                }
+                try await setBlobLifecycleStateWithoutGate(
+                    digestHex: digestHex,
+                    state: .reclaiming
+                )
+                return true
+            }
+        }
+        if needsReclamation {
+            try await reconcilePrivateBlobLifecycleLocked(
+                digestHex: digestHex
+            )
+        }
+    }
+
+    private func reconcilePrivateBlobLifecycleLocked(
+        digestHex: String
+    ) async throws {
+        let shouldUnlink = try await withConnectionGate {
+            try await transaction {
+                let hasPayload = try await hasFileBackedPayloadWithoutGate(
+                    digestHex: digestHex
+                )
+                let lifecycle = try await blobLifecycleStateWithoutGate(
+                    digestHex: digestHex
+                )
+                if hasPayload {
+                    // A re-reference won the CID lock before this reconciler.
+                    // Preserve its CAS and clear the stale reclaim intent.
+                    if lifecycle != .ready {
+                        try await setBlobLifecycleStateWithoutGate(
+                            digestHex: digestHex,
+                            state: .ready
+                        )
+                    }
+                    return false
+                }
+                guard lifecycle != nil else { return false }
+                if lifecycle != .reclaiming {
+                    try await setBlobLifecycleStateWithoutGate(
+                        digestHex: digestHex,
+                        state: .reclaiming
+                    )
+                }
+                return true
+            }
+        }
+        guard shouldUnlink else { return }
+
+        // Filesystem effects are intentionally outside the SQLite
+        // transaction.  The already-committed reclaiming state makes a crash
+        // here recoverable without ever pointing a live reference at a
+        // missing file.
+        try SQLiteProtectedPaths.removePrivateBlob(
+            accountDirectoryDescriptor: accountDirectoryDescriptor,
+            accountNamespace: accountBlobNamespace,
+            digestHex: digestHex
+        )
+        try await withConnectionGate {
+            try await transaction {
+                guard try await hasFileBackedPayloadWithoutGate(digestHex: digestHex) == false,
+                      try await blobLifecycleStateWithoutGate(digestHex: digestHex) == .reclaiming
+                else {
+                    return
+                }
+                _ = try await connection.query(
+                    "DELETE FROM blob_cas_lifecycle WHERE digest_hex = ?",
+                    [.text(digestHex)]
+                )
+            }
+        }
+    }
+
+    private func recoverPrivateBlobLifecycle() async throws {
+        let candidates = try await withConnectionGate {
+            let rows = try await connection.query(
+                """
+                SELECT digest_hex
+                FROM blob_cas_lifecycle
+                WHERE state != 'ready'
+                ORDER BY digest_hex
+                """
+            )
+            return try rows.map { try requiredText($0, "digest_hex") }
+        }
+        for digestHex in candidates {
+            guard legacyBlobDigest("sha256:\(digestHex)") != nil else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid blob lifecycle digest")
+            }
+            try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
+                try await reconcilePrivateBlobLifecycleLocked(
+                    digestHex: digestHex
+                )
+            }
+        }
+    }
+
+    private func verifyPrivateBlobFile(
+        digestHex: String,
+        expectedLength: Int
+    ) throws {
+        guard let expectedDigest = legacyBlobDigest("sha256:\(digestHex)") else {
+            throw SQLiteRepositoryError.corruptDatabase("invalid CAS blob digest")
+        }
+        let descriptor = try SQLiteProtectedPaths.openPrivateBlob(
+            accountDirectoryDescriptor: accountDirectoryDescriptor,
+            accountNamespace: accountBlobNamespace,
+            digestHex: digestHex
+        )
+        do {
+            let body = try SQLiteVerifiedSpaceBlobBody(
+                descriptor: descriptor,
+                expectedDigest: expectedDigest,
+                expectedLength: expectedLength
+            )
+            body.discardUnstreamed()
+        } catch {
+            SQLiteProtectedPaths.closeDirectory(descriptor)
+            throw error
+        }
+    }
+
+    private func blobPayload(
+        cid: String,
+        namespaceKind: String,
+        spaceURI: String
+    ) async throws -> StoredBlobPayload {
+        guard let stored = try await blobPayloadIfReachable(
+            cid: cid,
+            namespaceKind: namespaceKind,
+            spaceURI: spaceURI
+        ) else {
+            throw SwanError.unauthorized("blob is not reachable in this namespace")
+        }
+        return stored
+    }
+
+    private func blobPayloadIfReachable(
+        cid: String,
+        namespaceKind: String,
+        spaceURI: String
+    ) async throws -> StoredBlobPayload? {
+        try await withConnectionGate {
+            try await blobPayloadIfReachableWithoutGate(
+                cid: cid,
+                namespaceKind: namespaceKind,
+                spaceURI: spaceURI
+            )
+        }
+    }
+
+    private func blobPayloadIfReachableWithoutGate(
+        cid: String,
+        namespaceKind: String,
+        spaceURI: String
+    ) async throws -> StoredBlobPayload? {
+        let rows = try await connection.query(
+            """
+            SELECT blob_payloads.cid, blob_payloads.payload,
+                   blob_payloads.storage_kind, blob_payloads.cas_digest,
+                   blob_payloads.byte_count,
+                   blob_payloads.mime_type
+            FROM blob_payloads
+            JOIN blob_namespace_references USING(cid)
+            WHERE blob_payloads.cid = ? AND namespace_kind = ? AND space_uri = ?
+            """,
+            [.text(cid), .text(namespaceKind), .text(spaceURI)]
+        )
+        guard let row = rows.first else { return nil }
+        let storedCID = try requiredText(row, "cid")
+        guard storedCID == cid,
+              let storageKind = StoredBlobPayload.StorageKind(
+                  rawValue: try requiredText(row, "storage_kind")
+              )
+        else {
+            throw SQLiteRepositoryError.corruptDatabase("invalid blob metadata")
+        }
+        let storedByteCount: Int
+        if let value = row.column("byte_count"), !value.isNull {
+            guard let integer = value.integer, integer >= 0 else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid blob size")
+            }
+            storedByteCount = integer
+        } else if storageKind == .legacySQLite {
+            storedByteCount = try requiredBlob(row, "payload").count
+        } else {
+            throw SQLiteRepositoryError.corruptDatabase("missing blob size")
+        }
+        let mimeType: String?
+        if let value = row.column("mime_type"), !value.isNull {
+            guard let raw = value.string else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid blob MIME type")
+            }
+            mimeType = safeBlobMIMEType(raw)
+        } else {
+            mimeType = nil
+        }
+        let legacyPayload: Data?
+        let casDigest: String?
+        switch storageKind {
+        case .legacySQLite:
+            let payload = try requiredBlob(row, "payload")
+            guard legacyBlobCID(payload) == storedCID,
+                  payload.count == storedByteCount else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "legacy blob payload does not match metadata"
+                )
+            }
+            legacyPayload = payload
+            casDigest = nil
+        case .casV1:
+            let digest = try blobDigestHex(cid: storedCID, allowLegacy: true)
+            guard let storedDigest = row.column("cas_digest")?.string,
+                  storedDigest == digest,
+                  legacyBlobDigest("sha256:\(storedDigest)") != nil else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid CAS blob CID")
+            }
+            legacyPayload = nil
+            casDigest = storedDigest
+        }
+        return StoredBlobPayload(
+            cid: storedCID,
+            storageKind: storageKind,
+            byteCount: storedByteCount,
+            mimeType: mimeType,
+            casDigest: casDigest,
+            legacyPayload: legacyPayload
+        )
+    }
+
+    private func materializeBlobData(_ stored: StoredBlobPayload) async throws -> Data {
+        switch stored.storageKind {
+        case .legacySQLite:
+            guard let payload = stored.legacyPayload else {
+                throw SQLiteRepositoryError.corruptDatabase("missing legacy blob payload")
+            }
+            try await migrateLegacyBlobToCAS(stored, payload: payload)
+            return payload
+        case .casV1:
+            let body = try await fileBackedBlobBody(stored)
+            var output = Data()
+            output.reserveCapacity(stored.byteCount)
+            try await body.streamBody(maximumChunkBytes: 64 * 1_024) { chunk in
+                output.append(chunk)
+            }
+            guard output.count == stored.byteCount else {
+                throw SwanError.unavailable("permissioned blob storage is unavailable")
+            }
+            return output
+        }
+    }
+
+    private func migrateLegacyBlobToCAS(
+        _ stored: StoredBlobPayload,
+        payload: Data
+    ) async throws {
+        guard stored.storageKind == .legacySQLite,
+              legacyBlobCID(payload) == stored.cid,
+              payload.count == stored.byteCount else {
+            throw SQLiteRepositoryError.corruptDatabase("invalid legacy blob migration")
+        }
+        let digestHex = try blobDigestHex(cid: stored.cid, allowLegacy: true)
+        try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
+            let preparation = try await withConnectionGate {
+                try await transaction {
+                    switch try await blobStorageKindWithoutGate(cid: stored.cid) {
+                    case .casV1:
+                        return false
+                    case .legacySQLite:
+                        try await setBlobLifecycleStateWithoutGate(
+                            digestHex: digestHex,
+                            state: .creating
+                        )
+                        return true
+                    case nil:
+                        // The last authorized reference was removed after the
+                        // compatibility read began. Returning its already
+                        // validated payload is fine, but do not create an
+                        // unreachable replacement file.
+                        return false
+                    }
+                }
+            }
+            guard preparation else { return }
+
+            do {
+                let created = try SQLiteProtectedPaths.createPrivateBlob(
+                    accountDirectoryDescriptor: accountDirectoryDescriptor,
+                    accountNamespace: accountBlobNamespace,
+                    digestHex: digestHex,
+                    payload: payload
+                )
+                if !created {
+                    try verifyPrivateBlobFile(
+                        digestHex: digestHex,
+                        expectedLength: stored.byteCount
+                    )
+                }
+                if let hook = testingHooks.beforeLegacyBlobMigrationCommit {
+                    try await hook()
+                }
+                try await withConnectionGate {
+                    try await transaction {
+                        guard try await blobStorageKindWithoutGate(cid: stored.cid) == .legacySQLite else {
+                            throw SQLiteRepositoryError.corruptDatabase(
+                                "legacy blob changed during migration"
+                            )
+                        }
+                        _ = try await connection.query(
+                            """
+                            UPDATE blob_payloads
+                            SET payload = zeroblob(0), storage_kind = 'cas-v1',
+                                cas_digest = ?, byte_count = ?
+                            WHERE cid = ? AND storage_kind = 'legacy-sqlite'
+                            """,
+                            [
+                                .text(digestHex), .integer(stored.byteCount),
+                                .text(stored.cid),
+                            ]
+                        )
+                        try await setBlobLifecycleStateWithoutGate(
+                            digestHex: digestHex,
+                            state: .ready
+                        )
+                    }
+                }
+            } catch {
+                try? await abandonPrivateBlobCreationLocked(
+                    digestHex: digestHex
+                )
+                throw error
+            }
+        }
+    }
+
+    private func fileBackedBlobBody(
+        _ stored: StoredBlobPayload
+    ) async throws -> SQLiteVerifiedSpaceBlobBody {
+        guard stored.storageKind == .casV1 else {
+            throw SQLiteRepositoryError.corruptDatabase("blob is not file backed")
+        }
+        guard let digestHex = stored.casDigest else {
+            throw SQLiteRepositoryError.corruptDatabase("missing CAS blob digest")
+        }
+        guard let digest = legacyBlobDigest("sha256:\(digestHex)") else {
+            throw SQLiteRepositoryError.corruptDatabase("invalid CAS blob digest")
+        }
+        let descriptor = try SQLiteProtectedPaths.openPrivateBlob(
+            accountDirectoryDescriptor: accountDirectoryDescriptor,
+            accountNamespace: accountBlobNamespace,
+            digestHex: digestHex
+        )
+        do {
+            return try SQLiteVerifiedSpaceBlobBody(
+                descriptor: descriptor,
+                expectedDigest: digest,
+                expectedLength: stored.byteCount
+            )
+        } catch {
+            SQLiteProtectedPaths.closeDirectory(descriptor)
+            throw error
         }
     }
 
@@ -3819,8 +4777,102 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         }
     }
 
-    private func blobCID(_ payload: Data) -> String {
+    /// Account databases share the two-hex layout shard, so the CAS must add
+    /// the full DID hash before its content digest.  Otherwise two unrelated
+    /// accounts that happen to share a layout prefix could race on a payload
+    /// file while SQLite tracks references only in their separate databases.
+    private var accountBlobNamespace: String {
+        Hex.encode(SHA256.hash(data: Data(accountDID.utf8)))
+    }
+
+    private func legacyBlobCID(_ payload: Data) -> String {
         "sha256:\(Hex.encode(SHA256.hash(data: payload)))"
+    }
+
+    private func canonicalRawBlobCID(_ value: String) throws -> CID {
+        let cid: CID
+        do {
+            cid = try CID.parse(value)
+        } catch {
+            throw SwanError.malformed("blob CID is invalid")
+        }
+        guard cid.string == value,
+              cid.codec == .raw,
+              cid.multihash.algorithm == Multihash.sha256Code,
+              cid.multihash.length == Multihash.sha256Length,
+              cid.multihash.digest.count == Int(Multihash.sha256Length) else {
+            throw SwanError.malformed("blob CID is invalid")
+        }
+        return cid
+    }
+
+    private func blobDigestHex(cid: String, allowLegacy: Bool) throws -> String {
+        if let parsed = try? canonicalRawBlobCID(cid) {
+            return Hex.encode(parsed.multihash.digest)
+        }
+        guard allowLegacy,
+              cid.utf8.count == 71,
+              cid.hasPrefix("sha256:"),
+              let digest = legacyBlobDigest(cid) else {
+            throw SwanError.malformed("blob CID is invalid")
+        }
+        return Hex.encode(digest)
+    }
+
+    private func legacyBlobDigest(_ value: String) -> Data? {
+        guard value.utf8.count == 71, value.hasPrefix("sha256:") else {
+            return nil
+        }
+        let characters = Array(value.dropFirst("sha256:".count).utf8)
+        guard characters.count == 64 else { return nil }
+        var output = Data()
+        output.reserveCapacity(32)
+        for index in stride(from: 0, to: characters.count, by: 2) {
+            func nibble(_ value: UInt8) -> UInt8? {
+                switch value {
+                case UInt8(ascii: "0") ... UInt8(ascii: "9"):
+                    value - UInt8(ascii: "0")
+                case UInt8(ascii: "a") ... UInt8(ascii: "f"):
+                    value - UInt8(ascii: "a") + 10
+                default:
+                    nil
+                }
+            }
+            guard let high = nibble(characters[index]),
+                  let low = nibble(characters[index + 1]) else {
+                return nil
+            }
+            output.append((high << 4) | low)
+        }
+        return output
+    }
+
+    private func blobByteCount(_ count: Int) throws -> Int {
+        guard count >= 0 else {
+            throw SwanError.malformed("blob size is invalid")
+        }
+        return count
+    }
+
+    /// Keep the original upload MIME only when it is a simple header token
+    /// pair.  A database row is never allowed to introduce a line break,
+    /// parameter, or other response-header syntax at the HTTP boundary.
+    private func safeBlobMIMEType(_ value: String?) -> String? {
+        guard let value,
+              !value.isEmpty,
+              value.utf8.count <= 255,
+              value.utf8.allSatisfy({ byte in
+                  (byte >= UInt8(ascii: "A") && byte <= UInt8(ascii: "Z"))
+                      || (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "z"))
+                      || (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+                      || "!#$&^_.+-/".utf8.contains(byte)
+              }),
+              value.filter({ $0 == "/" }).count == 1,
+              !value.hasPrefix("/"), !value.hasSuffix("/")
+        else {
+            return nil
+        }
+        return value
     }
 
     private func verifiedPublicGenesis(
@@ -3984,6 +5036,105 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     private func blob(_ data: Data) -> SQLiteData {
         // SQLiteNIO's Foundation conformance binds Data as a native BLOB.
         data.sqliteData!
+    }
+}
+
+/// A one-shot, already-open descriptor for an authorized private blob.  The
+/// digest check completes before this object reaches HTTP, so the response
+/// cannot start successfully and later discover that a swapped/corrupt file
+/// had a different CID.  It intentionally exposes neither a path nor a way
+/// to seek/reopen the payload.
+private final class SQLiteVerifiedSpaceBlobBody: @unchecked Sendable,
+    AuthorizedSpaceBlobBody
+{
+    private let lock = NSLock()
+    private var descriptor: Int32
+    let contentLength: Int
+
+    init(
+        descriptor: Int32,
+        expectedDigest: Data,
+        expectedLength: Int
+    ) throws {
+        guard expectedLength >= 0, expectedDigest.count == 32 else {
+            throw SwanError.unavailable("permissioned blob storage is unavailable")
+        }
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_uid == geteuid(),
+              (metadata.st_mode & 0o777) == 0o600,
+              metadata.st_size >= 0,
+              metadata.st_size <= off_t(Int.max),
+              Int(metadata.st_size) == expectedLength else {
+            throw SwanError.unavailable("permissioned blob storage is unavailable")
+        }
+
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+        var digest = SHA256()
+        var readLength = 0
+        while let chunk = try handle.read(upToCount: 64 * 1_024), !chunk.isEmpty {
+            try Task.checkCancellation()
+            digest.update(data: chunk)
+            guard readLength <= expectedLength - chunk.count else {
+                throw SwanError.unavailable("permissioned blob storage is unavailable")
+            }
+            readLength += chunk.count
+        }
+        guard readLength == expectedLength,
+              Data(digest.finalize()) == expectedDigest,
+              lseek(descriptor, 0, SEEK_SET) == 0 else {
+            throw SwanError.unavailable("permissioned blob storage is unavailable")
+        }
+
+        self.descriptor = descriptor
+        contentLength = expectedLength
+    }
+
+    deinit { closeDescriptor() }
+
+    func streamBody(
+        maximumChunkBytes: Int,
+        consume: (Data) async throws -> Void
+    ) async throws {
+        guard (1 ... 64 * 1_024).contains(maximumChunkBytes) else {
+            closeDescriptor()
+            throw SwanError.malformed("permissioned blob chunk size is invalid")
+        }
+        let descriptor = takeDescriptor()
+        guard descriptor >= 0 else {
+            throw SwanError.unavailable("permissioned blob storage is unavailable")
+        }
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { try? handle.close() }
+        while true {
+            try Task.checkCancellation()
+            guard let chunk = try handle.read(upToCount: maximumChunkBytes),
+                  !chunk.isEmpty else {
+                return
+            }
+            try await consume(chunk)
+        }
+    }
+
+    /// Releases a verified descriptor that was opened only to validate an
+    /// existing CAS entry before lifecycle adoption.  This keeps the verifier
+    /// one-shot just like the HTTP streaming path without buffering a body.
+    func discardUnstreamed() {
+        closeDescriptor()
+    }
+
+    private func takeDescriptor() -> Int32 {
+        lock.lock()
+        defer { lock.unlock() }
+        let result = descriptor
+        descriptor = -1
+        return result
+    }
+
+    private func closeDescriptor() {
+        let descriptor = takeDescriptor()
+        if descriptor >= 0 { _ = close(descriptor) }
     }
 }
 
@@ -4306,6 +5457,22 @@ public actor DurableSpaceRepository {
         return try await database.prepareRepositoryCARSnapshot(
             space: space,
             author: author
+        )
+    }
+
+    /// Opens one already-authorized, file-backed blob body.  Blob retrieval is
+    /// an aggregate repository read: a collection-qualified OAuth grant may
+    /// read its individual records but cannot be repurposed into an arbitrary
+    /// blob oracle.
+    public func permissionedBlob(
+        cid: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceBlob? {
+        try requireRead(uri: nil, authorization: authorization)
+        return try await database.permissionedBlob(
+            space: space,
+            author: author,
+            cid: cid
         )
     }
 

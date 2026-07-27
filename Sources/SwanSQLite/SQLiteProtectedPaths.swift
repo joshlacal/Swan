@@ -161,6 +161,178 @@ enum SQLiteProtectedPaths {
         throw SwanError.unavailable("permissioned CAR spool is unavailable")
     }
 
+    // MARK: Permissioned blob CAS
+
+    /// Creates one immutable content-addressed payload below the already
+    /// descriptor-validated account directory.  `digestHex` is never a path
+    /// supplied by a client: callers derive it from a validated CID or a
+    /// legacy SHA-256 migration record.  Existing entries are never
+    /// overwritten; a later descriptor verification decides whether they are
+    /// usable.
+    @discardableResult
+    static func createPrivateBlob(
+        accountDirectoryDescriptor: Int32,
+        accountNamespace: String,
+        digestHex: String,
+        payload: Data
+    ) throws -> Bool {
+        let (directory, filename) = try privateBlobLocation(
+            accountDirectoryDescriptor: accountDirectoryDescriptor,
+            accountNamespace: accountNamespace,
+            digestHex: digestHex
+        )
+        defer { _ = close(directory) }
+
+        let descriptor = filename.withCString { path in
+            openat(
+                directory,
+                path,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                ownerOnlyFileMode
+            )
+        }
+        if descriptor < 0 {
+            guard errno == EEXIST else {
+                throw SwanError.unavailable("permissioned blob storage is unavailable")
+            }
+            return false
+        }
+
+        do {
+            try requireOwnerOnlyRegularFile(descriptor)
+            try writeAll(payload, to: descriptor)
+            guard fsync(descriptor) == 0,
+                  fchmod(descriptor, ownerOnlyFileMode) == 0 else {
+                throw SwanError.unavailable("permissioned blob storage is unavailable")
+            }
+            _ = close(descriptor)
+            return true
+        } catch {
+            _ = close(descriptor)
+            _ = filename.withCString { unlinkat(directory, $0, 0) }
+            throw error
+        }
+    }
+
+    /// Opens an immutable blob through the same directory descriptors used to
+    /// create it.  The returned FD is still at an arbitrary offset only if a
+    /// caller changes it; its owner must validate contents and seek before
+    /// streaming.  No filesystem path leaves this API.
+    static func openPrivateBlob(
+        accountDirectoryDescriptor: Int32,
+        accountNamespace: String,
+        digestHex: String
+    ) throws -> Int32 {
+        let (directory, filename) = try privateBlobLocation(
+            accountDirectoryDescriptor: accountDirectoryDescriptor,
+            accountNamespace: accountNamespace,
+            digestHex: digestHex
+        )
+        defer { _ = close(directory) }
+        let descriptor = filename.withCString { path in
+            openat(directory, path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else {
+            throw SwanError.unavailable("permissioned blob storage is unavailable")
+        }
+        do {
+            try requireOwnerOnlyRegularFile(descriptor)
+            return descriptor
+        } catch {
+            _ = close(descriptor)
+            throw error
+        }
+    }
+
+    /// Unlinks only the deterministic regular-file entry under the private
+    /// CAS directory.  Callers invoke this while their SQLite transaction has
+    /// proved that no public or space namespace still reaches the digest.
+    static func removePrivateBlob(
+        accountDirectoryDescriptor: Int32,
+        accountNamespace: String,
+        digestHex: String
+    ) throws {
+        let (directory, filename) = try privateBlobLocation(
+            accountDirectoryDescriptor: accountDirectoryDescriptor,
+            accountNamespace: accountNamespace,
+            digestHex: digestHex
+        )
+        defer { _ = close(directory) }
+        let descriptor = filename.withCString { path in
+            openat(directory, path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        if descriptor < 0 {
+            guard errno == ENOENT else {
+                throw SwanError.unavailable("permissioned blob storage is unavailable")
+            }
+            return
+        }
+        defer { _ = close(descriptor) }
+        try requireOwnerOnlyRegularFile(descriptor)
+        guard filename.withCString({ unlinkat(directory, $0, 0) }) == 0 else {
+            throw SwanError.unavailable("permissioned blob storage is unavailable")
+        }
+    }
+
+    /// Acquires a process-wide advisory lock for one private CAS digest.  The
+    /// in-process coordinator in `SQLiteAccountDatabase` covers Swift actors
+    /// in the same process; this descriptor-backed lock extends that ordering
+    /// to another Swan process sharing the account database.  The lock file is
+    /// deliberately retained after a blob is reclaimed: deleting a lock file
+    /// would reintroduce a name-replacement race at the precise boundary this
+    /// API protects.
+    static func openPrivateBlobLifecycleLock(
+        accountDirectoryDescriptor: Int32,
+        accountNamespace: String,
+        digestHex: String
+    ) throws -> Int32 {
+        let (directory, filename) = try privateBlobLocation(
+            accountDirectoryDescriptor: accountDirectoryDescriptor,
+            accountNamespace: accountNamespace,
+            digestHex: digestHex
+        )
+        defer { _ = close(directory) }
+        let lockName = "\(filename).lock"
+        let descriptor = lockName.withCString { path in
+            openat(
+                directory,
+                path,
+                O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+                ownerOnlyFileMode
+            )
+        }
+        guard descriptor >= 0 else {
+            throw SwanError.unavailable("permissioned blob storage is unavailable")
+        }
+        do {
+            var metadata = stat()
+            guard fchmod(descriptor, ownerOnlyFileMode) == 0,
+                  fstat(descriptor, &metadata) == 0,
+                  (metadata.st_mode & S_IFMT) == S_IFREG,
+                  metadata.st_uid == geteuid(),
+                  metadata.st_nlink == 1,
+                  (metadata.st_mode & 0o777) == ownerOnlyFileMode,
+                  fsync(descriptor) == 0 else {
+                throw SwanError.unavailable("permissioned blob storage is unavailable")
+            }
+            while flock(descriptor, LOCK_EX) != 0 {
+                guard errno == EINTR else {
+                    throw SwanError.unavailable("permissioned blob storage is unavailable")
+                }
+            }
+            return descriptor
+        } catch {
+            _ = close(descriptor)
+            throw error
+        }
+    }
+
+    static func closePrivateBlobLifecycleLock(_ descriptor: Int32) {
+        guard descriptor >= 0 else { return }
+        while flock(descriptor, LOCK_UN) != 0, errno == EINTR {}
+        _ = close(descriptor)
+    }
+
     static func closeDirectory(_ descriptor: Int32) {
         guard descriptor >= 0 else { return }
         _ = close(descriptor)
@@ -221,11 +393,80 @@ enum SQLiteProtectedPaths {
         }
     }
 
+    private static func privateBlobLocation(
+        accountDirectoryDescriptor: Int32,
+        accountNamespace: String,
+        digestHex: String
+    ) throws -> (directory: Int32, filename: String) {
+        guard validBlobDigest(accountNamespace), validBlobDigest(digestHex) else {
+            throw SwanError.unavailable("permissioned blob storage is unavailable")
+        }
+        let root = try openOrCreateDirectory(
+            parent: accountDirectoryDescriptor,
+            name: "permissioned-blob-cas"
+        )
+        do {
+            let account = try openOrCreateDirectory(
+                parent: root,
+                name: accountNamespace
+            )
+            do {
+                let shard = try openOrCreateDirectory(
+                    parent: account,
+                    name: String(digestHex.prefix(2))
+                )
+                _ = close(account)
+                _ = close(root)
+                return (shard, "\(digestHex).blob")
+            } catch {
+                _ = close(account)
+                throw error
+            }
+        } catch {
+            _ = close(root)
+            throw error
+        }
+    }
+
+    private static func writeAll(_ payload: Data, to descriptor: Int32) throws {
+        var offset = 0
+        while offset < payload.count {
+            let wrote: Int
+            do {
+                wrote = try payload.withUnsafeBytes { bytes in
+                    guard let base = bytes.baseAddress else { return 0 }
+                    let result = write(
+                        descriptor,
+                        base.advanced(by: offset),
+                        payload.count - offset
+                    )
+                    guard result >= 0 else {
+                        throw SwanError.unavailable("permissioned blob storage is unavailable")
+                    }
+                    return result
+                }
+            } catch {
+                throw error
+            }
+            guard wrote > 0 else {
+                throw SwanError.unavailable("permissioned blob storage is unavailable")
+            }
+            offset += wrote
+        }
+    }
+
     private static func validDirectoryComponent(_ value: String) -> Bool {
         !value.isEmpty && !value.contains("/") && value != "." && value != ".."
     }
 
     private static func validDatabaseFilename(_ value: String) -> Bool {
         value == "control.sqlite" || (value.hasSuffix(".sqlite") && !value.contains("/"))
+    }
+
+    private static func validBlobDigest(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy {
+            ($0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9"))
+                || ($0 >= UInt8(ascii: "a") && $0 <= UInt8(ascii: "f"))
+        }
     }
 }

@@ -22,6 +22,141 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
     private static let latestPath = "/xrpc/com.atproto.space.getLatestCommit"
     private static let oplogPath = "/xrpc/com.atproto.space.listRepoOps"
     private static let repoPath = "/xrpc/com.atproto.space.getRepo"
+    private static let blobPath = "/xrpc/com.atproto.space.getBlob"
+
+    func testGetBlobStreamsPrivateCASForOAuthAndSpaceCredential() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let app = try makeServer(fixture, enabled: true).buildApplication(
+                logger: Logger(label: "RepositorySyncHTTPTests.getBlob")
+            )
+            let oauth = try await issueToken(
+                runtime: fixture.runtime,
+                subject: Self.alice,
+                scopes: ["atproto"]
+            )
+            let credential = try await fixture.credential(for: fixture.space)
+            try await app.test(.router) { client in
+                let oauthHeaders = try self.dpopHeaders(
+                    token: oauth.token,
+                    key: oauth.key,
+                    jwk: oauth.jwk,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "blob-oauth-success",
+                    path: Self.blobPath
+                )
+                try await client.execute(
+                    uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID),
+                    method: .get,
+                    headers: oauthHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(Data(buffer: response.body), fixture.blobPayload)
+                    self.assertBlobHeaders(response, cid: fixture.blobCID, length: fixture.blobPayload.count)
+                }
+
+                try await client.execute(
+                    uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID),
+                    method: .get,
+                    headers: self.bearerHeaders(credential, dpop: "ignored-for-credential")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(Data(buffer: response.body), fixture.blobPayload)
+                    self.assertBlobHeaders(response, cid: fixture.blobCID, length: fixture.blobPayload.count)
+                }
+            }
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    func testGetBlobRejectsMalformedForeignCollectionScopedAndReplayRequests() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let app = try makeServer(fixture, enabled: true).buildApplication(
+                logger: Logger(label: "RepositorySyncHTTPTests.getBlobBoundaries")
+            )
+            let alice = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: ["atproto"])
+            let bob = try await issueToken(runtime: fixture.runtime, subject: Self.bob, scopes: ["atproto"])
+            let narrowScope = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=app.bsky.feed.post"
+            let narrow = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: [narrowScope])
+            try await app.test(.router) { client in
+                for uri in [
+                    Self.blobPath,
+                    "\(Self.blobPath)?space=at%3A%2F%2Fbad&space=at%3A%2F%2Fbad&repo=\(Self.alice)&cid=bad",
+                    "\(Self.blobPath)?space=\(self.percentEncode(fixture.space.rawValue))&repo=\(Self.alice)&cid=sha256%3Abad",
+                    "\(Self.blobPath)?space=\(self.percentEncode(fixture.space.rawValue))&repo=\(Self.alice)&cid=\(fixture.blobCID)&extra=x",
+                ] {
+                    try await client.execute(uri: uri, method: .get) { response in
+                        XCTAssertEqual(response.status, .badRequest)
+                        self.assertNoStore(response)
+                        XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                    }
+                }
+
+                let foreignHeaders = try self.dpopHeaders(
+                    token: bob.token, key: bob.key, jwk: bob.jwk,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "blob-foreign", path: Self.blobPath
+                )
+                try await client.execute(
+                    uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID),
+                    method: .get, headers: foreignHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    self.assertNoStore(response)
+                    XCTAssertFalse(String(decoding: response.body.readableBytesView, as: UTF8.self).contains(fixture.blobCID))
+                }
+
+                let narrowHeaders = try self.dpopHeaders(
+                    token: narrow.token, key: narrow.key, jwk: narrow.jwk,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "blob-narrow", path: Self.blobPath
+                )
+                try await client.execute(
+                    uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID),
+                    method: .get, headers: narrowHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    self.assertNoStore(response)
+                }
+
+                let replayHeaders = try self.dpopHeaders(
+                    token: alice.token, key: alice.key, jwk: alice.jwk,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "blob-replay", path: Self.blobPath
+                )
+                try await client.execute(
+                    uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID),
+                    method: .get, headers: replayHeaders
+                ) { XCTAssertEqual($0.status, .ok) }
+                try await client.execute(
+                    uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID),
+                    method: .get, headers: replayHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    self.assertNoStore(response)
+                }
+
+                try await client.execute(
+                    uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID),
+                    method: .post
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(try self.errorCode(response.body), "permissioned_endpoint_unavailable")
+                }
+            }
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
 
     func testGetRepoStreamsFreshTwoRootCARForOAuthSelfAndCredentialCrossRepository() async throws {
         let fixture = try await Fixture.make()
@@ -678,6 +813,10 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         "\(Self.repoPath)?space=\(percentEncode(space.rawValue))&repo=\(repo)"
     }
 
+    private func blobURI(space: SpaceURI, repo: String, cid: String) -> String {
+        "\(Self.blobPath)?space=\(percentEncode(space.rawValue))&repo=\(repo)&cid=\(cid)"
+    }
+
     private func oplogURI(
         space: SpaceURI,
         repo: String,
@@ -817,6 +956,21 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(response.headers[.cacheControl], "no-store", file: file, line: line)
     }
 
+    private func assertBlobHeaders(
+        _ response: TestResponse,
+        cid: String,
+        length: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(response.headers[.contentType], "application/octet-stream", file: file, line: line)
+        XCTAssertEqual(response.headers[.cacheControl], "no-store", file: file, line: line)
+        XCTAssertEqual(response.headers[.contentLength], String(length), file: file, line: line)
+        XCTAssertEqual(response.headers[HTTPField.Name("X-Content-Type-Options")!], "nosniff", file: file, line: line)
+        XCTAssertEqual(response.headers[HTTPField.Name("Content-Disposition")!], "attachment; filename=\"\(cid)\"", file: file, line: line)
+        XCTAssertEqual(response.headers[HTTPField.Name("Content-Security-Policy")!], "default-src 'none'; sandbox", file: file, line: line)
+    }
+
     private func assertRecoveryCAR(
         _ data: Data,
         fixture: Fixture,
@@ -920,6 +1074,8 @@ private struct Fixture: Sendable {
     let references: [String: AccountKeyReference]
     let publicKeys: [String: Data]
     let tids: [String]
+    let blobCID: String
+    let blobPayload: Data
 
     static func make(retention: Int = 10_000) async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
@@ -975,6 +1131,11 @@ private struct Fixture: Sendable {
                 wireRevision: try TID(tidString: tids[4]),
                 authorization: authorization
             )
+            let blobPayload = Data("permissioned blob payload".utf8)
+            let blob = try await aliceDatabase.putBlob(
+                blobPayload,
+                namespace: .space(space)
+            )
             try await aliceDatabase.close()
 
             let bobDatabase = try await SQLiteAccountDatabase(dataDirectory: root, did: RepositorySyncHTTPTests.bob, oplogRetention: retention)
@@ -996,7 +1157,9 @@ private struct Fixture: Sendable {
                 accounts: accounts, directory: directory, runtime: runtime,
                 references: [RepositorySyncHTTPTests.alice: aliceKeys.signingReference, RepositorySyncHTTPTests.bob: bobKeys.signingReference],
                 publicKeys: [RepositorySyncHTTPTests.alice: alicePublicKey, RepositorySyncHTTPTests.bob: bobPublicKey],
-                tids: tids
+                tids: tids,
+                blobCID: blob.cid,
+                blobPayload: blobPayload
             )
         } catch {
             try? await control.close()
