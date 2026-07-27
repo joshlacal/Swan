@@ -288,6 +288,11 @@ public struct OAuthClientMetadata: Codable, Sendable, Equatable {
             }
         }
         let scope = try parseScopes(items.first(where: { $0.name == "scope" })?.value ?? "atproto")
+        guard scope.allSatisfy({
+            $0 == "atproto" || PermissionedSpaceScopeSyntax.isIssuableQualified($0)
+        }) else {
+            throw SwanError.malformed("invalid localhost development scope")
+        }
         return try Self(
             clientID: clientID,
             applicationType: .native,
@@ -335,10 +340,12 @@ public struct OAuthClientMetadata: Codable, Sendable, Equatable {
         } else {
             try Self.validateHTTPSClientID(clientID)
         }
+        let hasResourceScope = scopes.contains("atproto") ||
+            (isLocalhostDevelopmentClient && scopes.contains(where: PermissionedSpaceScopeSyntax.isIssuableQualified))
         guard !redirectURIs.isEmpty,
               grantTypes.contains("authorization_code"),
               responseTypes.contains("code"),
-              scopes.contains("atproto"),
+              hasResourceScope,
               dpopBoundAccessTokens else {
             throw SwanError.malformed("OAuth client metadata misses a required AT Protocol field")
         }
@@ -435,6 +442,24 @@ public struct OAuthClientMetadata: Codable, Sendable, Equatable {
                   !value.isEmpty && value.utf8.allSatisfy { $0 > 0x20 && $0 < 0x7F }
               }) else {
             throw SwanError.malformed("OAuth scope declaration is invalid")
+        }
+        return Set(values)
+    }
+
+    /// Parses a scope parameter from the localhost virtual-client flow. The
+    /// virtual metadata itself is the allow-list, and qualified grants use
+    /// the issuer-side grammar rather than the resource server's deliberately
+    /// more permissive wildcard matcher.
+    public static func localhostRequestedScopes(_ raw: String?) throws -> Set<String>? {
+        guard let raw else { return nil }
+        let values = raw.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard !values.isEmpty, values.count <= 64, values.count == Set(values).count,
+              values.allSatisfy({ value in
+                  value.utf8.count <= 4_096 &&
+                      value.utf8.allSatisfy { $0 > 0x20 && $0 < 0x7F } &&
+                      (value == "atproto" || PermissionedSpaceScopeSyntax.isIssuableQualified(value))
+              }) else {
+            throw SwanError.malformed("localhost OAuth scope is invalid")
         }
         return Set(values)
     }

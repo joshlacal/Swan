@@ -56,6 +56,7 @@ private struct LocalhostTokenForm {
     let code: String?
     let verifier: String?
     let refreshToken: String?
+    let scopes: Set<String>?
 }
 
 private struct LocalhostRevocationForm {
@@ -69,7 +70,7 @@ private struct LocalhostTokenSuccess: Encodable {
     let refreshToken: String
     let tokenType = "DPoP"
     let expiresIn: Int
-    let scope = "atproto"
+    let scope: String
     let subject: String
 
     enum CodingKeys: String, CodingKey {
@@ -300,46 +301,48 @@ private func exchangeLocalhostToken(
     }
 
     do {
-        let pair: OAuthTokenPair
+        let issued: OAuthTokenGrantResult
         switch form.grant {
         case .authorizationCode:
             guard let code = form.code, let verifier = form.verifier, let redirectURI = form.redirectURI else {
                 return localhostTokenError(.badRequest)
             }
             let metadata = try OAuthClientMetadata.localhostDevelopmentMetadata(clientID: form.clientID)
-            let session = try OAuthValidatedSession(
-                issuer: configuration.issuer.absoluteString,
-                client: OAuthResolvedClientMetadata(metadata: metadata, keySet: nil),
-                redirectURI: redirectURI,
-                scopes: ["atproto"],
-                dpopProof: dpopProof
-            )
-            pair = try await runtime.tokenService.redeemAuthorizationCode(
+            issued = try await runtime.tokenService.redeemAuthorizationCodeForClient(
                 code,
                 verifier: verifier,
-                session: session,
-                requireActiveSubject: true
+                redirectURI: redirectURI,
+                authorizationServerIssuer: configuration.issuer.absoluteString,
+                client: OAuthResolvedClientMetadata(metadata: metadata, keySet: nil),
+                dpopProof: dpopProof,
+                clientAssertion: nil
             )
         case .refreshToken:
             guard let refreshToken = form.refreshToken else { return localhostTokenError(.badRequest) }
-            pair = try await runtime.tokenService.redeemLocalhostPublicRefresh(
+            let pair = try await runtime.tokenService.redeemLocalhostPublicRefresh(
                 refreshToken,
                 clientID: form.clientID,
-                dpopProof: dpopProof
+                dpopProof: dpopProof,
+                requestedScopes: form.scopes
+            )
+            let grant = try await runtime.tokenService.validateAccess(pair.accessToken, proof: dpopProof)
+            issued = OAuthTokenGrantResult(
+                accessToken: pair.accessToken,
+                accessExpiresAt: pair.accessExpiresAt,
+                scopes: grant.scopes,
+                subject: grant.subject,
+                refreshToken: pair.refreshToken
             )
         }
-        let grant = try await runtime.tokenService.validateAccess(
-            pair.accessToken,
-            proof: dpopProof
-        )
-        let expiresIn = max(0, Int(pair.accessExpiresAt.timeIntervalSinceNow.rounded(.down)))
+        let expiresIn = max(0, Int(issued.accessExpiresAt.timeIntervalSinceNow.rounded(.down)))
         return localhostTokenJSON(
             .ok,
             LocalhostTokenSuccess(
-                accessToken: pair.accessToken,
-                refreshToken: pair.refreshToken,
+                accessToken: issued.accessToken,
+                refreshToken: issued.refreshToken ?? "",
                 expiresIn: expiresIn,
-                subject: grant.subject
+                scope: issued.scopes.sorted().joined(separator: " "),
+                subject: issued.subject
             )
         )
     } catch let error as SwanError {
@@ -493,16 +496,18 @@ private func parseTokenForm(_ request: Request) async throws -> LocalhostTokenFo
         guard metadata.matchesRedirectURI(redirectURI) else { throw LocalhostOAuthRequestError.malformed }
         return LocalhostTokenForm(
             grant: grant, clientID: clientID, redirectURI: redirectURI,
-            code: code, verifier: verifier, refreshToken: nil
+            code: code, verifier: verifier, refreshToken: nil, scopes: nil
         )
     case .refreshToken:
-        guard Set(fields.keys) == ["grant_type", "client_id", "refresh_token"],
+        guard Set(fields.keys) == ["grant_type", "client_id", "refresh_token"] ||
+                Set(fields.keys) == ["grant_type", "client_id", "refresh_token", "scope"],
               let refreshToken = fields["refresh_token"], validOpaqueToken(refreshToken) else {
             throw LocalhostOAuthRequestError.malformed
         }
         return LocalhostTokenForm(
             grant: grant, clientID: clientID, redirectURI: nil,
-            code: nil, verifier: nil, refreshToken: refreshToken
+            code: nil, verifier: nil, refreshToken: refreshToken,
+            scopes: try OAuthClientMetadata.localhostRequestedScopes(fields["scope"])
         )
     }
 }

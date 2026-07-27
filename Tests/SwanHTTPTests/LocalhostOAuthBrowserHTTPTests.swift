@@ -273,6 +273,43 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testQualifiedScopeSurvivesCodeAndRefreshAndCannotBeWidened() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let scope = "space:app.example.space?authority=\(did)&skey=whole-space&action=read"
+        let qualifiedClientID = try XCTUnwrap(URL(string: "http://localhost?scope=\(formEncode(scope))&redirect_uri=\(formEncode(redirectURI.absoluteString))"))
+        let key = P256.Signing.PrivateKey()
+        let jwk = try makeJWK(key)
+        let session = try makeSession(
+            proofID: "qualified-code", keyThumbprint: jwk.thumbprint(), clientID: qualifiedClientID, scopes: [scope]
+        )
+        let verifier = "swan-localhost-qualified-scope-verifier-0000000000000"
+        let code = try await fixture.runtime.tokenService.issueAuthorizationCode(
+            subject: did,
+            session: session,
+            codeChallengeS256: Data(SHA256.hash(data: Data(verifier.utf8))).base64URLEncodedString()
+        )
+        let metadata = try OAuthClientMetadata.localhostDevelopmentMetadata(clientID: qualifiedClientID)
+        let issued = try await fixture.runtime.tokenService.redeemAuthorizationCodeForClient(
+            code, verifier: verifier, redirectURI: redirectURI, authorizationServerIssuer: issuer.absoluteString,
+            client: OAuthResolvedClientMetadata(metadata: metadata, keySet: nil), dpopProof: session.dpopProof, clientAssertion: nil
+        )
+        XCTAssertEqual(issued.scopes, [scope])
+        let refresh = try XCTUnwrap(issued.refreshToken)
+        do {
+            _ = try await fixture.runtime.tokenService.redeemLocalhostPublicRefresh(
+                refresh, clientID: qualifiedClientID, dpopProof: session.dpopProof, requestedScopes: ["atproto"]
+            )
+            XCTFail("refresh scope widening was accepted")
+        } catch {}
+        let refreshed = try await fixture.runtime.tokenService.redeemLocalhostPublicRefresh(
+            refresh, clientID: qualifiedClientID, dpopProof: session.dpopProof, requestedScopes: [scope]
+        )
+        let grant = try await fixture.runtime.tokenService.validateAccess(refreshed.accessToken, proof: session.dpopProof)
+        XCTAssertEqual(grant.scopes, [scope])
+        try await fixture.control.close()
+    }
+
     private func makeFixture() async throws -> (server: SwanHTTPServer, runtime: SwanOAuthRuntime, control: SQLiteControlDatabase, root: URL) {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "LocalhostOAuthBrowserHTTPTests-\(UUID().uuidString)")
@@ -314,13 +351,18 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    private func makeSession(proofID: String, keyThumbprint: String) throws -> OAuthValidatedSession {
-        let metadata = try OAuthClientMetadata.localhostDevelopmentMetadata(clientID: clientID)
+    private func makeSession(
+        proofID: String,
+        keyThumbprint: String,
+        clientID: URL? = nil,
+        scopes: Set<String> = ["atproto"]
+    ) throws -> OAuthValidatedSession {
+        let metadata = try OAuthClientMetadata.localhostDevelopmentMetadata(clientID: clientID ?? self.clientID)
         return try OAuthValidatedSession(
             issuer: issuer.absoluteString,
             client: OAuthResolvedClientMetadata(metadata: metadata, keySet: nil),
             redirectURI: redirectURI,
-            scopes: ["atproto"],
+            scopes: scopes,
             dpopProof: OAuthValidatedDPoPProof(
                 keyThumbprint: keyThumbprint,
                 jwtID: proofID,

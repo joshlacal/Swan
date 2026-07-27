@@ -164,6 +164,37 @@ public enum Hex {
 /// to normalize it into an authority, `skey`, and action, so accepting it
 /// would make the grant broader than the pinned TypeScript tuple check.
 public enum PermissionedSpaceScopeSyntax {
+    /// The issuer-side subset of the qualified scope grammar. Resource
+    /// matching deliberately accepts wildcard grants for compatibility with
+    /// the pinned implementation; an interactive localhost client must not
+    /// mint one of those ambient grants by spelling it into its client ID.
+    ///
+    /// This is intentionally separate from ``isQualified(_:)``: the latter
+    /// is a structural parser used by a resource server, while this function
+    /// validates an *issuable* whole-space/record permission tuple.
+    public static func isIssuableQualified(_ scope: String) -> Bool {
+        guard isQualified(scope),
+              let type = strictSpaceType(scope),
+              validNSID(type),
+              let parameters = strictQualifiedParameters(scope),
+              Set(parameters.keys) == ["authority", "skey", "action"] ||
+                Set(parameters.keys) == ["authority", "skey", "action", "collection"],
+              let authority = parameters["authority"], validDID(authority),
+              let skey = parameters["skey"], validRecordKey(skey),
+              let action = parameters["action"],
+              ["read", "read_self", "create", "update", "delete"].contains(action)
+        else {
+            return false
+        }
+        if let collection = parameters["collection"], !validNSID(collection) {
+            return false
+        }
+        // A complete space read is the only collection-free action.  The
+        // other actions need a concrete collection so their authorization
+        // cannot become a latent whole-repository capability.
+        return action == "read" || parameters["collection"] != nil
+    }
+
     public static func isQualified(_ scope: String) -> Bool {
         let prefix = "space:"
         guard scope.hasPrefix(prefix),
@@ -366,6 +397,33 @@ public enum PermissionedSpaceScopeSyntax {
             return nil
         }
         return result
+    }
+
+    private static func validDID(_ value: String) -> Bool {
+        let parts = value.split(separator: ":", omittingEmptySubsequences: false)
+        return parts.count >= 3 && parts[0] == "did" && !parts[1].isEmpty &&
+            !parts.dropFirst(2).joined(separator: ":").isEmpty &&
+            value.utf8.allSatisfy { $0 >= 33 && $0 <= 126 && $0 != 47 && $0 != 63 && $0 != 35 }
+    }
+
+    private static func validNSID(_ value: String) -> Bool {
+        let labels = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard labels.count >= 3, value.utf8.count <= 317 else { return false }
+        return labels.allSatisfy { label in
+            guard !label.isEmpty, label.utf8.count <= 63, label.first?.isLetter == true else { return false }
+            return label.utf8.allSatisfy { byte in
+                (48 ... 57).contains(byte) || (65 ... 90).contains(byte) ||
+                    (97 ... 122).contains(byte) || byte == 45
+            }
+        }
+    }
+
+    private static func validRecordKey(_ value: String) -> Bool {
+        guard (1 ... 512).contains(value.utf8.count), value != ".", value != ".." else { return false }
+        return value.utf8.allSatisfy { byte in
+            (48 ... 57).contains(byte) || (65 ... 90).contains(byte) ||
+                (97 ... 122).contains(byte) || [45, 46, 95, 58, 126].contains(byte)
+        }
     }
 
     private static func hexValue(_ byte: UInt8) -> UInt8? {

@@ -572,6 +572,7 @@ public actor DurableOAuthTokenService {
         _ refreshToken: String,
         clientID: URL,
         dpopProof: OAuthValidatedDPoPProof,
+        requestedScopes: Set<String>? = nil,
         accessLifetime: TimeInterval = 300,
         requireActiveSubject: Bool = true,
         now: Date = Date()
@@ -589,7 +590,8 @@ public actor DurableOAuthTokenService {
         }
         do {
             guard family.binding.clientID == metadata.clientID.absoluteString,
-                  family.binding.confidentialClientKey == nil else {
+                  family.binding.confidentialClientKey == nil,
+                  requestedScopes.map({ $0 == family.binding.scopes }) ?? true else {
                 throw OAuthControlStoreError.bindingMismatch
             }
             try requirePresentedBindings(

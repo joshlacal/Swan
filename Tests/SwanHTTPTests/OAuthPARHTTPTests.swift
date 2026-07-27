@@ -16,6 +16,7 @@ final class OAuthPARHTTPTests: XCTestCase, @unchecked Sendable {
     private let issuer = URL(string: "https://swan.example")!
     private let clientID = URL(string: "http://localhost?scope=atproto")!
     private let redirectURI = URL(string: "http://127.0.0.1/")!
+    private let qualifiedScope = "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=read"
 
     func testLocalhostPARIsClosedByDefaultAndRequiresHTTPSIssuer() async throws {
         XCTAssertThrowsError(try SwanLocalhostPARConfiguration(issuer: URL(string: "http://swan.example")!))
@@ -173,6 +174,40 @@ final class OAuthPARHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testLocalhostPARPreservesRegisteredQualifiedWholeSpaceScope() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let clientID = try XCTUnwrap(URL(string: "http://localhost?scope=\(formEncode(qualifiedScope))"))
+        let form = validForm(state: "qualified", clientID: clientID, scope: qualifiedScope)
+        let key = P256.Signing.PrivateKey()
+        let jwk = try makeJWK(key)
+        do {
+            let app = fixture.server.buildApplication(logger: Logger(label: "OAuthPARHTTPTests.qualified"))
+            try await app.test(.router) { client in
+                var nonce: String?
+                try await client.execute(uri: "/oauth/par", method: .post, headers: formHeaders(), body: ByteBuffer(string: form)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    nonce = response.headers[dpopNonceHeader]
+                }
+                let proof = try makeDPoPProof(
+                    key: key, jwk: jwk, jti: "qualified-scope", nonce: try XCTUnwrap(nonce),
+                    target: try OAuthDPoPProofValidator.normalizedTarget(issuer.appending(path: "oauth/par"))
+                )
+                var requestURI: String?
+                try await client.execute(uri: "/oauth/par", method: .post, headers: formHeaders(dpop: proof), body: ByteBuffer(string: form)) { response in
+                    XCTAssertEqual(response.status, .created)
+                    requestURI = (try XCTUnwrap(JSONSerialization.jsonObject(with: Data(buffer: response.body)) as? [String: Any]))["request_uri"] as? String
+                }
+                let active = try await fixture.runtime.tokenService.activePushedAuthorizationRequest(try XCTUnwrap(requestURI))
+                XCTAssertEqual(active?.binding.scopes, [qualifiedScope])
+            }
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
     func testEnabledLocalhostPARRejectsBroadFormsWithoutOpeningAnOAuthErrorOracle() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -184,6 +219,10 @@ final class OAuthPARHTTPTests: XCTestCase, @unchecked Sendable {
                     validForm(state: "duplicate") + "&scope=atproto",
                     validForm(state: "plain").replacingOccurrences(of: "code_challenge_method=S256", with: "code_challenge_method=plain"),
                     validForm(state: "scope").replacingOccurrences(of: "scope=atproto", with: "scope=atproto%20profile"),
+                    validForm(state: "bare").replacingOccurrences(of: "scope=atproto", with: "scope=space%3Aapp.example.space"),
+                    validForm(state: "wildcard").replacingOccurrences(of: "scope=atproto", with: "scope=space%3A%2A%3Fauthority%3D%2A%26skey%3D%2A%26action%3Dread"),
+                    validForm(state: "duplicate-dimension").replacingOccurrences(of: "scope=atproto", with: "scope=space%3Aapp.example.space%3Fauthority%3Ddid%3Aplc%3Aabcdefghijklmnopqrstuvwx%26%2561uthority%3Ddid%3Aplc%3Aabcdefghijklmnopqrstuvwx%26skey%3Dwhole-space%26action%3Dread"),
+                    validForm(state: "unregistered").replacingOccurrences(of: "scope=atproto", with: "scope=space%3Aapp.example.space%3Fauthority%3Ddid%3Aplc%3Aabcdefghijklmnopqrstuvwx%26skey%3Dwhole-space%26action%3Dread"),
                     validForm(state: "redirect").replacingOccurrences(of: formEncode(redirectURI.absoluteString), with: formEncode("https://client.example/callback")),
                 ]
                 for form in malformedForms {
@@ -256,12 +295,12 @@ final class OAuthPARHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    private func validForm(state: String) -> String {
+    private func validForm(state: String, clientID: URL? = nil, scope: String = "atproto") -> String {
         [
-            ("client_id", clientID.absoluteString),
+            ("client_id", (clientID ?? self.clientID).absoluteString),
             ("redirect_uri", redirectURI.absoluteString),
             ("response_type", "code"),
-            ("scope", "atproto"),
+            ("scope", scope),
             ("state", state),
             ("code_challenge", String(repeating: "a", count: 43)),
             ("code_challenge_method", "S256"),

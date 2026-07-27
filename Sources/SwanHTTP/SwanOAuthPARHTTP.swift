@@ -23,6 +23,7 @@ private enum LocalhostPARRequestError: Error {
 private struct LocalhostPARForm: Sendable {
     let clientID: URL
     let redirectURI: URL
+    let scopes: Set<String>?
     let state: String
     let codeChallenge: String
 }
@@ -129,7 +130,7 @@ private func handleLocalhostPAR(
             issuer: issuer.absoluteString,
             client: client,
             redirectURI: form.redirectURI,
-            scopes: ["atproto"],
+            scopes: form.scopes ?? metadata.scopes,
             dpopProof: dpopProof
         )
         let requestURI = try await runtime.tokenService.createPushedAuthorizationRequest(
@@ -264,13 +265,17 @@ private func hexNibble(_ byte: UInt8) -> UInt8? {
 }
 
 private func validateLocalhostPARFields(_ fields: [String: String]) throws -> LocalhostPARForm {
-    let allowed: Set<String> = [
+    let required: Set<String> = [
         "client_id", "redirect_uri", "response_type", "scope", "state",
         "code_challenge", "code_challenge_method",
     ]
-    guard Set(fields.keys) == allowed,
+    let permitted: Set<String> = [
+        "client_id", "redirect_uri", "response_type", "scope", "state",
+        "code_challenge", "code_challenge_method",
+    ]
+    guard fields.keys.allSatisfy({ permitted.contains($0) }),
+          required.subtracting(["scope"]).isSubset(of: Set(fields.keys)),
           fields["response_type"] == "code",
-          fields["scope"] == "atproto",
           fields["code_challenge_method"] == "S256",
           let clientIDText = fields["client_id"],
           let redirectURIText = fields["redirect_uri"],
@@ -285,12 +290,15 @@ private func validateLocalhostPARFields(_ fields: [String: String]) throws -> Lo
         throw LocalhostPARRequestError.malformed
     }
     let metadata = try OAuthClientMetadata.localhostDevelopmentMetadata(clientID: clientID)
-    guard metadata.matchesRedirectURI(redirectURI) else {
+    let scopes = try OAuthClientMetadata.localhostRequestedScopes(fields["scope"])
+    guard metadata.matchesRedirectURI(redirectURI),
+          scopes.map({ $0.isSubset(of: metadata.scopes) }) ?? true else {
         throw LocalhostPARRequestError.malformed
     }
     return LocalhostPARForm(
         clientID: clientID,
         redirectURI: redirectURI,
+        scopes: scopes,
         state: state,
         codeChallenge: codeChallenge
     )

@@ -8,6 +8,23 @@ import SwanCore
 import SwanStorage
 
 final class SwanOAuthTests: XCTestCase {
+    func testLocalhostQualifiedScopeEnvelopeRejectsAmbientAndMalformedTuples() throws {
+        let valid = "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=read"
+        XCTAssertEqual(try OAuthClientMetadata.localhostRequestedScopes(valid), Set([valid]))
+        for invalid in [
+            "space:app.example.space",
+            "space:*?authority=*&skey=*&action=read",
+            "space:app.example.space?authority=not-a-did&skey=whole-space&action=read",
+            "space:not-an-nsid?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=read",
+            "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=*&action=read",
+            "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=anything",
+            "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=read&unknown=value",
+            "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&%61uthority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=read",
+        ] {
+            XCTAssertThrowsError(try OAuthClientMetadata.localhostRequestedScopes(invalid), invalid)
+        }
+    }
+
     func testBrowserApprovalSessionIsBoundAndExpiresWithoutPersistingCredentials() throws {
         let service = try OAuthBrowserSessionService(serverKey: Data(repeating: 0x43, count: 32))
         let now = Date(timeIntervalSince1970: 1_750_000_000)
