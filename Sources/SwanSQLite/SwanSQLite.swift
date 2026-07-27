@@ -358,6 +358,14 @@ public enum SQLiteLayout {
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS permissioned_restored_repository_closures (
+            space_uri TEXT NOT NULL,
+            author_did TEXT NOT NULL,
+            reason TEXT NOT NULL CHECK(reason = 'missing-authority-policy-v1'),
+            PRIMARY KEY(space_uri, author_did)
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS permissioned_repository_migrations (
             version INTEGER PRIMARY KEY CHECK(version > 0),
             applied_at INTEGER NOT NULL CHECK(applied_at >= 0)
@@ -625,6 +633,31 @@ public struct SQLitePortableExportInventory: Sendable, Equatable {
     public init(repositories: [Repository], blobs: [BlobReference]) {
         self.repositories = repositories
         self.blobs = blobs
+    }
+}
+
+/// Offline-only input for restoring one fully verified permissioned CAR.
+/// The SPI keeps this policy-bypassing boundary out of request-time modules.
+@_spi(PortableRestore)
+public struct SQLitePortableRestoreRepository: Sendable, Equatable {
+    public let space: SpaceURI
+    public let author: String
+    public let wireRevision: TID
+    public let records: [SpaceRecord]
+    public let ltHash: Data
+    public let commitment: Data
+
+    public init(
+        space: SpaceURI,
+        author: String,
+        recovery: VerifiedSpaceCARRecovery
+    ) {
+        self.space = space
+        self.author = author
+        wireRevision = recovery.wireRevision
+        records = recovery.records
+        ltHash = recovery.ltHash
+        commitment = recovery.commitment
     }
 }
 
@@ -2245,6 +2278,235 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                     blobs: blobs
                 )
             }
+        }
+    }
+
+    /// Installs verified full-recovery snapshots into a brand-new account
+    /// database without manufacturing oplog, outbox, authority, membership,
+    /// or client-policy rows. Every installed repository is marked HTTP-closed
+    /// until a later backup format can authenticate its authority policy.
+    @_spi(PortableRestore)
+    public func restorePortableRepositories(
+        _ repositories: [SQLitePortableRestoreRepository]
+    ) async throws {
+        let ordered = repositories.sorted {
+            ($0.space.rawValue, $0.author) < ($1.space.rawValue, $1.author)
+        }
+        guard ordered == repositories,
+              Set(ordered.map { "\($0.space.rawValue)\u{0}\($0.author)" }).count
+                == ordered.count else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "portable restore repository inventory is invalid"
+            )
+        }
+        for repository in ordered {
+            try validatePortableRestoreRepository(repository)
+        }
+
+        try await withConnectionGate {
+            try await transaction {
+                for table in [
+                    "permissioned_repository_state",
+                    "permissioned_space_records",
+                    "permissioned_space_oplog",
+                    "permissioned_space_requests",
+                    "permissioned_space_outbox",
+                    "permissioned_restored_repository_closures",
+                ] {
+                    let rows = try await connection.query(
+                        "SELECT 1 FROM \(table) LIMIT 1"
+                    )
+                    guard rows.isEmpty else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "portable restore target is not empty"
+                        )
+                    }
+                }
+
+                for repository in ordered {
+                    for record in repository.records {
+                        _ = try await connection.query(
+                            """
+                            INSERT INTO permissioned_space_records(
+                                space_uri, author_did, collection, rkey,
+                                value, cid, revision
+                            ) VALUES (?, ?, ?, ?, ?, ?, 1)
+                            """,
+                            [
+                                .text(repository.space.rawValue),
+                                .text(repository.author),
+                                .text(record.uri.collection),
+                                .text(record.uri.rkey),
+                                blob(record.value),
+                                .text(record.cid),
+                            ]
+                        )
+                    }
+                    let marker = try repositoryStateMarker(
+                        space: repository.space,
+                        author: repository.author,
+                        revision: 1,
+                        wireRevision: repository.wireRevision,
+                        commitment: repository.commitment
+                    )
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO permissioned_repository_state(
+                            space_uri, author_did, revision, wire_revision,
+                            lthash, current_commit
+                        ) VALUES (?, ?, 1, ?, ?, ?)
+                        """,
+                        [
+                            .text(repository.space.rawValue),
+                            .text(repository.author),
+                            .text(repository.wireRevision.toString()),
+                            blob(repository.ltHash),
+                            blob(marker),
+                        ]
+                    )
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO permissioned_restored_repository_closures(
+                            space_uri, author_did, reason
+                        ) VALUES (?, ?, 'missing-authority-policy-v1')
+                        """,
+                        [
+                            .text(repository.space.rawValue),
+                            .text(repository.author),
+                        ]
+                    )
+                }
+            }
+        }
+    }
+
+    /// Reopens and revalidates the offline restore inventory while
+    /// intentionally bypassing only the V1 HTTP-closure marker.
+    @_spi(PortableRestore)
+    public func validatePortableRestore(
+        repositories expected: [SQLitePortableRestoreRepository]
+    ) async throws {
+        for repository in expected {
+            try validatePortableRestoreRepository(repository)
+        }
+        try await withConnectionGate {
+            try await readTransaction {
+                let states = try await connection.query(
+                    """
+                    SELECT space_uri, author_did
+                    FROM permissioned_repository_state
+                    ORDER BY space_uri, author_did
+                    """
+                )
+                guard states.count == expected.count else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "portable restore repository inventory is invalid"
+                    )
+                }
+                for (row, repository) in zip(states, expected) {
+                    guard try requiredText(row, "space_uri")
+                            == repository.space.rawValue,
+                          try requiredText(row, "author_did")
+                            == repository.author else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "portable restore repository inventory is invalid"
+                        )
+                    }
+                }
+                let rows = try await connection.query(
+                    """
+                    SELECT space_uri, author_did, reason
+                    FROM permissioned_restored_repository_closures
+                    ORDER BY space_uri, author_did
+                    """
+                )
+                guard rows.count == expected.count else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "portable restore closure inventory is invalid"
+                    )
+                }
+                for (row, repository) in zip(rows, expected) {
+                    guard try requiredText(row, "space_uri") == repository.space.rawValue,
+                          try requiredText(row, "author_did") == repository.author,
+                          try requiredText(row, "reason") == "missing-authority-policy-v1",
+                          let snapshot = try await repositorySnapshotWithoutTransaction(
+                              space: repository.space,
+                              author: repository.author
+                          ),
+                          snapshot.state.revision == 1,
+                          snapshot.state.wireRevision == repository.wireRevision,
+                          snapshot.state.ltHash == repository.ltHash,
+                          snapshot.state.commitment == repository.commitment,
+                          snapshot.records.map(\.uri) == repository.records.map(\.uri),
+                          snapshot.records.map(\.value) == repository.records.map(\.value),
+                          snapshot.records.map(\.cid) == repository.records.map(\.cid),
+                          snapshot.records.allSatisfy({ $0.revision == 1 }) else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "portable restore repository validation failed"
+                        )
+                    }
+                }
+                for table in [
+                    "permissioned_space_oplog",
+                    "permissioned_space_requests",
+                    "permissioned_space_outbox",
+                    "permissioned_simple_space_authorities",
+                    "permissioned_simple_space_members",
+                    "permissioned_simple_space_clients",
+                    "permissioned_simple_space_managing_app_decisions",
+                    "permissioned_space_writers",
+                    "permissioned_space_notification_registrations",
+                ] {
+                    let unexpected = try await connection.query(
+                        "SELECT 1 FROM \(table) LIMIT 1"
+                    )
+                    guard unexpected.isEmpty else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "portable restore fabricated policy or delivery state"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Restores one verified blob under its manifest-selected namespace while
+    /// preserving either a current raw CID or the alpha's legacy sha256 label.
+    @_spi(PortableRestore)
+    public func restorePortableBlob(
+        _ data: Data,
+        expectedCID: String,
+        namespace: BlobNamespace
+    ) async throws -> BlobReference {
+        let computedRawCID = CID.fromBlob(data).string
+        if expectedCID.hasPrefix("sha256:") {
+            guard expectedCID
+                == "sha256:\(Hex.encode(SHA256.hash(data: data)))" else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "portable restore blob CID is invalid"
+                )
+            }
+        } else {
+            guard expectedCID == computedRawCID else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "portable restore blob CID is invalid"
+                )
+            }
+        }
+        let digestHex = try blobDigestHex(cid: expectedCID, allowLegacy: true)
+        let byteCount = try blobByteCount(data.count)
+        let columns = blobNamespaceColumns(namespace)
+        return try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
+            try await putBlobLocked(
+                data,
+                cid: expectedCID,
+                digestHex: digestHex,
+                byteCount: byteCount,
+                namespace: namespace,
+                namespaceKind: columns.kind,
+                spaceURI: columns.spaceURI,
+                mimeType: nil
+            )
         }
     }
 
@@ -5323,6 +5585,50 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         }
     }
 
+    private func validatePortableRestoreRepository(
+        _ repository: SQLitePortableRestoreRepository
+    ) throws {
+        try requireAccount(repository.author)
+        guard repository.ltHash.count == LtHash.byteCount,
+              repository.commitment == Data(SHA256.hash(data: repository.ltHash)),
+              repository.records == repository.records.sorted(by: {
+                  ($0.uri.collection, $0.uri.rkey)
+                    < ($1.uri.collection, $1.uri.rkey)
+              }),
+              Set(repository.records.map {
+                  "\($0.uri.collection)\u{0}\($0.uri.rkey)"
+              }).count == repository.records.count else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "portable restore repository state is invalid"
+            )
+        }
+        var ltHash = LtHash()
+        var totalBytes = 0
+        for record in repository.records {
+            guard record.uri.space == repository.space,
+                  record.uri.author == repository.author,
+                  record.revision == 1,
+                  record.value.count <= 512 * 1_024 * 1_024,
+                  totalBytes <= 1_024 * 1_024 * 1_024 - record.value.count,
+                  CID.fromDAGCBOR(record.value).string == record.cid else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "portable restore record is invalid"
+                )
+            }
+            totalBytes += record.value.count
+            ltHash.add(
+                element:
+                    "\(record.uri.collection)/\(record.uri.rkey)/\(record.cid)"
+            )
+        }
+        guard ltHash.serialized == repository.ltHash,
+              ltHash.commitment == repository.commitment else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "portable restore LtHash is invalid"
+            )
+        }
+    }
+
     /// A verified authority deletion closes any local recipient repository
     /// without manufacturing remote authority state or applying remote
     /// operations. This helper is used only while an existing SQLite
@@ -5334,7 +5640,15 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             "SELECT 1 FROM permissioned_space_recipient_tombstones WHERE space_uri = ?",
             [.text(space.rawValue)]
         )
-        guard rows.isEmpty else {
+        let restoredClosures = try await connection.query(
+            """
+            SELECT 1
+            FROM permissioned_restored_repository_closures
+            WHERE space_uri = ? AND author_did = ?
+            """,
+            [.text(space.rawValue), .text(accountDID)]
+        )
+        guard rows.isEmpty, restoredClosures.isEmpty else {
             throw SwanError.unauthorized("permissioned space is closed")
         }
     }

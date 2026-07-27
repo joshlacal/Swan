@@ -403,17 +403,36 @@ extension SwanCommand {
 
     struct Restore: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
-            abstract: "Verify and stage a portable logical account archive"
+            abstract:
+                "Stage a portable archive or atomically restore an encrypted operator backup"
         )
 
-        @Option(name: .long, help: "Existing owner-only Swan data directory")
+        @Option(
+            name: .long,
+            help: "Existing portable-staging root or absent encrypted-backup restore target"
+        )
         var dataDirectory: String
 
-        @Option(name: .long, help: "Portable archive directory to verify and stage")
+        @Option(name: .long, help: "Portable archive or encrypted operator-backup directory")
         var inputDirectory: String
 
         @Option(name: .long, help: "Owner-only mounted operator-secret file")
         var operatorSecretFile: String
+
+        @Option(
+            name: .long,
+            help: "Owner-only mounted 32-byte backup key; selects encrypted-backup restore"
+        )
+        var backupKeyFile: String?
+
+        @Option(
+            name: .long,
+            help: "Owner-only mounted 32-byte active account KEK required in backup mode"
+        )
+        var accountKekFile: String?
+
+        @Option(name: .long, help: "Active account KEK identifier (default: primary)")
+        var accountKekId: String?
 
         func run() async throws {
             // Operator authority is resolved before either supplied directory
@@ -423,6 +442,43 @@ extension SwanCommand {
             )
             guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !inputDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ValidationError(
+                    backupKeyFile == nil
+                        ? "portable restore failed"
+                        : "operator backup restore failed"
+                )
+            }
+            if let backupKeyFile {
+                guard let accountKekFile,
+                      !backupKeyFile.trimmingCharacters(
+                          in: .whitespacesAndNewlines
+                      ).isEmpty,
+                      !accountKekFile.trimmingCharacters(
+                          in: .whitespacesAndNewlines
+                      ).isEmpty else {
+                    throw ValidationError("operator backup restore failed")
+                }
+                do {
+                    let backupKey = try SwanOperatorBackupKey(
+                        secretFile: URL(fileURLWithPath: backupKeyFile)
+                    )
+                    let accountKEK = try SwanOperatorAccountKEK(
+                        secretFile: URL(fileURLWithPath: accountKekFile)
+                    )
+                    let result = try await SwanOperatorAccountRestorer().restore(
+                        backupAt: URL(fileURLWithPath: inputDirectory),
+                        using: backupKey,
+                        accountKEK: accountKEK,
+                        accountKEKID: accountKekId ?? "primary",
+                        to: URL(fileURLWithPath: dataDirectory)
+                    )
+                    try AccountCommandSupport.write(result)
+                    return
+                } catch {
+                    throw ValidationError("operator backup restore failed")
+                }
+            }
+            guard accountKekFile == nil, accountKekId == nil else {
                 throw ValidationError("portable restore failed")
             }
             do {

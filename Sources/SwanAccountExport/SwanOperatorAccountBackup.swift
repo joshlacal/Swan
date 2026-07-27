@@ -178,6 +178,14 @@ public struct SwanOperatorAccountBackupVerification: Sendable, Equatable {
     public let publicGenesisCommitCID: String
 }
 
+/// Module-internal authenticated plaintext transport used only by the
+/// offline restorer. No public result or error can represent these fields.
+struct SwanOperatorVerifiedBackupPayload: Sendable {
+    let verification: SwanOperatorAccountBackupVerification
+    let portable: SwanPortableArchiveVerification
+    let secrets: SwanOperatorAccountSecrets
+}
+
 /// Creates a single-account same-version operator backup without mutating its
 /// control row, repository database, blob inventory, or key store.
 public struct SwanOperatorAccountBackupExporter: Sendable {
@@ -420,6 +428,16 @@ public enum SwanOperatorAccountBackupVerifier {
         directoryDescriptor root: Int32,
         using backupKey: SwanOperatorBackupKey
     ) throws -> SwanOperatorAccountBackupVerification {
+        try verifiedPayload(
+            directoryDescriptor: root,
+            using: backupKey
+        ).verification
+    }
+
+    static func verifiedPayload(
+        directoryDescriptor root: Int32,
+        using backupKey: SwanOperatorBackupKey
+    ) throws -> SwanOperatorVerifiedBackupPayload {
         do {
             try SwanPortableExportFilesystem.requireOwnerOnlyDirectory(root)
             let manifestData = try SwanPortableExportFilesystem.read(
@@ -485,7 +503,7 @@ public enum SwanOperatorAccountBackupVerifier {
                   entries.directories == expectedDirectories else {
                 throw SwanOperatorAccountBackupError.failed
             }
-            return SwanOperatorAccountBackupVerification(
+            let verification = SwanOperatorAccountBackupVerification(
                 backupManifestSHA256:
                     "sha256:\(SwanPortableExportDigest.hex(manifestData))",
                 canonicalHandle: portable.manifest.canonicalHandle,
@@ -494,6 +512,11 @@ public enum SwanOperatorAccountBackupVerifier {
                 portableManifestSHA256: portable.manifestSHA256,
                 profileID: portable.manifest.profileID,
                 publicGenesisCommitCID: plc.publicGenesisCommitCID
+            )
+            return SwanOperatorVerifiedBackupPayload(
+                verification: verification,
+                portable: portable,
+                secrets: secrets
             )
         } catch {
             throw SwanOperatorAccountBackupError.failed

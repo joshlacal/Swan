@@ -523,6 +523,57 @@ enum SwanPortableExportFilesystem {
         }
     }
 
+    /// Flushes a completed owner-only tree bottom-up without following links.
+    /// SQLite/key-store handles must already be closed before this is called.
+    static func synchronizeTree(root: Int32) throws {
+        try requireOwnerOnlyDirectory(root)
+        for name in try directoryEntryNames(root) {
+            var metadata = stat()
+            guard name.withCString({
+                fstatat(root, $0, &metadata, AT_SYMLINK_NOFOLLOW)
+            }) == 0,
+            metadata.st_uid == geteuid() else {
+                throw SwanPortableExportError.publicationFailed
+            }
+            switch metadata.st_mode & S_IFMT {
+            case S_IFDIR:
+                let child = try openDirectory(parent: root, name: name)
+                do {
+                    try synchronizeTree(root: child)
+                } catch {
+                    _ = close(child)
+                    throw error
+                }
+                guard close(child) == 0 else {
+                    throw SwanPortableExportError.publicationFailed
+                }
+            case S_IFREG:
+                let descriptor = name.withCString {
+                    openat(root, $0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+                }
+                guard descriptor >= 0 else {
+                    throw SwanPortableExportError.publicationFailed
+                }
+                var current = stat()
+                let valid = fstat(descriptor, &current) == 0
+                    && (current.st_mode & S_IFMT) == S_IFREG
+                    && current.st_uid == geteuid()
+                    && current.st_nlink == 1
+                    && (current.st_mode & 0o777) == 0o600
+                guard valid, fsync(descriptor) == 0 else {
+                    _ = close(descriptor)
+                    throw SwanPortableExportError.publicationFailed
+                }
+                guard close(descriptor) == 0 else {
+                    throw SwanPortableExportError.publicationFailed
+                }
+            default:
+                throw SwanPortableExportError.publicationFailed
+            }
+        }
+        try synchronizeParent(root)
+    }
+
     static func requireOwnerOnlyDirectory(_ descriptor: Int32) throws {
         var metadata = stat()
         guard fstat(descriptor, &metadata) == 0,

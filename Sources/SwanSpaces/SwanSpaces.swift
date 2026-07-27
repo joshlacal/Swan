@@ -537,6 +537,28 @@ public struct SpaceCAR: Sendable, Equatable {
     public let indexCID: CID
 }
 
+/// Fully revalidated recovery facts decoded from a two-root permissioned CAR.
+/// Reader-specific envelope material is deliberately omitted: restore callers
+/// receive only the wire revision and repository facts authenticated by it.
+public struct VerifiedSpaceCARRecovery: Sendable, Equatable {
+    public let wireRevision: TID
+    public let records: [SpaceRecord]
+    public let ltHash: Data
+    public let commitment: Data
+
+    public init(
+        wireRevision: TID,
+        records: [SpaceRecord],
+        ltHash: Data,
+        commitment: Data
+    ) {
+        self.wireRevision = wireRevision
+        self.records = records
+        self.ltHash = ltHash
+        self.commitment = commitment
+    }
+}
+
 /// An owner-only, private spool containing the index and record-block suffix
 /// of a full-recovery CAR.  It deliberately never contains the request's
 /// reader-specific commit envelope: fresh IKM, the context signature, and the
@@ -733,6 +755,55 @@ public enum SpaceCARCodec {
         author: String,
         publicKey: P256.Signing.PublicKey
     ) throws -> [String: Data] {
+        let recovery = try decodeRecovery(
+            car,
+            space: space,
+            author: author,
+            publicKey: publicKey
+        )
+        return Dictionary(
+            uniqueKeysWithValues: recovery.records.map {
+                ("\($0.uri.collection)/\($0.uri.rkey)", $0.value)
+            }
+        )
+    }
+
+    /// Verifies a recovery CAR and returns the exact state needed by the
+    /// offline SQLite restore boundary. This does not authorize a request or
+    /// create any authority/member policy.
+    public static func verifyRecovery(
+        _ car: Data,
+        space: SpaceURI,
+        author: String,
+        publicKey: P256.Signing.PublicKey
+    ) throws -> VerifiedSpaceCARRecovery {
+        let decoded = try decodeRecovery(
+            car,
+            space: space,
+            author: author,
+            publicKey: publicKey
+        )
+        return VerifiedSpaceCARRecovery(
+            wireRevision: try TID(tidString: decoded.revision),
+            records: decoded.records,
+            ltHash: decoded.ltHash,
+            commitment: decoded.commitment
+        )
+    }
+
+    private struct DecodedSpaceCARRecovery {
+        let revision: String
+        let records: [SpaceRecord]
+        let ltHash: Data
+        let commitment: Data
+    }
+
+    private static func decodeRecovery(
+        _ car: Data,
+        space: SpaceURI,
+        author: String,
+        publicKey: P256.Signing.PublicKey
+    ) throws -> DecodedSpaceCARRecovery {
         let reader = try CARReader(data: car)
         guard reader.roots.count == 2 else { throw SwanError.malformed("permissioned CAR must have two roots") }
         let commitCID = reader.roots[0]
@@ -753,7 +824,7 @@ public enum SpaceCARCodec {
         }
 
         var setHash = LtHash()
-        var recovered: [String: Data] = [:]
+        var records: [SpaceRecord] = []
         for path in rawIndex.keys.sorted(by: { $0.utf8.lexicographicallyPrecedes($1.utf8) }) {
             guard isRecordPath(path), let cid = rawIndex[path] as? CID else {
                 throw SwanError.malformed("permissioned CAR index entry is invalid")
@@ -761,15 +832,29 @@ public enum SpaceCARCodec {
             let value = try reader.rawBlockData(for: CARReader.cidHex(from: cid))
             guard CID.fromDAGCBOR(value) == cid else { throw SwanError.malformed("record CID does not match block") }
             setHash.add(element: "\(path)/\(cid.string)")
-            recovered[path] = value
+            let components = path.split(separator: "/", omittingEmptySubsequences: false)
+            let uri = try SpaceRecordURI(
+                space: space,
+                author: author,
+                collection: String(components[0]),
+                rkey: String(components[1])
+            )
+            records.append(
+                SpaceRecord(uri: uri, value: value, cid: cid.string, revision: 1)
+            )
         }
         guard constantTimeEqual(setHash.commitment, envelope.commitment) else {
             throw SwanError.malformed("permissioned CAR index does not match commit")
         }
-        guard reader.blockIndex.count == recovered.count + 2 else {
+        guard reader.blockIndex.count == records.count + 2 else {
             throw SwanError.malformed("permissioned CAR has unindexed blocks")
         }
-        return recovered
+        return DecodedSpaceCARRecovery(
+            revision: envelope.context.rev,
+            records: records,
+            ltHash: setHash.serialized,
+            commitment: setHash.commitment
+        )
     }
 
     private static func encodeCommit(_ commit: SpaceCommitEnvelope) throws -> Data {

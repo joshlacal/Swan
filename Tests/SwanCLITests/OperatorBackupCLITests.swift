@@ -166,6 +166,103 @@ final class OperatorBackupCLITests: XCTestCase {
     }
 }
 
+final class OperatorAccountRestoreCLITests: XCTestCase {
+    func testEncryptedBackupModeRestoresAbsentDataRootWithExactSortedJSON() async throws {
+        let fixture = try await OperatorBackupCLIFixture()
+        defer { fixture.remove() }
+        let backup = try runCLI(command: "backup", arguments: fixture.arguments)
+        XCTAssertEqual(backup.status, 0, String(decoding: backup.stderr, as: UTF8.self))
+
+        let target = fixture.root.appending(path: "restored-data")
+        let restored = try runCLI(command: "restore", arguments: [
+            "--data-directory", target.path,
+            "--input-directory", fixture.output.path,
+            "--operator-secret-file", fixture.operatorSecretFile.path,
+            "--backup-key-file", fixture.backupKeyFile.path,
+            "--account-kek-file", fixture.accountKEKFile.path,
+            "--account-kek-id", "primary",
+        ])
+
+        XCTAssertEqual(
+            restored.status,
+            0,
+            String(decoding: restored.stderr, as: UTF8.self)
+        )
+        XCTAssertTrue(restored.stderr.isEmpty)
+        let decoded = try JSONDecoder().decode(
+            SwanOperatorAccountRestoreResult.self,
+            from: restored.stdout
+        )
+        XCTAssertEqual(decoded.status, "restored")
+        XCTAssertEqual(decoded.did, fixture.did)
+        XCTAssertEqual(decoded.targetDataDirectory, target.path)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        XCTAssertEqual(restored.stdout, try encoder.encode(decoded) + Data("\n".utf8))
+        for sentinel in fixture.secretSentinels {
+            XCTAssertNil(restored.stdout.range(of: sentinel))
+            XCTAssertNil(restored.stderr.range(of: sentinel))
+        }
+
+        let control = try await SQLiteControlDatabase(dataDirectory: target)
+        let activeDIDs = try await control.activeAccountDIDs()
+        XCTAssertEqual(activeDIDs, [fixture.did])
+        try await control.close()
+    }
+
+    func testEncryptedBackupModeFailureIsOneSafeMessageAndLeavesNoTarget() async throws {
+        let fixture = try await OperatorBackupCLIFixture()
+        defer { fixture.remove() }
+        let backup = try runCLI(command: "backup", arguments: fixture.arguments)
+        XCTAssertEqual(backup.status, 0)
+        let wrongKey = fixture.root.appending(path: "wrong-backup-key")
+        try cliProtectedWrite(
+            Data(Data(repeating: 0x91, count: 32).cliBase64URL.utf8),
+            to: wrongKey
+        )
+        let target = fixture.root.appending(path: "failed-restored-data")
+
+        let restored = try runCLI(command: "restore", arguments: [
+            "--data-directory", target.path,
+            "--input-directory", fixture.output.path,
+            "--operator-secret-file", fixture.operatorSecretFile.path,
+            "--backup-key-file", wrongKey.path,
+            "--account-kek-file", fixture.accountKEKFile.path,
+        ])
+
+        XCTAssertNotEqual(restored.status, 0)
+        XCTAssertTrue(restored.stdout.isEmpty)
+        let diagnostic = String(decoding: restored.stderr, as: UTF8.self)
+        XCTAssertTrue(diagnostic.contains("operator backup restore failed"))
+        XCTAssertFalse(diagnostic.contains(fixture.root.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        for sentinel in fixture.secretSentinels {
+            XCTAssertNil(restored.stderr.range(of: sentinel))
+        }
+    }
+
+    private func runCLI(
+        command: String,
+        arguments: [String]
+    ) throws -> (status: Int32, stdout: Data, stderr: Data) {
+        let process = Process()
+        process.executableURL = try XCTUnwrap(cliExecutableURL())
+        process.arguments = [command] + arguments
+        process.environment = [:]
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            stdout.fileHandleForReading.readDataToEndOfFile(),
+            stderr.fileHandleForReading.readDataToEndOfFile()
+        )
+    }
+}
+
 private struct OperatorBackupCLIFixture {
     let root: URL
     let dataDirectory: URL

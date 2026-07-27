@@ -4,7 +4,8 @@ import Petrel
 @testable import SwanAccountExport
 import SwanAccounts
 import SwanPublicRepository
-import SwanSQLite
+@_spi(PortableRestore) import SwanSQLite
+import SwanSpaces
 import SwanStorage
 import XCTest
 
@@ -295,6 +296,329 @@ final class SwanOperatorBackupTests: XCTestCase {
     }
 }
 
+final class SwanOperatorAccountRestoreTests: XCTestCase {
+    func testVerifiedBackupRestoresOneActiveAccountAndReopensEveryDurableBoundary() async throws {
+        let fixture = try await OperatorBackupFixture()
+        defer { fixture.remove() }
+        let backup = try await fixture.completedBackup(named: "restore-source")
+        let sourceBefore = try treeSnapshot(backup)
+        let target = fixture.root.appending(path: "restored-data")
+        let restoredKEK = try SwanOperatorAccountKEK(
+            rawBytes: Data(repeating: 0xD4, count: 32)
+        )
+
+        let result = try await SwanOperatorAccountRestorer().restore(
+            backupAt: backup,
+            using: fixture.backupKey,
+            accountKEK: restoredKEK,
+            accountKEKID: "primary",
+            to: target
+        )
+        XCTAssertEqual(try treeSnapshot(backup), sourceBefore)
+
+        XCTAssertEqual(result.status, "restored")
+        XCTAssertEqual(result.did, fixture.account.did)
+        XCTAssertEqual(result.canonicalHandle, fixture.account.canonicalHandle)
+        XCTAssertEqual(
+            result.publicGenesisCommitCID,
+            fixture.account.publicGenesisCommitCID
+        )
+        XCTAssertEqual(result.targetDataDirectory, target.standardizedFileURL.path)
+
+        let control = try await SQLiteControlDatabase(dataDirectory: target)
+        let loadedAccount = try await control.account(did: fixture.account.did)
+        let account = try XCTUnwrap(loadedAccount)
+        XCTAssertEqual(account.status, .active)
+        XCTAssertEqual(account.publicGenesisCommitCID, fixture.account.publicGenesisCommitCID)
+        let activeDIDs = try await control.activeAccountDIDs()
+        XCTAssertEqual(activeDIDs, [fixture.account.did])
+        let loadedCredential = try await control.credential(did: fixture.account.did)
+        let credential = try XCTUnwrap(loadedCredential)
+        XCTAssertEqual(credential.verifier, fixture.credential.verifier)
+        XCTAssertTrue(
+            try LibsodiumArgon2idHasher().verify(
+                fixture.password,
+                encodedHash: credential.verifier
+            )
+        )
+        try await control.close()
+
+        let keyStore = try FileAccountKeyStore(
+            root: target.appending(path: "keys"),
+            configuration: try AccountKeyEncryptionConfiguration(
+                activeKeyID: "primary",
+                activeKey: restoredKEK.bytes
+            )
+        )
+        let signingReference = try AccountKeyReference(
+            accountDID: fixture.account.did,
+            purpose: .signing,
+            generation: 1
+        )
+        let restoredSigningKey = try P256.Signing.PrivateKey(
+            rawRepresentation: await keyStore.key(for: signingReference)
+        )
+        let sourceSigningPublicKey = try P256.Signing.PrivateKey(
+            rawRepresentation: await fixture.keyStore.key(for: signingReference)
+        )
+        XCTAssertEqual(
+            restoredSigningKey.publicKey.compressedRepresentation,
+            sourceSigningPublicKey.publicKey.compressedRepresentation
+        )
+        let rotationReference = try AccountKeyReference(
+            accountDID: fixture.account.did,
+            purpose: .rotation,
+            generation: 1
+        )
+        let restoredRotationKey = try P256.Signing.PrivateKey(
+            rawRepresentation: await keyStore.key(for: rotationReference)
+        )
+        let sourceRotationPublicKey = try P256.Signing.PrivateKey(
+            rawRepresentation: await fixture.keyStore.key(for: rotationReference)
+        )
+        XCTAssertEqual(
+            restoredRotationKey.publicKey.compressedRepresentation,
+            sourceRotationPublicKey.publicKey.compressedRepresentation
+        )
+        let wrongKeyReader = try ExistingFileAccountKeyReader(
+            root: target.appending(path: "keys"),
+            configuration: try AccountKeyEncryptionConfiguration(
+                activeKeyID: "primary",
+                activeKey: Data(repeating: 0xD5, count: 32)
+            )
+        )
+        await XCTAssertThrowsErrorAsync {
+            _ = try await wrongKeyReader.key(for: signingReference)
+        }
+
+        let database = try await SQLiteAccountDatabase(dataDirectory: target, did: fixture.account.did)
+        let loadedGenesis = try await database.loadPublicRepositoryGenesis(
+            did: fixture.account.did,
+            signingPublicKey: restoredSigningKey.publicKey
+        )
+        let genesis = try XCTUnwrap(loadedGenesis)
+        XCTAssertEqual(genesis.genesis.commitCID.string, fixture.account.publicGenesisCommitCID)
+        let restoredInventory = try await database.portableExportInventory()
+        let sourceInventory = try await fixture.database.portableExportInventory()
+        XCTAssertEqual(restoredInventory, sourceInventory)
+        let portable = try SwanPortableExportVerifier.verifyArchive(
+            at: backup.appending(path: "portable")
+        )
+        let spaceEntry = try XCTUnwrap(
+            portable.manifest.files.first { $0.type == .spaceCAR }
+        )
+        let recovery = try SpaceCARCodec.verifyRecovery(
+            Data(
+                contentsOf: backup
+                    .appending(path: "portable")
+                    .appending(path: spaceEntry.path)
+            ),
+            space: fixture.space,
+            author: fixture.account.did,
+            publicKey: portable.signingPublicKey
+        )
+        try await database.validatePortableRestore(
+            repositories: [
+                SQLitePortableRestoreRepository(
+                    space: fixture.space,
+                    author: fixture.account.did,
+                    recovery: recovery
+                ),
+            ]
+        )
+        let restoredPublicBlob = try XCTUnwrap(
+            restoredInventory.blobs.first {
+                if case .public = $0.namespace { return true }
+                return false
+            }
+        )
+        let restoredPublicBlobData = try await database.publicData(
+            cid: restoredPublicBlob.cid
+        )
+        XCTAssertNotNil(restoredPublicBlobData)
+        await XCTAssertThrowsErrorAsync {
+            _ = try await database.repositoryState(
+                space: fixture.space,
+                author: fixture.account.did
+            )
+        }
+        let restoredSpaceBlob = try XCTUnwrap(
+            restoredInventory.blobs.first {
+                if case .space(fixture.space) = $0.namespace { return true }
+                return false
+            }
+        )
+        await XCTAssertThrowsErrorAsync {
+            _ = try await database.permissionedBlob(
+                space: fixture.space,
+                author: fixture.account.did,
+                cid: restoredSpaceBlob.cid
+            )
+        }
+        try await database.close()
+
+        let bootstrapControl = try await SQLiteControlDatabase(dataDirectory: target)
+        let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+            dataDirectory: target,
+            controlStore: bootstrapControl
+        )
+        let restoredURI = try SpaceRecordURI(
+            space: fixture.space,
+            author: fixture.account.did,
+            collection: "app.example.note",
+            rkey: "one"
+        )
+        await XCTAssertThrowsErrorAsync {
+            _ = try await directory.record(
+                restoredURI,
+                authorization: .accountOAuth(
+                    subject: fixture.account.did,
+                    scopes: ["atproto"]
+                )
+            )
+        }
+        try await directory.close()
+        try await bootstrapControl.close()
+
+        let targetBytes = try allRegularFileBytes(under: target)
+        for sentinel in fixture.secretSentinels.prefix(4) {
+            XCTAssertNil(targetBytes.range(of: sentinel))
+        }
+    }
+
+    func testSourceFailureAndDestinationCollisionNeverCreateOrMergeTarget() async throws {
+        let fixture = try await OperatorBackupFixture()
+        defer { fixture.remove() }
+        XCTAssertThrowsError(
+            try SwanOperatorAccountKEK(rawBytes: Data(repeating: 0xD4, count: 31))
+        )
+        let backup = try await fixture.completedBackup(named: "failure-source")
+        let target = fixture.root.appending(path: "must-remain-absent")
+        let accountKEK = try SwanOperatorAccountKEK(
+            rawBytes: Data(repeating: 0xD4, count: 32)
+        )
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await SwanOperatorAccountRestorer().restore(
+                backupAt: backup,
+                using: try SwanOperatorBackupKey(
+                    rawBytes: Data(repeating: 0x91, count: 32)
+                ),
+                accountKEK: accountKEK,
+                to: target
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
+                .contains { $0.hasPrefix(".swan-account-restore-") }
+        )
+
+        let carURL = backup.appending(path: "portable/public/repository.car")
+        var car = try Data(contentsOf: carURL)
+        car[car.startIndex] ^= 0x01
+        try car.write(to: carURL)
+        let alteredTarget = fixture.root.appending(path: "altered-must-remain-absent")
+        await XCTAssertThrowsErrorAsync {
+            _ = try await SwanOperatorAccountRestorer().restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: alteredTarget
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: alteredTarget.path))
+
+        let validBackup = try await fixture.completedBackup(named: "collision-source")
+        try FileManager.default.createDirectory(
+            at: target,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try protectedWrite(Data("do-not-merge".utf8), to: target.appending(path: "sentinel"))
+        let before = try treeSnapshot(target)
+        await XCTAssertThrowsErrorAsync {
+            _ = try await SwanOperatorAccountRestorer().restore(
+                backupAt: validBackup,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: target
+            )
+        }
+        XCTAssertEqual(try treeSnapshot(target), before)
+    }
+
+    func testPrepublicationParentReplacementAndPostRenameFailureCleanlyRetry() async throws {
+        let fixture = try await OperatorBackupFixture()
+        defer { fixture.remove() }
+        let backup = try await fixture.completedBackup(named: "atomic-source")
+        let accountKEK = try SwanOperatorAccountKEK(
+            rawBytes: Data(repeating: 0xD4, count: 32)
+        )
+
+        let parent = fixture.root.appending(path: "restore-parent")
+        let displaced = fixture.root.appending(path: "restore-parent-displaced")
+        try FileManager.default.createDirectory(
+            at: parent,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let replacedTarget = parent.appending(path: "data")
+        let replacing = SwanOperatorAccountRestorer(
+            afterStagingBeforeValidation: {
+                try FileManager.default.moveItem(at: parent, to: displaced)
+                try FileManager.default.createDirectory(
+                    at: parent,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+            }
+        )
+        await XCTAssertThrowsErrorAsync {
+            _ = try await replacing.restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: replacedTarget
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: replacedTarget.path))
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: displaced.path)
+                .contains { $0.hasPrefix(".swan-account-restore-") }
+        )
+        try FileManager.default.removeItem(at: displaced)
+        _ = try await SwanOperatorAccountRestorer().restore(
+            backupAt: backup,
+            using: fixture.backupKey,
+            accountKEK: accountKEK,
+            to: replacedTarget
+        )
+
+        let postRenameTarget = fixture.root.appending(path: "post-rename-data")
+        let interrupted = SwanOperatorAccountRestorer(
+            afterRenameBeforeParentSync: {
+                throw SwanOperatorAccountRestoreError.failed
+            }
+        )
+        await XCTAssertThrowsErrorAsync {
+            _ = try await interrupted.restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: postRenameTarget
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: postRenameTarget.path))
+        _ = try await SwanOperatorAccountRestorer().restore(
+            backupAt: backup,
+            using: fixture.backupKey,
+            accountKEK: accountKEK,
+            to: postRenameTarget
+        )
+    }
+}
+
 private struct OperatorBackupFixture {
     let root: URL
     let database: SQLiteAccountDatabase
@@ -302,6 +626,9 @@ private struct OperatorBackupFixture {
     let account: AccountControlAccount
     let credential: AccountControlCredential
     let backupKey: SwanOperatorBackupKey
+    let accountKEK: Data
+    let space: SpaceURI
+    let password: String
     let secretSentinels: [Data]
 
     init() async throws {
@@ -319,6 +646,7 @@ private struct OperatorBackupFixture {
         let operation = try PLCOperationCodec.sign(.regular(unsigned), using: rotationKey)
         let did = try PLCOperationCodec.genesisDID(for: operation)
         let kek = Data(repeating: 0xA7, count: 32)
+        accountKEK = kek
         keyStore = try FileAccountKeyStore(
             root: root.appending(path: "keys"),
             configuration: try AccountKeyEncryptionConfiguration(
@@ -345,6 +673,11 @@ private struct OperatorBackupFixture {
             ),
         ])
         database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        space = try SpaceURI(
+            authority: did,
+            spaceType: "app.example.room",
+            skey: "restored"
+        )
         let genesis = try PublicRepositoryGenesisCodec.create(
             did: did,
             revision: "3jzfcijpj2z2a",
@@ -395,6 +728,33 @@ private struct OperatorBackupFixture {
             Data("operator-backup-public-blob".utf8),
             namespace: .public
         )
+        let recordURI = try SpaceRecordURI(
+            space: space,
+            author: did,
+            collection: "app.example.note",
+            rkey: "one"
+        )
+        let recordValue = try DAGCBOR.encodeValue(
+            OrderedCBORMap(entries: [(key: "text", value: "restore me")])
+        )
+        _ = try await database.apply(
+            space: space,
+            author: did,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try TID(tidString: "3jzfcijpj2z3a"),
+            writes: [
+                .create(
+                    uri: recordURI,
+                    value: recordValue,
+                    cid: CID.fromDAGCBOR(recordValue).string
+                ),
+            ]
+        )
+        _ = try await database.putBlob(
+            Data("operator-backup-space-blob".utf8),
+            namespace: .space(space)
+        )
         _ = try await database.advancePLCAccountPreparationJournal(
             requestID: journal.requestID,
             expectedStage: .submissionPending,
@@ -412,9 +772,11 @@ private struct OperatorBackupFixture {
             rotationKey: rotationReference,
             publicGenesisCommitCID: genesis.commitCID.string
         )
+        password = "operator restore password"
+        let passwordVerifier = try LibsodiumArgon2idHasher().hash(password)
         credential = try AccountControlCredential(
             did: did,
-            verifier: operatorBackupVerifierSentinel,
+            verifier: passwordVerifier,
             updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
         )
         let rawBackupKey = Data(repeating: 0xC3, count: 32)
@@ -424,7 +786,7 @@ private struct OperatorBackupFixture {
             rawBackupKey,
             signingKey.rawRepresentation,
             rotationKey.rawRepresentation,
-            Data(operatorBackupVerifierSentinel.utf8),
+            Data(passwordVerifier.utf8),
         ]
     }
 

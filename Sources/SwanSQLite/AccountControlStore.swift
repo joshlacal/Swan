@@ -137,6 +137,48 @@ extension SQLiteControlDatabase {
 
     // MARK: AccountControlStore
 
+    /// Offline-restore invariant: exactly one selected account exists and no
+    /// OAuth, replay, client-metadata, or PLC-preparation control state was
+    /// fabricated. Kept behind SPI so request-time modules cannot treat it as
+    /// a general control-plane inspection API.
+    @_spi(PortableRestore)
+    public func validateOperatorRestoreOnlyAccount(did: String) async throws {
+        guard AccountControlIdentifiers.isDID(did) else {
+            throw AccountControlStoreError.invalidInput
+        }
+        try await withConnectionGate {
+            let accounts = try await connection.query(
+                "SELECT did FROM accounts ORDER BY did"
+            )
+            guard accounts.count == 1,
+                  try requiredText(accounts[0], "did") == did else {
+                throw AccountControlStoreError.malformedRecord
+            }
+            for table in [
+                "oauth_tokens",
+                "oauth_client_metadata",
+                "oauth_control_client_metadata",
+                "oauth_control_token_families",
+                "oauth_control_par_requests",
+                "oauth_control_par_state_replays",
+                "oauth_control_authorization_codes",
+                "oauth_control_access_tokens",
+                "oauth_control_refresh_tokens",
+                "oauth_control_dpop_replays",
+                "oauth_control_client_assertion_replays",
+                "permissioned_space_delegation_replays",
+                "plc_account_preparation_intents",
+            ] {
+                let rows = try await connection.query(
+                    "SELECT 1 FROM \(table) LIMIT 1"
+                )
+                guard rows.isEmpty else {
+                    throw AccountControlStoreError.malformedRecord
+                }
+            }
+        }
+    }
+
     public func createAccount(
         _ registration: AccountControlRegistration
     ) async throws -> AccountControlAccount {
