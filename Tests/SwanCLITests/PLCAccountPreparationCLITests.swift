@@ -279,7 +279,7 @@ final class PLCAccountPreparationCLITests: XCTestCase {
     func testWrongOrMissingWellKnownProofDoesNotActivateSubmittedIdentity() async throws {
         for proof in [
             TestWellKnownResponse.body(
-                Data("did:plc:zyxwvutsrqponmlkjihgfedc".utf8)
+                Data(TestPLCState.dnsResponseSentinel.utf8)
             ),
             .missing,
         ] {
@@ -302,7 +302,7 @@ final class PLCAccountPreparationCLITests: XCTestCase {
             XCTAssertNotEqual(activation.status, 0)
             XCTAssertTrue(activation.output.isEmpty)
             XCTAssertFalse(
-                activation.error.contains("did:plc:zyxwvutsrqponmlkjihgfedc")
+                activation.error.contains(TestPLCState.dnsResponseSentinel)
             )
             for sentinel in fixture.renderedSecretSentinels {
                 XCTAssertFalse(activation.error.contains(sentinel))
@@ -312,6 +312,10 @@ final class PLCAccountPreparationCLITests: XCTestCase {
             let activeAccount = try await control.account(did: did)
             XCTAssertNil(activeAccount)
             try await control.close()
+            try assertPersistedData(
+                under: fixture.data,
+                excludes: [Data(TestPLCState.dnsResponseSentinel.utf8)]
+            )
         }
     }
 
@@ -620,6 +624,7 @@ private final class TestPLCDirectory {
 
 private final class TestPLCState: @unchecked Sendable {
     static let responseBodySentinel = "2026-07-27T12:34:56.789Z"
+    static let dnsResponseSentinel = "did=did:plc:zyxwvutsrqponmlkjihgfedc"
 
     private let lock = NSLock()
     private let submitBody: Data

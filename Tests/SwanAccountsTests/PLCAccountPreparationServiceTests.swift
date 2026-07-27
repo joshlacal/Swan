@@ -840,6 +840,42 @@ final class PLCAccountActivationServiceTests: XCTestCase {
         try await fixture.close()
     }
 
+    func testActualDNSSentinelFailureNeverReachesHiddenPersistenceOrErrors() async throws {
+        let fixture = try await ActivationFixture(requestID: "activate-dns-sentinel")
+        defer { fixture.removeFiles() }
+        let dnsSentinel = "did=did:plc:zyxwvutsrqponmlkjihgfedc"
+        let verifier = ATProtocolHandleVerifier(
+            policy: try .production(),
+            dns: ActivationSentinelDNS(rawTXTRecord: Data(dnsSentinel.utf8)),
+            http: ActivationUnexpectedHTTP()
+        )
+
+        do {
+            _ = try await fixture.activation(
+                handleVerifier: verifier
+            ).activate(
+                requestID: "activate-dns-sentinel",
+                password: "activation-password"
+            )
+            XCTFail("expected mismatched DNS handle proof to fail")
+        } catch {
+            XCTAssertEqual(error as? PLCAccountActivationError, .conflict)
+            XCTAssertFalse(String(describing: error).contains(dnsSentinel))
+        }
+
+        let active = try await fixture.preparation.control.account(
+            did: fixture.identity.did
+        )
+        XCTAssertNil(active)
+        for file in try regularFiles(under: fixture.preparation.root) {
+            XCTAssertNil(
+                try Data(contentsOf: file).range(of: Data(dnsSentinel.utf8)),
+                "raw DNS response leaked to \(file.lastPathComponent)"
+            )
+        }
+        try await fixture.close()
+    }
+
     private func assertActivationError<T>(
         _ expression: @autoclosure () async throws -> T,
         expected: PLCAccountActivationError,
@@ -867,7 +903,7 @@ final class PLCAccountActivationServiceTests: XCTestCase {
         guard let enumerator = FileManager.default.enumerator(
             at: root,
             includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles]
+            options: []
         ) else {
             throw SwanError.unavailable("test persistence inventory unavailable")
         }
@@ -941,6 +977,33 @@ private final class ActivationFixture: @unchecked Sendable {
 
     func removeFiles() {
         preparation.removeFiles()
+    }
+}
+
+private actor ActivationSentinelDNS: ATHandleDNSResolving {
+    let rawTXTRecord: Data
+
+    init(rawTXTRecord: Data) {
+        self.rawTXTRecord = rawTXTRecord
+    }
+
+    func txtRecords(name _: String) async throws -> [ATHandleTXTRecord] {
+        [try ATHandleTXTRecord(bytes: rawTXTRecord)]
+    }
+
+    func addresses(host _: String) async throws -> [ATHandleIPAddress] {
+        throw ATHandleVerificationError.unavailable
+    }
+}
+
+private actor ActivationUnexpectedHTTP: ATHandleHTTPFetching {
+    func get(
+        url _: URL,
+        approvedPeers _: Set<ATHandleIPAddress>,
+        timeout _: TimeInterval,
+        maximumBodyBytes _: Int
+    ) async throws -> ATHandleHTTPResponse {
+        throw ATHandleVerificationError.unavailable
     }
 }
 
