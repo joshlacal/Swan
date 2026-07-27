@@ -91,7 +91,7 @@ public struct AccountKeyEncryptionConfiguration: Sendable {
         keysByID = decryptOnlyKeys.merging([activeKeyID: activeKey]) { _, active in active }
     }
 
-    fileprivate func key(for keyID: String) -> Data? {
+    func key(for keyID: String) -> Data? {
         keysByID[keyID]
     }
 
@@ -123,10 +123,13 @@ public struct AccountKeyMigrationReport: Sendable, Equatable {
     public let inventory: AccountKeyEnvelopeInventory
 }
 
-public protocol AccountKeyStore: Sendable {
+public protocol AccountKeyMaterialReader: Sendable {
+    func key(for reference: AccountKeyReference) async throws -> Data
+}
+
+public protocol AccountKeyStore: AccountKeyMaterialReader {
     func create(_ key: Data, for reference: AccountKeyReference) async throws
     func createBatch(_ materials: [AccountKeyMaterial]) async throws
-    func key(for reference: AccountKeyReference) async throws -> Data
 }
 
 /// The only pre-DID private-material persistence surface. It is purpose-bound

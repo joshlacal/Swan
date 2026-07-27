@@ -180,7 +180,7 @@ public enum SwanPortableExportManifestCodec {
         } catch {
             throw SwanPortableExportError.invalidManifest
         }
-        return try SwanPortableExportManifest(
+        let reconstructed = try SwanPortableExportManifest(
             profileID: decoded.profileID,
             did: decoded.did,
             canonicalHandle: decoded.canonicalHandle,
@@ -194,6 +194,10 @@ public enum SwanPortableExportManifestCodec {
                 )
             }
         )
+        guard try encode(reconstructed) == data else {
+            throw SwanPortableExportError.invalidManifest
+        }
+        return reconstructed
     }
 }
 
@@ -202,25 +206,60 @@ public enum SwanPortableExportVerifier {
         at root: URL,
         signingPublicKey: P256.Signing.PublicKey
     ) throws -> SwanPortableExportManifest {
-        try requireOwnerOnlyDirectory(root)
-        let manifestURL = root.appending(path: "manifest.json")
-        let manifestData = try readRegularFile(manifestURL, maximumBytes: 4 * 1_024 * 1_024)
+        let descriptor = try SwanPortableExportFilesystem.openArchiveRoot(root)
+        defer { _ = close(descriptor) }
+        return try verifyArchive(
+            directoryDescriptor: descriptor,
+            signingPublicKey: signingPublicKey
+        )
+    }
+
+    static func verifyArchive(
+        directoryDescriptor: Int32,
+        signingPublicKey: P256.Signing.PublicKey
+    ) throws -> SwanPortableExportManifest {
+        try SwanPortableExportFilesystem.requireOwnerOnlyDirectory(directoryDescriptor)
+        let manifestData = try SwanPortableExportFilesystem.read(
+            path: "manifest.json",
+            root: directoryDescriptor,
+            maximumBytes: 4 * 1_024 * 1_024
+        )
         let manifest = try SwanPortableExportManifestCodec.decode(manifestData)
         let expectedPaths = Set(manifest.files.map(\.path) + ["manifest.json"])
-        guard try actualFilePaths(root: root) == expectedPaths else {
+        let entries = try SwanPortableExportFilesystem.entries(root: directoryDescriptor)
+        guard entries.files == expectedPaths,
+              entries.directories
+                == (try SwanPortableExportFilesystem.expectedDirectories(for: expectedPaths))
+        else {
             throw SwanPortableExportError.invalidArchive
         }
 
         var verifiedPublicGenesis: PublicRepositoryGenesis?
         var plcHistory: Data?
+        var totalBytes = manifestData.count
         for entry in manifest.files {
             try validatePlacement(entry, manifest: manifest)
-            let fileURL = root.appending(path: entry.path)
-            let data = try readRegularFile(fileURL)
+            let maximumBytes = switch entry.type {
+            case .plcHistory:
+                64 * 1_024
+            default:
+                SwanPortableExportFilesystem.maximumArtifactBytes
+            }
+            guard entry.byteCount <= maximumBytes,
+                  totalBytes <= SwanPortableExportFilesystem.maximumArchiveBytes - entry.byteCount
+            else {
+                throw SwanPortableExportError.invalidArchive
+            }
+            let data = try SwanPortableExportFilesystem.read(
+                path: entry.path,
+                root: directoryDescriptor,
+                maximumBytes: maximumBytes
+            )
             guard data.count == entry.byteCount,
                   SwanPortableExportDigest.hex(data) == entry.sha256 else {
                 throw SwanPortableExportError.invalidArchive
             }
+            totalBytes += data.count
             switch entry.type {
             case .publicCAR:
                 let genesis = try PublicRepositoryGenesisCodec.verify(
@@ -259,7 +298,8 @@ public enum SwanPortableExportVerifier {
             expectedDID: manifest.did,
             expectedHandle: manifest.canonicalHandle,
             expectedRepositoryRevision: verifiedPublicGenesis.revision,
-            expectedPublicGenesisCID: verifiedPublicGenesis.commitCID.string
+            expectedPublicGenesisCID: verifiedPublicGenesis.commitCID.string,
+            expectedSigningDIDKey: P256DIDKey(publicKey: signingPublicKey).value
         )
         return manifest
     }
@@ -320,12 +360,13 @@ public enum SwanPortableExportVerifier {
         expectedDID: String,
         expectedHandle: String,
         expectedRepositoryRevision: String,
-        expectedPublicGenesisCID: String
+        expectedPublicGenesisCID: String,
+        expectedSigningDIDKey: String
     ) throws {
         let expectedKeys = Set([
             "format", "scope", "did", "operationCID", "operation",
             "canonicalHandle", "pdsOrigin", "repositoryRevision",
-            "publicGenesisCommitCID",
+            "publicGenesisCommitCID", "signingKeyBinding",
         ])
         guard data.count <= 64 * 1_024,
               let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -333,6 +374,8 @@ public enum SwanPortableExportVerifier {
               object["format"] as? String == "swan-plc-history-v1",
               object["scope"] as? String
                 == SwanPortableExportManifest.plcHistoryScopeValue,
+              object["signingKeyBinding"] as? String
+                == SwanPortableExportPLC.signingKeyBindingValue,
               object["did"] as? String == expectedDID,
               let operationObject = object["operation"],
               let operationCID = object["operationCID"] as? String,
@@ -352,79 +395,13 @@ public enum SwanPortableExportVerifier {
         let operation = try PLCOperationCodec.decodeSignedJSON(operationData)
         try PLCOperationCodec.verifyGenesis(operation, expectedDID: expectedDID)
         guard try operation.cid.string == operationCID,
+              operation.regular?.verificationMethods["atproto"] == expectedSigningDIDKey,
               operation.regular?.alsoKnownAs == ["at://\(handle)"],
               operation.regular?.services["atproto_pds"]?.endpoint == pdsOrigin else {
             throw SwanPortableExportError.invalidArchive
         }
     }
 
-    private static func actualFilePaths(root: URL) throws -> Set<String> {
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
-            options: []
-        ) else {
-            throw SwanPortableExportError.invalidArchive
-        }
-        var files = Set<String>()
-        for case let url as URL in enumerator {
-            let values = try url.resourceValues(
-                forKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]
-            )
-            guard values.isSymbolicLink != true else {
-                throw SwanPortableExportError.invalidArchive
-            }
-            if values.isRegularFile == true {
-                let prefix = root.standardizedFileURL.path + "/"
-                guard url.standardizedFileURL.path.hasPrefix(prefix) else {
-                    throw SwanPortableExportError.invalidArchive
-                }
-                files.insert(String(url.standardizedFileURL.path.dropFirst(prefix.count)))
-            } else if values.isDirectory == true {
-                try requireOwnerOnlyDirectory(url)
-            } else {
-                throw SwanPortableExportError.invalidArchive
-            }
-        }
-        return files
-    }
-
-    private static func requireOwnerOnlyDirectory(_ url: URL) throws {
-        var metadata = stat()
-        guard url.withUnsafeFileSystemRepresentation({ path in
-            guard let path else { return -1 }
-            return lstat(path, &metadata)
-        }) == 0,
-        (metadata.st_mode & S_IFMT) == S_IFDIR,
-        metadata.st_uid == geteuid(),
-        (metadata.st_mode & 0o777) == 0o700 else {
-            throw SwanPortableExportError.invalidPlacement
-        }
-    }
-
-    private static func readRegularFile(
-        _ url: URL,
-        maximumBytes: Int = Int.max
-    ) throws -> Data {
-        let descriptor = url.withUnsafeFileSystemRepresentation { path -> Int32 in
-            guard let path else { return -1 }
-            return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
-        }
-        guard descriptor >= 0 else { throw SwanPortableExportError.invalidArchive }
-        defer { _ = close(descriptor) }
-        var metadata = stat()
-        guard fstat(descriptor, &metadata) == 0,
-              (metadata.st_mode & S_IFMT) == S_IFREG,
-              metadata.st_uid == geteuid(),
-              metadata.st_nlink == 1,
-              (metadata.st_mode & 0o077) == 0,
-              metadata.st_size >= 0,
-              metadata.st_size <= off_t(maximumBytes) else {
-            throw SwanPortableExportError.invalidArchive
-        }
-        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
-        return try handle.readToEnd() ?? Data()
-    }
 }
 
 public struct SwanPortableExportResult: Codable, Sendable, Equatable {
@@ -438,14 +415,14 @@ public struct SwanPortableExportResult: Codable, Sendable, Equatable {
 public struct SwanPortableAccountExporter: Sendable {
     private let profileID: String
     private let database: SQLiteAccountDatabase
-    private let keyStore: any AccountKeyStore
+    private let keyStore: any AccountKeyMaterialReader
     private let now: @Sendable () -> Date
     private let afterArtifactWrite: (@Sendable (Int) throws -> Void)?
 
     public init(
         profileID: String = PermissionedData0016.profileID,
         database: SQLiteAccountDatabase,
-        keyStore: any AccountKeyStore,
+        keyStore: any AccountKeyMaterialReader,
         now: @escaping @Sendable () -> Date = Date.init
     ) throws {
         guard profileID == PermissionedData0016.profileID else {
@@ -461,7 +438,7 @@ public struct SwanPortableAccountExporter: Sendable {
     init(
         profileID: String = PermissionedData0016.profileID,
         database: SQLiteAccountDatabase,
-        keyStore: any AccountKeyStore,
+        keyStore: any AccountKeyMaterialReader,
         now: @escaping @Sendable () -> Date = Date.init,
         afterArtifactWrite: @escaping @Sendable (Int) throws -> Void
     ) throws {
@@ -478,6 +455,14 @@ public struct SwanPortableAccountExporter: Sendable {
     public func export(
         account: AccountControlAccount,
         to outputDirectory: URL
+    ) async throws -> SwanPortableExportResult {
+        let destination = try SwanPortableExportDestination(outputDirectory)
+        return try await export(account: account, to: destination)
+    }
+
+    public func export(
+        account: AccountControlAccount,
+        to destination: SwanPortableExportDestination
     ) async throws -> SwanPortableExportResult {
         guard account.status == .active,
               let signing = account.signingKey,
@@ -503,7 +488,8 @@ public struct SwanPortableAccountExporter: Sendable {
         let plcHistory = try makePLCHistory(
             journal: journal,
             did: account.did,
-            expectedGenesisCID: expectedGenesisCID
+            expectedGenesisCID: expectedGenesisCID,
+            signingPublicKey: privateKey.publicKey
         )
 
         var artifacts = [Artifact(
@@ -583,12 +569,12 @@ public struct SwanPortableAccountExporter: Sendable {
         try publish(
             artifacts: artifacts,
             manifest: manifestData,
-            outputDirectory: outputDirectory,
+            destination: destination,
             signingPublicKey: privateKey.publicKey
         )
         return SwanPortableExportResult(
             did: account.did,
-            outputDirectory: outputDirectory.standardizedFileURL.path,
+            outputDirectory: destination.url.path,
             manifestSHA256: "sha256:\(SwanPortableExportDigest.hex(manifestData))",
             fileCount: artifacts.count,
             includesPrivateKeys: false
@@ -623,7 +609,8 @@ public struct SwanPortableAccountExporter: Sendable {
     private func makePLCHistory(
         journal: PLCAccountPreparationJournal?,
         did: String,
-        expectedGenesisCID: String
+        expectedGenesisCID: String,
+        signingPublicKey: P256.Signing.PublicKey
     ) throws -> Data {
         guard let journal, journal.stage == .submitted,
               journal.publicGenesisCommitCID == expectedGenesisCID else {
@@ -637,6 +624,10 @@ public struct SwanPortableAccountExporter: Sendable {
             signature: journal.operation.signature
         )
         try PLCOperationCodec.verifyGenesis(operation, expectedDID: did)
+        guard operation.regular?.verificationMethods["atproto"]
+            == P256DIDKey(publicKey: signingPublicKey).value else {
+            throw SwanPortableExportError.invalidAccount
+        }
         let object: [String: Any] = [
             "format": "swan-plc-history-v1",
             "scope": SwanPortableExportManifest.plcHistoryScopeValue,
@@ -647,6 +638,11 @@ public struct SwanPortableAccountExporter: Sendable {
             "pdsOrigin": journal.pdsOrigin,
             "repositoryRevision": journal.repositoryRevision,
             "publicGenesisCommitCID": expectedGenesisCID,
+            // V1 intentionally binds an export to the current PLC `atproto`
+            // verification method. A future signing-key rotation profile must
+            // introduce a new value and verification rule rather than silently
+            // weakening this alpha invariant.
+            "signingKeyBinding": SwanPortableExportPLC.signingKeyBindingValue,
         ]
         return try JSONSerialization.data(
             withJSONObject: object,
@@ -657,70 +653,52 @@ public struct SwanPortableAccountExporter: Sendable {
     private func publish(
         artifacts: [Artifact],
         manifest: Data,
-        outputDirectory: URL,
+        destination: SwanPortableExportDestination,
         signingPublicKey: P256.Signing.PublicKey
     ) throws {
-        let output = outputDirectory.standardizedFileURL
-        guard output.path != "/",
-              !FileManager.default.fileExists(atPath: output.path) else {
-            throw SwanPortableExportError.invalidPlacement
-        }
-        let parent = output.deletingLastPathComponent()
-        try requireSafeParent(parent)
-        let staging = parent.appending(
-            path: ".swan-export-\(UUID().uuidString.lowercased())",
-            directoryHint: .isDirectory
+        let stagingName = ".swan-export-\(UUID().uuidString.lowercased())"
+        let stagingDescriptor = try SwanPortableExportFilesystem.createStagingDirectory(
+            parent: destination.parentDescriptor,
+            name: stagingName
         )
+        var published = false
         do {
-            try FileManager.default.createDirectory(
-                at: staging,
-                withIntermediateDirectories: false,
-                attributes: [.posixPermissions: 0o700]
-            )
             for (index, artifact) in artifacts.enumerated() {
-                let destination = staging.appending(path: artifact.path)
-                try FileManager.default.createDirectory(
-                    at: destination.deletingLastPathComponent(),
-                    withIntermediateDirectories: true,
-                    attributes: [.posixPermissions: 0o700]
+                try SwanPortableExportFilesystem.write(
+                    artifact.data,
+                    path: artifact.path,
+                    root: stagingDescriptor
                 )
-                guard FileManager.default.createFile(
-                    atPath: destination.path,
-                    contents: artifact.data,
-                    attributes: [.posixPermissions: 0o600]
-                ) else {
-                    throw SwanPortableExportError.publicationFailed
-                }
                 try afterArtifactWrite?(index + 1)
             }
-            guard FileManager.default.createFile(
-                atPath: staging.appending(path: "manifest.json").path,
-                contents: manifest,
-                attributes: [.posixPermissions: 0o600]
-            ) else {
+            try SwanPortableExportFilesystem.write(
+                manifest,
+                path: "manifest.json",
+                root: stagingDescriptor
+            )
+            guard fsync(stagingDescriptor) == 0 else {
                 throw SwanPortableExportError.publicationFailed
             }
             _ = try SwanPortableExportVerifier.verifyArchive(
-                at: staging,
+                directoryDescriptor: stagingDescriptor,
                 signingPublicKey: signingPublicKey
             )
-            try FileManager.default.moveItem(at: staging, to: output)
+            try destination.requireCurrentParentAndAbsentTarget()
+            try SwanPortableExportFilesystem.renameExclusively(
+                parent: destination.parentDescriptor,
+                source: stagingName,
+                destination: destination.outputName
+            )
+            published = true
+            try destination.requireCurrentParentAndInstalledTarget()
+            _ = close(stagingDescriptor)
         } catch {
-            try? FileManager.default.removeItem(at: staging)
+            _ = close(stagingDescriptor)
+            SwanPortableExportFilesystem.removeTree(
+                parent: destination.parentDescriptor,
+                name: published ? destination.outputName : stagingName
+            )
             throw error
-        }
-    }
-
-    private func requireSafeParent(_ parent: URL) throws {
-        var metadata = stat()
-        guard parent.withUnsafeFileSystemRepresentation({ path in
-            guard let path else { return -1 }
-            return lstat(path, &metadata)
-        }) == 0,
-        (metadata.st_mode & S_IFMT) == S_IFDIR,
-        metadata.st_uid == geteuid(),
-        (metadata.st_mode & 0o077) == 0 else {
-            throw SwanPortableExportError.invalidPlacement
         }
     }
 
@@ -729,6 +707,10 @@ public struct SwanPortableAccountExporter: Sendable {
         let type: SwanPortableExportFileType
         let data: Data
     }
+}
+
+private enum SwanPortableExportPLC {
+    static let signingKeyBindingValue = "plc-atproto-current-v1"
 }
 
 enum SwanPortableExportTimestamp {

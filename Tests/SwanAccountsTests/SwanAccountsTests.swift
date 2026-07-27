@@ -232,6 +232,36 @@ final class SwanAccountsTests: XCTestCase {
         }
     }
 
+    func testExistingFileKeyReaderReadsWithoutCreatingOrMutatingStore() async throws {
+        let parent = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let root = parent.appending(path: "keys")
+        let configuration = try keyConfiguration(activeKeyID: "active", byte: 23)
+        let reference = try keyReference()
+        let expectedKey = Data(repeating: 0x5A, count: 32)
+
+        let writer = try FileAccountKeyStore(root: root, configuration: configuration)
+        try await writer.create(expectedKey, for: reference)
+        let before = try keyStoreSnapshot(root)
+
+        var reader: ExistingFileAccountKeyReader? = try ExistingFileAccountKeyReader(
+            root: root,
+            configuration: configuration
+        )
+        let actualKey = try await reader?.key(for: reference)
+        XCTAssertEqual(actualKey, expectedKey)
+        reader = nil
+
+        XCTAssertEqual(try keyStoreSnapshot(root), before)
+
+        let missing = parent.appending(path: "missing-keys")
+        XCTAssertThrowsError(try ExistingFileAccountKeyReader(
+            root: missing,
+            configuration: configuration
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path))
+    }
+
     func testPublicKeyMetadataIsAuthenticatedWithoutReadingPrivateMaterial() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -943,6 +973,19 @@ final class SwanAccountsTests: XCTestCase {
             purpose: .signing,
             generation: 1
         )
+    }
+
+    private func keyStoreSnapshot(_ root: URL) throws -> [String: Data] {
+        let names = try FileManager.default.contentsOfDirectory(atPath: root.path).sorted()
+        return try Dictionary(uniqueKeysWithValues: names.map { name in
+            let url = root.appending(path: name)
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            let mode = (attributes[.posixPermissions] as? NSNumber)?.uint16Value ?? 0
+            let payload = try Data(contentsOf: url)
+            var snapshot = Data("\(mode):\(payload.count):".utf8)
+            snapshot.append(payload)
+            return (name, snapshot)
+        })
     }
 
     private static let aliceDID = "did:plc:abcdefghijklmnopqrstuvwx"

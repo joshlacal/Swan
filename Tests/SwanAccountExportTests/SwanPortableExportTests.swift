@@ -103,6 +103,105 @@ final class SwanPortableExportTests: XCTestCase {
         )
     }
 
+    func testManifestCodecRejectsNoncanonicalJSONBytes() throws {
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+        let manifestURL = fixture.root.appending(path: "manifest.json")
+        let canonical = try Data(contentsOf: manifestURL)
+        let duplicateKey = Data(#"{"format":"swan-account-export-v2","#.utf8)
+            + canonical.dropFirst()
+        let leadingEntry = Data(#"{"canonicalHandle":"alice.example.com","#.utf8)
+        let unsorted = Data("{".utf8)
+            + canonical.dropFirst(leadingEntry.count).dropLast()
+            + Data(#","canonicalHandle":"alice.example.com"}"#.utf8)
+
+        for noncanonical in [
+            Data(" \n".utf8) + canonical,
+            canonical + Data("\n".utf8),
+            duplicateKey,
+            unsorted,
+        ] {
+            try noncanonical.write(to: manifestURL)
+            XCTAssertThrowsError(
+                try SwanPortableExportVerifier.verifyArchive(
+                    at: fixture.root,
+                    signingPublicKey: fixture.key.publicKey
+                )
+            )
+        }
+    }
+
+    func testVerifierRejectsMissingAndMalformedCARsAndBlobs() async throws {
+        let fixture = try await ExporterFixture()
+        defer { fixture.remove() }
+        let exported = try await fixture.export(named: "complete")
+        let manifest = try SwanPortableExportVerifier.verifyArchive(
+            at: exported.output,
+            signingPublicKey: fixture.signingKey.publicKey
+        )
+
+        for type in [
+            SwanPortableExportFileType.publicCAR,
+            .spaceCAR,
+            .publicBlob,
+            .spaceBlob,
+        ] {
+            let entry = try XCTUnwrap(manifest.files.first { $0.type == type })
+
+            let missing = fixture.root.appending(path: "missing-\(type.rawValue)")
+            try FileManager.default.copyItem(at: exported.output, to: missing)
+            try FileManager.default.removeItem(at: missing.appending(path: entry.path))
+            XCTAssertThrowsError(
+                try SwanPortableExportVerifier.verifyArchive(
+                    at: missing,
+                    signingPublicKey: fixture.signingKey.publicKey
+                ),
+                "missing \(type.rawValue) must fail"
+            )
+
+            let malformed = fixture.root.appending(path: "malformed-\(type.rawValue)")
+            try FileManager.default.copyItem(at: exported.output, to: malformed)
+            let malformedBytes = Data("malformed-\(type.rawValue)".utf8)
+            try malformedBytes.write(to: malformed.appending(path: entry.path))
+            try replaceManifestEntry(entry, data: malformedBytes, archive: malformed)
+            XCTAssertThrowsError(
+                try SwanPortableExportVerifier.verifyArchive(
+                    at: malformed,
+                    signingPublicKey: fixture.signingKey.publicKey
+                ),
+                "malformed \(type.rawValue) must fail after digest is updated"
+            )
+        }
+    }
+
+    func testVerifierRejectsUnexpectedDirectory() throws {
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+        try FileManager.default.createDirectory(
+            at: fixture.root.appending(path: "unexpected"),
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        XCTAssertThrowsError(
+            try SwanPortableExportVerifier.verifyArchive(
+                at: fixture.root,
+                signingPublicKey: fixture.key.publicKey
+            )
+        )
+    }
+
+    func testVerifierRejectsPLCAtprotoKeyDifferentFromCARSigningKey() throws {
+        let fixture = try ArchiveFixture(crossedPLCSigningKey: true)
+        defer { fixture.remove() }
+
+        XCTAssertThrowsError(
+            try SwanPortableExportVerifier.verifyArchive(
+                at: fixture.root,
+                signingPublicKey: fixture.key.publicKey
+            )
+        )
+    }
+
     func testExporterPublishesFreshVerifiedArchiveWithSeparatedBlobNamespaces() async throws {
         let fixture = try await ExporterFixture()
         defer { fixture.remove() }
@@ -171,6 +270,88 @@ final class SwanPortableExportTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: symlinkTarget.path), [])
     }
 
+    func testSuccessfulCLIPrintsOnlyPublicResultAndLeavesAccountAndKeySourcesUnchanged() async throws {
+        let fixture = try await ExporterFixture()
+        defer { fixture.remove() }
+        let control = try await SQLiteControlDatabase(dataDirectory: fixture.root)
+        _ = try await control.createAccount(
+            AccountControlRegistration(
+                did: fixture.account.did,
+                canonicalHandle: fixture.account.canonicalHandle,
+                passwordVerifier: portableExportTestVerifier,
+                signingKey: try XCTUnwrap(fixture.account.signingKey),
+                rotationKey: try XCTUnwrap(fixture.account.rotationKey),
+                publicGenesisCommitCID: fixture.account.publicGenesisCommitCID
+            )
+        )
+        try await control.close()
+
+        let operatorSecret = Data("portable-export-operator-secret".utf8)
+        let rawKEK = Data(repeating: 0xA7, count: 32)
+        let encodedKEK = rawKEK.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        let operatorURL = fixture.root.appending(path: "operator-secret")
+        let kekURL = fixture.root.appending(path: "account-kek")
+        try protectedWrite(operatorSecret, to: operatorURL)
+        try protectedWrite(Data(encodedKEK.utf8), to: kekURL)
+        let output = fixture.root.appending(path: "cli-export")
+        let sourceBefore = try selectedSourceSnapshot(fixture.root)
+
+        let process = Process()
+        process.executableURL = try XCTUnwrap(swanExecutableURL())
+        process.arguments = [
+            "export",
+            "--data-directory", fixture.root.path,
+            "--did", fixture.account.did,
+            "--output-directory", output.path,
+            "--operator-secret-file", operatorURL.path,
+            "--account-kek-file", kekURL.path,
+            "--account-key-directory", fixture.root.appending(path: "keys").path,
+        ]
+        process.environment = [:]
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        let outputBytes = stdout.fileHandleForReading.readDataToEndOfFile()
+        let errorBytes = stderr.fileHandleForReading.readDataToEndOfFile()
+
+        XCTAssertEqual(process.terminationStatus, 0)
+        XCTAssertTrue(errorBytes.isEmpty)
+        let result = try JSONDecoder().decode(SwanPortableExportResult.self, from: outputBytes)
+        XCTAssertEqual(result.did, fixture.account.did)
+        XCTAssertEqual(result.outputDirectory, output.path)
+        XCTAssertFalse(result.includesPrivateKeys)
+        let outputObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: outputBytes) as? [String: Any]
+        )
+        XCTAssertEqual(
+            Set(outputObject.keys),
+            ["did", "fileCount", "includesPrivateKeys", "manifestSHA256", "outputDirectory"]
+        )
+        for secret in fixture.secretSentinels + [operatorSecret, rawKEK, Data(encodedKEK.utf8)] {
+            XCTAssertNil(outputBytes.range(of: secret))
+            XCTAssertNil(errorBytes.range(of: secret))
+        }
+        _ = try SwanPortableExportVerifier.verifyArchive(
+            at: output,
+            signingPublicKey: fixture.signingKey.publicKey
+        )
+        XCTAssertEqual(try selectedSourceSnapshot(fixture.root), sourceBefore)
+
+        let reopenedControl = try await SQLiteControlDatabase(
+            dataDirectory: fixture.root,
+            openMode: .existingPortableExportSource
+        )
+        let updatedAccount = try await reopenedControl.account(did: fixture.account.did)
+        XCTAssertEqual(updatedAccount?.export?.reference, result.manifestSHA256)
+        try await reopenedControl.close()
+    }
+
     func testMidExportFailureCleansStagingAndDoesNotMutateSource() async throws {
         let fixture = try await ExporterFixture()
         defer { fixture.remove() }
@@ -198,6 +379,42 @@ final class SwanPortableExportTests: XCTestCase {
         )
         let after = try await fixture.database.portableExportInventory()
         XCTAssertEqual(after, before)
+    }
+
+    func testParentReplacementDuringPublicationCannotRedirectOrOrphanStaging() async throws {
+        let fixture = try await ExporterFixture()
+        defer { fixture.remove() }
+        let parent = fixture.root.appending(path: "exports")
+        let movedParent = fixture.root.appending(path: "exports-moved")
+        let output = parent.appending(path: "archive")
+        try FileManager.default.createDirectory(
+            at: parent,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let exporter = try SwanPortableAccountExporter(
+            database: fixture.database,
+            keyStore: fixture.keyStore,
+            afterArtifactWrite: { count in
+                guard count == 1 else { return }
+                try FileManager.default.moveItem(at: parent, to: movedParent)
+                try FileManager.default.createDirectory(
+                    at: parent,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+            }
+        )
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await exporter.export(account: fixture.account, to: output)
+        }
+
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: parent.path), [])
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: movedParent.path)
+                .contains { $0.hasPrefix(".swan-export-") || $0 == "archive" }
+        )
     }
 
     func testMissingJournalAndInactiveAccountNeverPublish() async throws {
@@ -238,6 +455,95 @@ final class SwanPortableExportTests: XCTestCase {
             output.append(try Data(contentsOf: url))
         }
         return output
+    }
+
+    private func replaceManifestEntry(
+        _ replaced: SwanPortableExportFile,
+        data: Data,
+        archive: URL
+    ) throws {
+        let manifestURL = archive.appending(path: "manifest.json")
+        let current = try SwanPortableExportManifestCodec.decode(Data(contentsOf: manifestURL))
+        let files = try current.files.map { entry in
+            guard entry.path == replaced.path else { return entry }
+            return try SwanPortableExportFile(
+                path: entry.path,
+                byteCount: data.count,
+                sha256: SwanPortableExportDigest.hex(data),
+                type: entry.type
+            )
+        }
+        let rewritten = try SwanPortableExportManifest(
+            profileID: current.profileID,
+            did: current.did,
+            canonicalHandle: current.canonicalHandle,
+            createdAt: current.createdAt,
+            files: files
+        )
+        try SwanPortableExportManifestCodec.encode(rewritten).write(to: manifestURL)
+    }
+
+    private func protectedWrite(_ data: Data, to url: URL) throws {
+        try data.write(to: url)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
+    }
+
+    private func swanExecutableURL() -> URL? {
+        let packageRoot = URL(filePath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        for candidate in [
+            packageRoot.appending(path: ".build-task19/debug/swan"),
+            packageRoot.appending(path: ".build/debug/swan"),
+        ] where FileManager.default.isExecutableFile(atPath: candidate.path) {
+            return candidate
+        }
+        return nil
+    }
+
+    private func selectedSourceSnapshot(_ root: URL) throws -> [String: Data] {
+        var result: [String: Data] = [:]
+        for source in ["actors", "keys"] {
+            let sourceRoot = root.appending(path: source)
+            let enumerator = try XCTUnwrap(
+                FileManager.default.enumerator(
+                    at: sourceRoot,
+                    includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey],
+                    options: [],
+                    errorHandler: nil
+                )
+            )
+            for case let url as URL in enumerator {
+                let relative = String(url.path.dropFirst(root.path.count + 1))
+                let values = try url.resourceValues(
+                    forKeys: [.isDirectoryKey, .isRegularFileKey]
+                )
+                let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+                let mode = (attributes[.posixPermissions] as? NSNumber)?.uint16Value ?? 0
+                if values.isDirectory == true {
+                    result[relative] = Data("directory:\(mode)".utf8)
+                } else if values.isRegularFile == true {
+                    var value = Data("file:\(mode):".utf8)
+                    // SQLite's shared-memory file contains transient reader
+                    // lock bytes. Durable source immutability is asserted over
+                    // the database, WAL, outbox rows, blobs, and key envelopes;
+                    // for `-shm`, assert identity/shape without treating
+                    // ephemeral reader locks as repository writes.
+                    if url.lastPathComponent.hasSuffix(".sqlite-shm") {
+                        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+                        value.append(Data("shared-memory:\(size)".utf8))
+                    } else {
+                        value.append(try Data(contentsOf: url))
+                    }
+                    result[relative] = value
+                }
+            }
+        }
+        return result
     }
 }
 
@@ -451,7 +757,7 @@ private struct ArchiveFixture {
     let key: P256.Signing.PrivateKey
     let did: String
 
-    init() throws {
+    init(crossedPLCSigningKey: Bool = false) throws {
         root = FileManager.default.temporaryDirectory
             .appending(path: "SwanPortableExportVerifier-\(UUID().uuidString)")
         key = P256.Signing.PrivateKey()
@@ -461,7 +767,13 @@ private struct ArchiveFixture {
             attributes: [.posixPermissions: 0o700]
         )
 
-        let operation = try PLCFixture.makeGenesis(handle: "alice.example.com")
+        let plcSigningKey = crossedPLCSigningKey
+            ? P256.Signing.PrivateKey().publicKey
+            : key.publicKey
+        let operation = try PLCFixture.makeGenesis(
+            handle: "alice.example.com",
+            signingPublicKey: plcSigningKey
+        )
         did = try PLCOperationCodec.genesisDID(for: operation)
         let publicGenesis = try PublicRepositoryGenesisCodec.create(
             did: did,
@@ -561,13 +873,13 @@ private struct ArchiveFixture {
 
 private enum PLCFixture {
     static func makeGenesis(
-        handle: String
+        handle: String,
+        signingPublicKey: P256.Signing.PublicKey
     ) throws -> PLCSignedOperation {
-        let signing = P256.Signing.PrivateKey()
         let rotation = P256.Signing.PrivateKey()
         let unsigned = try PLCATProfile.regularOperation(
             handle: handle,
-            signingPublicKey: signing.publicKey,
+            signingPublicKey: signingPublicKey,
             rotationPublicKeys: [rotation.publicKey],
             pdsOrigin: URL(string: "https://pds.example.com")!,
             prev: nil
@@ -592,6 +904,10 @@ private enum PLCFixture {
             "pdsOrigin": "https://pds.example.com",
             "repositoryRevision": repositoryRevision,
             "publicGenesisCommitCID": publicGenesisCommitCID,
+            "signingKeyBinding": "plc-atproto-current-v1",
         ], options: [.sortedKeys, .withoutEscapingSlashes])
     }
 }
+
+private let portableExportTestVerifier =
+    "$argon2id$v=19$m=65536,t=3,p=1$bcdefghijklmnopqrstuvw$BCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq"

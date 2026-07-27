@@ -9,6 +9,39 @@ import SwanStorage
 import XCTest
 
 final class SwanSQLiteTests: XCTestCase {
+    func testPortableExportDatabaseModesAreActuallyQueryOnly() async throws {
+        let fixture = try Fixture()
+        let managedAccount = try await fixture.open()
+        try await managedAccount.close()
+        let managedControl = try await SQLiteControlDatabase(dataDirectory: fixture.root)
+        try await managedControl.close()
+
+        let account = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root,
+            did: fixture.author,
+            openMode: .existingPortableExportSource
+        )
+        do {
+            _ = try await account.connection.query(
+                "CREATE TABLE portable_export_must_not_write(value INTEGER)"
+            )
+            XCTFail("portable export account connection accepted a write")
+        } catch {}
+        try await account.close()
+
+        let control = try await SQLiteControlDatabase(
+            dataDirectory: fixture.root,
+            openMode: .existingPortableExportSource
+        )
+        do {
+            _ = try await control.connection.query(
+                "CREATE TABLE portable_export_must_not_write(value INTEGER)"
+            )
+            XCTFail("portable export control connection accepted a write")
+        } catch {}
+        try await control.close()
+    }
+
     func testRestartPreservesRepositoryRecordsOplogAndPendingOutbox() async throws {
         let fixture = try Fixture()
         var database: SQLiteAccountDatabase? = try await fixture.open()

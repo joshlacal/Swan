@@ -119,7 +119,7 @@ enum SQLiteProtectedPaths {
             throw SwanError.unavailable("SQLite database path is unavailable")
         }
         let descriptor = name.withCString { path in
-            openat(parentDescriptor, path, O_RDWR | O_CLOEXEC | O_NOFOLLOW)
+            openat(parentDescriptor, path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
         }
         guard descriptor >= 0 else {
             throw SwanError.unavailable("SQLite database path is unavailable")

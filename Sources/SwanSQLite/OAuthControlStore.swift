@@ -24,6 +24,11 @@ actor ControlSQLiteConnectionGate {
     }
 }
 
+public enum SQLiteControlDatabaseOpenMode: Sendable, Equatable {
+    case managed
+    case existingPortableExportSource
+}
+
 /// Durable OAuth control-plane state backed by `control.sqlite`. Repository
 /// records deliberately never flow through this type. The actor serializes one
 /// process while `BEGIN IMMEDIATE` makes consume/rotate/revoke semantics hold
@@ -45,39 +50,73 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
     private var dataDirectoryDescriptor: Int32
     private var activeWriteTransactions = 0
 
-    public init(dataDirectory: URL) async throws {
-        let rootDescriptor = try SQLiteProtectedPaths.openRoot(dataDirectory)
+    public init(
+        dataDirectory: URL,
+        openMode: SQLiteControlDatabaseOpenMode = .managed
+    ) async throws {
+        let rootDescriptor = switch openMode {
+        case .managed:
+            try SQLiteProtectedPaths.openRoot(dataDirectory)
+        case .existingPortableExportSource:
+            try SQLiteProtectedPaths.openExistingRoot(dataDirectory)
+        }
         let databasePath: String
         do {
-            databasePath = try SQLiteProtectedPaths.openDatabaseFile(
-                parentDescriptor: rootDescriptor,
-                name: "control.sqlite",
-                resolvedPath: SQLiteLayout.controlDatabase(in: dataDirectory)
-                    .standardizedFileURL.path
-            )
+            let resolvedPath = SQLiteLayout.controlDatabase(in: dataDirectory)
+                .standardizedFileURL.path
+            databasePath = switch openMode {
+            case .managed:
+                try SQLiteProtectedPaths.openDatabaseFile(
+                    parentDescriptor: rootDescriptor,
+                    name: "control.sqlite",
+                    resolvedPath: resolvedPath
+                )
+            case .existingPortableExportSource:
+                try SQLiteProtectedPaths.openExistingDatabaseFile(
+                    parentDescriptor: rootDescriptor,
+                    name: "control.sqlite",
+                    resolvedPath: resolvedPath
+                )
+            }
         } catch {
             SQLiteProtectedPaths.closeDirectory(rootDescriptor)
             throw error
         }
         let openedConnection: SQLiteConnection
         do {
-            openedConnection = try await SQLiteConnection.open(storage: .file(path: databasePath))
+            let connectionPath = try openMode == .existingPortableExportSource
+                ? SQLiteLayout.readOnlyURI(for: databasePath)
+                : databasePath
+            openedConnection = try await SQLiteConnection.open(
+                storage: .file(path: connectionPath)
+            )
         } catch {
             SQLiteProtectedPaths.closeDirectory(rootDescriptor)
             throw error
         }
         connection = openedConnection
         dataDirectoryDescriptor = rootDescriptor
-        do {
-            try await migrateWithBusyRetry()
-            try SQLiteProtectedPaths.hardenSQLiteFiles(
-                parentDescriptor: rootDescriptor,
-                databaseName: "control.sqlite"
-            )
-        } catch {
-            try? await openedConnection.close()
-            SQLiteProtectedPaths.closeDirectory(rootDescriptor)
-            throw error
+        switch openMode {
+        case .managed:
+            do {
+                try await migrateWithBusyRetry()
+                try SQLiteProtectedPaths.hardenSQLiteFiles(
+                    parentDescriptor: rootDescriptor,
+                    databaseName: "control.sqlite"
+                )
+            } catch {
+                try? await openedConnection.close()
+                SQLiteProtectedPaths.closeDirectory(rootDescriptor)
+                throw error
+            }
+        case .existingPortableExportSource:
+            do {
+                _ = try await openedConnection.query("PRAGMA query_only=ON")
+            } catch {
+                try? await openedConnection.close()
+                SQLiteProtectedPaths.closeDirectory(rootDescriptor)
+                throw error
+            }
         }
     }
 

@@ -342,10 +342,22 @@ extension SwanCommand {
             let outputURL = URL(fileURLWithPath: outputDirectory).standardizedFileURL
             let keyURL = accountKeyDirectory.map { URL(fileURLWithPath: $0) }
                 ?? dataURL.appending(path: "keys", directoryHint: .isDirectory)
+            // Pin and validate the destination before opening any component
+            // that could create, migrate, recover, or otherwise mutate source
+            // state.
+            let destination: SwanPortableExportDestination
+            do {
+                destination = try SwanPortableExportDestination(outputURL)
+            } catch {
+                throw ValidationError("portable export failed")
+            }
             var control: SQLiteControlDatabase?
             var accountDatabase: SQLiteAccountDatabase?
             do {
-                let openedControl = try await SQLiteControlDatabase(dataDirectory: dataURL)
+                let openedControl = try await SQLiteControlDatabase(
+                    dataDirectory: dataURL,
+                    openMode: .existingPortableExportSource
+                )
                 control = openedControl
                 guard let account = try await openedControl.account(did: canonicalDID) else {
                     throw AccountOperatorError.unknownAccount
@@ -355,13 +367,15 @@ extension SwanCommand {
                       account.publicGenesisCommitCID != nil else {
                     throw AccountOperatorError.accountInactive
                 }
+                try await openedControl.close()
+                control = nil
                 let openedAccount = try await SQLiteAccountDatabase(
                     dataDirectory: dataURL,
                     did: canonicalDID,
                     openMode: .existingPortableExportSource
                 )
                 accountDatabase = openedAccount
-                let keyStore = try FileAccountKeyStore(
+                let keyStore = try ExistingFileAccountKeyReader(
                     root: keyURL,
                     configuration: keyConfiguration
                 )
@@ -369,15 +383,29 @@ extension SwanCommand {
                     database: openedAccount,
                     keyStore: keyStore
                 )
-                let result = try await exporter.export(account: account, to: outputURL)
-                _ = try await AccountOperatorService(store: openedControl).declareExport(
-                    did: canonicalDID,
-                    manifestReference: result.manifestSHA256,
-                    authorization: authorization
-                )
+                let result = try await exporter.export(account: account, to: destination)
                 try await openedAccount.close()
                 accountDatabase = nil
-                try await openedControl.close()
+
+                // The only source mutation occurs after a complete archive has
+                // been installed and independently verified.
+                let declarationControl = try await SQLiteControlDatabase(dataDirectory: dataURL)
+                control = declarationControl
+                do {
+                    _ = try await AccountOperatorService(store: declarationControl).declareExport(
+                        did: canonicalDID,
+                        manifestReference: result.manifestSHA256,
+                        authorization: authorization
+                    )
+                } catch {
+                    try? await declarationControl.close()
+                    control = nil
+                    throw ValidationError(
+                        "portable export was published but its digest declaration failed; "
+                            + "retry only the declaration with 'swan account declare-export'"
+                    )
+                }
+                try await declarationControl.close()
                 control = nil
                 try AccountCommandSupport.write(result)
             } catch {
@@ -385,6 +413,9 @@ extension SwanCommand {
                 try? await control?.close()
                 if let error = error as? AccountOperatorError {
                     throw AccountCommandSupport.validationError(for: error)
+                }
+                if let error = error as? ValidationError {
+                    throw error
                 }
                 throw ValidationError("portable export failed")
             }
@@ -850,7 +881,7 @@ extension SwanCommand {
             abstract: "Inspect or manage a provisioned Swan account",
             subcommands: [
                 InstallLocal.self, PreparePLC.self, ActivatePLC.self, Show.self,
-                Deactivate.self, Reactivate.self, Delete.self,
+                Deactivate.self, Reactivate.self, DeclareExport.self, Delete.self,
             ]
         )
 
@@ -1362,6 +1393,43 @@ extension SwanCommand {
                     dataDirectory: dataDirectory
                 ) { service in
                     try await service.reactivate(did: did, authorization: authorization)
+                }
+                try AccountCommandSupport.write(view)
+            }
+        }
+
+        /// Idempotent recovery path for the narrow interval after an archive
+        /// was durably published but before its digest reached control.sqlite.
+        struct DeclareExport: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "declare-export",
+                abstract: "Record the digest of an already verified portable export"
+            )
+
+            @Option(name: .long, help: "Required Swan data directory containing control.sqlite")
+            var dataDirectory: String
+
+            @Option(name: .long, help: "Active account DID")
+            var did: String
+
+            @Option(name: .long, help: "sha256:<64 lowercase hex> manifest digest")
+            var manifestReference: String
+
+            @Option(name: .long, help: "Mounted operator-secret file; never accepted as a literal argument")
+            var operatorSecretFile: String?
+
+            func run() async throws {
+                let authorization = try AccountCommandSupport.authorization(
+                    secretFilePath: operatorSecretFile
+                )
+                let view = try await AccountCommandSupport.withService(
+                    dataDirectory: dataDirectory
+                ) { service in
+                    try await service.declareExport(
+                        did: did,
+                        manifestReference: manifestReference,
+                        authorization: authorization
+                    )
                 }
                 try AccountCommandSupport.write(view)
             }

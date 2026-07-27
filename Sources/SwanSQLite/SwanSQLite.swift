@@ -29,6 +29,20 @@ public enum SQLiteLayout {
             .appending(path: "\(digest).sqlite")
     }
 
+    static func readOnlyURI(for path: String) throws -> String {
+        let uriPathCharacters = CharacterSet(
+            charactersIn:
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/"
+        )
+        guard path.hasPrefix("/"),
+              let encoded = path.addingPercentEncoding(
+                  withAllowedCharacters: uriPathCharacters
+              ) else {
+            throw SwanError.unavailable("SQLite read-only path is unavailable")
+        }
+        return "file:\(encoded)?mode=ro"
+    }
+
     /// Connection-local configuration must run outside a migration write
     /// transaction (`foreign_keys` and `journal_mode` are not safely changed
     /// inside one). Schema DDL below is serialized separately with
@@ -1016,7 +1030,12 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         portableExportReadOnly = openMode == .existingPortableExportSource
         let openedConnection: SQLiteConnection
         do {
-            openedConnection = try await SQLiteConnection.open(storage: .file(path: databasePath))
+            let connectionPath = try openMode == .existingPortableExportSource
+                ? SQLiteLayout.readOnlyURI(for: databasePath)
+                : databasePath
+            openedConnection = try await SQLiteConnection.open(
+                storage: .file(path: connectionPath)
+            )
         } catch {
             SQLiteProtectedPaths.closeDirectory(accountDescriptor)
             throw error
@@ -1031,6 +1050,14 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                     parentDescriptor: accountDescriptor,
                     databaseName: "\(Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite"
                 )
+            } catch {
+                try? await openedConnection.close()
+                SQLiteProtectedPaths.closeDirectory(accountDescriptor)
+                throw error
+            }
+        } else {
+            do {
+                _ = try await openedConnection.query("PRAGMA query_only=ON")
             } catch {
                 try? await openedConnection.close()
                 SQLiteProtectedPaths.closeDirectory(accountDescriptor)
