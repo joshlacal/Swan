@@ -161,13 +161,21 @@ public enum PermissionedDataJWT {
     public static let delegationType = "atproto-space-delegation+jwt"
     public static let credentialType = "atproto-space-credential+jwt"
     public static let clientAttestationType = "atproto-client-attestation+jwt"
+    /// Proposal 0016 signs user-to-space-host delegations with the user's
+    /// regular AT Protocol signing key. This is intentionally distinct from
+    /// the authority-owned `#atproto_space` credential key below.
+    public static let delegationKeyID = "#atproto"
+    public static let delegationLifetime: TimeInterval = 60
     /// Proposal 0016 assigns a dedicated DID verification method to space
     /// credentials. Swan's authority boundary does not silently fall back to
     /// another account key: a future DID resolver can make that fallback an
     /// explicit, profile-reviewed decision instead.
     public static let spaceCredentialKeyID = "#atproto_space"
     public static let spaceCredentialLifetime: TimeInterval = 2 * 60 * 60
+    public static let maximumCompactDelegationBytes = 8 * 1_024
     public static let maximumCompactSpaceCredentialBytes = 8 * 1_024
+    private static let maximumDelegationComponentBytes = 4 * 1_024
+    private static let maximumDelegationJSONBytes = 4 * 1_024
     private static let maximumSpaceCredentialComponentBytes = 4 * 1_024
     private static let maximumSpaceCredentialJSONBytes = 4 * 1_024
 
@@ -207,6 +215,20 @@ public enum PermissionedDataJWT {
         }
     }
 
+    /// The unsigned, bounded metadata used to select a local or pinned user
+    /// verification key for a delegation. Inspection is never authorization:
+    /// callers must verify the ES256 signature before creating a requester
+    /// context or minting a credential.
+    public struct DelegationInspection: Sendable, Equatable {
+        public let header: Header
+        public let claims: DelegationClaims
+
+        public init(header: Header, claims: DelegationClaims) {
+            self.header = header
+            self.claims = claims
+        }
+    }
+
     public struct ClientAttestationClaims: Codable, Sendable, Equatable {
         public let iss: String
         public let sub: String
@@ -224,10 +246,17 @@ public enum PermissionedDataJWT {
         now: Date = Date(),
         lifetime: TimeInterval = 60
     ) throws -> String {
+        guard isPermissionedDataDID(issuer),
+              audience == "\(space.authority)#atproto_space_host",
+              lifetime > 0,
+              lifetime <= delegationLifetime,
+              lifetime.rounded(.towardZero) == lifetime else {
+            throw SwanError.malformed("invalid delegation issuer, audience, or lifetime")
+        }
         let issuedAt = Int64(now.timeIntervalSince1970)
         return try sign(
             type: delegationType,
-            kid: "#atproto",
+            kid: delegationKeyID,
             claims: DelegationClaims(
                 iss: issuer, aud: audience, sub: space.rawValue, iat: issuedAt,
                 exp: issuedAt + Int64(lifetime), jti: UUID().uuidString
@@ -240,16 +269,54 @@ public enum PermissionedDataJWT {
         _ token: String,
         publicKey: P256.Signing.PublicKey,
         audience: String,
+        expectedSpace: SpaceURI? = nil,
         now: Date = Date(),
         clockSkew: TimeInterval = 60
     ) throws -> DelegationClaims {
-        let parsed = try verify(token, expectedType: delegationType, publicKey: publicKey)
+        guard clockSkew >= 0, clockSkew <= 5 * 60 else {
+            throw SwanError.malformed("invalid delegation clock skew")
+        }
+        let parsed = try verifyDelegationStructure(token, publicKey: publicKey)
         let claims = try decode(DelegationClaims.self, from: parsed.payload)
-        guard claims.aud == audience, (try? SpaceURI(claims.sub)) != nil else {
+        guard claims.aud == audience,
+              isPermissionedDataDID(claims.iss),
+              let space = try? SpaceURI(claims.sub),
+              claims.aud == "\(space.authority)#atproto_space_host",
+              expectedSpace.map({ $0 == space }) ?? true,
+              claims.jti.isCanonicalCredentialJTI else {
             throw SwanError.unauthorized("delegation token audience or space is invalid")
         }
-        try validateTimes(iat: claims.iat, exp: claims.exp, now: now, clockSkew: clockSkew)
+        try validateTimes(
+            iat: claims.iat,
+            exp: claims.exp,
+            now: now,
+            clockSkew: clockSkew,
+            maximumLifetime: Int64(delegationLifetime)
+        )
         return claims
+    }
+
+    /// Inspects a compact delegation before selecting a verification key.
+    /// Like space credentials, this applies byte, base64url, JSON, type,
+    /// algorithm, key-ID, DID, space, and JTI constraints before callers can
+    /// access an issuer value. It deliberately performs no network lookup.
+    public static func inspectDelegationToken(
+        _ token: String
+    ) throws -> DelegationInspection {
+        let parsed = try parseDelegationToken(token)
+        guard parsed.header.typ == delegationType,
+              parsed.header.alg == "ES256",
+              parsed.header.kid == delegationKeyID else {
+            throw SwanError.unauthorized("JWT type, algorithm, or key ID is invalid")
+        }
+        let claims = try decode(DelegationClaims.self, from: parsed.payload)
+        guard isPermissionedDataDID(claims.iss),
+              let space = try? SpaceURI(claims.sub),
+              claims.aud == "\(space.authority)#atproto_space_host",
+              claims.jti.isCanonicalCredentialJTI else {
+            throw SwanError.unauthorized("delegation token issuer, audience, or subject is invalid")
+        }
+        return DelegationInspection(header: parsed.header, claims: claims)
     }
 
     public static func createSpaceCredential(
@@ -390,6 +457,23 @@ public enum PermissionedDataJWT {
         return parsed
     }
 
+    private static func verifyDelegationStructure(
+        _ token: String,
+        publicKey: P256.Signing.PublicKey
+    ) throws -> ParsedJWT {
+        let parsed = try parseDelegationToken(token)
+        guard parsed.header.typ == delegationType,
+              parsed.header.alg == "ES256",
+              parsed.header.kid == delegationKeyID else {
+            throw SwanError.unauthorized("JWT type, algorithm, or key ID is invalid")
+        }
+        let signature = try P256WireSignature.decodeCanonical(parsed.signature)
+        guard publicKey.isValidSignature(signature, for: parsed.signingInput) else {
+            throw SwanError.unauthorized("JWT signature is invalid")
+        }
+        return parsed
+    }
+
     private static func parse(_ token: String) throws -> ParsedJWT {
         let pieces = token.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
         guard pieces.count == 3,
@@ -420,6 +504,34 @@ public enum PermissionedDataJWT {
               payload.count <= maximumSpaceCredentialJSONBytes,
               signature.count == 64 else {
             throw SwanError.malformed("malformed space credential")
+        }
+        let header = try decode(Header.self, from: headerData)
+        return ParsedJWT(
+            header: header,
+            payload: payload,
+            signingInput: Data("\(pieces[0]).\(pieces[1])".utf8),
+            signature: signature
+        )
+    }
+
+    private static func parseDelegationToken(_ token: String) throws -> ParsedJWT {
+        guard token.utf8.count <= maximumCompactDelegationBytes else {
+            throw SwanError.malformed("delegation token is too large")
+        }
+        let pieces = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard pieces.count == 3,
+              pieces.allSatisfy({
+                  !$0.isEmpty
+                      && $0.utf8.count <= maximumDelegationComponentBytes
+                      && $0.utf8.allSatisfy(isBase64URLByte)
+              }),
+              let headerData = Data(base64URLEncoded: String(pieces[0])),
+              let payload = Data(base64URLEncoded: String(pieces[1])),
+              let signature = Data(base64URLEncoded: String(pieces[2])),
+              headerData.count <= maximumDelegationJSONBytes,
+              payload.count <= maximumDelegationJSONBytes,
+              signature.count == 64 else {
+            throw SwanError.malformed("malformed delegation token")
         }
         let header = try decode(Header.self, from: headerData)
         return ParsedJWT(
@@ -466,6 +578,23 @@ public enum PermissionedDataJWT {
             return nil
         }
         return Int64(timestamp)
+    }
+
+    /// The JWT primitive validates the protocol's generic DID grammar rather
+    /// than a local account-registry policy. A concrete local resolver later
+    /// requires a registered, active account; pinned interop fixtures may use
+    /// another valid DID method or a deliberately minimal test DID.
+    private static func isPermissionedDataDID(_ value: String) -> Bool {
+        let parts = value.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count >= 3,
+              parts[0] == "did",
+              !parts[1].isEmpty,
+              !parts.dropFirst(2).joined(separator: ":").isEmpty else {
+            return false
+        }
+        return value.utf8.allSatisfy {
+            $0 >= 33 && $0 <= 126 && $0 != 47 && $0 != 63 && $0 != 35
+        }
     }
 
     private static func integerClockSkew(_ skew: TimeInterval) -> Int64? {

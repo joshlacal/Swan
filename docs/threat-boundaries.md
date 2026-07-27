@@ -4,9 +4,12 @@ Permissioned data provides access control, not end-to-end confidentiality. A
 repo or space host can read data it serves. Swan’s alpha therefore focuses on
 preventing accidental public exposure and unauthorized cross-space access.
 
-- `AuthorizationContext` is explicit: public, account OAuth, self-only read,
-  space credential, and service contexts are distinct. No repository API takes
-  an authenticated boolean.
+- `AuthorizationContext` is explicit: public, account OAuth, validated
+  delegation exchange, self-only read, space credential, and service contexts
+  are distinct. No repository API takes an authenticated boolean.
+- Delegation JWTs are valid only for one short authority exchange and have no
+  repository permission. They resolve exclusively through local or pinned
+  `#atproto` keys; unknown issuers never cause DID/PLC/DNS/HTTP lookup.
 - A space credential is read-only at the repo host. Writes require a scope
   covering the authenticated account’s own `(space, repo)`.
 - The content-binding MAC is a deniable integrity check, never an author

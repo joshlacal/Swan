@@ -86,8 +86,8 @@ Catbird UI work.
   an explicit empty-string clear. Focused tests cover the old-schema upgrade,
   `manage=update` membership/list operations, DPoP replay, and an oversized
   body delivered in streaming chunks.
-- The credential foundation is now a closed SwanOAuth/storage boundary, not
-  an XRPC route. `DurableSpaceCredentialAuthority` evaluates the authority's
+- The credential foundation now includes the bounded authority exchange and
+  credential read XRPC routes. `DurableSpaceCredentialAuthority` evaluates the authority's
   startup-preopened SQLite `authorizeSimpleSpaceRead` policy before obtaining
   the active account signing key through `AccountKeyStore`; it emits only a
   transient ES256 `atproto-space-credential+jwt` with `#atproto_space`, a
@@ -96,12 +96,19 @@ Catbird UI work.
   binding, resolves only configured local or static pinned public keys, and
   returns `AuthorizationContext.spaceCredential` only after signature and
   clock checks. Remote DID/PLC key retrieval, client metadata/JWKS attestation
-  verification, delegation exchange, and all credential HTTP endpoints remain
-  unavailable; an allow-listed app therefore fails closed until a signed
-  attestation policy is implemented. Focused tests cover durable public/member
-  policy, app and managing-app denial, requester binding, key-generation
-  selection, malformed/tampered/expired credentials, concurrent unique JTIs,
-  and scans that reject token/private-key persistence in SQLite.
+  verification remains unavailable; an allow-listed app therefore fails closed
+  until a signed attestation policy is implemented. A delegation exchange
+  accepts only a bounded Bearer JWT with the exact proposal type/algorithm/key
+  ID, local/pinned user key, exact `authority#atproto_space_host` audience,
+  space subject, clock bounds, and UUID JTI before it can enter durable policy
+  evaluation. The issued credential is accepted by `getRecord`/`listRecords`
+  without DPoP and can read another active preopened member repository only in
+  its bound space. It cannot write records. `getDelegationToken` remains
+  unavailable because user-PDS account-key OAuth binding is separate work.
+  Focused tests cover durable public/member policy, app and managing-app
+  denial, wrong issuer/key/audience/space, expiry/tampering, replay-compatible
+  fresh credential issuance, cross-repository reads, duplicate/oversized
+  bodies, write rejection, and no request-time DB opening.
 - All unimplemented HTTP endpoints intentionally return generic authorization
   errors or `profile_endpoint_pending`; they are not interop evidence. The
   pinned TypeScript `com.atproto.space.getSpace` exception is now a typed,

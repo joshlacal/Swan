@@ -72,6 +72,31 @@ public protocol SpaceCredentialAuthorizationVerifier: Sendable {
     ) async throws -> AuthorizationContext
 }
 
+/// Resolves the public material for an inspected user-to-space-host
+/// delegation. This is a separate protocol from
+/// ``SpaceCredentialPublicKeyResolver`` because delegations are signed by the
+/// user's `#atproto` key while space credentials are signed by an authority's
+/// dedicated `#atproto_space` key. Implementations supplied in this alpha are
+/// local or operator-pinned only and never fetch DID, PLC, DNS, or HTTP data
+/// while handling a request.
+public protocol SpaceDelegationPublicKeyResolver: Sendable {
+    func publicKey(
+        for issuer: String,
+        keyID: String
+    ) async throws -> P256.Signing.PublicKey?
+}
+
+/// Verifies one compact delegation and returns the deliberately narrow
+/// requester context that can be exchanged at a space authority. The context
+/// is never a repository grant and cannot be used for record I/O directly.
+public protocol SpaceDelegationAuthorizationVerifier: Sendable {
+    func authorization(
+        for token: String,
+        expectedSpace: SpaceURI,
+        now: Date
+    ) async throws -> AuthorizationContext
+}
+
 /// A policy hook for resolving a client identity from a signed client
 /// attestation. The implementation must return a client ID only after the
 /// attestation's metadata/JWKS signature is verified. Swan deliberately
@@ -99,9 +124,7 @@ public struct UnavailableSpaceCredentialClientAttestationPolicy:
         now _: Date
     ) async throws -> String? {
         guard clientAttestation == nil else {
-            throw SwanError.unavailable(
-                "client attestation verification is unavailable"
-            )
+            throw SpaceCredentialClientAttestationFailure.invalid
         }
         return nil
     }
@@ -186,6 +209,43 @@ public struct LocalAccountSpaceCredentialPublicKeyResolver:
     }
 }
 
+/// Local public-key resolver for a user's `#atproto` delegation key. It uses
+/// the same authenticated public metadata projection as credential
+/// verification, so a delegation request cannot decrypt a private account
+/// scalar merely to validate a signature.
+public struct LocalAccountSpaceDelegationPublicKeyResolver:
+    SpaceDelegationPublicKeyResolver
+{
+    private let accounts: DurableAccountDirectory
+    private let publicKeyStore: any AccountKeyPublicKeyStore
+
+    public init(
+        accounts: DurableAccountDirectory,
+        publicKeyStore: any AccountKeyPublicKeyStore
+    ) {
+        self.accounts = accounts
+        self.publicKeyStore = publicKeyStore
+    }
+
+    public func publicKey(
+        for issuer: String,
+        keyID: String
+    ) async throws -> P256.Signing.PublicKey? {
+        guard keyID == PermissionedDataJWT.delegationKeyID,
+              let account = try await accounts.account(did: issuer),
+              account.status.authorizesAccount,
+              let references = try await accounts.keyReferences(did: issuer),
+              let encoded = try await publicKeyStore.publicKey(for: references.signing) else {
+            return nil
+        }
+        do {
+            return try P256.Signing.PublicKey(x963Representation: encoded)
+        } catch {
+            throw SwanError.unavailable("delegation verification key is unavailable")
+        }
+    }
+}
+
 /// A static, offline public-key resolver for pinned interop fixtures and
 /// explicitly configured local peers. It never attempts DID, PLC, DNS, or
 /// HTTP resolution. When several generations for one `(authority, kid)` are
@@ -251,6 +311,70 @@ public struct PinnedSpaceCredentialPublicKeyResolver:
     }
 }
 
+/// An immutable offline delegation-key pin for interop fixtures and explicitly
+/// configured local peers. A pin never authorizes network resolution; it is
+/// selected only after bounded inspection established the exact issuer and
+/// `#atproto` key ID.
+public struct PinnedSpaceDelegationPublicKey: Sendable {
+    public let issuer: String
+    public let keyID: String
+    public let generation: UInt64
+    let publicKey: P256.Signing.PublicKey
+
+    public init(
+        issuer: String,
+        keyID: String = PermissionedDataJWT.delegationKeyID,
+        generation: UInt64,
+        publicKey: P256.Signing.PublicKey
+    ) throws {
+        guard (try? AccountIdentifiers.validateDID(issuer)) != nil,
+              keyID == PermissionedDataJWT.delegationKeyID,
+              generation > 0 else {
+            throw SwanError.malformed("invalid pinned delegation key")
+        }
+        self.issuer = issuer
+        self.keyID = keyID
+        self.generation = generation
+        self.publicKey = publicKey
+    }
+}
+
+public struct PinnedSpaceDelegationPublicKeyResolver:
+    SpaceDelegationPublicKeyResolver
+{
+    private let keys: [PinnedKey: P256.Signing.PublicKey]
+
+    public init(pins: [PinnedSpaceDelegationPublicKey]) throws {
+        var selected: [PinnedKey: (generation: UInt64, key: P256.Signing.PublicKey)] = [:]
+        for pin in pins {
+            let identity = PinnedKey(issuer: pin.issuer, keyID: pin.keyID)
+            if let existing = selected[identity] {
+                guard existing.generation != pin.generation else {
+                    throw SwanError.malformed("duplicate pinned delegation key generation")
+                }
+                if pin.generation > existing.generation {
+                    selected[identity] = (pin.generation, pin.publicKey)
+                }
+            } else {
+                selected[identity] = (pin.generation, pin.publicKey)
+            }
+        }
+        keys = selected.mapValues(\.key)
+    }
+
+    public func publicKey(
+        for issuer: String,
+        keyID: String
+    ) async throws -> P256.Signing.PublicKey? {
+        keys[PinnedKey(issuer: issuer, keyID: keyID)]
+    }
+
+    private struct PinnedKey: Hashable, Sendable {
+        let issuer: String
+        let keyID: String
+    }
+}
+
 /// Explicitly refuses remote authority resolution. This is the only default
 /// remote behavior until a future DID/PLC cache can satisfy the same limits
 /// and SSRF controls as Swan's OAuth metadata loader.
@@ -265,6 +389,30 @@ public struct UnavailableSpaceCredentialPublicKeyResolver:
     ) async throws -> P256.Signing.PublicKey? {
         nil
     }
+}
+
+/// Explicitly refuses remote user-key resolution for delegation exchange.
+/// This prevents a Bearer token from becoming an SSRF or request-time DID/PLC
+/// lookup primitive until an independently bounded cache is implemented.
+public struct UnavailableSpaceDelegationPublicKeyResolver:
+    SpaceDelegationPublicKeyResolver
+{
+    public init() {}
+
+    public func publicKey(
+        for _: String,
+        keyID _: String
+    ) async throws -> P256.Signing.PublicKey? {
+        nil
+    }
+}
+
+/// A client-attestation policy must distinguish its own rejection from a
+/// durable policy or key-store failure so an HTTP adapter can render the
+/// profile's `InvalidClientAttestation` error without exposing implementation
+/// details. The enum carries no token, client, or metadata material.
+public enum SpaceCredentialClientAttestationFailure: Error, Sendable, Equatable {
+    case invalid
 }
 
 /// Issues proposal-shaped space credentials after the authority's durable
@@ -315,21 +463,34 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
         clientAttestation: String? = nil,
         now: Date = Date()
     ) async throws -> String {
-        // A JWT space credential has no reader subject claim. It therefore
-        // must not be accepted as proof that some caller may mint another
-        // credential. The future delegation-token boundary will construct a
-        // distinct validated requester context; this foundation accepts only
-        // the direct account principal and binds it to `user` here.
-        guard case let .accountOAuth(subject, _) = authorization,
-              subject == user,
+        // A credential never authorizes creation of another credential. The
+        // only admissible requesters are a direct account principal (used by
+        // non-HTTP authority control) or the narrow verifier-produced
+        // delegation context. Both bind the user and exact space before the
+        // durable policy transaction begins.
+        let requesterMatches: Bool
+        switch authorization {
+        case let .accountOAuth(subject, _):
+            requesterMatches = subject == user
+        case let .spaceDelegation(subject, delegatedSpace):
+            requesterMatches = subject == user && delegatedSpace == space
+        default:
+            requesterMatches = false
+        }
+        guard requesterMatches,
               (try? AccountIdentifiers.validateDID(user)) != nil else {
             throw SwanError.unauthorized("credential requester does not match the requested user")
         }
-        let clientID = try await clientAttestationPolicy.verifiedClientID(
-            for: clientAttestation,
-            authority: space.authority,
-            now: now
-        )
+        let clientID: String?
+        do {
+            clientID = try await clientAttestationPolicy.verifiedClientID(
+                for: clientAttestation,
+                authority: space.authority,
+                now: now
+            )
+        } catch {
+            throw SpaceCredentialClientAttestationFailure.invalid
+        }
         try await policyDirectory.authorizeSimpleSpaceCredentialRead(
             space: space,
             user: user,
@@ -349,6 +510,72 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
             lifetime: configuration.lifetime,
             kid: signingKey.keyID
         )
+    }
+}
+
+/// Verifies bounded ES256 user-to-space-host delegations through a local or
+/// pinned key resolver. It contains no replay store because proposal 0016
+/// models the one-minute token as a stateless exchange proof; repeated valid
+/// exchanges deliberately mint distinct short-lived credentials, exactly as
+/// the pinned TypeScript PDS does. Invalid tokens never reach policy or key
+/// signing work.
+public struct DurableSpaceDelegationVerifier: SpaceDelegationAuthorizationVerifier {
+    public struct Configuration: Sendable, Equatable {
+        public static let standard = Configuration(uncheckedClockSkew: 60)
+
+        public let clockSkew: TimeInterval
+
+        public init(clockSkew: TimeInterval = 60) throws {
+            guard (0 ... 5 * 60).contains(clockSkew) else {
+                throw SwanError.malformed("invalid delegation clock skew")
+            }
+            self.clockSkew = clockSkew
+        }
+
+        private init(uncheckedClockSkew: TimeInterval) {
+            clockSkew = uncheckedClockSkew
+        }
+    }
+
+    private let publicKeys: any SpaceDelegationPublicKeyResolver
+    private let configuration: Configuration
+
+    public init(
+        publicKeys: any SpaceDelegationPublicKeyResolver,
+        configuration: Configuration = .standard
+    ) {
+        self.publicKeys = publicKeys
+        self.configuration = configuration
+    }
+
+    public func authorization(
+        for token: String,
+        expectedSpace: SpaceURI,
+        now: Date = Date()
+    ) async throws -> AuthorizationContext {
+        let inspection = try PermissionedDataJWT.inspectDelegationToken(token)
+        let expectedAudience = "\(expectedSpace.authority)#atproto_space_host"
+        guard inspection.claims.aud == expectedAudience,
+              inspection.claims.sub == expectedSpace.rawValue else {
+            throw SwanError.unauthorized("delegation token does not match the requested authority or space")
+        }
+        guard let publicKey = try await publicKeys.publicKey(
+            for: inspection.claims.iss,
+            keyID: inspection.header.kid ?? ""
+        ) else {
+            // Deliberately do not distinguish a missing local account, absent
+            // pin, or disabled resolver to a remote bearer-token sender.
+            throw SwanError.unavailable("delegation verification key is unavailable")
+        }
+        let claims = try PermissionedDataJWT.verifyDelegationToken(
+            token,
+            publicKey: publicKey,
+            audience: expectedAudience,
+            expectedSpace: expectedSpace,
+            now: now,
+            clockSkew: configuration.clockSkew
+        )
+        return .spaceDelegation(subject: claims.iss, space: expectedSpace)
     }
 }
 

@@ -97,12 +97,22 @@ checksum-verified way to populate the ignored reference cache.
   clock checks before creating `AuthorizationContext.spaceCredential`. Remote
   DID/PLC key lookup and client-attestation JWKS validation are explicitly
   unavailable, so unverified app identity and unknown remote keys fail closed.
-  No credential or delegation XRPC endpoint is enabled by this evidence.
+- `com.atproto.space.getSpaceCredential` now exchanges a bounded signed
+  `Authorization: Bearer` delegation JWT for an authority-issued credential.
+  Delegations require the exact type/algorithm/`#atproto` key ID, issuer,
+  authority service audience, space subject, UUID JTI, lifetime, low-S ES256
+  signature, and a local or pinned public key; unknown keys never trigger
+  DID/PLC/DNS/HTTP resolution. The exchange uses only the startup-preopened
+  authority policy directory, then the existing durable credential authority.
+  `getRecord` and `listRecords` accept either their existing DPoP OAuth path
+  or an exact Bearer space credential. Credential reads are cross-repository
+  only within their bound space and remain read-only; Bearer tokens never
+  satisfy the DPoP OAuth authorizer. `getDelegationToken` remains closed.
 
 ## Completion gates
 
-Completion still requires the full pinned XRPC surface, signed delegation and
-credential *exchange* routes, durable repositories/CARs/blobs, OAuth and account
+Completion still requires the full pinned XRPC surface, delegation minting at
+the user PDS, durable repositories/CARs/blobs, OAuth and account
 lifecycle, generated wire sources, Compose reference PDS/PLC/Caddy matrix,
 and macOS/Linux verification. The public-genesis vector is a narrow
 cross-language gate; it is not evidence that the complete matrix has passed.

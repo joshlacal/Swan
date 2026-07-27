@@ -310,14 +310,20 @@ func authenticatedGetSpaceJSON(
 public struct SwanAuthenticatedSpaceRecordsCapability: Sendable {
     let authorizer: SwanOAuthResourceAuthorizer
     let directory: any AuthorizedSpaceRepositoryDirectory
+    /// Nil means only the established OAuth/DPoP route is enabled. A present
+    /// verifier is invoked only for an exact `Authorization: Bearer` space
+    /// credential; it never sees DPoP access tokens.
+    let credentialAuthorizer: (any SpaceCredentialAuthorizationVerifier)?
     let tidAllocator: SwanPermissionedTIDAllocator
 
     init(
         authorizer: SwanOAuthResourceAuthorizer,
-        directory: any AuthorizedSpaceRepositoryDirectory
+        directory: any AuthorizedSpaceRepositoryDirectory,
+        credentialAuthorizer: (any SpaceCredentialAuthorizationVerifier)? = nil
     ) {
         self.authorizer = authorizer
         self.directory = directory
+        self.credentialAuthorizer = credentialAuthorizer
         tidAllocator = SwanPermissionedTIDAllocator()
     }
 }
@@ -354,16 +360,22 @@ private struct AuthenticatedGetRecordHandler: ComAtprotoSpaceGetRecord.ServerHan
             throw AuthenticatedSpaceRecordFailure.invalidRequest
         }
 
-        let authorization = try await authorize(
-            capability.authorizer,
+        let authorization = try await authorizeRecordRead(
+            capability,
             request: request,
+            expectedSpace: uri.space,
             fixedPath: "/xrpc/com.atproto.space.getRecord"
         )
-        guard case let .accountOAuth(subject, _) = authorization,
-              subject == uri.author else {
-            // The caller must never learn whether another account has a
-            // repository, space, or record. The declared space-not-found
-            // result is the reference endpoint's opaque closure.
+        switch authorization {
+        case let .accountOAuth(subject, _) where subject == uri.author:
+            break
+        case .spaceCredential:
+            break
+        default:
+            // A valid OAuth principal for another repository must not prove
+            // whether this space or record exists. A verified credential is
+            // intentionally different: it is the proposal's cross-member
+            // read grant and its exact space was already bound above.
             throw AuthenticatedSpaceRecordFailure.spaceNotFound
         }
 
@@ -437,13 +449,18 @@ private struct AuthenticatedListRecordsHandler: ComAtprotoSpaceListRecords.Serve
             throw AuthenticatedSpaceRecordFailure.invalidRequest
         }
 
-        let authorization = try await authorize(
-            capability.authorizer,
+        let authorization = try await authorizeRecordRead(
+            capability,
             request: request,
+            expectedSpace: space,
             fixedPath: "/xrpc/com.atproto.space.listRecords"
         )
-        guard case let .accountOAuth(subject, _) = authorization,
-              subject == repo else {
+        switch authorization {
+        case let .accountOAuth(subject, _) where subject == repo:
+            break
+        case .spaceCredential:
+            break
+        default:
             throw AuthenticatedSpaceRecordFailure.spaceNotFound
         }
 
@@ -572,6 +589,49 @@ private func authorize(
     } catch {
         throw AuthenticatedSpaceRecordFailure.unavailable
     }
+}
+
+/// Selects the authenticated read mechanism without allowing the two bearer
+/// formats to bleed into one another. `Bearer` is reserved for a compact
+/// space credential and does not require or inspect DPoP. Any other scheme,
+/// including the established `DPoP` OAuth scheme, stays on the exact
+/// OAuth/DPoP authorizer and retains its nonce/replay behavior.
+private func authorizeRecordRead(
+    _ capability: SwanAuthenticatedSpaceRecordsCapability,
+    request: Request,
+    expectedSpace: SpaceURI,
+    fixedPath: String
+) async throws -> AuthorizationContext {
+    let bearerToken: String?
+    do {
+        bearerToken = try exactBearerToken(from: request.headers)
+    } catch {
+        throw AuthenticatedSpaceRecordFailure.denied
+    }
+    if let token = bearerToken {
+        guard let credentialAuthorizer = capability.credentialAuthorizer else {
+            throw AuthenticatedSpaceRecordFailure.denied
+        }
+        do {
+            return try await credentialAuthorizer.authorization(
+                for: token,
+                expectedSpace: expectedSpace,
+                now: Date()
+            )
+        } catch let error as SwanError {
+            if case .unavailable = error {
+                throw AuthenticatedSpaceRecordFailure.unavailable
+            }
+            throw AuthenticatedSpaceRecordFailure.denied
+        } catch {
+            throw AuthenticatedSpaceRecordFailure.denied
+        }
+    }
+    return try await authorize(
+        capability.authorizer,
+        request: request,
+        fixedPath: fixedPath
+    )
 }
 
 /// Write routes deliberately map OAuth/DPoP failures into the write failure

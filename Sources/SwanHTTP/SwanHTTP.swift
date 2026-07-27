@@ -78,6 +78,31 @@ public struct SwanLocalhostOAuthConfiguration: Sendable {
     }
 }
 
+/// The explicit, offline-only dependencies that enable the permissioned
+/// delegation exchange and Bearer credential read paths. The server combines
+/// these with the exact startup-preopened directory supplied to its
+/// initializer, so an issuer cannot accidentally evaluate policy through an
+/// arbitrary request-selected database. Every resolver is local or pinned;
+/// none receives network authority from an HTTP request.
+public struct SwanSpaceCredentialHTTPConfiguration: Sendable {
+    let authoritySigningKeys: any SpaceCredentialSigningKeyResolver
+    let delegationPublicKeys: any SpaceDelegationPublicKeyResolver
+    let credentialPublicKeys: any SpaceCredentialPublicKeyResolver
+    let clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy
+
+    public init(
+        authoritySigningKeys: any SpaceCredentialSigningKeyResolver,
+        delegationPublicKeys: any SpaceDelegationPublicKeyResolver,
+        credentialPublicKeys: any SpaceCredentialPublicKeyResolver,
+        clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy = UnavailableSpaceCredentialClientAttestationPolicy()
+    ) {
+        self.authoritySigningKeys = authoritySigningKeys
+        self.delegationPublicKeys = delegationPublicKeys
+        self.credentialPublicKeys = credentialPublicKeys
+        self.clientAttestationPolicy = clientAttestationPolicy
+    }
+}
+
 public struct SwanHTTPServer: Sendable {
     public let profile: ProtocolProfile
     public let configuration: SwanHTTPConfiguration
@@ -109,6 +134,10 @@ public struct SwanHTTPServer: Sendable {
     /// remain closed unless the same startup-preopened directory explicitly
     /// exposes the narrower lifecycle projection.
     public let authenticatedSimpleSpaceLifecycle: SwanAuthenticatedSimpleSpaceLifecycleCapability?
+    /// The authority-only delegation exchange. It remains unavailable unless
+    /// a caller supplied local/pinned key resolvers and the same startup
+    /// directory exposes the narrow durable credential-policy projection.
+    public let authenticatedSpaceCredentialExchange: SwanSpaceCredentialExchangeCapability?
 
     public init(
         profile: ProtocolProfile,
@@ -119,7 +148,8 @@ public struct SwanHTTPServer: Sendable {
         localhostPARConfiguration: SwanLocalhostPARConfiguration? = nil,
         localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration? = nil,
         authenticatedGetSpaceDirectory: (any AuthorizedSimpleSpaceDirectory)? = nil,
-        accountControlStore: (any AccountControlStore)? = nil
+        accountControlStore: (any AccountControlStore)? = nil,
+        spaceCredentialConfiguration: SwanSpaceCredentialHTTPConfiguration? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -165,9 +195,18 @@ public struct SwanHTTPServer: Sendable {
             )
             if let repositoryDirectory = authenticatedGetSpaceDirectory
                 as? any AuthorizedSpaceRepositoryDirectory {
+                let credentialVerifier: (any SpaceCredentialAuthorizationVerifier)?
+                if let spaceCredentialConfiguration {
+                    credentialVerifier = DurableSpaceCredentialVerifier(
+                        publicKeys: spaceCredentialConfiguration.credentialPublicKeys
+                    )
+                } else {
+                    credentialVerifier = nil
+                }
                 authenticatedSpaceRecords = SwanAuthenticatedSpaceRecordsCapability(
                     authorizer: authorizer,
-                    directory: repositoryDirectory
+                    directory: repositoryDirectory,
+                    credentialAuthorizer: credentialVerifier
                 )
             } else {
                 authenticatedSpaceRecords = nil
@@ -181,10 +220,27 @@ public struct SwanHTTPServer: Sendable {
             } else {
                 authenticatedSimpleSpaceLifecycle = nil
             }
+            if let credentialDirectory = authenticatedGetSpaceDirectory
+                as? any AuthorizedSimpleSpaceCredentialDirectory,
+               let spaceCredentialConfiguration {
+                authenticatedSpaceCredentialExchange = SwanSpaceCredentialExchangeCapability(
+                    delegationAuthorizer: DurableSpaceDelegationVerifier(
+                        publicKeys: spaceCredentialConfiguration.delegationPublicKeys
+                    ),
+                    credentialIssuer: DurableSpaceCredentialAuthority(
+                        policyDirectory: credentialDirectory,
+                        signingKeys: spaceCredentialConfiguration.authoritySigningKeys,
+                        clientAttestationPolicy: spaceCredentialConfiguration.clientAttestationPolicy
+                    )
+                )
+            } else {
+                authenticatedSpaceCredentialExchange = nil
+            }
         } else {
             authenticatedGetSpace = nil
             authenticatedSpaceRecords = nil
             authenticatedSimpleSpaceLifecycle = nil
+            authenticatedSpaceCredentialExchange = nil
         }
     }
 
@@ -279,6 +335,12 @@ public struct SwanHTTPServer: Sendable {
             if descriptor.nsid == ComAtprotoSpaceGetSpace.typeIdentifier,
                let authenticatedGetSpace {
                 registerAuthenticatedGetSpaceEndpoint(on: router, capability: authenticatedGetSpace)
+            } else if descriptor.nsid == ComAtprotoSpaceGetSpaceCredential.typeIdentifier,
+                      let authenticatedSpaceCredentialExchange {
+                registerAuthenticatedGetSpaceCredentialEndpoint(
+                    on: router,
+                    capability: authenticatedSpaceCredentialExchange
+                )
             } else if descriptor.nsid == ComAtprotoSpaceGetRecord.typeIdentifier,
                       let authenticatedSpaceRecords {
                 registerAuthenticatedGetRecordEndpoint(on: router, capability: authenticatedSpaceRecords)

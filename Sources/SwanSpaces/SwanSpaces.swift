@@ -213,6 +213,11 @@ public struct SpaceGrant: Codable, Sendable, Equatable {
 public enum AuthorizationContext: Sendable, Equatable {
     case `public`
     case accountOAuth(subject: String, scopes: Set<String>)
+    /// A short-lived, signature-verified user-to-space-host delegation. This
+    /// context exists only while the authority evaluates whether that user may
+    /// exchange it for a read credential. It is deliberately not a repository
+    /// capability: a delegation cannot read or write records directly.
+    case spaceDelegation(subject: String, space: SpaceURI)
     case spaceSelfRead(subject: String, space: SpaceURI)
     case spaceCredential(SpaceGrant)
     case service(subject: String, audience: String)
@@ -245,6 +250,8 @@ public enum SpaceAuthorizationPolicy {
             guard permission == .read, grantSpace == space, subject == author else {
                 throw SwanError.unauthorized("self grant cannot perform this operation")
             }
+        case .spaceDelegation:
+            throw SwanError.unauthorized("delegation tokens cannot access repositories")
         case let .accountOAuth(subject, scopes):
             guard subject == author,
                   scopeAllows(scopes, space: space, permission: permission, collection: uri?.collection)

@@ -2602,6 +2602,12 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                     "credential requester does not match the requested user"
                 )
             }
+        case let .spaceDelegation(subject, delegatedSpace):
+            guard subject == user, delegatedSpace == space else {
+                throw SwanError.unauthorized(
+                    "delegation does not match the requested user or space"
+                )
+            }
         case let .spaceCredential(grant):
             guard grant.subject == user, grant.space == space else {
                 throw SwanError.unauthorized(

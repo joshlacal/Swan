@@ -1,0 +1,289 @@
+import Foundation
+import Hummingbird
+import HTTPTypes
+import NIOCore
+import Petrel
+import SwanCore
+import SwanOAuth
+import SwanSpaces
+import SwanSpacesWire
+import SwanStorage
+
+/// The request-only capability for an authority's delegation exchange. It is
+/// assembled by ``SwanHTTPServer`` from a startup-preopened credential-policy
+/// directory and explicitly local/pinned key resolvers. Neither the HTTP
+/// route nor the capability has a database handle, remote resolver, or raw
+/// signing material.
+public struct SwanSpaceCredentialExchangeCapability: Sendable {
+    let delegationAuthorizer: any SpaceDelegationAuthorizationVerifier
+    let credentialIssuer: any SpaceCredentialAuthoritySigner
+
+    init(
+        delegationAuthorizer: any SpaceDelegationAuthorizationVerifier,
+        credentialIssuer: any SpaceCredentialAuthoritySigner
+    ) {
+        self.delegationAuthorizer = delegationAuthorizer
+        self.credentialIssuer = credentialIssuer
+    }
+}
+
+enum SwanSpaceCredentialHTTP {
+    /// Exchange bodies contain only a space URI and (optionally) a compact
+    /// client attestation. Keep this much smaller than record-write JSON so a
+    /// procedure that returns a bearer credential cannot become a generic
+    /// buffered upload endpoint.
+    static let maximumJSONBytes = 16 * 1_024
+}
+
+private enum SpaceCredentialExchangeFailure: Error {
+    case invalidRequest
+    case invalidDelegation
+    case invalidClientAttestation
+    case spaceNotFound
+    case notAuthorized
+    case unavailable
+}
+
+private struct AuthenticatedGetSpaceCredentialHandler:
+    ComAtprotoSpaceGetSpaceCredential.ServerHandler
+{
+    typealias Context = Request
+
+    let capability: SwanSpaceCredentialExchangeCapability
+
+    func handle(
+        parameters: Void,
+        input: ComAtprotoSpaceGetSpaceCredential.Input,
+        context request: Request
+    ) async throws -> ComAtprotoSpaceGetSpaceCredential.Output {
+        let space: SpaceURI
+        do {
+            space = try SpaceURI(input.space.uriString())
+        } catch {
+            throw SpaceCredentialExchangeFailure.invalidRequest
+        }
+
+        let delegation: String
+        do {
+            guard let token = try exactBearerToken(from: request.headers) else {
+                throw SpaceCredentialExchangeFailure.invalidDelegation
+            }
+            delegation = token
+        } catch let failure as SpaceCredentialExchangeFailure {
+            throw failure
+        } catch {
+            throw SpaceCredentialExchangeFailure.invalidDelegation
+        }
+
+        let authorization: AuthorizationContext
+        do {
+            authorization = try await capability.delegationAuthorizer.authorization(
+                for: delegation,
+                expectedSpace: space,
+                now: Date()
+            )
+        } catch {
+            // The public exchange surface never distinguishes an unknown
+            // issuer/pin/key from malformed, expired, wrong-audience, or bad
+            // signature delegation material. None of these paths may enter a
+            // durable policy transaction or invoke the signing resolver.
+            throw SpaceCredentialExchangeFailure.invalidDelegation
+        }
+        guard case let .spaceDelegation(user, delegatedSpace) = authorization,
+              delegatedSpace == space else {
+            throw SpaceCredentialExchangeFailure.invalidDelegation
+        }
+
+        do {
+            let credential = try await capability.credentialIssuer.issueSpaceCredential(
+                space: space,
+                user: user,
+                authorization: authorization,
+                clientAttestation: input.clientAttestation,
+                now: Date()
+            )
+            return .init(credential: credential)
+        } catch is SpaceCredentialClientAttestationFailure {
+            throw SpaceCredentialExchangeFailure.invalidClientAttestation
+        } catch is AuthorizedSimpleSpaceLifecycleError {
+            throw SpaceCredentialExchangeFailure.spaceNotFound
+        } catch let error as SwanError {
+            switch error {
+            case .unavailable:
+                throw SpaceCredentialExchangeFailure.unavailable
+            case .unauthorized:
+                throw SpaceCredentialExchangeFailure.notAuthorized
+            case .invalidIdentifier, .invalidProfile, .conflict, .expired, .malformed:
+                throw SpaceCredentialExchangeFailure.invalidRequest
+            }
+        } catch {
+            throw SpaceCredentialExchangeFailure.unavailable
+        }
+    }
+}
+
+func registerAuthenticatedGetSpaceCredentialEndpoint(
+    on router: Router<BasicRequestContext>,
+    capability: SwanSpaceCredentialExchangeCapability
+) {
+    let handler = AuthenticatedGetSpaceCredentialHandler(capability: capability)
+    let path: RouterPath = "/xrpc/com.atproto.space.getSpaceCredential"
+    router.post(path) { request, _ async -> Response in
+        do {
+            let input = try await decodeGetSpaceCredentialInput(request)
+            let output = try await handler.handle(
+                parameters: (), input: input, context: request
+            )
+            return authenticatedGetSpaceJSON(
+                .ok,
+                GetSpaceCredentialWireOutput(credential: output.credential)
+            )
+        } catch let failure as SpaceCredentialExchangeFailure {
+            return getSpaceCredentialResponse(for: failure)
+        } catch {
+            return getSpaceCredentialError(.badRequest, code: "InvalidRequest")
+        }
+    }
+    for method: HTTPRequest.Method in [
+        .get, .head, .put, .patch, .delete, .options, .connect, .trace,
+    ] {
+        router.on(path, method: method) { _, _ -> Response in
+            getSpaceCredentialError(
+                .notFound,
+                code: "permissioned_endpoint_unavailable"
+            )
+        }
+    }
+}
+
+private func decodeGetSpaceCredentialInput(
+    _ request: Request
+) async throws -> ComAtprotoSpaceGetSpaceCredential.Input {
+    let contentTypes = request.headers[values: .contentType]
+    guard contentTypes.count == 1,
+          contentTypes[0]
+            .split(separator: ";", maxSplits: 1).first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "application/json" else {
+        throw SpaceCredentialExchangeFailure.invalidRequest
+    }
+    let lengths = request.headers[values: .contentLength]
+    guard lengths.count <= 1,
+          lengths.first.flatMap(Int.init).map({
+              (0 ... SwanSpaceCredentialHTTP.maximumJSONBytes).contains($0)
+          }) ?? true else {
+        throw SpaceCredentialExchangeFailure.invalidRequest
+    }
+
+    let body: ByteBuffer
+    do {
+        body = try await request.body.collect(
+            upTo: SwanSpaceCredentialHTTP.maximumJSONBytes
+        )
+    } catch is NIOTooManyBytesError {
+        throw SpaceCredentialExchangeFailure.invalidRequest
+    } catch {
+        throw SpaceCredentialExchangeFailure.invalidRequest
+    }
+    guard body.readableBytes > 0,
+          let bytes = body.getBytes(
+              at: body.readerIndex,
+              length: body.readableBytes
+          ) else {
+        throw SpaceCredentialExchangeFailure.invalidRequest
+    }
+    let data = Data(bytes)
+    do {
+        // Reuse the existing recursive duplicate-member validator before
+        // Foundation decodes the same exact bytes into the generated input.
+        try StrictPermissionedWriteJSON.validate(data)
+    } catch {
+        throw SpaceCredentialExchangeFailure.invalidRequest
+    }
+    guard let root = try? JSONSerialization.jsonObject(with: data)
+        as? [String: Any],
+        !root.isEmpty,
+        Set(root.keys).isSubset(of: ["space", "clientAttestation"]),
+        root.keys.filter({ $0 == "space" }).count == 1,
+        let rawSpace = root["space"] as? String,
+        !rawSpace.isEmpty,
+        rawSpace.utf8.count <= 2_048 else {
+        throw SpaceCredentialExchangeFailure.invalidRequest
+    }
+    if let attestation = root["clientAttestation"] {
+        guard let text = attestation as? String,
+              !text.isEmpty,
+              text.utf8.count <= PermissionedDataJWT.maximumCompactDelegationBytes else {
+            throw SpaceCredentialExchangeFailure.invalidRequest
+        }
+    }
+    do {
+        let input = try JSONDecoder().decode(
+            ComAtprotoSpaceGetSpaceCredential.Input.self,
+            from: data
+        )
+        _ = try SpaceURI(input.space.uriString())
+        return input
+    } catch {
+        throw SpaceCredentialExchangeFailure.invalidRequest
+    }
+}
+
+/// Returns a compact Bearer value only when the request has exactly one
+/// canonical authorization field. `nil` means another scheme (notably DPoP)
+/// and lets the caller use its own proof policy; a malformed Bearer field is
+/// an error and must not fall through to a different authentication scheme.
+func exactBearerToken(from headers: HTTPFields) throws -> String? {
+    let values = headers[values: .authorization]
+    guard values.count <= 1 else {
+        throw SpaceCredentialExchangeFailure.invalidDelegation
+    }
+    guard let raw = values.first else { return nil }
+    let canonicalPrefix = "Bearer "
+    if raw.hasPrefix(canonicalPrefix) {
+        let token = String(raw.dropFirst(canonicalPrefix.count))
+        guard !token.isEmpty,
+              token.utf8.count <= PermissionedDataJWT.maximumCompactDelegationBytes,
+              token.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+            throw SpaceCredentialExchangeFailure.invalidDelegation
+        }
+        return token
+    }
+    // HTTP authorization schemes are case-insensitive. If this field tried
+    // to use Bearer with an invalid separator/casing, fail it rather than
+    // treating it as a DPoP or future scheme.
+    if raw.lowercased().hasPrefix("bearer") {
+        throw SpaceCredentialExchangeFailure.invalidDelegation
+    }
+    return nil
+}
+
+private struct GetSpaceCredentialWireOutput: Encodable {
+    let credential: String
+}
+
+private func getSpaceCredentialResponse(
+    for failure: SpaceCredentialExchangeFailure
+) -> Response {
+    switch failure {
+    case .invalidRequest:
+        getSpaceCredentialError(.badRequest, code: "InvalidRequest")
+    case .invalidDelegation:
+        getSpaceCredentialError(.unauthorized, code: "InvalidDelegationToken")
+    case .invalidClientAttestation:
+        getSpaceCredentialError(.badRequest, code: "InvalidClientAttestation")
+    case .spaceNotFound:
+        getSpaceCredentialError(.notFound, code: "SpaceNotFound")
+    case .notAuthorized:
+        getSpaceCredentialError(.unauthorized, code: "NotAuthorized")
+    case .unavailable:
+        getSpaceCredentialError(.serviceUnavailable, code: "temporarily_unavailable")
+    }
+}
+
+private func getSpaceCredentialError(
+    _ status: HTTPResponse.Status,
+    code: String
+) -> Response {
+    authenticatedGetSpaceJSON(status, ["error": code])
+}

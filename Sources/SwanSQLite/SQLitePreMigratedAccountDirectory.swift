@@ -433,10 +433,12 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
-    /// Selects an existing startup-opened database for the OAuth subject's
-    /// own repository. This is intentionally shared by the two record-read
-    /// projections so one path cannot regress into request-time opening or
-    /// forget the stale-path defense.
+    /// Selects an existing startup-opened database for an OAuth subject's own
+    /// repository or for a verified space credential. This is intentionally
+    /// shared by the two record-read projections so one path cannot regress
+    /// into request-time opening or forget the stale-path defense. The domain
+    /// repository still receives the exact context and enforces the requested
+    /// space before it returns any record material.
     private func preopenedRepositoryDatabase(
         for did: String,
         authorization: AuthorizationContext
@@ -444,9 +446,13 @@ public actor SQLitePreMigratedAccountDirectory:
         guard !isClosed else {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
-        guard case let .accountOAuth(subject, _) = authorization,
-              subject == did else {
-            throw SwanError.unauthorized("account OAuth may read only its own repository")
+        switch authorization {
+        case let .accountOAuth(subject, _) where subject == did:
+            break
+        case .spaceCredential:
+            break
+        default:
+            throw SwanError.unauthorized("authorization may not read this repository")
         }
         guard try await isActiveAccount(did) else { return nil }
         guard !isClosed else {
