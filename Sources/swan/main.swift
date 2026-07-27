@@ -60,82 +60,97 @@ extension SwanCommand {
             try FileManager.default.createDirectory(at: dataURL, withIntermediateDirectories: true)
             let serverKey = try loadOAuthServerKey()
             let controlDatabase = try await SQLiteControlDatabase(dataDirectory: dataURL)
-            let oauthRuntime: SwanOAuthRuntime
+            var preopenedAccountDirectory: SQLitePreMigratedAccountDirectory?
             do {
-                oauthRuntime = try SwanOAuthRuntime(
+                // Permissioned lookup never creates or migrates an account
+                // database during a request. Build the complete active set
+                // before the public listener exists; failures keep the
+                // endpoint unavailable rather than repairing state online.
+                let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+                    dataDirectory: dataURL,
+                    controlStore: controlDatabase
+                )
+                preopenedAccountDirectory = directory
+                let oauthRuntime = try SwanOAuthRuntime(
                     controlStore: controlDatabase,
                     serverKey: serverKey
                 )
-            } catch {
-                try? await controlDatabase.close()
-                throw error
-            }
-            var logger = Logger(label: "swan")
-            logger.logLevel = .info
-            let localhostPARConfiguration: SwanLocalhostPARConfiguration?
-            if enableLocalhostPAR {
-                do {
-                    localhostPARConfiguration = try SwanLocalhostPARConfiguration(issuer: baseURL)
-                } catch {
-                    try? await controlDatabase.close()
-                    throw ValidationError("--enable-localhost-par requires an HTTPS public issuer URL")
-                }
-            } else {
-                localhostPARConfiguration = nil
-            }
-            let server = SwanHTTPServer(
-                profile: loadedProfile,
-                configuration: .init(host: host, port: port, publicURL: baseURL),
-                oauthRuntime: oauthRuntime,
-                localhostPARConfiguration: localhostPARConfiguration
-            )
-            // Both applications are built before a ServiceGroup starts either
-            // one. A bad management bind/config/secret therefore exits rather
-            // than silently serving a public-only process to an operator who
-            // asked for control-plane access.
-            let publicApplication = server.buildApplication(logger: logger)
-            let managementApplication: (any Service)?
-            if let managementPort {
-                guard managementPort != port else {
-                    try? await controlDatabase.close()
-                    throw ValidationError("--management-port must differ from --port")
-                }
-                let managementConfiguration: SwanManagementHTTPConfiguration
-                do {
-                    managementConfiguration = try .init(
-                        bindAddressLiteral: managementAddress,
-                        port: managementPort
-                    )
-                } catch {
-                    try? await controlDatabase.close()
-                    throw ValidationError("management listener must use literal 127.0.0.1 or ::1 and a valid port")
-                }
-                let verifier: OperatorSecretVerifier
-                do {
-                    verifier = try OperatorSecretResolver.loadVerifier(
-                        secretFile: managementOperatorSecretFile.map { URL(fileURLWithPath: $0) }
-                    )
-                } catch {
-                    try? await controlDatabase.close()
-                    throw ValidationError("management operator secret is unavailable")
-                }
-                let managementServer = SwanManagementHTTPServer(
-                    configuration: managementConfiguration,
-                    controlStore: controlDatabase,
-                    operatorSecretVerifier: verifier
+                // Make an unsafe public identity a startup error rather than
+                // silently leaving the authenticated endpoint closed. The
+                // server constructs its own instance from these same values
+                // when it installs the route.
+                _ = try SwanOAuthResourceAuthorizer(
+                    publicURL: baseURL,
+                    runtime: oauthRuntime,
+                    accountControlStore: controlDatabase
                 )
-                managementApplication = managementServer.buildApplication(
-                    logger: Logger(label: "swan.management")
-                )
-            } else {
-                guard managementOperatorSecretFile == nil else {
-                    try? await controlDatabase.close()
-                    throw ValidationError("--management-operator-secret-file requires --management-port")
+                var logger = Logger(label: "swan")
+                logger.logLevel = .info
+                let localhostPARConfiguration: SwanLocalhostPARConfiguration?
+                if enableLocalhostPAR {
+                    do {
+                        localhostPARConfiguration = try SwanLocalhostPARConfiguration(issuer: baseURL)
+                    } catch {
+                        throw ValidationError("--enable-localhost-par requires an HTTPS public issuer URL")
+                    }
+                } else {
+                    localhostPARConfiguration = nil
                 }
-                managementApplication = nil
-            }
-            logger.info("starting Swan", metadata: ["profile": .string(loadedProfile.id), "address": .string("\(host):\(port)")])
-            do {
+                let server = SwanHTTPServer(
+                    profile: loadedProfile,
+                    configuration: .init(host: host, port: port, publicURL: baseURL),
+                    oauthRuntime: oauthRuntime,
+                    localhostPARConfiguration: localhostPARConfiguration,
+                    authenticatedGetSpaceDirectory: directory,
+                    accountControlStore: controlDatabase
+                )
+                guard server.authenticatedGetSpace != nil else {
+                    throw ValidationError(
+                        "permissioned resource endpoints require HTTPS, or an HTTP public URL and listener both bound to literal loopback on the same port"
+                    )
+                }
+                // Both applications are built before a ServiceGroup starts
+                // either one. A bad management bind/config/secret therefore
+                // exits rather than silently serving a public-only process to
+                // an operator who asked for control-plane access.
+                let publicApplication = server.buildApplication(logger: logger)
+                let managementApplication: (any Service)?
+                if let managementPort {
+                    guard managementPort != port else {
+                        throw ValidationError("--management-port must differ from --port")
+                    }
+                    let managementConfiguration: SwanManagementHTTPConfiguration
+                    do {
+                        managementConfiguration = try .init(
+                            bindAddressLiteral: managementAddress,
+                            port: managementPort
+                        )
+                    } catch {
+                        throw ValidationError("management listener must use literal 127.0.0.1 or ::1 and a valid port")
+                    }
+                    let verifier: OperatorSecretVerifier
+                    do {
+                        verifier = try OperatorSecretResolver.loadVerifier(
+                            secretFile: managementOperatorSecretFile.map { URL(fileURLWithPath: $0) }
+                        )
+                    } catch {
+                        throw ValidationError("management operator secret is unavailable")
+                    }
+                    let managementServer = SwanManagementHTTPServer(
+                        configuration: managementConfiguration,
+                        controlStore: controlDatabase,
+                        operatorSecretVerifier: verifier
+                    )
+                    managementApplication = managementServer.buildApplication(
+                        logger: Logger(label: "swan.management")
+                    )
+                } else {
+                    guard managementOperatorSecretFile == nil else {
+                        throw ValidationError("--management-operator-secret-file requires --management-port")
+                    }
+                    managementApplication = nil
+                }
+                logger.info("starting Swan", metadata: ["profile": .string(loadedProfile.id), "address": .string("\(host):\(port)")])
                 var services: [any Service] = [publicApplication]
                 if let managementApplication {
                     services.append(managementApplication)
@@ -148,8 +163,12 @@ extension SwanCommand {
                     logger: logger
                 )
                 try await serviceGroup.run()
+                try await directory.close()
                 try await controlDatabase.close()
             } catch {
+                if let preopenedAccountDirectory {
+                    try? await preopenedAccountDirectory.close()
+                }
                 try? await controlDatabase.close()
                 throw error
             }

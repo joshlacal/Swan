@@ -48,15 +48,21 @@ production deployment.
   credential and proof, binds the proof to a configured route target and
   access-token hash, checks the durable token-family JKT, and rechecks the
   account lifecycle before it can create `AuthorizationContext.accountOAuth`.
-  It is not registered on an XRPC route yet.
+  Resource authorization permits HTTPS public identities, with HTTP accepted
+  only for `localhost`, `127.0.0.1`, or `::1` lab origins when Hummingbird is
+  itself bound to literal `127.0.0.1` or `::1` on the same port; an invalid
+  remote cleartext identity leaves permissioned routes closed. The typed
+  authority `getSpace` route now uses this boundary.
 - The account suite passes locally. Its native-library portability remains an
   explicit gate: local macOS testing uses Homebrew libsodium include/library
   paths, and Linux plus the minimum supported macOS have not yet been run.
 - `OAuthTokenVault` and memory-only DPoP replay are compatibility scaffolds,
-  not sufficient durable authorization state. The pre-migrated
-  account-directory read path now exists; the next HTTP unit may combine it
-  with the resource boundary, but request handling must never create or
-  migrate an account database.
+  not sufficient durable authorization state. `getSpace` combines the durable
+  resource boundary with the pre-migrated account directory; request handling
+  never creates or migrates account SQLite state. The server—not an external
+  capability—constructs that route's authorizer from its canonical URL and
+  OAuth runtime, so the DPoP `htu`, nonce issuer, token service, and handler
+  cannot be miswired independently.
 
 ## Acceptance gates
 

@@ -34,12 +34,16 @@ Catbird UI work.
   retention-gap snapshots, and durable blob namespace separation.
 - `c7403e5b` aligns the generated incremental-op contract with required-null
   CIDs for deletes.
-- Existing HTTP endpoints intentionally return generic authorization errors or
-  `profile_endpoint_pending`; they are not interop evidence. In particular,
-  pinned TypeScript `com.atproto.space.getSpace` is an authenticated,
-  authority-only query. Swan now has its DPoP-bound authorization prerequisite
-  and a startup-preopened account-directory boundary, but no HTTP route is
-  registered until its typed adapter has the same authority-only behavior.
+- All unimplemented HTTP endpoints intentionally return generic authorization
+  errors or `profile_endpoint_pending`; they are not interop evidence. The
+  pinned TypeScript `com.atproto.space.getSpace` exception is now a typed,
+  authenticated authority-only adapter. It is installed only after startup
+  preopens the active account database set, and it accepts only an active
+  `atproto`-scoped DPoP token whose subject equals the requested authority.
+  It emits just the generated URI/config shape, rejects a mismatched storage
+  projection, and maps foreign/missing/deleted spaces to the same 404. The
+  route remains closed unless the server itself can bind the authorizer to its
+  configured public URL and durable OAuth runtime.
 
 ## Acceptance gates
 

@@ -76,6 +76,10 @@ public struct SwanHTTPServer: Sendable {
     /// The sole live OAuth alpha route. This never enables discovery or any
     /// other authorization-server endpoint.
     public let localhostPARConfiguration: SwanLocalhostPARConfiguration?
+    /// The one authenticated authority `getSpace` query. It is unavailable by
+    /// default and only constructed from this server's runtime and canonical
+    /// public URL after account databases have been preopened at startup.
+    public let authenticatedGetSpace: SwanAuthenticatedGetSpaceCapability?
 
     public init(
         profile: ProtocolProfile,
@@ -83,7 +87,9 @@ public struct SwanHTTPServer: Sendable {
         repositories: any AccountRepositoryStore = InMemoryAccountRepositoryStore(),
         oauthRuntime: SwanOAuthRuntime,
         oauthPublicationGate: OAuthPublicationGate = .unavailable,
-        localhostPARConfiguration: SwanLocalhostPARConfiguration? = nil
+        localhostPARConfiguration: SwanLocalhostPARConfiguration? = nil,
+        authenticatedGetSpaceDirectory: (any AuthorizedSimpleSpaceDirectory)? = nil,
+        accountControlStore: (any AccountControlStore)? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -98,6 +104,44 @@ public struct SwanHTTPServer: Sendable {
             self.localhostPARConfiguration = localhostPARConfiguration
         } else {
             self.localhostPARConfiguration = nil
+        }
+        // Never accept a caller-supplied authorizer here: it might bind DPoP
+        // to another public URL or runtime. Failure to form the exact local
+        // binding is a safe closed route, not a best-effort fallback.
+        if let authenticatedGetSpaceDirectory,
+           let accountControlStore,
+           Self.permitsResourceAuthorization(on: configuration),
+           let authorizer = try? SwanOAuthResourceAuthorizer(
+               publicURL: configuration.publicURL,
+               runtime: oauthRuntime,
+               accountControlStore: accountControlStore
+           ) {
+            authenticatedGetSpace = SwanAuthenticatedGetSpaceCapability(
+                authorizer: authorizer,
+                directory: authenticatedGetSpaceDirectory
+            )
+        } else {
+            authenticatedGetSpace = nil
+        }
+    }
+
+    /// HTTPS resource identities may be reverse-proxied in the normal way.
+    /// A cleartext identity is only a local lab escape hatch, so require the
+    /// actual listener to be a literal loopback address on the same port.
+    /// This prevents `http://127.0.0.1` from being advertised while Hummingbird
+    /// is really accepting DPoP credentials on `0.0.0.0`.
+    private static func permitsResourceAuthorization(
+        on configuration: SwanHTTPConfiguration
+    ) -> Bool {
+        guard configuration.publicURL.scheme?.lowercased() == "http" else {
+            return true
+        }
+        guard (configuration.publicURL.port ?? 80) == configuration.port else {
+            return false
+        }
+        return switch configuration.host.lowercased() {
+        case "127.0.0.1", "::1": true
+        default: false
         }
     }
 
@@ -154,7 +198,12 @@ public struct SwanHTTPServer: Sendable {
         // every profile method gets an explicit, method-correct closed handler
         // until its authenticated implementation is ready.
         for descriptor in PermissionedData0016.methods {
-            registerUnavailablePermissionedEndpoint(descriptor, on: router)
+            if descriptor.nsid == ComAtprotoSpaceGetSpace.typeIdentifier,
+               let authenticatedGetSpace {
+                registerAuthenticatedGetSpaceEndpoint(on: router, capability: authenticatedGetSpace)
+            } else {
+                registerUnavailablePermissionedEndpoint(descriptor, on: router)
+            }
         }
 
         // Reject future/unknown permissioned methods explicitly instead of

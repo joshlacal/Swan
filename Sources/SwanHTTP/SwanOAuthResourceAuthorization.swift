@@ -56,6 +56,14 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         self.accountControlStore = accountControlStore
     }
 
+    /// Issues a challenge nonce from the exact OAuth runtime used by
+    /// ``authorize(request:method:fixedPath:now:)``. Keeping issuance behind
+    /// this boundary means an HTTP resource adapter cannot accidentally send
+    /// a nonce that its DPoP validator will reject.
+    public func issueNonce(now: Date = Date()) -> String {
+        runtime.dpopNonceService.issue(now: now)
+    }
+
     /// Returns only a domain authorization context. A raw opaque token, a
     /// parsed subject, or a DPoP JKT is never treated as authorization on its
     /// own: all three durable/token/lifecycle checks must complete first.
@@ -228,14 +236,25 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
 
     private static func validPublicURL(_ url: URL) -> Bool {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
-              components.host != nil,
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host?.lowercased(),
               components.user == nil, components.password == nil,
               components.query == nil, components.fragment == nil,
               components.percentEncodedPath.isEmpty || components.percentEncodedPath == "/" else {
             return false
         }
-        return true
+        // An OAuth resource endpoint can carry an opaque access token and
+        // DPoP proof. Permit cleartext only for an explicit, non-routable
+        // local development origin; all remotely reachable identities must
+        // use TLS.
+        return scheme == "https" || (scheme == "http" && isLiteralLoopback(host))
+    }
+
+    private static func isLiteralLoopback(_ host: String) -> Bool {
+        switch host {
+        case "localhost", "127.0.0.1", "::1": true
+        default: false
+        }
     }
 
     private static func target(publicURL: URL, fixedPath: String) throws -> URL {

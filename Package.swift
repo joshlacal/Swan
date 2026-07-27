@@ -105,6 +105,7 @@ let package = Package(
             dependencies: [
                 "SwanAccounts", "SwanCore", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth",
                 .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "Petrel", package: "Petrel"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
                 .product(name: "UnixSignals", package: "swift-service-lifecycle"),
