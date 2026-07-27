@@ -10,6 +10,7 @@ import SwanStorage
 public struct SwanOAuthRuntime: Sendable {
     public let tokenService: DurableOAuthTokenService
     public let dpopReplayStore: DurableDPoPReplayStore
+    public let browserSessionService: OAuthBrowserSessionService
     /// The nonce MAC key is the injected non-persisted OAuth server key. It
     /// never crosses into `OAuthControlStore`; validators receive this service
     /// from the runtime rather than accepting arbitrary caller text as a nonce.
@@ -24,6 +25,7 @@ public struct SwanOAuthRuntime: Sendable {
             controlStore: controlStore,
             serverKey: serverKey
         )
+        browserSessionService = try OAuthBrowserSessionService(serverKey: serverKey)
         dpopNonceService = DPoPNonceService(secret: serverKey)
     }
 }

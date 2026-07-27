@@ -8,6 +8,32 @@ import SwanCore
 import SwanStorage
 
 final class SwanOAuthTests: XCTestCase {
+    func testBrowserApprovalSessionIsBoundAndExpiresWithoutPersistingCredentials() throws {
+        let service = try OAuthBrowserSessionService(serverKey: Data(repeating: 0x43, count: 32))
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let requestURI = "urn:ietf:params:oauth:request_uri:" + String(repeating: "a", count: 43)
+        let issued = try service.issue(
+            requestURI: requestURI,
+            subject: "did:plc:abcdefghijklmnopqrstuvwx",
+            now: now
+        )
+        let verified = try service.verify(issued.value, now: now.addingTimeInterval(1))
+        XCTAssertEqual(verified.requestURI, requestURI)
+        XCTAssertEqual(verified.subject, "did:plc:abcdefghijklmnopqrstuvwx")
+        XCTAssertEqual(verified.csrfToken, issued.session.csrfToken)
+        XCTAssertFalse(issued.value.contains("correct horse battery staple"))
+
+        var tampered = issued.value
+        let finalIndex = tampered.index(before: tampered.endIndex)
+        tampered.replaceSubrange(
+            finalIndex ... finalIndex,
+            with: tampered[finalIndex] == "A" ? "B" : "A"
+        )
+        XCTAssertThrowsError(try service.verify(tampered, now: now.addingTimeInterval(1)))
+        XCTAssertThrowsError(try service.verify(issued.value, now: now.addingTimeInterval(601)))
+        XCTAssertThrowsError(try service.issue(requestURI: "not-a-request-uri", now: now))
+    }
+
     func testPKCEAndRefreshReuseRevokesFamily() async throws {
         XCTAssertTrue(PKCE.verifyS256(
             verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
