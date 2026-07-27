@@ -2248,7 +2248,7 @@ final class SwanSQLiteTests: XCTestCase {
         }
         await XCTAssertThrowsErrorAsync(
             try await reopened.refreshTokenFamily(
-                refreshTokenDigest: tokens.refreshTokenDigest,
+                refreshTokenDigest: try XCTUnwrap(tokens.refreshTokenDigest),
                 now: now
             )
         ) { error in

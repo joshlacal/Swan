@@ -97,6 +97,7 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
                         item.value.map { (item.name, $0) }
                     })
                     XCTAssertEqual(values["state"], "client-return-state")
+                    XCTAssertEqual(values["iss"], self.issuer.absoluteString)
                     code = values["code"]
                 }
 
@@ -133,6 +134,7 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
                     let tokens = try self.tokenResponse(from: response.body)
                     XCTAssertEqual(tokens["token_type"], "DPoP")
                     XCTAssertEqual(tokens["scope"], "atproto")
+                    XCTAssertEqual(tokens["sub"], self.did)
                     XCTAssertEqual(tokens["access_token"]?.utf8.count, 43)
                     refreshToken = tokens["refresh_token"]
                 }

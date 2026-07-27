@@ -2,6 +2,18 @@ import Crypto
 import Foundation
 import SwanCore
 import SwanStorage
+
+/// Raw values live only long enough to build one remote token response.  In
+/// particular, refresh material is optional so an authorization-code client
+/// which did not request/declare refresh capability never receives—or leaves
+/// behind—a refresh bearer credential.
+private struct OAuthTokenGrantMaterial: Sendable {
+    let accessToken: String
+    let refreshToken: String?
+    let accessExpiresAt: Date
+    let refreshExpiresAt: Date?
+    let familyID: UUID
+}
 import SwanSpaces
 
 /// The single typed OAuth dependency accepted by a running Swan HTTP server.
@@ -286,6 +298,7 @@ public actor DurableOAuthTokenService {
         verifier: String,
         session: OAuthValidatedSession,
         accessLifetime: TimeInterval = 300,
+        requireActiveSubject: Bool = false,
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
         let binding = session.durableBinding
@@ -318,6 +331,7 @@ public actor DurableOAuthTokenService {
                 codeDigest: codeDigest,
                 binding: binding,
                 issuedTokens: tokenDigests(for: pair),
+                requireActiveSubject: requireActiveSubject,
                 now: now
             )
         } catch {
@@ -365,6 +379,9 @@ public actor DurableOAuthTokenService {
             guard redirectURI.absoluteString == record.binding.redirectURI else {
                 throw OAuthControlStoreError.bindingMismatch
             }
+            guard client.metadata.grantTypes.contains("authorization_code") else {
+                throw OAuthControlStoreError.bindingMismatch
+            }
             let family = OAuthTokenFamily(
                 familyID: record.familyID,
                 subject: record.subject,
@@ -385,24 +402,33 @@ public actor DurableOAuthTokenService {
         }
 
         let refreshLifetime = record.familyExpiresAt.timeIntervalSince(now)
-        let pair: OAuthTokenPair
+        let issueRefresh = record.binding.refreshTokenAllowed
+            && client.metadata.grantTypes.contains("refresh_token")
+        let grant: OAuthTokenGrantMaterial
         do {
-            pair = try makeTokenPair(
+            grant = try makeTokenGrant(
                 familyID: record.familyID,
                 accessLifetime: min(accessLifetime, refreshLifetime),
-                refreshLifetime: refreshLifetime,
+                refreshLifetime: issueRefresh ? refreshLifetime : nil,
                 now: now
             )
             try await controlStore.redeemAuthorizationCode(
                 codeDigest: codeDigest,
                 binding: record.binding,
-                issuedTokens: tokenDigests(for: pair),
+                issuedTokens: tokenDigests(for: grant),
+                requireActiveSubject: true,
                 now: now
             )
         } catch {
             throw secureControlError(error)
         }
-        return OAuthTokenGrantResult(pair: pair, scopes: record.binding.scopes)
+        return OAuthTokenGrantResult(
+            accessToken: grant.accessToken,
+            accessExpiresAt: grant.accessExpiresAt,
+            scopes: record.binding.scopes,
+            subject: record.subject,
+            refreshToken: grant.refreshToken
+        )
     }
 
     public func validateAccess(
@@ -436,6 +462,7 @@ public actor DurableOAuthTokenService {
         clientAssertion: OAuthValidatedClientAssertion?,
         metadataLoader: OAuthClientMetadataLoader,
         accessLifetime: TimeInterval = 300,
+        requireActiveSubject: Bool = false,
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
         let refreshDigest = digest(refreshToken, purpose: .refreshToken)
@@ -475,6 +502,7 @@ public actor DurableOAuthTokenService {
             try await controlStore.redeemRefreshToken(
                 refreshTokenDigest: refreshDigest,
                 replacement: tokenDigests(for: pair),
+                requireActiveSubject: requireActiveSubject,
                 now: now
             )
         } catch {
@@ -510,6 +538,10 @@ public actor DurableOAuthTokenService {
                 authorizationServerIssuer: authorizationServerIssuer,
                 now: now
             )
+            guard family.binding.refreshTokenAllowed,
+                  client.metadata.grantTypes.contains("refresh_token") else {
+                throw OAuthControlStoreError.bindingMismatch
+            }
         } catch {
             throw secureControlError(error)
         }
@@ -519,9 +551,16 @@ public actor DurableOAuthTokenService {
             clientAssertion: clientAssertion,
             metadataLoader: metadataLoader,
             accessLifetime: accessLifetime,
+            requireActiveSubject: true,
             now: now
         )
-        return OAuthTokenGrantResult(pair: pair, scopes: family.binding.scopes)
+        return OAuthTokenGrantResult(
+            accessToken: pair.accessToken,
+            accessExpiresAt: pair.accessExpiresAt,
+            scopes: family.binding.scopes,
+            subject: family.subject,
+            refreshToken: pair.refreshToken
+        )
     }
 
     /// Rotates a token family belonging to the AT Protocol localhost
@@ -534,6 +573,7 @@ public actor DurableOAuthTokenService {
         clientID: URL,
         dpopProof: OAuthValidatedDPoPProof,
         accessLifetime: TimeInterval = 300,
+        requireActiveSubject: Bool = true,
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
         let metadata = try OAuthClientMetadata.localhostDevelopmentMetadata(clientID: clientID)
@@ -572,6 +612,7 @@ public actor DurableOAuthTokenService {
             try await controlStore.redeemRefreshToken(
                 refreshTokenDigest: refreshDigest,
                 replacement: tokenDigests(for: pair),
+                requireActiveSubject: requireActiveSubject,
                 now: now
             )
         } catch {
@@ -789,6 +830,16 @@ public actor DurableOAuthTokenService {
         )
     }
 
+    private func tokenDigests(for grant: OAuthTokenGrantMaterial) -> OAuthIssuedTokenDigests {
+        OAuthIssuedTokenDigests(
+            familyID: grant.familyID,
+            accessTokenDigest: digest(grant.accessToken, purpose: .accessToken),
+            refreshTokenDigest: grant.refreshToken.map { digest($0, purpose: .refreshToken) },
+            accessExpiresAt: grant.accessExpiresAt,
+            refreshExpiresAt: grant.refreshExpiresAt
+        )
+    }
+
     private func makeTokenPair(
         familyID: UUID,
         accessLifetime: TimeInterval,
@@ -804,6 +855,29 @@ public actor DurableOAuthTokenService {
             refreshToken: Self.randomOpaqueValue(),
             accessExpiresAt: now.addingTimeInterval(accessLifetime),
             refreshExpiresAt: now.addingTimeInterval(refreshLifetime),
+            familyID: familyID
+        )
+    }
+
+    private func makeTokenGrant(
+        familyID: UUID,
+        accessLifetime: TimeInterval,
+        refreshLifetime: TimeInterval?,
+        now: Date
+    ) throws -> OAuthTokenGrantMaterial {
+        guard accessLifetime > 0, accessLifetime.isFinite else {
+            throw SwanError.malformed("OAuth access-token lifetime must be positive")
+        }
+        if let refreshLifetime {
+            guard refreshLifetime > 0, refreshLifetime.isFinite else {
+                throw SwanError.malformed("OAuth refresh-token lifetime must be positive")
+            }
+        }
+        return OAuthTokenGrantMaterial(
+            accessToken: Self.randomOpaqueValue(),
+            refreshToken: refreshLifetime == nil ? nil : Self.randomOpaqueValue(),
+            accessExpiresAt: now.addingTimeInterval(accessLifetime),
+            refreshExpiresAt: refreshLifetime.map { now.addingTimeInterval($0) },
             familyID: familyID
         )
     }

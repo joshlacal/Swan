@@ -267,64 +267,40 @@ public struct OAuthRemoteHTTPResponse: Sendable {
 }
 
 public protocol OAuthRemoteTransport: Sendable {
-    func get(url: URL, timeout: TimeInterval, maximumBodyBytes: Int) async throws -> OAuthRemoteHTTPResponse
+    /// `approvedPeers` is the exact, policy-checked result of the DNS lookup
+    /// immediately preceding this request. A production transport must select
+    /// a literal member of this set before any HTTP bytes are sent.
+    func get(
+        url: URL,
+        approvedPeers: Set<OAuthIPAddress>,
+        timeout: TimeInterval,
+        maximumBodyBytes: Int
+    ) async throws -> OAuthRemoteHTTPResponse
 }
 
-/// AsyncHTTPClient adapter configured to disallow redirects and bound each
-/// response body. It preflights and postflights DNS through
-/// `OAuthRemoteDocumentFetcher`, but AHC does not expose the final connected
-/// peer address (and Apple's Network.framework can resolve independently).
-/// Therefore this adapter cannot by itself prove DNS re-resolution safety; a
-/// deployment needing that guarantee must inject a transport that reports and
-/// enforces `connectedPeerAddress` before sending HTTP bytes.
+/// Legacy compatibility type. It is deliberately disabled: AsyncHTTPClient
+/// cannot report the actual connected peer, so it cannot meet the metadata
+/// fetcher's DNS-rebinding proof. Production server setup uses
+/// `NIOPeerPinnedOAuthDocumentTransport`, which connects a policy-approved
+/// literal IP and reports that peer.
 public final class AsyncHTTPClientOAuthTransport: OAuthRemoteTransport {
-    private let client: HTTPClient
-    private let maximumTransportTimeout: TimeInterval
-
     public init(maximumTransportTimeout: TimeInterval = 5) throws {
         guard maximumTransportTimeout > 0, maximumTransportTimeout <= 30, maximumTransportTimeout.isFinite else {
             throw SwanError.malformed("OAuth transport timeout is invalid")
         }
-        self.maximumTransportTimeout = maximumTransportTimeout
-        let timeout = HTTPClient.Configuration.Timeout(
-            connect: .milliseconds(Int64(maximumTransportTimeout * 1_000)),
-            read: .milliseconds(Int64(maximumTransportTimeout * 1_000))
+        throw SwanError.unavailable(
+            "AsyncHTTPClient cannot prove an OAuth metadata peer; use NIOPeerPinnedOAuthDocumentTransport"
         )
-        client = HTTPClient(configuration: .init(
-            redirectConfiguration: .disallow,
-            timeout: timeout,
-            decompression: .disabled
-        ))
     }
 
-    deinit {
-        client.shutdown { _ in }
-    }
-
-    public func get(url: URL, timeout: TimeInterval, maximumBodyBytes: Int) async throws -> OAuthRemoteHTTPResponse {
-        guard timeout <= maximumTransportTimeout else {
-            throw SwanError.unavailable("OAuth fetch timeout exceeds transport policy")
-        }
-        var request = HTTPClientRequest(url: url.absoluteString)
-        request.method = .GET
-        request.headers.add(name: "accept", value: "application/json")
-        let response = try await client.execute(
-            request,
-            timeout: .milliseconds(Int64(timeout * 1_000))
-        )
-        let buffer = try await response.body.collect(upTo: maximumBodyBytes)
-        let bytes = buffer.getBytes(at: buffer.readerIndex, length: buffer.readableBytes) ?? []
-        var headers: [String: [String]] = [:]
-        for header in response.headers {
-            headers[header.name.lowercased(), default: []].append(header.value)
-        }
-        return OAuthRemoteHTTPResponse(
-            status: Int(response.status.code),
-            headers: headers,
-            body: Data(bytes),
-            responseURL: response.url ?? url,
-            redirectCount: max(0, response.history.count - 1),
-            connectedPeerAddress: nil
+    public func get(
+        url _: URL,
+        approvedPeers _: Set<OAuthIPAddress>,
+        timeout _: TimeInterval,
+        maximumBodyBytes _: Int
+    ) async throws -> OAuthRemoteHTTPResponse {
+        throw SwanError.unavailable(
+            "AsyncHTTPClient cannot prove an OAuth metadata peer; use NIOPeerPinnedOAuthDocumentTransport"
         )
     }
 }
@@ -349,11 +325,13 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
 
     public func fetchJSON(from url: URL) async throws -> Data {
         let host = try policy.validateURL(url)
-        try policy.validateResolved(try await resolver.resolve(host: host), host: host)
+        let preflightPeers = Set(try await resolver.resolve(host: host))
+        try policy.validateResolved(Array(preflightPeers), host: host)
         let response: OAuthRemoteHTTPResponse
         do {
             response = try await transport.get(
                 url: url,
+                approvedPeers: preflightPeers,
                 timeout: policy.timeout,
                 maximumBodyBytes: policy.maximumBodyBytes
             )
@@ -362,19 +340,21 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         } catch {
             throw SwanError.unavailable("OAuth remote fetch failed")
         }
-        // Resolve again after the request. This catches an answer which changed
-        // during the operation; it is not a substitute for a peer-reporting
-        // hardened connector (see AsyncHTTPClientOAuthTransport's doc comment).
-        try policy.validateResolved(try await resolver.resolve(host: host), host: host)
+        // Resolve again after the request, then require the observed socket
+        // peer to be in *both* answer sets. A transport without a peer proof
+        // is not a valid remote-document transport.
+        let postflightPeers = Set(try await resolver.resolve(host: host))
+        try policy.validateResolved(Array(postflightPeers), host: host)
         guard response.redirectCount == 0,
               response.responseURL.absoluteString == url.absoluteString,
               response.status == 200 else {
             throw SwanError.unauthorized("OAuth remote document did not return exact HTTP 200")
         }
-        if let peer = response.connectedPeerAddress {
-            guard policy.permits(peer, forHost: host) else {
-                throw SwanError.unauthorized("OAuth remote peer address is forbidden")
-            }
+        guard let peer = response.connectedPeerAddress,
+              preflightPeers.contains(peer),
+              postflightPeers.contains(peer),
+              policy.permits(peer, forHost: host) else {
+            throw SwanError.unauthorized("OAuth remote peer was not in both approved DNS answer sets")
         }
         let headers = response.headers.reduce(into: [String: [String]]()) { output, item in
             output[item.key.lowercased(), default: []].append(contentsOf: item.value)

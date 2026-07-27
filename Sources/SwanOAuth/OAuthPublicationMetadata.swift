@@ -43,7 +43,11 @@ public struct OAuthAuthorizationServerMetadata: Codable, Sendable, Equatable {
     public let grantTypesSupported: [String]
     public let codeChallengeMethodsSupported: [String]
     public let tokenEndpointAuthMethodsSupported: [String]
+    public let tokenEndpointAuthSigningAlgValuesSupported: [String]
     public let dpopSigningAlgValuesSupported: [String]
+    public let authorizationResponseIssuerParameterSupported: Bool
+    public let requirePushedAuthorizationRequests: Bool
+    public let clientIDMetadataDocumentSupported: Bool
 
     public init(issuer: URL) throws {
         self.issuer = try OAuthPublishedURL.validate(issuer, role: "issuer")
@@ -55,7 +59,11 @@ public struct OAuthAuthorizationServerMetadata: Codable, Sendable, Equatable {
         grantTypesSupported = ["authorization_code", "refresh_token"]
         codeChallengeMethodsSupported = ["S256"]
         tokenEndpointAuthMethodsSupported = ["none", "private_key_jwt"]
+        tokenEndpointAuthSigningAlgValuesSupported = ["ES256"]
         dpopSigningAlgValuesSupported = ["ES256"]
+        authorizationResponseIssuerParameterSupported = true
+        requirePushedAuthorizationRequests = true
+        clientIDMetadataDocumentSupported = true
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -68,7 +76,11 @@ public struct OAuthAuthorizationServerMetadata: Codable, Sendable, Equatable {
         case grantTypesSupported = "grant_types_supported"
         case codeChallengeMethodsSupported = "code_challenge_methods_supported"
         case tokenEndpointAuthMethodsSupported = "token_endpoint_auth_methods_supported"
+        case tokenEndpointAuthSigningAlgValuesSupported = "token_endpoint_auth_signing_alg_values_supported"
         case dpopSigningAlgValuesSupported = "dpop_signing_alg_values_supported"
+        case authorizationResponseIssuerParameterSupported = "authorization_response_iss_parameter_supported"
+        case requirePushedAuthorizationRequests = "require_pushed_authorization_requests"
+        case clientIDMetadataDocumentSupported = "client_id_metadata_document_supported"
     }
 }
 

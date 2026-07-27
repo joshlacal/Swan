@@ -62,6 +62,7 @@ public enum SQLiteLayout {
             client_assertion_key_id TEXT,
             client_assertion_algorithm TEXT,
             client_assertion_jkt TEXT,
+            refresh_token_allowed INTEGER NOT NULL DEFAULT 1 CHECK(refresh_token_allowed IN (0, 1)),
             expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
             revoked_at INTEGER CHECK(revoked_at >= 0)
         )
@@ -77,6 +78,7 @@ public enum SQLiteLayout {
             client_assertion_key_id TEXT,
             client_assertion_algorithm TEXT,
             client_assertion_jkt TEXT,
+            refresh_token_allowed INTEGER NOT NULL DEFAULT 1 CHECK(refresh_token_allowed IN (0, 1)),
             state TEXT NOT NULL,
             state_digest BLOB NOT NULL CHECK(length(state_digest) = 32),
             code_challenge_method TEXT NOT NULL CHECK(code_challenge_method = 'S256'),

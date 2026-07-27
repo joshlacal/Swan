@@ -434,7 +434,7 @@ extension SwanCommand {
                         )
                         let fetcher = OAuthRemoteDocumentFetcher(
                             policy: fetchPolicy,
-                            transport: try AsyncHTTPClientOAuthTransport(
+                            transport: try NIOPeerPinnedOAuthDocumentTransport(
                                 maximumTransportTimeout: fetchPolicy.timeout
                             )
                         )

@@ -99,9 +99,10 @@ private struct OAuthServerPARSuccess: Encodable {
 
 private struct OAuthServerTokenSuccess: Encodable {
   let accessToken: String
-  let refreshToken: String
+  let refreshToken: String?
   let expiresIn: Int
   let scope: String
+  let subject: String
   let tokenType = "DPoP"
 
   enum CodingKeys: String, CodingKey {
@@ -109,6 +110,7 @@ private struct OAuthServerTokenSuccess: Encodable {
     case refreshToken = "refresh_token"
     case expiresIn = "expires_in"
     case scope
+    case subject = "sub"
     case tokenType = "token_type"
   }
 }
@@ -331,12 +333,18 @@ private func consentOAuthServerAuthorization(
       )
       destination = try oauthServerAuthorizationRedirect(
         base: consumed.binding.redirectURI,
-        parameters: [("code", code), ("state", consumed.state)]
+        parameters: [
+          ("code", code), ("state", consumed.state),
+          ("iss", configuration.issuer.absoluteString),
+        ]
       )
     case .deny:
       destination = try oauthServerAuthorizationRedirect(
         base: consumed.binding.redirectURI,
-        parameters: [("error", "access_denied"), ("state", consumed.state)]
+        parameters: [
+          ("error", "access_denied"), ("state", consumed.state),
+          ("iss", configuration.issuer.absoluteString),
+        ]
       )
     }
     return oauthServerRedirect(destination, clearCookie: true)
@@ -425,14 +433,15 @@ private func exchangeOAuthServerToken(
         metadataLoader: configuration.clientMetadataLoader
       )
     }
-    let expires = max(0, Int(issued.pair.accessExpiresAt.timeIntervalSinceNow.rounded(.down)))
+    let expires = max(0, Int(issued.accessExpiresAt.timeIntervalSinceNow.rounded(.down)))
     return oauthServerTokenJSON(
       .ok,
       OAuthServerTokenSuccess(
-        accessToken: issued.pair.accessToken,
-        refreshToken: issued.pair.refreshToken,
+        accessToken: issued.accessToken,
+        refreshToken: issued.refreshToken,
         expiresIn: expires,
-        scope: issued.scopes.sorted().joined(separator: " ")
+        scope: issued.scopes.sorted().joined(separator: " "),
+        subject: issued.subject
       )
     )
   } catch let error as SwanError {

@@ -203,6 +203,10 @@ public struct OAuthClientBinding: Sendable, Equatable {
     /// It is intentionally absent for public clients; an identifier-only
     /// confidential-client binding is not representable.
     public let confidentialClientKey: OAuthConfidentialClientKeyBinding?
+    /// This is frozen from client metadata at PAR. A later metadata expansion
+    /// cannot turn a code originally authorized without refresh permission
+    /// into a refresh-token grant.
+    public let refreshTokenAllowed: Bool
 
     public init(
         issuer: String,
@@ -210,7 +214,8 @@ public struct OAuthClientBinding: Sendable, Equatable {
         redirectURI: String,
         scopes: Set<String>,
         dpopJKT: String? = nil,
-        confidentialClientKey: OAuthConfidentialClientKeyBinding? = nil
+        confidentialClientKey: OAuthConfidentialClientKeyBinding? = nil,
+        refreshTokenAllowed: Bool = true
     ) {
         self.issuer = issuer
         self.clientID = clientID
@@ -218,6 +223,7 @@ public struct OAuthClientBinding: Sendable, Equatable {
         self.scopes = scopes
         self.dpopJKT = dpopJKT
         self.confidentialClientKey = confidentialClientKey
+        self.refreshTokenAllowed = refreshTokenAllowed
     }
 }
 
@@ -343,16 +349,20 @@ public struct OAuthTokenFamily: Sendable, Equatable {
 public struct OAuthIssuedTokenDigests: Sendable, Equatable {
     public let familyID: UUID
     public let accessTokenDigest: Data
-    public let refreshTokenDigest: Data
+    /// A code issued to a client which did not declare `refresh_token` has no
+    /// refresh credential at all.  Keeping this optional is materially
+    /// different from minting an undisclosed refresh token: no durable bearer
+    /// capability then exists to be discovered or accidentally enabled later.
+    public let refreshTokenDigest: Data?
     public let accessExpiresAt: Date
-    public let refreshExpiresAt: Date
+    public let refreshExpiresAt: Date?
 
     public init(
         familyID: UUID,
         accessTokenDigest: Data,
-        refreshTokenDigest: Data,
+        refreshTokenDigest: Data? = nil,
         accessExpiresAt: Date,
-        refreshExpiresAt: Date
+        refreshExpiresAt: Date? = nil
     ) {
         self.familyID = familyID
         self.accessTokenDigest = accessTokenDigest
@@ -400,6 +410,7 @@ public protocol OAuthControlStore: Sendable {
         codeDigest: Data,
         binding: OAuthClientBinding,
         issuedTokens: OAuthIssuedTokenDigests,
+        requireActiveSubject: Bool,
         now: Date
     ) async throws
 
@@ -421,6 +432,7 @@ public protocol OAuthControlStore: Sendable {
     func redeemRefreshToken(
         refreshTokenDigest: Data,
         replacement: OAuthIssuedTokenDigests,
+        requireActiveSubject: Bool,
         now: Date
     ) async throws
     /// Revokes the complete family identified by a refresh-token digest. The

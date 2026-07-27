@@ -168,10 +168,10 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                     INSERT INTO oauth_control_par_requests(
                         request_digest, issuer, client_id, redirect_uri, scopes,
                         dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
-                        client_assertion_jkt, state, state_digest,
+                        client_assertion_jkt, refresh_token_allowed, state, state_digest,
                         code_challenge_method, code_challenge_s256,
                         expires_at, consumed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                     """,
                     [
                         blob(request.requestDigest), .text(request.binding.issuer),
@@ -180,6 +180,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                         optionalText(request.binding.confidentialClientKey?.keyID),
                         optionalText(request.binding.confidentialClientKey?.algorithm),
                         optionalText(request.binding.confidentialClientKey?.keyThumbprint),
+                        .integer(request.binding.refreshTokenAllowed ? 1 : 0),
                         .text(request.state), blob(request.stateDigest),
                         .text(request.codeChallengeMethod.rawValue),
                         .text(request.codeChallengeS256),
@@ -216,7 +217,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                     """
                     SELECT issuer, client_id, redirect_uri, scopes, dpop_jkt,
                            client_assertion_key_id, client_assertion_algorithm,
-                           client_assertion_jkt, state, state_digest,
+                           client_assertion_jkt, refresh_token_allowed, state, state_digest,
                            code_challenge_method, code_challenge_s256,
                            expires_at, consumed_at
                     FROM oauth_control_par_requests
@@ -258,7 +259,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                     """
                     SELECT issuer, client_id, redirect_uri, scopes, dpop_jkt,
                            client_assertion_key_id, client_assertion_algorithm,
-                           client_assertion_jkt, state, state_digest,
+                           client_assertion_jkt, refresh_token_allowed, state, state_digest,
                            code_challenge_method, code_challenge_s256,
                            expires_at, consumed_at
                     FROM oauth_control_par_requests
@@ -343,6 +344,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         codeDigest: Data,
         binding: OAuthClientBinding,
         issuedTokens: OAuthIssuedTokenDigests,
+        requireActiveSubject: Bool,
         now: Date = Date()
     ) async throws {
         try validateDigest(codeDigest)
@@ -374,6 +376,9 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 guard family.subject == code.subject, family.binding == code.binding,
                       family.revokedAt == nil, family.expiresAt > now else {
                     throw OAuthControlStoreError.malformedRecord
+                }
+                if requireActiveSubject {
+                    try await requireActiveAccount(family.subject)
                 }
                 try validate(tokens: issuedTokens, for: family, now: now)
                 _ = try await connection.query(
@@ -425,7 +430,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                     SELECT f.family_id, f.subject, f.issuer, f.client_id,
                            f.redirect_uri, f.scopes, f.dpop_jkt,
                            f.client_assertion_key_id, f.client_assertion_algorithm,
-                           f.client_assertion_jkt, f.expires_at, f.revoked_at,
+                           f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at, f.revoked_at,
                            a.expires_at AS token_expires_at
                     FROM oauth_control_access_tokens a
                     JOIN oauth_control_token_families f ON f.family_id = a.family_id
@@ -492,7 +497,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                     SELECT f.family_id, f.subject, f.issuer, f.client_id,
                            f.redirect_uri, f.scopes, f.dpop_jkt,
                            f.client_assertion_key_id, f.client_assertion_algorithm,
-                           f.client_assertion_jkt, f.expires_at, f.revoked_at,
+                           f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at, f.revoked_at,
                            t.expires_at AS token_expires_at
                     FROM \(table) t
                     JOIN oauth_control_token_families f ON f.family_id = t.family_id
@@ -514,6 +519,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
     public func redeemRefreshToken(
         refreshTokenDigest: Data,
         replacement: OAuthIssuedTokenDigests,
+        requireActiveSubject: Bool,
         now: Date = Date()
     ) async throws {
         try validateDigest(refreshTokenDigest)
@@ -529,6 +535,9 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 }
                 guard replacement.familyID == family.familyID else {
                     throw OAuthControlStoreError.invalidInput
+                }
+                if requireActiveSubject {
+                    try await requireActiveAccount(family.subject)
                 }
                 if row.column("used_at")?.isNull == false {
                     try await revokeFamily(family.familyID, now: now)
@@ -720,6 +729,16 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 column: "client_assertion_jkt",
                 definition: "TEXT"
             )
+            try await addColumnIfMissing(
+                table: "oauth_control_token_families",
+                column: "refresh_token_allowed",
+                definition: "INTEGER NOT NULL DEFAULT 1 CHECK(refresh_token_allowed IN (0, 1))"
+            )
+            try await addColumnIfMissing(
+                table: "oauth_control_par_requests",
+                column: "refresh_token_allowed",
+                definition: "INTEGER NOT NULL DEFAULT 1 CHECK(refresh_token_allowed IN (0, 1))"
+            )
             try await migrateAccountControlSchema()
         }
     }
@@ -887,8 +906,8 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
             INSERT INTO oauth_control_token_families(
                 family_id, subject, issuer, client_id, redirect_uri, scopes,
                 dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
-                client_assertion_jkt, expires_at, revoked_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                client_assertion_jkt, refresh_token_allowed, expires_at, revoked_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 .text(family.familyID.uuidString), .text(family.subject),
@@ -898,6 +917,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 optionalText(family.binding.confidentialClientKey?.keyID),
                 optionalText(family.binding.confidentialClientKey?.algorithm),
                 optionalText(family.binding.confidentialClientKey?.keyThumbprint),
+                .integer(family.binding.refreshTokenAllowed ? 1 : 0),
                 .integer(try timestamp(family.expiresAt)),
                 family.revokedAt.map { try? timestamp($0) }.flatMap { $0 }.map(SQLiteData.integer) ?? .null,
             ]
@@ -915,16 +935,19 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 .integer(try timestamp(tokens.accessExpiresAt)),
             ]
         )
-        _ = try await connection.query(
-            """
-            INSERT INTO oauth_control_refresh_tokens(token_digest, family_id, expires_at, used_at)
-            VALUES (?, ?, ?, NULL)
-            """,
-            [
-                blob(tokens.refreshTokenDigest), .text(tokens.familyID.uuidString),
-                .integer(try timestamp(tokens.refreshExpiresAt)),
-            ]
-        )
+        if let refreshTokenDigest = tokens.refreshTokenDigest,
+           let refreshExpiresAt = tokens.refreshExpiresAt {
+            _ = try await connection.query(
+                """
+                INSERT INTO oauth_control_refresh_tokens(token_digest, family_id, expires_at, used_at)
+                VALUES (?, ?, ?, NULL)
+                """,
+                [
+                    blob(refreshTokenDigest), .text(tokens.familyID.uuidString),
+                    .integer(try timestamp(refreshExpiresAt)),
+                ]
+            )
+        }
     }
 
     private func revokeFamily(_ familyID: UUID, now: Date) async throws {
@@ -938,12 +961,23 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         )
     }
 
+    /// Account lifecycle is authority state, not a cache hint.  This helper
+    /// is invoked inside the same `BEGIN IMMEDIATE` transaction that consumes
+    /// a code or rotates a refresh token, closing the consent-to-token race.
+    private func requireActiveAccount(_ did: String) async throws {
+        let rows = try await connection.query(
+            "SELECT 1 FROM accounts WHERE did = ? AND status = 'active'",
+            [.text(did)]
+        )
+        guard !rows.isEmpty else { throw OAuthControlStoreError.bindingMismatch }
+    }
+
     private func loadFamily(_ familyID: UUID) async throws -> OAuthTokenFamily {
         let rows = try await connection.query(
             """
             SELECT family_id, subject, issuer, client_id, redirect_uri, scopes,
                    dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
-                   client_assertion_jkt, expires_at, revoked_at
+                   client_assertion_jkt, refresh_token_allowed, expires_at, revoked_at
             FROM oauth_control_token_families
             WHERE family_id = ?
             """,
@@ -959,7 +993,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                c.reuse_expires_at, c.consumed_at,
                f.subject, f.issuer, f.client_id, f.redirect_uri, f.scopes,
                f.dpop_jkt, f.client_assertion_key_id, f.client_assertion_algorithm,
-               f.client_assertion_jkt, f.expires_at AS family_expires_at,
+               f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at AS family_expires_at,
                f.revoked_at
         FROM oauth_control_authorization_codes c
         JOIN oauth_control_token_families f ON f.family_id = c.family_id
@@ -971,7 +1005,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         """
         SELECT f.family_id, f.subject, f.issuer, f.client_id, f.redirect_uri,
                f.scopes, f.dpop_jkt, f.client_assertion_key_id,
-               f.client_assertion_algorithm, f.client_assertion_jkt, f.expires_at,
+               f.client_assertion_algorithm, f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at,
                f.revoked_at, r.expires_at AS token_expires_at, r.used_at
         FROM oauth_control_refresh_tokens r
         JOIN oauth_control_token_families f ON f.family_id = r.family_id
@@ -1072,7 +1106,8 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
             redirectURI: try requiredText(row, "redirect_uri"),
             scopes: try decodeScopes(try requiredBlob(row, "scopes")),
             dpopJKT: try optionalText(row, "dpop_jkt"),
-            confidentialClientKey: confidentialClientKey
+            confidentialClientKey: confidentialClientKey,
+            refreshTokenAllowed: try requiredBoolean(row, "refresh_token_allowed")
         )
         do {
             try validate(binding: binding)
@@ -1139,11 +1174,21 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         now: Date
     ) throws {
         try validateDigest(tokens.accessTokenDigest)
-        try validateDigest(tokens.refreshTokenDigest)
-        guard tokens.accessTokenDigest != tokens.refreshTokenDigest,
-              tokens.accessExpiresAt > now, tokens.refreshExpiresAt > now,
-              tokens.accessExpiresAt <= family.expiresAt,
-              tokens.refreshExpiresAt <= family.expiresAt else {
+        guard tokens.accessExpiresAt > now,
+              tokens.accessExpiresAt <= family.expiresAt else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        switch (tokens.refreshTokenDigest, tokens.refreshExpiresAt) {
+        case (nil, nil):
+            return
+        case let (.some(refreshTokenDigest), .some(refreshExpiresAt)):
+            try validateDigest(refreshTokenDigest)
+            guard tokens.accessTokenDigest != refreshTokenDigest,
+                  refreshExpiresAt > now,
+                  refreshExpiresAt <= family.expiresAt else {
+                throw OAuthControlStoreError.invalidInput
+            }
+        case (.some, nil), (nil, .some):
             throw OAuthControlStoreError.invalidInput
         }
     }
@@ -1211,6 +1256,13 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         let seconds = Double(value) / Self.microsecondsPerSecond
         guard seconds.isFinite else { throw OAuthControlStoreError.malformedRecord }
         return Date(timeIntervalSince1970: seconds)
+    }
+
+    private func requiredBoolean(_ row: SQLiteRow, _ column: String) throws -> Bool {
+        guard case let .integer(value) = row.column(column), value == 0 || value == 1 else {
+            throw OAuthControlStoreError.malformedRecord
+        }
+        return value == 1
     }
 
     private func optionalDate(_ row: SQLiteRow, _ column: String) throws -> Date? {

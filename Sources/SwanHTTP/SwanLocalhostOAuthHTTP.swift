@@ -70,6 +70,7 @@ private struct LocalhostTokenSuccess: Encodable {
     let tokenType = "DPoP"
     let expiresIn: Int
     let scope = "atproto"
+    let subject: String
 
     enum CodingKeys: String, CodingKey {
         case accessToken = "access_token"
@@ -77,6 +78,7 @@ private struct LocalhostTokenSuccess: Encodable {
         case tokenType = "token_type"
         case expiresIn = "expires_in"
         case scope
+        case subject = "sub"
     }
 }
 
@@ -236,12 +238,18 @@ private func consentLocalhostAuthorization(
             )
             destination = try authorizationRedirect(
                 base: consumed.binding.redirectURI,
-                parameters: [("code", code), ("state", consumed.state)]
+                parameters: [
+                    ("code", code), ("state", consumed.state),
+                    ("iss", configuration.issuer.absoluteString),
+                ]
             )
         case .deny:
             destination = try authorizationRedirect(
                 base: consumed.binding.redirectURI,
-                parameters: [("error", "access_denied"), ("state", consumed.state)]
+                parameters: [
+                    ("error", "access_denied"), ("state", consumed.state),
+                    ("iss", configuration.issuer.absoluteString),
+                ]
             )
         }
         return localhostRedirect(destination, clearCookie: true)
@@ -309,7 +317,8 @@ private func exchangeLocalhostToken(
             pair = try await runtime.tokenService.redeemAuthorizationCode(
                 code,
                 verifier: verifier,
-                session: session
+                session: session,
+                requireActiveSubject: true
             )
         case .refreshToken:
             guard let refreshToken = form.refreshToken else { return localhostTokenError(.badRequest) }
@@ -319,13 +328,18 @@ private func exchangeLocalhostToken(
                 dpopProof: dpopProof
             )
         }
+        let grant = try await runtime.tokenService.validateAccess(
+            pair.accessToken,
+            proof: dpopProof
+        )
         let expiresIn = max(0, Int(pair.accessExpiresAt.timeIntervalSinceNow.rounded(.down)))
         return localhostTokenJSON(
             .ok,
             LocalhostTokenSuccess(
                 accessToken: pair.accessToken,
                 refreshToken: pair.refreshToken,
-                expiresIn: expiresIn
+                expiresIn: expiresIn,
+                subject: grant.subject
             )
         )
     } catch let error as SwanError {

@@ -121,12 +121,27 @@ public struct OAuthTokenPair: Sendable, Equatable {
 /// authorization binding. The HTTP layer never reconstructs scope from a
 /// current client document or form input.
 public struct OAuthTokenGrantResult: Sendable, Equatable {
-    public let pair: OAuthTokenPair
+    public let accessToken: String
+    public let accessExpiresAt: Date
     public let scopes: Set<String>
+    public let subject: String
+    /// Omitted when the metadata that authorized this code did not declare
+    /// the `refresh_token` grant. The durable token pair is intentionally not
+    /// itself an HTTP response model.
+    public let refreshToken: String?
 
-    public init(pair: OAuthTokenPair, scopes: Set<String>) {
-        self.pair = pair
+    public init(
+        accessToken: String,
+        accessExpiresAt: Date,
+        scopes: Set<String>,
+        subject: String,
+        refreshToken: String?
+    ) {
+        self.accessToken = accessToken
+        self.accessExpiresAt = accessExpiresAt
         self.scopes = scopes
+        self.subject = subject
+        self.refreshToken = refreshToken
     }
 }
 

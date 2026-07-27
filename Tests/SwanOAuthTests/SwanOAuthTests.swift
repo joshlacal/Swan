@@ -338,6 +338,91 @@ final class SwanOAuthTests: XCTestCase {
         try await secondDatabase.close()
     }
 
+    func testRemoteTokenRedemptionChecksDurableLifecycleAndRefreshGrant() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        let registration = try AccountControlRegistration(
+            did: did,
+            canonicalHandle: "alice.swan.test",
+            passwordVerifier: "$argon2id$v=19$test-verifier",
+            signingKey: try AccountControlKeyReference(purpose: .signing, generation: 1),
+            rotationKey: try AccountControlKeyReference(purpose: .rotation, generation: 1),
+            createdAt: now
+        )
+        _ = try await database.createAccount(registration)
+        let service = try DurableOAuthTokenService(
+            controlStore: database, serverKey: Data(repeating: 0xD4, count: 32))
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+        let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+
+        let noRefreshMetadata = try OAuthClientMetadata(
+            clientID: URL(string: "https://client.example/metadata")!,
+            redirectURIs: [URL(string: "https://client.example/callback")!],
+            grantTypes: ["authorization_code"], responseTypes: ["code"], scopes: ["atproto"],
+            dpopBoundAccessTokens: true
+        )
+        let noRefreshSession = try OAuthValidatedSession(
+            issuer: "https://swan.example",
+            client: OAuthResolvedClientMetadata(metadata: noRefreshMetadata, keySet: nil),
+            redirectURI: URL(string: "https://client.example/callback")!, scopes: ["atproto"],
+            dpopProof: OAuthValidatedDPoPProof(
+                keyThumbprint: testDPoPJKT("L"), jwtID: "lifecycle-code", issuedAt: now),
+            now: now
+        )
+        let code = try await service.issueAuthorizationCode(
+            subject: did, session: noRefreshSession, codeChallengeS256: challenge, now: now)
+        _ = try await database.transitionStatus(
+            did: did, to: .deactivated, declaration: .init(), now: now)
+        await XCTAssertThrowsErrorAsync(
+            try await service.redeemAuthorizationCodeForClient(
+                code, verifier: verifier,
+                redirectURI: URL(string: "https://client.example/callback")!,
+                authorizationServerIssuer: "https://swan.example",
+                client: OAuthResolvedClientMetadata(metadata: noRefreshMetadata, keySet: nil),
+                dpopProof: noRefreshSession.dpopProof, clientAssertion: nil, now: now
+            )
+        )
+
+        // A failed active-status check leaves the code usable after an
+        // operator reactivates the account, but it still cannot mint a
+        // refresh capability that the metadata never declared.
+        _ = try await database.transitionStatus(
+            did: did, to: .active, declaration: .init(), now: now)
+        let noRefreshGrant = try await service.redeemAuthorizationCodeForClient(
+            code, verifier: verifier, redirectURI: URL(string: "https://client.example/callback")!,
+            authorizationServerIssuer: "https://swan.example",
+            client: OAuthResolvedClientMetadata(metadata: noRefreshMetadata, keySet: nil),
+            dpopProof: noRefreshSession.dpopProof, clientAssertion: nil, now: now
+        )
+        XCTAssertNil(noRefreshGrant.refreshToken)
+        _ = try await service.validateAccess(noRefreshGrant.accessToken, proof: noRefreshSession.dpopProof, now: now)
+
+        let refreshSession = try publicOAuthSession(dpopJKT: testDPoPJKT("M"), now: now)
+        let refreshCode = try await service.issueAuthorizationCode(
+            subject: did, session: refreshSession, codeChallengeS256: challenge, now: now)
+        let refreshMetadata = refreshSession.client.metadata
+        let refreshGrant = try await service.redeemAuthorizationCodeForClient(
+            refreshCode, verifier: verifier,
+            redirectURI: URL(string: "https://client.example/callback")!,
+            authorizationServerIssuer: "https://swan.example", client: refreshSession.client,
+            dpopProof: refreshSession.dpopProof, clientAssertion: nil, now: now
+        )
+        let refreshToken = try XCTUnwrap(refreshGrant.refreshToken)
+        _ = try await database.transitionStatus(
+            did: did, to: .deactivated, declaration: .init(), now: now)
+        await XCTAssertThrowsErrorAsync(
+            try await service.redeemRefreshForClient(
+                refreshToken, client: OAuthResolvedClientMetadata(metadata: refreshMetadata, keySet: nil),
+                authorizationServerIssuer: "https://swan.example", dpopProof: refreshSession.dpopProof,
+                clientAssertion: nil, metadataLoader: try testMetadataLoader(database: database), now: now
+            )
+        )
+        try await database.close()
+    }
+
     func testDurablePARAndCodePreserveBindingStateAndSingleUse() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -726,7 +811,8 @@ final class SwanOAuthTests: XCTestCase {
             status: 200,
             headers: ["Content-Type": ["application/json; charset=utf-8"]],
             body: body,
-            responseURL: url
+            responseURL: url,
+            connectedPeerAddress: publicAddress
         )])
         let fetcher = OAuthRemoteDocumentFetcher(policy: policy, resolver: safeResolver, transport: safeTransport)
         let fetched = try await fetcher.fetchJSON(from: url)
@@ -743,7 +829,8 @@ final class SwanOAuthTests: XCTestCase {
             status: 200,
             headers: ["content-type": ["application/json"]],
             body: body,
-            responseURL: url
+            responseURL: url,
+            connectedPeerAddress: publicAddress
         )])
         let rebindingFetcher = OAuthRemoteDocumentFetcher(
             policy: policy, resolver: rebindingResolver, transport: rebindingTransport
@@ -765,6 +852,18 @@ final class SwanOAuthTests: XCTestCase {
             let badFetcher = OAuthRemoteDocumentFetcher(policy: policy, resolver: resolver, transport: transport)
             await XCTAssertThrowsErrorAsync(try await badFetcher.fetchJSON(from: url))
         }
+        let nilPeerFetcher = OAuthRemoteDocumentFetcher(
+            policy: policy,
+            resolver: TestResolver(answers: [[publicAddress], [publicAddress]]),
+            transport: TestTransport(
+                responses: [url.absoluteString: .init(
+                    status: 200, headers: ["content-type": ["application/json"]],
+                    body: body, responseURL: url
+                )],
+                reportsConnectedPeer: false
+            )
+        )
+        await XCTAssertThrowsErrorAsync(try await nilPeerFetcher.fetchJSON(from: url))
     }
 
     func testMetadataLoaderValidatesJWKSAndUsesDurableCache() async throws {
@@ -792,8 +891,8 @@ final class SwanOAuthTests: XCTestCase {
         let publicAddress = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
         let resolver = TestResolver(answers: [[publicAddress], [publicAddress], [publicAddress], [publicAddress]])
         let transport = TestTransport(responses: [
-            clientID.absoluteString: .init(status: 200, headers: ["content-type": ["application/json"]], body: metadataBody, responseURL: clientID),
-            jwksURI.absoluteString: .init(status: 200, headers: ["content-type": ["application/json"]], body: jwksBody, responseURL: jwksURI),
+            clientID.absoluteString: .init(status: 200, headers: ["content-type": ["application/json"]], body: metadataBody, responseURL: clientID, connectedPeerAddress: publicAddress),
+            jwksURI.absoluteString: .init(status: 200, headers: ["content-type": ["application/json"]], body: jwksBody, responseURL: jwksURI, connectedPeerAddress: publicAddress),
         ])
         let fetcher = OAuthRemoteDocumentFetcher(
             policy: try OAuthRemoteFetchPolicy(), resolver: resolver, transport: transport
@@ -1166,16 +1265,35 @@ private actor TestTransport: OAuthRemoteTransport {
     private let responses: [String: OAuthRemoteHTTPResponse]
     private var requests = 0
 
-    init(responses: [String: OAuthRemoteHTTPResponse]) {
+    private let reportsConnectedPeer: Bool
+
+    init(
+        responses: [String: OAuthRemoteHTTPResponse],
+        reportsConnectedPeer: Bool = true
+    ) {
         self.responses = responses
+        self.reportsConnectedPeer = reportsConnectedPeer
     }
 
-    func get(url: URL, timeout _: TimeInterval, maximumBodyBytes _: Int) async throws -> OAuthRemoteHTTPResponse {
+    func get(
+        url: URL,
+        approvedPeers: Set<OAuthIPAddress>,
+        timeout _: TimeInterval,
+        maximumBodyBytes _: Int
+    ) async throws -> OAuthRemoteHTTPResponse {
         requests += 1
         guard let response = responses[url.absoluteString] else {
             throw SwanError.unavailable("test transport has no response")
         }
-        return response
+        guard reportsConnectedPeer, response.connectedPeerAddress == nil,
+              let peer = approvedPeers.sorted(by: { $0.description < $1.description }).first else {
+            return response
+        }
+        return .init(
+            status: response.status, headers: response.headers, body: response.body,
+            responseURL: response.responseURL, redirectCount: response.redirectCount,
+            connectedPeerAddress: peer
+        )
     }
 
     func requestCount() -> Int { requests }

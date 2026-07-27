@@ -70,7 +70,8 @@ public struct OAuthValidatedSession: Sendable, Equatable {
                     algorithm: $0.algorithm,
                     keyThumbprint: $0.keyThumbprint
                 )
-            }
+            },
+            refreshTokenAllowed: client.metadata.grantTypes.contains("refresh_token")
         )
     }
 

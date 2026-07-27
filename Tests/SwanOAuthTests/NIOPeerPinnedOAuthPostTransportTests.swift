@@ -8,6 +8,26 @@ import XCTest
 import SwanCore
 
 final class NIOPeerPinnedOAuthPostTransportTests: XCTestCase {
+    func testDocumentTransportConnectsToApprovedLiteralAndReportsPeer() async throws {
+        let server = try await LocalTLSPeer.start()
+        defer { Task { await server.close() } }
+
+        let connector = try NIOPeerPinnedOAuthDocumentTransport(
+            maximumTransportTimeout: 2,
+            additionalTrustRootsPEM: Data(LocalTLSCertificate.authority.utf8)
+        )
+        let response = try await connector.get(
+            url: server.endpoint,
+            approvedPeers: [server.peer],
+            timeout: 2,
+            maximumBodyBytes: 1_024
+        )
+        XCTAssertEqual(response.status, 204)
+        XCTAssertEqual(response.connectedPeerAddress, server.peer)
+        let requests = try await server.receivedRequest()
+        XCTAssertEqual(requests, 1)
+    }
+
     func testPinnedTransportConnectsToConfiguredLiteralAndVerifiesTLSHostname() async throws {
         let server = try await LocalTLSPeer.start()
         defer { Task { await server.close() } }

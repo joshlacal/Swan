@@ -47,7 +47,16 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
           try await client.execute(uri: path, method: .get) { response in
             XCTAssertEqual(response.status, .ok)
             XCTAssertEqual(response.headers[.cacheControl], "no-store")
-            XCTAssertFalse(Data(buffer: response.body).isEmpty)
+            let object = try self.json(response.body)
+            XCTAssertFalse(object.isEmpty)
+            if path == "/.well-known/oauth-authorization-server" {
+              XCTAssertEqual(
+                object["authorization_response_iss_parameter_supported"] as? Bool, true)
+              XCTAssertEqual(object["require_pushed_authorization_requests"] as? Bool, true)
+              XCTAssertEqual(object["client_id_metadata_document_supported"] as? Bool, true)
+              XCTAssertEqual(
+                object["token_endpoint_auth_signing_alg_values_supported"] as? [String], ["ES256"])
+            }
           }
         }
         var parNonce: String?
@@ -115,8 +124,9 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
           let values = Dictionary(
             uniqueKeysWithValues: (destination.queryItems ?? []).compactMap { item in
               item.value.map { (item.name, $0) }
-            })
+          })
           XCTAssertEqual(values["state"], "remote-state")
+          XCTAssertEqual(values["iss"], self.issuer.absoluteString)
           code = values["code"]
         }
         let codeForm = self.form([
@@ -163,6 +173,7 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
           let object = try self.json(response.body)
           XCTAssertEqual(object["token_type"] as? String, "DPoP")
           XCTAssertEqual(object["scope"] as? String, "atproto")
+          XCTAssertEqual(object["sub"] as? String, self.did)
           accessToken = object["access_token"] as? String
           refreshToken = object["refresh_token"] as? String
           XCTAssertEqual(accessToken?.utf8.count, 43)
@@ -397,6 +408,50 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     }
   }
 
+  func testAuthorizationDenialRedirectIncludesIssuer() async throws {
+    let fixture = try await makeFixture(metadata: try publicMetadata())
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let resolved = try await fixture.completeConfiguration.clientMetadataLoader.load(clientID: clientID)
+      let session = try OAuthValidatedSession(
+        issuer: issuer.absoluteString, client: resolved, redirectURI: redirectURI, scopes: ["atproto"],
+        dpopProof: .init(
+          keyThumbprint: String(repeating: "n", count: 43), jwtID: "denial-contract",
+          issuedAt: Date())
+      )
+      let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
+        session: session, state: "denied-state", codeChallengeS256: String(repeating: "a", count: 43))
+      let browser = try fixture.runtime.browserSessionService.issue(
+        requestURI: requestURI, subject: did, lifetime: 300)
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.denial"))
+      try await app.test(.router) { client in
+        try await client.execute(
+          uri: "/oauth/authorize/consent", method: .post,
+          headers: formHeaders(cookie: browser.value),
+          body: ByteBuffer(string: self.form([
+            ("csrf", browser.session.csrfToken), ("decision", "deny"),
+          ]))
+        ) { response in
+          XCTAssertEqual(response.status, .found)
+          let components = try XCTUnwrap(
+            URLComponents(string: try XCTUnwrap(response.headers[.location])))
+          let values = Dictionary(
+            uniqueKeysWithValues: (components.queryItems ?? []).compactMap { item in
+              item.value.map { (item.name, $0) }
+            })
+          XCTAssertEqual(values["error"], "access_denied")
+          XCTAssertEqual(values["state"], "denied-state")
+          XCTAssertEqual(values["iss"], self.issuer.absoluteString)
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
   func testCompleteOAuthNeverPublishesWhenServerIdentityMismatches() async throws {
     let fixture = try await makeFixture(metadata: try publicMetadata())
     defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -461,7 +516,7 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
       let transport = RemoteOAuthTransport(
         response: .init(
           status: 200, headers: ["content-type": ["application/json"]], body: body,
-          responseURL: clientID))
+          responseURL: clientID, connectedPeerAddress: publicIP))
       let loader = try OAuthClientMetadataLoader(
         fetcher: .init(
           policy: try OAuthRemoteFetchPolicy(), resolver: resolver, transport: transport),
@@ -628,7 +683,12 @@ private actor RemoteOAuthTransport: OAuthRemoteTransport {
   private let response: OAuthRemoteHTTPResponse
   private var requests = 0
   init(response: OAuthRemoteHTTPResponse) { self.response = response }
-  func get(url _: URL, timeout _: TimeInterval, maximumBodyBytes _: Int) async throws
+  func get(
+    url _: URL,
+    approvedPeers _: Set<OAuthIPAddress>,
+    timeout _: TimeInterval,
+    maximumBodyBytes _: Int
+  ) async throws
     -> OAuthRemoteHTTPResponse
   {
     requests += 1
