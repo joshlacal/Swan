@@ -362,6 +362,14 @@ public struct OAuthIssuedTokenDigests: Sendable, Equatable {
     }
 }
 
+/// The two opaque token tables which may identify a durable OAuth family for
+/// RFC 7009 revocation. Keeping this typed prevents an adapter from probing
+/// arbitrary control-plane tables using a client-presented string.
+public enum OAuthOpaqueTokenKind: Sendable, Equatable {
+    case accessToken
+    case refreshToken
+}
+
 /// Domain-specific durable OAuth state. This is intentionally not a generic
 /// key/value API: every operation names the protocol fact and transaction
 /// boundary it needs to preserve.
@@ -402,6 +410,14 @@ public protocol OAuthControlStore: Sendable {
     ) async throws
     func validatedAccessToken(accessTokenDigest: Data, now: Date) async throws -> OAuthTokenFamily
     func refreshTokenFamily(refreshTokenDigest: Data, now: Date) async throws -> OAuthTokenFamily
+    /// Returns an active, unrevoked family selected by one typed opaque-token
+    /// digest. This is used only to validate sender constraints immediately
+    /// before revocation; callers receive no raw token material.
+    func tokenFamily(
+        tokenDigest: Data,
+        kind: OAuthOpaqueTokenKind,
+        now: Date
+    ) async throws -> OAuthTokenFamily?
     func redeemRefreshToken(
         refreshTokenDigest: Data,
         replacement: OAuthIssuedTokenDigests,

@@ -470,6 +470,44 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
         return result.0
     }
 
+    public func tokenFamily(
+        tokenDigest: Data,
+        kind: OAuthOpaqueTokenKind,
+        now: Date = Date()
+    ) async throws -> OAuthTokenFamily? {
+        try validateDigest(tokenDigest)
+        let table: String
+        switch kind {
+        case .accessToken: table = "oauth_control_access_tokens"
+        case .refreshToken: table = "oauth_control_refresh_tokens"
+        }
+        return try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                let rows = try await connection.query(
+                    """
+                    SELECT f.family_id, f.subject, f.issuer, f.client_id,
+                           f.redirect_uri, f.scopes, f.dpop_jkt,
+                           f.client_assertion_key_id, f.client_assertion_algorithm,
+                           f.client_assertion_jkt, f.expires_at, f.revoked_at,
+                           t.expires_at AS token_expires_at
+                    FROM \(table) t
+                    JOIN oauth_control_token_families f ON f.family_id = t.family_id
+                    WHERE t.token_digest = ?
+                    """,
+                    [blob(tokenDigest)]
+                )
+                guard let row = rows.first else { return nil }
+                let family = try decodeFamily(row)
+                guard family.revokedAt == nil, family.expiresAt > now,
+                      try requiredDate(row, "token_expires_at") > now else {
+                    return nil
+                }
+                return family
+            }
+        }
+    }
+
     public func redeemRefreshToken(
         refreshTokenDigest: Data,
         replacement: OAuthIssuedTokenDigests,

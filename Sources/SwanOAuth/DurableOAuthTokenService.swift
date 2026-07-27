@@ -392,6 +392,107 @@ public actor DurableOAuthTokenService {
         return pair
     }
 
+    /// Rotates a token family belonging to the AT Protocol localhost
+    /// development-client exception. This deliberately accepts only a public
+    /// client identifier already validated by
+    /// `OAuthClientMetadata.localhostDevelopmentMetadata`; it never bypasses
+    /// remote metadata/JWKS revalidation for a confidential family.
+    public func redeemLocalhostPublicRefresh(
+        _ refreshToken: String,
+        clientID: URL,
+        dpopProof: OAuthValidatedDPoPProof,
+        accessLifetime: TimeInterval = 300,
+        now: Date = Date()
+    ) async throws -> OAuthTokenPair {
+        let metadata = try OAuthClientMetadata.localhostDevelopmentMetadata(clientID: clientID)
+        let refreshDigest = digest(refreshToken, purpose: .refreshToken)
+        let family: OAuthTokenFamily
+        do {
+            family = try await controlStore.refreshTokenFamily(
+                refreshTokenDigest: refreshDigest,
+                now: now
+            )
+        } catch {
+            throw secureControlError(error)
+        }
+        do {
+            guard family.binding.clientID == metadata.clientID.absoluteString,
+                  family.binding.confidentialClientKey == nil else {
+                throw OAuthControlStoreError.bindingMismatch
+            }
+            try requirePresentedBindings(
+                family: family,
+                dpopProof: dpopProof,
+                clientAssertion: nil,
+                requireClientAssertionKey: true
+            )
+        } catch {
+            throw secureControlError(error)
+        }
+        let remainingLifetime = family.expiresAt.timeIntervalSince(now)
+        let pair = try makeTokenPair(
+            familyID: family.familyID,
+            accessLifetime: min(accessLifetime, remainingLifetime),
+            refreshLifetime: remainingLifetime,
+            now: now
+        )
+        do {
+            try await controlStore.redeemRefreshToken(
+                refreshTokenDigest: refreshDigest,
+                replacement: tokenDigests(for: pair),
+                now: now
+            )
+        } catch {
+            throw secureControlError(error)
+        }
+        return pair
+    }
+
+    /// Revokes the complete family for one locally-valid public-client token.
+    /// An unknown, expired, revoked, or differently-bound token returns false
+    /// so the RFC 7009 HTTP adapter can remain an oracle-free 200 response.
+    /// The DPoP proof must already have been validated for the revocation
+    /// endpoint; this method rechecks its JKT against the selected family.
+    public func revokeLocalhostPublicToken(
+        _ token: String,
+        kind: OAuthOpaqueTokenKind,
+        clientID: URL,
+        dpopProof: OAuthValidatedDPoPProof,
+        now: Date = Date()
+    ) async throws -> Bool {
+        let metadata = try OAuthClientMetadata.localhostDevelopmentMetadata(clientID: clientID)
+        let family: OAuthTokenFamily?
+        do {
+            family = try await controlStore.tokenFamily(
+                tokenDigest: digest(token, purpose: kind == .accessToken ? .accessToken : .refreshToken),
+                kind: kind,
+                now: now
+            )
+        } catch {
+            throw secureControlError(error)
+        }
+        guard let family,
+              family.binding.clientID == metadata.clientID.absoluteString,
+              family.binding.confidentialClientKey == nil else {
+            return false
+        }
+        do {
+            try requirePresentedBindings(
+                family: family,
+                dpopProof: dpopProof,
+                clientAssertion: nil,
+                requireClientAssertionKey: true
+            )
+            try await controlStore.revokeTokenFamily(familyID: family.familyID, now: now)
+            return true
+        } catch {
+            // A wrong proof or caller ID must not reveal that the family was
+            // present, and must never revoke a token it did not bind.
+            if error is OAuthControlStoreError { return false }
+            throw secureControlError(error)
+        }
+    }
+
     public func revokeFamily(for refreshToken: String, now: Date = Date()) async throws -> Bool {
         do {
             return try await controlStore.revokeTokenFamily(

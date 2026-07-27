@@ -38,6 +38,9 @@ extension SwanCommand {
         @Flag(name: .long, help: "Enable only the localhost-development-client OAuth PAR bridge; requires an HTTPS public issuer")
         var enableLocalhostPAR = false
 
+        @Flag(name: .customLong("enable-localhost-oauth"), help: "Enable the localhost-development-client PAR, browser authorization, token, refresh, and revocation bridge; requires an HTTPS public issuer")
+        var enableLocalhostOAuth = false
+
         @Option(name: .long, help: "Reserved root for control/account databases and blobs")
         var dataDirectory: String = ".swan-data"
 
@@ -85,6 +88,9 @@ extension SwanCommand {
                 )
                 var logger = Logger(label: "swan")
                 logger.logLevel = .info
+                guard !(enableLocalhostPAR && enableLocalhostOAuth) else {
+                    throw ValidationError("--enable-localhost-par and --enable-localhost-oauth are mutually exclusive")
+                }
                 let localhostPARConfiguration: SwanLocalhostPARConfiguration?
                 if enableLocalhostPAR {
                     do {
@@ -95,11 +101,31 @@ extension SwanCommand {
                 } else {
                     localhostPARConfiguration = nil
                 }
+                let localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration?
+                if enableLocalhostOAuth {
+                    do {
+                        let passwordHasher = try LibsodiumArgon2idHasher()
+                        let accounts = DurableAccountDirectory(
+                            store: controlDatabase,
+                            passwordHasher: passwordHasher,
+                            verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher)
+                        )
+                        localhostOAuthConfiguration = try SwanLocalhostOAuthConfiguration(
+                            issuer: baseURL,
+                            accounts: accounts
+                        )
+                    } catch {
+                        throw ValidationError("--enable-localhost-oauth requires an HTTPS public issuer URL and usable password verification")
+                    }
+                } else {
+                    localhostOAuthConfiguration = nil
+                }
                 let server = SwanHTTPServer(
                     profile: loadedProfile,
                     configuration: .init(host: host, port: port, publicURL: baseURL),
                     oauthRuntime: oauthRuntime,
                     localhostPARConfiguration: localhostPARConfiguration,
+                    localhostOAuthConfiguration: localhostOAuthConfiguration,
                     authenticatedGetSpaceDirectory: directory,
                     accountControlStore: controlDatabase
                 )

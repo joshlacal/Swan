@@ -2,6 +2,7 @@ import Foundation
 import Hummingbird
 import Logging
 import ServiceLifecycle
+import SwanAccounts
 import SwanCore
 import SwanOAuth
 import SwanSpaces
@@ -61,6 +62,22 @@ public struct SwanLocalhostPARConfiguration: Sendable, Equatable {
     }
 }
 
+/// An explicit local-laboratory OAuth authorization surface. It is restricted
+/// to the AT Protocol localhost development-client exception: no remote client
+/// metadata, confidential-client authentication, or discovery publication is
+/// implied by constructing it. Password verification remains in
+/// ``DurableAccountDirectory``; this configuration contains no password or
+/// account-key material.
+public struct SwanLocalhostOAuthConfiguration: Sendable {
+    public let issuer: URL
+    public let accounts: DurableAccountDirectory
+
+    public init(issuer: URL, accounts: DurableAccountDirectory) throws {
+        self.issuer = try OAuthAuthorizationServerMetadata(issuer: issuer).issuer
+        self.accounts = accounts
+    }
+}
+
 public struct SwanHTTPServer: Sendable {
     public let profile: ProtocolProfile
     public let configuration: SwanHTTPConfiguration
@@ -76,6 +93,10 @@ public struct SwanHTTPServer: Sendable {
     /// The sole live OAuth alpha route. This never enables discovery or any
     /// other authorization-server endpoint.
     public let localhostPARConfiguration: SwanLocalhostPARConfiguration?
+    /// The opt-in local browser authorization bridge. It is intentionally
+    /// separate from PAR-only mode so a caller cannot make password pages
+    /// appear merely by enabling the lower-risk PAR endpoint.
+    public let localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration?
     /// The one authenticated authority `getSpace` query. It is unavailable by
     /// default and only constructed from this server's runtime and canonical
     /// public URL after account databases have been preopened at startup.
@@ -88,6 +109,7 @@ public struct SwanHTTPServer: Sendable {
         oauthRuntime: SwanOAuthRuntime,
         oauthPublicationGate: OAuthPublicationGate = .unavailable,
         localhostPARConfiguration: SwanLocalhostPARConfiguration? = nil,
+        localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration? = nil,
         authenticatedGetSpaceDirectory: (any AuthorizedSimpleSpaceDirectory)? = nil,
         accountControlStore: (any AccountControlStore)? = nil
     ) {
@@ -99,11 +121,24 @@ public struct SwanHTTPServer: Sendable {
         // A mismatched issuer would produce a DPoP target different from the
         // process's public identity. There is no best-effort normalization:
         // retain the default 404 closure instead.
-        if let localhostPARConfiguration,
-           localhostPARConfiguration.issuer.absoluteString == configuration.publicURL.absoluteString {
-            self.localhostPARConfiguration = localhostPARConfiguration
-        } else {
+        let matchesPublicIdentity: (URL) -> Bool = {
+            $0.absoluteString == configuration.publicURL.absoluteString
+        }
+        if let localhostOAuthConfiguration,
+           matchesPublicIdentity(localhostOAuthConfiguration.issuer) {
+            self.localhostOAuthConfiguration = localhostOAuthConfiguration
+            // The complete local bridge includes PAR. Do not permit a second
+            // caller-selected PAR configuration to make route selection
+            // ambiguous.
             self.localhostPARConfiguration = nil
+        } else {
+            self.localhostOAuthConfiguration = nil
+            if let localhostPARConfiguration,
+               matchesPublicIdentity(localhostPARConfiguration.issuer) {
+                self.localhostPARConfiguration = localhostPARConfiguration
+            } else {
+                self.localhostPARConfiguration = nil
+            }
         }
         // Never accept a caller-supplied authorizer here: it might bind DPoP
         // to another public URL or runtime. Failure to form the exact local
@@ -168,14 +203,28 @@ public struct SwanHTTPServer: Sendable {
             return jsonResponse(metadata)
         }
 
-        router.get("/oauth/authorize") { _, _ -> Response in
-            oauthUnavailable()
+        if let localhostOAuthConfiguration {
+            registerLocalhostOAuthEndpoints(
+                on: router,
+                configuration: localhostOAuthConfiguration,
+                runtime: oauthRuntime
+            )
+        } else {
+            router.get("/oauth/authorize") { _, _ -> Response in
+                oauthUnavailable()
+            }
         }
 
         // This narrow development bridge stores a durable PAR only. It does
         // not publish discovery and cannot lead to login, consent, codes, or
         // tokens until a complete OAuth HTTP assembly is separately enabled.
-        if let localhostPARConfiguration {
+        if let localhostOAuthConfiguration {
+            registerLocalhostPAREndpoint(
+                on: router,
+                issuer: localhostOAuthConfiguration.issuer,
+                runtime: oauthRuntime
+            )
+        } else if let localhostPARConfiguration {
             registerLocalhostPAREndpoint(
                 on: router,
                 configuration: localhostPARConfiguration,

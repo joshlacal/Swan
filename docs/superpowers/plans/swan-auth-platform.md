@@ -52,12 +52,22 @@ production deployment.
   listener and process lifecycle wiring. It does not make public OAuth routes
   available; those remain deliberately fail-closed pending the full HTTP
   authorization flow.
-- The first live OAuth bridge is an explicit `--enable-localhost-par` lab
-  option. It requires an HTTPS issuer and exposes only `POST /oauth/par` for
-  virtual localhost public clients, using strict bounded forms and durable
-  DPoP nonce/replay validation. Discovery, authorization, token, and
-  revocation routes remain unavailable; PAR success is not a claim of a
-  complete authorization server.
+- `--enable-localhost-par` remains a deliberately narrow PAR-only lab option.
+  `--enable-localhost-oauth` is its separate, mutually-exclusive progression:
+  it exposes PAR, browser login/consent, token, refresh, and revocation only
+  for the AT Protocol virtual localhost public client. It requires an HTTPS
+  issuer and an already-provisioned local account; it neither fetches remote
+  client metadata nor accepts confidential clients. Discovery remains closed,
+  so this cannot be mistaken for the complete public authorization server.
+- The local browser bridge carries an HMAC-signed, ten-minute,
+  `Secure; HttpOnly; SameSite=Lax` approval cookie containing only an opaque
+  PAR URI, CSRF value, and (after password authentication) account DID. The
+  database retains the original DPoP/PKCE/client/redirect binding but never a
+  browser session, password, raw token, or proof. Approval atomically consumes
+  that exact PAR before code issuance; token exchange and refresh prove a new
+  ES256 DPoP proof, and refresh reuse revokes the durable family. The local
+  revocation endpoint accepts DPoP-bound access or refresh tokens and returns
+  oracle-free RFC 7009 success after revoking the entire matching family.
 - The protected-resource foundation accepts only one DPoP authorization
   credential and proof, binds the proof to a configured route target and
   access-token hash, checks the durable token-family JKT, and rechecks the
@@ -77,17 +87,18 @@ production deployment.
   capability—constructs that route's authorizer from its canonical URL and
   OAuth runtime, so the DPoP `htu`, nonce issuer, token service, and handler
   cannot be miswired independently.
-- PAR now has a durable browser-handoff primitive: an opaque request URI can
+- PAR has a durable browser-handoff primitive: an opaque request URI can
   retrieve only its live, unconsumed bound request, and final approval
-  consumes that exact binding before issuing a code. This gives upcoming login
-  and consent routes the original PAR DPoP, PKCE, redirect, scope, and
-  confidential-client-key tuple without persisting browser sessions or
-  reconstructing a DPoP proof from form input.
+  consumes that exact binding before issuing a code. This preserves the
+  original DPoP, PKCE, redirect, and scope facts without reconstructing a DPoP
+  proof from form input. The remote-metadata/confidential-client path remains
+  separately fail-closed until its own full HTTP negative suite is complete.
 
 ## Acceptance gates
 
 Negative tests must cover malformed client metadata, unsafe remote endpoints,
 PAR/code expiry and reuse, PKCE mismatch, nonce challenge, DPoP and client
 assertion replay, bad issuer/audience, JWKS rotation, concurrent refresh,
-family revocation, account status, and key rotation. Real OAuth HTTP routes
-remain fail-closed until these pass.
+family revocation, account status, and key rotation. Remote-client and
+confidential OAuth HTTP routes remain fail-closed until these pass; the
+localhost virtual-client bridge has its own end-to-end negative coverage.

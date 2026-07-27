@@ -53,10 +53,21 @@ func registerLocalhostPAREndpoint(
     configuration: SwanLocalhostPARConfiguration,
     runtime: SwanOAuthRuntime
 ) {
+    registerLocalhostPAREndpoint(on: router, issuer: configuration.issuer, runtime: runtime)
+}
+
+/// Internal overload used by the complete localhost browser bridge. Its
+/// public configuration has already validated the same issuer, so we avoid a
+/// force-try while retaining one exact PAR handler implementation.
+func registerLocalhostPAREndpoint(
+    on router: Router<BasicRequestContext>,
+    issuer: URL,
+    runtime: SwanOAuthRuntime
+) {
     router.post("/oauth/par") { request, _ async -> Response in
         await handleLocalhostPAR(
             request: request,
-            issuer: configuration.issuer,
+            issuer: issuer,
             runtime: runtime
         )
     }
