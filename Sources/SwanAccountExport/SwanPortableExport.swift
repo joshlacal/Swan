@@ -837,10 +837,14 @@ public struct SwanPortableAccountExporter: Sendable {
             _ = close(stagingDescriptor)
         } catch {
             _ = close(stagingDescriptor)
-            SwanPortableExportFilesystem.removeTree(
-                parent: destination.parentDescriptor,
-                name: published ? destination.outputName : stagingName
-            )
+            do {
+                try SwanPortableExportFilesystem.removeTree(
+                    parent: destination.parentDescriptor,
+                    name: published ? destination.outputName : stagingName
+                )
+            } catch {
+                throw SwanPortableExportError.publicationFailed
+            }
             throw error
         }
     }

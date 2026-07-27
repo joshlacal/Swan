@@ -792,6 +792,114 @@ final class SwanPortableRestoreTests: XCTestCase {
         )
     }
 
+    func testRestoreParentReplacementFailsAndCannotRedirectAdvertisedStage() throws {
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+        let dataDirectory = try temporaryDirectory(named: "replacement-data")
+        defer { try? FileManager.default.removeItem(at: dataDirectory.deletingLastPathComponent()) }
+        let restoreParent = dataDirectory.appending(path: "restore-staging")
+        let displacedParent = dataDirectory.appending(path: "restore-staging-displaced")
+        try FileManager.default.createDirectory(
+            at: restoreParent,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let stager = SwanPortableAccountRestoreStager(
+            beforeSuccessIdentityValidation: {
+                try FileManager.default.moveItem(
+                    at: restoreParent,
+                    to: displacedParent
+                )
+                try FileManager.default.createDirectory(
+                    at: restoreParent,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+            }
+        )
+
+        XCTAssertThrowsError(
+            try stager.stage(
+                archiveAt: fixture.root,
+                dataDirectory: dataDirectory
+            )
+        )
+
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: restoreParent.path),
+            []
+        )
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: displacedParent.path),
+            []
+        )
+    }
+
+    func testIntermediateDirectorySyncFailureCleansAllRestoreState() throws {
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+        let dataDirectory = try temporaryDirectory(named: "sync-failure-data")
+        defer { try? FileManager.default.removeItem(at: dataDirectory.deletingLastPathComponent()) }
+        let recorder = RestoreFaultRecorder()
+        let stager = SwanPortableAccountRestoreStager(
+            synchronizeCreatedDirectoryParent: { _ in
+                recorder.record(1)
+                throw SwanPortableExportError.publicationFailed
+            }
+        )
+
+        XCTAssertThrowsError(
+            try stager.stage(
+                archiveAt: fixture.root,
+                dataDirectory: dataDirectory
+            )
+        )
+
+        XCTAssertEqual(recorder.values, [1])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dataDirectory.appending(path: "restore-staging").path
+        ))
+    }
+
+    func testTransientCleanupFailureIsRetriedAndAbsenceIsVerified() throws {
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+        let dataDirectory = try temporaryDirectory(named: "cleanup-failure-data")
+        defer { try? FileManager.default.removeItem(at: dataDirectory.deletingLastPathComponent()) }
+        let verification = try SwanPortableExportVerifier.verifyArchive(at: fixture.root)
+        let hash = String(verification.manifestSHA256.dropFirst("sha256:".count))
+        let recorder = RestoreFaultRecorder()
+        let stager = SwanPortableAccountRestoreStager(
+            afterRenameBeforeParentSync: {
+                throw SwanPortableExportError.publicationFailed
+            },
+            beforeCleanupAttempt: { attempt in
+                recorder.record(attempt)
+                if attempt == 1 {
+                    throw SwanPortableExportError.publicationFailed
+                }
+            }
+        )
+
+        XCTAssertThrowsError(
+            try stager.stage(
+                archiveAt: fixture.root,
+                dataDirectory: dataDirectory
+            )
+        )
+
+        XCTAssertEqual(recorder.values, [1, 2])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dataDirectory
+                .appending(path: "restore-staging")
+                .appending(path: hash)
+                .path
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: dataDirectory.appending(path: "restore-staging").path
+        ))
+    }
+
     func testDataDirectoryMustAlreadyBeAnOwnerOnlyUnlinkedDirectory() throws {
         let fixture = try ArchiveFixture()
         defer { fixture.remove() }
@@ -927,6 +1035,21 @@ final class SwanPortableRestoreTests: XCTestCase {
                 value.append(try Data(contentsOf: url))
                 output[childRelative] = value
             }
+        }
+    }
+}
+
+private final class RestoreFaultRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Int] = []
+
+    var values: [Int] {
+        lock.withLock { storage }
+    }
+
+    func record(_ value: Int) {
+        lock.withLock {
+            storage.append(value)
         }
     }
 }

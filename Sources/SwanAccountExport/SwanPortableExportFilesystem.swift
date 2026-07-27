@@ -165,6 +165,49 @@ enum SwanPortableExportFilesystem {
         try openDirectory(parent: parent, name: name)
     }
 
+    static func requireCurrentChildDirectory(
+        parent: Int32,
+        name: String,
+        matches expectedDescriptor: Int32
+    ) throws {
+        let currentDescriptor = try openDirectory(parent: parent, name: name)
+        defer { _ = close(currentDescriptor) }
+        var expected = stat()
+        var current = stat()
+        guard fstat(expectedDescriptor, &expected) == 0,
+              fstat(currentDescriptor, &current) == 0,
+              expected.st_dev == current.st_dev,
+              expected.st_ino == current.st_ino else {
+            throw SwanPortableExportError.publicationFailed
+        }
+    }
+
+    static func currentChildDirectoryMatches(
+        parent: Int32,
+        name: String,
+        expectedDescriptor: Int32
+    ) throws -> Bool {
+        guard isSafeComponent(name) else {
+            throw SwanPortableExportError.invalidPlacement
+        }
+        var expected = stat()
+        var current = stat()
+        guard fstat(expectedDescriptor, &expected) == 0 else {
+            throw SwanPortableExportError.publicationFailed
+        }
+        if name.withCString({
+            fstatat(parent, $0, &current, AT_SYMLINK_NOFOLLOW)
+        }) != 0 {
+            guard errno == ENOENT else {
+                throw SwanPortableExportError.publicationFailed
+            }
+            return false
+        }
+        return (current.st_mode & S_IFMT) == S_IFDIR
+            && current.st_dev == expected.st_dev
+            && current.st_ino == expected.st_ino
+    }
+
     static func openOrCreateOwnerOnlyDirectory(
         parent: Int32,
         name: String
@@ -211,9 +254,12 @@ enum SwanPortableExportFilesystem {
         return false
     }
 
-    static func removeEmptyDirectory(parent: Int32, name: String) {
-        guard isSafeComponent(name) else { return }
-        _ = name.withCString { unlinkat(parent, $0, AT_REMOVEDIR) }
+    static func removeEmptyDirectory(parent: Int32, name: String) throws {
+        guard isSafeComponent(name),
+              name.withCString({ unlinkat(parent, $0, AT_REMOVEDIR) }) == 0 else {
+            throw SwanPortableExportError.publicationFailed
+        }
+        try requireAbsent(parent: parent, name: name)
     }
 
     static func createStagingDirectory(parent: Int32, name: String) throws -> Int32 {
@@ -234,8 +280,23 @@ enum SwanPortableExportFilesystem {
         path: String,
         root: Int32
     ) throws {
+        try write(
+            data,
+            path: path,
+            root: root,
+            synchronizeCreatedDirectoryParent: synchronizeParent
+        )
+    }
+
+    static func write(
+        _ data: Data,
+        path: String,
+        root: Int32,
+        synchronizeCreatedDirectoryParent: @Sendable (Int32) throws -> Void
+    ) throws {
         let components = try pathComponents(path)
         var openedDirectories: [Int32] = []
+        var createdDirectoryParents: [Int32] = []
         var current = root
         defer {
             for descriptor in openedDirectories.reversed() {
@@ -248,6 +309,9 @@ enum SwanPortableExportFilesystem {
                 throw SwanPortableExportError.publicationFailed
             }
             let child = try openDirectory(parent: current, name: component)
+            if created == 0 {
+                createdDirectoryParents.append(current)
+            }
             openedDirectories.append(child)
             current = child
         }
@@ -297,6 +361,9 @@ enum SwanPortableExportFilesystem {
         shouldClose = false
         guard fsync(current) == 0 else {
             throw SwanPortableExportError.publicationFailed
+        }
+        for descriptor in createdDirectoryParents.reversed() {
+            try synchronizeCreatedDirectoryParent(descriptor)
         }
     }
 
@@ -371,28 +438,52 @@ enum SwanPortableExportFilesystem {
         return entries
     }
 
-    static func removeTree(parent: Int32, name: String) {
-        guard isSafeComponent(name) else { return }
+    static func removeTree(parent: Int32, name: String) throws {
+        guard isSafeComponent(name) else {
+            throw SwanPortableExportError.invalidPlacement
+        }
+        var rootMetadata = stat()
+        if name.withCString({
+            fstatat(parent, $0, &rootMetadata, AT_SYMLINK_NOFOLLOW)
+        }) != 0 {
+            guard errno == ENOENT else {
+                throw SwanPortableExportError.publicationFailed
+            }
+            return
+        }
+        guard (rootMetadata.st_mode & S_IFMT) == S_IFDIR,
+              rootMetadata.st_uid == geteuid() else {
+            throw SwanPortableExportError.publicationFailed
+        }
         let descriptor = name.withCString {
             openat(parent, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         }
-        if descriptor >= 0 {
-            if let names = try? directoryEntryNames(descriptor) {
-                for child in names {
-                    var metadata = stat()
-                    if child.withCString({
-                        fstatat(descriptor, $0, &metadata, AT_SYMLINK_NOFOLLOW)
-                    }) == 0,
-                    (metadata.st_mode & S_IFMT) == S_IFDIR {
-                        removeTree(parent: descriptor, name: child)
-                    } else {
-                        _ = child.withCString { unlinkat(descriptor, $0, 0) }
-                    }
-                }
-            }
-            _ = close(descriptor)
+        guard descriptor >= 0 else {
+            throw SwanPortableExportError.publicationFailed
         }
-        _ = name.withCString { unlinkat(parent, $0, AT_REMOVEDIR) }
+        defer { _ = close(descriptor) }
+        try requireOwnerOnlyDirectory(descriptor)
+        for child in try directoryEntryNames(descriptor) {
+            var metadata = stat()
+            guard child.withCString({
+                fstatat(descriptor, $0, &metadata, AT_SYMLINK_NOFOLLOW)
+            }) == 0,
+            metadata.st_uid == geteuid() else {
+                throw SwanPortableExportError.publicationFailed
+            }
+            if (metadata.st_mode & S_IFMT) == S_IFDIR {
+                try removeTree(parent: descriptor, name: child)
+            } else {
+                guard child.withCString({ unlinkat(descriptor, $0, 0) }) == 0 else {
+                    throw SwanPortableExportError.publicationFailed
+                }
+                try requireAbsent(parent: descriptor, name: child)
+            }
+        }
+        guard name.withCString({ unlinkat(parent, $0, AT_REMOVEDIR) }) == 0 else {
+            throw SwanPortableExportError.publicationFailed
+        }
+        try requireAbsent(parent: parent, name: name)
     }
 
     static func renameExclusively(
@@ -458,6 +549,18 @@ enum SwanPortableExportFilesystem {
         !value.isEmpty && value != "." && value != ".."
             && value.utf8.count <= 255 && !value.contains("/")
             && !value.contains("\u{0}")
+    }
+
+    private static func requireAbsent(parent: Int32, name: String) throws {
+        var metadata = stat()
+        if name.withCString({
+            fstatat(parent, $0, &metadata, AT_SYMLINK_NOFOLLOW)
+        }) == 0 {
+            throw SwanPortableExportError.publicationFailed
+        }
+        guard errno == ENOENT else {
+            throw SwanPortableExportError.publicationFailed
+        }
     }
 
     private static func pathComponents(_ path: String) throws -> [String] {
