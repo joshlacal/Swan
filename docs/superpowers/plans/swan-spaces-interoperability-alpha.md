@@ -54,6 +54,15 @@ checksum-verified way to populate the ignored reference cache.
   `verifyRepoCar` path verifies Swan's CAR. This also enforces canonical
   low-S ES256 repository signatures, because the pinned verifier rejects the
   mathematically valid high-S encoding accepted by Swift Crypto.
+- The Compose laboratory now has a separate, cache-gated topology: Swan,
+  source-pinned reference PDS and PLC images, Caddy local TLS, Mailpit,
+  Toxiproxy, and a Swift scenario-runner. `interop/fetch-reference.sh` is the
+  only source-population path; both image Dockerfiles verify the archive SHA
+  before unpacking it and contain no source clone or curl. `swan lab validate`
+  checks the same archive/source prerequisites without starting containers;
+  `swan lab scenario --output ...` emits a summary-only, planned-not-executed
+  artifact whose type has no credential, token, key, request, response, or
+  account-data field.
 
 ## Completion gates
 
@@ -62,3 +71,19 @@ space credential JWTs, durable repositories/CARs/blobs, OAuth and account
 lifecycle, generated wire sources, Compose reference PDS/PLC/Caddy matrix,
 and macOS/Linux verification. The public-genesis vector is a narrow
 cross-language gate; it is not evidence that the complete matrix has passed.
+
+## Compose laboratory evidence and live gates
+
+- `Scripts/verify-interop-lab.sh` is an offline structural verifier for the
+  cache SHA, source shape, topology membership, local-TLS/Toxiproxy route, and
+  the no-network-source-fetch Dockerfile boundary. `SwanInteropTests` also
+  covers cache-pin rejection and the sanitized scenario schema.
+- The laboratory does not expose PLC, Mailpit, or Toxiproxy publicly. Caddy
+  has only local-CA TLS routes for `swan.test` and `pds.test`; PDS traffic goes
+  through its named Toxiproxy listener. No permissioned route gains a public
+  fallback.
+- A live matrix is still unverified. It requires Docker Compose v2, locally
+  supplied disposable secrets (never committed or included in artifacts),
+  trust of Caddy's laboratory CA by the runner, and implementation of the
+  remaining pinned endpoint/credential paths. The scenario artifact records
+  intent only and must not be represented as a passing reference-PDS matrix.

@@ -1,0 +1,15 @@
+{
+	# Caddy's local CA is a lab-only trust anchor. The Compose matrix must add it
+	# to its client trust store explicitly; there is no cleartext/public fallback.
+	local_certs
+}
+
+https://swan.test {
+	tls internal
+	reverse_proxy swan:3000
+}
+
+https://pds.test {
+	tls internal
+	reverse_proxy toxiproxy:8666
+}

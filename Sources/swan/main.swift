@@ -486,12 +486,70 @@ extension SwanCommand {
     }
 
     struct Lab: ParsableCommand {
-        static let configuration = CommandConfiguration(abstract: "Print pinned TypeScript interop source information")
+        static let configuration = CommandConfiguration(
+            abstract: "Validate and record sanitized Compose laboratory scenarios",
+            subcommands: [Validate.self, Scenario.self],
+            defaultSubcommand: Validate.self
+        )
 
-        func run() throws {
-            let pin = ReferenceSourcePin()
-            print("REFERENCE: \(pin.repository.absoluteString)@\(pin.commit)")
-            print("Use interop/fetch-reference.sh to populate the ignored .interop-cache directory.")
+        struct Validate: ParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Check the pinned reference archive and extracted source cache without starting Compose"
+            )
+
+            @Option(name: .long, help: "Swan package root containing .interop-cache")
+            var root: String = "."
+
+            func run() throws {
+                let rootURL = URL(fileURLWithPath: root)
+                let report = InteropLaboratory.validate(
+                    cacheDirectory: rootURL.appending(path: ".interop-cache", directoryHint: .isDirectory)
+                )
+                guard report.isValid else {
+                    for diagnostic in report.diagnostics {
+                        FileHandle.standardError.write(Data("lab prerequisite failed: \(diagnostic.rawValue)\n".utf8))
+                    }
+                    throw ValidationError(
+                        "pinned reference cache is not ready; run interop/fetch-reference.sh and retry"
+                    )
+                }
+                let pin = ReferenceSourcePin()
+                print("LAB PREREQUISITES OK: \(pin.commit)")
+            }
+        }
+
+        struct Scenario: ParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Write a summary-only scenario artifact; it never accepts or records credentials"
+            )
+
+            @Option(name: .long, help: "Scenario identifier (letters, numbers, hyphen, and underscore only)")
+            var name: String = "reference-matrix"
+
+            @Option(name: .long, parsing: .upToNextOption, help: "Repeatable fault mode: offline, delayed, duplicated, reordered, or corrupted")
+            var fault: [String] = []
+
+            @Option(name: .long, help: "Explicit destination for the sanitized JSON artifact")
+            var output: String
+
+            func run() throws {
+                let modes = try fault.map { rawValue -> FaultMode in
+                    guard let mode = FaultMode(rawValue: rawValue) else {
+                        throw ValidationError("unsupported lab fault mode")
+                    }
+                    return mode
+                }
+                let artifact = try SanitizedScenarioArtifact(scenario: name, faultModes: modes)
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                let outputURL = URL(fileURLWithPath: output)
+                try FileManager.default.createDirectory(
+                    at: outputURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try encoder.encode(artifact).write(to: outputURL, options: .atomic)
+                print("SANITIZED SCENARIO ARTIFACT WRITTEN")
+            }
         }
     }
 }

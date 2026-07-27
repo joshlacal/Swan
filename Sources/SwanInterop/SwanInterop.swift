@@ -417,11 +417,107 @@ public struct ReferenceSourcePin: Codable, Sendable, Equatable {
     public init(
         repository: URL = URL(string: "https://github.com/bluesky-social/atproto")!,
         commit: String = "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
-        archiveSHA256: String? = nil
+        archiveSHA256: String? = "1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea"
     ) {
         self.repository = repository
         self.commit = commit
         self.archiveSHA256 = archiveSHA256
+    }
+}
+
+/// A path-free status for the local Compose laboratory inputs.  The report is
+/// deliberately suitable for CI logs: it identifies only the failed invariant,
+/// never an operator-provided filesystem location or file contents.
+public struct InteropLabPrerequisiteReport: Sendable, Equatable {
+    public enum Diagnostic: String, Sendable, Equatable, Codable {
+        case missingReferenceArchive
+        case invalidReferenceArchive
+        case missingReferenceSource
+        case invalidReferenceSource
+    }
+
+    public let diagnostics: [Diagnostic]
+
+    public init(diagnostics: [Diagnostic]) {
+        self.diagnostics = diagnostics
+    }
+
+    public var isValid: Bool { diagnostics.isEmpty }
+}
+
+/// The intentionally small artifact emitted by the scenario runner before a
+/// matrix execution. It describes only public pins and fault intent; request,
+/// response, account, and credential values have no representation here.
+public struct SanitizedScenarioArtifact: Codable, Sendable, Equatable {
+    public let profileID: String
+    public let proposalCommit: String
+    public let referenceImplementationCommit: String
+    public let scenario: String
+    public let faultModes: [FaultMode]
+    public let status: String
+    public let fixturePolicy: String
+
+    public init(scenario: String, faultModes: [FaultMode]) throws {
+        let normalizedScenario = scenario.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedScenario.isEmpty,
+              normalizedScenario.unicodeScalars.allSatisfy({
+                  CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_")).contains($0)
+              }) else {
+            throw SwanError.malformed("scenario names must be non-empty ASCII identifiers")
+        }
+        profileID = OfflineProtocolProfileVerifier.stableProfileID
+        proposalCommit = "1caad93dbb1f445396f6abf3b97eb4040345e78e"
+        referenceImplementationCommit = "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354"
+        self.scenario = normalizedScenario
+        self.faultModes = faultModes
+        status = "planned-not-executed"
+        fixturePolicy = "summary-only; no passwords, bearer tokens, DPoP keys, refresh tokens, or recoverable account data"
+    }
+}
+
+/// Offline checks shared by `swan lab validate` and the Compose launcher. The
+/// cache is deliberately an explicit prerequisite: image builds unpack its
+/// verified archive and never clone or download the TypeScript reference.
+public enum InteropLaboratory {
+    public static func validate(
+        cacheDirectory: URL,
+        pin: ReferenceSourcePin = ReferenceSourcePin()
+    ) -> InteropLabPrerequisiteReport {
+        let manager = FileManager.default
+        let archive = cacheDirectory.appending(path: "atproto-\(pin.commit).tar.gz")
+        let sourceRoot = cacheDirectory.appending(path: "atproto-\(pin.commit)", directoryHint: .isDirectory)
+        var diagnostics: [InteropLabPrerequisiteReport.Diagnostic] = []
+
+        guard let archiveSHA256 = pin.archiveSHA256,
+              archiveSHA256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else {
+            return .init(diagnostics: [.invalidReferenceArchive])
+        }
+        guard manager.fileExists(atPath: archive.path) else {
+            diagnostics.append(.missingReferenceArchive)
+            return .init(diagnostics: diagnostics)
+        }
+        guard let data = try? Data(contentsOf: archive),
+              SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == archiveSHA256 else {
+            diagnostics.append(.invalidReferenceArchive)
+            return .init(diagnostics: diagnostics)
+        }
+
+        var isDirectory: ObjCBool = false
+        guard manager.fileExists(atPath: sourceRoot.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            diagnostics.append(.missingReferenceSource)
+            return .init(diagnostics: diagnostics)
+        }
+        let requiredSourceFiles = [
+            "package.json",
+            "pnpm-lock.yaml",
+            "services/pds/Dockerfile",
+            "packages/pds/package.json",
+        ]
+        guard requiredSourceFiles.allSatisfy({ manager.fileExists(atPath: sourceRoot.appending(path: $0).path) }) else {
+            diagnostics.append(.invalidReferenceSource)
+            return .init(diagnostics: diagnostics)
+        }
+        return .init(diagnostics: diagnostics)
     }
 }
 

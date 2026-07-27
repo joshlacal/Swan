@@ -1,25 +1,122 @@
+name: swan-interop-alpha
+
+# This file is intentionally launched through ./interop/compose.sh. That
+# wrapper verifies the ignored reference cache before Docker receives a build
+# context, so the normal build never fetches TypeScript source from the network.
 services:
   swan:
     build:
       context: ..
       dockerfile: Swan/Dockerfile
     command: ["serve", "--host", "0.0.0.0", "--port", "3000", "--public-url", "https://swan.test", "--data-directory", "/var/lib/swan/data"]
+    environment:
+      SWAN_OAUTH_SERVER_KEY: ${SWAN_OAUTH_SERVER_KEY:?set a disposable 32-byte URL-safe-base64 lab key outside the repository}
     volumes:
       - swan-data:/var/lib/swan
     networks: [swan]
+    healthcheck:
+      test: ["CMD-SHELL", "test -e /usr/local/bin/swan"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  reference-pds:
+    build:
+      context: ..
+      dockerfile: Swan/interop/Dockerfile.reference-pds
+    environment:
+      PDS_HOSTNAME: pds.test
+      PDS_PORT: "3000"
+      PDS_DATA_DIRECTORY: /pds
+      PDS_BLOBSTORE_DISK_LOCATION: /pds/blocks
+      PDS_DID_PLC_URL: http://reference-plc:2582
+      PDS_DPOP_SECRET: ${PDS_DPOP_SECRET:?set a disposable PDS DPoP secret outside the repository}
+      PDS_JWT_SECRET: ${PDS_JWT_SECRET:?set a disposable PDS JWT secret outside the repository}
+      PDS_ADMIN_PASSWORD: ${PDS_ADMIN_PASSWORD:?set a disposable PDS administrator password outside the repository}
+      PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX: ${PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX:?set a disposable PDS signing key outside the repository}
+      PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX: ${PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX:?set a disposable PDS PLC rotation key outside the repository}
+      PDS_INVITE_REQUIRED: "true"
+      PDS_DISABLE_SSRF_PROTECTION: "false"
+      LOG_ENABLED: "false"
+    volumes:
+      - reference-pds-data:/pds
+    networks: [swan]
+    depends_on:
+      reference-plc:
+        condition: service_started
+
+  # The PLC package is pinned by the same reference lockfile as the PDS. It is
+  # private to the lab network; Caddy exposes no PLC route.
+  reference-plc:
+    build:
+      context: ..
+      dockerfile: Swan/interop/Dockerfile.reference-plc
+    environment:
+      PORT: "2582"
+      LOG_ENABLED: "false"
+    networks: [swan]
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    ports:
+      - "443:443"
+    volumes:
+      - ./interop/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [swan]
+    depends_on:
+      swan:
+        condition: service_started
+      toxiproxy-setup:
+        condition: service_completed_successfully
 
   mailpit:
     image: axllent/mailpit:v1.27.1
-    ports: ["8025:8025"]
+    ports: ["127.0.0.1:8025:8025"]
     networks: [swan]
 
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.12.0
-    ports: ["8474:8474"]
+    ports: ["127.0.0.1:8474:8474"]
     networks: [swan]
+
+  toxiproxy-setup:
+    image: curlimages/curl:8.13.0
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        until curl --fail --silent http://toxiproxy:8474/version >/dev/null; do sleep 1; done
+        curl --fail --silent --show-error -X POST http://toxiproxy:8474/proxies \
+          -H 'Content-Type: application/json' \
+          --data '{"name":"reference-pds","listen":"0.0.0.0:8666","upstream":"reference-pds:3000","enabled":true}' \
+          || curl --fail --silent http://toxiproxy:8474/proxies/reference-pds >/dev/null
+    networks: [swan]
+    depends_on:
+      - toxiproxy
+      - reference-pds
+    restart: "no"
+
+  scenario-runner:
+    build:
+      context: ..
+      dockerfile: Swan/Dockerfile
+    command: ["lab", "scenario", "--name", "reference-matrix", "--fault", "delayed", "--fault", "duplicated", "--fault", "reordered", "--fault", "offline", "--fault", "corrupted", "--output", "/artifacts/reference-matrix.json"]
+    volumes:
+      - scenario-artifacts:/artifacts
+    networks: [swan]
+    depends_on:
+      caddy:
+        condition: service_started
+    restart: "no"
 
 volumes:
   swan-data:
+  reference-pds-data:
+  caddy-data:
+  caddy-config:
+  scenario-artifacts:
 
 networks:
   swan: {}

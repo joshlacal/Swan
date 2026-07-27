@@ -157,6 +157,55 @@ final class SwanInteropTests: XCTestCase {
         XCTAssertFalse(report.isValid)
         XCTAssertTrue(report.diagnostics.contains { $0.code == .malformedGeneratedWireManifest })
     }
+
+    func testLaboratoryCacheRequiresMatchingArchiveAndPDSSource() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "swan-lab-cache-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let archiveData = Data("pinned archive fixture".utf8)
+        let archiveDigest = SHA256.hash(data: archiveData).map { String(format: "%02x", $0) }.joined()
+        let pin = ReferenceSourcePin(
+            repository: URL(string: "https://example.invalid/reference")!,
+            commit: "fixture",
+            archiveSHA256: archiveDigest
+        )
+        try archiveData.write(to: root.appending(path: "atproto-fixture.tar.gz"))
+        let source = root.appending(path: "atproto-fixture", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(
+            at: source.appending(path: "services/pds", directoryHint: .isDirectory),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: source.appending(path: "packages/pds", directoryHint: .isDirectory),
+            withIntermediateDirectories: true
+        )
+        for path in ["package.json", "pnpm-lock.yaml", "services/pds/Dockerfile", "packages/pds/package.json"] {
+            try Data("{}".utf8).write(to: source.appending(path: path))
+        }
+
+        XCTAssertTrue(InteropLaboratory.validate(cacheDirectory: root, pin: pin).isValid)
+
+        try Data("mutated".utf8).write(to: root.appending(path: "atproto-fixture.tar.gz"))
+        XCTAssertEqual(
+            InteropLaboratory.validate(cacheDirectory: root, pin: pin).diagnostics,
+            [.invalidReferenceArchive]
+        )
+    }
+
+    func testSanitizedScenarioArtifactHasNoCredentialFields() throws {
+        let artifact = try SanitizedScenarioArtifact(
+            scenario: "reference-matrix",
+            faultModes: [.delayed, .corrupted]
+        )
+        let encoded = try JSONEncoder().encode(artifact)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let keys = Set(object.keys.map { $0.lowercased() })
+        XCTAssertTrue(keys.isDisjoint(with: ["password", "authorization", "access_token", "refresh_token", "dpop", "private_key", "ikm"]))
+        XCTAssertEqual(object["status"] as? String, "planned-not-executed")
+        XCTAssertTrue((object["fixturePolicy"] as? String ?? "").hasPrefix("summary-only"))
+    }
 }
 
 private final class ProfileFixture {

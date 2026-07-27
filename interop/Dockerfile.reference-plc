@@ -1,0 +1,22 @@
+# The PDS lockfile pins @did-plc/server@0.0.1 and its integrity. Build it from
+# the same verified atproto archive so the laboratory has no ambient checkout.
+FROM node:24.15-alpine3.23 AS build
+
+ARG REFERENCE_ARCHIVE_SHA256=1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea
+WORKDIR /reference
+COPY Swan/.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354.tar.gz /tmp/reference.tar.gz
+RUN echo "${REFERENCE_ARCHIVE_SHA256}  /tmp/reference.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/reference.tar.gz --strip-components=1 -C /reference \
+    && test -f /reference/pnpm-lock.yaml
+
+RUN npm install --global pnpm@11.5.2 \
+    && PUPPETEER_SKIP_DOWNLOAD=true pnpm install --frozen-lockfile --prefer-offline \
+    && test -f /reference/node_modules/.pnpm/@did-plc+server@0.0.1/node_modules/@did-plc/server/dist/bin.js
+
+FROM node:24.15-alpine3.23
+COPY --from=build /reference /reference
+WORKDIR /reference
+EXPOSE 2582
+ENV NODE_ENV=production
+USER node
+CMD ["node", "/reference/node_modules/.pnpm/@did-plc+server@0.0.1/node_modules/@did-plc/server/dist/bin.js"]
