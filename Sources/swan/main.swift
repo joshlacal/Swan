@@ -283,13 +283,125 @@ struct SwanCommand: AsyncParsableCommand {
         commandName: "swan",
         abstract: "Swift-native AT Protocol permissioned-data interoperability laboratory",
         subcommands: [
-            Serve.self, Account.self, Export.self, Restore.self, Verify.self, Lab.self,
+            Serve.self, Account.self, Export.self, Backup.self, Restore.self, Verify.self, Lab.self,
         ],
         defaultSubcommand: Verify.self
     )
 }
 
 extension SwanCommand {
+    struct Backup: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Write an authenticated encrypted operator account backup"
+        )
+
+        @Option(name: .long, help: "Required Swan data directory containing control.sqlite")
+        var dataDirectory: String
+
+        @Option(name: .long, help: "Active account DID to back up")
+        var did: String
+
+        @Option(name: .long, help: "New backup directory; an existing path is never overwritten")
+        var outputDirectory: String
+
+        @Option(name: .long, help: "Owner-only mounted operator-secret file")
+        var operatorSecretFile: String
+
+        @Option(name: .long, help: "Owner-only mounted account-KEK file")
+        var accountKEKFile: String
+
+        @Option(name: .long, help: "Owner-only mounted operator-backup key file")
+        var backupKeyFile: String
+
+        @Option(name: .customLong("account-kek-id"), help: "Active account-KEK identifier")
+        var accountKEKID: String = "primary"
+
+        @Option(name: .long, help: "Protected account key-envelope directory; defaults to <data-directory>/keys")
+        var accountKeyDirectory: String?
+
+        func run() async throws {
+            // Authorization is deliberately the first operation. No
+            // user-supplied source, output, or key path is standardized,
+            // opened, or otherwise probed before this capability exists.
+            _ = try AccountCommandSupport.authorization(
+                secretFilePath: operatorSecretFile
+            )
+            guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !did.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !outputDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !accountKEKFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !backupKeyFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !accountKEKID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  accountKeyDirectory.map({
+                      !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                  }) ?? true else {
+                throw ValidationError("operator backup failed")
+            }
+
+            var control: SQLiteControlDatabase?
+            var accountDatabase: SQLiteAccountDatabase?
+            do {
+                let canonicalDID = try AccountIdentifiers.validateDID(did)
+                let backupKey = try SwanOperatorBackupKey(
+                    secretFile: URL(fileURLWithPath: backupKeyFile)
+                )
+                let keyConfiguration = try AccountProvisioningSecrets
+                    .requiredMountedAccountKeyConfiguration(
+                        activeKeyID: accountKEKID,
+                        secretFile: URL(fileURLWithPath: accountKEKFile)
+                    )
+                let dataURL = URL(fileURLWithPath: dataDirectory).standardizedFileURL
+                let outputURL = URL(fileURLWithPath: outputDirectory).standardizedFileURL
+                let keyURL = accountKeyDirectory.map { URL(fileURLWithPath: $0) }
+                    ?? dataURL.appending(path: "keys", directoryHint: .isDirectory)
+                let destination = try SwanPortableExportDestination(outputURL)
+
+                let openedControl = try await SQLiteControlDatabase(
+                    dataDirectory: dataURL,
+                    openMode: .existingPortableExportSource
+                )
+                control = openedControl
+                guard let account = try await openedControl.account(did: canonicalDID),
+                      account.status == .active,
+                      account.signingKey != nil,
+                      account.rotationKey != nil,
+                      account.publicGenesisCommitCID != nil,
+                      let credential = try await openedControl.credential(did: canonicalDID) else {
+                    throw SwanOperatorAccountBackupError.failed
+                }
+                try await openedControl.close()
+                control = nil
+
+                let openedAccount = try await SQLiteAccountDatabase(
+                    dataDirectory: dataURL,
+                    did: canonicalDID,
+                    openMode: .existingPortableExportSource
+                )
+                accountDatabase = openedAccount
+                let keyReader = try ExistingFileAccountKeyReader(
+                    root: keyURL,
+                    configuration: keyConfiguration
+                )
+                let result = try await SwanOperatorAccountBackupExporter(
+                    database: openedAccount,
+                    keyReader: keyReader
+                ).backup(
+                    account: account,
+                    credential: credential,
+                    using: backupKey,
+                    to: destination
+                )
+                try await openedAccount.close()
+                accountDatabase = nil
+                try AccountCommandSupport.write(result)
+            } catch {
+                try? await accountDatabase?.close()
+                try? await control?.close()
+                throw ValidationError("operator backup failed")
+            }
+        }
+    }
+
     struct Restore: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
             abstract: "Verify and stage a portable logical account archive"

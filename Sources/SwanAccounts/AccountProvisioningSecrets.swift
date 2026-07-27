@@ -31,6 +31,35 @@ public enum AccountProvisioningSecrets {
         )
     }
 
+    /// Loads the account KEK for an offline operator backup from exactly one
+    /// selected mounted file. Unlike the general provisioning entry point,
+    /// this never consults process environment and requires canonical,
+    /// unpadded base64url for one 32-byte key.
+    public static func requiredMountedAccountKeyConfiguration(
+        activeKeyID: String = "primary",
+        secretFile: URL
+    ) throws -> AccountKeyEncryptionConfiguration {
+        let encoded = try readOwnerOnlyRegularFile(
+            secretFile,
+            maximumPayloadBytes: maximumEncodedKEKBytes
+        )
+        let normalized = try normalize(encoded, maximumBytes: maximumEncodedKEKBytes)
+        guard normalized.count == 43,
+              let text = String(data: normalized, encoding: .utf8),
+              text.utf8.allSatisfy({
+                  ($0 >= 0x41 && $0 <= 0x5a)
+                      || ($0 >= 0x61 && $0 <= 0x7a)
+                      || ($0 >= 0x30 && $0 <= 0x39)
+                      || $0 == 0x2d || $0 == 0x5f
+              }),
+              let key = decodeBase64URL(text),
+              key.count == 32,
+              encodeBase64URL(key) == text else {
+            throw SwanError.malformed("account KEK is invalid")
+        }
+        return try AccountKeyEncryptionConfiguration(activeKeyID: activeKeyID, activeKey: key)
+    }
+
     /// Reads one account password. A terminal LF or CRLF is accepted for
     /// mounted-secret compatibility; all other bytes are preserved exactly.
     public static func password(secretFile: URL) throws -> String {
@@ -88,6 +117,13 @@ public enum AccountProvisioningSecrets {
             .replacingOccurrences(of: "_", with: "/")
         base64.append(String(repeating: "=", count: (4 - base64.count % 4) % 4))
         return Data(base64Encoded: base64)
+    }
+
+    private static func encodeBase64URL(_ data: Data) -> String {
+        data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 
     private static func normalize(_ data: Data, maximumBytes: Int) throws -> Data {
