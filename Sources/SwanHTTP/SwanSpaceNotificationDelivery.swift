@@ -9,7 +9,9 @@ import SwanStorage
 
 /// One operator-configured service destination. The endpoint is selected from
 /// a static allowlist, never directly from a registered URL or an incoming
-/// service JWT. `audience` is the remote service DID used for the service JWT.
+/// service JWT. `audience` is the exact configured remote service identity
+/// used for the service JWT; it is not assumed to be a DID. The pinned
+/// TypeScript PDS records the registered endpoint itself as this identity.
 public struct SwanSpaceNotificationDestination: Sendable, Equatable {
     public let endpoint: URL
     public let audience: String
@@ -21,7 +23,7 @@ public struct SwanSpaceNotificationDestination: Sendable, Equatable {
               components.user == nil,
               components.password == nil,
               components.fragment == nil,
-              (try? DID(didString: audience)) != nil else {
+              validConfiguredServiceIdentity(audience) else {
             throw SwanError.malformed("notification destination is invalid")
         }
         self.endpoint = endpoint
@@ -45,9 +47,11 @@ public protocol SwanRegisteredSpaceNotificationDestinationResolving: Sendable {
     ) async throws -> SwanSpaceNotificationDestination?
 }
 
-/// Immutable lab configuration for both writer-to-authority and
-/// authority-to-recipient notification paths. Empty maps are a safe default:
-/// delivery remains durably pending until the operator configures a mapping.
+/// Immutable lab configuration for writer-to-authority notifications. The
+/// pinned TypeScript handler accepts only this writer-signed shape. Registered
+/// write fanout is retained as local discovery state but is not represented as
+/// a claimed cross-host delivery protocol until upstream defines a receiver
+/// that accepts an authority signing for another writer.
 public struct StaticSwanSpaceNotificationDestinations:
     SwanSpaceAuthorityNotificationDestinationResolving,
     SwanRegisteredSpaceNotificationDestinationResolving
@@ -165,10 +169,14 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
     }
 }
 
-/// Delivers authority-created fanout rows after confirming their registration
-/// remains current. The configured resolver maps an opaque registered string
-/// to an allowlisted endpoint and audience, so a malicious registration can
-/// never steer service traffic or JWT claims.
+/// Delivers authority-created *deletion* fanout rows after confirming their
+/// registration remains current. The pinned TypeScript `notifyWrite` handler
+/// requires `iss == repo`, while an authority cannot sign as an arbitrary
+/// member writer. Therefore write fanout is deliberately not sent across
+/// hosts; an old durable write row is acknowledged as a compatibility no-op.
+/// The configured resolver maps an opaque registered string to an allowlisted
+/// endpoint and exact audience, so a malicious registration can never steer
+/// service traffic or JWT claims.
 public struct HTTPPermissionedSpaceNotificationFanoutTransport:
     PermissionedSpaceNotificationFanoutTransport
 {
@@ -190,6 +198,13 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
     }
 
     public func deliver(_ notification: PersistedSpaceNotificationFanout) async throws {
+        guard notification.kind == .deleted else {
+            // Rows created by pre-interoperability builds are safe to retire:
+            // their authority-signed `notifyWrite` shape is rejected by the
+            // pinned TypeScript receiver and must not be retried as if it
+            // offered cross-host convergence.
+            return
+        }
         // A replacement, expiry, or future explicit removal wins over a row
         // that was already queued. Treat the stale delivery as a successful
         // no-op; the lease worker will acknowledge it without network I/O.
@@ -206,27 +221,8 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
         ) else {
             throw SwanError.unavailable("registered notification destination is unavailable")
         }
-        let method: String
-        let body: Data
-        switch notification.kind {
-        case .write:
-            guard let repository = notification.repository,
-                  let wireRevision = notification.wireRevision,
-                  let commitment = notification.commitment,
-                  commitment.count == 32 else {
-                throw SwanError.malformed("durable write fanout is invalid")
-            }
-            method = ComAtprotoSpaceNotifyWrite.typeIdentifier
-            body = try notificationJSON(
-                space: notification.space,
-                repository: repository,
-                wireRevision: wireRevision,
-                commitment: commitment
-            )
-        case .deleted:
-            method = ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier
-            body = try deletionJSON(space: notification.space)
-        }
+        let method = ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier
+        let body = try deletionJSON(space: notification.space)
         let token = try await serviceAuthentication.issue(
             issuer: notification.space.authority,
             audience: destination.audience,
@@ -292,4 +288,10 @@ private func validConfiguredNotificationEndpoint(_ raw: String) -> Bool {
         return false
     }
     return true
+}
+
+private func validConfiguredServiceIdentity(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 4_096 && value.utf8.allSatisfy {
+        $0 >= 0x21 && $0 <= 0x7e
+    }
 }

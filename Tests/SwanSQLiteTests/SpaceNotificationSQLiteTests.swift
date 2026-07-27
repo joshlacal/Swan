@@ -7,7 +7,7 @@ import SwanStorage
 import XCTest
 
 final class SpaceNotificationSQLiteTests: XCTestCase {
-    func testWriterNotificationsAreIdempotentMonotonicAndNeverCarryValues() async throws {
+    func testWriterNotificationsAreIdempotentMonotonicAndNeverEnqueueAuthorityFanout() async throws {
         let fixture = try NotificationFixture()
         let database = try await fixture.open()
         defer { Task { try? await database.close() } }
@@ -33,7 +33,9 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             commitmentByte: 1
         )
         try await database.receiveSpaceWriteNotification(first, now: now)
-        // Duplicate service JTI is a successful no-op, not a second fanout.
+        // Duplicate service JTI is a successful no-op, not another state
+        // change. The pinned TypeScript receiver requires `iss == repo`, so
+        // an authority cannot lawfully fan this write out to another host.
         try await database.receiveSpaceWriteNotification(first, now: now.addingTimeInterval(1))
         // A reordered older TID records its receipt but cannot regress the
         // authority hint or produce another recipient delivery.
@@ -57,9 +59,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         XCTAssertEqual(writers.first?.repository, fixture.writer)
         XCTAssertEqual(writers.first?.wireRevision, try fixture.tid(1).toString())
         XCTAssertEqual(writers.first?.commitment, Data(repeating: 1, count: 32))
-        XCTAssertEqual(pending.count, 1)
-        XCTAssertEqual(pending.first?.repository, fixture.writer)
-        XCTAssertEqual(pending.first?.commitment, Data(repeating: 1, count: 32))
+        XCTAssertTrue(pending.isEmpty)
         XCTAssertNil(String(describing: pending).range(of: "private record value"))
 
         do {
@@ -87,19 +87,16 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         XCTAssertEqual(afterConflict.first?.commitment, Data(repeating: 1, count: 32))
     }
 
-    func testFanoutWorkerRetriesOutsideTransactionsAndRecoversLease() async throws {
+    func testDeletionFanoutWorkerRetriesOutsideTransactionsAndRecoversLease() async throws {
         let fixture = try NotificationFixture()
         let database = try await fixture.open()
         defer { Task { try? await database.close() } }
         try await fixture.createAuthorityState(on: database)
         let now = Date(timeIntervalSince1970: 1_750_000_100)
         try await fixture.register(on: database, now: now)
-        try await database.receiveSpaceWriteNotification(
-            fixture.writeNotification(
-                eventID: "writer-event-retry",
-                revision: try fixture.tid(1),
-                commitmentByte: 2
-            ),
+        _ = try await database.deleteSimpleSpace(
+            space: fixture.space,
+            authorization: .accountOAuth(subject: fixture.authority, scopes: ["atproto"]),
             now: now
         )
 
@@ -125,6 +122,7 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         let transactionStates = await transport.writeTransactions()
         let remaining = try await database.pendingNotificationFanout()
         XCTAssertEqual(delivered.count, 2)
+        XCTAssertTrue(delivered.allSatisfy { $0.kind == .deleted })
         XCTAssertEqual(transactionStates, [false, false])
         XCTAssertTrue(remaining.isEmpty)
     }

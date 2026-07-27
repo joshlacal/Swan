@@ -65,28 +65,32 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertEqual(response.headers[.cacheControl], "no-store")
                 }
-                // Authority fanout preserves the member writer in `repo` but
-                // is signed by the authority. A recipient PDS accepts this as
-                // a successful no-op rather than trying to apply a remote
-                // operation or treating it as a retryable failure.
+                // The pinned TypeScript receiver requires `iss == repo` for
+                // notifyWrite. Do not accept an authority-signed surrogate:
+                // it would be incompatible with that receiver and would let
+                // Swan claim an unsupported cross-host delivery mode.
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.notifyWrite",
                     method: .post,
                     headers: authorityFanoutHeaders,
                     body: writeBody
                 ) { response in
-                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
                 }
-                // A service may receive a best-effort fanout for an account
-                // it does not host; this is also an opaque successful no-op.
+                // Likewise, an unbound recipient audience cannot turn an
+                // authority signature into a member-writer notification.
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.notifyWrite",
                     method: .post,
                     headers: unknownRecipientHeaders,
                     body: writeBody
                 ) { response in
-                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
                 }
+                // Deletion remains an authority-signed control-plane message.
+                // An unbound configured recipient is intentionally a no-op.
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.notifySpaceDeleted",
                     method: .post,
@@ -166,12 +170,12 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
 
         for _ in 0 ..< 100 {
             let counts = await transport.counts()
-            if counts.outbox == 1, counts.fanout == 1 { break }
+            if counts.outbox == 1 { break }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         let counts = await transport.counts()
         XCTAssertEqual(counts.outbox, 1)
-        XCTAssertEqual(counts.fanout, 1)
+        XCTAssertEqual(counts.fanout, 0)
         let remainingOutbox = try await database.pendingOutbox()
         let remainingFanout = try await database.pendingNotificationFanout()
         XCTAssertTrue(remainingOutbox.isEmpty)
@@ -393,11 +397,6 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
     }
 
     func receiveSpaceWriteNotification(_ notification: AuthorizedSpaceWriteNotification) async throws {
-        // Fanout from the authority is deliberately not remote state
-        // application at a recipient host.
-        if notification.issuer == authority, notification.audience != authority {
-            return
-        }
         guard notification.space.authority == authority, notification.repository == writer else {
             throw SwanError.unauthorized("notification is invalid")
         }

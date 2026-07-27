@@ -3419,42 +3419,13 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                     ]
                 )
 
-                let recipients = try await connection.query(
-                    """
-                    SELECT endpoint FROM permissioned_space_notification_registrations
-                    WHERE space_uri = ? AND expires_at > ?
-                      AND (repo_did IS NULL OR repo_did = ?)
-                    ORDER BY endpoint ASC
-                    """,
-                    [
-                        .text(notification.space.rawValue), .integer(timestamp),
-                        .text(notification.repository),
-                    ]
-                )
-                for row in recipients {
-                    let endpoint = try validNotificationEndpoint(
-                        try requiredText(row, "endpoint")
-                    )
-                    let fanoutID = UUID()
-                    _ = try await connection.query(
-                        """
-                        INSERT INTO permissioned_space_notification_fanout(
-                            id, source_issuer, source_event_id, kind, space_uri,
-                            repo_did, wire_revision, commitment, endpoint,
-                            attempts, created_at, available_at,
-                            lease_token, lease_expires_at
-                        ) VALUES (?, ?, ?, 'write', ?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL)
-                        ON CONFLICT(source_issuer, source_event_id, kind, endpoint) DO NOTHING
-                        """,
-                        [
-                            .text(fanoutID.uuidString), .text(notification.issuer),
-                            .text(eventID), .text(notification.space.rawValue),
-                            .text(notification.repository), .text(notification.wireRevision),
-                            blob(notification.commitment), .text(endpoint),
-                            .integer(timestamp), .integer(timestamp),
-                        ]
-                    )
-                }
+                // Do not enqueue an authority-signed `notifyWrite` fanout.
+                // The pinned TypeScript receiver requires `iss == repo`, but
+                // this authority has only its own key and cannot truthfully
+                // sign for another member writer. Registrations remain local
+                // discovery/authority state; cross-host write fanout awaits a
+                // compatible upstream receiver contract. Deletion fanout is
+                // separate and remains authority-signed by definition.
             }
         }
     }

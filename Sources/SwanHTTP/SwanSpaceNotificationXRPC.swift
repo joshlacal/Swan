@@ -16,15 +16,18 @@ public struct SwanAuthenticatedSpaceNotificationsCapability: Sendable {
     let directory: any AuthorizedSpaceNotificationDirectory
     let credentialAuthorizer: any SpaceCredentialAuthorizationVerifier
     let serviceAuthentication: any SpaceServiceAuthenticationVerifier
+    let recipientBindings: SwanSpaceNotificationRecipientBindings
 
     init(
         directory: any AuthorizedSpaceNotificationDirectory,
         credentialAuthorizer: any SpaceCredentialAuthorizationVerifier,
-        serviceAuthentication: any SpaceServiceAuthenticationVerifier
+        serviceAuthentication: any SpaceServiceAuthenticationVerifier,
+        recipientBindings: SwanSpaceNotificationRecipientBindings
     ) {
         self.directory = directory
         self.credentialAuthorizer = credentialAuthorizer
         self.serviceAuthentication = serviceAuthentication
+        self.recipientBindings = recipientBindings
     }
 }
 
@@ -154,17 +157,13 @@ private struct AuthenticatedNotifySpaceWriteHandler:
             expectedAudience: nil,
             expectedMethod: ComAtprotoSpaceNotifyWrite.typeIdentifier
         )
-        let directWriterToAuthority = service.issuer == input.repo.didString()
-            && service.audience == space.authority
-        // The authority's durable fanout preserves the original writer in
-        // `repo`, but is signed by the authority and addressed to a configured
-        // recipient service. A recipient which does not host the authority
-        // accepts this as a successful no-op; it must never interpret it as a
-        // remote operation to apply locally.
-        let authorityFanoutToRecipient = service.issuer == space.authority
-            && service.audience != space.authority
-        guard directWriterToAuthority || authorityFanoutToRecipient,
-              (try? DID(didString: service.audience)) != nil else {
+        // This is the only notifyWrite shape accepted by the pinned TypeScript
+        // PDS: the writer signs its own announcement and addresses the space
+        // authority. An authority cannot safely re-sign another writer's
+        // announcement, so Swan does not claim authority-to-recipient write
+        // fanout interoperability on this endpoint.
+        guard service.issuer == input.repo.didString(),
+              service.audience == space.authority else {
             throw AuthenticatedSpaceNotificationFailure.denied
         }
         do {
@@ -204,15 +203,23 @@ private struct AuthenticatedNotifySpaceDeletedHandler:
             expectedAudience: nil,
             expectedMethod: ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier
         )
-        guard service.issuer == space.authority,
-              (try? DID(didString: service.audience)) != nil else {
+        guard service.issuer == space.authority else {
             throw AuthenticatedSpaceNotificationFailure.denied
+        }
+        // A deletion receiver identity is an explicit operator binding rather
+        // than a syntactic DID check. This supports the pinned PDS's service
+        // identities (which may be endpoint-like) while ensuring an incoming
+        // audience cannot select an arbitrary local account.
+        guard let recipientAccount = capability.recipientBindings.account(
+            forServiceIdentity: service.audience
+        ) else {
+            return
         }
         do {
             try await capability.directory.receiveSpaceDeletionNotification(
                 space: space,
                 issuer: service.issuer,
-                audience: service.audience,
+                audience: recipientAccount,
                 eventID: service.eventID
             )
         } catch {

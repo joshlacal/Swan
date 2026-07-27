@@ -133,9 +133,14 @@ public struct SwanSpaceRepositorySyncHTTPConfiguration: Sendable {
 /// service claims can never turn an XRPC request into a network lookup.
 public struct SwanSpaceNotificationHTTPConfiguration: Sendable {
     let serviceAuthentication: any SpaceServiceAuthenticationVerifier
+    let recipientBindings: SwanSpaceNotificationRecipientBindings
 
-    public init(serviceAuthentication: any SpaceServiceAuthenticationVerifier) {
+    public init(
+        serviceAuthentication: any SpaceServiceAuthenticationVerifier,
+        recipientBindings: SwanSpaceNotificationRecipientBindings = .empty
+    ) {
         self.serviceAuthentication = serviceAuthentication
+        self.recipientBindings = recipientBindings
     }
 }
 
@@ -350,7 +355,8 @@ public struct SwanHTTPServer: Sendable {
                     credentialAuthorizer: DurableSpaceCredentialVerifier(
                         publicKeys: spaceCredentialConfiguration.credentialPublicKeys
                     ),
-                    serviceAuthentication: spaceNotificationConfiguration.serviceAuthentication
+                    serviceAuthentication: spaceNotificationConfiguration.serviceAuthentication,
+                    recipientBindings: spaceNotificationConfiguration.recipientBindings
                 )
             } else {
                 authenticatedSpaceNotifications = nil

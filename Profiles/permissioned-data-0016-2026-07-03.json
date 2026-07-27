@@ -23,6 +23,11 @@
       "endpoint": "com.atproto.space.getRepo",
       "referenceBehavior": "Pinned TypeScript handler throws MethodNotImplementedError and its generated Swift contract exposes a whole Data output.",
       "swanBehavior": "Streams proposal-0016 two-root full-recovery CARs from a private bounded-memory spool; the generated handler is retained for typed parameter/context semantics but its Data-returning method is never used by the transport."
+    },
+    {
+      "endpoint": "com.atproto.space.notifyWrite",
+      "referenceBehavior": "Pinned notifyWrite rejects a request unless auth.credentials.iss equals body.repo, but its authority fanout signs iss as ownerDid while retaining a member writer in body.repo; the resulting cross-host fanout shape is not accepted by that same pinned receiver when owner and writer differ.",
+      "swanBehavior": "Emits and accepts only direct writer-to-authority notifications with iss equal to repo and an exact configured authority service identity as aud. It intentionally does not emit or accept authority-signed cross-host write fanout; registrations remain discovery state and notifySpaceDeleted remains the separate authority-signed tombstone control plane."
     }
   ],
   "endpoints": [

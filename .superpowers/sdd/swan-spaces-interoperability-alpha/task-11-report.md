@@ -141,3 +141,97 @@ This task does not apply remote operations, persist operation values/CARs in
 notification state, enable unverified outbound transport in `swan serve`, or
 claim a Docker/reference-host interoperability matrix. A peer-verifying
 connector and Compose environment remain separate requirements.
+
+## Re-review repair — peer-pinned egress and pinned TypeScript semantics
+
+This section supersedes the earlier “Review repair,” “Tests,” “Verification,”
+and “Remaining executable integration gate” descriptions where they conflict.
+The stock executable now has a concrete peer-proving connector and enables
+the recovery worker when the operator supplies all required encrypted key and
+peer-pinning configuration.
+
+### Pinned-reference finding
+
+The pinned TypeScript PDS (`3f6c96d`) has an incompatibility in the claimed
+authority-to-recipient `notifyWrite` fanout path:
+
+- `packages/pds/src/api/com/atproto/space/registerNotify.ts` stores the raw
+  registered endpoint as `serviceDid`.
+- `packages/pds/src/api/com/atproto/space/notifyWrite.ts` rejects a request
+  unless `auth.credentials.iss === body.repo`, before its non-hosted-authority
+  no-op path.
+- Its authority fanout loop signs `iss: ownerDid` while retaining the member
+  writer in `repo`; such a request is therefore not accepted by that same
+  pinned receiver when owner and writer differ.
+
+Swan no longer claims to interoperate with that authority-signed write fanout.
+Only direct writer-to-authority delivery is emitted and accepted:
+`iss == repo`, `aud == configured authority service identity`, and
+`lxm == com.atproto.space.notifyWrite`. Authority-signed
+`notifySpaceDeleted` remains a separate deletion/tombstone control-plane
+message. Registration state remains durable discovery/intent state, but no
+cross-host write delivery is inferred from it. Pre-repair write fanout rows
+are acknowledged as compatibility no-ops rather than retried as a false
+convergence mechanism.
+
+### Delivered repair
+
+- Added `NIOPeerPinnedOAuthPostTransport`. It connects NIO directly to the
+  configured literal IP for an exact endpoint, validates TLS using the URL
+  hostname/SNI, verifies `Channel.remoteAddress`, and returns that peer to
+  `OAuthBoundedJSONPoster`. The existing poster retains pre/post DNS
+  resolution and requires the proved peer to occur in both approved answer
+  sets.
+- `swan serve --enable-notification-delivery` now instantiates that transport,
+  an encrypted `FileAccountKeyStore`-backed local service-JWT signer, and
+  `SwanNotificationRecoveryService`. It requires `--notification-config` plus
+  a mounted/ambient account KEK (`--notification-account-kek-file` or
+  `SWAN_ACCOUNT_KEK`), and it refuses to enable without a peer-pinned
+  destination.
+- Notification configuration accepts explicit `ES256` and `ES256K` public
+  pins for credential and service verification. Service audiences are bounded
+  configured identities rather than assumed DIDs, matching the pinned PDS’s
+  raw-endpoint behavior. Exact service-identity-to-local-account bindings
+  govern deletion receipt; an unbound deletion is an opaque no-op and cannot
+  select an arbitrary local account.
+- Fixed service-JWT XRPC method validation to accept the camel-case method
+  segments used by real endpoints (`notifyWrite`, `notifySpaceDeleted`). The
+  TypeScript ES256K golden exposed this otherwise silent interoperability
+  failure.
+- Recorded this receiver/fanout mismatch as an immutable
+  `com.atproto.space.notifyWrite` intentional divergence in
+  `permissioned-data-0016-2026-07-03`, alongside the existing streamed-CAR
+  divergence.
+- Added the deterministic TypeScript `Secp256k1Keypair` ES256K
+  `notifyWrite` fixture, which Swan verifies with the pinned public key and
+  tests against the exact source requirements whenever the pinned source cache
+  is available.
+
+### Updated test evidence
+
+- `NIOPeerPinnedOAuthPostTransportTests` starts a real local NIO TLS server
+  (TLS hostname `hummingbird.codes`, TCP peer `127.0.0.1`) and proves a
+  successful exact-peer request plus rejection after a post-request DNS
+  rebind. The request reaches the TLS peer before the rebinding rejection.
+- `TypeScriptSpaceNotificationContractTests` verifies the pinned ES256K
+  golden and asserts Swan’s direct-writer outgoing claim shape. Its cached
+  source check confirms the TypeScript `iss === repo`, `iss: ownerDid`, and
+  `aud: recipient.serviceDid` evidence.
+- Updated SQLite and HTTP notification tests to prove direct writer delivery
+  never creates authority write fanout, authority-signed write notifications
+  are rejected, deletion fanout retries outside a transaction, and unbound
+  deletion recipients remain no-ops.
+
+| Command | Result |
+| --- | --- |
+| `CPATH=/opt/homebrew/include LIBRARY_PATH=/opt/homebrew/lib swift build --target swan` | PASS. |
+| `CPATH=/opt/homebrew/include LIBRARY_PATH=/opt/homebrew/lib swift test --filter 'NIOPeerPinnedOAuthPostTransportTests|TypeScriptSpaceNotificationContractTests|SpaceNotificationSQLiteTests|SpaceNotificationHTTPTests'` | PASS. |
+| `CPATH=/opt/homebrew/include LIBRARY_PATH=/opt/homebrew/lib swift test` | PASS — complete package suite; the two pre-existing opt-in 256 MiB stress tests remain skipped without their environment flags. |
+| `swift run swan verify --reference-directory .interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354` | PASS — `PROFILE OK: permissioned-data-0016-2026-07-03`. |
+| `git diff --check` | PASS. |
+
+The expected local Petrel `libsecret-1` pkg-config warning and local
+libsodium deployment-target linker warning were non-fatal. This repair still
+does not claim the full Compose cross-host matrix; it corrects the executable
+and contract boundary so that matrix cannot test a known-invalid write-fanout
+shape.

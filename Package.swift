@@ -25,6 +25,12 @@ let package = Package(
         .package(url: "https://github.com/swift-server/swift-service-lifecycle.git", exact: "2.11.0"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", exact: "3.15.1"),
+        // The notification connector owns the TCP/TLS connection so it can
+        // pin and report the actual peer. Keep these direct pins aligned with
+        // Hummingbird's resolved NIO line instead of relying on a transitive
+        // import from the HTTP server.
+        .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.3"),
+        .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.37.2"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
         // The pinned TypeScript PDS signs AT Protocol repository and space
         // JWTs with secp256k1 (`ES256K`). Keep verification in SwanOAuth
@@ -103,6 +109,10 @@ let package = Package(
                 "SwanAccounts", "SwanCore", "SwanSpaces", "SwanStorage",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl"),
                 .product(name: "secp256k1", package: "secp256k1.swift"),
             ]
         ),
@@ -155,7 +165,12 @@ let package = Package(
             dependencies: [
                 "SwanAccounts", "SwanOAuth", "SwanSQLite", "SwanStorage", "SwanSpaces",
                 .product(name: "Crypto", package: "swift-crypto"),
-            ]
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl"),
+            ],
+            resources: [.copy("Fixtures")]
         ),
         .testTarget(
             name: "SwanAccountsTests",
