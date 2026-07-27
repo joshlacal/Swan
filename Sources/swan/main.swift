@@ -12,6 +12,12 @@ import SwanPublicRepository
 import SwanSQLite
 import ServiceLifecycle
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 /// Offline operator configuration for the notification laboratory. All key
 /// pins are public verification material; outbound signing remains backed by
 /// the separately configured encrypted account key store. Destinations are
@@ -274,6 +280,111 @@ private struct ServeUnavailableCredentialSigningKeyResolver:
 {
     func signingKey(for _: String) async throws -> SpaceCredentialAuthoritySigningKey? {
         nil
+    }
+}
+
+/// Startup-only composition for Swan's local permissioned-space laboratory.
+///
+/// This is deliberately kept in the executable rather than exported from an
+/// HTTP or account module: it is operator-selected deployment wiring, not a
+/// capability handlers may construct from request input.  The one
+/// `FileAccountKeyStore` is retained only by fixed-purpose protocol adapters.
+/// In particular, this type never hands a database, scalar, or general signing
+/// closure to the HTTP layer.
+private struct ServeLocalSpaceRuntime {
+    let credentialConfiguration: SwanSpaceCredentialHTTPConfiguration
+    let delegationConfiguration: SwanSpaceDelegationHTTPConfiguration
+    let repositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration
+
+    static func make(
+        keyDirectory: URL,
+        kekFile: URL,
+        kekID: String,
+        controlStore: SQLiteControlDatabase
+    ) async throws -> ServeLocalSpaceRuntime {
+        // `FileAccountKeyStore` will repeat this check while opening its
+        // descriptor.  Keep this preflight non-creating: `serve` must not
+        // create a key directory merely because local interop was requested.
+        try requireExistingOwnerOnlyKeyDirectory(keyDirectory)
+        let configuration = try AccountProvisioningSecrets
+            .requiredMountedAccountKeyConfiguration(
+                activeKeyID: kekID,
+                secretFile: kekFile
+            )
+        let keyStore = try FileAccountKeyStore(
+            root: keyDirectory,
+            configuration: configuration
+        )
+        let hasher = try LibsodiumArgon2idHasher()
+        let accounts = DurableAccountDirectory(
+            store: controlStore,
+            passwordHasher: hasher,
+            verificationExecutor: try Argon2idVerificationExecutor(hasher: hasher)
+        )
+
+        // A live local runtime is meaningful only for provisioned accounts.
+        // Verify the durable control references and authenticated public key
+        // metadata without decrypting a private scalar at startup.
+        let activeDIDs = try await controlStore.activeAccountDIDs()
+        guard !activeDIDs.isEmpty else {
+            throw SwanError.unavailable("local space runtime has no active accounts")
+        }
+        for did in activeDIDs {
+            guard let references = try await accounts.keyReferences(did: did),
+                  try await keyStore.publicKey(for: references.signing) != nil else {
+                throw SwanError.unavailable("local space runtime account keys are unavailable")
+            }
+        }
+
+        return .init(
+            credentialConfiguration: .init(
+                authoritySigningKeys: LocalAccountSpaceCredentialSigningKeyResolver(
+                    accounts: accounts,
+                    keyStore: keyStore
+                ),
+                delegationPublicKeys: LocalAccountSpaceDelegationPublicKeyResolver(
+                    accounts: accounts,
+                    publicKeyStore: keyStore
+                ),
+                credentialPublicKeys: LocalAccountSpaceCredentialPublicKeyResolver(
+                    accounts: accounts,
+                    publicKeyStore: keyStore
+                )
+            ),
+            delegationConfiguration: .init(
+                tokenIssuer: LocalAccountSpaceDelegationTokenIssuer(
+                    accounts: accounts,
+                    keyStore: keyStore
+                )
+            ),
+            repositorySyncConfiguration: .init(
+                commitSigner: LocalAccountSpaceRepositoryCommitSigner(
+                    accounts: accounts,
+                    keyStore: keyStore
+                )
+            )
+        )
+    }
+}
+
+/// The key store itself repeats this descriptor-safe validation when it opens
+/// the directory. This check exists solely to prohibit `serve` from creating a
+/// new key root in its opt-in runtime path.
+private func requireExistingOwnerOnlyKeyDirectory(_ url: URL) throws {
+    let descriptor = url.withUnsafeFileSystemRepresentation { path in
+        guard let path else { return Int32(-1) }
+        return open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    }
+    guard descriptor >= 0 else {
+        throw SwanError.unavailable("local space key directory is unavailable")
+    }
+    defer { _ = close(descriptor) }
+    var status = stat()
+    guard fstat(descriptor, &status) == 0,
+          (status.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR),
+          status.st_uid == geteuid(),
+          Int(status.st_mode & mode_t(0o777)) == 0o700 else {
+        throw SwanError.unavailable("local space key directory is unavailable")
     }
 }
 
@@ -690,13 +801,68 @@ extension SwanCommand {
         @Option(name: .customLong("notification-account-kek-file"), help: "Owner-only mounted account-KEK file for notification signing; SWAN_ACCOUNT_KEK is the alternative")
         var notificationAccountKEKFile: String?
 
-        @Option(name: .customLong("notification-account-kek-id"), help: "Active account-KEK identifier for notification signing")
-        var notificationAccountKEKID: String = "primary"
+        @Option(name: .customLong("notification-account-kek-id"), help: "Active account-KEK identifier for notification signing (default: primary)")
+        var notificationAccountKEKID: String?
 
         @Option(name: .customLong("notification-account-key-directory"), help: "Protected account key-envelope directory for notification signing; defaults to <data-directory>/keys")
         var notificationAccountKeyDirectory: String?
 
+        @Flag(
+            name: .customLong("enable-local-space-interop"),
+            help: "Enable local account-key credential, delegation, and repository-sync interop. Conflicts with all notification configuration until resolver merging is separately reviewed."
+        )
+        var enableLocalSpaceInterop = false
+
+        @Option(
+            name: .customLong("space-account-kek-file"),
+            help: "Owner-only mounted account-KEK file required by --enable-local-space-interop"
+        )
+        var spaceAccountKEKFile: String?
+
+        @Option(
+            name: .customLong("space-account-kek-id"),
+            help: "Active account-KEK identifier for local space interop (default: primary)"
+        )
+        var spaceAccountKEKID: String?
+
+        @Option(
+            name: .customLong("space-account-key-directory"),
+            help: "Existing owner-only account key-envelope directory for local space interop; defaults to <data-directory>/keys"
+        )
+        var spaceAccountKeyDirectory: String?
+
         func run() async throws {
+            if !enableLocalSpaceInterop {
+                guard spaceAccountKEKFile == nil,
+                      spaceAccountKEKID == nil,
+                      spaceAccountKeyDirectory == nil else {
+                    throw ValidationError(
+                        "space account key options require --enable-local-space-interop"
+                    )
+                }
+            } else {
+                guard let spaceAccountKEKFile,
+                      !spaceAccountKEKFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      spaceAccountKEKID.map({
+                          !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      }) ?? true,
+                      spaceAccountKeyDirectory.map({
+                          !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      }) ?? true else {
+                    throw ValidationError(
+                        "--enable-local-space-interop requires an owner-only --space-account-kek-file"
+                    )
+                }
+                guard !enableNotificationDelivery,
+                      notificationConfig == nil,
+                      notificationAccountKEKFile == nil,
+                      notificationAccountKEKID == nil,
+                      notificationAccountKeyDirectory == nil else {
+                    throw ValidationError(
+                        "--enable-local-space-interop conflicts with notification configuration"
+                    )
+                }
+            }
             guard !enableManagementPLCProvisioning || managementPort != nil else {
                 throw ValidationError("--enable-management-plc-provisioning requires --management-port")
             }
@@ -723,6 +889,12 @@ extension SwanCommand {
                 guard let url = URL(string: value) else { throw ValidationError("--public-url must be a URL") }
                 return url
             } ?? URL(string: "http://\(host):\(port)")!
+            if enableLocalSpaceInterop,
+               baseURL.scheme?.lowercased() != "https" {
+                throw ValidationError(
+                    "--enable-local-space-interop requires an HTTPS --public-url"
+                )
+            }
             let dataURL = URL(fileURLWithPath: dataDirectory)
             let serverKey = try loadOAuthServerKey()
             let controlDatabase = try await SQLiteControlDatabase(dataDirectory: dataURL)
@@ -738,6 +910,23 @@ extension SwanCommand {
                     controlStore: controlDatabase
                 )
                 preopenedAccountDirectory = directory
+                let localSpaceRuntime: ServeLocalSpaceRuntime?
+                if enableLocalSpaceInterop {
+                    do {
+                        localSpaceRuntime = try await .make(
+                            keyDirectory: spaceAccountKeyDirectory.map {
+                                URL(fileURLWithPath: $0)
+                            } ?? dataURL.appending(path: "keys"),
+                            kekFile: URL(fileURLWithPath: spaceAccountKEKFile!),
+                            kekID: spaceAccountKEKID ?? "primary",
+                            controlStore: controlDatabase
+                        )
+                    } catch {
+                        throw ValidationError("local space interop runtime is unavailable")
+                    }
+                } else {
+                    localSpaceRuntime = nil
+                }
                 let oauthRuntime = try SwanOAuthRuntime(
                     controlStore: controlDatabase,
                     serverKey: serverKey
@@ -854,7 +1043,7 @@ extension SwanCommand {
                     let keyStore: FileAccountKeyStore
                     do {
                         keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
-                            activeKeyID: notificationAccountKEKID,
+                            activeKeyID: notificationAccountKEKID ?? "primary",
                             secretFile: notificationAccountKEKFile.map { URL(fileURLWithPath: $0) }
                         )
                         let keyDirectory = notificationAccountKeyDirectory.map { URL(fileURLWithPath: $0) }
@@ -947,7 +1136,10 @@ extension SwanCommand {
                     authorizationServerConfiguration: authorizationServerConfiguration,
                     authenticatedGetSpaceDirectory: directory,
                     accountControlStore: controlDatabase,
-                    spaceCredentialConfiguration: notificationRuntime?.credentialConfiguration,
+                    spaceCredentialConfiguration: localSpaceRuntime?.credentialConfiguration
+                        ?? notificationRuntime?.credentialConfiguration,
+                    spaceDelegationConfiguration: localSpaceRuntime?.delegationConfiguration,
+                    spaceRepositorySyncConfiguration: localSpaceRuntime?.repositorySyncConfiguration,
                     spaceNotificationConfiguration: notificationRuntime?.notificationConfiguration
                 )
                 guard server.authenticatedGetSpace != nil else {
