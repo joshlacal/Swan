@@ -1,0 +1,22 @@
+# Reference-PLC context follows the PDS rule: only its immutable archive is
+# allowed back into the otherwise excluded ignored reference cache.
+**
+!Swan/
+!Swan/**
+!Petrel/
+!Petrel/**
+**/.env*
+!**/.env.example
+**/.swan-data/
+**/.swan-data/**
+**/*.sqlite
+**/*.sqlite-shm
+**/*.sqlite-wal
+**/*.pem
+**/*.key
+**/*.p8
+**/keys/
+**/keys/**
+Swan/.interop-cache/**
+!Swan/.interop-cache/
+!Swan/.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354.tar.gz

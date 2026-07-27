@@ -6,7 +6,7 @@ cd "$root"
 
 ./interop/verify-reference.sh
 
-for service in swan reference-pds reference-plc caddy mailpit toxiproxy scenario-runner; do
+for service in swan reference-pds reference-plc caddy mailpit toxiproxy scenario-runner scenario-artifacts-init; do
   rg -q "^  ${service}:" docker-compose.yml
 done
 rg -q 'permissioned-data-0016-2026-07-03' Sources/SwanInterop/SwanInterop.swift
@@ -15,6 +15,48 @@ rg -q '3f6c96d5d2d25438bd40fa89d6ecc37865f8e354' interop/Dockerfile.reference-pd
 rg -q '1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea' interop/Dockerfile.reference-pds
 rg -q 'tls internal' interop/Caddyfile
 rg -q 'reverse_proxy toxiproxy:8666' interop/Caddyfile
+
+rg -qx 'FROM swift:6\.1-jammy AS build' Dockerfile
+rg -q 'libsodium-dev pkg-config' Dockerfile
+rg -qx 'FROM ubuntu:24\.04' Dockerfile
+rg -q 'libsodium23' Dockerfile
+
+# A named volume starts root-owned. This root-only init container is the sole
+# ownership transition; the scenario runner retains the Dockerfile's swan user.
+init_block="$(awk '/^  scenario-artifacts-init:/{capture=1; next} capture && /^  [[:alnum:]][[:alnum:]-]*:/{capture=0} capture {print}' docker-compose.yml)"
+runner_block="$(awk '/^  scenario-runner:/{capture=1; next} capture && /^  [[:alnum:]][[:alnum:]-]*:/{capture=0} capture {print}' docker-compose.yml)"
+[[ "$init_block" == *'user: root'* ]]
+[[ "$init_block" == *'install -d -o swan -g swan -m 0700 /artifacts'* ]]
+[[ "$init_block" == *'scenario-artifacts:/artifacts'* ]]
+[[ "$runner_block" == *'scenario-artifacts-init:'* ]]
+[[ "$runner_block" == *'condition: service_completed_successfully'* ]]
+[[ "$runner_block" != *'user:'* ]]
+
+for reference_dockerfile in interop/Dockerfile.reference-pds interop/Dockerfile.reference-plc; do
+  ! rg -q '^ARG[[:space:]]+REFERENCE_ARCHIVE_SHA256' "$reference_dockerfile"
+  rg -q '^RUN echo "1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea  /tmp/reference\.tar\.gz" \| sha256sum -c -' "$reference_dockerfile"
+done
+
+# Compose uses the repository root as its context. The generic and
+# Dockerfile-specific controls must be allowlists with the sensitive cache
+# excluded, except for the one archive explicitly needed by reference builds.
+for ignore_file in Dockerfile.dockerignore interop/Dockerfile.reference-pds.dockerignore interop/Dockerfile.reference-plc.dockerignore; do
+  rg -qx '\*\*' "$ignore_file"
+  rg -qx '!Swan/' "$ignore_file"
+  rg -qx '!Petrel/' "$ignore_file"
+  rg -qx '\*\*/\.env\*' "$ignore_file"
+  rg -qx '\*\*/\.swan-data/' "$ignore_file"
+  rg -qx '\*\*/\*\.sqlite' "$ignore_file"
+  rg -qx '\*\*/\*\.key' "$ignore_file"
+done
+for ignore_file in Dockerfile.dockerignore; do
+  rg -qx 'Swan/\.interop-cache/\*\*' "$ignore_file"
+  ! rg -q '^!Swan/\.interop-cache/atproto-' "$ignore_file"
+done
+for ignore_file in interop/Dockerfile.reference-pds.dockerignore interop/Dockerfile.reference-plc.dockerignore; do
+  rg -qx 'Swan/\.interop-cache/\*\*' "$ignore_file"
+  rg -qx '!Swan/\.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354\.tar\.gz' "$ignore_file"
+done
 
 if rg -n '^[[:space:]]*RUN .*\b(curl|git clone|git fetch)\b' interop/Dockerfile.reference-pds interop/Dockerfile.reference-plc; then
   echo "reference image Dockerfiles must not fetch source from the network" >&2

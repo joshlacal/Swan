@@ -3,11 +3,9 @@
 # source checkout in this Dockerfile.
 FROM node:24.15-alpine3.23 AS build
 
-ARG REFERENCE_SHA=3f6c96d5d2d25438bd40fa89d6ecc37865f8e354
-ARG REFERENCE_ARCHIVE_SHA256=1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea
 WORKDIR /app
 COPY Swan/.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354.tar.gz /tmp/reference.tar.gz
-RUN echo "${REFERENCE_ARCHIVE_SHA256}  /tmp/reference.tar.gz" | sha256sum -c - \
+RUN echo "1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea  /tmp/reference.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/reference.tar.gz --strip-components=1 -C /app \
     && test -f /app/services/pds/Dockerfile \
     && test -f /app/pnpm-lock.yaml

@@ -6,6 +6,10 @@ DONE_WITH_CONCERNS. The cache-gated Compose topology, local TLS route,
 sanitized scenario artifact path, focused tests, and offline verifier are
 implemented. No reference-PDS matrix is claimed as passing.
 
+An acceptance-hardening follow-up also closes the builder/runtime libsodium,
+fresh-volume ownership, immutable-checksum, and build-context exposure gaps
+identified in review.
+
 ## Files changed
 
 - `docker-compose.yml` now defines Swan, the pinned reference PDS and PLC,
@@ -34,6 +38,20 @@ implemented. No reference-PDS matrix is claimed as passing.
   local TLS/Toxiproxy route, and no-network-source-fetch Dockerfile invariant.
 - `docs/superpowers/plans/swan-spaces-interoperability-alpha.md` records this
   evidence and the explicit non-passing/live-matrix gates.
+- The Swift Dockerfile now retains the pinned `swift:6.1-jammy` builder and
+  installs `libsodium-dev` plus `pkg-config`; its Ubuntu runtime installs
+  `libsodium23`. This gives a clean Linux image the same system dependency
+  boundary required by the Swift package instead of relying on a host library.
+- `scenario-artifacts-init` is a root-only, network-disabled one-shot service
+  that prepares the fresh named `scenario-artifacts` volume with `swan`
+  ownership and mode `0700`. `scenario-runner` waits for it before writing,
+  so `/artifacts` is writable by the non-root image user.
+- Both reference Dockerfiles now embed the immutable archive SHA directly in
+  their `sha256sum -c` command; no checksum ARG can override it in a direct
+  Docker build. Dockerfile-specific ignore files allowlist only Swan/Petrel
+  source and exclude environment files, Swan data, SQLite/key material, and
+  the extracted reference cache. The PDS/PLC files re-include exactly the
+  one verified tarball required by their `COPY` instruction.
 
 ## Architecture decisions
 
@@ -49,6 +67,11 @@ implemented. No reference-PDS matrix is claimed as passing.
   frozen profile/revision pins, scenario name, fault intent, and fixture
   policy. It is intentionally not a protocol-result fixture and cannot be
   evidence of matrix success.
+- Compose explicitly names each Dockerfile, so its matching Dockerfile-specific
+  `.dockerignore` controls the shared repository-root context. The ordinary
+  Swan/scenario context never receives `.interop-cache`; reference contexts
+  receive only the immutable tarball, not the extracted checkout or any local
+  state.
 
 ## Verification
 
@@ -61,6 +84,8 @@ All commands ran from `/Users/joshlacalamito/Developer/Catbird+Petrel/Swan`.
 | `swift run swan lab validate --root .` | PASS — `LAB PREREQUISITES OK: 3f6c96d5d2d25438bd40fa89d6ecc37865f8e354`. |
 | `swift run swan lab scenario --name reference-matrix --fault delayed --fault corrupted --output <temporary-file>` plus a Node JSON key check | PASS — artifact was written and contains no forbidden credential/key field names. |
 | `git diff --check` | PASS. |
+| Acceptance hardening: `Scripts/verify-interop-lab.sh` | PASS — additionally asserts Swift builder/runtime libsodium packages, root-only artifact-volume initialization and runner dependency, literal non-ARG archive checksums, and Dockerfile-specific context allowlists/exclusions. |
+| Acceptance hardening: `swift test --filter SwanInteropTests` | PASS — 13 tests, 0 failures (the prior focused cache/artifact coverage remains green). |
 
 ## Commits
 

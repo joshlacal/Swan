@@ -109,6 +109,22 @@ services:
     depends_on:
       caddy:
         condition: service_started
+      scenario-artifacts-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  # Docker creates a fresh named volume as root. Prepare it with the runtime
+  # account's ownership before the unprivileged scenario runner mounts it.
+  scenario-artifacts-init:
+    build:
+      context: ..
+      dockerfile: Swan/Dockerfile
+    user: root
+    entrypoint: ["/bin/sh", "-ec"]
+    command: "install -d -o swan -g swan -m 0700 /artifacts"
+    volumes:
+      - scenario-artifacts:/artifacts
+    network_mode: "none"
     restart: "no"
 
 volumes:
