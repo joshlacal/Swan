@@ -373,12 +373,15 @@ public struct PersistedSpaceRecord: Sendable, Equatable {
 /// SQLite accepts an already-derived CID because canonical DAG-CBOR/CID
 /// construction belongs to SwanSpaces. Identifiers remain typed at this API.
 public enum SQLiteSpaceWrite: Sendable, Equatable {
+    case create(uri: SpaceRecordURI, value: Data, cid: String)
     case put(uri: SpaceRecordURI, value: Data, cid: String)
+    case update(uri: SpaceRecordURI, value: Data, cid: String)
     case delete(uri: SpaceRecordURI)
 
     fileprivate var uri: SpaceRecordURI {
         switch self {
-        case let .put(uri, _, _), let .delete(uri): uri
+        case let .create(uri, _, _), let .put(uri, _, _),
+             let .update(uri, _, _), let .delete(uri): uri
         }
     }
 }
@@ -1111,8 +1114,13 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             guard write.uri.space == space, write.uri.author == author else {
                 throw SwanError.unauthorized("record belongs to another repository")
             }
-            if case let .put(_, _, cid) = write, cid.isEmpty {
+            switch write {
+            case let .create(_, _, cid) where cid.isEmpty,
+                 let .put(_, _, cid) where cid.isEmpty,
+                 let .update(_, _, cid) where cid.isEmpty:
                 throw SwanError.malformed("record CID is empty")
+            default:
+                break
             }
         }
         _ = try sqliteRevision(expectedRevision)
@@ -1157,12 +1165,36 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                 let action: PersistedRepoAction
                 let previousCID = old?.cid
                 let newCID: String? = switch write {
-                case let .put(_, _, cid): cid
+                case let .create(_, _, cid), let .put(_, _, cid), let .update(_, _, cid): cid
                 case .delete: nil
                 }
 
                 switch write {
-                case let .put(_, value, cid):
+                case let .create(_, value, cid):
+                    guard old == nil else {
+                        throw SwanError.malformed("cannot create an existing record")
+                    }
+                    action = .create
+                    ltHash.add(
+                        element: "\(uri.collection)/\(uri.rkey)/\(cid)"
+                    )
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO permissioned_space_records(
+                            space_uri, author_did, collection, rkey,
+                            value, cid, revision
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            .text(space.rawValue), .text(author),
+                            .text(uri.collection), .text(uri.rkey),
+                            blob(value), .text(cid), .integer(storedRevision),
+                        ]
+                    )
+                case let .put(_, value, cid), let .update(_, value, cid):
+                    if case .update = write, old == nil {
+                        throw SwanError.malformed("cannot update a missing record")
+                    }
                     action = old == nil ? .create : .update
                     if let old {
                         ltHash.remove(element: ltHashElement(for: old))
@@ -2790,7 +2822,8 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         let value: SQLiteData
         let cid: SQLiteData
         switch write {
-        case let .put(_, bytes, recordCID):
+        case let .create(_, bytes, recordCID), let .put(_, bytes, recordCID),
+             let .update(_, bytes, recordCID):
             value = blob(bytes)
             cid = .text(recordCID)
         case .delete:
@@ -3307,6 +3340,93 @@ public actor DurableSpaceRepository {
         return persisted.entries.map(oplogEntry(from:))
     }
 
+    /// Applies XRPC operation kinds without collapsing them into a generic
+    /// upsert before SQLite has made the revision-CAS decision.  This is the
+    /// write-side counterpart to the read projections: it reads only the
+    /// local durable snapshot needed to choose the expected revision and to
+    /// preflight an ordered batch, then performs one no-network transaction.
+    public func applyAuthorizedWrites(
+        _ writes: [AuthorizedSpaceRepositoryWrite],
+        requestID: UUID,
+        wireRevision: TID,
+        authorization: AuthorizationContext
+    ) async throws -> [AuthorizedSpaceRepositoryWriteResult] {
+        guard !writes.isEmpty else {
+            throw SwanError.malformed("repository batch must contain a write")
+        }
+
+        let snapshot = try await database.repositorySnapshot(space: space, author: author)
+        let expectedRevision = snapshot?.state.revision ?? 0
+        var expectedRecords = Dictionary(
+            uniqueKeysWithValues: (snapshot?.records ?? []).map { ($0.uri, $0) }
+        )
+        var sqliteWrites: [SQLiteSpaceWrite] = []
+
+        for write in writes {
+            let uri = write.uri
+            try requireRepositoryURI(uri)
+            let existing = expectedRecords[uri]
+            switch write {
+            case let .create(_, value):
+                try requireWrite(uri: uri, authorization: authorization, permission: .create)
+                guard existing == nil else {
+                    throw SwanError.malformed("cannot create an existing record")
+                }
+                let cid = CID.fromDAGCBOR(value).string
+                sqliteWrites.append(.create(uri: uri, value: value, cid: cid))
+                expectedRecords[uri] = PersistedSpaceRecord(uri: uri, value: value, cid: cid, revision: expectedRevision + 1)
+            case let .put(_, value):
+                // A `putRecord` can be either branch when the transaction
+                // reaches SQLite, so both grants are mandatory before the
+                // state-dependent choice is made.
+                try requireWrite(uri: uri, authorization: authorization, permission: .create)
+                try requireWrite(uri: uri, authorization: authorization, permission: .update)
+                let cid = CID.fromDAGCBOR(value).string
+                sqliteWrites.append(.put(uri: uri, value: value, cid: cid))
+                expectedRecords[uri] = PersistedSpaceRecord(uri: uri, value: value, cid: cid, revision: expectedRevision + 1)
+            case let .update(_, value):
+                try requireWrite(uri: uri, authorization: authorization, permission: .update)
+                guard existing != nil else {
+                    throw SwanError.malformed("cannot update a missing record")
+                }
+                let cid = CID.fromDAGCBOR(value).string
+                sqliteWrites.append(.update(uri: uri, value: value, cid: cid))
+                expectedRecords[uri] = PersistedSpaceRecord(uri: uri, value: value, cid: cid, revision: expectedRevision + 1)
+            case .delete:
+                try requireWrite(uri: uri, authorization: authorization, permission: .delete)
+                guard existing != nil else {
+                    throw SwanError.malformed("cannot delete a missing record")
+                }
+                sqliteWrites.append(.delete(uri: uri))
+                expectedRecords.removeValue(forKey: uri)
+            }
+        }
+
+        let persisted = try await database.apply(
+            space: space,
+            author: author,
+            expectedRevision: expectedRevision,
+            requestID: requestID,
+            wireRevision: wireRevision,
+            writes: sqliteWrites
+        )
+        return try persisted.entries.map { entry in
+            let action: AuthorizedSpaceRepositoryWriteResult.Action = switch entry.action {
+            case .create: .create
+            case .update: .update
+            case .delete: .delete
+            }
+            guard entry.write.uri.space == space, entry.write.uri.author == author else {
+                throw SQLiteRepositoryError.corruptDatabase("write result belongs to another repository")
+            }
+            return AuthorizedSpaceRepositoryWriteResult(
+                action: action,
+                uri: entry.write.uri,
+                cid: entry.cid
+            )
+        }
+    }
+
     /// Returns ordered incremental operations when retained, or a durable full
     /// snapshot after an oplog gap. Recovery only reads SQLite; it does not
     /// mutate or replace local repository state.
@@ -3522,7 +3642,8 @@ public actor DurableSpaceRepository {
     ) -> DurableSpaceOplogEntry {
         let write: SpaceWrite
         switch persisted.write {
-        case let .put(uri, value, _):
+        case let .create(uri, value, _), let .put(uri, value, _),
+             let .update(uri, value, _):
             write = .put(uri: uri, value: value)
         case let .delete(uri):
             write = .delete(uri: uri)

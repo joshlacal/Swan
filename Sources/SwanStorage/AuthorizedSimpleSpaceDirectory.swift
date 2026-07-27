@@ -1,5 +1,48 @@
+import Foundation
 import SwanCore
 import SwanSpaces
+
+/// A caller-selected record mutation.  Unlike ``SpaceWrite``, this retains
+/// the XRPC operation's requested create/update semantics until the durable
+/// transaction has checked them against the authoritative SQLite state.
+/// Keeping `put` distinct is important: it is the only endpoint permitted to
+/// choose create versus update from that state.
+public enum AuthorizedSpaceRepositoryWrite: Sendable, Equatable {
+    case create(uri: SpaceRecordURI, value: Data)
+    case put(uri: SpaceRecordURI, value: Data)
+    case update(uri: SpaceRecordURI, value: Data)
+    case delete(uri: SpaceRecordURI)
+
+    public var uri: SpaceRecordURI {
+        switch self {
+        case let .create(uri, _): return uri
+        case let .put(uri, _): return uri
+        case let .update(uri, _): return uri
+        case let .delete(uri): return uri
+        }
+    }
+}
+
+/// The privacy-safe subset of a committed mutation required to render the
+/// generated write outputs. It deliberately omits the opaque outbox payload,
+/// LT-hash material, and any other repository state.
+public struct AuthorizedSpaceRepositoryWriteResult: Sendable, Equatable {
+    public enum Action: Sendable, Equatable {
+        case create
+        case update
+        case delete
+    }
+
+    public let action: Action
+    public let uri: SpaceRecordURI
+    public let cid: String?
+
+    public init(action: Action, uri: SpaceRecordURI, cid: String?) {
+        self.action = action
+        self.uri = uri
+        self.cid = cid
+    }
+}
 
 /// The deliberately narrow result available to an authenticated authority
 /// lookup. It is a projection made only after the durable simple-space state
@@ -61,4 +104,17 @@ public protocol AuthorizedSpaceRepositoryDirectory: Sendable {
         reverse: Bool,
         authorization: AuthorizationContext
     ) async throws -> [SpaceRecord]
+
+    /// Applies an ordered, all-or-nothing mutation batch through an account
+    /// database that was opened during startup. Implementations must retain
+    /// the supplied operation kinds until their revision-CAS transaction, and
+    /// must never use this request as authority to open or migrate SQLite.
+    func apply(
+        space: SpaceURI,
+        author: String,
+        writes: [AuthorizedSpaceRepositoryWrite],
+        requestID: UUID,
+        wireRevision: String,
+        authorization: AuthorizationContext
+    ) async throws -> [AuthorizedSpaceRepositoryWriteResult]
 }

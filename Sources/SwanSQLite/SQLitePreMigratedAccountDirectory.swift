@@ -1,4 +1,5 @@
 import Foundation
+import Petrel
 import SwanCore
 import SwanSpaces
 import SwanStorage
@@ -191,6 +192,51 @@ public actor SQLitePreMigratedAccountDirectory:
                 authorization: authorization
             )
             guard try await isActiveAccount(author) else { return [] }
+            guard !isClosed else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return result
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    /// Writes only through a database that was opened and migrated before the
+    /// listener accepted traffic. The actor rechecks lifecycle, terminal
+    /// shutdown, and the resolved database path around the durable operation;
+    /// it deliberately has no construction or migration fallback.
+    public func apply(
+        space: SpaceURI,
+        author: String,
+        writes: [AuthorizedSpaceRepositoryWrite],
+        requestID: UUID,
+        wireRevision: String,
+        authorization: AuthorizationContext
+    ) async throws -> [AuthorizedSpaceRepositoryWriteResult] {
+        let database = try await preopenedRepositoryDatabase(
+            for: author,
+            authorization: authorization
+        )
+        guard let database else {
+            throw SwanError.unauthorized("account repository is unavailable")
+        }
+        do {
+            let repository = try DurableSpaceRepository(
+                database: database,
+                space: space,
+                author: author
+            )
+            let result = try await repository.applyAuthorizedWrites(
+                writes,
+                requestID: requestID,
+                wireRevision: try TID(tidString: wireRevision),
+                authorization: authorization
+            )
+            guard try await isActiveAccount(author) else {
+                throw SwanError.unauthorized("account repository is unavailable")
+            }
             guard !isClosed else {
                 throw SwanError.unavailable("authenticated space directory is unavailable")
             }

@@ -270,6 +270,18 @@ public struct SwanHTTPServer: Sendable {
             } else if descriptor.nsid == ComAtprotoSpaceListRecords.typeIdentifier,
                       let authenticatedSpaceRecords {
                 registerAuthenticatedListRecordsEndpoint(on: router, capability: authenticatedSpaceRecords)
+            } else if descriptor.nsid == ComAtprotoSpaceCreateRecord.typeIdentifier,
+                      let authenticatedSpaceRecords {
+                registerAuthenticatedCreateRecordEndpoint(on: router, capability: authenticatedSpaceRecords)
+            } else if descriptor.nsid == ComAtprotoSpacePutRecord.typeIdentifier,
+                      let authenticatedSpaceRecords {
+                registerAuthenticatedPutRecordEndpoint(on: router, capability: authenticatedSpaceRecords)
+            } else if descriptor.nsid == ComAtprotoSpaceDeleteRecord.typeIdentifier,
+                      let authenticatedSpaceRecords {
+                registerAuthenticatedDeleteRecordEndpoint(on: router, capability: authenticatedSpaceRecords)
+            } else if descriptor.nsid == ComAtprotoSpaceApplyWrites.typeIdentifier,
+                      let authenticatedSpaceRecords {
+                registerAuthenticatedApplyWritesEndpoint(on: router, capability: authenticatedSpaceRecords)
             } else {
                 registerUnavailablePermissionedEndpoint(descriptor, on: router)
             }

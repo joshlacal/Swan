@@ -52,6 +52,18 @@ Catbird UI work.
   tokens and signed DPoP proofs, narrow grants, cross-authority denial,
   foreign-repository opacity, lifecycle closure, replay, and no
   public-repository fallback.
+- The local self-repository write slice now exposes the generated
+  `com.atproto.space.createRecord`, `putRecord`, `deleteRecord`, and
+  `applyWrites` server contracts only through the same startup-preopened
+  OAuth/DPoP capability. POST bodies are bounded to 1 MiB, duplicate-key
+  checked before generated-contract decoding, canonically DAG-CBOR encoded,
+  and never echoed in errors. The durable transaction preserves explicit
+  create/update/delete intent through revision CAS, record/LtHash/oplog/outbox
+  insertion, and rejects an invalid batch without a partial write. `putRecord`
+  deliberately requires both create and update grants before SQLite chooses
+  its branch. Swan does not yet implement lexicon schema validation, so
+  `validate: true` is explicitly rejected rather than silently ignored;
+  omitted or `false` requests receive structural AT-record validation only.
 - All unimplemented HTTP endpoints intentionally return generic authorization
   errors or `profile_endpoint_pending`; they are not interop evidence. The
   pinned TypeScript `com.atproto.space.getSpace` exception is now a typed,

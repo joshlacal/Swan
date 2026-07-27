@@ -20,6 +20,10 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
     private static let publicURL = URL(string: "https://swan.example")!
     private static let getPath = "/xrpc/com.atproto.space.getRecord"
     private static let listPath = "/xrpc/com.atproto.space.listRecords"
+    private static let createPath = "/xrpc/com.atproto.space.createRecord"
+    private static let putPath = "/xrpc/com.atproto.space.putRecord"
+    private static let deletePath = "/xrpc/com.atproto.space.deleteRecord"
+    private static let applyPath = "/xrpc/com.atproto.space.applyWrites"
     private static let collection = "app.bsky.feed.post"
     private static let otherCollection = "app.example.records.item"
 
@@ -442,6 +446,74 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testAuthenticatedWriteEndpointsPersistCanonicalPrivateRecordsAndFailAtomically() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let app = try makeServer(fixture).buildApplication(logger: Logger(label: "PermissionedRecordWriteHTTPTests"))
+            let rkey = "created"
+            let createdURI = "\(fixture.space.rawValue)/\(Self.alice)/\(Self.collection)/\(rkey)"
+            let create = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","collection":"\#(Self.collection)","rkey":"\#(rkey)","record":{"$type":"app.bsky.feed.post","text":"created"}}"#
+            let createHeaders = try writeHeaders(fixture, path: Self.createPath, jti: "create")
+            try await app.test(.router) { client in
+                try await client.execute(uri: Self.createPath, method: .post, headers: createHeaders, body: ByteBuffer(string: create)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    self.assertNoStore(response)
+                    let body = try self.jsonObject(response.body)
+                    XCTAssertEqual(body["uri"] as? String, createdURI)
+                    XCTAssertNotNil(body["cid"] as? String)
+                }
+                let getHeaders = try self.signedHeaders(fixture, subject: Self.alice, path: Self.getPath, jti: "created-read")
+                try await client.execute(uri: self.getURI(fixture, collection: Self.collection, rkey: rkey), method: .get, headers: getHeaders) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let value = try XCTUnwrap((try self.jsonObject(response.body))["value"] as? [String: Any])
+                    XCTAssertEqual(value["$type"] as? String, "app.bsky.feed.post")
+                    XCTAssertEqual(value["text"] as? String, "created")
+                }
+
+                let put = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","collection":"\#(Self.collection)","rkey":"\#(rkey)","record":{"$type":"app.bsky.feed.post","text":"updated"}}"#
+                try await client.execute(uri: Self.putPath, method: .post, headers: try self.writeHeaders(fixture, path: Self.putPath, jti: "put"), body: ByteBuffer(string: put)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual((try self.jsonObject(response.body))["uri"] as? String, createdURI)
+                }
+
+                let apply = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","writes":[{"$type":"com.atproto.space.applyWrites#create","collection":"\#(Self.collection)","rkey":"batch","value":{"$type":"app.bsky.feed.post","text":"one"}},{"$type":"com.atproto.space.applyWrites#update","collection":"\#(Self.collection)","rkey":"batch","value":{"$type":"app.bsky.feed.post","text":"two"}}]}"#
+                try await client.execute(uri: Self.applyPath, method: .post, headers: try self.writeHeaders(fixture, path: Self.applyPath, jti: "apply"), body: ByteBuffer(string: apply)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let results = try XCTUnwrap((try self.jsonObject(response.body))["results"] as? [[String: Any]])
+                    XCTAssertEqual(results.count, 2)
+                    XCTAssertEqual(results.map { $0["$type"] as? String }, ["com.atproto.space.applyWrites#createResult", "com.atproto.space.applyWrites#updateResult"])
+                }
+
+                let atomicFailure = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","writes":[{"$type":"com.atproto.space.applyWrites#create","collection":"\#(Self.collection)","rkey":"must-not-appear","value":{"$type":"app.bsky.feed.post","text":"no"}},{"$type":"com.atproto.space.applyWrites#update","collection":"\#(Self.collection)","rkey":"missing","value":{"$type":"app.bsky.feed.post","text":"no"}}]}"#
+                try await client.execute(uri: Self.applyPath, method: .post, headers: try self.writeHeaders(fixture, path: Self.applyPath, jti: "apply-atomic"), body: ByteBuffer(string: atomicFailure)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                }
+                try await client.execute(uri: self.getURI(fixture, collection: Self.collection, rkey: "must-not-appear"), method: .get, headers: try self.signedHeaders(fixture, subject: Self.alice, path: Self.getPath, jti: "atomic-read")) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(try self.errorCode(response.body), "RecordNotFound")
+                }
+
+                let missingDelete = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","collection":"\#(Self.collection)","rkey":"missing"}"#
+                try await client.execute(uri: Self.deletePath, method: .post, headers: try self.writeHeaders(fixture, path: Self.deletePath, jti: "missing-delete"), body: ByteBuffer(string: missingDelete)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                }
+                let duplicate = #"{"space":"\#(fixture.space.rawValue)","space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","collection":"\#(Self.collection)","record":{"$type":"app.bsky.feed.post"}}"#
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.writeHeaders(fixture, path: Self.createPath, jti: "duplicate"), body: ByteBuffer(string: duplicate)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                }
+            }
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
     private func makeFixture() async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "PermissionedRecordReadHTTPTests-\(UUID().uuidString)")
@@ -590,6 +662,7 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         subject: String,
         path: String,
         jti: String,
+        method: String = "GET",
         issuedAt: Date = Date()
     ) throws -> HTTPFields {
         let material = subject == Self.alice
@@ -602,6 +675,7 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
             path: path,
             nonce: fixture.runtime.dpopNonceService.issue(),
             jti: jti,
+            method: method,
             issuedAt: issuedAt
         )
     }
@@ -613,6 +687,7 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         path: String,
         nonce: String,
         jti: String,
+        method: String = "GET",
         issuedAt: Date = Date()
     ) throws -> HTTPFields {
         struct Header: Encodable {
@@ -634,7 +709,7 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         let claims = try encoder.encode(Claims(
             jti: jti,
             iat: Int64(issuedAt.timeIntervalSince1970),
-            htm: "GET",
+            htm: method,
             htu: "\(Self.publicURL.absoluteString)\(path)",
             nonce: nonce,
             ath: Data(SHA256.hash(data: Data(token.utf8))).base64URLEncodedString()
@@ -648,6 +723,12 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         var headers = HTTPFields()
         headers[.authorization] = "DPoP \(token)"
         if let proof { headers[HTTPField.Name("DPoP")!] = proof }
+        return headers
+    }
+
+    private func writeHeaders(_ fixture: Fixture, path: String, jti: String) throws -> HTTPFields {
+        var headers = try signedHeaders(fixture, subject: Self.alice, path: path, jti: jti, method: "POST")
+        headers[.contentType] = "application/json"
         return headers
     }
 
