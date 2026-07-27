@@ -28,7 +28,9 @@ actor ControlSQLiteConnectionGate {
 /// records deliberately never flow through this type. The actor serializes one
 /// process while `BEGIN IMMEDIATE` makes consume/rotate/revoke semantics hold
 /// across independently reopened Swan processes as well.
-public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
+public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
+    SpaceDelegationReplayStore
+{
     private static let microsecondsPerSecond = 1_000_000.0
     /// Cold control connections can contend during WAL configuration or the
     /// idempotent migration transaction. SQLite can report that startup race
@@ -614,6 +616,43 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
         )
     }
 
+    /// Reserves a verified delegation in its own durable namespace. The
+    /// digest is HMAC-protected by SwanOAuth before it reaches SQLite, and
+    /// `claimReplay` performs the purge, uniqueness check, and insert inside
+    /// one `BEGIN IMMEDIATE` transaction across reopened processes.
+    public func claimSpaceDelegation(
+        digest: Data,
+        expiresAt: Date,
+        now: Date = Date()
+    ) async throws -> Bool {
+        try validateDigest(digest)
+        guard expiresAt > now else { throw OAuthControlStoreError.expired }
+        return try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                let rows = try await connection.query(
+                    "SELECT expires_at FROM permissioned_space_delegation_replays WHERE jti_digest = ?",
+                    [blob(digest)]
+                )
+                if let row = rows.first {
+                    guard try requiredDate(row, "expires_at") > now else {
+                        throw OAuthControlStoreError.malformedRecord
+                    }
+                    return false
+                }
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_space_delegation_replays(
+                        jti_digest, expires_at
+                    ) VALUES (?, ?)
+                    """,
+                    [blob(digest), .integer(try timestamp(expiresAt))]
+                )
+                return true
+            }
+        }
+    }
+
     public func purgeExpiredOAuthControlState(now: Date = Date()) async throws {
         try await withConnectionGate {
             try await transaction {
@@ -768,6 +807,10 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore {
         )
         _ = try await connection.query(
             "DELETE FROM oauth_control_client_assertion_replays WHERE expires_at <= ?",
+            [.integer(nowTimestamp)]
+        )
+        _ = try await connection.query(
+            "DELETE FROM permissioned_space_delegation_replays WHERE expires_at <= ?",
             [.integer(nowTimestamp)]
         )
         _ = try await connection.query(

@@ -488,6 +488,70 @@ final class SwanOAuthTests: XCTestCase {
         try await reopened.close()
     }
 
+    func testDurableSpaceDelegationReplayIsSingleUseAndSurvivesReopen() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let serverKey = Data(repeating: 5, count: 32)
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let space = try SpaceURI(
+            authority: "did:plc:abcdefghijklmnopqrstuvwx",
+            spaceType: "app.bsky.bookmarks",
+            skey: "replay"
+        )
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        let replay = try DurableSpaceDelegationReplayStore(
+            controlStore: database,
+            serverKey: serverKey
+        )
+        let expiry = now.addingTimeInterval(60)
+        let firstClaim = try await replay.claim(
+            issuer: "did:plc:bcdefghijklmnopqrstuvwxy",
+            audience: "did:plc:abcdefghijklmnopqrstuvwx#atproto_space_host",
+            space: space,
+            jti: "ts-nonce_01",
+            expiresAt: expiry,
+            now: now
+        )
+        XCTAssertTrue(firstClaim)
+        // A rejected replay makes no issuer call possible: the store returns
+        // false atomically before the HTTP capability reaches policy/signing.
+        let duplicateClaim = try await replay.claim(
+            issuer: "did:plc:bcdefghijklmnopqrstuvwxy",
+            audience: "did:plc:abcdefghijklmnopqrstuvwx#atproto_space_host",
+            space: space,
+            jti: "ts-nonce_01",
+            expiresAt: expiry,
+            now: now.addingTimeInterval(1)
+        )
+        XCTAssertFalse(duplicateClaim)
+        try await database.close()
+
+        let reopened = try await SQLiteControlDatabase(dataDirectory: root)
+        let reopenedReplay = try DurableSpaceDelegationReplayStore(
+            controlStore: reopened,
+            serverKey: serverKey
+        )
+        let reopenedDuplicateClaim = try await reopenedReplay.claim(
+            issuer: "did:plc:bcdefghijklmnopqrstuvwxy",
+            audience: "did:plc:abcdefghijklmnopqrstuvwx#atproto_space_host",
+            space: space,
+            jti: "ts-nonce_01",
+            expiresAt: expiry,
+            now: now.addingTimeInterval(2)
+        )
+        XCTAssertFalse(reopenedDuplicateClaim)
+        let reclaimedClaim = try await reopenedReplay.claim(
+            issuer: "did:plc:bcdefghijklmnopqrstuvwxy",
+            audience: "did:plc:abcdefghijklmnopqrstuvwx#atproto_space_host",
+            space: space,
+            jti: "ts-nonce_01",
+            expiresAt: now.addingTimeInterval(120),
+            now: now.addingTimeInterval(61)
+        )
+        XCTAssertTrue(reclaimedClaim)
+        try await reopened.close()
+    }
+
     func testDurableAccessAndRefreshRequireValidatedProofOutputs() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

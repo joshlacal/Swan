@@ -90,24 +90,28 @@ Catbird UI work.
   credential read XRPC routes. `DurableSpaceCredentialAuthority` evaluates the authority's
   startup-preopened SQLite `authorizeSimpleSpaceRead` policy before obtaining
   the active account signing key through `AccountKeyStore`; it emits only a
-  transient ES256 `atproto-space-credential+jwt` with `#atproto_space`, a
-  fresh UUID JTI, and a two-hour maximum lifetime. The verifier bounds compact
-  JWT parsing, requires the exact type/algorithm/key ID and authority/space
-  binding, resolves only configured local or static pinned public keys, and
+  transient ES256 `atproto-space-credential+jwt` with a fresh opaque JTI and
+  a two-hour maximum lifetime. The verifier bounds compact JWT parsing,
+  accepts ES256 and the pinned TypeScript ES256K low-S format, accepts the
+  proposal's `#atproto` fallback when no dedicated `#atproto_space` key is
+  available, requires exact authority/space binding, resolves only configured
+  local or static pinned public keys, and
   returns `AuthorizationContext.spaceCredential` only after signature and
   clock checks. Remote DID/PLC key retrieval, client metadata/JWKS attestation
   verification remains unavailable; an allow-listed app therefore fails closed
   until a signed attestation policy is implemented. A delegation exchange
-  accepts only a bounded Bearer JWT with the exact proposal type/algorithm/key
-  ID, local/pinned user key, exact `authority#atproto_space_host` audience,
-  space subject, clock bounds, and UUID JTI before it can enter durable policy
-  evaluation. The issued credential is accepted by `getRecord`/`listRecords`
+  accepts only a bounded case-insensitive Bearer JWT with the proposal type,
+  supported ES256 or ES256K algorithm, `#atproto` key ID, local/pinned user
+  key, exact `authority#atproto_space_host` audience, space subject, clock
+  bounds, and bounded opaque JTI. The authority HMAC-binds and atomically
+  consumes that JTI in `control.sqlite` before policy/signing, so duplicate
+  exchanges fail without a second credential. The issued credential is accepted by `getRecord`/`listRecords`
   without DPoP and can read another active preopened member repository only in
   its bound space. It cannot write records. `getDelegationToken` remains
   unavailable because user-PDS account-key OAuth binding is separate work.
   Focused tests cover durable public/member policy, app and managing-app
-  denial, wrong issuer/key/audience/space, expiry/tampering, replay-compatible
-  fresh credential issuance, cross-repository reads, duplicate/oversized
+  denial, wrong issuer/key/audience/space, expiry/tampering, single-use
+  replay rejection across reopen, cross-repository reads, duplicate/oversized
   bodies, write rejection, and no request-time DB opening.
 - All unimplemented HTTP endpoints intentionally return generic authorization
   errors or `profile_endpoint_pending`; they are not interop evidence. The

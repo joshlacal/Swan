@@ -445,3 +445,20 @@ public protocol OAuthControlStore: Sendable {
 
     func purgeExpiredOAuthControlState(now: Date) async throws
 }
+
+/// One durable, expiry-bounded reservation for a verified permissioned-data
+/// delegation. The caller supplies an authority-scoped HMAC digest, never the
+/// raw JWT or its `jti`, so this remains a separate replay namespace from
+/// OAuth DPoP and client-assertion identifiers.
+///
+/// The reservation is deliberately made before authority policy evaluation or
+/// credential signing. A `false` result means a previously verified
+/// delegation has already been consumed and must not produce another
+/// credential.
+public protocol SpaceDelegationReplayStore: Sendable {
+    func claimSpaceDelegation(
+        digest: Data,
+        expiresAt: Date,
+        now: Date
+    ) async throws -> Bool
+}

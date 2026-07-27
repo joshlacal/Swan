@@ -16,13 +16,20 @@ import SwanStorage
 /// signing material.
 public struct SwanSpaceCredentialExchangeCapability: Sendable {
     let delegationAuthorizer: any SpaceDelegationAuthorizationVerifier
+    /// The runtime's dedicated HMAC-backed replay store. A delegation is
+    /// reserved after its signature is verified but before policy evaluation
+    /// or credential signing, so a concurrent/reopened authority cannot mint
+    /// two credentials from one JTI.
+    let delegationReplayStore: DurableSpaceDelegationReplayStore
     let credentialIssuer: any SpaceCredentialAuthoritySigner
 
     init(
         delegationAuthorizer: any SpaceDelegationAuthorizationVerifier,
+        delegationReplayStore: DurableSpaceDelegationReplayStore,
         credentialIssuer: any SpaceCredentialAuthoritySigner
     ) {
         self.delegationAuthorizer = delegationAuthorizer
+        self.delegationReplayStore = delegationReplayStore
         self.credentialIssuer = credentialIssuer
     }
 }
@@ -75,9 +82,9 @@ private struct AuthenticatedGetSpaceCredentialHandler:
             throw SpaceCredentialExchangeFailure.invalidDelegation
         }
 
-        let authorization: AuthorizationContext
+        let delegationGrant: VerifiedSpaceDelegation
         do {
-            authorization = try await capability.delegationAuthorizer.authorization(
+            delegationGrant = try await capability.delegationAuthorizer.verifiedDelegation(
                 for: delegation,
                 expectedSpace: space,
                 now: Date()
@@ -89,8 +96,36 @@ private struct AuthenticatedGetSpaceCredentialHandler:
             // durable policy transaction or invoke the signing resolver.
             throw SpaceCredentialExchangeFailure.invalidDelegation
         }
-        guard case let .spaceDelegation(user, delegatedSpace) = authorization,
-              delegatedSpace == space else {
+        guard case let .spaceDelegation(user, delegatedSpace) = delegationGrant.authorization,
+              delegatedSpace == space,
+              delegationGrant.issuer == user,
+              delegationGrant.space == space else {
+            throw SpaceCredentialExchangeFailure.invalidDelegation
+        }
+
+        // Proposal 0016 delegations are single-use. Reserve the verified
+        // opaque JTI before attestation/policy/signing so a duplicate request
+        // cannot create another credential, and so the authority never
+        // evaluates policy or decrypts a signing key for a rejected replay.
+        let replayNow = Date()
+        do {
+            let replayExpiry = delegationGrant.expiresAt.addingTimeInterval(60)
+            guard try await capability.delegationReplayStore.claim(
+                issuer: delegationGrant.issuer,
+                audience: delegationGrant.audience,
+                space: delegationGrant.space,
+                jti: delegationGrant.jti,
+                expiresAt: replayExpiry,
+                now: replayNow
+            ) else {
+                throw SpaceCredentialExchangeFailure.invalidDelegation
+            }
+        } catch let failure as SpaceCredentialExchangeFailure {
+            throw failure
+        } catch {
+            // Retain the same opaque delegation error for a duplicate or an
+            // unavailable replay store; the exchange must not continue into
+            // durable policy/signing without its single-use reservation.
             throw SpaceCredentialExchangeFailure.invalidDelegation
         }
 
@@ -98,7 +133,7 @@ private struct AuthenticatedGetSpaceCredentialHandler:
             let credential = try await capability.credentialIssuer.issueSpaceCredential(
                 space: space,
                 user: user,
-                authorization: authorization,
+                authorization: delegationGrant.authorization,
                 clientAttestation: input.clientAttestation,
                 now: Date()
             )
@@ -230,18 +265,21 @@ private func decodeGetSpaceCredentialInput(
 }
 
 /// Returns a compact Bearer value only when the request has exactly one
-/// canonical authorization field. `nil` means another scheme (notably DPoP)
-/// and lets the caller use its own proof policy; a malformed Bearer field is
-/// an error and must not fall through to a different authentication scheme.
+/// authorization field whose scheme is Bearer (case-insensitive per HTTP).
+/// `nil` means another scheme (notably DPoP) and lets the caller use its own
+/// proof policy; a malformed Bearer field is an error and must not fall
+/// through to a different authentication scheme.
 func exactBearerToken(from headers: HTTPFields) throws -> String? {
     let values = headers[values: .authorization]
     guard values.count <= 1 else {
         throw SpaceCredentialExchangeFailure.invalidDelegation
     }
     guard let raw = values.first else { return nil }
-    let canonicalPrefix = "Bearer "
-    if raw.hasPrefix(canonicalPrefix) {
-        let token = String(raw.dropFirst(canonicalPrefix.count))
+    let bearerPrefix = "Bearer "
+    if raw.count >= bearerPrefix.count,
+       raw.prefix(bearerPrefix.count)
+        .caseInsensitiveCompare(bearerPrefix) == .orderedSame {
+        let token = String(raw.dropFirst(bearerPrefix.count))
         guard !token.isEmpty,
               token.utf8.count <= PermissionedDataJWT.maximumCompactDelegationBytes,
               token.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {

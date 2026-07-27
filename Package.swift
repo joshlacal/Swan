@@ -26,6 +26,11 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", exact: "3.15.1"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
+        // The pinned TypeScript PDS signs AT Protocol repository and space
+        // JWTs with secp256k1 (`ES256K`). Keep verification in SwanOAuth
+        // explicit rather than inheriting an unstable transitive product from
+        // Petrel/JOSESwift.
+        .package(url: "https://github.com/GigaBitcoin/secp256k1.swift.git", exact: "0.15.0"),
     ],
     targets: [
         .systemLibrary(
@@ -98,6 +103,7 @@ let package = Package(
                 "SwanAccounts", "SwanCore", "SwanSpaces", "SwanStorage",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
+                .product(name: "secp256k1", package: "secp256k1.swift"),
             ]
         ),
         .target(

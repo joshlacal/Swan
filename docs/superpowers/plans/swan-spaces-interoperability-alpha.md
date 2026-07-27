@@ -86,9 +86,11 @@ checksum-verified way to populate the ignored reference cache.
   wire value clears it. This is not evidence of cross-host SimpleSpace
   interoperability.
 - Authority-issued space credentials now have a closed core/storage boundary.
-  The pinned ES256 compact JWT is limited to
-  `typ=atproto-space-credential+jwt`, `kid=#atproto_space`, a fresh UUID JTI,
-  and a two-hour maximum lifetime. Issuance first runs the durable
+  Swan locally issues ES256 compact JWTs with
+  `typ=atproto-space-credential+jwt`, a fresh opaque bounded JTI, and a
+  two-hour maximum lifetime. Verification also accepts the pinned TypeScript
+  ES256K compact low-S form and the permitted `#atproto` account-key fallback
+  when no `#atproto_space` key is published. Issuance first runs the durable
   startup-preopened `authorizeSimpleSpaceRead` policy, then resolves the
   active authority signing material only through `AccountKeyStore`; neither
   private key bytes nor reader-specific credential artifacts enter SQLite.
@@ -98,12 +100,16 @@ checksum-verified way to populate the ignored reference cache.
   DID/PLC key lookup and client-attestation JWKS validation are explicitly
   unavailable, so unverified app identity and unknown remote keys fail closed.
 - `com.atproto.space.getSpaceCredential` now exchanges a bounded signed
-  `Authorization: Bearer` delegation JWT for an authority-issued credential.
-  Delegations require the exact type/algorithm/`#atproto` key ID, issuer,
-  authority service audience, space subject, UUID JTI, lifetime, low-S ES256
+  case-insensitive `Authorization: Bearer` delegation JWT for an
+  authority-issued credential. Delegations require the proposal type,
+  supported ES256 or ES256K algorithm, `#atproto` key ID, issuer, authority
+  service audience, space subject, bounded opaque JTI, lifetime, low-S
   signature, and a local or pinned public key; unknown keys never trigger
-  DID/PLC/DNS/HTTP resolution. The exchange uses only the startup-preopened
-  authority policy directory, then the existing durable credential authority.
+  DID/PLC/DNS/HTTP resolution. The authority HMAC-binds and atomically reserves
+  each verified JTI in `control.sqlite` before policy or signing, so a replay
+  cannot mint a second credential even after restart. The exchange uses only
+  the startup-preopened authority policy directory, then the existing durable
+  credential authority.
   `getRecord` and `listRecords` accept either their existing DPoP OAuth path
   or an exact Bearer space credential. Credential reads are cross-repository
   only within their bound space and remain read-only; Bearer tokens never

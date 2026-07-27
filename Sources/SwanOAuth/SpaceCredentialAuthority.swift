@@ -36,7 +36,7 @@ public protocol SpaceCredentialSigningKeyResolver: Sendable {
 }
 
 /// Resolves the public material for a credential already inspected for its
-/// exact type and fixed key ID. Remote implementations are intentionally
+/// exact type and accepted dedicated-or-fallback key ID. Remote implementations are intentionally
 /// separate from SQLite policy evaluation: a future DID/PLC cache may fetch
 /// outside this method's callers' transactions, but this alpha ships only
 /// local and pinned resolvers.
@@ -44,7 +44,7 @@ public protocol SpaceCredentialPublicKeyResolver: Sendable {
     func publicKey(
         for issuer: String,
         keyID: String
-    ) async throws -> P256.Signing.PublicKey?
+    ) async throws -> PermissionedDataJWTVerificationKey?
 }
 
 /// The narrow signing boundary used by authority credential issuance. Its
@@ -83,18 +83,47 @@ public protocol SpaceDelegationPublicKeyResolver: Sendable {
     func publicKey(
         for issuer: String,
         keyID: String
-    ) async throws -> P256.Signing.PublicKey?
+    ) async throws -> PermissionedDataJWTVerificationKey?
+}
+
+/// A delegation whose compact JWT signature, issuer, audience, space,
+/// lifetime, and opaque nonce have all been verified. It still is not a
+/// repository grant: only the authority exchange can consume its JTI and pass
+/// the deliberately narrow authorization to credential policy.
+public struct VerifiedSpaceDelegation: Sendable {
+    public let authorization: AuthorizationContext
+    public let issuer: String
+    public let audience: String
+    public let space: SpaceURI
+    public let jti: String
+    public let expiresAt: Date
+
+    init(
+        authorization: AuthorizationContext,
+        issuer: String,
+        audience: String,
+        space: SpaceURI,
+        jti: String,
+        expiresAt: Date
+    ) {
+        self.authorization = authorization
+        self.issuer = issuer
+        self.audience = audience
+        self.space = space
+        self.jti = jti
+        self.expiresAt = expiresAt
+    }
 }
 
 /// Verifies one compact delegation and returns the deliberately narrow
 /// requester context that can be exchanged at a space authority. The context
 /// is never a repository grant and cannot be used for record I/O directly.
 public protocol SpaceDelegationAuthorizationVerifier: Sendable {
-    func authorization(
+    func verifiedDelegation(
         for token: String,
         expectedSpace: SpaceURI,
         now: Date
-    ) async throws -> AuthorizationContext
+    ) async throws -> VerifiedSpaceDelegation
 }
 
 /// A policy hook for resolving a client identity from a signed client
@@ -193,8 +222,9 @@ public struct LocalAccountSpaceCredentialPublicKeyResolver:
     public func publicKey(
         for issuer: String,
         keyID: String
-    ) async throws -> P256.Signing.PublicKey? {
-        guard keyID == PermissionedDataJWT.spaceCredentialKeyID,
+    ) async throws -> PermissionedDataJWTVerificationKey? {
+        guard keyID == PermissionedDataJWT.spaceCredentialKeyID
+                || keyID == PermissionedDataJWT.spaceCredentialFallbackKeyID,
               let account = try await accounts.account(did: issuer),
               account.status.authorizesAccount,
               let references = try await accounts.keyReferences(did: issuer),
@@ -202,7 +232,7 @@ public struct LocalAccountSpaceCredentialPublicKeyResolver:
             return nil
         }
         do {
-            return try P256.Signing.PublicKey(x963Representation: encoded)
+            return .p256(try P256.Signing.PublicKey(x963Representation: encoded))
         } catch {
             throw SwanError.unavailable("space credential verification key is unavailable")
         }
@@ -230,7 +260,7 @@ public struct LocalAccountSpaceDelegationPublicKeyResolver:
     public func publicKey(
         for issuer: String,
         keyID: String
-    ) async throws -> P256.Signing.PublicKey? {
+    ) async throws -> PermissionedDataJWTVerificationKey? {
         guard keyID == PermissionedDataJWT.delegationKeyID,
               let account = try await accounts.account(did: issuer),
               account.status.authorizesAccount,
@@ -239,7 +269,7 @@ public struct LocalAccountSpaceDelegationPublicKeyResolver:
             return nil
         }
         do {
-            return try P256.Signing.PublicKey(x963Representation: encoded)
+            return .p256(try P256.Signing.PublicKey(x963Representation: encoded))
         } catch {
             throw SwanError.unavailable("delegation verification key is unavailable")
         }
@@ -255,7 +285,7 @@ public struct PinnedSpaceCredentialPublicKey: Sendable {
     public let authority: String
     public let keyID: String
     public let generation: UInt64
-    let publicKey: P256.Signing.PublicKey
+    let publicKey: PermissionedDataJWTVerificationKey
 
     public init(
         authority: String,
@@ -264,24 +294,51 @@ public struct PinnedSpaceCredentialPublicKey: Sendable {
         publicKey: P256.Signing.PublicKey
     ) throws {
         guard (try? AccountIdentifiers.validateDID(authority)) != nil,
-              keyID == PermissionedDataJWT.spaceCredentialKeyID,
+              Self.isSpaceCredentialKeyID(keyID),
               generation > 0 else {
             throw SwanError.malformed("invalid pinned space credential key")
         }
         self.authority = authority
         self.keyID = keyID
         self.generation = generation
-        self.publicKey = publicKey
+        self.publicKey = .p256(publicKey)
+    }
+
+    /// Pins the compressed (33-byte) or uncompressed (65-byte) secp256k1
+    /// public material emitted by the pinned TypeScript PDS. Validation is
+    /// local and does not parse a DID document or make a network request.
+    public init(
+        authority: String,
+        keyID: String = PermissionedDataJWT.spaceCredentialKeyID,
+        generation: UInt64,
+        secp256k1PublicKey: Data
+    ) throws {
+        guard (try? AccountIdentifiers.validateDID(authority)) != nil,
+              Self.isSpaceCredentialKeyID(keyID),
+              generation > 0,
+              PermissionedDataJWTVerificationKey
+                .validatesSecp256k1PublicKey(secp256k1PublicKey) else {
+            throw SwanError.malformed("invalid pinned secp256k1 space credential key")
+        }
+        self.authority = authority
+        self.keyID = keyID
+        self.generation = generation
+        publicKey = .secp256k1PublicKey(secp256k1PublicKey)
+    }
+
+    private static func isSpaceCredentialKeyID(_ value: String) -> Bool {
+        value == PermissionedDataJWT.spaceCredentialKeyID
+            || value == PermissionedDataJWT.spaceCredentialFallbackKeyID
     }
 }
 
 public struct PinnedSpaceCredentialPublicKeyResolver:
     SpaceCredentialPublicKeyResolver
 {
-    private let keys: [PinnedKey: P256.Signing.PublicKey]
+    private let keys: [PinnedKey: PermissionedDataJWTVerificationKey]
 
     public init(pins: [PinnedSpaceCredentialPublicKey]) throws {
-        var selected: [PinnedKey: (generation: UInt64, key: P256.Signing.PublicKey)] = [:]
+        var selected: [PinnedKey: (generation: UInt64, key: PermissionedDataJWTVerificationKey)] = [:]
         for pin in pins {
             let identity = PinnedKey(authority: pin.authority, keyID: pin.keyID)
             if let existing = selected[identity] {
@@ -301,8 +358,20 @@ public struct PinnedSpaceCredentialPublicKeyResolver:
     public func publicKey(
         for issuer: String,
         keyID: String
-    ) async throws -> P256.Signing.PublicKey? {
-        keys[PinnedKey(authority: issuer, keyID: keyID)]
+    ) async throws -> PermissionedDataJWTVerificationKey? {
+        let exact = PinnedKey(authority: issuer, keyID: keyID)
+        if let key = keys[exact] { return key }
+        // A credential header normally names `#atproto_space`, but proposal
+        // 0016 permits the ordinary account key if no dedicated method is
+        // published. The pinned TypeScript PDS currently resolves exactly
+        // this fallback for simplespace authorities.
+        guard keyID == PermissionedDataJWT.spaceCredentialKeyID else {
+            return nil
+        }
+        return keys[PinnedKey(
+            authority: issuer,
+            keyID: PermissionedDataJWT.spaceCredentialFallbackKeyID
+        )]
     }
 
     private struct PinnedKey: Hashable, Sendable {
@@ -319,7 +388,7 @@ public struct PinnedSpaceDelegationPublicKey: Sendable {
     public let issuer: String
     public let keyID: String
     public let generation: UInt64
-    let publicKey: P256.Signing.PublicKey
+    let publicKey: PermissionedDataJWTVerificationKey
 
     public init(
         issuer: String,
@@ -335,17 +404,36 @@ public struct PinnedSpaceDelegationPublicKey: Sendable {
         self.issuer = issuer
         self.keyID = keyID
         self.generation = generation
-        self.publicKey = publicKey
+        self.publicKey = .p256(publicKey)
+    }
+
+    public init(
+        issuer: String,
+        keyID: String = PermissionedDataJWT.delegationKeyID,
+        generation: UInt64,
+        secp256k1PublicKey: Data
+    ) throws {
+        guard (try? AccountIdentifiers.validateDID(issuer)) != nil,
+              keyID == PermissionedDataJWT.delegationKeyID,
+              generation > 0,
+              PermissionedDataJWTVerificationKey
+                .validatesSecp256k1PublicKey(secp256k1PublicKey) else {
+            throw SwanError.malformed("invalid pinned secp256k1 delegation key")
+        }
+        self.issuer = issuer
+        self.keyID = keyID
+        self.generation = generation
+        publicKey = .secp256k1PublicKey(secp256k1PublicKey)
     }
 }
 
 public struct PinnedSpaceDelegationPublicKeyResolver:
     SpaceDelegationPublicKeyResolver
 {
-    private let keys: [PinnedKey: P256.Signing.PublicKey]
+    private let keys: [PinnedKey: PermissionedDataJWTVerificationKey]
 
     public init(pins: [PinnedSpaceDelegationPublicKey]) throws {
-        var selected: [PinnedKey: (generation: UInt64, key: P256.Signing.PublicKey)] = [:]
+        var selected: [PinnedKey: (generation: UInt64, key: PermissionedDataJWTVerificationKey)] = [:]
         for pin in pins {
             let identity = PinnedKey(issuer: pin.issuer, keyID: pin.keyID)
             if let existing = selected[identity] {
@@ -365,7 +453,7 @@ public struct PinnedSpaceDelegationPublicKeyResolver:
     public func publicKey(
         for issuer: String,
         keyID: String
-    ) async throws -> P256.Signing.PublicKey? {
+    ) async throws -> PermissionedDataJWTVerificationKey? {
         keys[PinnedKey(issuer: issuer, keyID: keyID)]
     }
 
@@ -386,7 +474,7 @@ public struct UnavailableSpaceCredentialPublicKeyResolver:
     public func publicKey(
         for _: String,
         keyID _: String
-    ) async throws -> P256.Signing.PublicKey? {
+    ) async throws -> PermissionedDataJWTVerificationKey? {
         nil
     }
 }
@@ -402,7 +490,7 @@ public struct UnavailableSpaceDelegationPublicKeyResolver:
     public func publicKey(
         for _: String,
         keyID _: String
-    ) async throws -> P256.Signing.PublicKey? {
+    ) async throws -> PermissionedDataJWTVerificationKey? {
         nil
     }
 }
@@ -499,7 +587,8 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
         )
         guard let signingKey = try await signingKeys.signingKey(for: space.authority),
               signingKey.authority == space.authority,
-              signingKey.keyID == PermissionedDataJWT.spaceCredentialKeyID else {
+              signingKey.keyID == PermissionedDataJWT.spaceCredentialKeyID
+                || signingKey.keyID == PermissionedDataJWT.spaceCredentialFallbackKeyID else {
             throw SwanError.unavailable("space credential signing key is unavailable")
         }
         return try PermissionedDataJWT.createSpaceCredential(
@@ -513,12 +602,10 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
     }
 }
 
-/// Verifies bounded ES256 user-to-space-host delegations through a local or
-/// pinned key resolver. It contains no replay store because proposal 0016
-/// models the one-minute token as a stateless exchange proof; repeated valid
-/// exchanges deliberately mint distinct short-lived credentials, exactly as
-/// the pinned TypeScript PDS does. Invalid tokens never reach policy or key
-/// signing work.
+/// Verifies bounded ES256 or ES256K user-to-space-host delegations through a
+/// local or pinned key resolver. A separately injected durable replay store
+/// consumes the verified JTI before policy or signing; this verifier itself
+/// remains pure and never performs network resolution.
 public struct DurableSpaceDelegationVerifier: SpaceDelegationAuthorizationVerifier {
     public struct Configuration: Sendable, Equatable {
         public static let standard = Configuration(uncheckedClockSkew: 60)
@@ -548,11 +635,11 @@ public struct DurableSpaceDelegationVerifier: SpaceDelegationAuthorizationVerifi
         self.configuration = configuration
     }
 
-    public func authorization(
+    public func verifiedDelegation(
         for token: String,
         expectedSpace: SpaceURI,
         now: Date = Date()
-    ) async throws -> AuthorizationContext {
+    ) async throws -> VerifiedSpaceDelegation {
         let inspection = try PermissionedDataJWT.inspectDelegationToken(token)
         let expectedAudience = "\(expectedSpace.authority)#atproto_space_host"
         guard inspection.claims.aud == expectedAudience,
@@ -575,7 +662,14 @@ public struct DurableSpaceDelegationVerifier: SpaceDelegationAuthorizationVerifi
             now: now,
             clockSkew: configuration.clockSkew
         )
-        return .spaceDelegation(subject: claims.iss, space: expectedSpace)
+        return VerifiedSpaceDelegation(
+            authorization: .spaceDelegation(subject: claims.iss, space: expectedSpace),
+            issuer: claims.iss,
+            audience: claims.aud,
+            space: expectedSpace,
+            jti: claims.jti,
+            expiresAt: Date(timeIntervalSince1970: TimeInterval(claims.exp))
+        )
     }
 }
 

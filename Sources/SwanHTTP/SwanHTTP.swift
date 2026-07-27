@@ -227,6 +227,7 @@ public struct SwanHTTPServer: Sendable {
                     delegationAuthorizer: DurableSpaceDelegationVerifier(
                         publicKeys: spaceCredentialConfiguration.delegationPublicKeys
                     ),
+                    delegationReplayStore: oauthRuntime.spaceDelegationReplayStore,
                     credentialIssuer: DurableSpaceCredentialAuthority(
                         policyDirectory: credentialDirectory,
                         signingKeys: spaceCredentialConfiguration.authoritySigningKeys,

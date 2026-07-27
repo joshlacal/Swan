@@ -2,6 +2,7 @@ import Crypto
 import Foundation
 import SwanCore
 import SwanStorage
+import SwanSpaces
 
 /// The single typed OAuth dependency accepted by a running Swan HTTP server.
 /// Both actors are backed by the same durable control store and the same
@@ -10,18 +11,29 @@ import SwanStorage
 public struct SwanOAuthRuntime: Sendable {
     public let tokenService: DurableOAuthTokenService
     public let dpopReplayStore: DurableDPoPReplayStore
+    /// A dedicated, durable single-use reservation for permissioned-data
+    /// delegations. It shares the injected non-persisted HMAC key with the
+    /// OAuth runtime but has a distinct storage and digest namespace.
+    public let spaceDelegationReplayStore: DurableSpaceDelegationReplayStore
     public let browserSessionService: OAuthBrowserSessionService
     /// The nonce MAC key is the injected non-persisted OAuth server key. It
     /// never crosses into `OAuthControlStore`; validators receive this service
     /// from the runtime rather than accepting arbitrary caller text as a nonce.
     public let dpopNonceService: DPoPNonceService
 
-    public init(controlStore: any OAuthControlStore, serverKey: Data) throws {
+    public init(
+        controlStore: any OAuthControlStore & SpaceDelegationReplayStore,
+        serverKey: Data
+    ) throws {
         tokenService = try DurableOAuthTokenService(
             controlStore: controlStore,
             serverKey: serverKey
         )
         dpopReplayStore = try DurableDPoPReplayStore(
+            controlStore: controlStore,
+            serverKey: serverKey
+        )
+        spaceDelegationReplayStore = try DurableSpaceDelegationReplayStore(
             controlStore: controlStore,
             serverKey: serverKey
         )
@@ -811,5 +823,70 @@ public actor DurableDPoPReplayStore {
             if error == .expired { throw SwanError.expired }
             throw SwanError.unauthorized("DPoP proof rejected")
         }
+    }
+}
+
+/// Reserves a verified proposal-0016 delegation exactly once through its
+/// expiry. The SQLite store receives only an authority-scoped HMAC digest, not
+/// the bearer JWT, its `jti`, or its identity claims. This must be invoked
+/// after signature validation but before any authority policy or credential
+/// signing work.
+public actor DurableSpaceDelegationReplayStore {
+    private let controlStore: any SpaceDelegationReplayStore
+    private let macKey: SymmetricKey
+
+    public init(
+        controlStore: any SpaceDelegationReplayStore,
+        serverKey: Data
+    ) throws {
+        guard serverKey.count == 32 else {
+            throw SwanError.malformed("OAuth server key must be exactly 32 bytes")
+        }
+        self.controlStore = controlStore
+        macKey = SymmetricKey(data: serverKey)
+    }
+
+    /// Returns `true` only for the first valid use of this exact delegation.
+    /// Every input field is length-delimited before HMAC so separate issuer,
+    /// audience, space, and opaque-JTI values cannot collide by concatenation.
+    public func claim(
+        issuer: String,
+        audience: String,
+        space: SpaceURI,
+        jti: String,
+        expiresAt: Date,
+        now: Date = Date()
+    ) async throws -> Bool {
+        guard Self.validOpaqueJTI(jti),
+              expiresAt > now else {
+            throw SwanError.expired
+        }
+        var input = Data("swan.space.delegation-replay-v1\u{0}".utf8)
+        for field in [issuer, audience, space.rawValue, jti] {
+            let bytes = Data(field.utf8)
+            var length = UInt64(bytes.count).bigEndian
+            withUnsafeBytes(of: &length) { input.append(contentsOf: $0) }
+            input.append(bytes)
+        }
+        let digest = Data(HMAC<SHA256>.authenticationCode(for: input, using: macKey))
+        do {
+            return try await controlStore.claimSpaceDelegation(
+                digest: digest,
+                expiresAt: expiresAt,
+                now: now
+            )
+        } catch let error as OAuthControlStoreError {
+            if error == .expired { throw SwanError.expired }
+            throw SwanError.unauthorized("delegation token rejected")
+        } catch {
+            throw SwanError.unavailable("delegation replay store unavailable")
+        }
+    }
+
+    private static func validOpaqueJTI(_ value: String) -> Bool {
+        let bytes = value.utf8
+        return !bytes.isEmpty
+            && bytes.count <= PermissionedDataJWT.maximumOpaqueJTIBytes
+            && bytes.allSatisfy { $0 >= 0x20 && $0 != 0x7f }
     }
 }

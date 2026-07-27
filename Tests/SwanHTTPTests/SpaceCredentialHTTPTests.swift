@@ -35,6 +35,10 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 user: Self.outsider,
                 space: fixture.publicSpace
             )
+            let caseInsensitivePublicHeaders = exchangeHeaders(
+                publicDelegation,
+                authorizationScheme: "bearer"
+            )
             let memberDelegation = try delegation(
                 fixture,
                 user: Self.member,
@@ -47,7 +51,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: exchangeHeaders(publicDelegation),
+                    headers: caseInsensitivePublicHeaders,
                     body: exchangeBody(space: fixture.publicSpace)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
@@ -110,7 +114,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    func testCredentialExchangeRejectsPolicyAndAttestationBoundariesWithoutStateChanges() async throws {
+    func testCredentialExchangeRejectsPolicyAndAttestationWithoutCredentialState() async throws {
         let fixture = try await Fixture.make()
         defer { fixture.cleanup() }
         do {
@@ -119,6 +123,11 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             )
             let outsiderMember = try delegation(fixture, user: Self.outsider, space: fixture.memberSpace)
             let outsiderAllow = try delegation(fixture, user: Self.outsider, space: fixture.allowListSpace)
+            let outsiderAllowWithAttestation = try delegation(
+                fixture,
+                user: Self.outsider,
+                space: fixture.allowListSpace
+            )
             let memberManaged = try delegation(fixture, user: Self.member, space: fixture.managingSpace)
             try await app.test(.router) { client in
                 for (delegation, space) in [
@@ -140,7 +149,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
-                    headers: self.exchangeHeaders(outsiderAllow),
+                    headers: self.exchangeHeaders(outsiderAllowWithAttestation),
                     body: self.exchangeBody(
                         space: fixture.allowListSpace,
                         clientAttestation: "not-a-verified-attestation"
@@ -204,12 +213,12 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 key: fixture.memberKey,
                 issuedAt: Int64(Date().timeIntervalSince1970) + 120
             )
-            let noncanonicalJTI = try signedDelegation(
+            let opaqueJTI = try signedDelegation(
                 issuer: Self.member,
                 audience: "\(Self.authority)#atproto_space_host",
                 space: fixture.publicSpace,
                 key: fixture.memberKey,
-                jti: "not-a-canonical-uuid"
+                jti: "ts-nonce_01"
             )
             let expired = try PermissionedDataJWT.createDelegationToken(
                 issuer: Self.member,
@@ -223,7 +232,7 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
             try await app.test(.router) { client in
                 for delegation in [
                     wrongSpace, wrongAudience, wrongKey, unknownIssuer,
-                    excessiveLifetime, futureIssued, noncanonicalJTI, expired,
+                    excessiveLifetime, futureIssued, expired,
                     tampered,
                 ] {
                     try await client.execute(
@@ -238,24 +247,35 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                     }
                 }
 
-                var first: String?
-                var second: String?
-                for index in 0 ..< 2 {
-                    try await client.execute(
-                        uri: Self.credentialPath,
-                        method: .post,
-                        headers: self.exchangeHeaders(valid),
-                        body: self.exchangeBody(space: fixture.publicSpace)
-                    ) { response in
-                        XCTAssertEqual(response.status, .ok)
-                        let value = try XCTUnwrap(self.jsonObject(response.body)["credential"] as? String)
-                        if index == 0 { first = value } else { second = value }
-                    }
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: self.exchangeHeaders(opaqueJTI),
+                    body: self.exchangeBody(space: fixture.publicSpace)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertNotNil(try self.jsonObject(response.body)["credential"] as? String)
                 }
-                // Proposal 0016 and the pinned reference treat delegations as
-                // stateless 60-second proofs. Replaying one valid exchange is
-                // therefore permitted and must issue fresh credential JTIs.
-                XCTAssertNotEqual(first, second)
+
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: self.exchangeHeaders(valid),
+                    body: self.exchangeBody(space: fixture.publicSpace)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertNotNil(try self.jsonObject(response.body)["credential"] as? String)
+                }
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: self.exchangeHeaders(valid),
+                    body: self.exchangeBody(space: fixture.publicSpace)
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidDelegationToken")
+                }
             }
             try await fixture.close()
         } catch {
@@ -466,17 +486,25 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         return "\(input).\(signature)"
     }
 
-    private func exchangeHeaders(_ token: String) -> HTTPFields {
-        bearerHeaders(token, contentType: true)
+    private func exchangeHeaders(
+        _ token: String,
+        authorizationScheme: String = "Bearer"
+    ) -> HTTPFields {
+        bearerHeaders(
+            token,
+            contentType: true,
+            authorizationScheme: authorizationScheme
+        )
     }
 
     private func bearerHeaders(
         _ token: String,
         dpop: String? = nil,
-        contentType: Bool = false
+        contentType: Bool = false,
+        authorizationScheme: String = "Bearer"
     ) -> HTTPFields {
         var headers = HTTPFields()
-        headers[.authorization] = "Bearer \(token)"
+        headers[.authorization] = "\(authorizationScheme) \(token)"
         if contentType { headers[.contentType] = "application/json" }
         if let dpop { headers[HTTPField.Name("DPoP")!] = dpop }
         return headers

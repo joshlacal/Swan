@@ -1,7 +1,102 @@
 import Crypto
 import Foundation
+import secp256k1
 import SwanCore
 import SwanSpaces
+
+/// A bounded public key selected from a local account projection or an
+/// operator-pinned interop fixture. P-256 remains Swan's local issuance
+/// format, while the pinned TypeScript PDS produces compact low-S secp256k1
+/// JWT signatures (`ES256K`). Keeping only raw secp256k1 public bytes here
+/// makes the key material `Sendable` and avoids a request path retaining a
+/// mutable C crypto context.
+public enum PermissionedDataJWTVerificationKey: Sendable {
+    case p256(P256.Signing.PublicKey)
+    case secp256k1PublicKey(Data)
+
+    fileprivate func verifies(
+        signature: Data,
+        signingInput: Data,
+        algorithm: String
+    ) throws -> Bool {
+        switch self {
+        case let .p256(publicKey):
+            guard algorithm == "ES256" else {
+                throw SwanError.unauthorized("JWT algorithm does not match verification key")
+            }
+            let canonical = try P256WireSignature.decodeCanonical(signature)
+            return publicKey.isValidSignature(canonical, for: signingInput)
+        case let .secp256k1PublicKey(encoded):
+            guard algorithm == "ES256K",
+                  Self.isCanonicalSecp256k1Signature(signature) else {
+                throw SwanError.unauthorized("JWT algorithm or signature is invalid")
+            }
+            let format: secp256k1.Format
+            switch (encoded.count, encoded.first) {
+            case (33, 0x02), (33, 0x03):
+                format = .compressed
+            case (65, 0x04):
+                format = .uncompressed
+            default:
+                throw SwanError.unauthorized("secp256k1 public key is invalid")
+            }
+            do {
+                let publicKey = try secp256k1.Signing.PublicKey(
+                    dataRepresentation: encoded,
+                    format: format
+                )
+                let compact = try secp256k1.Signing.ECDSASignature(
+                    compactRepresentation: signature
+                )
+                return publicKey.isValidSignature(compact, for: signingInput)
+            } catch {
+                throw SwanError.unauthorized("secp256k1 JWT verification failed")
+            }
+        }
+    }
+
+    static func validatesSecp256k1PublicKey(_ encoded: Data) -> Bool {
+        do {
+            let format: secp256k1.Format
+            switch (encoded.count, encoded.first) {
+            case (33, 0x02), (33, 0x03):
+                format = .compressed
+            case (65, 0x04):
+                format = .uncompressed
+            default:
+                return false
+            }
+            _ = try secp256k1.Signing.PublicKey(
+                dataRepresentation: encoded,
+                format: format
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Both the TypeScript `@noble/curves` implementation and Swan reject
+    /// malleable high-S compact signatures. secp256k1's group-order half is
+    /// encoded as a big-endian 32-byte integer for a constant-size lexical
+    /// comparison of the S half of `r || s`.
+    private static func isCanonicalSecp256k1Signature(_ signature: Data) -> Bool {
+        let bytes = Array(signature)
+        guard bytes.count == 64 else { return false }
+        let halfOrder: [UInt8] = [
+            0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d,
+            0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
+        ]
+        let s = bytes[32...]
+        guard s.contains(where: { $0 != 0 }) else { return false }
+        for (value, maximum) in zip(s, halfOrder) {
+            if value != maximum { return value < maximum }
+        }
+        return true
+    }
+}
 
 public enum PKCE {
     public static func verifyS256(verifier: String, challenge: String) -> Bool {
@@ -107,7 +202,7 @@ public actor OAuthTokenVault {
     }
 
     private func digest(_ token: String) -> Data {
-        Data(HMAC<SHA256>.authenticationCode(for: Data(token.utf8), using: macKey))
+        Data(HMAC<Crypto.SHA256>.authenticationCode(for: Data(token.utf8), using: macKey))
     }
 
     private static func randomToken() -> String { randomBytes(count: 32).base64URLEncodedString() }
@@ -129,7 +224,7 @@ public struct DPoPNonceService: Sendable {
 
     public func issue(now: Date = Date()) -> String {
         let timestamp = String(Int(now.timeIntervalSince1970))
-        let signature = Data(HMAC<SHA256>.authenticationCode(for: Data(timestamp.utf8), using: key)).base64URLEncodedString()
+        let signature = Data(HMAC<Crypto.SHA256>.authenticationCode(for: Data(timestamp.utf8), using: key)).base64URLEncodedString()
         return "\(timestamp).\(signature)"
     }
 
@@ -138,7 +233,7 @@ public struct DPoPNonceService: Sendable {
         guard pieces.count == 2, let timestamp = Int(pieces[0]),
               abs(now.timeIntervalSince1970 - TimeInterval(timestamp)) <= lifetime,
               let actual = Data(base64URLEncoded: pieces[1]) else { return false }
-        let expected = Data(HMAC<SHA256>.authenticationCode(for: Data(pieces[0].utf8), using: key))
+        let expected = Data(HMAC<Crypto.SHA256>.authenticationCode(for: Data(pieces[0].utf8), using: key))
         return constantTimeEqual(expected, actual)
     }
 }
@@ -167,13 +262,20 @@ public enum PermissionedDataJWT {
     public static let delegationKeyID = "#atproto"
     public static let delegationLifetime: TimeInterval = 60
     /// Proposal 0016 assigns a dedicated DID verification method to space
-    /// credentials. Swan's authority boundary does not silently fall back to
-    /// another account key: a future DID resolver can make that fallback an
-    /// explicit, profile-reviewed decision instead.
+    /// credentials. Local issuance defaults to that method; verification has
+    /// a separately named, profile-reviewed ordinary-account-key fallback.
     public static let spaceCredentialKeyID = "#atproto_space"
+    /// Proposal 0016 permits the authority's ordinary AT Protocol verification
+    /// method when no dedicated `#atproto_space` method is published. The
+    /// pinned TypeScript PDS currently exercises this fallback in practice.
+    public static let spaceCredentialFallbackKeyID = "#atproto"
     public static let spaceCredentialLifetime: TimeInterval = 2 * 60 * 60
     public static let maximumCompactDelegationBytes = 8 * 1_024
     public static let maximumCompactSpaceCredentialBytes = 8 * 1_024
+    /// `jti` is a bounded opaque nonce in proposal 0016, not a UUID grammar.
+    /// UUIDs remain Swan's minting format, but TypeScript producers and future
+    /// implementations may use another non-control nonce representation.
+    public static let maximumOpaqueJTIBytes = 512
     private static let maximumDelegationComponentBytes = 4 * 1_024
     private static let maximumDelegationJSONBytes = 4 * 1_024
     private static let maximumSpaceCredentialComponentBytes = 4 * 1_024
@@ -273,6 +375,27 @@ public enum PermissionedDataJWT {
         now: Date = Date(),
         clockSkew: TimeInterval = 60
     ) throws -> DelegationClaims {
+        try verifyDelegationToken(
+            token,
+            publicKey: .p256(publicKey),
+            audience: audience,
+            expectedSpace: expectedSpace,
+            now: now,
+            clockSkew: clockSkew
+        )
+    }
+
+    /// Verifies either proposal-supported ES256/P-256 or ES256K/secp256k1
+    /// delegation material. Resolver selection remains local/pinned and is
+    /// performed only after bounded structural inspection.
+    public static func verifyDelegationToken(
+        _ token: String,
+        publicKey: PermissionedDataJWTVerificationKey,
+        audience: String,
+        expectedSpace: SpaceURI? = nil,
+        now: Date = Date(),
+        clockSkew: TimeInterval = 60
+    ) throws -> DelegationClaims {
         guard clockSkew >= 0, clockSkew <= 5 * 60 else {
             throw SwanError.malformed("invalid delegation clock skew")
         }
@@ -283,7 +406,7 @@ public enum PermissionedDataJWT {
               let space = try? SpaceURI(claims.sub),
               claims.aud == "\(space.authority)#atproto_space_host",
               expectedSpace.map({ $0 == space }) ?? true,
-              claims.jti.isCanonicalCredentialJTI else {
+              claims.jti.isValidPermissionedDataJTI else {
             throw SwanError.unauthorized("delegation token audience or space is invalid")
         }
         try validateTimes(
@@ -305,7 +428,7 @@ public enum PermissionedDataJWT {
     ) throws -> DelegationInspection {
         let parsed = try parseDelegationToken(token)
         guard parsed.header.typ == delegationType,
-              parsed.header.alg == "ES256",
+              isSupportedJWTAlgorithm(parsed.header.alg),
               parsed.header.kid == delegationKeyID else {
             throw SwanError.unauthorized("JWT type, algorithm, or key ID is invalid")
         }
@@ -313,7 +436,7 @@ public enum PermissionedDataJWT {
         guard isPermissionedDataDID(claims.iss),
               let space = try? SpaceURI(claims.sub),
               claims.aud == "\(space.authority)#atproto_space_host",
-              claims.jti.isCanonicalCredentialJTI else {
+              claims.jti.isValidPermissionedDataJTI else {
             throw SwanError.unauthorized("delegation token issuer, audience, or subject is invalid")
         }
         return DelegationInspection(header: parsed.header, claims: claims)
@@ -328,7 +451,7 @@ public enum PermissionedDataJWT {
         kid: String = spaceCredentialKeyID
     ) throws -> String {
         guard issuer == space.authority,
-              kid == spaceCredentialKeyID,
+              isSpaceCredentialKeyID(kid),
               lifetime > 0,
               lifetime <= spaceCredentialLifetime,
               lifetime.rounded(.towardZero) == lifetime else {
@@ -353,6 +476,24 @@ public enum PermissionedDataJWT {
         now: Date = Date(),
         clockSkew: TimeInterval = 60
     ) throws -> SpaceCredentialClaims {
+        try verifySpaceCredential(
+            token,
+            publicKey: .p256(publicKey),
+            expectedSpace: expectedSpace,
+            now: now,
+            clockSkew: clockSkew
+        )
+    }
+
+    /// Verifies either proposal-supported ES256/P-256 or ES256K/secp256k1
+    /// authority credential material.
+    public static func verifySpaceCredential(
+        _ token: String,
+        publicKey: PermissionedDataJWTVerificationKey,
+        expectedSpace: SpaceURI? = nil,
+        now: Date = Date(),
+        clockSkew: TimeInterval = 60
+    ) throws -> SpaceCredentialClaims {
         guard clockSkew >= 0, clockSkew <= 5 * 60 else {
             throw SwanError.malformed("invalid space credential clock skew")
         }
@@ -360,7 +501,7 @@ public enum PermissionedDataJWT {
         let claims = try decode(SpaceCredentialClaims.self, from: parsed.payload)
         guard let space = try? SpaceURI(claims.sub),
               space.authority == claims.iss,
-              claims.jti.isCanonicalCredentialJTI,
+              claims.jti.isValidPermissionedDataJTI,
               expectedSpace.map({ $0 == space }) ?? true else {
             throw SwanError.unauthorized("space credential issuer or subject is invalid")
         }
@@ -383,14 +524,14 @@ public enum PermissionedDataJWT {
     ) throws -> SpaceCredentialInspection {
         let parsed = try parseSpaceCredential(token)
         guard parsed.header.typ == credentialType,
-              parsed.header.alg == "ES256",
-              parsed.header.kid == spaceCredentialKeyID else {
+              isSupportedJWTAlgorithm(parsed.header.alg),
+              parsed.header.kid.map(isSpaceCredentialKeyID) == true else {
             throw SwanError.unauthorized("JWT type, algorithm, or key ID is invalid")
         }
         let claims = try decode(SpaceCredentialClaims.self, from: parsed.payload)
         guard let space = try? SpaceURI(claims.sub),
               space.authority == claims.iss,
-              claims.jti.isCanonicalCredentialJTI else {
+              claims.jti.isValidPermissionedDataJTI else {
             throw SwanError.unauthorized("space credential issuer or subject is invalid")
         }
         return SpaceCredentialInspection(header: parsed.header, claims: claims)
@@ -428,30 +569,21 @@ public enum PermissionedDataJWT {
         return "\(signingInput).\(signature)"
     }
 
-    private static func verify(_ token: String, expectedType: String, publicKey: P256.Signing.PublicKey) throws -> ParsedJWT {
-        let parsed = try parse(token)
-        guard parsed.header.typ == expectedType, parsed.header.alg == "ES256" else {
-            throw SwanError.unauthorized("JWT type or algorithm is invalid")
-        }
-        let signature = try P256WireSignature.decodeCanonical(parsed.signature)
-        guard publicKey.isValidSignature(signature, for: parsed.signingInput) else {
-            throw SwanError.unauthorized("JWT signature is invalid")
-        }
-        return parsed
-    }
-
     private static func verifySpaceCredentialStructure(
         _ token: String,
-        publicKey: P256.Signing.PublicKey
+        publicKey: PermissionedDataJWTVerificationKey
     ) throws -> ParsedJWT {
         let parsed = try parseSpaceCredential(token)
         guard parsed.header.typ == credentialType,
-              parsed.header.alg == "ES256",
-              parsed.header.kid == spaceCredentialKeyID else {
+              isSupportedJWTAlgorithm(parsed.header.alg),
+              parsed.header.kid.map(isSpaceCredentialKeyID) == true else {
             throw SwanError.unauthorized("JWT type, algorithm, or key ID is invalid")
         }
-        let signature = try P256WireSignature.decodeCanonical(parsed.signature)
-        guard publicKey.isValidSignature(signature, for: parsed.signingInput) else {
+        guard try publicKey.verifies(
+            signature: parsed.signature,
+            signingInput: parsed.signingInput,
+            algorithm: parsed.header.alg
+        ) else {
             throw SwanError.unauthorized("JWT signature is invalid")
         }
         return parsed
@@ -459,16 +591,19 @@ public enum PermissionedDataJWT {
 
     private static func verifyDelegationStructure(
         _ token: String,
-        publicKey: P256.Signing.PublicKey
+        publicKey: PermissionedDataJWTVerificationKey
     ) throws -> ParsedJWT {
         let parsed = try parseDelegationToken(token)
         guard parsed.header.typ == delegationType,
-              parsed.header.alg == "ES256",
+              isSupportedJWTAlgorithm(parsed.header.alg),
               parsed.header.kid == delegationKeyID else {
             throw SwanError.unauthorized("JWT type, algorithm, or key ID is invalid")
         }
-        let signature = try P256WireSignature.decodeCanonical(parsed.signature)
-        guard publicKey.isValidSignature(signature, for: parsed.signingInput) else {
+        guard try publicKey.verifies(
+            signature: parsed.signature,
+            signingInput: parsed.signingInput,
+            algorithm: parsed.header.alg
+        ) else {
             throw SwanError.unauthorized("JWT signature is invalid")
         }
         return parsed
@@ -597,6 +732,14 @@ public enum PermissionedDataJWT {
         }
     }
 
+    private static func isSupportedJWTAlgorithm(_ value: String) -> Bool {
+        value == "ES256" || value == "ES256K"
+    }
+
+    private static func isSpaceCredentialKeyID(_ value: String) -> Bool {
+        value == spaceCredentialKeyID || value == spaceCredentialFallbackKeyID
+    }
+
     private static func integerClockSkew(_ skew: TimeInterval) -> Int64? {
         guard skew.isFinite,
               skew >= 0,
@@ -636,8 +779,14 @@ private func isBase64URLByte(_ byte: UInt8) -> Bool {
 }
 
 private extension String {
-    var isCanonicalCredentialJTI: Bool {
-        UUID(uuidString: self)?.uuidString.lowercased() == lowercased()
+    /// Proposal 0016 calls `jti` a random nonce. Do not impose Swan's UUID
+    /// minting format on a TypeScript producer; retain only a compact,
+    /// control-character-free representation suitable for HMAC replay keys.
+    var isValidPermissionedDataJTI: Bool {
+        let bytes = utf8
+        return !bytes.isEmpty
+            && bytes.count <= PermissionedDataJWT.maximumOpaqueJTIBytes
+            && bytes.allSatisfy { $0 >= 0x20 && $0 != 0x7f }
     }
 }
 

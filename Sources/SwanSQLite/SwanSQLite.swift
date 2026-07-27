@@ -124,6 +124,12 @@ public enum SQLiteLayout {
             expires_at INTEGER NOT NULL CHECK(expires_at >= 0)
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_space_delegation_replays (
+            jti_digest BLOB PRIMARY KEY CHECK(length(jti_digest) = 32),
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0)
+        )
+        """,
         "CREATE INDEX IF NOT EXISTS oauth_control_access_token_expiry ON oauth_control_access_tokens(expires_at)",
         "CREATE INDEX IF NOT EXISTS oauth_control_refresh_token_expiry ON oauth_control_refresh_tokens(expires_at)",
         "CREATE INDEX IF NOT EXISTS oauth_control_family_expiry ON oauth_control_token_families(expires_at)",
