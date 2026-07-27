@@ -35,6 +35,9 @@ extension SwanCommand {
         @Option(name: .long, help: "Public issuer URL")
         var publicURL: String?
 
+        @Flag(name: .long, help: "Enable only the localhost-development-client OAuth PAR bridge; requires an HTTPS public issuer")
+        var enableLocalhostPAR = false
+
         @Option(name: .long, help: "Reserved root for control/account databases and blobs")
         var dataDirectory: String = ".swan-data"
 
@@ -69,10 +72,22 @@ extension SwanCommand {
             }
             var logger = Logger(label: "swan")
             logger.logLevel = .info
+            let localhostPARConfiguration: SwanLocalhostPARConfiguration?
+            if enableLocalhostPAR {
+                do {
+                    localhostPARConfiguration = try SwanLocalhostPARConfiguration(issuer: baseURL)
+                } catch {
+                    try? await controlDatabase.close()
+                    throw ValidationError("--enable-localhost-par requires an HTTPS public issuer URL")
+                }
+            } else {
+                localhostPARConfiguration = nil
+            }
             let server = SwanHTTPServer(
                 profile: loadedProfile,
                 configuration: .init(host: host, port: port, publicURL: baseURL),
-                oauthRuntime: oauthRuntime
+                oauthRuntime: oauthRuntime,
+                localhostPARConfiguration: localhostPARConfiguration
             )
             // Both applications are built before a ServiceGroup starts either
             // one. A bad management bind/config/secret therefore exits rather

@@ -38,6 +38,12 @@ production deployment.
   listener and process lifecycle wiring. It does not make public OAuth routes
   available; those remain deliberately fail-closed pending the full HTTP
   authorization flow.
+- The first live OAuth bridge is an explicit `--enable-localhost-par` lab
+  option. It requires an HTTPS issuer and exposes only `POST /oauth/par` for
+  virtual localhost public clients, using strict bounded forms and durable
+  DPoP nonce/replay validation. Discovery, authorization, token, and
+  revocation routes remain unavailable; PAR success is not a claim of a
+  complete authorization server.
 - The account suite passes locally. Its native-library portability remains an
   explicit gate: local macOS testing uses Homebrew libsodium include/library
   paths, and Linux plus the minimum supported macOS have not yet been run.

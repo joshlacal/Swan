@@ -47,6 +47,20 @@ public struct SwanHTTPConfiguration: Sendable, Equatable {
     }
 }
 
+/// An explicit development-only opt-in for Swan's first live OAuth endpoint.
+///
+/// The value can be constructed only from an HTTPS issuer that passes the
+/// same URL policy as the eventual authorization-server metadata. It does not
+/// publish discovery metadata or make authorization, token, or revocation
+/// routes available.
+public struct SwanLocalhostPARConfiguration: Sendable, Equatable {
+    public let issuer: URL
+
+    public init(issuer: URL) throws {
+        self.issuer = try OAuthAuthorizationServerMetadata(issuer: issuer).issuer
+    }
+}
+
 public struct SwanHTTPServer: Sendable {
     public let profile: ProtocolProfile
     public let configuration: SwanHTTPConfiguration
@@ -59,19 +73,32 @@ public struct SwanHTTPServer: Sendable {
     /// explicitly supplies a ready gate. Durable OAuth primitives alone are
     /// not sufficient authorization-server behavior.
     public let oauthPublicationGate: OAuthPublicationGate
+    /// The sole live OAuth alpha route. This never enables discovery or any
+    /// other authorization-server endpoint.
+    public let localhostPARConfiguration: SwanLocalhostPARConfiguration?
 
     public init(
         profile: ProtocolProfile,
         configuration: SwanHTTPConfiguration = .init(),
         repositories: any AccountRepositoryStore = InMemoryAccountRepositoryStore(),
         oauthRuntime: SwanOAuthRuntime,
-        oauthPublicationGate: OAuthPublicationGate = .unavailable
+        oauthPublicationGate: OAuthPublicationGate = .unavailable,
+        localhostPARConfiguration: SwanLocalhostPARConfiguration? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
         self.repositories = repositories
         self.oauthRuntime = oauthRuntime
         self.oauthPublicationGate = oauthPublicationGate
+        // A mismatched issuer would produce a DPoP target different from the
+        // process's public identity. There is no best-effort normalization:
+        // retain the default 404 closure instead.
+        if let localhostPARConfiguration,
+           localhostPARConfiguration.issuer.absoluteString == configuration.publicURL.absoluteString {
+            self.localhostPARConfiguration = localhostPARConfiguration
+        } else {
+            self.localhostPARConfiguration = nil
+        }
     }
 
     /// All routes are registered before Application construction. Hummingbird
@@ -99,6 +126,17 @@ public struct SwanHTTPServer: Sendable {
 
         router.get("/oauth/authorize") { _, _ -> Response in
             oauthUnavailable()
+        }
+
+        // This narrow development bridge stores a durable PAR only. It does
+        // not publish discovery and cannot lead to login, consent, codes, or
+        // tokens until a complete OAuth HTTP assembly is separately enabled.
+        if let localhostPARConfiguration {
+            registerLocalhostPAREndpoint(
+                on: router,
+                configuration: localhostPARConfiguration,
+                runtime: oauthRuntime
+            )
         }
 
         router.get("/xrpc/com.atproto.server.describeServer") { _, _ -> Response in
