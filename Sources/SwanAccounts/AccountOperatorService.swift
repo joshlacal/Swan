@@ -15,6 +15,7 @@ public enum AccountOperatorError: Error, Sendable, Equatable, LocalizedError {
     case operatorSecretRejected
     case operatorSecretFileUnavailable
     case unknownAccount
+    case accountInactive
 
     public var errorDescription: String? {
         switch self {
@@ -26,6 +27,8 @@ public enum AccountOperatorError: Error, Sendable, Equatable, LocalizedError {
             "operator secret file is unavailable"
         case .unknownAccount:
             "account not found"
+        case .accountInactive:
+            "account is not active"
         }
     }
 }
@@ -335,6 +338,39 @@ public struct AccountOperatorService: Sendable {
             did: did,
             to: .deleted,
             declaration: declaration,
+            authorization: authorization,
+            now: now
+        )
+    }
+
+    /// Records only the digest declaration for a successfully published
+    /// portable export. The same-state transition is legal only while the
+    /// account is active; it never stores archive payloads.
+    public func declareExport(
+        did: String,
+        manifestReference: String,
+        authorization: AccountOperatorAuthorization,
+        now: Date = Date()
+    ) async throws -> AccountOperatorView {
+        guard authorization.isVerified else {
+            throw AccountOperatorError.operatorSecretRejected
+        }
+        let did = try AccountIdentifiers.validateDID(did)
+        guard let current = try await store.account(did: did) else {
+            throw AccountOperatorError.unknownAccount
+        }
+        guard current.status == .active else {
+            throw AccountOperatorError.accountInactive
+        }
+        return try await transition(
+            did: did,
+            to: .active,
+            declaration: .init(
+                export: try AccountExportMetadata(
+                    declaredAt: now,
+                    reference: manifestReference
+                )
+            ),
             authorization: authorization,
             now: now
         )

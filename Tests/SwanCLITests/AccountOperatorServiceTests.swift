@@ -172,6 +172,43 @@ final class AccountOperatorServiceTests: XCTestCase {
         }
     }
 
+    func testExportDeclarationStoresOnlyDigestAndRejectsInactiveAccount() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await control.close() } }
+        try await createAlice(in: control)
+        let service = AccountOperatorService(store: control)
+        let authorization = try OperatorSecretResolver.authorize(
+            environment: ["SWAN_OPERATOR_SECRET": "operator-secret"],
+            secretFile: nil
+        )
+        let digest = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+
+        let declared = try await service.declareExport(
+            did: Self.aliceDID,
+            manifestReference: digest,
+            authorization: authorization,
+            now: Date(timeIntervalSince1970: 1_750_000_010)
+        )
+        XCTAssertEqual(declared.status, "active")
+        XCTAssertEqual(declared.export?.reference, digest)
+        _ = try await service.deactivate(
+            did: Self.aliceDID,
+            authorization: authorization
+        )
+        do {
+            _ = try await service.declareExport(
+                did: Self.aliceDID,
+                manifestReference: digest,
+                authorization: authorization
+            )
+            XCTFail("inactive account accepted an export declaration")
+        } catch let error as AccountOperatorError {
+            XCTAssertEqual(error, .accountInactive)
+        }
+    }
+
     private func createAlice(in control: SQLiteControlDatabase) async throws {
         _ = try await control.createAccount(
             AccountControlRegistration(

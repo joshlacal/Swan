@@ -2,6 +2,7 @@ import ArgumentParser
 import Crypto
 import Foundation
 import Logging
+import SwanAccountExport
 import SwanAccounts
 import SwanHTTP
 import SwanInterop
@@ -281,12 +282,115 @@ struct SwanCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "swan",
         abstract: "Swift-native AT Protocol permissioned-data interoperability laboratory",
-        subcommands: [Serve.self, Account.self, Verify.self, Lab.self],
+        subcommands: [Serve.self, Account.self, Export.self, Verify.self, Lab.self],
         defaultSubcommand: Verify.self
     )
 }
 
 extension SwanCommand {
+    struct Export: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Write a checksummed portable logical export for one active account"
+        )
+
+        @Option(name: .long, help: "Required Swan data directory containing control.sqlite")
+        var dataDirectory: String
+
+        @Option(name: .long, help: "Active account DID to export")
+        var did: String
+
+        @Option(name: .long, help: "New archive directory; an existing path is never overwritten")
+        var outputDirectory: String
+
+        @Option(name: .long, help: "Owner-only mounted operator-secret file")
+        var operatorSecretFile: String
+
+        @Option(name: .long, help: "Owner-only mounted account-KEK file")
+        var accountKEKFile: String
+
+        @Option(name: .long, help: "Active account-KEK identifier")
+        var accountKEKID: String = "primary"
+
+        @Option(name: .long, help: "Protected account key-envelope directory; defaults to <data-directory>/keys")
+        var accountKeyDirectory: String?
+
+        func run() async throws {
+            // Resolve operator authority before probing any account metadata or
+            // account-database path.
+            let authorization = try AccountCommandSupport.authorization(
+                secretFilePath: operatorSecretFile
+            )
+            guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !outputDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !accountKEKFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !accountKEKID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ValidationError("portable export options must not be empty")
+            }
+            let canonicalDID: String
+            let keyConfiguration: AccountKeyEncryptionConfiguration
+            do {
+                canonicalDID = try AccountIdentifiers.validateDID(did)
+                keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                    activeKeyID: accountKEKID,
+                    secretFile: URL(fileURLWithPath: accountKEKFile)
+                )
+            } catch {
+                throw ValidationError("portable export configuration is invalid")
+            }
+
+            let dataURL = URL(fileURLWithPath: dataDirectory).standardizedFileURL
+            let outputURL = URL(fileURLWithPath: outputDirectory).standardizedFileURL
+            let keyURL = accountKeyDirectory.map { URL(fileURLWithPath: $0) }
+                ?? dataURL.appending(path: "keys", directoryHint: .isDirectory)
+            var control: SQLiteControlDatabase?
+            var accountDatabase: SQLiteAccountDatabase?
+            do {
+                let openedControl = try await SQLiteControlDatabase(dataDirectory: dataURL)
+                control = openedControl
+                guard let account = try await openedControl.account(did: canonicalDID) else {
+                    throw AccountOperatorError.unknownAccount
+                }
+                guard account.status == .active,
+                      account.signingKey != nil,
+                      account.publicGenesisCommitCID != nil else {
+                    throw AccountOperatorError.accountInactive
+                }
+                let openedAccount = try await SQLiteAccountDatabase(
+                    dataDirectory: dataURL,
+                    did: canonicalDID,
+                    openMode: .existingPortableExportSource
+                )
+                accountDatabase = openedAccount
+                let keyStore = try FileAccountKeyStore(
+                    root: keyURL,
+                    configuration: keyConfiguration
+                )
+                let exporter = try SwanPortableAccountExporter(
+                    database: openedAccount,
+                    keyStore: keyStore
+                )
+                let result = try await exporter.export(account: account, to: outputURL)
+                _ = try await AccountOperatorService(store: openedControl).declareExport(
+                    did: canonicalDID,
+                    manifestReference: result.manifestSHA256,
+                    authorization: authorization
+                )
+                try await openedAccount.close()
+                accountDatabase = nil
+                try await openedControl.close()
+                control = nil
+                try AccountCommandSupport.write(result)
+            } catch {
+                try? await accountDatabase?.close()
+                try? await control?.close()
+                if let error = error as? AccountOperatorError {
+                    throw AccountCommandSupport.validationError(for: error)
+                }
+                throw ValidationError("portable export failed")
+            }
+        }
+    }
+
     struct Serve: AsyncParsableCommand {
         static let configuration = CommandConfiguration(abstract: "Run Swan's Hummingbird server")
 

@@ -48,11 +48,41 @@ enum SQLiteProtectedPaths {
         return descriptor
     }
 
+    static func openExistingRoot(_ url: URL) throws -> Int32 {
+        let descriptor = try openExistingDirectory(path: url.standardizedFileURL.path)
+        do {
+            try requireOwnerOnlyDirectory(descriptor)
+            return descriptor
+        } catch {
+            _ = close(descriptor)
+            throw error
+        }
+    }
+
     static func openAccountDirectory(rootDescriptor: Int32, did: String) throws -> Int32 {
         let digest = Hex.encode(SHA256.hash(data: Data(did.utf8)))
         let actors = try openOrCreateDirectory(parent: rootDescriptor, name: "actors")
         do {
             let prefix = try openOrCreateDirectory(parent: actors, name: String(digest.prefix(2)))
+            _ = close(actors)
+            return prefix
+        } catch {
+            _ = close(actors)
+            throw error
+        }
+    }
+
+    static func openExistingAccountDirectory(
+        rootDescriptor: Int32,
+        did: String
+    ) throws -> Int32 {
+        let digest = Hex.encode(SHA256.hash(data: Data(did.utf8)))
+        let actors = try openExistingDirectory(parent: rootDescriptor, name: "actors")
+        do {
+            let prefix = try openExistingDirectory(
+                parent: actors,
+                name: String(digest.prefix(2))
+            )
             _ = close(actors)
             return prefix
         } catch {
@@ -71,6 +101,25 @@ enum SQLiteProtectedPaths {
         }
         let descriptor = name.withCString { path in
             openat(parentDescriptor, path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, ownerOnlyFileMode)
+        }
+        guard descriptor >= 0 else {
+            throw SwanError.unavailable("SQLite database path is unavailable")
+        }
+        defer { _ = close(descriptor) }
+        try requireOwnerOnlyRegularFile(descriptor)
+        return resolvedPath
+    }
+
+    static func openExistingDatabaseFile(
+        parentDescriptor: Int32,
+        name: String,
+        resolvedPath: String
+    ) throws -> String {
+        guard validDatabaseFilename(name) else {
+            throw SwanError.unavailable("SQLite database path is unavailable")
+        }
+        let descriptor = name.withCString { path in
+            openat(parentDescriptor, path, O_RDWR | O_CLOEXEC | O_NOFOLLOW)
         }
         guard descriptor >= 0 else {
             throw SwanError.unavailable("SQLite database path is unavailable")
@@ -346,6 +395,28 @@ enum SQLiteProtectedPaths {
             throw SwanError.unavailable("SQLite data directory is unavailable")
         }
         return descriptor
+    }
+
+    private static func openExistingDirectory(
+        parent: Int32,
+        name: String
+    ) throws -> Int32 {
+        guard validDirectoryComponent(name) else {
+            throw SwanError.unavailable("SQLite data directory is unavailable")
+        }
+        let descriptor = name.withCString { path in
+            openat(parent, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
+        }
+        guard descriptor >= 0 else {
+            throw SwanError.unavailable("SQLite data directory is unavailable")
+        }
+        do {
+            try requireOwnerOnlyDirectory(descriptor)
+            return descriptor
+        } catch {
+            _ = close(descriptor)
+            throw error
+        }
     }
 
     private static func openOrCreateDirectory(parent: Int32, name: String) throws -> Int32 {

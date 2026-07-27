@@ -590,6 +590,30 @@ public struct PersistedRepositorySnapshot: Sendable, Equatable {
     public let records: [PersistedSpaceRecord]
 }
 
+/// Read-only, domain-shaped inventory used by portable account export. It
+/// contains no paths, SQL handles, payload bytes, sessions, or key material.
+/// Each listed repository is loaded later through `repositorySnapshot`, and
+/// each blob through the existing verified `BlobStore` API.
+public struct SQLitePortableExportInventory: Sendable, Equatable {
+    public struct Repository: Sendable, Equatable {
+        public let space: SpaceURI
+        public let author: String
+
+        public init(space: SpaceURI, author: String) {
+            self.space = space
+            self.author = author
+        }
+    }
+
+    public let repositories: [Repository]
+    public let blobs: [BlobReference]
+
+    public init(repositories: [Repository], blobs: [BlobReference]) {
+        self.repositories = repositories
+        self.blobs = blobs
+    }
+}
+
 public enum PersistedOplogRead: Sendable, Equatable {
     case incremental([PersistedSpaceOplogEntry])
     /// The cursor predates retained operations. These durable facts are the
@@ -896,6 +920,11 @@ private struct LoadedSimpleSpaceAuthority: Sendable {
 /// The concrete SQLite/WAL boundary. Its actor is a coordination aid, while
 /// `BEGIN IMMEDIATE` makes the oplog/outbox write atomic even if another Swan
 /// process later opens the same file.
+public enum SQLiteAccountDatabaseOpenMode: Sendable, Equatable {
+    case managed
+    case existingPortableExportSource
+}
+
 public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     private static let permissionedRepositoryStorageMigrationVersion = 1
     private static let permissionedOutboxLeaseMigrationVersion = 2
@@ -909,6 +938,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     private let dataDirectory: URL
     let accountDID: String
     private let oplogRetention: Int
+    private let portableExportReadOnly: Bool
     private var accountDirectoryDescriptor: Int32
     private var testingHooks = SQLiteTestingHooks()
     private var activeWriteTransactions = 0
@@ -916,7 +946,8 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     public init(
         dataDirectory: URL,
         did: String,
-        oplogRetention: Int = 10_000
+        oplogRetention: Int = 10_000,
+        openMode: SQLiteAccountDatabaseOpenMode = .managed
     ) async throws {
         guard oplogRetention > 0 else {
             throw SwanError.malformed("oplog retention must be positive")
@@ -926,25 +957,49 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             spaceType: "app.swan.account",
             skey: "self"
         )
-        let rootDescriptor = try SQLiteProtectedPaths.openRoot(dataDirectory)
+        let rootDescriptor = switch openMode {
+        case .managed:
+            try SQLiteProtectedPaths.openRoot(dataDirectory)
+        case .existingPortableExportSource:
+            try SQLiteProtectedPaths.openExistingRoot(dataDirectory)
+        }
         let accountDescriptor: Int32
         do {
-            accountDescriptor = try SQLiteProtectedPaths.openAccountDirectory(
-                rootDescriptor: rootDescriptor,
-                did: did
-            )
+            accountDescriptor = switch openMode {
+            case .managed:
+                try SQLiteProtectedPaths.openAccountDirectory(
+                    rootDescriptor: rootDescriptor,
+                    did: did
+                )
+            case .existingPortableExportSource:
+                try SQLiteProtectedPaths.openExistingAccountDirectory(
+                    rootDescriptor: rootDescriptor,
+                    did: did
+                )
+            }
         } catch {
             SQLiteProtectedPaths.closeDirectory(rootDescriptor)
             throw error
         }
         let databasePath: String
         do {
-            databasePath = try SQLiteProtectedPaths.openDatabaseFile(
-                parentDescriptor: accountDescriptor,
-                name: "\(Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite",
-                resolvedPath: SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
-                    .standardizedFileURL.path
-            )
+            let name = "\(Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite"
+            let path = SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
+                .standardizedFileURL.path
+            databasePath = switch openMode {
+            case .managed:
+                try SQLiteProtectedPaths.openDatabaseFile(
+                    parentDescriptor: accountDescriptor,
+                    name: name,
+                    resolvedPath: path
+                )
+            case .existingPortableExportSource:
+                try SQLiteProtectedPaths.openExistingDatabaseFile(
+                    parentDescriptor: accountDescriptor,
+                    name: name,
+                    resolvedPath: path
+                )
+            }
         } catch {
             SQLiteProtectedPaths.closeDirectory(accountDescriptor)
             SQLiteProtectedPaths.closeDirectory(rootDescriptor)
@@ -958,6 +1013,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         self.dataDirectory = dataDirectory.standardizedFileURL
         self.accountDID = did
         self.oplogRetention = oplogRetention
+        portableExportReadOnly = openMode == .existingPortableExportSource
         let openedConnection: SQLiteConnection
         do {
             openedConnection = try await SQLiteConnection.open(storage: .file(path: databasePath))
@@ -967,17 +1023,19 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         }
         connection = openedConnection
         accountDirectoryDescriptor = accountDescriptor
-        do {
-            try await migrateWithoutGate()
-            try await recoverPrivateBlobLifecycle()
-            try SQLiteProtectedPaths.hardenSQLiteFiles(
-                parentDescriptor: accountDescriptor,
-                databaseName: "\(Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite"
-            )
-        } catch {
-            try? await openedConnection.close()
-            SQLiteProtectedPaths.closeDirectory(accountDescriptor)
-            throw error
+        if openMode == .managed {
+            do {
+                try await migrateWithoutGate()
+                try await recoverPrivateBlobLifecycle()
+                try SQLiteProtectedPaths.hardenSQLiteFiles(
+                    parentDescriptor: accountDescriptor,
+                    databaseName: "\(Hex.encode(SHA256.hash(data: Data(did.utf8)))).sqlite"
+                )
+            } catch {
+                try? await openedConnection.close()
+                SQLiteProtectedPaths.closeDirectory(accountDescriptor)
+                throw error
+            }
         }
     }
 
@@ -2084,6 +2142,80 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                 return try await repositorySnapshotWithoutTransaction(
                     space: space,
                     author: author
+                )
+            }
+        }
+    }
+
+    /// Enumerates only locally reachable portable-export content under one
+    /// SQLite read snapshot. Payload materialization and filesystem output are
+    /// deliberately outside this transaction.
+    public func portableExportInventory() async throws -> SQLitePortableExportInventory {
+        try await withConnectionGate {
+            try await readTransaction {
+                let repositoryRows = try await connection.query(
+                    """
+                    SELECT space_uri, author_did
+                    FROM permissioned_repository_state
+                    ORDER BY space_uri, author_did
+                    """
+                )
+                let repositories = try repositoryRows.map { row in
+                    let rawSpace = try requiredText(row, "space_uri")
+                    let author = try requiredText(row, "author_did")
+                    let space: SpaceURI
+                    do {
+                        space = try SpaceURI(rawSpace)
+                    } catch {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "invalid portable export repository identity"
+                        )
+                    }
+                    guard author == accountDID,
+                          space.rawValue == rawSpace else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "invalid portable export repository owner"
+                        )
+                    }
+                    return SQLitePortableExportInventory.Repository(
+                        space: space,
+                        author: author
+                    )
+                }
+
+                let blobRows = try await connection.query(
+                    """
+                    SELECT cid, namespace_kind, space_uri
+                    FROM blob_namespace_references
+                    ORDER BY namespace_kind, space_uri, cid
+                    """
+                )
+                let blobs = try blobRows.map { row in
+                    let cid = try requiredText(row, "cid")
+                    let kind = try requiredText(row, "namespace_kind")
+                    let rawSpace = try requiredText(row, "space_uri")
+                    let namespace: BlobNamespace
+                    switch (kind, rawSpace.isEmpty) {
+                    case ("public", true):
+                        namespace = .public
+                    case ("space", false):
+                        do {
+                            namespace = .space(try SpaceURI(rawSpace))
+                        } catch {
+                            throw SQLiteRepositoryError.corruptDatabase(
+                                "invalid portable export blob namespace"
+                            )
+                        }
+                    default:
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "invalid portable export blob namespace"
+                        )
+                    }
+                    return BlobReference(cid: cid, namespace: namespace)
+                }
+                return SQLitePortableExportInventory(
+                    repositories: repositories,
+                    blobs: blobs
                 )
             }
         }
@@ -4211,7 +4343,13 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             guard let payload = stored.legacyPayload else {
                 throw SQLiteRepositoryError.corruptDatabase("missing legacy blob payload")
             }
-            try await migrateLegacyBlobToCAS(stored, payload: payload)
+            guard legacyBlobCID(payload) == stored.cid,
+                  payload.count == stored.byteCount else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid legacy blob payload")
+            }
+            if !portableExportReadOnly {
+                try await migrateLegacyBlobToCAS(stored, payload: payload)
+            }
             return payload
         case .casV1:
             let body = try await fileBackedBlobBody(stored)

@@ -12,6 +12,7 @@ let package = Package(
         .library(name: "SwanStorage", targets: ["SwanStorage"]),
         .library(name: "SwanSQLite", targets: ["SwanSQLite"]),
         .library(name: "SwanAccounts", targets: ["SwanAccounts"]),
+        .library(name: "SwanAccountExport", targets: ["SwanAccountExport"]),
         .library(name: "SwanOAuth", targets: ["SwanOAuth"]),
         .library(name: "SwanHTTP", targets: ["SwanHTTP"]),
         .library(name: "SwanInterop", targets: ["SwanInterop"]),
@@ -135,6 +136,15 @@ let package = Package(
             ]
         ),
         .target(
+            name: "SwanAccountExport",
+            dependencies: [
+                "SwanAccounts", "SwanCore", "SwanPublicRepository",
+                "SwanSQLite", "SwanSpaces", "SwanSpacesWire", "SwanStorage",
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "Petrel", package: "Petrel"),
+            ]
+        ),
+        .target(
             name: "SwanHTTP",
             dependencies: [
                 "SwanAccounts", "SwanCore", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth", "SwanSQLite",
@@ -155,7 +165,7 @@ let package = Package(
         .executableTarget(
             name: "swan",
             dependencies: [
-                "SwanAccounts", "SwanHTTP", "SwanInterop", "SwanOAuth",
+                "SwanAccountExport", "SwanAccounts", "SwanHTTP", "SwanInterop", "SwanOAuth",
                 "SwanPublicRepository", "SwanSQLite",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Crypto", package: "swift-crypto"),
@@ -204,6 +214,15 @@ let package = Package(
                 .product(name: "NIOSSL", package: "swift-nio-ssl"),
                 .product(name: "Petrel", package: "Petrel"),
                 .product(name: "SQLiteNIO", package: "sqlite-nio"),
+            ]
+        ),
+        .testTarget(
+            name: "SwanAccountExportTests",
+            dependencies: [
+                "SwanAccountExport", "SwanAccounts", "SwanPublicRepository",
+                "SwanSQLite", "SwanSpaces", "SwanStorage",
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "Petrel", package: "Petrel"),
             ]
         ),
         .testTarget(

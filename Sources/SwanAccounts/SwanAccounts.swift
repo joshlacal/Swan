@@ -87,23 +87,3 @@ public actor InMemoryAccountDirectory {
         accounts[did] = account
     }
 }
-
-public struct PortableAccountExportManifest: Codable, Sendable, Equatable {
-    public let format: String
-    public let did: String
-    public let createdAt: Date
-    public let publicRepositoryPath: String
-    public let spaceRepositoryPaths: [String]
-    public let blobPaths: [String]
-    public let includesPrivateKeys: Bool
-
-    public init(did: String, publicRepositoryPath: String, spaceRepositoryPaths: [String], blobPaths: [String], includesPrivateKeys: Bool = false) {
-        format = "swan-account-export-v1"
-        self.did = did
-        createdAt = Date()
-        self.publicRepositoryPath = publicRepositoryPath
-        self.spaceRepositoryPaths = spaceRepositoryPaths
-        self.blobPaths = blobPaths
-        self.includesPrivateKeys = includesPrivateKeys
-    }
-}
