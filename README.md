@@ -39,6 +39,8 @@ and requires a byte-for-byte empty diff against the checked-in Swift output, so
 it is the CI gate. Neither command falls back to the ordinary `../Petrel`
 checkout. CI must materialize the pinned reference archive and the isolated
 Petrel generator source locally; the scripts perform no network access.
+Checksum validation goes through `Scripts/sha256.sh`, which uses `sha256sum`
+when available and otherwise macOS `shasum -a 256`.
 
 `Swan` never places permissioned records into a public repository, public blob
 namespace, log line, or fixture. Permissioned data is access-controlled, not
