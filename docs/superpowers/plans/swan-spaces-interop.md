@@ -64,6 +64,22 @@ Catbird UI work.
   its branch. Swan does not yet implement lexicon schema validation, so
   `validate: true` is explicitly rejected rather than silently ignored;
   omitted or `false` requests receive structural AT-record validation only.
+- The authority-owned SimpleSpace lifecycle slice now exposes the generated
+  `com.atproto.simplespace.createSpace`, `updateSpace`, `deleteSpace`,
+  `addMember`, `removeMember`, and `listMembers` contracts only through the
+  same startup-preopened DPoP/OAuth capability. The exact pinned OAuth
+  lifecycle vocabulary is `manage=create|update|delete`, distinct from record
+  `action` grants; all scoped grants bind type, authority, and skey, while a
+  broad `atproto` grant remains valid for the authority account. The adapter
+  never opens a database on demand, performs non-destructive configuration
+  patches transactionally, allocates omitted space keys safely, has
+  deterministic bounded membership pages, and maps foreign-authority access
+  to the opaque `SpaceNotFound` result. `checkUserAccess`, credentials,
+  notifications, service auth, remote authority delegation, and sync remain
+  explicitly closed. Focused tests use durable SQLite accounts, opaque OAuth
+  tokens, and signed DPoP proofs for create/update/delete scopes, owner-removal
+  rejection, malformed body/query closure, deactivation, vanished preopened
+  DBs, and public-route isolation.
 - All unimplemented HTTP endpoints intentionally return generic authorization
   errors or `profile_endpoint_pending`; they are not interop evidence. The
   pinned TypeScript `com.atproto.space.getSpace` exception is now a typed,

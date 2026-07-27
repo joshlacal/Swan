@@ -262,8 +262,7 @@ public enum SQLiteLayout {
             created_at INTEGER NOT NULL CHECK(created_at >= 0),
             updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
             CHECK(
-                (policy = 'managing-app' AND managing_app IS NOT NULL AND length(managing_app) > 0)
-                OR (policy != 'managing-app' AND managing_app IS NULL)
+                policy = 'managing-app' OR managing_app IS NULL
             )
         )
         """,
@@ -1591,7 +1590,11 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         return try await withConnectionGate {
             try await transaction {
                 try requireAuthorityAccount(space: space, owner: owner)
-                try requireAuthorityManagement(space: space, authorization: authorization)
+                try requireAuthorityManagement(
+                    space: space,
+                    authorization: authorization,
+                    operation: .create
+                )
                 let existing = try await connection.query(
                     "SELECT 1 FROM permissioned_simple_space_authorities WHERE space_uri = ?",
                     [.text(space.rawValue)]
@@ -1643,7 +1646,8 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             try await readTransaction {
                 try requireAuthorityManagement(
                     space: space,
-                    authorization: authorization
+                    authorization: authorization,
+                    operation: .update
                 )
                 return try await loadSimpleSpace(space)?.state
             }
@@ -1661,7 +1665,11 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         return try await withConnectionGate {
             try await transaction {
                 try requireAuthorityAccount(space: space)
-                try requireAuthorityManagement(space: space, authorization: authorization)
+                try requireAuthorityManagement(
+                    space: space,
+                    authorization: authorization,
+                    operation: .update
+                )
                 let stored = try await requiredSimpleSpace(space)
                 try requireActiveSimpleSpace(stored.state)
                 guard stored.state.space.configuration != configuration else {
@@ -1705,6 +1713,71 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         }
     }
 
+    /// Applies an XRPC `updateSpace` patch inside one authority transaction.
+    /// Fetching configuration in the HTTP layer and writing it back later
+    /// would race another patch and turn an omitted property into a stale
+    /// reset, so the patch is resolved against the durable row while the
+    /// write transaction is held.
+    public func patchSimpleSpace(
+        space: SpaceURI,
+        patch: SimpleSpaceConfigurationPatch,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        let timestamp = try simpleSpaceTimestamp(now)
+        return try await withConnectionGate {
+            try await transaction {
+                try requireAuthorityAccount(space: space)
+                try requireAuthorityManagement(
+                    space: space,
+                    authorization: authorization,
+                    operation: .update
+                )
+                let stored = try await requiredSimpleSpace(space)
+                try requireActiveSimpleSpace(stored.state)
+                let configuration = try patch.applying(
+                    to: stored.state.space.configuration
+                )
+                try validateSimpleSpaceConfiguration(configuration)
+                guard configuration != stored.state.space.configuration else {
+                    return stored.state
+                }
+                let previous = stored.state.space.configuration
+                let nextRevision = try nextSimpleSpaceRevision(stored.state.revision)
+                _ = try await connection.query(
+                    """
+                    UPDATE permissioned_simple_space_authorities
+                    SET policy = ?, app_access = ?, managing_app = ?,
+                        revision = ?,
+                        updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END
+                    WHERE space_uri = ?
+                    """,
+                    [
+                        .text(configuration.policy.rawValue),
+                        .text(simpleSpaceAppAccessName(configuration.appAccess)),
+                        configuration.managingApp.map(SQLiteData.text) ?? .null,
+                        .integer(try sqliteRevision(nextRevision)),
+                        .integer(timestamp), .integer(timestamp),
+                        .text(space.rawValue),
+                    ]
+                )
+                try await replaceSimpleSpaceClients(
+                    space: space,
+                    appAccess: configuration.appAccess
+                )
+                if previous.policy != .managingApp
+                    || configuration.policy != .managingApp
+                    || previous.managingApp != configuration.managingApp {
+                    _ = try await connection.query(
+                        "DELETE FROM permissioned_simple_space_managing_app_decisions WHERE space_uri = ?",
+                        [.text(space.rawValue)]
+                    )
+                }
+                return try await requiredSimpleSpace(space).state
+            }
+        }
+    }
+
     public func addSimpleSpaceMember(
         space: SpaceURI,
         member: String,
@@ -1718,7 +1791,11 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         return try await withConnectionGate {
             try await transaction {
                 try requireAuthorityAccount(space: space)
-                try requireAuthorityManagement(space: space, authorization: authorization)
+                try requireAuthorityManagement(
+                    space: space,
+                    authorization: authorization,
+                    operation: .update
+                )
                 let stored = try await requiredSimpleSpace(space)
                 try requireActiveSimpleSpace(stored.state)
                 guard !stored.state.space.members.contains(member) else {
@@ -1747,7 +1824,11 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         return try await withConnectionGate {
             try await transaction {
                 try requireAuthorityAccount(space: space)
-                try requireAuthorityManagement(space: space, authorization: authorization)
+                try requireAuthorityManagement(
+                    space: space,
+                    authorization: authorization,
+                    operation: .update
+                )
                 let stored = try await requiredSimpleSpace(space)
                 try requireActiveSimpleSpace(stored.state)
                 guard member != stored.state.space.owner else {
@@ -1781,7 +1862,11 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         return try await withConnectionGate {
             try await transaction {
                 try requireAuthorityAccount(space: space)
-                try requireAuthorityManagement(space: space, authorization: authorization)
+                try requireAuthorityManagement(
+                    space: space,
+                    authorization: authorization,
+                    operation: .update
+                )
                 let stored = try await requiredSimpleSpace(space)
                 try requireActiveSimpleSpace(stored.state)
                 guard case .allowList = stored.state.space.configuration.appAccess else {
@@ -1874,7 +1959,11 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         return try await withConnectionGate {
             try await transaction {
                 try requireAuthorityAccount(space: space)
-                try requireAuthorityManagement(space: space, authorization: authorization)
+                try requireAuthorityManagement(
+                    space: space,
+                    authorization: authorization,
+                    operation: .delete
+                )
                 let stored = try await requiredSimpleSpace(space)
                 guard !stored.state.space.isDeleted else { return stored.state }
                 let nextRevision = try nextSimpleSpaceRevision(stored.state.revision)
@@ -2355,14 +2444,13 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
 
     private func requireAuthorityManagement(
         space: SpaceURI,
-        authorization: AuthorizationContext
+        authorization: AuthorizationContext,
+        operation: SimpleSpaceManagementOperation
     ) throws {
-        try SpaceAuthorizationPolicy.require(
+        try SpaceAuthorizationPolicy.requireManagement(
             space: space,
-            author: space.authority,
-            uri: nil,
             authorization: authorization,
-            permission: .manage
+            operation: operation
         )
     }
 
@@ -2407,7 +2495,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         _ state: DurableSimpleSpaceState
     ) throws {
         guard !state.space.isDeleted else {
-            throw SwanError.unauthorized("space deleted")
+            throw AuthorizedSimpleSpaceLifecycleError.notFound
         }
     }
 
@@ -2424,10 +2512,9 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         }
         switch configuration.policy {
         case .managingApp:
-            guard let managingApp = configuration.managingApp else {
-                throw SwanError.malformed("managing-app spaces require a managing app")
+            if let managingApp = configuration.managingApp {
+                try validateSimpleSpaceAppIdentifier(managingApp)
             }
-            try validateSimpleSpaceAppIdentifier(managingApp)
         case .public, .memberList:
             guard configuration.managingApp == nil else {
                 throw SwanError.malformed("only managing-app spaces may name a managing app")
@@ -2483,7 +2570,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         _ space: SpaceURI
     ) async throws -> LoadedSimpleSpaceAuthority {
         guard let stored = try await loadSimpleSpace(space) else {
-            throw SwanError.malformed("space not found")
+            throw AuthorizedSimpleSpaceLifecycleError.notFound
         }
         return stored
     }
@@ -3703,7 +3790,7 @@ public actor DurableSpaceRepository {
 /// by `SpaceURI.authority`.
 public actor DurableSimpleSpaceAuthority {
     private let database: SQLiteAccountDatabase
-    private let credentials: HMACSpaceCredentialAuthority
+    private let credentials: HMACSpaceCredentialAuthority?
 
     public init(
         database: SQLiteAccountDatabase,
@@ -3714,6 +3801,14 @@ public actor DurableSimpleSpaceAuthority {
         }
         self.database = database
         credentials = HMACSpaceCredentialAuthority(key: credentialSecret)
+    }
+
+    /// Lifecycle-only facade used by the startup-preopened HTTP authority
+    /// directory. It intentionally cannot mint credentials: that requires a
+    /// separately configured secret-bearing authority instance.
+    public init(lifecycleDatabase database: SQLiteAccountDatabase) {
+        self.database = database
+        credentials = nil
     }
 
     public func create(
@@ -3748,6 +3843,20 @@ public actor DurableSimpleSpaceAuthority {
         try await database.updateSimpleSpace(
             space: space,
             configuration: configuration,
+            authorization: authorization,
+            now: now
+        )
+    }
+
+    public func update(
+        space: SpaceURI,
+        patch: SimpleSpaceConfigurationPatch,
+        authorization: AuthorizationContext,
+        now: Date = Date()
+    ) async throws -> DurableSimpleSpaceState {
+        try await database.patchSimpleSpace(
+            space: space,
+            patch: patch,
             authorization: authorization,
             now: now
         )
@@ -3848,6 +3957,9 @@ public actor DurableSimpleSpaceAuthority {
             expiresAt: now.addingTimeInterval(2 * 60 * 60),
             clientID: clientID
         )
+        guard let credentials else {
+            throw SwanError.unavailable("credential authority is unavailable")
+        }
         return try credentials.issue(SpaceCredential(grant: grant, issuedAt: now))
     }
 }

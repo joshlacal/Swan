@@ -780,12 +780,12 @@ final class SwanSpacesTests: XCTestCase {
             skey: "authority"
         )
         let credentialSecret = Data(repeating: 0x5A, count: 32)
-        let managementScope = """
-        space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&action=manage
-        """
         let manage = AuthorizationContext.accountOAuth(
             subject: authorityDID,
-            scopes: [managementScope]
+            scopes: [
+                "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&manage=create",
+                "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&manage=update",
+            ]
         )
         let initialConfiguration = try SimpleSpaceConfiguration(
             policy: .memberList,

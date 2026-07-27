@@ -74,6 +74,69 @@ public protocol AuthorizedSimpleSpaceDirectory: Sendable {
     func close() async throws
 }
 
+/// A deliberately narrow lifecycle/membership projection for a simple-space
+/// authority account that was opened at service startup.  It names domain
+/// operations rather than exposing a SQLite handle or mutable authority
+/// object, so request handlers cannot create, migrate, or select an arbitrary
+/// account database.
+public protocol AuthorizedSimpleSpaceLifecycleDirectory: Sendable {
+    func createSimpleSpace(
+        _ space: SpaceURI,
+        configuration: SimpleSpaceConfiguration,
+        authorization: AuthorizationContext
+    ) async throws
+
+    func updateSimpleSpace(
+        _ space: SpaceURI,
+        patch: SimpleSpaceConfigurationPatch,
+        authorization: AuthorizationContext
+    ) async throws
+
+    func deleteSimpleSpace(
+        _ space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws
+
+    func addSimpleSpaceMember(
+        _ member: String,
+        to space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws
+
+    func removeSimpleSpaceMember(
+        _ member: String,
+        from space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws
+
+    func simpleSpaceMembers(
+        _ space: SpaceURI,
+        limit: Int,
+        cursor: String?,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSimpleSpaceMemberPage
+}
+
+/// Privacy-safe page returned only after the caller has passed the exact
+/// authority account and lifecycle-scope checks.  Member identities are
+/// intentionally unavailable from the generic `getSpace` projection.
+public struct AuthorizedSimpleSpaceMemberPage: Sendable, Equatable {
+    public let members: [String]
+    public let cursor: String?
+
+    public init(members: [String], cursor: String?) {
+        self.members = members
+        self.cursor = cursor
+    }
+}
+
+/// Stable, privacy-safe lifecycle error used across the SQLite adapter and
+/// HTTP boundary. It intentionally carries no space, account, member, or
+/// storage detail.
+public enum AuthorizedSimpleSpaceLifecycleError: Error, Sendable, Equatable {
+    case notFound
+}
+
 /// Startup-preopened, authenticated projection of a permissioned repository.
 ///
 /// This is intentionally separate from ``AuthorizedSimpleSpaceDirectory``:

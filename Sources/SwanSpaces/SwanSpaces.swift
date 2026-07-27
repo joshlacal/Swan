@@ -175,6 +175,16 @@ public enum SpacePermission: String, Codable, Sendable, CaseIterable {
     case manage
 }
 
+/// The pinned OAuth `manage` vocabulary for authority-owned simple-space
+/// lifecycle operations.  It is intentionally separate from record actions:
+/// a grant that can write a permissioned record must never imply membership or
+/// lifecycle control.
+public enum SimpleSpaceManagementOperation: String, Codable, Sendable, CaseIterable {
+    case create
+    case update
+    case delete
+}
+
 public struct SpaceGrant: Codable, Sendable, Equatable {
     public let subject: String
     public let space: SpaceURI
@@ -250,6 +260,28 @@ public enum SpaceAuthorizationPolicy {
         }
     }
 
+    /// Requires the exact pinned `manage` verb for a simple-space authority
+    /// operation.  The broad `atproto` grant is deliberately retained for an
+    /// account's own PDS, while a scoped grant must bind the type, authority,
+    /// skey, and one lifecycle verb.  `action=manage` is not an OAuth scope
+    /// form and is therefore not accepted here.
+    public static func requireManagement(
+        space: SpaceURI,
+        authorization: AuthorizationContext,
+        operation: SimpleSpaceManagementOperation
+    ) throws {
+        guard case let .accountOAuth(subject, scopes) = authorization,
+              subject == space.authority else {
+            throw SwanError.unauthorized("authority account OAuth is required")
+        }
+        if scopes.contains("atproto") { return }
+        guard scopes.contains(where: {
+            managementScopeAllows($0, space: space, operation: operation)
+        }) else {
+            throw SwanError.unauthorized("OAuth scope does not cover this space management operation")
+        }
+    }
+
     private static func scopeAllows(
         _ scopes: Set<String>,
         space: SpaceURI,
@@ -302,6 +334,27 @@ public enum SpaceAuthorizationPolicy {
             }
             return parameters["collection"] == nil || parameters["collection"] == "*"
         }
+    }
+
+    private static func managementScopeAllows(
+        _ scope: String,
+        space: SpaceURI,
+        operation: SimpleSpaceManagementOperation
+    ) -> Bool {
+        let base = "space:\(space.spaceType)"
+        guard scope.hasPrefix(base + "?"),
+              PermissionedSpaceScopeSyntax.isQualified(scope),
+              let parameters = strictQueryParameters(
+                String(scope.dropFirst(base.count + 1))
+              ),
+              parameters["authority"] == space.authority,
+              parameters["skey"] == space.skey,
+              parameters["manage"] == operation.rawValue,
+              parameters["action"] == nil,
+              parameters["collection"] == nil else {
+            return false
+        }
+        return true
     }
 
     /// Parses only the compact query grammar used by scoped space grants.
@@ -712,15 +765,55 @@ public struct SimpleSpaceConfiguration: Sendable, Codable, Equatable {
     public let managingApp: String?
 
     public init(policy: SimpleSpacePolicy = .memberList, appAccess: SimpleSpaceAppAccess = .open, managingApp: String? = nil) throws {
-        guard policy != .managingApp || managingApp != nil else {
-            throw SwanError.malformed("managing-app spaces require a managing app")
-        }
         guard policy == .managingApp || managingApp == nil else {
             throw SwanError.malformed("only managing-app spaces may name a managing app")
         }
+        // The pinned `updateSpace` handler treats an empty `managingApp` as
+        // an explicit clear. A managing-app policy with no configured app is
+        // therefore a valid (but fail-closed) state, not malformed authority
+        // data. No app can submit managing-app decisions until one is set.
         self.policy = policy
         self.appAccess = appAccess
         self.managingApp = managingApp
+    }
+}
+
+/// A non-destructive update to simple-space configuration.  The wire
+/// `updateSpace` schema makes each field optional; representing that directly
+/// prevents an omitted field from silently resetting durable policy state.
+public struct SimpleSpaceConfigurationPatch: Sendable, Equatable {
+    public enum ManagingApp: Sendable, Equatable {
+        case unchanged
+        case set(String?)
+    }
+
+    public let policy: SimpleSpacePolicy?
+    public let appAccess: SimpleSpaceAppAccess?
+    public let managingApp: ManagingApp
+
+    public init(
+        policy: SimpleSpacePolicy? = nil,
+        appAccess: SimpleSpaceAppAccess? = nil,
+        managingApp: ManagingApp = .unchanged
+    ) {
+        self.policy = policy
+        self.appAccess = appAccess
+        self.managingApp = managingApp
+    }
+
+    public func applying(to current: SimpleSpaceConfiguration) throws -> SimpleSpaceConfiguration {
+        let nextManagingApp: String?
+        switch managingApp {
+        case .unchanged:
+            nextManagingApp = current.managingApp
+        case let .set(value):
+            nextManagingApp = value
+        }
+        return try SimpleSpaceConfiguration(
+            policy: policy ?? current.policy,
+            appAccess: appAccess ?? current.appAccess,
+            managingApp: nextManagingApp
+        )
     }
 }
 

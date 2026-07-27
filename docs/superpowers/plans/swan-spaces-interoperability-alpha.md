@@ -75,6 +75,13 @@ checksum-verified way to populate the ignored reference cache.
   issued as a narrow resource grant without adding the broad `atproto` token
   scope. Bare/default type scopes are rejected; the domain policy remains the
   exact space/collection authorization decision.
+- The six authority-owned `com.atproto.simplespace` lifecycle/membership
+  routes now use checked-in generated server contracts and the same
+  startup-preopened DPoP/OAuth capability. They are intentionally limited to
+  local authority state; managing-app service auth, credentials,
+  notifications, remote delegation, and synchronization remain closed pending
+  their dedicated capability work. This is not evidence of cross-host
+  SimpleSpace interoperability.
 
 ## Completion gates
 

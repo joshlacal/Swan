@@ -10,6 +10,7 @@ import SwanStorage
 /// successfully preopened for an active account at bootstrap.
 public actor SQLitePreMigratedAccountDirectory:
     AuthorizedSimpleSpaceDirectory,
+    AuthorizedSimpleSpaceLifecycleDirectory,
     AuthorizedSpaceRepositoryDirectory
 {
     private let controlStore: any AccountControlStore
@@ -123,6 +124,125 @@ public actor SQLitePreMigratedAccountDirectory:
         return AuthenticatedSimpleSpaceDescription(
             space: state.space.uri,
             configuration: state.space.configuration
+        )
+    }
+
+    // MARK: Authenticated simple-space lifecycle
+
+    /// Every lifecycle operation selects only the authority's preopened
+    /// database and delegates the exact operation to
+    /// `DurableSimpleSpaceAuthority`. The facade keeps scope matching in the
+    /// domain/storage layer, rather than treating a successful DPoP proof as
+    /// a generic management boolean.
+    public func createSimpleSpace(
+        _ space: SpaceURI,
+        configuration: SimpleSpaceConfiguration,
+        authorization: AuthorizationContext
+    ) async throws {
+        let authority = try await lifecycleAuthority(
+            for: space,
+            authorization: authorization
+        )
+        _ = try await authority.create(
+            space: space,
+            owner: space.authority,
+            configuration: configuration,
+            authorization: authorization
+        )
+        try await requireLifecycleAuthorityStillAvailable(space.authority)
+    }
+
+    public func updateSimpleSpace(
+        _ space: SpaceURI,
+        patch: SimpleSpaceConfigurationPatch,
+        authorization: AuthorizationContext
+    ) async throws {
+        let authority = try await lifecycleAuthority(
+            for: space,
+            authorization: authorization
+        )
+        _ = try await authority.update(
+            space: space,
+            patch: patch,
+            authorization: authorization
+        )
+        try await requireLifecycleAuthorityStillAvailable(space.authority)
+    }
+
+    public func deleteSimpleSpace(
+        _ space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws {
+        let authority = try await lifecycleAuthority(
+            for: space,
+            authorization: authorization
+        )
+        _ = try await authority.delete(space: space, authorization: authorization)
+        try await requireLifecycleAuthorityStillAvailable(space.authority)
+    }
+
+    public func addSimpleSpaceMember(
+        _ member: String,
+        to space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws {
+        let authority = try await lifecycleAuthority(
+            for: space,
+            authorization: authorization
+        )
+        _ = try await authority.addMember(
+            space: space,
+            member: member,
+            authorization: authorization
+        )
+        try await requireLifecycleAuthorityStillAvailable(space.authority)
+    }
+
+    public func removeSimpleSpaceMember(
+        _ member: String,
+        from space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws {
+        let authority = try await lifecycleAuthority(
+            for: space,
+            authorization: authorization
+        )
+        _ = try await authority.removeMember(
+            space: space,
+            member: member,
+            authorization: authorization
+        )
+        try await requireLifecycleAuthorityStillAvailable(space.authority)
+    }
+
+    public func simpleSpaceMembers(
+        _ space: SpaceURI,
+        limit: Int,
+        cursor: String?,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSimpleSpaceMemberPage {
+        guard (1 ... 1_000).contains(limit) else {
+            throw SwanError.malformed("invalid member page limit")
+        }
+        let authority = try await lifecycleAuthority(
+            for: space,
+            authorization: authorization
+        )
+        guard let state = try await authority.space(space, authorization: authorization),
+              !state.space.isDeleted else {
+            throw AuthorizedSimpleSpaceLifecycleError.notFound
+        }
+        let members = state.space.members.sorted()
+        let selected: [String]
+        if let cursor {
+            selected = Array(members.lazy.filter { $0 > cursor }.prefix(limit))
+        } else {
+            selected = Array(members.prefix(limit))
+        }
+        try await requireLifecycleAuthorityStillAvailable(space.authority)
+        return AuthorizedSimpleSpaceMemberPage(
+            members: selected,
+            cursor: selected.last
         )
     }
 
@@ -311,6 +431,68 @@ public actor SQLitePreMigratedAccountDirectory:
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
         return database
+    }
+
+    /// Returns a lifecycle-only authority facade over an account database that
+    /// was opened before the listener accepted traffic. The facade has no
+    /// credential secret, so it cannot accidentally become a credential
+    /// minting capability while serving lifecycle requests.
+    private func lifecycleAuthority(
+        for space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws -> DurableSimpleSpaceAuthority {
+        let database = try await preopenedAuthorityDatabase(
+            for: space,
+            authorization: authorization
+        )
+        return DurableSimpleSpaceAuthority(lifecycleDatabase: database)
+    }
+
+    /// Authority lifecycle operations may select only the exact active
+    /// authority account. This repeats the stale path, lifecycle, and closure
+    /// checks around every request and deliberately has no SQLite open or
+    /// migration fallback.
+    private func preopenedAuthorityDatabase(
+        for space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws -> SQLiteAccountDatabase {
+        guard !isClosed else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard case let .accountOAuth(subject, _) = authorization,
+              subject == space.authority else {
+            throw SwanError.unauthorized("authority account OAuth is required")
+        }
+        guard try await isActiveAccount(space.authority) else {
+            throw SwanError.unauthorized("authority account is unavailable")
+        }
+        guard !isClosed else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        do {
+            try Self.requireExistingRegularDatabase(
+                SQLiteLayout.accountDatabase(in: dataDirectory, did: space.authority)
+            )
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard let database = databases[space.authority] else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        return database
+    }
+
+    private func requireLifecycleAuthorityStillAvailable(_ did: String) async throws {
+        guard try await isActiveAccount(did), !isClosed else {
+            throw SwanError.unauthorized("authority account is unavailable")
+        }
+        do {
+            try Self.requireExistingRegularDatabase(
+                SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
+            )
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
     }
 
     private static func validateStartupDIDs(_ dids: [String]) throws {

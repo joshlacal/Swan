@@ -152,6 +152,8 @@ public enum PermissionedSpaceScopeSyntax {
 
         var keys = Set<String>()
         var requiredKeys = Set<String>()
+        var hasAction = false
+        var hasManage = false
         for component in scope[scope.index(after: queryStart)...].split(separator: "&", omittingEmptySubsequences: false) {
             let pair = component.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
             guard pair.count == 2,
@@ -162,13 +164,21 @@ public enum PermissionedSpaceScopeSyntax {
                 return false
             }
             switch pair[0] {
-            case "authority", "skey", "action":
+            case "authority", "skey":
                 requiredKeys.insert(String(pair[0]))
+            case "action":
+                hasAction = true
+            case "manage":
+                hasManage = true
             default:
                 break
             }
         }
-        return requiredKeys == ["authority", "skey", "action"]
+        // The pinned OAuth scopes distinguish record `action` grants from
+        // simple-space lifecycle `manage` grants.  A qualified scope names
+        // exactly one of them: accepting neither would make it ambient, and
+        // accepting both would leave the resource operation ambiguous.
+        return requiredKeys == ["authority", "skey"] && (hasAction != hasManage)
     }
 }
 

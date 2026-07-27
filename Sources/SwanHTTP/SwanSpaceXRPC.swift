@@ -227,7 +227,7 @@ private func parseAuthenticatedGetSpaceParameters(
     return .init(space: uri)
 }
 
-private func strictQueryDecode(_ encoded: Substring) throws -> String {
+func strictQueryDecode(_ encoded: Substring) throws -> String {
     var decoded = [UInt8]()
     decoded.reserveCapacity(encoded.utf8.count)
     var iterator = encoded.utf8.makeIterator()
@@ -264,7 +264,7 @@ private func hexNibble(_ byte: UInt8) -> UInt8? {
     }
 }
 
-private func authenticatedGetSpaceNonceChallenge(
+func authenticatedGetSpaceNonceChallenge(
     authorizer: SwanOAuthResourceAuthorizer
 ) -> Response {
     var headers = HTTPFields()
@@ -287,7 +287,7 @@ private func authenticatedGetSpaceError(
     authenticatedGetSpaceJSON(status, ["error": code])
 }
 
-private func authenticatedGetSpaceJSON(
+func authenticatedGetSpaceJSON(
     _ status: HTTPResponse.Status,
     _ body: some Encodable
 ) -> Response {
@@ -606,7 +606,7 @@ private func authorizeWrite(
 /// A deliberately conservative cap for JSON XRPC write bodies. Record and
 /// blob transfer use different streaming endpoints; accepting a large record
 /// here would make this control-plane path an accidental buffering surface.
-private let authenticatedSpaceWriteMaximumJSONBytes = 1 * 1024 * 1024
+let authenticatedSpaceWriteMaximumJSONBytes = 1 * 1024 * 1024
 private let authenticatedSpaceWriteMaximumOperations = 4_096
 
 private enum AuthenticatedSpaceWriteFailure: Error {
@@ -962,7 +962,7 @@ private func authenticatedSpaceWriteJSON(_ status: HTTPResponse.Status, _ output
 /// behavior. XRPC bodies are signed-and-applied commands, so accept each key
 /// exactly once at every object level before handing the same bytes to the
 /// generated `Decodable` input contract.
-private enum StrictPermissionedWriteJSON {
+enum StrictPermissionedWriteJSON {
     static func validate(_ data: Data) throws {
         guard !data.isEmpty, data.count <= authenticatedSpaceWriteMaximumJSONBytes else {
             throw AuthenticatedSpaceWriteFailure.invalidRequest

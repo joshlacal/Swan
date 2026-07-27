@@ -105,6 +105,10 @@ public struct SwanHTTPServer: Sendable {
     /// unavailable unless the supplied startup-preopened directory also
     /// implements the deliberately narrower repository projection.
     public let authenticatedSpaceRecords: SwanAuthenticatedSpaceRecordsCapability?
+    /// Authority-owned SimpleSpace lifecycle and membership endpoints. They
+    /// remain closed unless the same startup-preopened directory explicitly
+    /// exposes the narrower lifecycle projection.
+    public let authenticatedSimpleSpaceLifecycle: SwanAuthenticatedSimpleSpaceLifecycleCapability?
 
     public init(
         profile: ProtocolProfile,
@@ -168,9 +172,19 @@ public struct SwanHTTPServer: Sendable {
             } else {
                 authenticatedSpaceRecords = nil
             }
+            if let lifecycleDirectory = authenticatedGetSpaceDirectory
+                as? any AuthorizedSimpleSpaceLifecycleDirectory {
+                authenticatedSimpleSpaceLifecycle = SwanAuthenticatedSimpleSpaceLifecycleCapability(
+                    authorizer: authorizer,
+                    directory: lifecycleDirectory
+                )
+            } else {
+                authenticatedSimpleSpaceLifecycle = nil
+            }
         } else {
             authenticatedGetSpace = nil
             authenticatedSpaceRecords = nil
+            authenticatedSimpleSpaceLifecycle = nil
         }
     }
 
@@ -260,6 +274,7 @@ public struct SwanHTTPServer: Sendable {
         // The checked-in wire registry is the sole source for this coverage:
         // every profile method gets an explicit, method-correct closed handler
         // until its authenticated implementation is ready.
+        var installedSimpleSpaceLifecycle = false
         for descriptor in PermissionedData0016.methods {
             if descriptor.nsid == ComAtprotoSpaceGetSpace.typeIdentifier,
                let authenticatedGetSpace {
@@ -282,6 +297,15 @@ public struct SwanHTTPServer: Sendable {
             } else if descriptor.nsid == ComAtprotoSpaceApplyWrites.typeIdentifier,
                       let authenticatedSpaceRecords {
                 registerAuthenticatedApplyWritesEndpoint(on: router, capability: authenticatedSpaceRecords)
+            } else if let authenticatedSimpleSpaceLifecycle,
+                      Self.isSimpleSpaceLifecycleMethod(descriptor.nsid) {
+                if !installedSimpleSpaceLifecycle {
+                    registerAuthenticatedSimpleSpaceLifecycleEndpoints(
+                        on: router,
+                        capability: authenticatedSimpleSpaceLifecycle
+                    )
+                    installedSimpleSpaceLifecycle = true
+                }
             } else {
                 registerUnavailablePermissionedEndpoint(descriptor, on: router)
             }
@@ -295,6 +319,20 @@ public struct SwanHTTPServer: Sendable {
         registerUnknownPermissionedEndpointGuards(on: router)
 
         return router
+    }
+
+    private static func isSimpleSpaceLifecycleMethod(_ nsid: String) -> Bool {
+        switch nsid {
+        case ComAtprotoSimplespaceCreateSpace.typeIdentifier,
+             ComAtprotoSimplespaceUpdateSpace.typeIdentifier,
+             ComAtprotoSimplespaceDeleteSpace.typeIdentifier,
+             ComAtprotoSimplespaceAddMember.typeIdentifier,
+             ComAtprotoSimplespaceRemoveMember.typeIdentifier,
+             ComAtprotoSimplespaceListMembers.typeIdentifier:
+            true
+        default:
+            false
+        }
     }
 
     public func buildApplication(logger: Logger) -> some ApplicationProtocol {
