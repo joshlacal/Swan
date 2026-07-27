@@ -220,6 +220,103 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testQualifiedScopeTraversesPARBrowserTokenAndRefreshHTTP() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let scope = "space:app.example.space?authority=\(did)&skey=whole-space&action=read"
+        let scopedClientID = try XCTUnwrap(URL(string: "http://localhost?scope=\(formEncode(scope))&redirect_uri=\(formEncode(redirectURI.absoluteString))"))
+        let verifier = "swan-localhost-qualified-http-verifier-000000000000000"
+        let challenge = Data(SHA256.hash(data: Data(verifier.utf8))).base64URLEncodedString()
+        let key = P256.Signing.PrivateKey()
+        let jwk = try makeJWK(key)
+        let parForm = [
+            ("client_id", scopedClientID.absoluteString), ("redirect_uri", redirectURI.absoluteString),
+            ("response_type", "code"), ("scope", scope), ("state", "qualified-state"),
+            ("code_challenge", challenge), ("code_challenge_method", "S256"),
+        ].map { "\(formEncode($0.0))=\(formEncode($0.1))" }.joined(separator: "&")
+        do {
+            let app = fixture.server.buildApplication(logger: Logger(label: "LocalhostOAuthBrowserHTTPTests.qualifiedHTTP"))
+            try await app.test(.router) { client in
+                var parNonce: String?
+                try await client.execute(uri: "/oauth/par", method: .post, headers: tokenHeaders(), body: ByteBuffer(string: parForm)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    parNonce = response.headers[dpopNonceHeader]
+                }
+                let parProof = try makeDPoPProof(key: key, jwk: jwk, jti: "qualified-par", nonce: try XCTUnwrap(parNonce), target: try OAuthDPoPProofValidator.normalizedTarget(issuer.appending(path: "oauth/par")))
+                var requestURI: String?
+                try await client.execute(uri: "/oauth/par", method: .post, headers: tokenHeaders(dpop: parProof), body: ByteBuffer(string: parForm)) { response in
+                    XCTAssertEqual(response.status, .created)
+                    requestURI = (try XCTUnwrap(JSONSerialization.jsonObject(with: Data(buffer: response.body)) as? [String: Any]))["request_uri"] as? String
+                }
+                let authorize = "/oauth/authorize?client_id=\(formEncode(scopedClientID.absoluteString))&request_uri=\(formEncode(try XCTUnwrap(requestURI)))"
+                var loginCookie: String?
+                var loginCSRF: String?
+                try await client.execute(uri: authorize, method: .get) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    loginCookie = self.cookieValue(try XCTUnwrap(response.headers[setCookieHeader]))
+                    loginCSRF = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(loginCookie)).csrfToken
+                }
+                let login = [("csrf", try XCTUnwrap(loginCSRF)), ("handle", handle), ("password", password)]
+                    .map { "\(formEncode($0.0))=\(formEncode($0.1))" }.joined(separator: "&")
+                var consentCookie: String?
+                var consentCSRF: String?
+                try await client.execute(uri: "/oauth/authorize", method: .post, headers: browserFormHeaders(cookie: try XCTUnwrap(loginCookie)), body: ByteBuffer(string: login)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    consentCookie = self.cookieValue(try XCTUnwrap(response.headers[setCookieHeader]))
+                    consentCSRF = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(consentCookie)).csrfToken
+                }
+                var code: String?
+                try await client.execute(uri: "/oauth/authorize/consent", method: .post, headers: browserFormHeaders(cookie: try XCTUnwrap(consentCookie)), body: ByteBuffer(string: "csrf=\(formEncode(try XCTUnwrap(consentCSRF)))&decision=approve")) { response in
+                    XCTAssertEqual(response.status, .found)
+                    let items = try XCTUnwrap(URLComponents(string: try XCTUnwrap(response.headers[.location]))?.queryItems)
+                    code = items.first(where: { $0.name == "code" })?.value
+                }
+                let codeForm = [
+                    ("grant_type", "authorization_code"), ("client_id", scopedClientID.absoluteString),
+                    ("redirect_uri", redirectURI.absoluteString), ("code", try XCTUnwrap(code)), ("code_verifier", verifier),
+                ].map { "\(formEncode($0.0))=\(formEncode($0.1))" }.joined(separator: "&")
+                var tokenNonce: String?
+                try await client.execute(uri: "/oauth/token", method: .post, headers: tokenHeaders(), body: ByteBuffer(string: codeForm)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    tokenNonce = response.headers[dpopNonceHeader]
+                }
+                let tokenTarget = try OAuthDPoPProofValidator.normalizedTarget(issuer.appending(path: "oauth/token"))
+                let codeProof = try makeDPoPProof(key: key, jwk: jwk, jti: "qualified-code", nonce: try XCTUnwrap(tokenNonce), target: tokenTarget)
+                var refresh: String?
+                try await client.execute(uri: "/oauth/token", method: .post, headers: tokenHeaders(dpop: codeProof), body: ByteBuffer(string: codeForm)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let tokens = try self.tokenResponse(from: response.body)
+                    XCTAssertEqual(tokens["scope"], scope)
+                    refresh = tokens["refresh_token"]
+                }
+                let refreshForm = [("grant_type", "refresh_token"), ("client_id", scopedClientID.absoluteString), ("refresh_token", try XCTUnwrap(refresh))]
+                    .map { "\(formEncode($0.0))=\(formEncode($0.1))" }.joined(separator: "&")
+                let refreshProof = try makeDPoPProof(key: key, jwk: jwk, jti: "qualified-refresh", nonce: try XCTUnwrap(tokenNonce), target: tokenTarget)
+                var rotatedRefresh: String?
+                try await client.execute(uri: "/oauth/token", method: .post, headers: tokenHeaders(dpop: refreshProof), body: ByteBuffer(string: refreshForm)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let tokens = try self.tokenResponse(from: response.body)
+                    XCTAssertEqual(tokens["scope"], scope)
+                    rotatedRefresh = tokens["refresh_token"]
+                }
+                let widening = [
+                    ("grant_type", "refresh_token"), ("client_id", scopedClientID.absoluteString),
+                    ("refresh_token", try XCTUnwrap(rotatedRefresh)), ("scope", "atproto"),
+                ].map { "\(formEncode($0.0))=\(formEncode($0.1))" }.joined(separator: "&")
+                let wideningProof = try makeDPoPProof(key: key, jwk: jwk, jti: "qualified-widen", nonce: try XCTUnwrap(tokenNonce), target: tokenTarget)
+                try await client.execute(uri: "/oauth/token", method: .post, headers: tokenHeaders(dpop: wideningProof), body: ByteBuffer(string: widening)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(from: response.body), "invalid_grant")
+                }
+                XCTAssertNotNil(rotatedRefresh)
+            }
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
     func testLocalRevocationConsumesAValidDPoPProofAndRevokesTheWholeFamily() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
