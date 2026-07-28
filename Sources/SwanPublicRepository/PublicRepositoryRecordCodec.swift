@@ -88,6 +88,9 @@ public enum PublicRepositoryRecordCodec {
         for (key, value) in fields {
             output[key] = try convert(value, depth: depth, limits: limits)
         }
+        if case let .string(type)? = output["$type"], type == "blob" {
+            throw PublicRepositoryDomainError.invalidRecordType
+        }
         return .object(output)
     }
 
@@ -134,12 +137,18 @@ public enum PublicRepositoryRecordCodec {
                 }
                 fields[entry.key] = try convertCBOR(entry.value, depth: depth, limits: limits)
             }
+            if case let .string(type)? = fields["$type"], type == "blob" {
+                throw PublicRepositoryDomainError.invalidRecordType
+            }
             return .object(fields)
         }
         if let map = value as? [String: Any] {
             var fields: [String: PublicRecordValue] = [:]
             for (key, item) in map {
                 fields[key] = try convertCBOR(item, depth: depth, limits: limits)
+            }
+            if case let .string(type)? = fields["$type"], type == "blob" {
+                throw PublicRepositoryDomainError.invalidRecordType
             }
             return .object(fields)
         }

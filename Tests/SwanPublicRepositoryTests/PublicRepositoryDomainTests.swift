@@ -39,6 +39,13 @@ final class PublicRepositoryDomainTests: XCTestCase {
             from: .object(["$type": .string("app.other.record")]),
             collection: collection
         ))
+        XCTAssertThrowsError(try PublicRepositoryRecordCodec.publicRecord(
+            from: .object([
+                "$type": .string("blob"),
+                "ref": .object(["$link": .string("bafybeigdyrzt4q5x7wq6q3m3u4n4v6m4y4f5xq4z4q4w4q4w4q4w4q4w4q")]),
+            ]),
+            collection: collection
+        ))
     }
 
     func testPathAcceptsPinnedBoundarySyntax() throws {
