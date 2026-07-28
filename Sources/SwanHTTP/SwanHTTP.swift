@@ -280,6 +280,9 @@ public struct SwanHTTPServer: Sendable {
     /// routes, this has no storage dependency and always returns the pinned
     /// generic PDS denial after authenticating its service caller.
     public let simpleSpaceCheckUserAccess: SwanSimpleSpaceCheckUserAccessCapability?
+    /// Public-only read capability selected from the startup-preopened account
+    /// inventory. It contains no authorization or permissioned-data fallback.
+    public let publicRepositoryReadDirectory: (any PublicRepositoryReadDirectory)?
 
     public init(
         profile: ProtocolProfile,
@@ -298,12 +301,14 @@ public struct SwanHTTPServer: Sendable {
         spaceRepositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration? = nil,
         spaceRepositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration? = nil,
         spaceNotificationConfiguration: SwanSpaceNotificationHTTPConfiguration? = nil,
-        simpleSpaceCheckUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration? = nil
+        simpleSpaceCheckUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration? = nil,
+        publicRepositoryReadDirectory: (any PublicRepositoryReadDirectory)? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
         self.repositories = repositories
         self.oauthRuntime = oauthRuntime
+        self.publicRepositoryReadDirectory = publicRepositoryReadDirectory
         if let simpleSpaceCheckUserAccessConfiguration {
             simpleSpaceCheckUserAccess = SwanSimpleSpaceCheckUserAccessCapability(
                 serviceAuthentication: simpleSpaceCheckUserAccessConfiguration.serviceAuthentication,
@@ -735,7 +740,18 @@ public struct SwanHTTPServer: Sendable {
         // public route receives permissioned repositories or credential
         // readers, and streaming endpoints never invoke Data-shaped generated
         // handlers.
+        if let publicRepositoryReadDirectory {
+            registerPublicRepositoryReadEndpoints(
+                on: router,
+                directory: publicRepositoryReadDirectory,
+                publicURL: configuration.publicURL
+            )
+        }
         for descriptor in PublicDataTesting20260727.methods {
+            if publicRepositoryReadDirectory != nil,
+               isInstalledPublicReadMethod(descriptor.nsid) {
+                continue
+            }
             registerUnavailablePublicEndpoint(descriptor, on: router)
         }
         registerUnknownPublicEndpointGuards(on: router)

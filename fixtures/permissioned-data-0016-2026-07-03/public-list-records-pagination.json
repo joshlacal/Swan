@@ -1,0 +1,39 @@
+{
+  "profile": "permissioned-data-0016-2026-07-03",
+  "referenceCommit": "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
+  "reference": {
+    "handler": "packages/pds/src/api/com/atproto/repo/listRecords.ts:16-32",
+    "reader": "packages/pds/src/actor-store/record/reader.ts:67-112"
+  },
+  "sortedKeys": ["one", "three", "two"],
+  "cases": [
+    {
+      "reverse": false,
+      "limit": 2,
+      "cursor": null,
+      "records": ["two", "three"],
+      "outputCursor": "three"
+    },
+    {
+      "reverse": false,
+      "limit": 2,
+      "cursor": "three",
+      "records": ["one"],
+      "outputCursor": "one"
+    },
+    {
+      "reverse": false,
+      "limit": 2,
+      "cursor": "one",
+      "records": [],
+      "outputCursor": null
+    },
+    {
+      "reverse": true,
+      "limit": 2,
+      "cursor": null,
+      "records": ["one", "three"],
+      "outputCursor": "three"
+    }
+  ]
+}

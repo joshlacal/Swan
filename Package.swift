@@ -149,7 +149,7 @@ let package = Package(
         .target(
             name: "SwanHTTP",
             dependencies: [
-                "SwanAccounts", "SwanCore", "SwanPublicWire", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth", "SwanSQLite",
+                "SwanAccounts", "SwanCore", "SwanPublicRepository", "SwanPublicWire", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth", "SwanSQLite",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "Petrel", package: "Petrel"),
                 .product(name: "Logging", package: "swift-log"),
@@ -186,8 +186,9 @@ let package = Package(
         .testTarget(
             name: "SwanSQLiteTests",
             dependencies: [
-                "SwanAccounts", "SwanCore", "SwanPublicRepository", "SwanSQLite", "SwanStorage",
+                "SwanAccounts", "SwanCore", "SwanHTTP", "SwanPublicRepository", "SwanSQLite", "SwanStorage",
                 .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "Petrel", package: "Petrel"),
                 .product(name: "SQLiteNIO", package: "sqlite-nio"),
             ]

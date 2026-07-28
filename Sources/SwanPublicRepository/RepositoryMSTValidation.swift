@@ -69,6 +69,42 @@ public struct ValidatedPublicRepositoryProjection: Sendable, Equatable {
 }
 
 public enum RepositoryMSTValidation {
+    /// Applies the same canonical AT data-model and path `$type` validation
+    /// used for every reachable MST record to a single public read result.
+    public static func validateRecordBlock(
+        _ bytes: Data,
+        for path: PublicRepositoryPath,
+        limits: PublicRepositoryLimits = .standard
+    ) throws {
+        guard bytes.count <= limits.maximumRecordBlockBytes else {
+            throw RepositoryMSTValidationError.recordBlockTooLarge
+        }
+        _ = try RepositoryRecordBlockValidator.decode(
+            bytes,
+            expectedType: path.collection,
+            maximumDepth: limits.maximumCBORNestingDepth
+        )
+    }
+
+    /// Converts canonical repository DAG-CBOR directly into the AT data-model
+    /// container used by generated XRPC outputs. The repository validator is
+    /// the decoder, so no JSON bridge can stringify integers or rewrite
+    /// links/bytes.
+    public static func decodeRecordBlock(
+        _ bytes: Data,
+        for path: PublicRepositoryPath,
+        limits: PublicRepositoryLimits = .standard
+    ) throws -> ATProtocolValueContainer {
+        guard bytes.count <= limits.maximumRecordBlockBytes else {
+            throw RepositoryMSTValidationError.recordBlockTooLarge
+        }
+        return try RepositoryRecordBlockValidator.decode(
+            bytes,
+            expectedType: path.collection,
+            maximumDepth: limits.maximumCBORNestingDepth
+        )
+    }
+
     public static func validate(
         rootCID: CID,
         blocks: any PublicRepositoryBlockSource,
@@ -542,15 +578,39 @@ private struct RepositoryRecordBlockValidator {
     private var offset = 0
     private var topLevelType: String?
 
-    static func validate(_ data: Data, expectedType: String, maximumDepth: Int) throws {
+    static func validate(
+        _ data: Data,
+        expectedType: String,
+        maximumDepth: Int
+    ) throws {
+        _ = try decode(
+            data,
+            expectedType: expectedType,
+            maximumDepth: maximumDepth
+        )
+    }
+
+    static func decode(
+        _ data: Data,
+        expectedType: String,
+        maximumDepth: Int
+    ) throws -> ATProtocolValueContainer {
         var parser = Self(bytes: Array(data))
-        try parser.readMap(depth: 1, maximumDepth: maximumDepth, captureType: true)
+        let value = try parser.readMap(
+            depth: 1,
+            maximumDepth: maximumDepth,
+            captureType: true
+        )
         guard parser.offset == parser.bytes.count, parser.topLevelType == expectedType else {
             throw RepositoryMSTValidationError.invalidRecordBlock
         }
+        return .object(value)
     }
 
-    private mutating func readValue(depth: Int, maximumDepth: Int) throws {
+    private mutating func readValue(
+        depth: Int,
+        maximumDepth: Int
+    ) throws -> ATProtocolValueContainer {
         guard offset < bytes.count else { throw RepositoryMSTValidationError.invalidRecordBlock }
         switch bytes[offset] >> 5 {
         case 0:
@@ -558,24 +618,36 @@ private struct RepositoryRecordBlockValidator {
             guard value <= UInt64(PublicRepositoryRecordCodec.maximumSafeInteger) else {
                 throw RepositoryMSTValidationError.invalidRecordBlock
             }
+            return .number(Int(value))
         case 1:
             let value = try readArgument(major: 1)
             guard value < UInt64(-PublicRepositoryRecordCodec.minimumSafeInteger) else {
                 throw RepositoryMSTValidationError.invalidRecordBlock
             }
+            return .number(-1 - Int(value))
         case 2:
-            _ = try readData(major: 2)
+            return .bytes(Bytes(data: try readData(major: 2)))
         case 3:
-            _ = try readText()
+            return .string(try readText())
         case 4:
             guard depth < maximumDepth else { throw RepositoryMSTValidationError.invalidRecordBlock }
             let count = try readLength(major: 4)
+            var values: [ATProtocolValueContainer] = []
+            values.reserveCapacity(count)
             for _ in 0 ..< count {
-                try readValue(depth: depth + 1, maximumDepth: maximumDepth)
+                values.append(try readValue(
+                    depth: depth + 1,
+                    maximumDepth: maximumDepth
+                ))
             }
+            return .array(values)
         case 5:
             guard depth < maximumDepth else { throw RepositoryMSTValidationError.invalidRecordBlock }
-            try readMap(depth: depth + 1, maximumDepth: maximumDepth, captureType: false)
+            return .object(try readMap(
+                depth: depth + 1,
+                maximumDepth: maximumDepth,
+                captureType: false
+            ))
         case 6:
             guard try readArgument(major: 6) == 42 else {
                 throw RepositoryMSTValidationError.invalidRecordBlock
@@ -595,21 +667,33 @@ private struct RepositoryRecordBlockValidator {
                   cid.multihash.digest.count == 32 else {
                 throw RepositoryMSTValidationError.invalidRecordBlock
             }
+            return .link(ATProtoLink(cid: cid))
         case 7:
             let byte = bytes[offset]
             guard byte == 0xf4 || byte == 0xf5 || byte == 0xf6 else {
                 throw RepositoryMSTValidationError.invalidRecordBlock
             }
             offset += 1
+            switch byte {
+            case 0xf4: return .bool(false)
+            case 0xf5: return .bool(true)
+            default: return .null
+            }
         default:
             throw RepositoryMSTValidationError.invalidRecordBlock
         }
     }
 
-    private mutating func readMap(depth: Int, maximumDepth: Int, captureType: Bool) throws {
+    private mutating func readMap(
+        depth: Int,
+        maximumDepth: Int,
+        captureType: Bool
+    ) throws -> [String: ATProtocolValueContainer] {
         let count = try readLength(major: 5)
         var previousKey: Data?
         var sawType = false
+        var values: [String: ATProtocolValueContainer] = [:]
+        values.reserveCapacity(count)
         for _ in 0 ..< count {
             let key = try readText()
             let keyBytes = Data(key.utf8)
@@ -622,14 +706,19 @@ private struct RepositoryRecordBlockValidator {
             if captureType, key == "$type" {
                 guard !sawType else { throw RepositoryMSTValidationError.invalidRecordBlock }
                 topLevelType = try readText()
+                values[key] = .string(topLevelType!)
                 sawType = true
             } else {
-                try readValue(depth: depth, maximumDepth: maximumDepth)
+                values[key] = try readValue(
+                    depth: depth,
+                    maximumDepth: maximumDepth
+                )
             }
         }
         if captureType, !sawType {
             throw RepositoryMSTValidationError.invalidRecordBlock
         }
+        return values
     }
 
     private func canonicalKeyPrecedes(_ lhs: Data, _ rhs: Data) -> Bool {

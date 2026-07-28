@@ -247,6 +247,28 @@ public enum PublicRepositoryCAR {
         )
     }
 
+    /// Re-exports durable repository truth after its canonical commit/state
+    /// linkage and complete MST projection have been checked by storage.
+    /// This makes no signature-authenticity claim; it preserves the exact
+    /// already-signed commit bytes.
+    public static func export(
+        signedCommit: StructurallyValidatedPublicRepositorySignedCommit,
+        blocks: any PublicRepositoryBlockSource,
+        to sink: any PublicRepositoryCARByteSink,
+        limits: PublicRepositoryLimits = .standard,
+        maximumChunkBytes: Int = defaultMaximumChunkBytes
+    ) async throws -> PublicRepositoryCARWriteResult {
+        try await export(
+            commitCID: signedCommit.commitCID,
+            signedCommitBytes: signedCommit.signedCommitBytes,
+            dataCID: signedCommit.descriptor.dataCID,
+            blocks: blocks,
+            to: sink,
+            limits: limits,
+            maximumChunkBytes: maximumChunkBytes
+        )
+    }
+
     private static func export(
         commitCID: CID,
         signedCommitBytes: Data,

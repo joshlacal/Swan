@@ -4,6 +4,79 @@ import Petrel
 import XCTest
 
 final class RepositoryMSTValidationTests: XCTestCase {
+    func testDirectRecordDecoderPreservesATDataModelWithoutJSONRoundTrip() throws {
+        let path = try PublicRepositoryPath(
+            collection: "app.bsky.feed.post", recordKey: "direct"
+        )
+        let linkedCID = CID.fromDAGCBOR(Data("linked".utf8))
+        let bytesValue = Data([0x00, 0x7f, 0xff])
+        let prepared = try PublicRepositoryRecordCodec.prepare(
+            [
+                "$type": .string(path.collection),
+                "minimum": .integer(PublicRepositoryRecordCodec.minimumSafeInteger),
+                "maximum": .integer(PublicRepositoryRecordCodec.maximumSafeInteger),
+                "bytes": .bytes(bytesValue),
+                "link": .link(linkedCID),
+                "nested": .object([
+                    "array": .array([.bool(true), .null, .integer(-1)]),
+                ]),
+            ],
+            for: path
+        )
+
+        guard case let .object(value) =
+                try RepositoryMSTValidation.decodeRecordBlock(
+                    prepared.bytes, for: path
+                ) else {
+            return XCTFail("expected direct object")
+        }
+        XCTAssertEqual(value["minimum"], .number(
+            PublicRepositoryRecordCodec.minimumSafeInteger
+        ))
+        XCTAssertEqual(value["maximum"], .number(
+            PublicRepositoryRecordCodec.maximumSafeInteger
+        ))
+        guard case let .bytes(decodedBytes)? = value["bytes"] else {
+            return XCTFail("expected bytes")
+        }
+        XCTAssertEqual(decodedBytes.data, bytesValue)
+        guard case let .link(decodedLink)? = value["link"] else {
+            return XCTFail("expected link")
+        }
+        XCTAssertEqual(decodedLink.cid, linkedCID)
+        guard case let .object(nested)? = value["nested"],
+              case let .array(array)? = nested["array"] else {
+            return XCTFail("expected nested values")
+        }
+        XCTAssertEqual(array, [.bool(true), .null, .number(-1)])
+
+        var floatRecord = Data([0xa2, 0x65])
+        floatRecord.append(Data("$type".utf8))
+        floatRecord.append(0x72)
+        floatRecord.append(Data(path.collection.utf8))
+        floatRecord.append(0x65)
+        floatRecord.append(Data("float".utf8))
+        floatRecord.append(contentsOf: [
+            0xfb, 0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ])
+        XCTAssertThrowsError(
+            try RepositoryMSTValidation.decodeRecordBlock(
+                floatRecord, for: path
+            )
+        )
+        let wideInteger = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "$type", value: path.collection),
+            (key: "wide", value: UInt64(
+                PublicRepositoryRecordCodec.maximumSafeInteger + 1
+            )),
+        ]))
+        XCTAssertThrowsError(
+            try RepositoryMSTValidation.decodeRecordBlock(
+                wideInteger, for: path
+            )
+        )
+    }
+
     func testValidatesCanonicalEmptyRepository() async throws {
         let bytes = PublicRepositoryGenesisCodec.canonicalEmptyMST
         let cid = CID.fromDAGCBOR(bytes)

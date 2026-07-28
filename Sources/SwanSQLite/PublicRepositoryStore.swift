@@ -506,7 +506,7 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         }
     }
 
-    private func verifyProjectionWithoutGate(
+    func verifyProjectionWithoutGate(
         state: PublicRepositoryState
     ) async throws {
         do {
@@ -634,7 +634,7 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         }
     }
 
-    private func blockBytesWithoutGate(_ cid: CID) async throws -> Data {
+    func blockBytesWithoutGate(_ cid: CID) async throws -> Data {
         let rows = try await connection.query(
             "SELECT bytes FROM public_repository_blocks WHERE cid = ?",
             [.text(cid.string)]
@@ -652,7 +652,7 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         return bytes
     }
 
-    private func structurallyValidatedCommit(
+    func structurallyValidatedCommit(
         signedCommitBytes: Data,
         expectedCommitCID: CID
     ) throws -> StructurallyValidatedPublicRepositorySignedCommit {

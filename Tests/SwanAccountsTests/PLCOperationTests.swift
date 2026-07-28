@@ -2,6 +2,7 @@ import Crypto
 import Foundation
 import Petrel
 import SwanCore
+import SwanStorage
 import XCTest
 @testable import SwanAccounts
 
@@ -82,6 +83,53 @@ final class PLCOperationTests: XCTestCase {
         XCTAssertEqual(try PLCOperationCodec.genesisDID(for: signed).count, 32)
         XCTAssertEqual(try PLCOperationCodec.genesisDID(for: signed), "did:plc:3jczicvwcjagrdrstfh4eglw")
         XCTAssertNoThrow(try PLCOperationCodec.verifyGenesis(signed, expectedDID: "did:plc:3jczicvwcjagrdrstfh4eglw"))
+    }
+
+    func testPublicIdentityVerifierAuthenticatesCompleteGenesisAndRejectsTampering() throws {
+        let operation = try PLCOperationCodec.sign(
+            .regular(try profileUnsigned()),
+            using: rotationKey
+        )
+        let regular = try XCTUnwrap(operation.regular)
+        let did = try PLCOperationCodec.genesisDID(for: operation)
+        let facts = PublicPLCGenesisFacts(
+            signingDIDKey: try XCTUnwrap(
+                regular.verificationMethods["atproto"]
+            ),
+            rotationDIDKey: try XCTUnwrap(regular.rotationKeys.first),
+            canonicalHandle: "alice.example.com",
+            pdsOrigin: "https://pds.example.com",
+            signature: regular.signature
+        )
+        let verifier = SwanPublicPLCGenesisVerifier()
+        XCTAssertEqual(
+            try verifier.verifyGenesis(facts: facts, expectedDID: did),
+            try operation.cid.string
+        )
+        XCTAssertThrowsError(try verifier.verifyGenesis(
+            facts: .init(
+                signingDIDKey: facts.signingDIDKey,
+                rotationDIDKey: facts.rotationDIDKey,
+                canonicalHandle: "tampered.example.com",
+                pdsOrigin: facts.pdsOrigin,
+                signature: facts.signature
+            ),
+            expectedDID: did
+        ))
+        XCTAssertThrowsError(try verifier.verifyGenesis(
+            facts: .init(
+                signingDIDKey: facts.signingDIDKey,
+                rotationDIDKey: facts.rotationDIDKey,
+                canonicalHandle: facts.canonicalHandle,
+                pdsOrigin: facts.pdsOrigin,
+                signature: String(facts.signature.dropLast()) + "A"
+            ),
+            expectedDID: did
+        ))
+        XCTAssertThrowsError(try verifier.verifyGenesis(
+            facts: facts,
+            expectedDID: "did:plc:abcdefghijklmnopqrstuvwx"
+        ))
     }
 
     func testSigningBytesOmitSignatureAndGenesisPrevIsExplicitNull() throws {

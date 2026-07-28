@@ -1135,7 +1135,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
 
     let connection: SQLiteConnection
     let connectionGate = SQLiteConnectionGate()
-    private let dataDirectory: URL
+    let dataDirectory: URL
     let accountDID: String
     private let oplogRetention: Int
     private let portableExportReadOnly: Bool

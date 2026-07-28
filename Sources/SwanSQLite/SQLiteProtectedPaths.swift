@@ -269,6 +269,58 @@ enum SQLiteProtectedPaths {
         throw SwanError.unavailable("permissioned CAR spool is unavailable")
     }
 
+    /// Creates an owner-only anonymous regular file for public repository CAR
+    /// streaming. The directory entry is removed before the descriptor leaves
+    /// this function, so later path replacement or symlink attacks cannot
+    /// affect the bytes drained by HTTP.
+    static func makeUnlinkedPublicCARSpool(
+        in dataDirectory: URL
+    ) throws -> FileHandle {
+        let root = try openRoot(dataDirectory)
+        defer { _ = close(root) }
+        let spoolDirectory = try openOrCreateDirectory(
+            parent: root,
+            name: "public-car-spool"
+        )
+        defer { _ = close(spoolDirectory) }
+
+        for _ in 0..<16 {
+            let name = "car-\(UUID().uuidString.lowercased()).spool"
+            let descriptor = name.withCString { path in
+                openat(
+                    spoolDirectory,
+                    path,
+                    O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                    ownerOnlyFileMode
+                )
+            }
+            if descriptor < 0 {
+                guard errno == EEXIST else {
+                    throw SwanError.unavailable("public CAR spool is unavailable")
+                }
+                continue
+            }
+            do {
+                try requireOwnerOnlyRegularFile(descriptor)
+                guard fchmod(descriptor, ownerOnlyFileMode) == 0,
+                      name.withCString({
+                          unlinkat(spoolDirectory, $0, 0)
+                      }) == 0 else {
+                    throw SwanError.unavailable("public CAR spool is unavailable")
+                }
+                return FileHandle(
+                    fileDescriptor: descriptor,
+                    closeOnDealloc: true
+                )
+            } catch {
+                _ = close(descriptor)
+                _ = name.withCString { unlinkat(spoolDirectory, $0, 0) }
+                throw error
+            }
+        }
+        throw SwanError.unavailable("public CAR spool is unavailable")
+    }
+
     // MARK: Permissioned blob CAS
 
     /// Creates one immutable content-addressed payload below the already

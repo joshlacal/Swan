@@ -72,6 +72,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase {
             XCTAssertNotNil(server.authenticatedSpaceBlobs)
             XCTAssertNotNil(server.authenticatedSpaceNotifications)
             XCTAssertNotNil(server.simpleSpaceCheckUserAccess)
+            XCTAssertNotNil(server.publicRepositoryReadDirectory)
 
             let app = server.buildApplication(
                 logger: Logger(label: "ServePermissionedRuntimeCompositionTests")
@@ -85,6 +86,28 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase {
                     ) { response in
                         XCTAssertNotEqual(response.status, .notFound, descriptor.nsid)
                         XCTAssertNotEqual(response.status, .serviceUnavailable, descriptor.nsid)
+                    }
+                }
+                for path in [
+                    "/xrpc/com.atproto.repo.describeRepo",
+                    "/xrpc/com.atproto.repo.getRecord",
+                    "/xrpc/com.atproto.repo.listRecords",
+                    "/xrpc/com.atproto.sync.getLatestCommit",
+                    "/xrpc/com.atproto.sync.getRepo",
+                    "/xrpc/com.atproto.sync.getRepoStatus",
+                ] {
+                    try await client.execute(uri: path, method: .get) { response in
+                        XCTAssertEqual(response.status, .badRequest, path)
+                        XCTAssertNotEqual(response.status, .serviceUnavailable, path)
+                    }
+                }
+                for (path, method): (String, HTTPRequest.Method) in [
+                    ("/xrpc/com.atproto.repo.createRecord", .post),
+                    ("/xrpc/com.atproto.repo.uploadBlob", .post),
+                    ("/xrpc/com.atproto.sync.getBlob", .get),
+                ] {
+                    try await client.execute(uri: path, method: method) { response in
+                        XCTAssertEqual(response.status, .serviceUnavailable, path)
                     }
                 }
             }

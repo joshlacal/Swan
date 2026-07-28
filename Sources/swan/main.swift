@@ -585,7 +585,8 @@ struct ServePermissionedRuntime {
             spaceRepositorySyncConfiguration: repositorySyncConfiguration,
             spaceRepositoryCredentialConfiguration: repositoryCredentialConfiguration,
             spaceNotificationConfiguration: notificationConfiguration,
-            simpleSpaceCheckUserAccessConfiguration: checkUserAccessConfiguration
+            simpleSpaceCheckUserAccessConfiguration: checkUserAccessConfiguration,
+            publicRepositoryReadDirectory: directory
         )
     }
 }
@@ -1200,7 +1201,8 @@ extension SwanCommand {
                 // endpoint unavailable rather than repairing state online.
                 let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
                     dataDirectory: dataURL,
-                    controlStore: controlDatabase
+                    controlStore: controlDatabase,
+                    publicIdentityVerifier: SwanPublicPLCGenesisVerifier()
                 )
                 preopenedAccountDirectory = directory
                 let localSpaceRuntime: ServeLocalSpaceRuntime?
