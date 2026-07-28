@@ -183,6 +183,49 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         running.cancel()
         _ = await running.value
     }
+
+    func testCommittedWriteSurvivesStopAndRecoversIdempotentlyFromPreopenedDirectory() async throws {
+        let fixture = try PreopenedRecoveryFixture()
+        defer { fixture.cleanup() }
+        try await fixture.createCommittedWrite()
+
+        // The first process opens the exact startup directory used by HTTP
+        // writes, observes the committed event, then stops before delivery.
+        let first = try await fixture.openRuntime()
+        let firstDatabases = try await first.directory.notificationRecoveryDatabases()
+        let firstPending = try await XCTUnwrap(firstDatabases.first).pendingOutbox()
+        XCTAssertEqual(firstPending.count, 1)
+        try await first.close()
+
+        // The restarted process reopens the same durable inventory. The
+        // transport records one logical receiver effect, then simulates a
+        // lost acknowledgement so the stable event ID is delivered twice.
+        let restarted = try await fixture.openRuntime()
+        let transport = IdempotentCrashRecoveryTransport()
+        let service = try await SwanNotificationRecoveryService.fromPreopenedDirectory(
+            restarted.directory,
+            makeOutboxTransport: { _ in transport },
+            makeFanoutTransport: { _ in transport },
+            configuration: try notificationRecoveryConfiguration()
+        )
+        let running = Task { try? await service.run() }
+        defer { running.cancel() }
+
+        for _ in 0 ..< 200 {
+            let state = await transport.state()
+            if state.attempts >= 2 { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let state = await transport.state()
+        XCTAssertEqual(state.attempts, 2)
+        XCTAssertEqual(state.uniqueEffects, 1)
+        let restartedDatabases = try await restarted.directory.notificationRecoveryDatabases()
+        let remaining = try await XCTUnwrap(restartedDatabases.first).pendingOutbox()
+        XCTAssertTrue(remaining.isEmpty)
+        running.cancel()
+        _ = await running.value
+        try await restarted.close()
+    }
 }
 
 private struct NotificationHTTPFixture {
@@ -346,6 +389,115 @@ private actor NotificationRecoveryTransport:
 
     func counts() -> (outbox: Int, fanout: Int) {
         (outboxCount, fanoutCount)
+    }
+}
+
+private actor IdempotentCrashRecoveryTransport:
+    PermissionedSpaceOutboxTransport,
+    PermissionedSpaceNotificationFanoutTransport
+{
+    private var attempts = 0
+    private var applied = Set<UUID>()
+
+    func deliver(_ notification: PermissionedSpaceOutboxNotification) async throws {
+        attempts += 1
+        applied.insert(notification.id)
+        if attempts == 1 {
+            throw SwanError.unavailable("simulated lost delivery acknowledgement")
+        }
+    }
+
+    func deliver(_: PersistedSpaceNotificationFanout) async throws {}
+
+    func state() -> (attempts: Int, uniqueEffects: Int) {
+        (attempts, applied.count)
+    }
+}
+
+private struct PreopenedRecoveryFixture {
+    let root: URL
+    let authority = "did:plc:abcdefghijklmnopqrstuvwx"
+    let space: SpaceURI
+
+    init() throws {
+        root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanPreopenedRecoveryTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        space = try SpaceURI(
+            authority: authority,
+            spaceType: "app.bsky.bookmarks",
+            skey: "preopened-recovery"
+        )
+    }
+
+    func createCommittedWrite() async throws {
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        do {
+            _ = try await control.createAccount(try .init(
+                did: authority,
+                canonicalHandle: "recovery.example.com",
+                passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                signingKey: .init(purpose: .signing, generation: 1),
+                rotationKey: .init(purpose: .rotation, generation: 1),
+                createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+            ))
+            let database = try await SQLiteAccountDatabase(
+                dataDirectory: root,
+                did: authority
+            )
+            let lifecycle = DurableSimpleSpaceAuthority(lifecycleDatabase: database)
+            _ = try await lifecycle.create(
+                space: space,
+                owner: authority,
+                configuration: try .init(policy: .public, appAccess: .open),
+                authorization: .accountOAuth(subject: authority, scopes: ["atproto"])
+            )
+            _ = try await database.appendOplogAndOutbox(
+                space: space,
+                revision: 1,
+                operation: Data([0xA1, 0x61, 0x61, 0x01]),
+                commitment: Data(repeating: 0xB4, count: 32)
+            )
+            try await database.close()
+            try await control.close()
+        } catch {
+            try? await control.close()
+            throw error
+        }
+    }
+
+    func openRuntime() async throws -> PreopenedRecoveryRuntime {
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        do {
+            return .init(
+                control: control,
+                directory: try await .bootstrap(
+                    dataDirectory: root,
+                    controlStore: control
+                )
+            )
+        } catch {
+            try? await control.close()
+            throw error
+        }
+    }
+
+    func cleanup() {
+        try? FileManager.default.removeItem(at: root)
+    }
+}
+
+private struct PreopenedRecoveryRuntime {
+    let control: SQLiteControlDatabase
+    let directory: SQLitePreMigratedAccountDirectory
+
+    func close() async throws {
+        try await directory.close()
+        try await control.close()
     }
 }
 

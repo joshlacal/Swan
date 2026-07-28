@@ -14,6 +14,15 @@ public enum PermissionedDataJWTVerificationKey: Sendable {
     case p256(P256.Signing.PublicKey)
     case secp256k1PublicKey(Data)
 
+    var deterministicIdentity: Data {
+        switch self {
+        case let .p256(publicKey):
+            return Data([0x01]) + publicKey.x963Representation
+        case let .secp256k1PublicKey(encoded):
+            return Data([0x02]) + encoded
+        }
+    }
+
     /// Internal shared verifier for the bounded proposal JWT and service-JWT
     /// parsers. The key enum itself still exposes no signing material and the
     /// caller must select it from a local/pinned resolver before this method

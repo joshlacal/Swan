@@ -22,16 +22,21 @@ import Glibc
 /// pins are public verification material; outbound signing remains backed by
 /// the separately configured encrypted account key store. Destinations are
 /// static, peer-pinned facts rather than data learned from registrations.
-private struct ServeNotificationRuntime {
-    let credentialConfiguration: SwanSpaceCredentialHTTPConfiguration
-    let notificationConfiguration: SwanSpaceNotificationHTTPConfiguration
-    let serviceAuthentication: any SpaceServiceAuthenticationVerifier
+struct ServeNotificationRuntime {
+    let credentialPins: [PinnedSpaceCredentialPublicKey]
+    let delegationPins: [PinnedSpaceDelegationPublicKey]
+    let servicePins: [PinnedSpaceServicePublicKey]
+    let credentialPublicKeys: PinnedSpaceCredentialPublicKeyResolver
+    let delegationPublicKeys: PinnedSpaceDelegationPublicKeyResolver
+    let servicePublicKeys: PinnedSpaceServicePublicKeyResolver
+    let recipientBindings: SwanSpaceNotificationRecipientBindings
     let destinations: StaticSwanSpaceNotificationDestinations
     let peerPinnedTransportConfiguration: NIOPeerPinnedOAuthPostTransport.Configuration
-    let checkUserAccessAudience: String?
+    let managingServiceAudience: String?
 
     private struct Configuration: Decodable {
         let credentialPublicKeys: [CredentialKey]
+        let delegationPublicKeys: [CredentialKey]?
         let servicePublicKeys: [ServiceKey]
         let authorityDestinations: [Destination]
         let registrationDestinations: [Destination]
@@ -94,6 +99,9 @@ private struct ServeNotificationRuntime {
             let credentialPins = try configuration.credentialPublicKeys.map { pin in
                 try credentialPin(pin)
             }
+            let delegationPins = try (configuration.delegationPublicKeys ?? []).map { pin in
+                try delegationPin(pin)
+            }
             let servicePins = try configuration.servicePublicKeys.map { pin in
                 try servicePin(pin)
             }
@@ -127,31 +135,28 @@ private struct ServeNotificationRuntime {
                 bindings: recipientAccounts
             )
             let managedAudience = try resolveManagingServiceAudience(
-                requested: configuration.managingServiceAudience,
-                authorityDestinations: authorities,
-                registrationDestinations: registrations
+                requested: configuration.managingServiceAudience
             )
-            let serviceAuthentication: any SpaceServiceAuthenticationVerifier =
-                DurableSpaceServiceAuthenticationVerifier(
-                    publicKeys: try PinnedSpaceServicePublicKeyResolver(pins: servicePins)
-                )
             return ServeNotificationRuntime(
-                credentialConfiguration: .init(
-                    authoritySigningKeys: ServeUnavailableCredentialSigningKeyResolver(),
-                    delegationPublicKeys: UnavailableSpaceDelegationPublicKeyResolver(),
-                    credentialPublicKeys: try PinnedSpaceCredentialPublicKeyResolver(pins: credentialPins)
+                credentialPins: credentialPins,
+                delegationPins: delegationPins,
+                servicePins: servicePins,
+                credentialPublicKeys: try PinnedSpaceCredentialPublicKeyResolver(
+                    pins: credentialPins
                 ),
-                notificationConfiguration: .init(
-                    serviceAuthentication: serviceAuthentication,
-                    recipientBindings: recipientBindings
+                delegationPublicKeys: try PinnedSpaceDelegationPublicKeyResolver(
+                    pins: delegationPins
                 ),
-                serviceAuthentication: serviceAuthentication,
+                servicePublicKeys: try PinnedSpaceServicePublicKeyResolver(
+                    pins: servicePins
+                ),
+                recipientBindings: recipientBindings,
                 destinations: try StaticSwanSpaceNotificationDestinations(
                     authorityDestinations: authorities,
                     registrationDestinations: registrations
                 ),
                 peerPinnedTransportConfiguration: try .init(endpointPeers: peers),
-                checkUserAccessAudience: managedAudience
+                managingServiceAudience: managedAudience
             )
         } catch {
             throw ValidationError("--notification-config contains invalid pinned notification material")
@@ -159,40 +164,18 @@ private struct ServeNotificationRuntime {
     }
 
     private static func resolveManagingServiceAudience(
-        requested: String?,
-        authorityDestinations: [String: SwanSpaceNotificationDestination],
-        registrationDestinations: [String: SwanSpaceNotificationDestination]
+        requested: String?
     ) throws -> String? {
-        if let requested {
-            let normalized = requested.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !normalized.isEmpty else {
-                return nil
-            }
-            guard normalized.utf8.count <= 2_048,
-                  normalized.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
-                throw SwanError.malformed("notification managing service audience is invalid")
-            }
-            return normalized
+        guard let requested else { return nil }
+        let normalized = requested.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            return nil
         }
-        for destination in authorityDestinations.values {
-            let value = destination.audience
-            guard !value.isEmpty,
-                  value.utf8.count <= 2_048,
-                  value.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
-                continue
-            }
-            return value
+        guard normalized.utf8.count <= 2_048,
+              normalized.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+            throw SwanError.malformed("notification managing service audience is invalid")
         }
-        for destination in registrationDestinations.values {
-            let value = destination.audience
-            guard !value.isEmpty,
-                  value.utf8.count <= 2_048,
-                  value.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
-                continue
-            }
-            return value
-        }
-        return nil
+        return normalized
     }
 
     private static func decode(
@@ -257,6 +240,31 @@ private struct ServeNotificationRuntime {
             return try .init(
                 authority: pin.issuer,
                 keyID: pin.keyID ?? PermissionedDataJWT.spaceCredentialKeyID,
+                generation: pin.generation,
+                secp256k1PublicKey: bytes.value
+            )
+        }
+    }
+
+    private static func delegationPin(_ pin: CredentialKey) throws -> PinnedSpaceDelegationPublicKey {
+        let bytes = try keyBytes(
+            algorithm: pin.algorithm,
+            publicKey: pin.publicKey,
+            p256X963: pin.p256X963,
+            secp256k1: pin.secp256k1
+        )
+        switch bytes.algorithm {
+        case .es256:
+            return try .init(
+                issuer: pin.issuer,
+                keyID: pin.keyID ?? PermissionedDataJWT.delegationKeyID,
+                generation: pin.generation,
+                publicKey: P256.Signing.PublicKey(x963Representation: bytes.value)
+            )
+        case .es256k:
+            return try .init(
+                issuer: pin.issuer,
+                keyID: pin.keyID ?? PermissionedDataJWT.delegationKeyID,
                 generation: pin.generation,
                 secp256k1PublicKey: bytes.value
             )
@@ -341,12 +349,15 @@ private struct ServeUnavailableCredentialSigningKeyResolver:
 /// In particular, this type never hands a database, scalar, or general signing
 /// closure to the HTTP layer.
 struct ServeLocalSpaceRuntime {
+    let credentialSigningKeys: any SpaceCredentialSigningKeyResolver
+    let credentialPublicKeys: any SpaceCredentialPublicKeyResolver
+    let delegationPublicKeys: any SpaceDelegationPublicKeyResolver
+    let servicePublicKeys: any SpaceServicePublicKeyResolver
     let credentialExchangeConfiguration: SwanSpaceCredentialHTTPConfiguration
     let delegationConfiguration: SwanSpaceDelegationHTTPConfiguration
     let repositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration
     let repositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration
-    let notificationServiceAuthentication: any SpaceServiceAuthenticationVerifier
-    let checkUserAccessAudience: String
+    let notificationServiceIssuer: any SpaceServiceAuthenticationIssuer
 
     static func make(
         keyDirectory: URL,
@@ -387,30 +398,36 @@ struct ServeLocalSpaceRuntime {
                 throw SwanError.unavailable("local space runtime account keys are unavailable")
             }
         }
-        guard let checkUserAccessAudience = activeDIDs.sorted().first else {
-            throw SwanError.unavailable("local space runtime has no active account")
-        }
-        let notificationServiceAuthentication = DurableSpaceServiceAuthenticationVerifier(
-            publicKeys: LocalAccountSpaceServicePublicKeyResolver(
-                accounts: accounts,
-                publicKeyStore: keyStore
-            )
+        let credentialSigningKeys = LocalAccountSpaceCredentialSigningKeyResolver(
+            accounts: accounts,
+            keyStore: keyStore
+        )
+        let credentialPublicKeys = LocalAccountSpaceCredentialPublicKeyResolver(
+            accounts: accounts,
+            publicKeyStore: keyStore
+        )
+        let delegationPublicKeys = LocalAccountSpaceDelegationPublicKeyResolver(
+            accounts: accounts,
+            publicKeyStore: keyStore
+        )
+        let servicePublicKeys = LocalAccountSpaceServicePublicKeyResolver(
+            accounts: accounts,
+            publicKeyStore: keyStore
+        )
+        let notificationServiceIssuer = LocalAccountSpaceServiceAuthenticationIssuer(
+            accounts: accounts,
+            keyStore: keyStore
         )
 
         return .init(
+            credentialSigningKeys: credentialSigningKeys,
+            credentialPublicKeys: credentialPublicKeys,
+            delegationPublicKeys: delegationPublicKeys,
+            servicePublicKeys: servicePublicKeys,
             credentialExchangeConfiguration: .init(
-                authoritySigningKeys: LocalAccountSpaceCredentialSigningKeyResolver(
-                    accounts: accounts,
-                    keyStore: keyStore
-                ),
-                delegationPublicKeys: LocalAccountSpaceDelegationPublicKeyResolver(
-                    accounts: accounts,
-                    publicKeyStore: keyStore
-                ),
-                credentialPublicKeys: LocalAccountSpaceCredentialPublicKeyResolver(
-                    accounts: accounts,
-                    publicKeyStore: keyStore
-                )
+                authoritySigningKeys: credentialSigningKeys,
+                delegationPublicKeys: delegationPublicKeys,
+                credentialPublicKeys: credentialPublicKeys
             ),
             delegationConfiguration: .init(
                 tokenIssuer: LocalAccountSpaceDelegationTokenIssuer(
@@ -425,13 +442,147 @@ struct ServeLocalSpaceRuntime {
                 )
             ),
             repositoryCredentialConfiguration: .init(
-                credentialPublicKeys: LocalAccountSpaceCredentialPublicKeyResolver(
-                    accounts: accounts,
-                    publicKeyStore: keyStore
-                )
+                credentialPublicKeys: credentialPublicKeys
             ),
-            notificationServiceAuthentication: notificationServiceAuthentication,
-            checkUserAccessAudience: checkUserAccessAudience
+            notificationServiceIssuer: notificationServiceIssuer
+        )
+    }
+}
+
+/// The complete permissioned-data capability assembly used by `swan serve`.
+/// It is intentionally typed and startup-only: request handlers receive only
+/// their fixed-purpose configurations and cannot add resolvers or open stores.
+struct ServePermissionedRuntime {
+    let credentialConfiguration: SwanSpaceCredentialHTTPConfiguration?
+    let credentialExchangeConfiguration: SwanSpaceCredentialHTTPConfiguration?
+    let delegationConfiguration: SwanSpaceDelegationHTTPConfiguration?
+    let repositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration?
+    let repositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration?
+    let notificationConfiguration: SwanSpaceNotificationHTTPConfiguration?
+    let checkUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration?
+
+    static func compose(
+        local: ServeLocalSpaceRuntime?,
+        notification: ServeNotificationRuntime?
+    ) async throws -> ServePermissionedRuntime {
+        let credentialPublicKeys: (any SpaceCredentialPublicKeyResolver)?
+        let delegationPublicKeys: (any SpaceDelegationPublicKeyResolver)?
+        let servicePublicKeys: (any SpaceServicePublicKeyResolver)?
+
+        switch (local, notification) {
+        case let (.some(local), .some(notification)):
+            credentialPublicKeys = try await CompositeSpaceCredentialPublicKeyResolver(
+                local: local.credentialPublicKeys,
+                pinned: notification.credentialPins
+            )
+            delegationPublicKeys = try await CompositeSpaceDelegationPublicKeyResolver(
+                local: local.delegationPublicKeys,
+                pinned: notification.delegationPins
+            )
+            servicePublicKeys = try await CompositeSpaceServicePublicKeyResolver(
+                local: local.servicePublicKeys,
+                pinned: notification.servicePins
+            )
+        case let (.some(local), nil):
+            credentialPublicKeys = local.credentialPublicKeys
+            delegationPublicKeys = local.delegationPublicKeys
+            servicePublicKeys = local.servicePublicKeys
+        case let (nil, .some(notification)):
+            credentialPublicKeys = notification.credentialPublicKeys
+            delegationPublicKeys = notification.delegationPublicKeys
+            servicePublicKeys = notification.servicePublicKeys
+        case (nil, nil):
+            credentialPublicKeys = nil
+            delegationPublicKeys = nil
+            servicePublicKeys = nil
+        }
+
+        let credentialConfiguration: SwanSpaceCredentialHTTPConfiguration?
+        if let credentialPublicKeys, let delegationPublicKeys {
+            credentialConfiguration = .init(
+                authoritySigningKeys: local?.credentialSigningKeys
+                    ?? ServeUnavailableCredentialSigningKeyResolver(),
+                delegationPublicKeys: delegationPublicKeys,
+                credentialPublicKeys: credentialPublicKeys
+            )
+        } else {
+            credentialConfiguration = nil
+        }
+
+        let notificationConfiguration: SwanSpaceNotificationHTTPConfiguration?
+        let serviceAuthentication: (any SpaceServiceAuthenticationVerifier)?
+        if let servicePublicKeys {
+            let verifier = DurableSpaceServiceAuthenticationVerifier(
+                publicKeys: servicePublicKeys
+            )
+            serviceAuthentication = verifier
+            notificationConfiguration = .init(
+                serviceAuthentication: verifier,
+                recipientBindings: notification?.recipientBindings ?? .empty
+            )
+        } else {
+            serviceAuthentication = nil
+            notificationConfiguration = nil
+        }
+
+        let checkUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration?
+        if let serviceAuthentication,
+           let managingServiceAudience = notification?.managingServiceAudience {
+            checkUserAccessConfiguration = try .init(
+                serviceAuthentication: serviceAuthentication,
+                managingServiceAudience: managingServiceAudience
+            )
+        } else {
+            checkUserAccessConfiguration = nil
+        }
+
+        return .init(
+            credentialConfiguration: credentialConfiguration,
+            credentialExchangeConfiguration: local.map { local in
+                .init(
+                    authoritySigningKeys: local.credentialSigningKeys,
+                    delegationPublicKeys: delegationPublicKeys
+                        ?? UnavailableSpaceDelegationPublicKeyResolver(),
+                    credentialPublicKeys: credentialPublicKeys
+                        ?? UnavailableSpaceCredentialPublicKeyResolver()
+                )
+            },
+            delegationConfiguration: local?.delegationConfiguration,
+            repositorySyncConfiguration: local?.repositorySyncConfiguration,
+            repositoryCredentialConfiguration: credentialPublicKeys.map {
+                .init(credentialPublicKeys: $0)
+            },
+            notificationConfiguration: notificationConfiguration,
+            checkUserAccessConfiguration: checkUserAccessConfiguration
+        )
+    }
+
+    func makeServer(
+        profile: ProtocolProfile,
+        configuration: SwanHTTPConfiguration,
+        oauthRuntime: SwanOAuthRuntime,
+        directory: SQLitePreMigratedAccountDirectory,
+        accountControlStore: SQLiteControlDatabase,
+        localhostPARConfiguration: SwanLocalhostPARConfiguration? = nil,
+        localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration? = nil,
+        authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration? = nil
+    ) -> SwanHTTPServer {
+        SwanHTTPServer(
+            profile: profile,
+            configuration: configuration,
+            oauthRuntime: oauthRuntime,
+            localhostPARConfiguration: localhostPARConfiguration,
+            localhostOAuthConfiguration: localhostOAuthConfiguration,
+            authorizationServerConfiguration: authorizationServerConfiguration,
+            authenticatedGetSpaceDirectory: directory,
+            accountControlStore: accountControlStore,
+            spaceCredentialConfiguration: credentialConfiguration,
+            spaceCredentialExchangeConfiguration: credentialExchangeConfiguration,
+            spaceDelegationConfiguration: delegationConfiguration,
+            spaceRepositorySyncConfiguration: repositorySyncConfiguration,
+            spaceRepositoryCredentialConfiguration: repositoryCredentialConfiguration,
+            spaceNotificationConfiguration: notificationConfiguration,
+            simpleSpaceCheckUserAccessConfiguration: checkUserAccessConfiguration
         )
     }
 }
@@ -980,13 +1131,26 @@ extension SwanCommand {
                         "--enable-local-space-interop requires an owner-only --space-account-kek-file"
                     )
                 }
-                guard !enableNotificationDelivery,
-                      notificationAccountKEKFile == nil,
+            }
+            if !enableNotificationDelivery {
+                guard notificationAccountKEKFile == nil,
                       notificationAccountKEKID == nil,
                       notificationAccountKeyDirectory == nil else {
                     throw ValidationError(
                         "notification account options require --enable-notification-delivery"
                     )
+                }
+            } else {
+                guard notificationAccountKEKFile.map({
+                          !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      }) ?? true,
+                      notificationAccountKEKID.map({
+                          !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      }) ?? true,
+                      notificationAccountKeyDirectory.map({
+                          !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      }) ?? true else {
+                    throw ValidationError("notification account key-store options are invalid")
                 }
             }
             guard !enableManagementPLCProvisioning || managementPort != nil else {
@@ -1160,55 +1324,59 @@ extension SwanCommand {
                 guard !enableNotificationDelivery || notificationRuntime != nil else {
                     throw ValidationError("--enable-notification-delivery requires --notification-config")
                 }
-                let spaceNotificationConfiguration: SwanSpaceNotificationHTTPConfiguration? = if let localSpaceRuntime {
-                    .init(serviceAuthentication: localSpaceRuntime.notificationServiceAuthentication)
-                } else {
-                    notificationRuntime?.notificationConfiguration
-                }
-                let spaceCredentialConfiguration = localSpaceRuntime?.credentialExchangeConfiguration
-                    ?? notificationRuntime?.credentialConfiguration
-                let simpleSpaceCheckUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration? = if let configuration = spaceNotificationConfiguration,
-                   let managedAudience = localSpaceRuntime?.checkUserAccessAudience
-                   ?? notificationRuntime?.checkUserAccessAudience {
-                    try .init(
-                        serviceAuthentication: configuration.serviceAuthentication,
-                        managingServiceAudience: managedAudience
+                let permissionedRuntime: ServePermissionedRuntime
+                do {
+                    permissionedRuntime = try await .compose(
+                        local: localSpaceRuntime,
+                        notification: notificationRuntime
                     )
-                } else {
-                    nil
+                } catch {
+                    throw ValidationError("permissioned runtime key composition is invalid")
                 }
                 let notificationRecoveryService: SwanNotificationRecoveryService?
                 if enableNotificationDelivery, let notificationRuntime {
                     guard !notificationRuntime.peerPinnedTransportConfiguration.endpointPeers.isEmpty else {
                         throw ValidationError("--enable-notification-delivery requires at least one peer-pinned destination")
                     }
-                    let keyConfiguration: AccountKeyEncryptionConfiguration
-                    let keyStore: FileAccountKeyStore
-                    do {
-                        keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
-                            activeKeyID: notificationAccountKEKID ?? "primary",
-                            secretFile: notificationAccountKEKFile.map { URL(fileURLWithPath: $0) }
-                        )
-                        let keyDirectory = notificationAccountKeyDirectory.map { URL(fileURLWithPath: $0) }
-                            ?? dataURL.appending(path: "keys")
-                        keyStore = try FileAccountKeyStore(
-                            root: keyDirectory,
-                            configuration: keyConfiguration
-                        )
-                    } catch {
-                        throw ValidationError("notification account signing key store is unavailable")
-                    }
-                    let serviceIssuer: LocalAccountSpaceServiceAuthenticationIssuer
-                    do {
-                        let passwordHasher = try LibsodiumArgon2idHasher()
-                        let accounts = DurableAccountDirectory(
-                            store: controlDatabase,
-                            passwordHasher: passwordHasher,
-                            verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher)
-                        )
-                        serviceIssuer = .init(accounts: accounts, keyStore: keyStore)
-                    } catch {
-                        throw ValidationError("notification account signing runtime is unavailable")
+                    let serviceIssuer: any SpaceServiceAuthenticationIssuer
+                    if let localSpaceRuntime,
+                       notificationAccountKEKFile == nil,
+                       notificationAccountKEKID == nil,
+                       notificationAccountKeyDirectory == nil {
+                        serviceIssuer = localSpaceRuntime.notificationServiceIssuer
+                    } else {
+                        let keyStore: FileAccountKeyStore
+                        do {
+                            let keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                                activeKeyID: notificationAccountKEKID ?? "primary",
+                                secretFile: notificationAccountKEKFile.map { URL(fileURLWithPath: $0) }
+                            )
+                            let keyDirectory = notificationAccountKeyDirectory.map {
+                                URL(fileURLWithPath: $0)
+                            } ?? dataURL.appending(path: "keys")
+                            keyStore = try FileAccountKeyStore(
+                                root: keyDirectory,
+                                configuration: keyConfiguration
+                            )
+                        } catch {
+                            throw ValidationError("notification account signing key store is unavailable")
+                        }
+                        do {
+                            let passwordHasher = try LibsodiumArgon2idHasher()
+                            let accounts = DurableAccountDirectory(
+                                store: controlDatabase,
+                                passwordHasher: passwordHasher,
+                                verificationExecutor: try Argon2idVerificationExecutor(
+                                    hasher: passwordHasher
+                                )
+                            )
+                            serviceIssuer = LocalAccountSpaceServiceAuthenticationIssuer(
+                                accounts: accounts,
+                                keyStore: keyStore
+                            )
+                        } catch {
+                            throw ValidationError("notification account signing runtime is unavailable")
+                        }
                     }
                     let poster: OAuthBoundedJSONPoster
                     do {
@@ -1270,26 +1438,15 @@ extension SwanCommand {
                 } else {
                     managementPLCProvisioning = nil
                 }
-                let server = SwanHTTPServer(
+                let server = permissionedRuntime.makeServer(
                     profile: loadedProfile,
                     configuration: .init(host: host, port: port, publicURL: baseURL),
                     oauthRuntime: oauthRuntime,
+                    directory: directory,
+                    accountControlStore: controlDatabase,
                     localhostPARConfiguration: localhostPARConfiguration,
                     localhostOAuthConfiguration: localhostOAuthConfiguration,
-                    authorizationServerConfiguration: authorizationServerConfiguration,
-                    authenticatedGetSpaceDirectory: directory,
-                    accountControlStore: controlDatabase,
-                    // Local interop activates only exchange and sync
-                    // Local interop uses account-keyed credential verification
-                    // for exchange, reads, and sync. Notification runtime also
-                    // supports this path when configured separately.
-                    spaceCredentialConfiguration: spaceCredentialConfiguration,
-                    spaceCredentialExchangeConfiguration: localSpaceRuntime?.credentialExchangeConfiguration,
-                    spaceDelegationConfiguration: localSpaceRuntime?.delegationConfiguration,
-                    spaceRepositorySyncConfiguration: localSpaceRuntime?.repositorySyncConfiguration,
-                    spaceRepositoryCredentialConfiguration: localSpaceRuntime?.repositoryCredentialConfiguration,
-                    spaceNotificationConfiguration: spaceNotificationConfiguration,
-                    simpleSpaceCheckUserAccessConfiguration: simpleSpaceCheckUserAccessConfiguration
+                    authorizationServerConfiguration: authorizationServerConfiguration
                 )
                 guard server.authenticatedGetSpace != nil else {
                     throw ValidationError(
@@ -1340,7 +1497,7 @@ extension SwanCommand {
                 }
                 logger.info("starting Swan", metadata: ["profile": .string(loadedProfile.id), "address": .string("\(host):\(port)")])
                 var services: [any Service] = [publicApplication]
-                if spaceNotificationConfiguration != nil {
+                if permissionedRuntime.notificationConfiguration != nil {
                     logger.info("space notification receiver routes enabled")
                 }
                 if let notificationRecoveryService {
