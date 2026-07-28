@@ -98,6 +98,26 @@ public struct VerifiedPublicRepositorySignedCommit: Sendable, Equatable {
 }
 
 public enum PublicRepositoryCommitCodec {
+    /// Returns the exact signed P-256 commit block size without invoking a
+    /// signer. P-256 wire signatures are fixed-width, so the value is suitable
+    /// for aggregate relevant-block budget enforcement before key use.
+    static func preflightSignedCommitByteCount(
+        did: String,
+        revision: String,
+        dataCID: CID,
+        currentRevision: String?,
+        signingAlgorithm: PublicRepositorySigningAlgorithm
+    ) throws -> Int {
+        let descriptor = try descriptor(
+            did: did,
+            revision: revision,
+            dataCID: dataCID,
+            currentRevision: currentRevision
+        )
+        try validateSupportedAlgorithm(signingAlgorithm)
+        return try encodeSigned(descriptor, signature: Data(repeating: 0, count: 64)).count
+    }
+
     public static func encodeUnsigned(
         did: String,
         revision: String,
