@@ -323,17 +323,25 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
             throw PublicRepositoryImportStagingError.invalidTimestamp
         }
         return try await withConnectionGate {
-            try await transaction {
-                let rows = try await connection.query(
-                    """
-                    DELETE FROM public_repository_import_sessions
-                    WHERE status != 'consumed' AND expires_at < ?
-                    RETURNING session_id
-                    """,
-                    [.integer(try Self.sqliteInteger(now))]
-                )
-                return rows.count
-            }
+            try await recoverExpiredPublicRepositoryImportSessionsWithoutGate(
+                now: try Self.sqliteInteger(now)
+            )
+        }
+    }
+
+    func recoverExpiredPublicRepositoryImportSessionsWithoutGate(
+        now: Int
+    ) async throws -> Int {
+        try await transaction {
+            let rows = try await connection.query(
+                """
+                DELETE FROM public_repository_import_sessions
+                WHERE status != 'consumed' AND expires_at < ?
+                RETURNING session_id
+                """,
+                [.integer(now)]
+            )
+            return rows.count
         }
     }
 

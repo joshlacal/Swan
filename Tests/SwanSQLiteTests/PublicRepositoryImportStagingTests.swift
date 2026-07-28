@@ -188,7 +188,7 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
         let reopened = try await SQLiteAccountDatabase(dataDirectory: fixture.root, did: did)
         let expired = try await reopened
             .recoverExpiredPublicRepositoryImportSessions(now: 21)
-        XCTAssertEqual(expired, 1)
+        XCTAssertEqual(expired, 0, "startup recovery should remove the expired attempt")
         if case .staged = try await reopened.createPublicRepositoryImportSession(
             binding: binding, createdAt: 22, expiresAt: 30
         ) {} else {

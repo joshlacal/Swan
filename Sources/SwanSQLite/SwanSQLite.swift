@@ -1276,6 +1276,9 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         if !readOnly {
             do {
                 try await migrateWithoutGate()
+                _ = try await recoverExpiredPublicRepositoryImportSessionsWithoutGate(
+                    now: Int(Date().timeIntervalSince1970)
+                )
                 try await recoverPrivateBlobLifecycle()
                 if !descriptorBacked {
                     try SQLiteProtectedPaths.hardenSQLiteFiles(
@@ -1320,6 +1323,9 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     public func migrate() async throws {
         try await withConnectionGate {
             try await migrateWithoutGate()
+            _ = try await recoverExpiredPublicRepositoryImportSessionsWithoutGate(
+                now: Int(Date().timeIntervalSince1970)
+            )
         }
         try await recoverPrivateBlobLifecycle()
     }
