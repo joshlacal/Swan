@@ -2370,8 +2370,12 @@ extension SwanCommand {
                 help: "Repeatable allowlist for strict-convergence mismatches (path or METHOD path)")
             var allowedConvergenceDivergences: [String] = []
 
-            @Flag(name: .long, help: "Return non-zero when scenario status is not passed")
-            var failOnFailure: Bool = false
+            @Flag(
+                name: .customLong("fail-on-failure"),
+                inversion: .prefixedNo,
+                help: "Return non-zero when scenario status is not passed (default; use --no-fail-on-failure only for diagnostics)"
+            )
+            var failOnFailure: Bool = true
 
             func run() async throws {
                 let normalizedScenario = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2463,8 +2467,12 @@ extension SwanCommand {
                 help: "Repeatable allowlist for strict-convergence mismatches (path or METHOD path)")
             var allowedConvergenceDivergences: [String] = []
 
-            @Flag(name: .long, help: "Return non-zero when any matrix cell is not passed")
-            var failOnFailure: Bool = false
+            @Flag(
+                name: .customLong("fail-on-failure"),
+                inversion: .prefixedNo,
+                help: "Return non-zero when any matrix cell is not passed (default; use --no-fail-on-failure only for diagnostics)"
+            )
+            var failOnFailure: Bool = true
 
             func run() async throws {
                 let normalizedScenario = name.trimmingCharacters(in: .whitespacesAndNewlines)

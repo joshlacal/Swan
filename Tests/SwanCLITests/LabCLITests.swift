@@ -31,6 +31,7 @@ final class LabCLITests: XCTestCase {
                 "--swan-base-url", "https://127.0.0.1:1",
                 "--reference-base-url", "https://127.0.0.1:1",
                 "--request-timeout-seconds", "0.2",
+                "--no-fail-on-failure",
             ]
         )
         XCTAssertEqual(result.status, 0, String(decoding: result.stderr, as: UTF8.self))
@@ -91,6 +92,7 @@ final class LabCLITests: XCTestCase {
                 "--swan-base-url", "https://127.0.0.1:1",
                 "--reference-base-url", "https://127.0.0.1:1",
                 "--request-timeout-seconds", "0.2",
+                "--no-fail-on-failure",
             ]
         )
         XCTAssertEqual(result.status, 0, String(decoding: result.stderr, as: UTF8.self))
