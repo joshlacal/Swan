@@ -106,7 +106,6 @@ public enum RepositoryMSTValidation {
         var mstBlocks: [CID: Data] = [:]
         var leaves: [RepositoryMSTLeaf] = []
         var recordCIDs = Set<CID>()
-        var recordBlocks: [CID: Data] = [:]
         var reachableBytes = 0
         var rootLayer: Int?
 
@@ -224,6 +223,10 @@ public enum RepositoryMSTValidation {
             }
         }
 
+        var expectedCollectionsByRecordCID: [CID: Set<String>] = [:]
+        for leaf in leaves {
+            expectedCollectionsByRecordCID[leaf.recordCID, default: []].insert(leaf.path.collection)
+        }
         for cid in recordCIDs {
             guard let bytes = try await blocks.block(for: cid) else {
                 throw RepositoryMSTValidationError.missingRecordBlock
@@ -238,28 +241,27 @@ public enum RepositoryMSTValidation {
             guard bytes.count <= limits.maximumRecordBlockBytes else {
                 throw RepositoryMSTValidationError.recordBlockTooLarge
             }
-            recordBlocks[cid] = bytes
             reachableBytes = try adding(bytes.count, to: reachableBytes, maximum: maximumReachableBytes)
+            guard let expectedCollections = expectedCollectionsByRecordCID[cid] else {
+                throw RepositoryMSTValidationError.missingRecordBlock
+            }
+            for expectedCollection in expectedCollections {
+                do {
+                    try RepositoryRecordBlockValidator.validate(
+                        bytes,
+                        expectedType: expectedCollection,
+                        maximumDepth: limits.maximumCBORNestingDepth
+                    )
+                } catch {
+                    throw RepositoryMSTValidationError.invalidRecordBlock
+                }
+            }
         }
 
         leaves.sort { Data($0.path.mstKey.utf8).lexicographicallyPrecedes(Data($1.path.mstKey.utf8)) }
         for pair in zip(leaves, leaves.dropFirst()) {
             guard pair.0.path.mstKey < pair.1.path.mstKey else {
                 throw RepositoryMSTValidationError.keysNotStrictlyIncreasing
-            }
-        }
-        for leaf in leaves {
-            guard let bytes = recordBlocks[leaf.recordCID] else {
-                throw RepositoryMSTValidationError.missingRecordBlock
-            }
-            do {
-                try RepositoryRecordBlockValidator.validate(
-                    bytes,
-                    expectedType: leaf.path.collection,
-                    maximumDepth: limits.maximumCBORNestingDepth
-                )
-            } catch {
-                throw RepositoryMSTValidationError.invalidRecordBlock
             }
         }
         guard let rootLayer else {

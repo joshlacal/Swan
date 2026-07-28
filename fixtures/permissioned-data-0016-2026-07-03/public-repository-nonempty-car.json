@@ -1,0 +1,17 @@
+{
+  "pin": "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
+  "did": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+  "revision": "3jzfcijpj2z2a",
+  "signingKeyDID": "did:key:zDnaeXxvmFHMHjqgQTbadpWG7gPHwnga1i7SMwxrV2BSdUjAD",
+  "commitCID": "bafyreicrx5ixv5a7lcgt2cwyx2vn3h7xfw5mjt6ob4t2oyxvy45mkygxfy",
+  "record": {
+    "collection": "app.bsky.feed.post",
+    "rkey": "0",
+    "text": "hello from pinned TypeScript"
+  },
+  "carBase64": "OqJlcm9vdHOB2CpYJQABcRIgUb9RevQfWI09Cti+qt2f9y26xM/ODyenYvXHOsVg1y5ndmVyc2lvbgHgAQFxEiBRv1F69B9YjT0K2L6q3Z/3LbrEz84PJ6di9cc6xWDXLqZjZGlkeCBkaWQ6cGxjOmV3dmk3bnh6eW91bjZ6aHhyaHM2NG9pemNyZXZtM2p6ZmNpanBqMnoyYWNzaWdYQB7hxPKqGRgEAmLhl/9gcP6KPxZ27Kuq8TEgEBBanN00HTHYPItY2OYi1SSnFXNgWdHvUpPKbg5vyiaG9f+X27dkZGF0YdgqWCUAAXESIBpKoUfD4BmU7U13yh4x/ikZ9nAZ29Ek9LFlP8lJtWX3ZHByZXb2Z3ZlcnNpb24DdAFxEiAaSqFHw+AZlO1Nd8oeMf4pGfZwGdvRJPSxZT/JSbVl96JhZYGkYWtUYXBwLmJza3kuZmVlZC5wb3N0LzBhcABhdPZhdtgqWCUAAXESIGk0RaQWmdJnLmvjDnSWWlR7kWG7SDcI3sEQLvym/rEGYWz2YQFxEiBpNEWkFpnSZy5r4w50llpUe5Fhu0g3CN7BEC78pv6xBqJkdGV4dHgcaGVsbG8gZnJvbSBwaW5uZWQgVHlwZVNjcmlwdGUkdHlwZXJhcHAuYnNreS5mZWVkLnBvc3Q=",
+  "swift": {
+    "commitCID": "bafyreia7bw4wjm5c633ylhroqgkdlfpst2bvdlfm64k5bbsqhvoea36dti",
+    "carBase64": "OqJlcm9vdHOB2CpYJQABcRIgHw25ZLOi9veFni6BlDWV8p6DUays9xXQhlA9XEBvw5pndmVyc2lvbgHgAQFxEiAfDblks6L294WeLoGUNZXynoNRrKz3FdCGUD1cQG/DmqZjZGlkeCBkaWQ6cGxjOmV3dmk3bnh6eW91bjZ6aHhyaHM2NG9pemNyZXZtM2p6ZmNpanBqMnoyYWNzaWdYQC0dFnr9h93SKyTGvyPQtD/Z+4vttqkbFOcHm/HXgOFnP/mtQARw/ad39P0fgqCJnPWTFC1f0+7/zfaGVdrzyTpkZGF0YdgqWCUAAXESIBpKoUfD4BmU7U13yh4x/ikZ9nAZ29Ek9LFlP8lJtWX3ZHByZXb2Z3ZlcnNpb24DdAFxEiAaSqFHw+AZlO1Nd8oeMf4pGfZwGdvRJPSxZT/JSbVl96JhZYGkYWtUYXBwLmJza3kuZmVlZC5wb3N0LzBhcABhdPZhdtgqWCUAAXESIGk0RaQWmdJnLmvjDnSWWlR7kWG7SDcI3sEQLvym/rEGYWz2YQFxEiBpNEWkFpnSZy5r4w50llpUe5Fhu0g3CN7BEC78pv6xBqJkdGV4dHgcaGVsbG8gZnJvbSBwaW5uZWQgVHlwZVNjcmlwdGUkdHlwZXJhcHAuYnNreS5mZWVkLnBvc3Q="
+  }
+}
