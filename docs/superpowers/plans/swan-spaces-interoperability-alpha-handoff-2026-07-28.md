@@ -431,3 +431,39 @@ suite on that clean parent executed 602 tests with 0 failures and 5 expected
 skips (four opt-in 256 MiB/cache gates and the environment-gated lab
 validation). The filtered `PublicRepositoryReadHTTPTests` command executed
 8/8, and the static/profile/interop verifiers remained green.
+
+## Follow-up verification: Linux Compose and cross-host permissioned proof
+
+The Docker/Compose environment became available later on 2026-07-28. The
+clean-cache Linux aarch64 lab now passes the following gates:
+
+- Caddy local TLS, Mailpit, Toxiproxy, the pinned reference PDS/PLC, and Swan
+  all report healthy; PLC-backed Swan account bootstrap completes before the
+  listener accepts traffic.
+- Stateful Swan-to-Swan public and permissioned round trips return matching
+  CIDs. Public/private HTTP and CAR isolation checks show no permissioned CID
+  or private-only blob through public routes.
+- The sanitized six-mode fault matrix covers offline, disconnected, delayed,
+  duplicated, reordered, and corrupted traffic (156 convergence comparisons,
+  416 endpoint events) across Swan and the pinned reference host. This is
+  transport/profile evidence, not complete TypeScript semantic convergence.
+- A disposable TypeScript member account passed public record create/read/list
+  on the reference PDS. It then wrote a permissioned record on that host,
+  received a Swan-issued space credential from the Swan authority, and read
+  the same CID from the TypeScript member host with
+  `--permissioned-read-host member`. The authority used an explicit static
+  public-key pin for the remote delegation; no private material or tokens were
+  persisted in the repository.
+
+The runner/API and Compose lifecycle fix are committed in
+`ea47ba82` (`feat(interop): select permissioned repository read host`), on top
+of `fa391bee` (`fix(interop): validate public and permissioned Linux lab`). The
+Compose fix keeps the complete `swan-data-init` shell script in one argument;
+without it, `/bin/sh -ec` treated `install` flags as positional parameters and
+the service failed with “missing file operand.” The restored normal Compose
+stack is healthy after the fix.
+
+The alpha is still not complete. Full TypeScript public repository import,
+dynamic remote DID/PLC/JWKS resolution, blobs, incremental sync and
+compaction-gap recovery, reverse authority placement, and the complete
+cross-implementation security/lifecycle/export matrix remain follow-up gates.
