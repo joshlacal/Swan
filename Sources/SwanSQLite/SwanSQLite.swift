@@ -413,7 +413,14 @@ public enum SQLiteLayout {
             verified_data_cid TEXT,
             verified_revision TEXT,
             reachable_block_count INTEGER,
-            record_count INTEGER
+            record_count INTEGER,
+            commit_block_count INTEGER,
+            mst_block_count INTEGER,
+            record_block_count INTEGER,
+            index_count INTEGER,
+            verified_projection_digest BLOB
+                CHECK(verified_projection_digest IS NULL
+                    OR length(verified_projection_digest) = 32)
         )
         """,
         """
@@ -1362,6 +1369,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             try await migrateFileBackedBlobLifecycleIfNeeded()
             try await migratePhysicalBlobCASLifecycleIfNeeded()
             try await migratePublicRepositoryRequestIntegrityIfNeeded()
+            try await migratePublicRepositoryImportProjectionBindingIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -1435,6 +1443,39 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         _ = try await connection.query(
             "DROP TABLE public_repository_mutation_requests_pre_integrity"
         )
+    }
+
+    /// Task 42 originally shipped staging tables before the exact projection
+    /// binding columns. In-flight sessions cannot be upgraded safely because
+    /// their verifier result is process-local, so discard them atomically;
+    /// durable import results remain the sole replay truth.
+    private func migratePublicRepositoryImportProjectionBindingIfNeeded() async throws {
+        let columns = try await connection.query(
+            "PRAGMA table_info(public_repository_import_sessions)"
+        )
+        let existing = Set(columns.compactMap { $0.column("name")?.string })
+        let additions = [
+            ("commit_block_count", "INTEGER"),
+            ("mst_block_count", "INTEGER"),
+            ("record_block_count", "INTEGER"),
+            ("index_count", "INTEGER"),
+            (
+                "verified_projection_digest",
+                "BLOB CHECK(verified_projection_digest IS NULL OR length(verified_projection_digest) = 32)"
+            ),
+        ]
+        var changed = false
+        for (name, declaration) in additions where !existing.contains(name) {
+            _ = try await connection.query(
+                "ALTER TABLE public_repository_import_sessions ADD COLUMN \(name) \(declaration)"
+            )
+            changed = true
+        }
+        if changed {
+            _ = try await connection.query(
+                "DELETE FROM public_repository_import_sessions"
+            )
+        }
     }
 
     /// Upgrades rows written before the persistence API owned its state marker

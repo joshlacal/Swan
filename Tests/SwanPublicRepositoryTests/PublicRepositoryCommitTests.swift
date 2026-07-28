@@ -389,6 +389,7 @@ private actor RecordingUnsupportedSigner: PublicRepositoryCommitSigner {
 
 private actor RecordingUnsupportedVerifier: PublicRepositoryCommitVerifier {
     nonisolated let signingAlgorithm: PublicRepositorySigningAlgorithm = .secp256k1
+    nonisolated let verificationIdentity = "test:unsupported"
     private var calls = 0
 
     func verify(signature _: Data, unsignedCommitBytes _: Data, did _: String) async throws {

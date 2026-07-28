@@ -166,7 +166,8 @@ public protocol PublicRepositoryImportStagingStore: Sendable {
     func createPublicRepositoryImportSession(
         binding: PublicRepositoryImportBinding,
         createdAt: Int64,
-        expiresAt: Int64
+        expiresAt: Int64,
+        now: Int64
     ) async throws -> PublicRepositoryImportStartOutcome
     func publicRepositoryImportSession(id: String) async throws
         -> PublicRepositoryImportStagingSession

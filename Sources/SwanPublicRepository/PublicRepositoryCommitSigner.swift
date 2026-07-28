@@ -19,6 +19,9 @@ public protocol PublicRepositoryCommitSigner: Sendable {
 
 public protocol PublicRepositoryCommitVerifier: Sendable {
     var signingAlgorithm: PublicRepositorySigningAlgorithm { get }
+    /// Stable identity derived from the exact resolved verification key.
+    /// Import callers bind this value before accepting any CAR bytes.
+    var verificationIdentity: String { get }
 
     func verify(
         signature: Data,
@@ -45,10 +48,13 @@ public struct P256PublicRepositoryCommitSigner: PublicRepositoryCommitSigner {
 /// resolution and key rotation remain outside this pure repository target.
 public struct P256PublicRepositoryCommitVerifier: PublicRepositoryCommitVerifier {
     public let signingAlgorithm: PublicRepositorySigningAlgorithm = .p256
+    public let verificationIdentity: String
     private let publicKey: P256.Signing.PublicKey
 
     public init(publicKey: P256.Signing.PublicKey) {
         self.publicKey = publicKey
+        let digest = SHA256.hash(data: publicKey.x963Representation)
+        self.verificationIdentity = "p256-sha256:\(Hex.encode(digest))"
     }
 
     public func verify(

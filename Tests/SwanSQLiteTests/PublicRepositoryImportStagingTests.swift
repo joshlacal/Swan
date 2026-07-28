@@ -6,6 +6,11 @@ import SwanPublicRepository
 import SwanStorage
 @testable import SwanSQLite
 import XCTest
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 final class PublicRepositoryImportStagingTests: XCTestCase {
     private let did = "did:plc:abcdefghijklmnopqrstuvwx"
@@ -60,10 +65,12 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
             requestDigest: Data(repeating: 0x71, count: 32),
             accountDID: fixtureDID,
             expectedBaseCommitCID: genesis.commitCID,
-            verifierIdentity: try XCTUnwrap(object["signingKeyDID"] as? String),
+            verifierIdentity: P256PublicRepositoryCommitVerifier(
+                publicKey: key.publicKey
+            ).verificationIdentity,
             policy: .init(limits: .standard)
         )
-        let result = try await SQLitePublicRepositoryImportCoordinator(database: database)
+        let result = try await testCoordinator(database)
             .importRepository(
                 from: InstrumentedCARSource(data: shuffled, chunkBytes: 4_111),
                 binding: binding,
@@ -108,7 +115,7 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
             requestID: "import-success",
             baseCID: fixture.initial.commitCID
         )
-        let coordinator = SQLitePublicRepositoryImportCoordinator(database: fixture.database)
+        let coordinator = testCoordinator(fixture.database)
         let result = try await coordinator.importRepository(
             from: source,
             binding: binding,
@@ -165,7 +172,7 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
                 group.addTask {
                     do {
                         return .success(try await fixture.database.createPublicRepositoryImportSession(
-                            binding: binding, createdAt: 10, expiresAt: 20
+                            binding: binding, createdAt: 10, expiresAt: 20, now: 10
                         ))
                     } catch {
                         return .failure(error)
@@ -190,7 +197,7 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
             .recoverExpiredPublicRepositoryImportSessions(now: 21)
         XCTAssertEqual(expired, 0, "startup recovery should remove the expired attempt")
         if case .staged = try await reopened.createPublicRepositoryImportSession(
-            binding: binding, createdAt: 22, expiresAt: 30
+            binding: binding, createdAt: 22, expiresAt: 30, now: 22
         ) {} else {
             XCTFail("expired attempt was not recoverable")
         }
@@ -205,13 +212,16 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
             frames: try await fixture.blocks()
         )
         let wrongKey = P256.Signing.PrivateKey()
-        let coordinator = SQLitePublicRepositoryImportCoordinator(database: fixture.database)
+        let coordinator = testCoordinator(fixture.database)
 
         do {
             _ = try await coordinator.importRepository(
                 from: InstrumentedCARSource(data: car, chunkBytes: 17),
                 binding: try binding(
-                    requestID: "bad-signature", baseCID: fixture.initial.commitCID
+                    requestID: "bad-signature", baseCID: fixture.initial.commitCID,
+                    verifierIdentity: P256PublicRepositoryCommitVerifier(
+                        publicKey: wrongKey.publicKey
+                    ).verificationIdentity
                 ),
                 verifier: P256PublicRepositoryCommitVerifier(publicKey: wrongKey.publicKey),
                 createdAt: 100,
@@ -228,11 +238,190 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
         XCTAssertEqual(unchanged, fixture.initial)
         let raw = try await openRaw(fixture.root)
         let rows = try await raw.query(
-            "SELECT COUNT(*) AS count FROM public_repository_import_sessions"
+            """
+            SELECT
+              (SELECT COUNT(*) FROM public_repository_import_sessions) AS sessions,
+              (SELECT COUNT(*) FROM public_repository_import_blocks) AS blocks,
+              (SELECT COUNT(*) FROM public_repository_import_reachable) AS reachable,
+              (SELECT COUNT(*) FROM public_repository_import_record_index) AS indexes,
+              (SELECT COUNT(*) FROM public_repository_import_results) AS results
+            """
         )
-        XCTAssertEqual(rows.first?.column("count")?.integer, 0)
+        for column in ["sessions", "blocks", "reachable", "indexes", "results"] {
+            XCTAssertEqual(rows.first?.column(column)?.integer, 0, column)
+        }
         try await raw.close()
         try await fixture.database.close()
+    }
+
+    func testVerifierIdentityMismatchReadsNothingAndCreatesNoSession() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let source = InstrumentedCARSource(data: Data([0]), chunkBytes: 1)
+        let verifier = P256PublicRepositoryCommitVerifier(publicKey: fixture.key.publicKey)
+        let mismatched = try PublicRepositoryImportBinding(
+            requestID: "identity-mismatch",
+            requestDigest: Data(repeating: 0x91, count: 32),
+            accountDID: did,
+            expectedBaseCommitCID: fixture.initial.commitCID,
+            verifierIdentity: "p256-sha256:\(String(repeating: "0", count: 64))",
+            policy: .init(limits: .standard)
+        )
+        do {
+            _ = try await testCoordinator(fixture.database).importRepository(
+                from: source,
+                binding: mismatched,
+                verifier: verifier,
+                createdAt: 100,
+                expiresAt: 200
+            )
+            XCTFail("mismatched verifier identity accepted")
+        } catch {
+            XCTAssertEqual(
+                error as? PublicRepositoryImportStagingError, .bindingMismatch
+            )
+        }
+        let reads = await source.readCount()
+        XCTAssertEqual(reads, 0)
+        try await assertInitialAndNoStaging(fixture)
+        try await fixture.database.close()
+    }
+
+    func testPublishRejectsEveryProjectionAndCommitTamperAtomically() async throws {
+        for tamper in StagingTamper.allCases {
+            let fixture = try await makeFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let extraBytes = try DAGCBOR.encodeValue(Data("unlinked".utf8))
+            let extraCID = CID.fromDAGCBOR(extraBytes)
+            var frames = try await fixture.blocks()
+            frames.append(.init(cid: extraCID, bytes: extraBytes))
+            let car = try await encodeCAR(
+                root: fixture.prepared.state.commitCID, frames: frames
+            )
+            let databasePath = SQLiteLayout.accountDatabase(
+                in: fixture.root, did: did
+            ).path
+            let coordinator = SQLitePublicRepositoryImportCoordinator(
+                database: fixture.database,
+                beforePublish: {
+                    let raw = try await SQLiteConnection.open(
+                        storage: .file(path: databasePath)
+                    )
+                    try await tamper.apply(to: raw, extraCID: extraCID)
+                    try await raw.close()
+                },
+                now: { 100 }
+            )
+            do {
+                _ = try await coordinator.importRepository(
+                    from: InstrumentedCARSource(data: car, chunkBytes: 127),
+                    binding: try binding(
+                        requestID: "tamper-\(tamper.rawValue)",
+                        baseCID: fixture.initial.commitCID
+                    ),
+                    verifier: P256PublicRepositoryCommitVerifier(
+                        publicKey: fixture.key.publicKey
+                    ),
+                    createdAt: 100,
+                    expiresAt: 200
+                )
+                XCTFail("\(tamper.rawValue) published")
+            } catch {
+                XCTAssertEqual(
+                    error as? PublicRepositoryImportStagingError, .corruptStaging
+                )
+            }
+            try await assertInitialAndNoStaging(fixture)
+            try await fixture.database.close()
+        }
+    }
+
+    func testExpiryIsExclusiveAndEnforcedDuringReceiveVerifyAndPublish() async throws {
+        let boundary = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: boundary.root) }
+        let boundaryBinding = try binding(
+            requestID: "expiry-boundary", baseCID: boundary.initial.commitCID
+        )
+        if case .staged = try await boundary.database.createPublicRepositoryImportSession(
+            binding: boundaryBinding, createdAt: 10, expiresAt: 12, now: 11
+        ) {} else {
+            XCTFail("one tick before expiry was rejected")
+        }
+        let beforeExpiry = try await boundary.database
+            .recoverExpiredPublicRepositoryImportSessions(now: 11)
+        XCTAssertEqual(beforeExpiry, 0)
+        let atExpiry = try await boundary.database
+            .recoverExpiredPublicRepositoryImportSessions(now: 12)
+        XCTAssertEqual(atExpiry, 1)
+        for now in [12, 13] {
+            do {
+                _ = try await boundary.database.createPublicRepositoryImportSession(
+                    binding: boundaryBinding, createdAt: 10, expiresAt: 12, now: Int64(now)
+                )
+                XCTFail("now \(now) accepted")
+            } catch {
+                XCTAssertEqual(
+                    error as? PublicRepositoryImportStagingError, .expiredSession
+                )
+            }
+        }
+        do {
+            _ = try await boundary.database.createPublicRepositoryImportSession(
+                binding: boundaryBinding, createdAt: 12, expiresAt: 12, now: 11
+            )
+            XCTFail("zero lifetime accepted")
+        } catch {
+            XCTAssertEqual(
+                error as? PublicRepositoryImportStagingError, .invalidTimestamp
+            )
+        }
+        try await boundary.database.close()
+
+        for phase in ExpiryPhase.allCases {
+            let fixture = try await makeFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let car = try await encodeCAR(
+                root: fixture.prepared.state.commitCID,
+                frames: try await fixture.blocks()
+            )
+            let clock = TestImportClock(10)
+            let baseVerifier = P256PublicRepositoryCommitVerifier(
+                publicKey: fixture.key.publicKey
+            )
+            let verifier: any PublicRepositoryCommitVerifier = phase == .verification
+                ? ExpiringVerifier(base: baseVerifier, clock: clock, expiry: 12)
+                : baseVerifier
+            let source: any PublicRepositoryCARByteSource = phase == .receive
+                ? ExpiringCARSource(data: car, clock: clock, expiry: 12)
+                : InstrumentedCARSource(data: car, chunkBytes: 127)
+            let beforePublish: (@Sendable () async throws -> Void)? =
+                phase == .publish ? { @Sendable in await clock.set(12) } : nil
+            let coordinator = SQLitePublicRepositoryImportCoordinator(
+                database: fixture.database,
+                beforePublish: beforePublish,
+                now: { await clock.now() }
+            )
+            do {
+                _ = try await coordinator.importRepository(
+                    from: source,
+                    binding: try binding(
+                        requestID: "expiry-\(phase.rawValue)",
+                        baseCID: fixture.initial.commitCID,
+                        verifierIdentity: verifier.verificationIdentity
+                    ),
+                    verifier: verifier,
+                    createdAt: 10,
+                    expiresAt: 12
+                )
+                XCTFail("\(phase.rawValue) crossed expiry")
+            } catch {
+                XCTAssertEqual(
+                    error as? PublicRepositoryImportStagingError, .expiredSession
+                )
+            }
+            try await assertInitialAndNoStaging(fixture)
+            try await fixture.database.close()
+        }
     }
 
     func testTamperedCommittedResultFailsReplayClosed() async throws {
@@ -243,7 +432,7 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
             root: fixture.prepared.state.commitCID,
             frames: try await fixture.blocks()
         )
-        let coordinator = SQLitePublicRepositoryImportCoordinator(database: fixture.database)
+        let coordinator = testCoordinator(fixture.database)
         _ = try await coordinator.importRepository(
             from: InstrumentedCARSource(data: car, chunkBytes: 257),
             binding: binding,
@@ -263,7 +452,7 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
         try await raw.close()
         let reopened = try await SQLiteAccountDatabase(dataDirectory: fixture.root, did: did)
         do {
-            _ = try await SQLitePublicRepositoryImportCoordinator(database: reopened)
+            _ = try await testCoordinator(reopened, now: 201)
                 .importRepository(
                     from: InstrumentedCARSource(data: Data(), chunkBytes: 1),
                     binding: binding,
@@ -291,7 +480,7 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
                 frames: try await fixture.blocks()
             )
             do {
-                _ = try await SQLitePublicRepositoryImportCoordinator(database: fixture.database)
+                _ = try await testCoordinator(fixture.database)
                     .importRepository(
                         from: CancellingCARSource(data: car, cancellationOffset: cancellationOffset),
                         binding: try binding(
@@ -316,13 +505,12 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
             frames: try await verificationFixture.blocks()
         )
         do {
-            _ = try await SQLitePublicRepositoryImportCoordinator(
-                database: verificationFixture.database
-            ).importRepository(
+            _ = try await testCoordinator(verificationFixture.database).importRepository(
                 from: InstrumentedCARSource(data: verificationCAR, chunkBytes: 31),
                 binding: try binding(
                     requestID: "cancel-verification",
-                    baseCID: verificationFixture.initial.commitCID
+                    baseCID: verificationFixture.initial.commitCID,
+                    verifierIdentity: CancellingVerifier().verificationIdentity
                 ),
                 verifier: CancellingVerifier(),
                 createdAt: 100, expiresAt: 200
@@ -341,8 +529,8 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
             frames: try await publishFixture.blocks()
         )
         do {
-            _ = try await SQLitePublicRepositoryImportCoordinator(
-                database: publishFixture.database,
+            _ = try await testCoordinator(
+                publishFixture.database,
                 beforePublish: { throw CancellationError() }
             ).importRepository(
                 from: InstrumentedCARSource(data: publishCAR, chunkBytes: 31),
@@ -365,9 +553,7 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
         let timeoutFixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: timeoutFixture.root) }
         do {
-            _ = try await SQLitePublicRepositoryImportCoordinator(
-                database: timeoutFixture.database
-            ).importRepository(
+            _ = try await testCoordinator(timeoutFixture.database).importRepository(
                 from: TimeoutCARSource(),
                 binding: try binding(
                     requestID: "transport-timeout",
@@ -407,6 +593,7 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
                 baseCID: fixture.initial.commitCID
             )
         }
+        let coordinator = testCoordinator(fixture.database)
         let outcomes = await withTaskGroup(
             of: (Int, Result<CommittedPublicRepositoryImport, Error>).self
         ) { group in
@@ -414,9 +601,7 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
                 group.addTask {
                     do {
                         return (index, .success(
-                            try await SQLitePublicRepositoryImportCoordinator(
-                                database: fixture.database
-                            ).importRepository(
+                            try await coordinator.importRepository(
                                 from: InstrumentedCARSource(
                                     data: cars[index], chunkBytes: 37
                                 ),
@@ -489,9 +674,7 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
         ]
         for (index, bytes) in cases.enumerated() {
             do {
-                _ = try await SQLitePublicRepositoryImportCoordinator(
-                    database: fixture.database
-                ).importRepository(
+                _ = try await testCoordinator(fixture.database).importRepository(
                     from: InstrumentedCARSource(data: bytes, chunkBytes: 7),
                     binding: try binding(
                         requestID: "corrupt-\(index)",
@@ -523,7 +706,7 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
         }
         let car = try await encodeCAR(root: fixture.prepared.state.commitCID, frames: frames)
         let source = InstrumentedCARSource(data: car, chunkBytes: 32 * 1_024)
-        _ = try await SQLitePublicRepositoryImportCoordinator(database: fixture.database)
+        _ = try await testCoordinator(fixture.database)
             .importRepository(
                 from: source,
                 binding: try binding(
@@ -639,40 +822,212 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
         try await fixture.database.close()
     }
 
+    func testEveryPersistedTopologyLimitAtAndOnePastStagingBoundary() async throws {
+        let probe = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: probe.root) }
+        let prepared = try await prepareWideRepository(probe)
+        let frames = try await blocks(prepared)
+        let validated = try await RepositoryMSTValidation.validate(
+            rootCID: prepared.state.dataCID, blocks: prepared.newBlocks
+        )
+        let maximumEntries = try validated.reachableMSTBlocks.values.map {
+            try RepositoryMSTCodec.decode($0).entries.count
+        }.max() ?? 0
+        let maximumBody = try XCTUnwrap(frames.map(\.bytes.count).max())
+        let minimumDepth = try await minimumAcceptedDepth(
+            root: prepared.state.dataCID, blocks: prepared.newBlocks
+        )
+        let dimensions: [LimitDimension] = [
+            .blocks(frames.count),
+            .body(maximumBody),
+            .nodes(validated.reachableMSTBlocks.count),
+            .entries(maximumEntries),
+            .depth(minimumDepth),
+        ]
+        try await probe.database.close()
+
+        for dimension in dimensions {
+            for delta in -1 ... 1 {
+                let fixture = try await makeFixture()
+                defer { try? FileManager.default.removeItem(at: fixture.root) }
+                let wide = try await prepareWideRepository(fixture)
+                let wideCAR = try await encodeCAR(
+                    root: wide.state.commitCID, frames: try await blocks(wide)
+                )
+                let limits = try dimension.policy(delta: delta, baseline: (
+                    body: maximumBody,
+                    blocks: frames.count,
+                    nodes: validated.reachableMSTBlocks.count,
+                    entries: maximumEntries,
+                    depth: minimumDepth
+                ))
+                if delta == -1 {
+                    try await assertRejected(
+                        car: wideCAR,
+                        requestID: "limit-\(dimension.name)-below",
+                        limits: limits,
+                        fixture: fixture,
+                        expected: dimension.expectedFailure
+                    )
+                } else {
+                    let result = try await testCoordinator(fixture.database)
+                        .importRepository(
+                            from: InstrumentedCARSource(data: wideCAR, chunkBytes: 257),
+                            binding: try PublicRepositoryImportBinding(
+                                requestID: "limit-\(dimension.name)-\(delta)",
+                                requestDigest: Data(
+                                    SHA256.hash(
+                                        data: Data("limit-\(dimension.name)-\(delta)".utf8)
+                                    )
+                                ),
+                                accountDID: did,
+                                expectedBaseCommitCID: fixture.initial.commitCID,
+                                verifierIdentity: P256PublicRepositoryCommitVerifier(
+                                    publicKey: fixture.key.publicKey
+                                ).verificationIdentity,
+                                policy: .init(limits: limits)
+                            ),
+                            verifier: P256PublicRepositoryCommitVerifier(
+                                publicKey: fixture.key.publicKey
+                            ),
+                            createdAt: 100,
+                            expiresAt: 200
+                        )
+                    XCTAssertEqual(result.state, wide.state)
+                }
+                try await fixture.database.close()
+            }
+        }
+    }
+
     func testOptIn256MiBStagedCAR() async throws {
         guard ProcessInfo.processInfo.environment["SWAN_RUN_256MIB_CAR_STAGING"] == "1" else {
             throw XCTSkip("set SWAN_RUN_256MIB_CAR_STAGING=1 for the 256 MiB acceptance run")
         }
-        let fixture = try await makeFixture()
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
-        var frames = try await fixture.blocks()
-        for index in 0 ..< 286 {
-            var payload = Data("large-extra-\(index)-".utf8)
-            payload.append(Data(repeating: UInt8(truncatingIfNeeded: index), count: 940_000))
-            let bytes = try DAGCBOR.encodeValue(payload)
-            frames.append(.init(cid: CID.fromDAGCBOR(bytes), bytes: bytes))
-        }
-        let car = try await encodeCAR(root: fixture.prepared.state.commitCID, frames: frames)
-        XCTAssertGreaterThanOrEqual(car.count, PublicRepositoryLimits.requiredStreamingCARBytes)
-        let source = InstrumentedCARSource(data: car, chunkBytes: 64 * 1_024)
-        _ = try await SQLitePublicRepositoryImportCoordinator(database: fixture.database)
-            .importRepository(
-                from: source,
-                binding: try binding(
-                    requestID: "opt-in-256mib",
-                    baseCID: fixture.initial.commitCID
-                ),
-                verifier: P256PublicRepositoryCommitVerifier(publicKey: fixture.key.publicKey),
-                createdAt: 100, expiresAt: 200
+        let baselineHWM = peakResidentBytes()
+        var exactCARURL: URL?
+        for delta in [-1, 0] {
+            let fixture = try await makeFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let carURL = fixture.root.appending(path: "streaming-256mib-\(delta).car")
+            let sink = try FileCARByteSink(url: carURL)
+            let blockStream = try ExactSizedCARBlockStream(
+                required: try await fixture.blocks(),
+                targetCARBytes: PublicRepositoryLimits.requiredStreamingCARBytes + delta
             )
-        let maximumReturned = await source.maximumReturned()
-        XCTAssertLessThanOrEqual(maximumReturned, 64 * 1_024)
-        try await fixture.database.close()
+            _ = try await PublicRepositoryCAR.write(
+                rootCID: fixture.prepared.state.commitCID,
+                blocks: blockStream,
+                to: sink
+            )
+            try await sink.close()
+            let carBytes = try XCTUnwrap(
+                try FileManager.default.attributesOfItem(atPath: carURL.path)[.size]
+                    as? NSNumber
+            ).intValue
+            XCTAssertEqual(
+                carBytes, PublicRepositoryLimits.requiredStreamingCARBytes + delta
+            )
+            let source = try FileCARByteSource(
+                url: carURL, chunkBytes: 64 * 1_024
+            )
+            let limits = try PublicRepositoryLimits(
+                maximumRecordBlockBytes: 1_000_000,
+                maximumCARBytes: PublicRepositoryLimits.requiredStreamingCARBytes,
+                maximumCARBlocks: 1_000_000,
+                maximumMSTNodes: 500_000,
+                maximumMSTEntriesPerNode: 4_096,
+                maximumCBORNestingDepth: 64
+            )
+            let requestID = "opt-in-256mib-\(delta)"
+            _ = try await testCoordinator(fixture.database).importRepository(
+                from: source,
+                binding: try PublicRepositoryImportBinding(
+                    requestID: requestID,
+                    requestDigest: Data(SHA256.hash(data: Data(requestID.utf8))),
+                    accountDID: did,
+                    expectedBaseCommitCID: fixture.initial.commitCID,
+                    verifierIdentity: P256PublicRepositoryCommitVerifier(
+                        publicKey: fixture.key.publicKey
+                    ).verificationIdentity,
+                    policy: .init(limits: limits)
+                ),
+                verifier: P256PublicRepositoryCommitVerifier(
+                    publicKey: fixture.key.publicKey
+                ),
+                createdAt: 100,
+                expiresAt: 200
+            )
+            let maximumReturned = await source.maximumReturned()
+            XCTAssertLessThanOrEqual(maximumReturned, 64 * 1_024)
+            let maximumGeneratedBody = await blockStream.maximumGeneratedBody()
+            XCTAssertLessThanOrEqual(maximumGeneratedBody, 1_000_000)
+            try await source.close()
+            try await fixture.database.close()
+            if delta == 0 {
+                let retained = FileManager.default.temporaryDirectory
+                    .appending(path: "swan-task42-exact-\(UUID().uuidString).car")
+                try FileManager.default.copyItem(at: carURL, to: retained)
+                exactCARURL = retained
+            }
+        }
+
+        let overFixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: overFixture.root) }
+        let retainedExact = try XCTUnwrap(exactCARURL)
+        defer { try? FileManager.default.removeItem(at: retainedExact) }
+        let exactSource = try FileCARByteSource(
+            url: retainedExact, chunkBytes: 64 * 1_024
+        )
+        let overSource = AppendingByteCARSource(source: exactSource)
+        let exactLimit = try PublicRepositoryLimits(
+            maximumRecordBlockBytes: 1_000_000,
+            maximumCARBytes: PublicRepositoryLimits.requiredStreamingCARBytes,
+            maximumCARBlocks: 1_000_000,
+            maximumMSTNodes: 500_000,
+            maximumMSTEntriesPerNode: 4_096,
+            maximumCBORNestingDepth: 64
+        )
+        do {
+            _ = try await testCoordinator(overFixture.database).importRepository(
+                from: overSource,
+                binding: try PublicRepositoryImportBinding(
+                    requestID: "opt-in-256mib-over",
+                    requestDigest: Data(repeating: 0xa4, count: 32),
+                    accountDID: did,
+                    expectedBaseCommitCID: overFixture.initial.commitCID,
+                    verifierIdentity: P256PublicRepositoryCommitVerifier(
+                        publicKey: overFixture.key.publicKey
+                    ).verificationIdentity,
+                    policy: .init(limits: exactLimit)
+                ),
+                verifier: P256PublicRepositoryCommitVerifier(
+                    publicKey: overFixture.key.publicKey
+                ),
+                createdAt: 100,
+                expiresAt: 200
+            )
+            XCTFail("one byte over maximum CAR bytes published")
+        } catch {
+            XCTAssertEqual(error as? PublicRepositoryCARError, .byteLimitExceeded)
+        }
+        try await assertInitialAndNoStaging(overFixture)
+        try await exactSource.close()
+        try await overFixture.database.close()
+        let finalHWM = peakResidentBytes()
+        XCTAssertLessThan(
+            finalHWM - baselineHWM,
+            128 * 1_024 * 1_024,
+            "streamed generation/import must not retain a payload-sized representation"
+        )
+        XCTAssertLessThan(finalHWM, 512 * 1_024 * 1_024)
     }
 
     private func makeFixture() async throws -> ImportFixture {
         let root = try temporaryDirectory()
-        let key = P256.Signing.PrivateKey()
+        let key = try P256.Signing.PrivateKey(
+            rawRepresentation: Data(repeating: 1, count: 32)
+        )
         let database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
         let genesis = try PublicRepositoryGenesisCodec.create(
             did: did, revision: genesisRevision, signingKey: key
@@ -743,6 +1098,56 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
         )
     }
 
+    private func prepareWideRepository(
+        _ fixture: ImportFixture
+    ) async throws -> PreparedPublicRepositoryMutation {
+        let writes: [PublicRepositoryWrite] = try (0 ..< 96).map { index in
+            .create(
+                path: try PublicRepositoryPath(
+                    collection: "com.example.record",
+                    recordKey: String(format: "wide-%03d", index)
+                ),
+                record: PublicRecord([
+                    "$type": .string("com.example.record"),
+                    "value": .integer(index),
+                ])
+            )
+        }
+        return try await PublicRepositoryEngine.apply(
+            repositoryDID: did,
+            currentState: fixture.initial,
+            blocks: fixture.database,
+            revision: fixture.prepared.state.revision,
+            batch: try PublicRepositoryWriteBatch(
+                writes: writes,
+                expectedCommitCID: fixture.initial.commitCID
+            ),
+            signer: P256PublicRepositoryCommitSigner(privateKey: fixture.key)
+        )
+    }
+
+    private func minimumAcceptedDepth(
+        root: CID,
+        blocks: any PublicRepositoryBlockSource
+    ) async throws -> Int {
+        for depth in 1 ... PublicRepositoryLimits.maximumPermittedCBORNestingDepth {
+            let limits = try PublicRepositoryLimits(
+                maximumRecordBlockBytes: 1_000_000,
+                maximumCARBytes: PublicRepositoryLimits.requiredStreamingCARBytes,
+                maximumCARBlocks: 1_000,
+                maximumMSTNodes: 1_000,
+                maximumMSTEntriesPerNode: 4_096,
+                maximumCBORNestingDepth: depth
+            )
+            if (try? await RepositoryMSTValidation.validate(
+                rootCID: root, blocks: blocks, limits: limits
+            )) != nil {
+                return depth
+            }
+        }
+        throw PublicRepositoryImportStagingError.corruptRepository
+    }
+
     private func blocks(
         _ prepared: PreparedPublicRepositoryMutation
     ) async throws -> [PublicRepositoryBlock] {
@@ -775,7 +1180,7 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
         expected: PublicRepositoryCARError
     ) async throws {
         do {
-            _ = try await SQLitePublicRepositoryImportCoordinator(database: fixture.database)
+            _ = try await testCoordinator(fixture.database)
                 .importRepository(
                     from: InstrumentedCARSource(data: car, chunkBytes: 29),
                     binding: try PublicRepositoryImportBinding(
@@ -783,7 +1188,9 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
                         requestDigest: Data(SHA256.hash(data: Data(requestID.utf8))),
                         accountDID: did,
                         expectedBaseCommitCID: fixture.initial.commitCID,
-                        verifierIdentity: "did:key:test-signing-key",
+                        verifierIdentity: P256PublicRepositoryCommitVerifier(
+                            publicKey: fixture.key.publicKey
+                        ).verificationIdentity,
                         policy: .init(limits: limits)
                     ),
                     verifier: P256PublicRepositoryCommitVerifier(
@@ -798,15 +1205,35 @@ final class PublicRepositoryImportStagingTests: XCTestCase {
         try await assertInitialAndNoStaging(fixture)
     }
 
-    private func binding(requestID: String, baseCID: CID) throws
+    private func binding(
+        requestID: String,
+        baseCID: CID,
+        verifierIdentity: String? = nil
+    ) throws
         -> PublicRepositoryImportBinding {
         try PublicRepositoryImportBinding(
             requestID: requestID,
             requestDigest: Data(SHA256.hash(data: Data(requestID.utf8))),
             accountDID: did,
             expectedBaseCommitCID: baseCID,
-            verifierIdentity: "did:key:test-signing-key",
+            verifierIdentity: verifierIdentity ?? P256PublicRepositoryCommitVerifier(
+                publicKey: try P256.Signing.PrivateKey(
+                    rawRepresentation: Data(repeating: 1, count: 32)
+                ).publicKey
+            ).verificationIdentity,
             policy: .init(limits: .standard)
+        )
+    }
+
+    private func testCoordinator(
+        _ database: SQLiteAccountDatabase,
+        now: Int64 = 100,
+        beforePublish: (@Sendable () async throws -> Void)? = nil
+    ) -> SQLitePublicRepositoryImportCoordinator {
+        SQLitePublicRepositoryImportCoordinator(
+            database: database,
+            beforePublish: beforePublish,
+            now: { now }
         )
     }
 
@@ -859,9 +1286,389 @@ private struct ImportFixture {
     }
 }
 
+private enum StagingTamper: String, CaseIterable, Sendable {
+    case addReachable
+    case dropReachable
+    case changeReachableKind
+    case addIndex
+    case dropIndex
+    case changeIndex
+    case changeCommitBody
+
+    func apply(to connection: SQLiteConnection, extraCID: CID) async throws {
+        switch self {
+        case .addReachable:
+            _ = try await connection.query(
+                """
+                INSERT INTO public_repository_import_reachable(session_id, cid, kind)
+                SELECT session_id, ?, 'record'
+                FROM public_repository_import_sessions
+                """,
+                [.text(extraCID.string)]
+            )
+        case .dropReachable:
+            _ = try await connection.query(
+                """
+                DELETE FROM public_repository_import_reachable
+                WHERE rowid = (
+                    SELECT rowid FROM public_repository_import_reachable
+                    WHERE kind = 'record' ORDER BY cid LIMIT 1
+                )
+                """
+            )
+        case .changeReachableKind:
+            _ = try await connection.query(
+                """
+                UPDATE public_repository_import_reachable SET kind = 'record'
+                WHERE rowid = (
+                    SELECT rowid FROM public_repository_import_reachable
+                    WHERE kind = 'mst' ORDER BY cid LIMIT 1
+                )
+                """
+            )
+        case .addIndex:
+            _ = try await connection.query(
+                """
+                INSERT INTO public_repository_import_record_index(
+                    session_id, collection, rkey, record_cid
+                )
+                SELECT session_id, 'app.bsky.feed.post', 'tampered', ?
+                FROM public_repository_import_sessions
+                """,
+                [.text(extraCID.string)]
+            )
+        case .dropIndex:
+            _ = try await connection.query(
+                """
+                DELETE FROM public_repository_import_record_index
+                WHERE rowid = (
+                    SELECT rowid FROM public_repository_import_record_index
+                    ORDER BY collection, rkey LIMIT 1
+                )
+                """
+            )
+        case .changeIndex:
+            _ = try await connection.query(
+                """
+                UPDATE public_repository_import_record_index SET record_cid = ?
+                WHERE rowid = (
+                    SELECT rowid FROM public_repository_import_record_index
+                    ORDER BY collection, rkey LIMIT 1
+                )
+                """,
+                [.text(extraCID.string)]
+            )
+        case .changeCommitBody:
+            _ = try await connection.query(
+                """
+                UPDATE public_repository_import_blocks SET bytes = X'00'
+                WHERE cid = (
+                    SELECT root_cid FROM public_repository_import_sessions LIMIT 1
+                )
+                """
+            )
+        }
+    }
+}
+
+private enum LimitDimension: Sendable {
+    case blocks(Int)
+    case body(Int)
+    case nodes(Int)
+    case entries(Int)
+    case depth(Int)
+
+    var name: String {
+        switch self {
+        case .blocks: "blocks"
+        case .body: "body"
+        case .nodes: "nodes"
+        case .entries: "entries"
+        case .depth: "depth"
+        }
+    }
+
+    var expectedFailure: PublicRepositoryCARError {
+        switch self {
+        case .blocks: .blockLimitExceeded
+        case .body: .blockBodyLimitExceeded
+        case .nodes: .repository(.nodeLimitExceeded)
+        case .entries: .repository(.entryLimitExceeded)
+        case .depth: .repository(.cborDepthLimitExceeded)
+        }
+    }
+
+    func policy(
+        delta: Int,
+        baseline: (body: Int, blocks: Int, nodes: Int, entries: Int, depth: Int)
+    ) throws -> PublicRepositoryLimits {
+        var body = baseline.body + 1
+        var blocks = baseline.blocks + 1
+        var nodes = baseline.nodes + 1
+        var entries = baseline.entries + 1
+        var depth = baseline.depth + 1
+        switch self {
+        case let .body(value): body = value + delta
+        case let .blocks(value): blocks = value + delta
+        case let .nodes(value): nodes = value + delta
+        case let .entries(value): entries = value + delta
+        case let .depth(value): depth = value + delta
+        }
+        return try PublicRepositoryLimits(
+            maximumRecordBlockBytes: body,
+            maximumCARBytes: PublicRepositoryLimits.requiredStreamingCARBytes,
+            maximumCARBlocks: blocks,
+            maximumMSTNodes: min(nodes, blocks),
+            maximumMSTEntriesPerNode: entries,
+            maximumCBORNestingDepth: depth
+        )
+    }
+}
+
+private enum ExpiryPhase: String, CaseIterable, Sendable {
+    case receive
+    case verification
+    case publish
+}
+
+private actor TestImportClock {
+    private var value: Int64
+    init(_ value: Int64) { self.value = value }
+    func now() -> Int64 { value }
+    func set(_ value: Int64) { self.value = value }
+}
+
+private struct ExpiringVerifier: PublicRepositoryCommitVerifier {
+    let base: P256PublicRepositoryCommitVerifier
+    let clock: TestImportClock
+    let expiry: Int64
+    var signingAlgorithm: PublicRepositorySigningAlgorithm { base.signingAlgorithm }
+    var verificationIdentity: String { base.verificationIdentity }
+
+    func verify(signature: Data, unsignedCommitBytes: Data, did: String) async throws {
+        try await base.verify(
+            signature: signature, unsignedCommitBytes: unsignedCommitBytes, did: did
+        )
+        await clock.set(expiry)
+    }
+}
+
+private actor ExpiringCARSource: PublicRepositoryCARByteSource {
+    private let data: Data
+    private let clock: TestImportClock
+    private let expiry: Int64
+    private var offset = 0
+
+    init(data: Data, clock: TestImportClock, expiry: Int64) {
+        self.data = data
+        self.clock = clock
+        self.expiry = expiry
+    }
+
+    func read(maximumBytes: Int) async throws -> Data? {
+        guard offset < data.count else { return nil }
+        let count = min(maximumBytes, 64, data.count - offset)
+        let result = Data(data[offset ..< offset + count])
+        offset += count
+        await clock.set(expiry)
+        return result
+    }
+}
+
 private actor DataCARSink: PublicRepositoryCARByteSink {
     private(set) var data = Data()
     func write(_ bytes: Data) async throws { data.append(bytes) }
+}
+
+private actor FileCARByteSink: PublicRepositoryCARByteSink {
+    private let handle: FileHandle
+
+    init(url: URL) throws {
+        _ = FileManager.default.createFile(atPath: url.path, contents: nil)
+        handle = try FileHandle(forWritingTo: url)
+    }
+
+    func write(_ bytes: Data) async throws {
+        try handle.write(contentsOf: bytes)
+    }
+
+    func close() throws {
+        try handle.close()
+    }
+}
+
+private actor FileCARByteSource: PublicRepositoryCARByteSource {
+    private let handle: FileHandle
+    private let chunkBytes: Int
+    private var maximumReturnedBytes = 0
+
+    init(url: URL, chunkBytes: Int) throws {
+        handle = try FileHandle(forReadingFrom: url)
+        self.chunkBytes = chunkBytes
+    }
+
+    func read(maximumBytes: Int) async throws -> Data? {
+        let bytes = try handle.read(upToCount: min(maximumBytes, chunkBytes))
+        guard let bytes, !bytes.isEmpty else { return nil }
+        maximumReturnedBytes = max(maximumReturnedBytes, bytes.count)
+        return bytes
+    }
+
+    func maximumReturned() -> Int { maximumReturnedBytes }
+    func close() throws { try handle.close() }
+}
+
+private actor AppendingByteCARSource: PublicRepositoryCARByteSource {
+    private let source: FileCARByteSource
+    private var appended = false
+
+    init(source: FileCARByteSource) {
+        self.source = source
+    }
+
+    func read(maximumBytes: Int) async throws -> Data? {
+        if let bytes = try await source.read(maximumBytes: maximumBytes) {
+            return bytes
+        }
+        guard !appended else { return nil }
+        appended = true
+        return Data([0])
+    }
+}
+
+private actor ExactSizedCARBlockStream: PublicRepositoryCARBlockStream {
+    private let required: [PublicRepositoryBlock]
+    private let extraBodyLengths: [Int]
+    private var index = 0
+    private var maximumBody = 0
+
+    init(required: [PublicRepositoryBlock], targetCARBytes: Int) throws {
+        self.required = required
+        var remaining = targetCARBytes - 59
+        for block in required {
+            remaining -= Self.frameByteCount(bodyBytes: block.bytes.count)
+        }
+        guard remaining >= 0 else {
+            throw PublicRepositoryImportStagingError.corruptRepository
+        }
+        let maximumFrame = Self.frameByteCount(bodyBytes: 1_000_000)
+        var bodies: [Int] = []
+        while remaining > maximumFrame * 2 {
+            bodies.append(1_000_000)
+            remaining -= maximumFrame
+        }
+        if remaining > 0 {
+            if let body = Self.bodyLength(forExactFrameBytes: remaining) {
+                bodies.append(body)
+            } else {
+                var pair: (Int, Int)?
+                for first in stride(from: min(1_000_000, remaining), through: 1, by: -1)
+                where Self.isCanonicalByteStringLength(first) {
+                    let rest = remaining - Self.frameByteCount(bodyBytes: first)
+                    guard rest > 0,
+                          let second = Self.bodyLength(forExactFrameBytes: rest)
+                    else { continue }
+                    pair = (first, second)
+                    break
+                }
+                guard let pair else {
+                    throw PublicRepositoryImportStagingError.corruptRepository
+                }
+                bodies.append(pair.0)
+                bodies.append(pair.1)
+            }
+        }
+        extraBodyLengths = bodies
+    }
+
+    func nextBlock() async throws -> PublicRepositoryBlock? {
+        if index < required.count {
+            defer { index += 1 }
+            return required[index]
+        }
+        let extraIndex = index - required.count
+        guard extraIndex < extraBodyLengths.count else { return nil }
+        index += 1
+        let bytes = Self.canonicalByteString(
+            totalBytes: extraBodyLengths[extraIndex],
+            fill: UInt8(truncatingIfNeeded: extraIndex)
+        )
+        maximumBody = max(maximumBody, bytes.count)
+        return PublicRepositoryBlock(cid: CID.fromDAGCBOR(bytes), bytes: bytes)
+    }
+
+    func maximumGeneratedBody() -> Int { maximumBody }
+
+    private static func frameByteCount(bodyBytes: Int) -> Int {
+        let frameLength = 36 + bodyBytes
+        return canonicalVarintByteCount(UInt64(frameLength)) + frameLength
+    }
+
+    private static func bodyLength(forExactFrameBytes bytes: Int) -> Int? {
+        for varintBytes in 1 ... 10 {
+            let body = bytes - 36 - varintBytes
+            guard body > 0, body <= 1_000_000,
+                  isCanonicalByteStringLength(body),
+                  canonicalVarintByteCount(UInt64(36 + body)) == varintBytes
+            else { continue }
+            return body
+        }
+        return nil
+    }
+
+    private static func canonicalVarintByteCount(_ value: UInt64) -> Int {
+        var value = value
+        var count = 1
+        while value >= 0x80 {
+            value >>= 7
+            count += 1
+        }
+        return count
+    }
+
+    private static func isCanonicalByteStringLength(_ total: Int) -> Bool {
+        (1 ... 24).contains(total)
+            || (26 ... 257).contains(total)
+            || (259 ... 65_538).contains(total)
+            || (65_541 ... 1_000_000).contains(total)
+    }
+
+    private static func canonicalByteString(totalBytes: Int, fill: UInt8) -> Data {
+        precondition(isCanonicalByteStringLength(totalBytes))
+        var result = Data()
+        let payloadBytes: Int
+        switch totalBytes {
+        case 1 ... 24:
+            payloadBytes = totalBytes - 1
+            result.append(0x40 | UInt8(payloadBytes))
+        case 26 ... 257:
+            payloadBytes = totalBytes - 2
+            result.append(0x58)
+            result.append(UInt8(payloadBytes))
+        case 259 ... 65_538:
+            payloadBytes = totalBytes - 3
+            result.append(0x59)
+            var value = UInt16(payloadBytes).bigEndian
+            withUnsafeBytes(of: &value) { result.append(contentsOf: $0) }
+        default:
+            payloadBytes = totalBytes - 5
+            result.append(0x5a)
+            var value = UInt32(payloadBytes).bigEndian
+            withUnsafeBytes(of: &value) { result.append(contentsOf: $0) }
+        }
+        result.append(Data(repeating: fill, count: payloadBytes))
+        return result
+    }
+}
+
+private func peakResidentBytes() -> Int {
+    var usage = rusage()
+    guard getrusage(RUSAGE_SELF, &usage) == 0 else { return 0 }
+    #if os(Linux)
+    return Int(usage.ru_maxrss) * 1_024
+    #else
+    return Int(usage.ru_maxrss)
+    #endif
 }
 
 private actor ArrayCARBlockStream: PublicRepositoryCARBlockStream {
@@ -881,6 +1688,7 @@ private actor InstrumentedCARSource: PublicRepositoryCARByteSource {
     private var offset = 0
     private(set) var maximumReturnedBytes = 0
     private var maximumRequestedBytes = 0
+    private var reads = 0
 
     init(data: Data, chunkBytes: Int) {
         self.data = data
@@ -888,6 +1696,7 @@ private actor InstrumentedCARSource: PublicRepositoryCARByteSource {
     }
 
     func read(maximumBytes: Int) async throws -> Data? {
+        reads += 1
         maximumRequestedBytes = max(maximumRequestedBytes, maximumBytes)
         guard offset < data.count else { return nil }
         let count = min(maximumBytes, chunkBytes, data.count - offset)
@@ -899,6 +1708,7 @@ private actor InstrumentedCARSource: PublicRepositoryCARByteSource {
 
     func maximumReturned() -> Int { maximumReturnedBytes }
     func maximumRequested() -> Int { maximumRequestedBytes }
+    func readCount() -> Int { reads }
 }
 
 private actor CollectingFrameSink: PublicRepositoryCARFrameSink {
@@ -942,6 +1752,7 @@ private actor CancellingCARSource: PublicRepositoryCARByteSource {
 
 private struct CancellingVerifier: PublicRepositoryCommitVerifier {
     let signingAlgorithm: PublicRepositorySigningAlgorithm = .p256
+    let verificationIdentity = "test:cancelling"
     func verify(
         signature _: Data,
         unsignedCommitBytes _: Data,

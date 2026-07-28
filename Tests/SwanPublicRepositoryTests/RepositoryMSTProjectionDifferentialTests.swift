@@ -57,6 +57,84 @@ final class RepositoryMSTProjectionDifferentialTests: XCTestCase {
         )
     }
 
+    func testHostileMissingRecordSchemaAndEveryTraversalBudgetMatch() async throws {
+        let missingRoot = CID.fromDAGCBOR(Data([0xa0]))
+        await assertSameFailure(
+            root: missingRoot, source: DifferentialBlockSource([:])
+        )
+
+        let pathA = try PublicRepositoryPath(
+            collection: "com.example.record", recordKey: "a"
+        )
+        let pathB = try PublicRepositoryPath(
+            collection: "com.example.record", recordKey: "b"
+        )
+        let recordA = try PublicRepositoryRecordCodec.prepare(
+            PublicRecord([
+                "$type": .string("com.example.record"),
+                "value": .string("a"),
+            ]), for: pathA
+        )
+        let recordB = try PublicRepositoryRecordCodec.prepare(
+            PublicRecord([
+                "$type": .string("com.example.record"),
+                "value": .string("b"),
+            ]), for: pathB
+        )
+        let nodeBytes = try RepositoryMSTCodec.encode(try RepositoryMSTCodec.node(
+            leaves: [
+                .init(path: pathA, recordCID: recordA.cid),
+                .init(path: pathB, recordCID: recordB.cid),
+            ]
+        ))
+        let nodeCID = CID.fromDAGCBOR(nodeBytes)
+        await assertSameFailure(
+            root: nodeCID,
+            source: DifferentialBlockSource([nodeCID: nodeBytes])
+        )
+        await assertSameFailure(
+            root: nodeCID,
+            source: DifferentialBlockSource([
+                nodeCID: nodeBytes,
+                recordA.cid: recordA.bytes,
+                recordB.cid: Data([0xa0]),
+            ])
+        )
+
+        let storage = DifferentialBlockSource([
+            nodeCID: nodeBytes,
+            recordA.cid: recordA.bytes,
+            recordB.cid: recordB.bytes,
+        ])
+        let entryLimited = try PublicRepositoryLimits(
+            maximumRecordBlockBytes: 1_000_000,
+            maximumCARBytes: PublicRepositoryLimits.requiredStreamingCARBytes,
+            maximumCARBlocks: 10,
+            maximumMSTNodes: 10,
+            maximumMSTEntriesPerNode: 1,
+            maximumCBORNestingDepth: 64
+        )
+        await assertSameFailure(
+            root: nodeCID, source: storage, limits: entryLimited
+        )
+        let depthLimited = try PublicRepositoryLimits(
+            maximumRecordBlockBytes: 1_000_000,
+            maximumCARBytes: PublicRepositoryLimits.requiredStreamingCARBytes,
+            maximumCARBlocks: 10,
+            maximumMSTNodes: 10,
+            maximumMSTEntriesPerNode: 4_096,
+            maximumCBORNestingDepth: 2
+        )
+        await assertSameFailure(
+            root: nodeCID, source: storage, limits: depthLimited
+        )
+        await assertSameFailure(
+            root: nodeCID,
+            source: storage,
+            maximumReachableRepositoryBytes: nodeBytes.count + recordA.bytes.count
+        )
+    }
+
     @discardableResult
     private func assertEquivalent(
         root: CID,
@@ -91,11 +169,16 @@ final class RepositoryMSTProjectionDifferentialTests: XCTestCase {
 
     private func assertSameFailure(
         root: CID,
-        source: DifferentialBlockSource
+        source: DifferentialBlockSource,
+        limits: PublicRepositoryLimits = .standard,
+        maximumReachableRepositoryBytes: Int? = nil
     ) async {
         let first: RepositoryMSTValidationError?
         do {
-            _ = try await RepositoryMSTValidation.validate(rootCID: root, blocks: source)
+            _ = try await RepositoryMSTValidation.validate(
+                rootCID: root, blocks: source, limits: limits,
+                maximumReachableRepositoryBytes: maximumReachableRepositoryBytes
+            )
             first = nil
         } catch {
             first = error as? RepositoryMSTValidationError
@@ -104,7 +187,9 @@ final class RepositoryMSTProjectionDifferentialTests: XCTestCase {
         do {
             _ = try await RepositoryMSTValidation.validateProjection(
                 rootCID: root, blocks: source,
-                projection: DifferentialProjectionSink()
+                projection: DifferentialProjectionSink(),
+                limits: limits,
+                maximumReachableRepositoryBytes: maximumReachableRepositoryBytes
             )
             second = nil
         } catch {
