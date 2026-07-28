@@ -368,3 +368,20 @@ surface is implemented but has not yet been exercised against that live
 fixture. Semantic cross-host interop, Docker/Compose, Linux, Petrel
 regeneration, and the remaining public/private acceptance matrix are still
 outstanding.
+
+## Follow-up verification: Task 43 rereview and reference-host smoke
+
+The independent Task 43 rereview is now recorded in
+`.superpowers/sdd/swan-spaces-interoperability-alpha/task-43-rereview-2026-07-28.md`.
+The scoped public-read verdict is **PASS** on macOS: the filtered HTTP suite
+executed 8/8 tests, the opt-in 256 MiB RSS gate passed, and the complete
+serialized suite passed with exit code 0.
+
+The pinned TypeScript source cache was also booted in a disposable localhost
+runtime using temporary PostgreSQL and Valkey services. A sanitized smoke run
+proved reference-host account creation, authenticated public `createRecord`,
+`getRecord`, `listRecords`, and `sync.getRepo` responses. `uploadBlob` returned
+the expected staged blob response; a retrieval attempt before a valid record
+reference returned `Blob not found`, and an invalid plain-text profile
+attachment was rejected. No cross-host Swan/TypeScript exchange is claimed by
+this smoke run, and all temporary service processes were stopped afterward.

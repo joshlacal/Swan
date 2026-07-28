@@ -127,6 +127,16 @@ checksum-verified way to populate the ignored reference cache.
   enforce a bound space credential, and verify public/private blob namespace
   isolation. The artifact is summary-only and explicitly does not claim that
   the pinned TypeScript PDS participated.
+- Task 43's independent rereview is recorded under
+  `.superpowers/sdd/swan-spaces-interoperability-alpha/task-43-rereview-2026-07-28.md`.
+  Its scoped public-read verdict is PASS: `PublicRepositoryReadHTTPTests`
+  executes 8/8, the opt-in 256 MiB production-directory RSS gate passes, and
+  the serialized macOS suite passes.
+- The pinned TypeScript source cache was booted in a disposable localhost
+  smoke runtime. Account creation, authenticated public record creation,
+  record read/list, and `sync.getRepo` succeeded. Blob upload remained staged
+  until a valid record reference; the smoke result is reference-host evidence,
+  not Swan/TypeScript convergence evidence.
 
 ## Completion gates
 
