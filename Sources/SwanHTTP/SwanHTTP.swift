@@ -779,6 +779,10 @@ public struct SwanHTTPServer: Sendable {
                Self.isInstalledPublicMutationMethod(descriptor.nsid) {
                 continue
             }
+            if publicRepositoryMutations?.blobStore != nil,
+               descriptor.nsid == "com.atproto.sync.getBlob" {
+                continue
+            }
             registerUnavailablePublicEndpoint(descriptor, on: router)
         }
         registerUnknownPublicEndpointGuards(on: router)

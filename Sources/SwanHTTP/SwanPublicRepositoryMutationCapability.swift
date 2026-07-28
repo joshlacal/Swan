@@ -51,14 +51,17 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
     let directory: any PublicRepositoryMutationDirectory
     let signerProvider: any PublicRepositoryMutationSignerProvider
     let tidAllocator = SwanPermissionedTIDAllocator()
+    let blobStore: (any BlobStore)?
 
     public init(
         authorizer: SwanOAuthResourceAuthorizer,
         directory: any PublicRepositoryMutationDirectory,
-        signerProvider: any PublicRepositoryMutationSignerProvider
+        signerProvider: any PublicRepositoryMutationSignerProvider,
+        blobStore: (any BlobStore)? = nil
     ) {
         self.authorizer = authorizer
         self.directory = directory
         self.signerProvider = signerProvider
+        self.blobStore = blobStore
     }
 }

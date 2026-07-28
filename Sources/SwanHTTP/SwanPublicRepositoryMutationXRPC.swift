@@ -254,6 +254,31 @@ func registerPublicRepositoryMutationEndpoints(
             router.on(path, method: method) { _, _ in publicMutationError(.notFound, "public_endpoint_unavailable") }
         }
     }
+    if let blobStore = capability.blobStore {
+        let blobPath: RouterPath = "/xrpc/com.atproto.sync.getBlob"
+        router.get(blobPath) { request, _ async -> Response in
+            guard let cid = publicQueryValue("cid", request: request) else {
+                return publicMutationError(.notFound, "BlobNotFound")
+            }
+            let maybeData: Data?
+            do { maybeData = try await blobStore.publicData(cid: cid) }
+            catch { return publicMutationError(.notFound, "BlobNotFound") }
+            guard let data = maybeData else {
+                return publicMutationError(.notFound, "BlobNotFound")
+            }
+            var headers: HTTPFields = [.contentType: "application/octet-stream", .cacheControl: "no-store"]
+            headers[.contentLength] = String(data.count)
+            return Response(status: .ok, headers: headers, body: .init(byteBuffer: ByteBuffer(data: data)))
+        }
+    }
+}
+
+private func publicQueryValue(_ name: String, request: Request) -> String? {
+    request.uri.query?.split(separator: "&").compactMap { pair in
+        let pieces = pair.split(separator: "=", maxSplits: 1)
+        guard pieces.first == Substring(name), pieces.count == 2 else { return nil }
+        return String(pieces[1])
+    }.first
 }
 
 private func publicMutationInput<Value: Decodable>(
