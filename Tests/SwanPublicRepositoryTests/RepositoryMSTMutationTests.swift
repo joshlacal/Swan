@@ -272,9 +272,13 @@ final class RepositoryMSTMutationTests: XCTestCase {
         let loaded = try RepositoryMST.load(rootCID: base.rootCID, blocks: baseSource)
         let replacement = try preparedRecord(path: paths[0], text: "replacement")
         let updated = try await loaded.updating(path: paths[0], recordCID: replacement.cid)
+        await baseSource.resetReads()
         let changed = try await updated.materialized()
+        let materializationReads = await baseSource.readCIDs
 
         XCTAssertLessThan(changed.newBlocks.count, base.newBlocks.count)
+        XCTAssertEqual(materializationReads.count, changed.newBlocks.count)
+        XCTAssertEqual(Set(materializationReads), changed.newBlocks.cids)
         var combined = base.newBlocks.blocks
         combined.merge(changed.newBlocks.blocks) { _, new in new }
         combined.merge(recordBlocks) { old, _ in old }
@@ -330,6 +334,7 @@ final class RepositoryMSTMutationTests: XCTestCase {
 private actor CountingBlockSource: PublicRepositoryBlockSource {
     private let storage: [CID: Data]
     private(set) var readCount = 0
+    private(set) var readCIDs: [CID] = []
 
     init(_ storage: [CID: Data]) {
         self.storage = storage
@@ -337,7 +342,13 @@ private actor CountingBlockSource: PublicRepositoryBlockSource {
 
     func block(for cid: CID) async throws -> Data? {
         readCount += 1
+        readCIDs.append(cid)
         return storage[cid]
+    }
+
+    func resetReads() {
+        readCount = 0
+        readCIDs = []
     }
 }
 

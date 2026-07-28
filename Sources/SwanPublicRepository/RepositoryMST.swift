@@ -437,6 +437,14 @@ public struct RepositoryMST: Sendable {
     }
 
     private func collectNewBlocks(into collector: inout NewBlockCollector) async throws -> CID {
+        // A CID-only node is an untouched subtree loaded from the immutable
+        // base source. Its pointer is already the complete persisted
+        // projection, so do not fetch/decode it merely to rediscover that it
+        // contributes no new blocks. This is the same stored-pointer
+        // short-circuit used by the pinned TypeScript implementation.
+        if let pointer, knownEntries == nil {
+            return pointer
+        }
         let encoded = try await encoded()
         if let existing = try await blocks.block(for: encoded.cid) {
             guard existing == encoded.bytes else {
