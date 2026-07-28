@@ -642,6 +642,7 @@ public enum PermissionedDataJWT {
               header.base64Payload == nil else {
             throw SwanError.unauthorized("client attestation JOSE header is invalid")
         }
+        try StrictJSON.validateTopLevelIntegerMembers(["iat", "exp"], in: payload)
         let claims = try StrictJSON.decode(ClientAttestationClaims.self, from: payload)
         let expectedAudience = "\(authority)#atproto_space_host"
         guard claims.iss == claims.sub,

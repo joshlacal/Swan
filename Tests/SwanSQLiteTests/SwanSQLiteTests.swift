@@ -3,12 +3,34 @@ import Foundation
 import Petrel
 import SQLiteNIO
 import SwanCore
-@testable import SwanSQLite
+@_spi(PortableRestore) @testable import SwanSQLite
 import SwanSpaces
 import SwanStorage
 import XCTest
 
 final class SwanSQLiteTests: XCTestCase {
+    func testOperatorRestoreRejectsClientAttestationReplayState() async throws {
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        _ = try await database.createAccount(
+            controlRegistration(did: did, handle: "restore.example.com")
+        )
+        let claimed = try await database.claimSpaceClientAttestation(
+            digest: Data(repeating: 0xA7, count: 32),
+            expiresAt: Date(timeIntervalSince1970: 1_750_000_120),
+            now: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+        XCTAssertTrue(claimed)
+        await XCTAssertThrowsErrorAsync(
+            try await database.validateOperatorRestoreOnlyAccount(did: did)
+        ) { error in
+            XCTAssertEqual(error as? AccountControlStoreError, .malformedRecord)
+        }
+        try await database.close()
+    }
+
     func testPortableExportDatabaseModesAreActuallyQueryOnly() async throws {
         let fixture = try Fixture()
         let managedAccount = try await fixture.open()

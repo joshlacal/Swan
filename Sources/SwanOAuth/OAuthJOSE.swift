@@ -389,7 +389,22 @@ public enum OAuthCompactJWT {
 /// would otherwise accept duplicate keys with last-value-wins semantics.
 public enum StrictJSON {
     public static func validate(_ data: Data) throws {
-        var parser = Parser(bytes: Array(data))
+        var parser = Parser(bytes: Array(data), topLevelIntegerMembers: [])
+        try parser.parseDocument()
+    }
+
+    /// Validates complete duplicate-free JSON while additionally requiring
+    /// the named members of the root object to use JSON integer tokens. This
+    /// distinguishes `1` from the numerically equal but wire-distinct `1.0`
+    /// and `1e0`, which Foundation's `Int64` decoder intentionally accepts.
+    public static func validateTopLevelIntegerMembers(
+        _ members: Set<String>,
+        in data: Data
+    ) throws {
+        var parser = Parser(
+            bytes: Array(data),
+            topLevelIntegerMembers: members
+        )
         try parser.parseDocument()
     }
 
@@ -406,31 +421,53 @@ public enum StrictJSON {
 
     private struct Parser {
         let bytes: [UInt8]
+        let topLevelIntegerMembers: Set<String>
         var index = 0
 
         mutating func parseDocument() throws {
             skipWhitespace()
-            try parseValue()
+            try parseValue(isTopLevel: true)
             skipWhitespace()
             guard index == bytes.count else { throw SwanError.malformed("invalid JSON") }
         }
 
-        mutating func parseValue() throws {
+        mutating func parseValue(
+            isTopLevel: Bool = false,
+            requiresIntegerToken: Bool = false
+        ) throws {
             skipWhitespace()
             guard let byte = bytes[safe: index] else { throw SwanError.malformed("invalid JSON") }
+            if requiresIntegerToken,
+               byte != 0x2D,
+               !(0x30 ... 0x39).contains(byte) {
+                throw SwanError.malformed("JSON member must be an integer")
+            }
             switch byte {
-            case 0x7B: try parseObject()
-            case 0x5B: try parseArray()
+            case 0x7B:
+                guard !requiresIntegerToken else {
+                    throw SwanError.malformed("JSON member must be an integer")
+                }
+                try parseObject(isTopLevel: isTopLevel)
+            case 0x5B:
+                guard !requiresIntegerToken else {
+                    throw SwanError.malformed("JSON member must be an integer")
+                }
+                try parseArray()
             case 0x22: _ = try parseString()
             case 0x74: try consumeLiteral("true")
             case 0x66: try consumeLiteral("false")
             case 0x6E: try consumeLiteral("null")
-            case 0x2D, 0x30 ... 0x39: try parseNumber()
+            case 0x2D, 0x30 ... 0x39:
+                try parseNumber(requiresIntegerToken: requiresIntegerToken)
             default: throw SwanError.malformed("invalid JSON")
+            }
+            if requiresIntegerToken,
+               !(byte == 0x2D || (0x30 ... 0x39).contains(byte)) {
+                throw SwanError.malformed("JSON member must be an integer")
             }
         }
 
-        mutating func parseObject() throws {
+        mutating func parseObject(isTopLevel: Bool) throws {
             try consume(0x7B)
             skipWhitespace()
             if consumeIf(0x7D) { return }
@@ -441,7 +478,10 @@ public enum StrictJSON {
                 guard keys.insert(key).inserted else { throw SwanError.malformed("duplicate JSON member") }
                 skipWhitespace()
                 try consume(0x3A)
-                try parseValue()
+                try parseValue(
+                    requiresIntegerToken: isTopLevel
+                        && topLevelIntegerMembers.contains(key)
+                )
                 skipWhitespace()
                 if consumeIf(0x7D) { return }
                 try consume(0x2C)
@@ -531,7 +571,7 @@ public enum StrictJSON {
             return result
         }
 
-        mutating func parseNumber() throws {
+        mutating func parseNumber(requiresIntegerToken: Bool) throws {
             _ = consumeIf(0x2D)
             guard let first = bytes[safe: index] else { throw SwanError.malformed("invalid JSON number") }
             if first == 0x30 {
@@ -542,19 +582,25 @@ public enum StrictJSON {
             } else {
                 throw SwanError.malformed("invalid JSON number")
             }
-            if consumeIf(0x2E) {
+            let hasFraction = consumeIf(0x2E)
+            if hasFraction {
                 guard let digit = bytes[safe: index], (0x30 ... 0x39).contains(digit) else {
                     throw SwanError.malformed("invalid JSON number")
                 }
                 while let digit = bytes[safe: index], (0x30 ... 0x39).contains(digit) { index += 1 }
             }
+            var hasExponent = false
             if let exponent = bytes[safe: index], exponent == 0x45 || exponent == 0x65 {
+                hasExponent = true
                 index += 1
                 _ = consumeIf(0x2B) || consumeIf(0x2D)
                 guard let digit = bytes[safe: index], (0x30 ... 0x39).contains(digit) else {
                     throw SwanError.malformed("invalid JSON number")
                 }
                 while let digit = bytes[safe: index], (0x30 ... 0x39).contains(digit) { index += 1 }
+            }
+            guard !requiresIntegerToken || (!hasFraction && !hasExponent) else {
+                throw SwanError.malformed("JSON member must be an integer")
             }
         }
 

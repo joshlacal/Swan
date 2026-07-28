@@ -351,8 +351,13 @@ final class ClientAttestationPolicyTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let serverKey = Data(repeating: 0x31, count: 32)
         let database = try await SQLiteControlDatabase(dataDirectory: root)
-        let replay = try DurableSpaceClientAttestationReplayStore(
+        let secondDatabase = try await SQLiteControlDatabase(dataDirectory: root)
+        let firstReplay = try DurableSpaceClientAttestationReplayStore(
             controlStore: database,
+            serverKey: serverKey
+        )
+        let secondReplay = try DurableSpaceClientAttestationReplayStore(
+            controlStore: secondDatabase,
             serverKey: serverKey
         )
         let expiresAt = now.addingTimeInterval(120)
@@ -360,9 +365,10 @@ final class ClientAttestationPolicyTests: XCTestCase {
         let replayAudience = "\(authority)#atproto_space_host"
         let replayNow = now
         let results = try await withThrowingTaskGroup(of: Bool.self) { group in
-            for _ in 0 ..< 16 {
+            for index in 0 ..< 16 {
                 group.addTask {
-                    try await replay.claim(
+                    let replay = index.isMultiple(of: 2) ? firstReplay : secondReplay
+                    return try await replay.claim(
                         clientID: replayClientID,
                         audience: replayAudience,
                         jti: "never-persist-this-raw-jti",
@@ -379,6 +385,7 @@ final class ClientAttestationPolicyTests: XCTestCase {
         }
         XCTAssertEqual(results.filter { $0 }.count, 1)
         try await database.close()
+        try await secondDatabase.close()
 
         let reopened = try await SQLiteControlDatabase(dataDirectory: root)
         let reopenedReplay = try DurableSpaceClientAttestationReplayStore(
@@ -401,6 +408,14 @@ final class ClientAttestationPolicyTests: XCTestCase {
             now: now.addingTimeInterval(1)
         )
         XCTAssertTrue(differentlyScopedClaim)
+        let duplicateAtFinalAcceptedFraction = try await reopenedReplay.claim(
+            clientID: clientID,
+            audience: "\(authority)#atproto_space_host",
+            jti: "never-persist-this-raw-jti",
+            expiresAt: now.addingTimeInterval(240),
+            now: now.addingTimeInterval(120.999)
+        )
+        XCTAssertFalse(duplicateAtFinalAcceptedFraction)
         let reclaimedAfterCleanup = try await reopenedReplay.claim(
             clientID: clientID,
             audience: "\(authority)#atproto_space_host",
@@ -572,6 +587,18 @@ final class ClientAttestationPolicyTests: XCTestCase {
             claimsJSON: #"{"iss":"https://client.example/client-metadata.json","sub":"https://client.example/client-metadata.json","aud":"\#(audience)","iat":\#(issuedAt),"exp":\#(issuedAt + 60),"jti":"first","jti":"second"}"#,
             key: key
         ))
+        for claimsJSON in [
+            #"{"iss":"https://client.example/client-metadata.json","sub":"https://client.example/client-metadata.json","aud":"\#(audience)","iat":\#(issuedAt).0,"exp":\#(issuedAt + 60),"jti":"fractional-iat"}"#,
+            #"{"iss":"https://client.example/client-metadata.json","sub":"https://client.example/client-metadata.json","aud":"\#(audience)","iat":\#(issuedAt),"exp":\#(issuedAt + 60).0,"jti":"fractional-exp"}"#,
+            #"{"iss":"https://client.example/client-metadata.json","sub":"https://client.example/client-metadata.json","aud":"\#(audience)","iat":\#(issuedAt)e0,"exp":\#(issuedAt + 60),"jti":"exponent-iat"}"#,
+            #"{"iss":"https://client.example/client-metadata.json","sub":"https://client.example/client-metadata.json","aud":"\#(audience)","iat":\#(issuedAt),"exp":\#(issuedAt + 60)e0,"jti":"exponent-exp"}"#,
+        ] {
+            values.append(try rawClientAttestation(
+                headerJSON: jsonString(validHeader),
+                claimsJSON: claimsJSON,
+                key: key
+            ))
+        }
 
         var claims = validClaims
         claims["sub"] = "https://CLIENT.example/client-metadata.json"
