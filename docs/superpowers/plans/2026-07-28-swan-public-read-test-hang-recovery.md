@@ -470,6 +470,11 @@ was resolved and built with Xcode-beta Swift 6.4, `--jobs 1`.
 - `swan lab validate`: passed for pinned reference SHA
   `3f6c96d5d2d25438bd40fa89d6ecc37865f8e354`.
 - Offline lab matrix: passed and wrote a sanitized artifact.
+- `Scripts/test-verify-interop-lab.sh` passed its mutation tests; profile and
+  static interop invariant verifiers also passed.
+- `Scripts/verify-public-wire-generation.sh` was not run to completion because
+  this checkout has no `PETREL_GENERATOR_ROOT`; run it from the pinned Petrel
+  generator workspace before claiming regeneration determinism.
 - Docker/Compose is not installed in this environment; live cross-host Swan /
   TypeScript matrix execution remains an external gate and must not be marked
   complete from these local results.
