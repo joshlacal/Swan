@@ -175,6 +175,7 @@ public enum SQLiteLayout {
     ]
 
     public static let accountConnectionPragmas = [
+        "PRAGMA busy_timeout=5000",
         "PRAGMA journal_mode=WAL",
         "PRAGMA foreign_keys=ON",
     ]
@@ -330,6 +331,61 @@ public enum SQLiteLayout {
             commit_cid TEXT NOT NULL,
             car BLOB NOT NULL,
             installed_at INTEGER NOT NULL CHECK(installed_at >= 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS public_repository_state (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            did TEXT NOT NULL UNIQUE,
+            revision TEXT NOT NULL,
+            commit_cid TEXT NOT NULL,
+            data_cid TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS public_repository_blocks (
+            cid TEXT PRIMARY KEY,
+            bytes BLOB NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS public_repository_record_index (
+            collection TEXT NOT NULL,
+            rkey TEXT NOT NULL,
+            record_cid TEXT NOT NULL,
+            PRIMARY KEY(collection, rkey)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS public_repository_mutation_requests (
+            request_id TEXT PRIMARY KEY,
+            request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
+            base_commit_cid TEXT NOT NULL,
+            base_revision TEXT NOT NULL,
+            next_revision TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL CHECK(status IN ('reserved', 'committed')),
+            committed_commit_cid TEXT,
+            committed_data_cid TEXT,
+            committed_projection BLOB,
+            committed_projection_digest BLOB CHECK(
+                committed_projection_digest IS NULL
+                OR length(committed_projection_digest) = 32
+            ),
+            CHECK(
+                (status = 'reserved' AND committed_commit_cid IS NULL
+                    AND committed_data_cid IS NULL AND committed_projection IS NULL
+                    AND committed_projection_digest IS NULL)
+                OR
+                (status = 'committed' AND committed_commit_cid IS NOT NULL
+                    AND committed_data_cid IS NOT NULL AND committed_projection IS NOT NULL
+                    AND committed_projection_digest IS NOT NULL)
+            )
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS public_repository_revision_allocator (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            highest_value INTEGER NOT NULL CHECK(highest_value >= 0)
         )
         """,
         """
@@ -949,19 +1005,22 @@ struct SQLiteTestingHooks: Sendable {
     var beforeBlobReferenceCommit: (@Sendable () async throws -> Void)?
     var beforeLegacyBlobMigrationCommit: (@Sendable () async throws -> Void)?
     var afterBlobReclaimCommit: (@Sendable () async throws -> Void)?
+    var beforePublicRepositoryCommit: (@Sendable () async throws -> Void)?
 
     init(
         beforeApplyCommit: (@Sendable () async throws -> Void)? = nil,
         afterSnapshotStateRead: (@Sendable () async -> Void)? = nil,
         beforeBlobReferenceCommit: (@Sendable () async throws -> Void)? = nil,
         beforeLegacyBlobMigrationCommit: (@Sendable () async throws -> Void)? = nil,
-        afterBlobReclaimCommit: (@Sendable () async throws -> Void)? = nil
+        afterBlobReclaimCommit: (@Sendable () async throws -> Void)? = nil,
+        beforePublicRepositoryCommit: (@Sendable () async throws -> Void)? = nil
     ) {
         self.beforeApplyCommit = beforeApplyCommit
         self.afterSnapshotStateRead = afterSnapshotStateRead
         self.beforeBlobReferenceCommit = beforeBlobReferenceCommit
         self.beforeLegacyBlobMigrationCommit = beforeLegacyBlobMigrationCommit
         self.afterBlobReclaimCommit = afterBlobReclaimCommit
+        self.beforePublicRepositoryCommit = beforePublicRepositoryCommit
     }
 }
 
@@ -997,7 +1056,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     private let descriptorBackedRestore: Bool
     private var accountDirectoryDescriptor: Int32
     private var databaseFileDescriptor: Int32
-    private var testingHooks = SQLiteTestingHooks()
+    var testingHooks = SQLiteTestingHooks()
     private var activeWriteTransactions = 0
 
     public init(
@@ -1916,6 +1975,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                             .integer(timestamp),
                         ]
                     )
+                    try await installPublicRepositoryTruth(verifiedCandidate)
                     return PublicRepositoryGenesisInstallation(
                         persisted: candidateState,
                         wasAlreadyInstalled: false
@@ -1929,9 +1989,87 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                 guard stored.genesis == verifiedCandidate else {
                     throw PublicRepositoryGenesisStoreError.conflictingGenesis
                 }
+                try await installPublicRepositoryTruth(verifiedCandidate)
                 return PublicRepositoryGenesisInstallation(
                     persisted: stored,
                     wasAlreadyInstalled: true
+                )
+            }
+        }
+    }
+
+    private func installPublicRepositoryTruth(
+        _ genesis: PublicRepositoryGenesis
+    ) async throws {
+        let stateRows = try await connection.query(
+            """
+            SELECT did, revision, commit_cid, data_cid
+            FROM public_repository_state WHERE singleton = 1
+            """
+        )
+        guard stateRows.count <= 1 else {
+            throw PublicRepositoryGenesisStoreError.corruptStoredGenesis
+        }
+        if let row = stateRows.first {
+            guard row.column("did")?.string == genesis.did,
+                  let revision = row.column("revision")?.string,
+                  (try? PublicRepositoryTID(revision)) != nil,
+                  let commitString = row.column("commit_cid")?.string,
+                  let commitCID = try? CID.parse(commitString),
+                  commitCID.string == commitString,
+                  (try? PublicRepositoryCID.validate(commitCID)) != nil,
+                  let dataString = row.column("data_cid")?.string,
+                  let dataCID = try? CID.parse(dataString),
+                  dataCID.string == dataString,
+                  (try? PublicRepositoryCID.validate(dataCID)) != nil
+            else {
+                throw PublicRepositoryGenesisStoreError.corruptStoredGenesis
+            }
+            for cid in [commitCID, dataCID] {
+                let blockRows = try await connection.query(
+                    "SELECT bytes FROM public_repository_blocks WHERE cid = ?",
+                    [.text(cid.string)]
+                )
+                guard blockRows.count == 1,
+                      let value = blockRows[0].column("bytes"),
+                      let bytes = Data(sqliteData: value),
+                      (try? PublicRepositoryCID.validate(cid, blockBytes: bytes)) != nil
+                else {
+                    throw PublicRepositoryGenesisStoreError.corruptStoredGenesis
+                }
+            }
+        } else {
+            _ = try await connection.query(
+                """
+                INSERT INTO public_repository_state(
+                    singleton, did, revision, commit_cid, data_cid
+                ) VALUES (1, ?, ?, ?, ?)
+                """,
+                [
+                    .text(genesis.did),
+                    .text(genesis.revision),
+                    .text(genesis.commitCID.string),
+                    .text(genesis.emptyMSTCID.string),
+                ]
+            )
+        }
+        for (cid, bytes) in [
+            (genesis.commitCID, genesis.signedCommit),
+            (genesis.emptyMSTCID, genesis.emptyMST),
+        ] {
+            let existing = try await connection.query(
+                "SELECT bytes FROM public_repository_blocks WHERE cid = ?",
+                [.text(cid.string)]
+            )
+            if let row = existing.first {
+                guard let value = row.column("bytes"),
+                      Data(sqliteData: value) == bytes else {
+                    throw PublicRepositoryGenesisStoreError.corruptStoredGenesis
+                }
+            } else {
+                _ = try await connection.query(
+                    "INSERT INTO public_repository_blocks(cid, bytes) VALUES (?, ?)",
+                    [.text(cid.string), bytes.sqliteData!]
                 )
             }
         }
