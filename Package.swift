@@ -160,8 +160,11 @@ let package = Package(
         .target(
             name: "SwanInterop",
             dependencies: [
-                "SwanCore", "SwanSpaces", "SwanSpacesWire", "SwanSQLite", "SwanStorage",
+                "SwanCore", "SwanSpaces", "SwanSpacesWire", "SwanSQLite", "SwanStorage", "SwanOAuth",
+                .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "Petrel", package: "Petrel"),
             ]
         ),
@@ -257,8 +260,9 @@ let package = Package(
         .testTarget(
             name: "SwanInteropTests",
             dependencies: [
-                "SwanInterop",
+                "SwanInterop", "SwanOAuth", "SwanSpaces",
                 .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "NIOCore", package: "swift-nio"),
             ]
         ),
         .testTarget(

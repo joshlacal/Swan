@@ -94,6 +94,12 @@ public enum SwanPublicRepositoryMutationCoordinator {
                 state: initial, action: .update, path: path, recordCID: current, isNoOp: true
             )
         }
+        // A record swap is meaningful only when the selected path already
+        // exists. Do not turn a caller's failed create CAS into an
+        // unconditional create by silently dropping the supplied swap.
+        if current == nil, swapRecord != nil {
+            throw PublicRepositoryMutationCoordinatorError.invalidSwap
+        }
         return try await applyWithRetry(
             store: store,
             did: did,
@@ -104,7 +110,6 @@ public enum SwanPublicRepositoryMutationCoordinator {
                     : [.update(path: path, record: record, expectedRecordCID: swapRecord)],
                 expectedCommitCID: swapCommit
             ),
-            expectedRecord: swapRecord,
             requestID: requestID,
             bodyDigest: bodyDigest,
             signerProvider: signerProvider,
@@ -129,7 +134,7 @@ public enum SwanPublicRepositoryMutationCoordinator {
         }
         let current = try await store.publicRepositoryRecordCID(for: path)
         // Pinned behavior: deleting an absent record is a no-op before swaps.
-        guard let current else { return nil }
+        guard current != nil else { return nil }
         return try await applyWithRetry(
             store: store,
             did: did,
@@ -138,7 +143,6 @@ public enum SwanPublicRepositoryMutationCoordinator {
                 writes: [.delete(path: path, expectedRecordCID: swapRecord)],
                 expectedCommitCID: swapCommit
             ),
-            expectedRecord: current,
             requestID: requestID,
             bodyDigest: bodyDigest,
             signerProvider: signerProvider,
@@ -152,14 +156,14 @@ public enum SwanPublicRepositoryMutationCoordinator {
         did: String,
         path: PublicRepositoryPath,
         batch: PublicRepositoryWriteBatch,
-        expectedRecord: CID?,
         requestID: String,
         bodyDigest: Data,
         signerProvider: any PublicRepositoryMutationSignerProvider,
         now: @Sendable () -> UInt64,
         action: PublicRepositoryMutationAction
     ) async throws -> PublicRepositoryMutationResult {
-        let callerSuppliedSwap = batch.expectedCommitCID != nil || expectedRecord != nil
+        let callerSuppliedSwap = batch.expectedCommitCID != nil
+            || batch.writes.contains { $0.expectedRecordCID != nil }
         var attempts = 0
         while true {
             attempts += 1
@@ -199,6 +203,7 @@ public enum SwanPublicRepositoryMutationCoordinator {
                         try? await store.abandonPublicRepositoryReservation(reservation)
                         throw map(error)
                     }
+                    try? await store.abandonPublicRepositoryReservation(reservation)
                 } catch {
                     try? await store.abandonPublicRepositoryReservation(reservation)
                     throw map(error)

@@ -194,6 +194,87 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase {
         }
     }
 
+    func testLocalRuntimeCanEnableManagingAppAndNotificationCapabilitiesWithoutPinnedFile() async throws {
+        let fixture = try await Fixture.make(localDID: localDID)
+        defer { fixture.cleanup() }
+        do {
+            let composition = try await ServePermissionedRuntime.compose(
+                local: fixture.localRuntime,
+                notification: nil,
+                managingServiceAudience: managingAudience
+            )
+            let server = composition.makeServer(
+                profile: try ProtocolProfile.load(
+                    from: packageRoot().appending(
+                        path: "Profiles/permissioned-data-0016-2026-07-03.json"
+                    )
+                ),
+                configuration: .init(
+                    host: "127.0.0.1",
+                    port: 3_000,
+                    publicURL: URL(string: "https://swan.example")!
+                ),
+                oauthRuntime: fixture.oauthRuntime,
+                directory: fixture.directory,
+                accountControlStore: fixture.control
+            )
+
+            // Local account keys are a complete closed-world verifier for
+            // inbound notification service JWTs. A notification JSON file is
+            // only needed when outbound destinations or remote pins are
+            // selected; it must not be required merely to expose the local
+            // endpoint contracts.
+            XCTAssertNotNil(composition.notificationConfiguration)
+            XCTAssertNotNil(composition.checkUserAccessConfiguration)
+            XCTAssertNotNil(server.authenticatedSpaceNotifications)
+            XCTAssertNotNil(server.simpleSpaceCheckUserAccess)
+
+            let app = server.buildApplication(
+                logger: Logger(label: "ServePermissionedRuntimeCompositionTests.local")
+            )
+            try await app.test(.router) { client in
+                for descriptor in PermissionedData0016.methods {
+                    let method: HTTPRequest.Method = descriptor.kind == .query ? .get : .post
+                    try await client.execute(
+                        uri: "/xrpc/\(descriptor.nsid)",
+                        method: method
+                    ) { response in
+                        XCTAssertNotEqual(response.status, .notFound, descriptor.nsid)
+                        XCTAssertNotEqual(response.status, .serviceUnavailable, descriptor.nsid)
+                    }
+                }
+            }
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    func testExplicitManagingAudienceCannotConflictWithPinnedConfiguration() async throws {
+        let fixture = try await Fixture.make(localDID: localDID)
+        defer { fixture.cleanup() }
+        do {
+            let notification = try makeNotificationRuntime(
+                root: fixture.root,
+                issuer: remoteDID,
+                key: P256.Signing.PrivateKey().publicKey
+            )
+            do {
+                _ = try await ServePermissionedRuntime.compose(
+                    local: fixture.localRuntime,
+                    notification: notification,
+                    managingServiceAudience: "did:web:another-managing.example"
+                )
+                XCTFail("conflicting managing audience must fail startup")
+            } catch {}
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     func testAccountBackedES256AndPinnedTypeScriptES256KVerifyInExactComposition() async throws {
         let local = "did:plc:cdefghijklmnopqrstuvwxyz"
         let fixture = try await Fixture.make(localDID: local)

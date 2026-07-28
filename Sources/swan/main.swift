@@ -338,9 +338,20 @@ private struct ServePublicMutationDirectory: PublicRepositoryMutationDirectory {
     let controls: SQLiteControlDatabase
 
     func publicRepositoryMutationTarget(selector: String) async throws -> PublicRepositoryMutationTarget? {
-        guard let account = try await controls.account(did: selector),
-              let store = await directory.preopenedPublicMutationStore(did: selector) else { return nil }
-        return try PublicRepositoryMutationTarget(did: account.did, status: account.status, store: store)
+        let account: AccountControlAccount?
+        if (try? AccountIdentifiers.validateDID(selector)) != nil {
+            account = try await controls.account(did: selector)
+        } else if let handle = try? AccountIdentifiers.canonicalHandle(selector) {
+            account = try await controls.account(canonicalHandle: handle)
+        } else {
+            account = nil
+        }
+        guard let account else { return nil }
+        // The store is keyed by the resolved DID, not by the caller's handle.
+        guard let resolvedStore = await directory.preopenedPublicMutationStore(did: account.did) else {
+            return nil
+        }
+        return try PublicRepositoryMutationTarget(did: account.did, status: account.status, store: resolvedStore)
     }
 
     func publicBlob(cid: String) async throws -> PublicBlob? {
@@ -364,6 +375,53 @@ private struct ServePublicMutationSignerProvider: PublicRepositoryMutationSigner
         }
         let material = try await keyStore.key(for: references.signing)
         return P256PublicRepositoryCommitSigner(privateKey: try P256.Signing.PrivateKey(rawRepresentation: material))
+    }
+}
+
+/// Startup-only key projection for public repository mutations. This is kept
+/// separate from `ServeLocalSpaceRuntime` so enabling public writes never
+/// implicitly enables permissioned-space credentials, delegation, or sync.
+struct ServePublicMutationRuntime {
+    let signerProvider: any PublicRepositoryMutationSignerProvider
+
+    static func make(
+        keyDirectory: URL,
+        kekFile: URL,
+        kekID: String,
+        controlStore: SQLiteControlDatabase
+    ) async throws -> ServePublicMutationRuntime {
+        try requireExistingOwnerOnlyKeyDirectory(keyDirectory)
+        let configuration = try AccountProvisioningSecrets
+            .requiredMountedAccountKeyConfiguration(
+                activeKeyID: kekID,
+                secretFile: kekFile
+            )
+        let keyStore = try FileAccountKeyStore(
+            root: keyDirectory,
+            configuration: configuration
+        )
+        let hasher = try LibsodiumArgon2idHasher()
+        let accounts = DurableAccountDirectory(
+            store: controlStore,
+            passwordHasher: hasher,
+            verificationExecutor: try Argon2idVerificationExecutor(hasher: hasher)
+        )
+        let activeDIDs = try await controlStore.activeAccountDIDs()
+        guard !activeDIDs.isEmpty else {
+            throw SwanError.unavailable("public mutation runtime has no active accounts")
+        }
+        for did in activeDIDs {
+            guard let references = try await accounts.keyReferences(did: did),
+                  try await keyStore.publicKey(for: references.signing) != nil else {
+                throw SwanError.unavailable("public mutation account keys are unavailable")
+            }
+        }
+        return .init(
+            signerProvider: ServePublicMutationSignerProvider(
+                accounts: accounts,
+                keyStore: keyStore
+            )
+        )
     }
 }
 
@@ -393,7 +451,6 @@ struct ServeLocalSpaceRuntime {
     let repositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration
     let repositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration
     let notificationServiceIssuer: any SpaceServiceAuthenticationIssuer
-    let publicMutationSignerProvider: any PublicRepositoryMutationSignerProvider
 
     static func make(
         keyDirectory: URL,
@@ -454,10 +511,6 @@ struct ServeLocalSpaceRuntime {
             accounts: accounts,
             keyStore: keyStore
         )
-        let publicMutationSignerProvider = ServePublicMutationSignerProvider(
-            accounts: accounts, keyStore: keyStore
-        )
-
         return .init(
             credentialSigningKeys: credentialSigningKeys,
             credentialPublicKeys: credentialPublicKeys,
@@ -483,8 +536,7 @@ struct ServeLocalSpaceRuntime {
             repositoryCredentialConfiguration: .init(
                 credentialPublicKeys: credentialPublicKeys
             ),
-            notificationServiceIssuer: notificationServiceIssuer,
-            publicMutationSignerProvider: publicMutationSignerProvider
+            notificationServiceIssuer: notificationServiceIssuer
         )
     }
 }
@@ -504,6 +556,7 @@ struct ServePermissionedRuntime {
     static func compose(
         local: ServeLocalSpaceRuntime?,
         notification: ServeNotificationRuntime?,
+        managingServiceAudience: String? = nil,
         clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy =
             UnavailableSpaceCredentialClientAttestationPolicy()
     ) async throws -> ServePermissionedRuntime {
@@ -567,9 +620,20 @@ struct ServePermissionedRuntime {
             notificationConfiguration = nil
         }
 
+        let configuredManagingAudience: String?
+        if let pinnedAudience = notification?.managingServiceAudience,
+           let explicitAudience = managingServiceAudience {
+            guard pinnedAudience == explicitAudience else {
+                throw SwanError.malformed("managing service audience conflicts with notification configuration")
+            }
+            configuredManagingAudience = pinnedAudience
+        } else {
+            configuredManagingAudience = notification?.managingServiceAudience ?? managingServiceAudience
+        }
+
         let checkUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration?
         if let serviceAuthentication,
-           let managingServiceAudience = notification?.managingServiceAudience {
+           let managingServiceAudience = configuredManagingAudience {
             checkUserAccessConfiguration = try .init(
                 serviceAuthentication: serviceAuthentication,
                 managingServiceAudience: managingServiceAudience
@@ -607,6 +671,7 @@ struct ServePermissionedRuntime {
         directory: SQLitePreMigratedAccountDirectory,
         accountControlStore: SQLiteControlDatabase,
         localSpaceRuntime: ServeLocalSpaceRuntime? = nil,
+        publicMutationRuntime: ServePublicMutationRuntime? = nil,
         localhostPARConfiguration: SwanLocalhostPARConfiguration? = nil,
         localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration? = nil,
         authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration? = nil
@@ -628,8 +693,10 @@ struct ServePermissionedRuntime {
             spaceNotificationConfiguration: notificationConfiguration,
             simpleSpaceCheckUserAccessConfiguration: checkUserAccessConfiguration,
             publicRepositoryReadDirectory: directory,
-            publicRepositoryMutationDirectory: localSpaceRuntime.map { _ in ServePublicMutationDirectory(directory: directory, controls: accountControlStore) },
-            publicRepositoryMutationSignerProvider: localSpaceRuntime?.publicMutationSignerProvider
+            publicRepositoryMutationDirectory: publicMutationRuntime.map { _ in
+                ServePublicMutationDirectory(directory: directory, controls: accountControlStore)
+            },
+            publicRepositoryMutationSignerProvider: publicMutationRuntime?.signerProvider
         )
     }
 }
@@ -1132,11 +1199,41 @@ extension SwanCommand {
         @Option(name: .customLong("notification-account-key-directory"), help: "Protected account key-envelope directory for notification signing; defaults to <data-directory>/keys")
         var notificationAccountKeyDirectory: String?
 
+        @Option(
+            name: .customLong("managing-service-audience"),
+            help: "Explicit service-JWT audience for com.atproto.simplespace.checkUserAccess"
+        )
+        var managingServiceAudience: String?
+
         @Flag(
             name: .customLong("enable-local-space-interop"),
             help: "Enable local account-key credential, delegation, and repository-sync interop."
         )
         var enableLocalSpaceInterop = false
+
+        @Flag(
+            name: .customLong("enable-public-repository-mutations"),
+            help: "Enable the separately composed OAuth-authorized public repository mutation capability."
+        )
+        var enablePublicRepositoryMutations = false
+
+        @Option(
+            name: .customLong("public-account-kek-file"),
+            help: "Owner-only mounted account-KEK file required by --enable-public-repository-mutations"
+        )
+        var publicAccountKEKFile: String?
+
+        @Option(
+            name: .customLong("public-account-kek-id"),
+            help: "Active account-KEK identifier for public repository mutations (default: primary)"
+        )
+        var publicAccountKEKID: String?
+
+        @Option(
+            name: .customLong("public-account-key-directory"),
+            help: "Existing owner-only account key-envelope directory for public repository mutations; defaults to <data-directory>/keys"
+        )
+        var publicAccountKeyDirectory: String?
 
         @Option(
             name: .customLong("space-account-kek-file"),
@@ -1176,6 +1273,28 @@ extension SwanCommand {
                       }) ?? true else {
                     throw ValidationError(
                         "--enable-local-space-interop requires an owner-only --space-account-kek-file"
+                    )
+                }
+            }
+            if !enablePublicRepositoryMutations {
+                guard publicAccountKEKFile == nil,
+                      publicAccountKEKID == nil,
+                      publicAccountKeyDirectory == nil else {
+                    throw ValidationError(
+                        "public account key options require --enable-public-repository-mutations"
+                    )
+                }
+            } else {
+                guard let publicAccountKEKFile,
+                      !publicAccountKEKFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      publicAccountKEKID.map({
+                          !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      }) ?? true,
+                      publicAccountKeyDirectory.map({
+                          !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      }) ?? true else {
+                    throw ValidationError(
+                        "--enable-public-repository-mutations requires an owner-only --public-account-kek-file"
                     )
                 }
             }
@@ -1264,6 +1383,23 @@ extension SwanCommand {
                     }
                 } else {
                     localSpaceRuntime = nil
+                }
+                let publicMutationRuntime: ServePublicMutationRuntime?
+                if enablePublicRepositoryMutations {
+                    do {
+                        publicMutationRuntime = try await .make(
+                            keyDirectory: publicAccountKeyDirectory.map {
+                                URL(fileURLWithPath: $0)
+                            } ?? dataURL.appending(path: "keys"),
+                            kekFile: URL(fileURLWithPath: publicAccountKEKFile!),
+                            kekID: publicAccountKEKID ?? "primary",
+                            controlStore: controlDatabase
+                        )
+                    } catch {
+                        throw ValidationError("public repository mutation runtime is unavailable")
+                    }
+                } else {
+                    publicMutationRuntime = nil
                 }
                 let oauthRuntime = try SwanOAuthRuntime(
                     controlStore: controlDatabase,
@@ -1431,6 +1567,7 @@ extension SwanCommand {
                     permissionedRuntime = try await .compose(
                         local: localSpaceRuntime,
                         notification: notificationRuntime,
+                        managingServiceAudience: managingServiceAudience,
                         clientAttestationPolicy: clientAttestationPolicy
                     )
                 } catch {
@@ -1548,6 +1685,7 @@ extension SwanCommand {
                     directory: directory,
                     accountControlStore: controlDatabase,
                     localSpaceRuntime: localSpaceRuntime,
+                    publicMutationRuntime: publicMutationRuntime,
                     localhostPARConfiguration: localhostPARConfiguration,
                     localhostOAuthConfiguration: localhostOAuthConfiguration,
                     authorizationServerConfiguration: authorizationServerConfiguration

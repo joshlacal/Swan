@@ -22,6 +22,102 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
     private static let collection = "app.bsky.feed.post"
     private static let mutationPath = "/xrpc/com.atproto.repo.createRecord"
 
+    func testExplicitRKeyPutDeleteNoOpAndSwapSemantics() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let putPath = "/xrpc/com.atproto.repo.putRecord"
+        let deletePath = "/xrpc/com.atproto.repo.deleteRecord"
+        let putBody = self.putBody(rkey: "alpha", text: "one")
+
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.put")
+        ).test(.router) { client in
+            let first = try await client.execute(
+                uri: putPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "put-create",
+                    method: "POST",
+                    path: putPath
+                ),
+                body: ByteBuffer(string: putBody)
+            )
+            XCTAssertEqual(first.status, .ok, String(decoding: first.body.readableBytesView, as: UTF8.self))
+            let firstObject = try self.jsonObject(first.body)
+            let firstCID = try XCTUnwrap(firstObject["cid"] as? String)
+            let firstCommit = try XCTUnwrap((firstObject["commit"] as? [String: Any])?["cid"] as? String)
+            XCTAssertEqual(firstObject["uri"] as? String, "at://" + Self.did + "/" + Self.collection + "/alpha")
+
+            // A same-CID put is a no-op before swap checks. The deliberately
+            // wrong but structurally valid swap commit must not be consulted.
+            let noOpBody = self.putBody(rkey: "alpha", text: "one", swapRecord: firstCommit)
+            let noOp = try await client.execute(
+                uri: putPath,
+                method: .post,
+                headers: try fixture.headers(jti: "put-no-op", method: "POST", path: putPath),
+                body: ByteBuffer(string: noOpBody)
+            )
+            XCTAssertEqual(noOp.status, .ok, String(decoding: noOp.body.readableBytesView, as: UTF8.self))
+            let noOpObject = try self.jsonObject(noOp.body)
+            XCTAssertEqual(noOpObject["cid"] as? String, firstCID)
+            XCTAssertNil(noOpObject["commit"] as? [String: Any])
+
+            let updateBody = self.putBody(
+                rkey: "alpha", text: "two", swapRecord: firstCID, swapCommit: firstCommit
+            )
+            let update = try await client.execute(
+                uri: putPath,
+                method: .post,
+                headers: try fixture.headers(jti: "put-update", method: "POST", path: putPath),
+                body: ByteBuffer(string: updateBody)
+            )
+            XCTAssertEqual(update.status, .ok, String(decoding: update.body.readableBytesView, as: UTF8.self))
+            let updateObject = try self.jsonObject(update.body)
+            let updateCID = try XCTUnwrap(updateObject["cid"] as? String)
+            let updateCommit = try XCTUnwrap((updateObject["commit"] as? [String: Any])?["cid"] as? String)
+            XCTAssertNotEqual(updateCID, firstCID)
+            XCTAssertNotEqual(updateCommit, firstCommit)
+
+            let stale = self.putBody(rkey: "alpha", text: "three", swapRecord: firstCID)
+            let staleResponse = try await client.execute(
+                uri: putPath,
+                method: .post,
+                headers: try fixture.headers(jti: "put-stale", method: "POST", path: putPath),
+                body: ByteBuffer(string: stale)
+            )
+            XCTAssertEqual(staleResponse.status, .badRequest)
+            XCTAssertEqual(try self.jsonObject(staleResponse.body)["error"] as? String, "InvalidSwap")
+
+            let deleteBody = self.deleteBody(
+                rkey: "alpha", swapRecord: updateCID, swapCommit: updateCommit
+            )
+            let deleted = try await client.execute(
+                uri: deletePath,
+                method: .post,
+                headers: try fixture.headers(jti: "delete", method: "POST", path: deletePath),
+                body: ByteBuffer(string: deleteBody)
+            )
+            XCTAssertEqual(deleted.status, .ok, String(decoding: deleted.body.readableBytesView, as: UTF8.self))
+            XCTAssertNotNil((try self.jsonObject(deleted.body)["commit"] as? [String: Any])?["cid"])
+
+            // A missing delete is a no-op before swap checks.
+            let missing = try await client.execute(
+                uri: deletePath,
+                method: .post,
+                headers: try fixture.headers(jti: "delete-missing", method: "POST", path: deletePath),
+                body: ByteBuffer(string: self.deleteBody(rkey: "alpha", swapRecord: firstCID))
+            )
+            XCTAssertEqual(missing.status, .ok, String(decoding: missing.body.readableBytesView, as: UTF8.self))
+            XCTAssertNil(try self.jsonObject(missing.body)["commit"] as? [String: Any])
+        }
+    }
+
     func testPublicRecordLinksRequirePublicBlobReachability() async throws {
         let fixture = try await makeFixture()
         defer { Task { try? await fixture.database.close(); try? await fixture.control.close(); try? FileManager.default.removeItem(at: fixture.root) } }
@@ -39,7 +135,9 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         )
 
         try await app.test(.router) { client in
-            let publicHeaders = try fixture.headers(jti: "public-record")
+            let publicHeaders = try fixture.headers(
+                jti: "public-record", method: "POST", path: Self.mutationPath
+            )
             let publicBody = self.recordBody(rkey: "public", cid: publicReference.cid)
             do {
                 let decoded = try JSONDecoder().decode(
@@ -65,7 +163,9 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
                 XCTAssertNotNil(object["cid"] as? String)
             }
 
-            let privateHeaders = try fixture.headers(jti: "private-record")
+            let privateHeaders = try fixture.headers(
+                jti: "private-record", method: "POST", path: Self.mutationPath
+            )
             let privateBody = self.recordBody(rkey: "private", cid: privateReference.cid)
             try await client.execute(
                 uri: Self.mutationPath,
@@ -203,6 +303,35 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         "{\"repo\":\"" + Self.did + "\",\"collection\":\"" + Self.collection + "\",\"rkey\":\"" + rkey + "\",\"record\":{\"blob\":{\"$link\":\"" + cid + "\"}}}"
     }
 
+    private func putBody(
+        rkey: String,
+        text: String,
+        swapRecord: String? = nil,
+        swapCommit: String? = nil
+    ) -> String {
+        let swaps = [
+            swapRecord.map { "\"swapRecord\":\"\($0)\"" },
+            swapCommit.map { "\"swapCommit\":\"\($0)\"" },
+        ].compactMap { $0 }.joined(separator: ",")
+        let suffix = swaps.isEmpty ? "" : "," + swaps
+        return "{\"repo\":\"" + Self.did + "\",\"collection\":\"" + Self.collection
+            + "\",\"rkey\":\"" + rkey + "\",\"record\":{\"text\":\"" + text + "\"}" + suffix + "}"
+    }
+
+    private func deleteBody(
+        rkey: String,
+        swapRecord: String? = nil,
+        swapCommit: String? = nil
+    ) -> String {
+        let swaps = [
+            swapRecord.map { "\"swapRecord\":\"\($0)\"" },
+            swapCommit.map { "\"swapCommit\":\"\($0)\"" },
+        ].compactMap { $0 }.joined(separator: ",")
+        let suffix = swaps.isEmpty ? "" : "," + swaps
+        return "{\"repo\":\"" + Self.did + "\",\"collection\":\"" + Self.collection
+            + "\",\"rkey\":\"" + rkey + "\"" + suffix + "}"
+    }
+
     private func jsonObject(_ body: ByteBuffer) throws -> [String: Any] {
         try XCTUnwrap(JSONSerialization.jsonObject(with: Data(buffer: body)) as? [String: Any])
     }
@@ -238,7 +367,11 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         let jwk: OAuthJSONWebKey
         let runtime: SwanOAuthRuntime
 
-        func headers(jti: String) throws -> HTTPFields {
+        func headers(
+            jti: String,
+            method: String,
+            path: String
+        ) throws -> HTTPFields {
             struct Header: Encodable {
                 let alg = "ES256"
                 let typ = OAuthDPoPProofValidator.proofType
@@ -259,8 +392,8 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
             let claims = try encoder.encode(Claims(
                 jti: jti,
                 iat: Int64(Date().timeIntervalSince1970),
-                htm: "POST",
-                htu: PublicRepositoryMutationHTTPTests.publicURL.absoluteString + PublicRepositoryMutationHTTPTests.mutationPath,
+                htm: method,
+                htu: PublicRepositoryMutationHTTPTests.publicURL.absoluteString + path,
                 nonce: nonce,
                 ath: Data(SHA256.hash(data: Data(token.utf8))).base64URLEncodedString()
             )).base64URLEncodedString()

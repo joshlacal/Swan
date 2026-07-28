@@ -1,7 +1,10 @@
 import Foundation
 import XCTest
 import Crypto
+import Petrel
 @testable import SwanInterop
+import SwanOAuth
+import SwanSpaces
 
 final class SwanInteropTests: XCTestCase {
     func testCheckedInProfileAndArtifactsVerifyOffline() throws {
@@ -205,6 +208,138 @@ final class SwanInteropTests: XCTestCase {
         XCTAssertTrue(keys.isDisjoint(with: ["password", "authorization", "access_token", "refresh_token", "dpop", "private_key", "ikm"]))
         XCTAssertEqual(object["status"] as? String, "planned-not-executed")
         XCTAssertTrue((object["fixturePolicy"] as? String ?? "").hasPrefix("summary-only"))
+    }
+
+    func testLiveReplicaRejectsReorderingAndVerifiesReaderCommitBeforePublication() async throws {
+        let space = try SpaceURI(
+            authority: "did:plc:alice",
+            spaceType: "app.swan.interop",
+            skey: "replica"
+        )
+        let uri = try SpaceRecordURI(
+            space: space,
+            author: "did:plc:alice",
+            collection: "app.bsky.feed.post",
+            rkey: "r1"
+        )
+        let value = Data([0xa1, 0x61, 0x78, 0x01])
+        let cid = CID.fromDAGCBOR(value).string
+        var hash = LtHash()
+        hash.add(element: "app.bsky.feed.post/r1/\(cid)")
+        let key = P256.Signing.PrivateKey()
+        let commit = try SpaceCommitCodec.sign(
+            context: try SpaceCommitContext(
+                space: space,
+                author: "did:plc:alice",
+                rev: "222222222222a",
+                ikm: Data(repeating: 0x41, count: 32)
+            ),
+            commitment: hash.commitment,
+            key: key
+        )
+        let replica = try SpaceReplica(space: space, author: "did:plc:alice")
+        let synchronizer = IncrementalSynchronizer(replica: replica)
+        let entry = InteropRepositoryOperation(
+            revision: 1,
+            uri: uri,
+            cid: cid,
+            value: value,
+            commitment: hash.commitment
+        )
+        let state = try await synchronizer.apply(
+            [entry],
+            terminalCommit: commit,
+            publicKey: key.publicKey
+        )
+        XCTAssertEqual(state.revision, 1)
+        XCTAssertEqual(state.commitment, hash.commitment)
+
+        do {
+            _ = try await replica.apply([entry])
+            XCTFail("duplicate delivery must not be published")
+        } catch let error as SpaceReplica.Error {
+            XCTAssertEqual(error, .staleRevision)
+        }
+        let afterDuplicate = await replica.state()
+        XCTAssertEqual(afterDuplicate, state)
+    }
+
+    func testCARConsumerVerifiesTwoRootRecoveryFromAFileSpool() throws {
+        let space = try SpaceURI(
+            authority: "did:plc:alice",
+            spaceType: "app.swan.interop",
+            skey: "car"
+        )
+        let uri = try SpaceRecordURI(
+            space: space,
+            author: "did:plc:alice",
+            collection: "app.bsky.feed.post",
+            rkey: "r1"
+        )
+        let value = Data([0xa1, 0x61, 0x78, 0x01])
+        let cid = CID.fromDAGCBOR(value).string
+        var hash = LtHash()
+        hash.add(element: "app.bsky.feed.post/r1/\(cid)")
+        let key = P256.Signing.PrivateKey()
+        let commit = try SpaceCommitCodec.sign(
+            context: try SpaceCommitContext(
+                space: space,
+                author: "did:plc:alice",
+                rev: "222222222222a",
+                ikm: Data(repeating: 0x42, count: 32)
+            ),
+            commitment: hash.commitment,
+            key: key
+        )
+        let car = try SpaceCARCodec.encode(
+            commit: commit,
+            records: [SpaceRecord(uri: uri, value: value, cid: cid, revision: 1)]
+        )
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "swan-car-consumer-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try car.data.write(to: root, options: .atomic)
+        let recovery = try SwanCARConsumer(maximumBytes: car.data.count + 1).verify(
+            fileURL: root,
+            space: space,
+            author: "did:plc:alice",
+            publicKey: key.publicKey
+        )
+        XCTAssertEqual(recovery.records.count, 1)
+        XCTAssertEqual(recovery.commitment, hash.commitment)
+    }
+
+    func testDPoPClientProofIsStrictlySignedAndFresh() throws {
+        let key = InteropDPoPKey()
+        let target = URL(string: "https://swan.example/xrpc/com.atproto.space.listSpaces")!
+        let proof = try key.proof(
+            method: "GET",
+            target: target,
+            nonce: "nonce.fixture",
+            accessToken: "opaque-access-token",
+            now: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+        let verified = try OAuthCompactJWT.verify(
+            proof,
+            publicKey: try key.publicJWK.publicKey(),
+            expectedType: OAuthDPoPProofValidator.proofType,
+            constraints: .init(
+                now: Date(timeIntervalSince1970: 1_750_000_000),
+                clockSkew: 0,
+                requireIssuedAt: true
+            )
+        )
+        XCTAssertEqual(verified.header.jwk?.thumbprint(), try key.thumbprint)
+        XCTAssertNotEqual(
+            proof,
+            try key.proof(
+                method: "GET",
+                target: target,
+                nonce: "nonce.fixture",
+                accessToken: "opaque-access-token",
+                now: Date(timeIntervalSince1970: 1_750_000_000)
+            )
+        )
     }
 
     func testDuplicatedFaultModeProbesEachEndpointTwice() async throws {

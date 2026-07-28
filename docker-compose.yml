@@ -76,9 +76,17 @@ services:
       - /run/secrets/swan-runtime/account-kek
       - --space-account-kek-id
       - primary
+      - --enable-public-repository-mutations
+      - --public-account-kek-file
+      - /run/secrets/swan-runtime/account-kek
+      - --public-account-kek-id
+      - primary
       - --oauth-server-key-file
       - /run/secrets/swan-runtime/oauth-server-key
-      - --enable-localhost-oauth
+      - --enable-oauth-authorization-server
+      - --oauth-allow-localhost-development-client
+      - --managing-service-audience
+      - did:web:interop-swan-managing-service
     volumes:
       - swan-data:/var/lib/swan
       - swan-runtime-secrets:/run/secrets/swan-runtime:ro

@@ -141,7 +141,7 @@ public enum PublicRepositoryWrite: Sendable, Equatable {
         }
     }
 
-    fileprivate var expectedRecordCID: CID? {
+    public var expectedRecordCID: CID? {
         switch self {
         case .create:
             return nil

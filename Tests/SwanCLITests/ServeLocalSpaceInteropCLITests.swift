@@ -32,6 +32,24 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
     }
 
+    func testPublicMutationKeyOptionsRequireSeparateExplicitOptIn() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appending(path: "data")
+        let secret = root.appending(path: "mounted-kek")
+        try protectedWrite(Data(repeating: 0x41, count: 43), to: secret)
+
+        let result = try runServe(
+            data: data,
+            arguments: ["--public-account-kek-file", secret.path]
+        )
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.isEmpty)
+        XCTAssertFalse(result.error.contains(secret.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
+    }
+
     func testLocalInteropRejectsCleartextAndMissingNotificationConfigWithoutLeakingPaths() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
