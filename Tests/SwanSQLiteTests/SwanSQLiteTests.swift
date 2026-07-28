@@ -1445,6 +1445,8 @@ final class SwanSQLiteTests: XCTestCase {
         let publicBlob = try XCTUnwrap(maybePublicBlob)
         XCTAssertEqual(publicBlob.mimeType, "image/test")
         XCTAssertEqual(publicBlob.body.contentLength, expected.count)
+        let publicReachable = try await database.publicBlobExists(cid: reference.cid)
+        XCTAssertTrue(publicReachable)
         var received = Data()
         var maximumChunk = 0
         try await publicBlob.body.streamBody(maximumChunkBytes: 8 * 1_024) { chunk in
@@ -1461,6 +1463,8 @@ final class SwanSQLiteTests: XCTestCase {
         )
         let privateBlob = try await database.publicBlob(cid: privateReference.cid)
         XCTAssertNil(privateBlob)
+        let privateReachable = try await database.publicBlobExists(cid: privateReference.cid)
+        XCTAssertFalse(privateReachable)
 
         let tooLargeSource: @Sendable (
             @escaping (Data) async throws -> Void

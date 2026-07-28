@@ -119,15 +119,18 @@ private struct PublicMutationHandlers {
                 if let supplied = value.rkey { rkey = supplied }
                 else { rkey = try RecordKey(keyString: try await capability.tidAllocator.next().toString()) }
                 let path = try PublicRepositoryPath(collection: value.collection.nsidString(), recordKey: rkey.value)
-                writes.append(.create(path: path, record: try PublicRepositoryRecordCodec.publicRecord(from: value.value, collection: path.collection)))
+                let record = try PublicRepositoryRecordCodec.publicRecord(from: value.value, collection: path.collection)
+                writes.append(.create(path: path, record: record))
             case let .comAtprotoRepoApplyWritesUpdate(value):
                 let path = try PublicRepositoryPath(collection: value.collection.nsidString(), recordKey: value.rkey.value)
-                writes.append(.update(path: path, record: try PublicRepositoryRecordCodec.publicRecord(from: value.value, collection: path.collection), expectedRecordCID: nil))
+                let record = try PublicRepositoryRecordCodec.publicRecord(from: value.value, collection: path.collection)
+                writes.append(.update(path: path, record: record, expectedRecordCID: nil))
             case let .comAtprotoRepoApplyWritesDelete(value):
                 writes.append(.delete(path: try PublicRepositoryPath(collection: value.collection.nsidString(), recordKey: value.rkey.value), expectedRecordCID: nil))
             case .unexpected: throw PublicMutationFailure.invalidRequest
             }
         }
+        try await validatePublicBlobLinks(in: writes, target: target)
         let committed = try await SwanPublicRepositoryMutationCoordinator.applyBatch(
             store: target.store, did: target.did,
             batch: try PublicRepositoryWriteBatch(writes: writes, expectedCommitCID: input.swapCommit),
@@ -162,6 +165,7 @@ private struct PublicMutationHandlers {
         }
         let path = try PublicRepositoryPath(collection: input.collection.nsidString(), recordKey: rkey.value)
         let record = try PublicRepositoryRecordCodec.publicRecord(from: input.record, collection: path.collection)
+        try await validatePublicBlobLinks(in: [.create(path: path, record: record)], target: target)
         let result = try await SwanPublicRepositoryMutationCoordinator.put(
             store: target.store, did: target.did, path: path, record: record,
             swapRecord: nil, swapCommit: input.swapCommit,
@@ -193,6 +197,7 @@ private struct PublicMutationHandlers {
         let record = try PublicRepositoryRecordCodec.publicRecord(
             from: input.record, collection: path.collection
         )
+        try await validatePublicBlobLinks(in: [.update(path: path, record: record, expectedRecordCID: nil)], target: target)
         let result = try await SwanPublicRepositoryMutationCoordinator.put(
             store: target.store, did: target.did, path: path, record: record,
             swapRecord: input.swapRecord, swapCommit: input.swapCommit,
@@ -278,6 +283,33 @@ private struct PublicMutationHandlers {
             throw PublicMutationFailure.unavailable
         }
         return authorization
+    }
+
+    private func validatePublicBlobLinks(
+        in writes: [PublicRepositoryWrite],
+        target: PublicRepositoryMutationTarget
+    ) async throws {
+        let records = writes.compactMap { write -> PublicRecord? in
+            switch write {
+            case let .create(_, record), let .update(_, record, _): return record
+            case .delete: return nil
+            }
+        }
+        let cids = records.flatMap(PublicRepositoryRecordCodec.publicBlobCIDs(in:))
+        guard !cids.isEmpty else { return }
+        guard let blobStore = target.store as? any StreamingBlobStore else {
+            throw PublicMutationFailure.unavailable
+        }
+        var seen = Set<String>()
+        for cid in cids where seen.insert(cid.string).inserted {
+            let reachable: Bool
+            do {
+                reachable = try await blobStore.publicBlobExists(cid: cid.string)
+            } catch {
+                throw PublicMutationFailure.unavailable
+            }
+            guard reachable else { throw PublicMutationFailure.invalidRequest }
+        }
     }
 }
 

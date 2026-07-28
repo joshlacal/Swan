@@ -202,6 +202,31 @@ public enum PublicRepositoryRecordCodec {
         return PreparedPublicRecord(bytes: bytes, cid: CID.fromDAGCBOR(bytes))
     }
 
+    /// Returns the raw CIDs embedded in a public record. In AT repository
+    /// values, raw CIDs are blob references while DAG-CBOR CIDs identify
+    /// repository blocks and are not blob-namespace references. The result is
+    /// deterministic and de-duplicated so callers can perform bounded,
+    /// metadata-only reachability checks before committing a mutation.
+    public static func publicBlobCIDs(in record: PublicRecord) -> [CID] {
+        var byString: [String: CID] = [:]
+
+        func visit(_ value: PublicRecordValue) {
+            switch value {
+            case let .link(cid) where cid.codec == .raw:
+                byString[cid.string] = cid
+            case let .array(values):
+                for value in values { visit(value) }
+            case let .object(fields):
+                for value in fields.values { visit(value) }
+            default:
+                break
+            }
+        }
+
+        visit(.object(record.fields))
+        return byString.keys.sorted().compactMap { byString[$0] }
+    }
+
     private static func encodeObject(
         _ object: [String: PublicRecordValue],
         depth: Int,

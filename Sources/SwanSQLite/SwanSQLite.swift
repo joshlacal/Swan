@@ -4642,6 +4642,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return PublicBlob(mimeType: stored.mimeType, body: body)
     }
 
+    public func publicBlobExists(cid: String) async throws -> Bool {
+        _ = try canonicalRawBlobCID(cid)
+        return try await publicBlobMetadataIfReachable(
+            cid: cid,
+            namespaceKind: "public",
+            spaceURI: ""
+        ) != nil
+    }
+
     public func removeBlobReference(_ reference: BlobReference) async throws {
         let columns = blobNamespaceColumns(reference.namespace)
         let digestHex = try blobDigestHex(cid: reference.cid, allowLegacy: true)

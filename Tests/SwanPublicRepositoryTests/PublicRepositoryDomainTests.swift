@@ -269,6 +269,25 @@ final class PublicRepositoryDomainTests: XCTestCase {
         ))
     }
 
+    func testPublicBlobCIDProjectionOnlyReturnsDeduplicatedRawLinks() throws {
+        let raw = CID.fromBlob(Data("blob".utf8))
+        let dagCBOR = CID.fromDAGCBOR(Data([0xa0]))
+        let record = PublicRecord([
+            "$type": .string(collection),
+            "one": .link(raw),
+            "nested": .object([
+                "same": .link(raw),
+                "record": .link(dagCBOR),
+            ]),
+            "many": .array([.link(raw), .string("not-a-link")]),
+        ])
+
+        XCTAssertEqual(
+            PublicRepositoryRecordCodec.publicBlobCIDs(in: record).map(\.string),
+            [raw.string]
+        )
+    }
+
     func testRecordCodecEnforcesInclusiveSignedSafeIntegerRange() throws {
         let path = try PublicRepositoryPath(collection: collection, recordKey: "integers")
         let boundaries = PublicRecord([

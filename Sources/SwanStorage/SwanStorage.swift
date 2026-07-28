@@ -64,6 +64,10 @@ public protocol StreamingBlobStore: BlobStore {
     ) async throws -> BlobReference
 
     func publicBlob(cid: String) async throws -> PublicBlob?
+
+    /// Metadata-only reachability check for public record references. This
+    /// must not open or materialize the blob body.
+    func publicBlobExists(cid: String) async throws -> Bool
 }
 
 /// Local immutable content-addressed blobs. File contents are shared, while

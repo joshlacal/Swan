@@ -1,0 +1,318 @@
+import Crypto
+import Foundation
+import Hummingbird
+import HummingbirdTesting
+import HTTPTypes
+import Logging
+import NIOCore
+import Petrel
+import SwanCore
+@testable import SwanHTTP
+@testable import SwanOAuth
+import SwanPublicRepository
+import SwanPublicWire
+import SwanSQLite
+import SwanSpaces
+import SwanStorage
+import XCTest
+
+final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
+    private static let did = "did:plc:abcdefghijklmnopqrstuvwx"
+    private static let publicURL = URL(string: "https://swan.example")!
+    private static let collection = "app.bsky.feed.post"
+    private static let mutationPath = "/xrpc/com.atproto.repo.createRecord"
+
+    func testPublicRecordLinksRequirePublicBlobReachability() async throws {
+        let fixture = try await makeFixture()
+        defer { Task { try? await fixture.database.close(); try? await fixture.control.close(); try? FileManager.default.removeItem(at: fixture.root) } }
+
+        let publicReference = try await fixture.database.putBlob(
+            Data("public-image".utf8), namespace: .public
+        )
+        let privateReference = try await fixture.database.putBlob(
+            Data("private-image".utf8), namespace: .space(
+                try SpaceURI(authority: Self.did, spaceType: "app.swan.private", skey: "test")
+            )
+        )
+        let app = fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests")
+        )
+
+        try await app.test(.router) { client in
+            let publicHeaders = try fixture.headers(jti: "public-record")
+            let publicBody = self.recordBody(rkey: "public", cid: publicReference.cid)
+            do {
+                let decoded = try JSONDecoder().decode(
+                    SwanPublicWire.ComAtprotoRepoCreateRecord.Input.self,
+                    from: Data(publicBody.utf8)
+                )
+                _ = try PublicRepositoryRecordCodec.publicRecord(
+                    from: decoded.record,
+                    collection: Self.collection
+                )
+            } catch {
+                XCTFail("test body does not decode: " + String(describing: error))
+            }
+            try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: publicHeaders,
+                body: ByteBuffer(string: publicBody)
+            ) { response in
+                XCTAssertEqual(response.status, .ok, String(decoding: response.body.readableBytesView, as: UTF8.self))
+                let object = try self.jsonObject(response.body)
+                XCTAssertEqual(object["uri"] as? String, "at://" + Self.did + "/" + Self.collection + "/public")
+                XCTAssertNotNil(object["cid"] as? String)
+            }
+
+            let privateHeaders = try fixture.headers(jti: "private-record")
+            let privateBody = self.recordBody(rkey: "private", cid: privateReference.cid)
+            try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: privateHeaders,
+                body: ByteBuffer(string: privateBody)
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest)
+                XCTAssertEqual(try self.jsonObject(response.body)["error"] as? String, "InvalidRequest")
+            }
+
+            try await client.execute(
+                uri: "/xrpc/com.atproto.sync.getBlob?cid=" + publicReference.cid,
+                method: .get
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertEqual(Data(buffer: response.body), Data("public-image".utf8))
+                XCTAssertEqual(response.headers[.contentLength], "12")
+            }
+            try await client.execute(
+                uri: "/xrpc/com.atproto.sync.getBlob?cid=" + privateReference.cid,
+                method: .get
+            ) { response in
+                XCTAssertEqual(response.status, .notFound)
+            }
+        }
+    }
+
+    private func makeFixture() async throws -> Fixture {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanPublicRepositoryMutationHTTPTests-" + UUID().uuidString)
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        let signingKey = P256.Signing.PrivateKey()
+        let genesis = try PublicRepositoryGenesisCodec.create(
+            did: Self.did,
+            revision: "3jzfcijpj2z2a",
+            signingKey: signingKey
+        )
+        do {
+            _ = try await control.createAccount(try AccountControlRegistration(
+                did: Self.did,
+                canonicalHandle: "alice.example.com",
+                passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                signingKey: try AccountControlKeyReference(purpose: .signing, generation: 1),
+                rotationKey: try AccountControlKeyReference(purpose: .rotation, generation: 1),
+                publicGenesisCommitCID: genesis.commitCID.string,
+                createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+            ))
+            let database = try await SQLiteAccountDatabase(dataDirectory: root, did: Self.did)
+            _ = try await database.installPublicRepositoryGenesis(
+                genesis,
+                signingPublicKey: signingKey.publicKey,
+                installedAt: Date(timeIntervalSince1970: 1_750_000_000)
+            )
+            let runtime = try SwanOAuthRuntime(
+                controlStore: control,
+                serverKey: Data(repeating: 0x41, count: 32)
+            )
+            let token = try await issueToken(runtime: runtime)
+            let directory = TestMutationDirectory(did: Self.did, database: database)
+            let server = try makeServer(
+                runtime: runtime,
+                control: control,
+                directory: directory,
+                signer: P256PublicRepositoryCommitSigner(privateKey: signingKey)
+            )
+            return Fixture(
+                root: root,
+                control: control,
+                database: database,
+                server: server,
+                token: token.token,
+                key: token.key,
+                jwk: token.jwk,
+                runtime: runtime
+            )
+        } catch {
+            try? await control.close()
+            try? FileManager.default.removeItem(at: root)
+            throw error
+        }
+    }
+
+    private func makeServer(
+        runtime: SwanOAuthRuntime,
+        control: SQLiteControlDatabase,
+        directory: TestMutationDirectory,
+        signer: any PublicRepositoryCommitSigner
+    ) throws -> SwanHTTPServer {
+        let profile = try ProtocolProfile.load(
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")
+        )
+        return SwanHTTPServer(
+            profile: profile,
+            configuration: .init(publicURL: Self.publicURL),
+            oauthRuntime: runtime,
+            authenticatedGetSpaceDirectory: NoopSimpleSpaceDirectory(),
+            accountControlStore: control,
+            publicRepositoryMutationDirectory: directory,
+            publicRepositoryMutationSignerProvider: TestSignerProvider(signer: signer)
+        )
+    }
+
+    private func issueToken(runtime: SwanOAuthRuntime) async throws -> TokenMaterial {
+        let key = P256.Signing.PrivateKey()
+        let jwk = try makeJWK(key)
+        let now = Date()
+        let session = try OAuthValidatedSession(
+            issuer: Self.publicURL.absoluteString,
+            client: OAuthResolvedClientMetadata(
+                metadata: try OAuthClientMetadata(
+                    clientID: URL(string: "https://client.example/metadata")!,
+                    redirectURIs: [URL(string: "https://client.example/callback")!],
+                    grantTypes: ["authorization_code", "refresh_token"],
+                    responseTypes: ["code"],
+                    scopes: ["atproto"],
+                    dpopBoundAccessTokens: true
+                ),
+                keySet: nil
+            ),
+            redirectURI: URL(string: "https://client.example/callback")!,
+            scopes: ["atproto"],
+            dpopProof: OAuthValidatedDPoPProof(
+                keyThumbprint: jwk.thumbprint(),
+                jwtID: "issue-" + UUID().uuidString,
+                issuedAt: now
+            ),
+            now: now
+        )
+        let tokens = try await runtime.tokenService.issue(subject: Self.did, session: session, now: now)
+        return TokenMaterial(token: tokens.accessToken, key: key, jwk: jwk)
+    }
+
+    private func recordBody(rkey: String, cid: String) -> String {
+        "{\"repo\":\"" + Self.did + "\",\"collection\":\"" + Self.collection + "\",\"rkey\":\"" + rkey + "\",\"record\":{\"blob\":{\"$link\":\"" + cid + "\"}}}"
+    }
+
+    private func jsonObject(_ body: ByteBuffer) throws -> [String: Any] {
+        try XCTUnwrap(JSONSerialization.jsonObject(with: Data(buffer: body)) as? [String: Any])
+    }
+
+    private func packageRoot() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    private func makeJWK(_ key: P256.Signing.PrivateKey) throws -> OAuthJSONWebKey {
+        let representation = key.publicKey.x963Representation
+        return try OAuthJSONWebKey(
+            x: Data(representation[1 ..< 33]).base64URLEncodedString(),
+            y: Data(representation[33 ..< 65]).base64URLEncodedString()
+        )
+    }
+
+    private struct TokenMaterial: Sendable {
+        let token: String
+        let key: P256.Signing.PrivateKey
+        let jwk: OAuthJSONWebKey
+    }
+
+    private struct Fixture {
+        let root: URL
+        let control: SQLiteControlDatabase
+        let database: SQLiteAccountDatabase
+        let server: SwanHTTPServer
+        let token: String
+        let key: P256.Signing.PrivateKey
+        let jwk: OAuthJSONWebKey
+        let runtime: SwanOAuthRuntime
+
+        func headers(jti: String) throws -> HTTPFields {
+            struct Header: Encodable {
+                let alg = "ES256"
+                let typ = OAuthDPoPProofValidator.proofType
+                let jwk: OAuthJSONWebKey
+            }
+            struct Claims: Encodable {
+                let jti: String
+                let iat: Int64
+                let htm: String
+                let htu: String
+                let nonce: String
+                let ath: String
+            }
+            let nonce = runtime.dpopNonceService.issue()
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            let header = try encoder.encode(Header(jwk: jwk)).base64URLEncodedString()
+            let claims = try encoder.encode(Claims(
+                jti: jti,
+                iat: Int64(Date().timeIntervalSince1970),
+                htm: "POST",
+                htu: PublicRepositoryMutationHTTPTests.publicURL.absoluteString + PublicRepositoryMutationHTTPTests.mutationPath,
+                nonce: nonce,
+                ath: Data(SHA256.hash(data: Data(token.utf8))).base64URLEncodedString()
+            )).base64URLEncodedString()
+            let input = header + "." + claims
+            let signature = try P256WireSignature.sign(
+                Data(input.utf8), using: key
+            ).base64URLEncodedString()
+            var fields = HTTPFields()
+            fields[.authorization] = "DPoP " + token
+            fields[HTTPField.Name("DPoP")!] = input + "." + signature
+            fields[.contentType] = "application/json"
+            return fields
+        }
+    }
+}
+
+private actor TestMutationDirectory: PublicRepositoryMutationDirectory {
+    let did: String
+    let database: SQLiteAccountDatabase
+
+    init(did: String, database: SQLiteAccountDatabase) {
+        self.did = did
+        self.database = database
+    }
+
+    func publicRepositoryMutationTarget(selector: String) async throws -> PublicRepositoryMutationTarget? {
+        guard selector == did else { return nil }
+        return try PublicRepositoryMutationTarget(
+            did: did,
+            status: .active,
+            store: database
+        )
+    }
+
+    func publicBlob(cid: String) async throws -> PublicBlob? {
+        try await database.publicBlob(cid: cid)
+    }
+}
+
+private actor NoopSimpleSpaceDirectory: AuthorizedSimpleSpaceDirectory {
+    func space(
+        _ space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws -> AuthenticatedSimpleSpaceDescription? { nil }
+
+    func close() async throws {}
+}
+
+private struct TestSignerProvider: PublicRepositoryMutationSignerProvider {
+    let signer: any PublicRepositoryCommitSigner
+
+    func signer(for did: String) async throws -> any PublicRepositoryCommitSigner {
+        signer
+    }
+}
