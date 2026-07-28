@@ -260,6 +260,8 @@ public enum PublicRepositoryCommitCodec {
                 unsignedCommitBytes: unsigned,
                 did: descriptor.did
             )
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw PublicRepositoryCommitError.invalidSignature
         }

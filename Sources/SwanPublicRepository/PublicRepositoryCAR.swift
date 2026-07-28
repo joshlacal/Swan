@@ -20,6 +20,24 @@ public protocol PublicRepositoryCARByteSource: Sendable {
     func read(maximumBytes: Int) async throws -> Data?
 }
 
+/// Storage-neutral receiver for the strict incremental CAR parser. A sink is
+/// called with at most one complete block body at a time and may durably
+/// persist it before the parser requests the next frame.
+public protocol PublicRepositoryCARFrameSink: Sendable {
+    func receiveHeader(rootCID: CID, receivedByteCount: Int) async throws
+    func receiveBlock(
+        _ block: PublicRepositoryBlock,
+        receivedByteCount: Int,
+        frameCount: Int
+    ) async throws
+}
+
+public struct PublicRepositoryCARParseResult: Sendable, Equatable {
+    public let rootCID: CID
+    public let receivedByteCount: Int
+    public let frameCount: Int
+}
+
 public enum PublicRepositoryCARError: Error, Sendable, Equatable {
     case invalidChunkSize
     case invalidRootCID
@@ -325,52 +343,12 @@ public enum PublicRepositoryCAR {
         verifier: any PublicRepositoryCommitVerifier,
         limits: PublicRepositoryLimits = .standard
     ) async throws -> VerifiedPublicRepositoryCAR {
-        let reader = StreamingCARInput(source: source, maximumBytes: limits.maximumCARBytes)
-        let headerLength = try await reader.readCanonicalVarint()
-        guard headerLength <= UInt64(StreamingCARInput.maximumHeaderBytes) else {
-            throw PublicRepositoryCARError.malformedHeader
-        }
-        let header = try await reader.readExactly(Int(headerLength))
-        let root = try parseCanonicalHeader(header)
-
-        var allBlocks: [CID: Data] = [:]
-        var blockCount = 0
-        while let frameLength = try await reader.readCanonicalVarintOrEOF() {
-            try Task.checkCancellation()
-            guard blockCount < limits.maximumCARBlocks else {
-                throw PublicRepositoryCARError.blockLimitExceeded
-            }
-            guard frameLength > 36,
-                  frameLength <= UInt64(36 + limits.maximumRecordBlockBytes) else {
-                throw PublicRepositoryCARError.blockBodyLimitExceeded
-            }
-            let cidBytes = try await reader.readExactly(36)
-            let cid: CID
-            do {
-                cid = try CID(bytes: cidBytes)
-                try PublicRepositoryCID.validate(cid)
-            } catch {
-                throw PublicRepositoryCARError.invalidBlockCID
-            }
-            guard cid.bytes == cidBytes else {
-                throw PublicRepositoryCARError.invalidBlockCID
-            }
-            let bodyLength = Int(frameLength) - 36
-            let body = try await reader.readExactly(bodyLength)
-            do {
-                try PublicRepositoryCID.validate(cid, blockBytes: body)
-            } catch {
-                throw PublicRepositoryCARError.blockCIDMismatch
-            }
-            if let existing = allBlocks[cid] {
-                guard existing == body else {
-                    throw PublicRepositoryCARError.duplicateBlockConflict
-                }
-            } else {
-                allBlocks[cid] = body
-            }
-            blockCount += 1
-        }
+        let collectingSink = InMemoryImportFrameSink()
+        let parsed = try await parseIncrementally(
+            from: source, to: collectingSink, limits: limits
+        )
+        let root = parsed.rootCID
+        let allBlocks = await collectingSink.blocks
 
         guard let commitBytes = allBlocks[root] else {
             throw PublicRepositoryCARError.missingCommit
@@ -431,6 +409,67 @@ public enum PublicRepositoryCAR {
             signedCommit: verifiedCommit,
             repository: repository,
             reachableBlocks: .init(storage: reachable)
+        )
+    }
+
+    /// Strictly parses CARv1 framing without retaining the CAR. Duplicate
+    /// policy is deliberately owned by the sink because durable staging must
+    /// compare against prior frames, including frames received before restart.
+    public static func parseIncrementally(
+        from source: any PublicRepositoryCARByteSource,
+        to sink: any PublicRepositoryCARFrameSink,
+        limits: PublicRepositoryLimits = .standard
+    ) async throws -> PublicRepositoryCARParseResult {
+        let reader = StreamingCARInput(source: source, maximumBytes: limits.maximumCARBytes)
+        let headerLength = try await reader.readCanonicalVarint()
+        guard headerLength <= UInt64(StreamingCARInput.maximumHeaderBytes) else {
+            throw PublicRepositoryCARError.malformedHeader
+        }
+        let header = try await reader.readExactly(Int(headerLength))
+        let root = try parseCanonicalHeader(header)
+        try await sink.receiveHeader(
+            rootCID: root,
+            receivedByteCount: reader.receivedByteCount
+        )
+
+        var blockCount = 0
+        while let frameLength = try await reader.readCanonicalVarintOrEOF() {
+            try Task.checkCancellation()
+            guard blockCount < limits.maximumCARBlocks else {
+                throw PublicRepositoryCARError.blockLimitExceeded
+            }
+            guard frameLength > 36,
+                  frameLength <= UInt64(36 + limits.maximumRecordBlockBytes) else {
+                throw PublicRepositoryCARError.blockBodyLimitExceeded
+            }
+            let cidBytes = try await reader.readExactly(36)
+            let cid: CID
+            do {
+                cid = try CID(bytes: cidBytes)
+                try PublicRepositoryCID.validate(cid)
+            } catch {
+                throw PublicRepositoryCARError.invalidBlockCID
+            }
+            guard cid.bytes == cidBytes else {
+                throw PublicRepositoryCARError.invalidBlockCID
+            }
+            let body = try await reader.readExactly(Int(frameLength) - 36)
+            do {
+                try PublicRepositoryCID.validate(cid, blockBytes: body)
+            } catch {
+                throw PublicRepositoryCARError.blockCIDMismatch
+            }
+            blockCount += 1
+            try await sink.receiveBlock(
+                .init(cid: cid, bytes: body),
+                receivedByteCount: reader.receivedByteCount,
+                frameCount: blockCount
+            )
+        }
+        return .init(
+            rootCID: root,
+            receivedByteCount: reader.receivedByteCount,
+            frameCount: blockCount
         )
     }
 
@@ -539,6 +578,32 @@ private struct ImportedBlockSource: PublicRepositoryBlockSource {
     }
 }
 
+private actor InMemoryImportFrameSink: PublicRepositoryCARFrameSink {
+    private(set) var blocks: [CID: Data] = [:]
+    private var rootCID: CID?
+
+    func receiveHeader(rootCID: CID, receivedByteCount _: Int) async throws {
+        if let existing = self.rootCID, existing != rootCID {
+            throw PublicRepositoryCARError.malformedHeader
+        }
+        self.rootCID = rootCID
+    }
+
+    func receiveBlock(
+        _ block: PublicRepositoryBlock,
+        receivedByteCount _: Int,
+        frameCount _: Int
+    ) async throws {
+        if let existing = blocks[block.cid] {
+            guard existing == block.bytes else {
+                throw PublicRepositoryCARError.duplicateBlockConflict
+            }
+        } else {
+            blocks[block.cid] = block.bytes
+        }
+    }
+}
+
 private final class StreamingCARInput {
     static let maximumHeaderBytes = 1_024
     static let readChunkBytes = 64 * 1_024
@@ -554,6 +619,8 @@ private final class StreamingCARInput {
         self.source = source
         self.maximumBytes = maximumBytes
     }
+
+    var receivedByteCount: Int { receivedBytes }
 
     func readCanonicalVarint() async throws -> UInt64 {
         guard let value = try await readCanonicalVarintOrEOF() else {

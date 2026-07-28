@@ -390,6 +390,84 @@ public enum SQLiteLayout {
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS public_repository_import_sessions (
+            session_id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE,
+            request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
+            account_did TEXT NOT NULL,
+            expected_base_commit_cid TEXT NOT NULL,
+            verifier_identity TEXT NOT NULL,
+            maximum_record_block_bytes INTEGER NOT NULL CHECK(maximum_record_block_bytes > 0),
+            maximum_car_bytes INTEGER NOT NULL CHECK(maximum_car_bytes > 0),
+            maximum_car_blocks INTEGER NOT NULL CHECK(maximum_car_blocks > 0),
+            maximum_mst_nodes INTEGER NOT NULL CHECK(maximum_mst_nodes > 0),
+            maximum_mst_entries_per_node INTEGER NOT NULL CHECK(maximum_mst_entries_per_node > 0),
+            maximum_cbor_nesting_depth INTEGER NOT NULL CHECK(maximum_cbor_nesting_depth > 0),
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            expires_at INTEGER NOT NULL CHECK(expires_at >= created_at),
+            status TEXT NOT NULL CHECK(status IN ('receiving', 'verifying', 'verified', 'poisoned', 'consumed')),
+            root_cid TEXT,
+            received_byte_count INTEGER NOT NULL DEFAULT 0 CHECK(received_byte_count >= 0),
+            frame_count INTEGER NOT NULL DEFAULT 0 CHECK(frame_count >= 0),
+            verified_commit_cid TEXT,
+            verified_data_cid TEXT,
+            verified_revision TEXT,
+            reachable_block_count INTEGER,
+            record_count INTEGER
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS public_repository_import_blocks (
+            session_id TEXT NOT NULL REFERENCES public_repository_import_sessions(session_id) ON DELETE CASCADE,
+            cid TEXT NOT NULL,
+            bytes BLOB NOT NULL,
+            PRIMARY KEY(session_id, cid)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS public_repository_import_reachable (
+            session_id TEXT NOT NULL REFERENCES public_repository_import_sessions(session_id) ON DELETE CASCADE,
+            cid TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('commit', 'mst', 'record')),
+            PRIMARY KEY(session_id, cid)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS public_repository_import_record_index (
+            session_id TEXT NOT NULL REFERENCES public_repository_import_sessions(session_id) ON DELETE CASCADE,
+            collection TEXT NOT NULL,
+            rkey TEXT NOT NULL,
+            record_cid TEXT NOT NULL,
+            PRIMARY KEY(session_id, collection, rkey)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS public_repository_import_results (
+            request_id TEXT PRIMARY KEY,
+            request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
+            account_did TEXT NOT NULL,
+            expected_base_commit_cid TEXT NOT NULL,
+            verifier_identity TEXT NOT NULL,
+            maximum_record_block_bytes INTEGER NOT NULL,
+            maximum_car_bytes INTEGER NOT NULL,
+            maximum_car_blocks INTEGER NOT NULL,
+            maximum_mst_nodes INTEGER NOT NULL,
+            maximum_mst_entries_per_node INTEGER NOT NULL,
+            maximum_cbor_nesting_depth INTEGER NOT NULL,
+            revision TEXT NOT NULL,
+            commit_cid TEXT NOT NULL,
+            data_cid TEXT NOT NULL,
+            reachable_block_count INTEGER NOT NULL CHECK(reachable_block_count > 0),
+            record_count INTEGER NOT NULL CHECK(record_count >= 0),
+            consumed_at INTEGER NOT NULL CHECK(consumed_at >= 0),
+            integrity_digest BLOB NOT NULL CHECK(length(integrity_digest) = 32)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS public_repository_import_expiry
+        ON public_repository_import_sessions(status, expires_at)
+        """,
+        """
         CREATE TABLE IF NOT EXISTS plc_account_preparation_journal (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             request_id TEXT NOT NULL UNIQUE,

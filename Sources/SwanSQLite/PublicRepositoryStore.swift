@@ -5,7 +5,7 @@ import SQLiteNIO
 import SwanPublicRepository
 import SwanStorage
 
-private struct SQLitePublicRepositoryBlockSource: PublicRepositoryBlockSource {
+struct SQLitePublicRepositoryBlockSource: PublicRepositoryBlockSource {
     let connection: SQLiteConnection
 
     func block(for cid: CID) async throws -> Data? {
@@ -465,7 +465,7 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         return Data(SHA256.hash(data: bytes))
     }
 
-    private func loadPublicRepositoryStateWithoutGate() async throws -> PublicRepositoryState? {
+    func loadPublicRepositoryStateWithoutGate() async throws -> PublicRepositoryState? {
         let rows = try await connection.query(
             """
             SELECT did, revision, commit_cid, data_cid
