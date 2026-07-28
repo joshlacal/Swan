@@ -332,6 +332,31 @@ struct ServeNotificationRuntime {
     }
 }
 
+private struct ServePublicMutationDirectory: PublicRepositoryMutationDirectory {
+    let directory: SQLitePreMigratedAccountDirectory
+    let controls: SQLiteControlDatabase
+
+    func publicRepositoryMutationTarget(selector: String) async throws -> PublicRepositoryMutationTarget? {
+        guard let account = try await controls.account(did: selector),
+              let store = await directory.preopenedPublicMutationStore(did: selector) else { return nil }
+        return try PublicRepositoryMutationTarget(did: account.did, status: account.status, store: store)
+    }
+}
+
+private struct ServePublicMutationSignerProvider: PublicRepositoryMutationSignerProvider {
+    let accounts: DurableAccountDirectory
+    let keyStore: any AccountKeyStore
+
+    func signer(for did: String) async throws -> any PublicRepositoryCommitSigner {
+        guard let account = try await accounts.account(did: did), account.status.authorizesAccount,
+              let references = try await accounts.keyReferences(did: did) else {
+            throw SwanError.unauthorized("public repository signer is unavailable")
+        }
+        let material = try await keyStore.key(for: references.signing)
+        return P256PublicRepositoryCommitSigner(privateKey: try P256.Signing.PrivateKey(rawRepresentation: material))
+    }
+}
+
 private struct ServeUnavailableCredentialSigningKeyResolver:
     SpaceCredentialSigningKeyResolver
 {
@@ -358,6 +383,7 @@ struct ServeLocalSpaceRuntime {
     let repositorySyncConfiguration: SwanSpaceRepositorySyncHTTPConfiguration
     let repositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration
     let notificationServiceIssuer: any SpaceServiceAuthenticationIssuer
+    let publicMutationSignerProvider: any PublicRepositoryMutationSignerProvider
 
     static func make(
         keyDirectory: URL,
@@ -418,6 +444,9 @@ struct ServeLocalSpaceRuntime {
             accounts: accounts,
             keyStore: keyStore
         )
+        let publicMutationSignerProvider = ServePublicMutationSignerProvider(
+            accounts: accounts, keyStore: keyStore
+        )
 
         return .init(
             credentialSigningKeys: credentialSigningKeys,
@@ -444,7 +473,8 @@ struct ServeLocalSpaceRuntime {
             repositoryCredentialConfiguration: .init(
                 credentialPublicKeys: credentialPublicKeys
             ),
-            notificationServiceIssuer: notificationServiceIssuer
+            notificationServiceIssuer: notificationServiceIssuer,
+            publicMutationSignerProvider: publicMutationSignerProvider
         )
     }
 }
@@ -566,6 +596,7 @@ struct ServePermissionedRuntime {
         oauthRuntime: SwanOAuthRuntime,
         directory: SQLitePreMigratedAccountDirectory,
         accountControlStore: SQLiteControlDatabase,
+        localSpaceRuntime: ServeLocalSpaceRuntime? = nil,
         localhostPARConfiguration: SwanLocalhostPARConfiguration? = nil,
         localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration? = nil,
         authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration? = nil
@@ -586,7 +617,9 @@ struct ServePermissionedRuntime {
             spaceRepositoryCredentialConfiguration: repositoryCredentialConfiguration,
             spaceNotificationConfiguration: notificationConfiguration,
             simpleSpaceCheckUserAccessConfiguration: checkUserAccessConfiguration,
-            publicRepositoryReadDirectory: directory
+            publicRepositoryReadDirectory: directory,
+            publicRepositoryMutationDirectory: localSpaceRuntime.map { _ in ServePublicMutationDirectory(directory: directory, controls: accountControlStore) },
+            publicRepositoryMutationSignerProvider: localSpaceRuntime?.publicMutationSignerProvider
         )
     }
 }
@@ -1504,6 +1537,7 @@ extension SwanCommand {
                     oauthRuntime: oauthRuntime,
                     directory: directory,
                     accountControlStore: controlDatabase,
+                    localSpaceRuntime: localSpaceRuntime,
                     localhostPARConfiguration: localhostPARConfiguration,
                     localhostOAuthConfiguration: localhostOAuthConfiguration,
                     authorizationServerConfiguration: authorizationServerConfiguration
