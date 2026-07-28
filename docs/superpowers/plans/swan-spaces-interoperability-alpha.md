@@ -120,6 +120,13 @@ checksum-verified way to populate the ignored reference cache.
   terminal DID document. Rotation records the pending operation before PLC
   network I/O and promotes control key generations with a compare-and-swap;
   local tests cover restart, idempotency, tampering, and rotated public reads.
+- `swan lab semantic` and `LocalSemanticInteropRunner` now provide an offline
+  Swan-to-Swan durable semantic gate. Two independent account roots exchange
+  real oplog batches, reject duplicate and unordered delivery, force a
+  retention-gap full snapshot, authenticate/corruption-test a two-root CAR,
+  enforce a bound space credential, and verify public/private blob namespace
+  isolation. The artifact is summary-only and explicitly does not claim that
+  the pinned TypeScript PDS participated.
 
 ## Completion gates
 

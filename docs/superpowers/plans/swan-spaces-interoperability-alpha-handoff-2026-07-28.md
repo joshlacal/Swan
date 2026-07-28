@@ -346,6 +346,22 @@ Static/profile checks pass:
 - `Scripts/test-verify-interop-lab.sh`
 - `git diff --check`
 
+The offline semantic gate is also now available and passing:
+
+```sh
+env -u SDKROOT -u TOOLCHAINS \
+  DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer \
+  /usr/bin/xcrun --toolchain XcodeDefault swift test --jobs 1 \
+  --filter SwanInteropTests.testLocalSemanticInteropExercisesDurableConvergenceRecoveryAndIsolation
+```
+
+`swan lab semantic --output artifacts/swan-swan-semantic.json` writes the same
+summary-only artifact from two independent durable SQLite roots. It proves
+local replay, ordering, retention-gap recovery, CAR validation, credentials,
+and blob namespace isolation, but it is deliberately labeled
+`swan-durable-to-swan-durable`; it is not a substitute for the live
+Swan/TypeScript matrix.
+
 This does not close the alpha. A local/live PLC-client recovery run still
 needs to be performed against the supported fixture, and the operator/CLI
 surface is implemented but has not yet been exercised against that live

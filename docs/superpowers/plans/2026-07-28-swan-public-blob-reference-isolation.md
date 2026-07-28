@@ -49,6 +49,13 @@ Using the pinned Xcode toolchain with `--jobs 1`:
   `Scripts/test-verify-interop-lab.sh`: passed.
 - `git diff --check`: passed.
 - `swift build`: passed.
+- The offline `swan lab semantic` command now runs two independent durable
+  SQLite roots through incremental replay, duplicate/reordered delivery,
+  retention-gap full recovery, two-root CAR verification/corruption rejection,
+  credential enforcement, and public/private blob reachability. Its artifact
+  is explicitly labeled `swan-durable-to-swan-durable` and contains only
+  counts, commitments, and digests; it is local semantic evidence, not a
+  TypeScript PDS interop result.
 
 ## Deliberate boundary
 

@@ -449,6 +449,36 @@ final class SwanInteropTests: XCTestCase {
         }
     }
 
+    func testLocalSemanticInteropExercisesDurableConvergenceRecoveryAndIsolation() async throws {
+        let artifact = await LocalSemanticInteropRunner.execute(
+            scenario: "local-semantic-matrix"
+        )
+
+        XCTAssertEqual(artifact.implementation, "swan-durable-to-swan-durable")
+        XCTAssertEqual(artifact.status, "passed", "\(artifact)")
+        XCTAssertEqual(artifact.operationCount, 4)
+        XCTAssertEqual(artifact.recordCount, 1)
+        XCTAssertEqual(artifact.checks.count, 18)
+        XCTAssertTrue(artifact.checks.allSatisfy(\.passed))
+        XCTAssertNotNil(artifact.sourceCommitment)
+        XCTAssertEqual(artifact.sourceCommitment, artifact.consumerCommitment)
+        XCTAssertEqual(artifact.sourceCommitment, artifact.fullRecoveryCommitment)
+        XCTAssertNotNil(artifact.carDigest)
+        XCTAssertNil(artifact.errorCode)
+
+        let encoded = try JSONEncoder().encode(artifact)
+        let decoded = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let forbidden: Set<String> = [
+            "password", "authorization", "access_token", "refresh_token",
+            "dpop", "private_key", "ikm", "secret", "record_value",
+        ]
+        XCTAssertFalse(
+            Self.sanitizedKeys(in: decoded).contains { key in
+                forbidden.contains(where: { key.lowercased().contains($0) })
+            }
+        )
+    }
+
     private static func sanitizedKeys(in value: Any) -> [String] {
         switch value {
         case let object as [String: Any]:

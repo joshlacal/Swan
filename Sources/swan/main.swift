@@ -2425,7 +2425,7 @@ extension SwanCommand {
     struct Lab: ParsableCommand {
         static let configuration = CommandConfiguration(
             abstract: "Validate and record sanitized Compose laboratory scenarios",
-            subcommands: [Validate.self, Matrix.self, Scenario.self],
+            subcommands: [Validate.self, Matrix.self, Scenario.self, Semantic.self],
             defaultSubcommand: Validate.self
         )
 
@@ -2548,6 +2548,51 @@ extension SwanCommand {
                 print("INTEROP SCENARIO ARTIFACT WRITTEN")
                 guard !failOnFailure || artifact.status == "passed" else {
                     throw ValidationError("interop scenario did not pass; inspect \(outputURL.lastPathComponent)")
+                }
+            }
+        }
+
+        struct Semantic: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Run the offline durable Swan-to-Swan semantic interoperability checks"
+            )
+
+            @Option(name: .long, help: "Scenario identifier (letters, numbers, hyphen, and underscore only)")
+            var name: String = "swan-swan-semantic"
+
+            @Option(name: .long, help: "Destination for the sanitized semantic JSON artifact")
+            var output: String = "artifacts/swan-swan-semantic.json"
+
+            @Flag(
+                name: .customLong("fail-on-failure"),
+                inversion: .prefixedNo,
+                help: "Return non-zero when the semantic artifact is not passed (default; use --no-fail-on-failure only for diagnostics)"
+            )
+            var failOnFailure: Bool = true
+
+            func run() async throws {
+                let normalizedScenario = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !normalizedScenario.isEmpty,
+                      normalizedScenario.unicodeScalars.allSatisfy({
+                          CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_")).contains($0)
+                      }) else {
+                    throw ValidationError("semantic scenario must be an alphanumeric identifier using only letters, numbers, '-' and '_'")
+                }
+
+                let artifact = await LocalSemanticInteropRunner.execute(
+                    scenario: normalizedScenario
+                )
+                let outputURL = URL(fileURLWithPath: output)
+                try FileManager.default.createDirectory(
+                    at: outputURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                try encoder.encode(artifact).write(to: outputURL, options: .atomic)
+                print("LOCAL SEMANTIC ARTIFACT WRITTEN: \(outputURL.path) status=\(artifact.status)")
+                guard !failOnFailure || artifact.status == "passed" else {
+                    throw ValidationError("local semantic interoperability did not pass; inspect \(outputURL.lastPathComponent)")
                 }
             }
         }

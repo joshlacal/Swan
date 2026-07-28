@@ -14,7 +14,14 @@ and security boundary live in `Profiles/`.
 swift test
 swift run swan verify
 swift run swan serve --data-directory .swan-data
+swift run swan lab semantic --output /tmp/swan-semantic.json
 ```
+
+`lab semantic` is an offline local gate: it uses two independent durable
+SQLite roots to exercise replay, ordering, retention-gap recovery, CAR
+verification, permissioned credentials, and public/private blob reachability.
+Its summary artifact is explicitly labeled `swan-durable-to-swan-durable` and
+does not count as the pinned TypeScript PDS matrix.
 
 ## Disposable Compose interoperability lab
 

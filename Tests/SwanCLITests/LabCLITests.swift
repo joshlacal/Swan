@@ -77,6 +77,41 @@ final class LabCLITests: XCTestCase {
         }
     }
 
+    func testLabSemanticCommandWritesDurableSummaryArtifact() throws {
+        let outputFile = try temporaryDirectory().appending(path: "semantic-artifact.json")
+        defer { try? FileManager.default.removeItem(at: outputFile) }
+
+        let result = try runCLI(
+            command: [
+                "semantic",
+                "--name", "cli-semantic-smoke",
+                "--output", outputFile.path,
+            ]
+        )
+        XCTAssertEqual(result.status, 0, String(decoding: result.stderr, as: UTF8.self))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outputFile.path))
+
+        let decoded = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: outputFile),
+            options: []
+        )
+        guard let artifact = decoded as? [String: Any] else {
+            return XCTFail("artifact is not a dictionary")
+        }
+        XCTAssertEqual(artifact["scenario"] as? String, "cli-semantic-smoke")
+        XCTAssertEqual(artifact["implementation"] as? String, "swan-durable-to-swan-durable")
+        XCTAssertEqual(artifact["status"] as? String, "passed")
+        XCTAssertEqual(artifact["operationCount"] as? Int, 4)
+        XCTAssertEqual(artifact["recordCount"] as? Int, 1)
+        XCTAssertEqual((artifact["checks"] as? [[String: Any]])?.count, 18)
+        XCTAssertNotNil(artifact["carDigest"] as? String)
+        XCTAssertNil(artifact["errorCode"] as? String)
+        let serialized = String(decoding: try Data(contentsOf: outputFile), as: UTF8.self).lowercased()
+        for forbidden in ["access_token", "refresh_token", "private_key", "record_value"] {
+            XCTAssertFalse(serialized.contains(forbidden), "artifact leaked forbidden key: (forbidden)")
+        }
+    }
+
     func testLabMatrixCommandWritesOneArtifactPerMode() throws {
         let outputDirectory = try temporaryDirectory().appending(path: "artifacts")
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
