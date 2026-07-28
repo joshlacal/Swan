@@ -272,3 +272,29 @@ are true:
 Current truthful status: permissioned surfaces and durable public read/sync
 are substantially implemented; Task 43 awaits rereview; public mutations and
 public blobs remain closed; live Compose/Linux interop remains unproven.
+
+## Follow-up verification: 2026-07-28
+
+The Task 43 rereview and the next public-data slice were completed after this
+handoff was written. The current successor change is
+`babf71b8 fix(public): enforce blob namespace at mutation boundary`.
+
+- Public `createRecord`, `putRecord`, and `applyWrites` now reject raw blob
+  links that do not have a reachable public CAS reference. Permissioned-only
+  references cannot be promoted implicitly by a public record write.
+- The authenticated HTTP test proves a public raw link commits, a
+  permissioned-only raw link returns `InvalidRequest`, public `sync.getBlob`
+  streams the bytes, and a permissioned-only blob is not publicly reachable.
+- The original `swift test --filter PublicRepositoryReadHTTPTests` filter now
+  completes 8/8 when invoked with the Xcode toolchain and `--jobs 1`; the
+  earlier apparent hang was SwiftPM dependency resolution in the default
+  process state. The opt-in 256 MiB bounded-RSS test also passed.
+- The macOS suite, pinned CAR verifier, profile verifier, static Compose
+  verifier, and verifier mutation tests pass. Docker/Compose, Linux, and the
+  semantic cross-host matrix remain unrun in this environment.
+
+The earlier “public mutations and public blobs remain closed” sentence above
+is retained as historical context for the handoff snapshot; the dated
+follow-up note and `2026-07-28-swan-public-blob-reference-isolation.md` are the
+authoritative current status. Durable PLC rotation history and semantic live
+interoperability are still required before alpha completion.
