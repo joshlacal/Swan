@@ -764,9 +764,19 @@ public struct SwanHTTPServer: Sendable {
                 publicURL: configuration.publicURL
             )
         }
+        if let publicRepositoryMutations {
+            registerPublicRepositoryMutationEndpoints(
+                on: router,
+                capability: publicRepositoryMutations
+            )
+        }
         for descriptor in PublicDataTesting20260727.methods {
             if publicRepositoryReadDirectory != nil,
                isInstalledPublicReadMethod(descriptor.nsid) {
+                continue
+            }
+            if publicRepositoryMutations != nil,
+               Self.isInstalledPublicMutationMethod(descriptor.nsid) {
                 continue
             }
             registerUnavailablePublicEndpoint(descriptor, on: router)
@@ -788,6 +798,11 @@ public struct SwanHTTPServer: Sendable {
         default:
             false
         }
+    }
+
+    private static func isInstalledPublicMutationMethod(_ nsid: String) -> Bool {
+        nsid == SwanPublicWire.ComAtprotoRepoPutRecord.typeIdentifier ||
+            nsid == SwanPublicWire.ComAtprotoRepoDeleteRecord.typeIdentifier
     }
 
     public func buildApplication(logger: Logger) -> some ApplicationProtocol {

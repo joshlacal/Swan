@@ -15,17 +15,20 @@ public struct PublicRepositoryMutationResult: Sendable, Equatable {
     public let action: PublicRepositoryMutationAction
     public let path: PublicRepositoryPath
     public let recordCID: CID?
+    public let isNoOp: Bool
 
     public init(
         state: PublicRepositoryState,
         action: PublicRepositoryMutationAction,
         path: PublicRepositoryPath,
-        recordCID: CID?
+        recordCID: CID?,
+        isNoOp: Bool = false
     ) {
         self.state = state
         self.action = action
         self.path = path
         self.recordCID = recordCID
+        self.isNoOp = isNoOp
     }
 }
 
@@ -45,14 +48,14 @@ public enum SwanPublicRepositoryMutationCoordinator {
         now: @Sendable () -> UInt64 = currentWallClockMicroseconds
     ) async throws -> PublicRepositoryMutationResult {
         let prepared = try PublicRepositoryRecordCodec.prepare(record, for: path)
-        guard try await store.loadPublicRepositoryState() != nil else {
+        guard let initial = try await store.loadPublicRepositoryState() else {
             throw PublicRepositoryMutationCoordinatorError.repositoryNotFound
         }
         let current = try await store.publicRepositoryRecordCID(for: path)
         // Pinned behavior: a same-CID put is a no-op before either swap check.
         if current == prepared.cid {
             return PublicRepositoryMutationResult(
-                state: initial, action: .update, path: path, recordCID: current
+                state: initial, action: .update, path: path, recordCID: current, isNoOp: true
             )
         }
         return try await applyWithRetry(
@@ -85,7 +88,7 @@ public enum SwanPublicRepositoryMutationCoordinator {
         signerProvider: any PublicRepositoryMutationSignerProvider,
         now: @Sendable () -> UInt64 = currentWallClockMicroseconds
     ) async throws -> PublicRepositoryMutationResult? {
-        guard let initial = try await store.loadPublicRepositoryState() else {
+        guard try await store.loadPublicRepositoryState() != nil else {
             throw PublicRepositoryMutationCoordinatorError.repositoryNotFound
         }
         let current = try await store.publicRepositoryRecordCID(for: path)
