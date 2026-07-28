@@ -1,0 +1,310 @@
+import Foundation
+import Petrel
+@testable import SwanPublicRepository
+import XCTest
+
+final class PublicRepositoryDomainTests: XCTestCase {
+    private let collection = "app.bsky.feed.post"
+
+    func testPathAcceptsPinnedBoundarySyntax() throws {
+        let longCollection = String(repeating: "a", count: 63)
+            + "." + Array(repeating: String(repeating: "b", count: 63), count: 3).joined(separator: ".")
+            + "." + String(repeating: "c", count: 61)
+        XCTAssertEqual(longCollection.utf8.count, 317)
+        let path = try PublicRepositoryPath(
+            collection: longCollection,
+            recordKey: String(repeating: "z", count: 512)
+        )
+        XCTAssertEqual(path.mstKey, "\(longCollection)/\(String(repeating: "z", count: 512))")
+        XCTAssertLessThanOrEqual(path.mstKey.utf8.count, 1_024)
+    }
+
+    func testPathRejectsHostileNSIDs() {
+        for invalid in [
+            "com.example",
+            "1com.example.record",
+            "com..example.record",
+            "com.-example.record",
+            "com.example-.record",
+            "com.example.some-name",
+            "com.exa_mple.record",
+            "com.example." + String(repeating: "x", count: 64),
+        ] {
+            XCTAssertThrowsError(try PublicRepositoryPath(collection: invalid, recordKey: "ok")) {
+                XCTAssertEqual($0 as? PublicRepositoryDomainError, .invalidCollection)
+            }
+        }
+    }
+
+    func testPathRejectsHostileRecordKeysAndCountsCompleteKeyBytes() throws {
+        for invalid in ["", ".", "..", "bad/key", "bad%key", "space key", String(repeating: "x", count: 513)] {
+            XCTAssertThrowsError(try PublicRepositoryPath(collection: collection, recordKey: invalid)) {
+                XCTAssertEqual($0 as? PublicRepositoryDomainError, .invalidRecordKey)
+            }
+        }
+
+        let maximumCollection = String(repeating: "a", count: 63)
+            + "." + Array(repeating: String(repeating: "b", count: 63), count: 3).joined(separator: ".")
+            + "." + String(repeating: "c", count: 61)
+        let boundary = try PublicRepositoryPath(
+            collection: maximumCollection,
+            recordKey: String(repeating: "r", count: 512)
+        )
+        XCTAssertEqual(boundary.mstKey.utf8.count, 830)
+    }
+
+    func testTIDValidatesExactAlphabetLeadingRangeAndLexicalOrder() throws {
+        let first = try PublicRepositoryTID("2222222222222")
+        let second = try PublicRepositoryTID("2222222222223")
+        XCTAssertLessThan(first, second)
+        XCTAssertEqual(try PublicRepositoryTID("jzzzzzzzzzzzz").description, "jzzzzzzzzzzzz")
+
+        for invalid in [
+            "222222222222",
+            "22222222222222",
+            "k222222222222",
+            "1222222222222",
+            "2222222222220",
+            "222222222222I",
+        ] {
+            XCTAssertThrowsError(try PublicRepositoryTID(invalid)) {
+                XCTAssertEqual($0 as? PublicRepositoryDomainError, .invalidRevision)
+            }
+        }
+    }
+
+    func testRepositoryCIDBoundaryAcceptsOnlyBlessedTuple() throws {
+        let bytes = Data([0xa1, 0x61, 0x78, 0x01])
+        let cid = CID.fromDAGCBOR(bytes)
+        XCTAssertNoThrow(try PublicRepositoryCID.validate(cid))
+        XCTAssertNoThrow(try PublicRepositoryCID.validate(cid, blockBytes: bytes))
+
+        let raw = CID.fromBlob(bytes)
+        XCTAssertThrowsError(try PublicRepositoryCID.validate(raw)) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .unsupportedCID)
+        }
+        let wrongHash = CID(
+            codec: .dagCBOR,
+            multihash: Multihash(algorithm: Multihash.sha1Code, length: 20, digest: Data(repeating: 0, count: 20))
+        )
+        XCTAssertThrowsError(try PublicRepositoryCID.validate(wrongHash)) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .unsupportedCID)
+        }
+        XCTAssertThrowsError(try PublicRepositoryCID.validate(cid, blockBytes: Data([0]))) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .blockCIDMismatch)
+        }
+    }
+
+    func testRecordCodecRequiresMatchingTopLevelType() throws {
+        let path = try PublicRepositoryPath(collection: collection, recordKey: "3k2")
+        let valid: PublicRecord = [
+            "$type": .string(collection),
+            "text": .string("hello"),
+            "langs": .array([.string("en")]),
+            "replyCount": .integer(0),
+            "facets": .null,
+            "enabled": .bool(true),
+        ]
+        let prepared = try PublicRepositoryRecordCodec.prepare(valid, for: path)
+        XCTAssertEqual(prepared.cid, CID.fromDAGCBOR(prepared.bytes))
+        XCTAssertEqual(prepared.bytes, try PublicRepositoryRecordCodec.prepare(valid, for: path).bytes)
+
+        for invalid in [
+            PublicRecord(["text": .string("missing")]),
+            PublicRecord(["$type": .integer(1)]),
+            PublicRecord(["$type": .string("app.bsky.feed.like")]),
+        ] {
+            XCTAssertThrowsError(try PublicRepositoryRecordCodec.prepare(invalid, for: path)) {
+                XCTAssertEqual($0 as? PublicRepositoryDomainError, .invalidRecordType)
+            }
+        }
+    }
+
+    func testRecordEncodingIsCanonicalIndependentOfObjectInsertionOrder() throws {
+        let path = try PublicRepositoryPath(collection: collection, recordKey: "canonical")
+        let a = PublicRecord([
+            "zz": .integer(1),
+            "$type": .string(collection),
+            "a": .string("short"),
+        ])
+        let b = PublicRecord([
+            "a": .string("short"),
+            "$type": .string(collection),
+            "zz": .integer(1),
+        ])
+        XCTAssertEqual(
+            try PublicRepositoryRecordCodec.prepare(a, for: path),
+            try PublicRepositoryRecordCodec.prepare(b, for: path)
+        )
+    }
+
+    func testRecordCodecEnforcesDepthSizeAndEmbeddedLinkValidity() throws {
+        let path = try PublicRepositoryPath(collection: collection, recordKey: "limits")
+        let tinyLimits = try PublicRepositoryLimits(
+            maximumRecordBlockBytes: 32,
+            maximumCARBytes: PublicRepositoryLimits.requiredStreamingCARBytes,
+            maximumCARBlocks: 10,
+            maximumMSTNodes: 5,
+            maximumMSTEntriesPerNode: 5,
+            maximumCBORNestingDepth: 2
+        )
+        let tooLarge = PublicRecord([
+            "$type": .string(collection),
+            "text": .string(String(repeating: "x", count: 100)),
+        ])
+        XCTAssertThrowsError(try PublicRepositoryRecordCodec.prepare(tooLarge, for: path, limits: tinyLimits)) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .recordTooLarge)
+        }
+
+        let tooDeep = PublicRecord([
+            "$type": .string(collection),
+            "nested": .array([.object(["more": .array([.null])])]),
+        ])
+        XCTAssertThrowsError(try PublicRepositoryRecordCodec.prepare(tooDeep, for: path, limits: tinyLimits)) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .recordNestingTooDeep)
+        }
+
+        let invalidLink = CID(
+            codec: .dagPB,
+            multihash: Multihash.sha256(Data([1]))
+        )
+        let linked = PublicRecord([
+            "$type": .string(collection),
+            "subject": .link(invalidLink),
+        ])
+        XCTAssertThrowsError(try PublicRepositoryRecordCodec.prepare(linked, for: path)) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .invalidRecordLink)
+        }
+
+        let wrongHashLength = CID(
+            codec: .raw,
+            multihash: Multihash(
+                algorithm: Multihash.sha256Code,
+                length: 31,
+                digest: Data(repeating: 0, count: 31)
+            )
+        )
+        XCTAssertThrowsError(try PublicRepositoryRecordCodec.prepare(
+            PublicRecord(["$type": .string(collection), "blob": .link(wrongHashLength)]),
+            for: path
+        )) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .invalidRecordLink)
+        }
+
+        let validRawLink = CID.fromBlob(Data("blob".utf8))
+        XCTAssertNoThrow(try PublicRepositoryRecordCodec.prepare(
+            PublicRecord(["$type": .string(collection), "blob": .link(validRawLink)]),
+            for: path
+        ))
+    }
+
+    func testRecordCodecEnforcesInclusiveSignedSafeIntegerRange() throws {
+        let path = try PublicRepositoryPath(collection: collection, recordKey: "integers")
+        let boundaries = PublicRecord([
+            "$type": .string(collection),
+            "minimum": .integer(PublicRepositoryRecordCodec.minimumSafeInteger),
+            "maximum": .integer(PublicRepositoryRecordCodec.maximumSafeInteger),
+        ])
+        XCTAssertNoThrow(try PublicRepositoryRecordCodec.prepare(boundaries, for: path))
+
+        for invalid in [
+            PublicRepositoryRecordCodec.minimumSafeInteger - 1,
+            PublicRepositoryRecordCodec.maximumSafeInteger + 1,
+            Int.min,
+            Int.max,
+        ] {
+            XCTAssertThrowsError(try PublicRepositoryRecordCodec.prepare(
+                PublicRecord(["$type": .string(collection), "value": .integer(invalid)]),
+                for: path
+            )) {
+                XCTAssertEqual($0 as? PublicRepositoryDomainError, .invalidRecordInteger)
+            }
+        }
+    }
+
+    func testBlockMapRejectsMismatchAndConflictingDuplicates() throws {
+        let bytes = Data([0xa0])
+        let cid = CID.fromDAGCBOR(bytes)
+        let map = try PublicRepositoryBlockMap(blocks: [
+            .init(cid: cid, bytes: bytes),
+            .init(cid: cid, bytes: bytes),
+        ])
+        XCTAssertEqual(map.count, 1)
+        XCTAssertEqual(map.relevantByteCount, 1)
+        XCTAssertEqual(map.block(for: cid), bytes)
+
+        XCTAssertThrowsError(try PublicRepositoryBlockMap(blocks: [
+            .init(cid: cid, bytes: bytes),
+            .init(cid: cid, bytes: Data([0xa1])),
+        ])) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .duplicateBlockConflict)
+        }
+        XCTAssertThrowsError(try PublicRepositoryBlockMap(blocks: [
+            .init(cid: cid, bytes: Data([0xa1])),
+        ])) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .blockCIDMismatch)
+        }
+    }
+
+    func testBlockMapUsesUniqueRelevantBytesAndCheckedBudget() throws {
+        let first = Data([0xa0])
+        let second = Data([0x80])
+        let blocks = [
+            PublicRepositoryBlock(cid: CID.fromDAGCBOR(first), bytes: first),
+            PublicRepositoryBlock(cid: CID.fromDAGCBOR(second), bytes: second),
+        ]
+        XCTAssertThrowsError(try PublicRepositoryBlockMap(blocks: blocks, maximumRelevantBytes: 1)) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .relevantBlockBudgetExceeded)
+        }
+    }
+
+    func testBatchPreflightRejectsEmptyTooManyDuplicateAndMalformedCAS() throws {
+        let path = try PublicRepositoryPath(collection: collection, recordKey: "a")
+        let record = PublicRecord(["$type": .string(collection)])
+        XCTAssertThrowsError(try PublicRepositoryWriteBatch(writes: [])) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .emptyWriteBatch)
+        }
+        XCTAssertThrowsError(try PublicRepositoryWriteBatch(writes: [
+            .create(path: path, record: record),
+            .delete(path: path, expectedRecordCID: nil),
+        ])) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .duplicateWritePath)
+        }
+        XCTAssertThrowsError(try PublicRepositoryWriteBatch(
+            writes: Array(repeating: .create(path: path, record: record), count: 201)
+        )) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .tooManyWrites)
+        }
+
+        let unsupported = CID.fromBlob(Data([1]))
+        XCTAssertThrowsError(try PublicRepositoryWriteBatch(
+            writes: [.update(path: path, record: record, expectedRecordCID: unsupported)]
+        )) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .unsupportedCID)
+        }
+        XCTAssertThrowsError(try PublicRepositoryWriteBatch(
+            writes: [.create(path: path, record: record)],
+            expectedCommitCID: unsupported
+        )) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .unsupportedCID)
+        }
+    }
+
+    func testStateValidatesDIDTIDAndRepositoryCIDs() throws {
+        let cid = CID.fromDAGCBOR(Data([0xa0]))
+        XCTAssertNoThrow(try PublicRepositoryState(
+            did: "did:plc:abcdefghijklmnopqrstuvwxyz",
+            revision: "2222222222222",
+            commitCID: cid,
+            dataCID: cid
+        ))
+        XCTAssertThrowsError(try PublicRepositoryState(
+            did: "not a did",
+            revision: "2222222222222",
+            commitCID: cid,
+            dataCID: cid
+        )) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .invalidDID)
+        }
+    }
+}
