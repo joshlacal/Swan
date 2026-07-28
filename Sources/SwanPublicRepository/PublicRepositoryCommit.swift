@@ -97,7 +97,67 @@ public struct VerifiedPublicRepositorySignedCommit: Sendable, Equatable {
     }
 }
 
+/// A canonical signed commit whose schema and CID are valid, but whose
+/// signature has deliberately not been checked against an account key.
+public struct StructurallyValidatedPublicRepositorySignedCommit: Sendable, Equatable {
+    public let descriptor: PublicRepositoryCommitDescriptor
+    public let signature: Data
+    public let signedCommitBytes: Data
+    public let commitCID: CID
+
+    fileprivate init(
+        descriptor: PublicRepositoryCommitDescriptor,
+        signature: Data,
+        signedCommitBytes: Data,
+        commitCID: CID
+    ) {
+        self.descriptor = descriptor
+        self.signature = signature
+        self.signedCommitBytes = signedCommitBytes
+        self.commitCID = commitCID
+    }
+}
+
 public enum PublicRepositoryCommitCodec {
+    /// Strictly checks the canonical repository-v3 schema and CID without
+    /// making any cryptographic authenticity claim.
+    public static func structurallyValidate(
+        signedCommitBytes: Data,
+        expectedCommitCID: CID
+    ) throws -> StructurallyValidatedPublicRepositorySignedCommit {
+        do {
+            try PublicRepositoryCID.validate(
+                expectedCommitCID,
+                blockBytes: signedCommitBytes
+            )
+        } catch {
+            throw PublicRepositoryCommitError.invalidCommitCID
+        }
+        var parser = CommitCBORParser(signedCommitBytes)
+        let decoded = try parser.parseSignedCommit()
+        guard parser.isAtEnd else {
+            throw PublicRepositoryCommitError.invalidSchema
+        }
+        let descriptor = try PublicRepositoryCommitDescriptor(
+            did: decoded.did,
+            revision: decoded.revision,
+            dataCID: decoded.dataCID
+        )
+        guard decoded.signature.count == 64 else {
+            throw PublicRepositoryCommitError.invalidSignature
+        }
+        let canonical = try encodeSigned(descriptor, signature: decoded.signature)
+        guard canonical == signedCommitBytes else {
+            throw PublicRepositoryCommitError.nonCanonicalCBOR
+        }
+        return StructurallyValidatedPublicRepositorySignedCommit(
+            descriptor: descriptor,
+            signature: decoded.signature,
+            signedCommitBytes: signedCommitBytes,
+            commitCID: expectedCommitCID
+        )
+    }
+
     /// Returns the exact signed P-256 commit block size without invoking a
     /// signer. P-256 wire signatures are fixed-width, so the value is suitable
     /// for aggregate relevant-block budget enforcement before key use.

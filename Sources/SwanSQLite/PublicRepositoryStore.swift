@@ -115,15 +115,16 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
     ) async throws -> PublicRepositoryMutationReservationOutcome {
         try await withConnectionGate {
             try await transaction {
+                var mutatingSQLIndex = 0
                 guard let state = try await loadPublicRepositoryStateWithoutGate() else {
                     throw PublicRepositoryMutationStoreError.repositoryNotInstalled
                 }
                 let rows = try await connection.query(
                     """
-                    SELECT request_digest, base_commit_cid, base_revision,
+                    SELECT request_id, request_digest, base_commit_cid, base_revision,
                            next_revision, status, committed_commit_cid,
                            committed_data_cid, committed_projection,
-                           committed_projection_digest
+                           committed_projection_digest, integrity_digest
                     FROM public_repository_mutation_requests
                     WHERE request_id = ?
                     """,
@@ -133,7 +134,7 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                     throw PublicRepositoryMutationStoreError.corruptRepository
                 }
                 if let row = rows.first {
-                    return try decodeExistingRequest(
+                    return try await decodeExistingRequest(
                         row,
                         request: request,
                         repositoryDID: state.did
@@ -176,6 +177,17 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                     throw PublicRepositoryMutationStoreError.revisionExhausted
                 }
                 let nextRevision = Self.encodeRevision(nextValue)
+                let integrityDigest = Self.requestIntegrityDigest(
+                    requestID: request.id,
+                    requestDigest: request.canonicalDigest,
+                    baseCommitCID: request.baseCommitCID.string,
+                    baseRevision: state.revision,
+                    nextRevision: nextRevision,
+                    status: "reserved",
+                    committedCommitCID: nil,
+                    committedDataCID: nil,
+                    projection: nil
+                )
 
                 _ = try await connection.query(
                     """
@@ -185,12 +197,13 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                     """,
                     [.integer(Int(nextValue))]
                 )
+                try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
                 _ = try await connection.query(
                     """
                     INSERT INTO public_repository_mutation_requests(
                         request_id, request_digest, base_commit_cid, base_revision,
-                        next_revision, status
-                    ) VALUES (?, ?, ?, ?, ?, 'reserved')
+                        next_revision, status, integrity_digest
+                    ) VALUES (?, ?, ?, ?, ?, 'reserved', ?)
                     """,
                     [
                         .text(request.id),
@@ -198,8 +211,10 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                         .text(request.baseCommitCID.string),
                         .text(state.revision),
                         .text(nextRevision),
+                        integrityDigest.sqliteData!,
                     ]
                 )
+                try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
                 return .reserved(try PublicRepositoryMutationReservation(
                     request: request,
                     repositoryDID: state.did,
@@ -219,12 +234,13 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         }
         return try await withConnectionGate {
             try await transaction {
+                var mutatingSQLIndex = 0
                 let requestRows = try await connection.query(
                     """
-                    SELECT request_digest, base_commit_cid, base_revision,
+                    SELECT request_id, request_digest, base_commit_cid, base_revision,
                            next_revision, status, committed_commit_cid,
                            committed_data_cid, committed_projection,
-                           committed_projection_digest
+                           committed_projection_digest, integrity_digest
                     FROM public_repository_mutation_requests
                     WHERE request_id = ?
                     """,
@@ -233,7 +249,7 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 guard requestRows.count == 1, let requestRow = requestRows.first else {
                     throw PublicRepositoryMutationStoreError.reservationMismatch
                 }
-                let decoded = try decodeExistingRequest(
+                let decoded = try await decodeExistingRequest(
                     requestRow,
                     request: reservation.request,
                     repositoryDID: accountDID
@@ -263,6 +279,17 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 let projection = try await validatedProjection(
                     prepared.recordResults
                 )
+                let committedIntegrityDigest = Self.requestIntegrityDigest(
+                    requestID: reservation.request.id,
+                    requestDigest: reservation.request.canonicalDigest,
+                    baseCommitCID: reservation.request.baseCommitCID.string,
+                    baseRevision: reservation.baseRevision,
+                    nextRevision: reservation.nextRevision,
+                    status: "committed",
+                    committedCommitCID: prepared.state.commitCID.string,
+                    committedDataCID: prepared.state.dataCID.string,
+                    projection: projection
+                )
                 for cid in prepared.newBlocks.cids {
                     guard let bytes = try await prepared.newBlocks.block(for: cid) else {
                         throw PublicRepositoryMutationStoreError.preparedMutationMismatch
@@ -282,6 +309,7 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                             "INSERT INTO public_repository_blocks(cid, bytes) VALUES (?, ?)",
                             [.text(cid.string), bytes.sqliteData!]
                         )
+                        try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
                     }
                 }
 
@@ -305,6 +333,7 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                                 .text(recordCID.string),
                             ]
                         )
+                        try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
                     case .delete:
                         _ = try await connection.query(
                             """
@@ -313,10 +342,10 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                             """,
                             [.text(result.path.collection), .text(result.path.recordKey)]
                         )
+                        try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
                     }
                 }
 
-                try await testingHooks.beforePublicRepositoryCommit?()
                 let advanced = try await connection.query(
                     """
                     UPDATE public_repository_state
@@ -336,12 +365,13 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 guard advanced.count == 1 else {
                     throw PublicRepositoryMutationStoreError.commitCASConflict
                 }
+                try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
                 let marked = try await connection.query(
                     """
                     UPDATE public_repository_mutation_requests
                     SET status = 'committed', committed_commit_cid = ?,
                         committed_data_cid = ?, committed_projection = ?,
-                        committed_projection_digest = ?
+                        committed_projection_digest = ?, integrity_digest = ?
                     WHERE request_id = ? AND status = 'reserved'
                     RETURNING request_id
                     """,
@@ -350,18 +380,25 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                         .text(prepared.state.dataCID.string),
                         projection.sqliteData!,
                         Data(SHA256.hash(data: projection)).sqliteData!,
+                        committedIntegrityDigest.sqliteData!,
                         .text(reservation.request.id),
                     ]
                 )
                 guard marked.count == 1 else {
                     throw PublicRepositoryMutationStoreError.reservationMismatch
                 }
+                try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
                 return CommittedPublicRepositoryMutation(
                     state: prepared.state,
                     recordResults: prepared.recordResults
                 )
             }
         }
+    }
+
+    private func publicRepositorySQLDidMutate(index: inout Int) async throws {
+        index += 1
+        try await testingHooks.afterPublicRepositoryMutatingSQL?(index)
     }
 
     private static let maximumRevisionMicroseconds = UInt64(Int64.max) >> 10
@@ -394,6 +431,40 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         return value
     }
 
+    private static func requestIntegrityDigest(
+        requestID: String,
+        requestDigest: Data,
+        baseCommitCID: String,
+        baseRevision: String,
+        nextRevision: String,
+        status: String,
+        committedCommitCID: String?,
+        committedDataCID: String?,
+        projection: Data?
+    ) -> Data {
+        var bytes = Data("swan.public-repository-request.v1\u{0}".utf8)
+        func append(_ value: Data?) {
+            if let value {
+                bytes.append(1)
+                var length = UInt64(value.count).bigEndian
+                withUnsafeBytes(of: &length) { bytes.append(contentsOf: $0) }
+                bytes.append(value)
+            } else {
+                bytes.append(0)
+            }
+        }
+        append(Data(requestID.utf8))
+        append(requestDigest)
+        append(Data(baseCommitCID.utf8))
+        append(Data(baseRevision.utf8))
+        append(Data(nextRevision.utf8))
+        append(Data(status.utf8))
+        append(committedCommitCID.map { Data($0.utf8) })
+        append(committedDataCID.map { Data($0.utf8) })
+        append(projection)
+        return Data(SHA256.hash(data: bytes))
+    }
+
     private func loadPublicRepositoryStateWithoutGate() async throws -> PublicRepositoryState? {
         let rows = try await connection.query(
             """
@@ -416,18 +487,16 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 commitCID: try parseCID(try requiredText(row, "commit_cid")),
                 dataCID: try parseCID(try requiredText(row, "data_cid"))
             )
-            for cid in [state.commitCID, state.dataCID] {
-                let blockRows = try await connection.query(
-                    "SELECT bytes FROM public_repository_blocks WHERE cid = ?",
-                    [.text(cid.string)]
-                )
-                guard blockRows.count == 1,
-                      let value = blockRows[0].column("bytes"),
-                      let bytes = Data(sqliteData: value)
-                else {
-                    throw PublicRepositoryMutationStoreError.corruptRepository
-                }
-                try PublicRepositoryCID.validate(cid, blockBytes: bytes)
+            let commitBytes = try await blockBytesWithoutGate(state.commitCID)
+            _ = try await blockBytesWithoutGate(state.dataCID)
+            let commit = try structurallyValidatedCommit(
+                signedCommitBytes: commitBytes,
+                expectedCommitCID: state.commitCID
+            )
+            guard commit.descriptor.did == state.did,
+                  commit.descriptor.revision.value == state.revision,
+                  commit.descriptor.dataCID == state.dataCID else {
+                throw PublicRepositoryMutationStoreError.corruptRepository
             }
             return state
         } catch let error as PublicRepositoryMutationStoreError {
@@ -479,13 +548,14 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         _ row: SQLiteRow,
         request: PublicRepositoryMutationRequest,
         repositoryDID: String
-    ) throws -> PublicRepositoryMutationReservationOutcome {
+    ) async throws -> PublicRepositoryMutationReservationOutcome {
+        let storedRequestID = try requiredText(row, "request_id")
         guard let digestValue = row.column("request_digest"),
-              Data(sqliteData: digestValue) == request.canonicalDigest,
-              try requiredText(row, "base_commit_cid") == request.baseCommitCID.string
-        else {
-            throw PublicRepositoryMutationStoreError.conflictingRequestReuse
+              let storedRequestDigest = Data(sqliteData: digestValue),
+              storedRequestDigest.count == 32 else {
+            throw PublicRepositoryMutationStoreError.corruptRepository
         }
+        let storedBaseCommitCID = try requiredText(row, "base_commit_cid")
         let baseRevision = try requiredText(row, "base_revision")
         let nextRevision = try requiredText(row, "next_revision")
         _ = try Self.decodeAllocatableRevision(baseRevision)
@@ -496,19 +566,42 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
             baseRevision: baseRevision,
             nextRevision: nextRevision
         )
-        switch try requiredText(row, "status") {
+        let status = try requiredText(row, "status")
+        let committedCommitString = row.column("committed_commit_cid")?.string
+        let committedDataString = row.column("committed_data_cid")?.string
+        let projection = row.column("committed_projection").flatMap(Data.init(sqliteData:))
+        guard let integrityValue = row.column("integrity_digest"),
+              let storedIntegrity = Data(sqliteData: integrityValue),
+              storedIntegrity == Self.requestIntegrityDigest(
+                  requestID: storedRequestID,
+                  requestDigest: storedRequestDigest,
+                  baseCommitCID: storedBaseCommitCID,
+                  baseRevision: baseRevision,
+                  nextRevision: nextRevision,
+                  status: status,
+                  committedCommitCID: committedCommitString,
+                  committedDataCID: committedDataString,
+                  projection: projection
+              ) else {
+            throw PublicRepositoryMutationStoreError.corruptRepository
+        }
+        switch status {
         case "reserved":
-            guard row.column("committed_commit_cid")?.string == nil,
-                  row.column("committed_data_cid")?.string == nil,
-                  row.column("committed_projection").flatMap(Data.init(sqliteData:)) == nil,
+            guard committedCommitString == nil,
+                  committedDataString == nil,
+                  projection == nil,
                   row.column("committed_projection_digest").flatMap(Data.init(sqliteData:)) == nil
-            else {
-                throw PublicRepositoryMutationStoreError.corruptRepository
-            }
+        else {
+            throw PublicRepositoryMutationStoreError.corruptRepository
+        }
+        guard storedRequestID == request.id,
+              storedRequestDigest == request.canonicalDigest,
+              storedBaseCommitCID == request.baseCommitCID.string else {
+            throw PublicRepositoryMutationStoreError.conflictingRequestReuse
+        }
             return .reserved(reservation)
         case "committed":
-            guard let projectionValue = row.column("committed_projection"),
-                  let projection = Data(sqliteData: projectionValue),
+            guard let projection,
                   let digestValue = row.column("committed_projection_digest"),
                   let digest = Data(sqliteData: digestValue),
                   digest.count == 32,
@@ -521,11 +614,54 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 commitCID: try parseCID(try requiredText(row, "committed_commit_cid")),
                 dataCID: try parseCID(try requiredText(row, "committed_data_cid"))
             )
+            let commitBytes = try await blockBytesWithoutGate(state.commitCID)
+            _ = try await blockBytesWithoutGate(state.dataCID)
+            let commit = try structurallyValidatedCommit(
+                signedCommitBytes: commitBytes,
+                expectedCommitCID: state.commitCID
+            )
+            guard commit.descriptor.did == state.did,
+                  commit.descriptor.revision.value == state.revision,
+                  commit.descriptor.dataCID == state.dataCID else {
+                throw PublicRepositoryMutationStoreError.corruptRepository
+            }
             return .committed(CommittedPublicRepositoryMutation(
                 state: state,
                 recordResults: try decodeProjection(projection)
             ))
         default:
+            throw PublicRepositoryMutationStoreError.corruptRepository
+        }
+    }
+
+    private func blockBytesWithoutGate(_ cid: CID) async throws -> Data {
+        let rows = try await connection.query(
+            "SELECT bytes FROM public_repository_blocks WHERE cid = ?",
+            [.text(cid.string)]
+        )
+        guard rows.count == 1,
+              let value = rows[0].column("bytes"),
+              let bytes = Data(sqliteData: value) else {
+            throw PublicRepositoryMutationStoreError.corruptRepository
+        }
+        do {
+            try PublicRepositoryCID.validate(cid, blockBytes: bytes)
+        } catch {
+            throw PublicRepositoryMutationStoreError.corruptRepository
+        }
+        return bytes
+    }
+
+    private func structurallyValidatedCommit(
+        signedCommitBytes: Data,
+        expectedCommitCID: CID
+    ) throws -> StructurallyValidatedPublicRepositorySignedCommit {
+        do {
+            return try PublicRepositoryCommitCodec.structurallyValidate(
+                signedCommitBytes: signedCommitBytes,
+                expectedCommitCID: expectedCommitCID
+            )
+        } catch {
             throw PublicRepositoryMutationStoreError.corruptRepository
         }
     }

@@ -371,6 +371,7 @@ public enum SQLiteLayout {
                 committed_projection_digest IS NULL
                 OR length(committed_projection_digest) = 32
             ),
+            integrity_digest BLOB NOT NULL CHECK(length(integrity_digest) = 32),
             CHECK(
                 (status = 'reserved' AND committed_commit_cid IS NULL
                     AND committed_data_cid IS NULL AND committed_projection IS NULL
@@ -1005,7 +1006,7 @@ struct SQLiteTestingHooks: Sendable {
     var beforeBlobReferenceCommit: (@Sendable () async throws -> Void)?
     var beforeLegacyBlobMigrationCommit: (@Sendable () async throws -> Void)?
     var afterBlobReclaimCommit: (@Sendable () async throws -> Void)?
-    var beforePublicRepositoryCommit: (@Sendable () async throws -> Void)?
+    var afterPublicRepositoryMutatingSQL: (@Sendable (Int) async throws -> Void)?
 
     init(
         beforeApplyCommit: (@Sendable () async throws -> Void)? = nil,
@@ -1013,14 +1014,14 @@ struct SQLiteTestingHooks: Sendable {
         beforeBlobReferenceCommit: (@Sendable () async throws -> Void)? = nil,
         beforeLegacyBlobMigrationCommit: (@Sendable () async throws -> Void)? = nil,
         afterBlobReclaimCommit: (@Sendable () async throws -> Void)? = nil,
-        beforePublicRepositoryCommit: (@Sendable () async throws -> Void)? = nil
+        afterPublicRepositoryMutatingSQL: (@Sendable (Int) async throws -> Void)? = nil
     ) {
         self.beforeApplyCommit = beforeApplyCommit
         self.afterSnapshotStateRead = afterSnapshotStateRead
         self.beforeBlobReferenceCommit = beforeBlobReferenceCommit
         self.beforeLegacyBlobMigrationCommit = beforeLegacyBlobMigrationCommit
         self.afterBlobReclaimCommit = afterBlobReclaimCommit
-        self.beforePublicRepositoryCommit = beforePublicRepositoryCommit
+        self.afterPublicRepositoryMutatingSQL = afterPublicRepositoryMutatingSQL
     }
 }
 
@@ -1276,6 +1277,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             try await migrateFileBackedBlobSchemaIfNeeded()
             try await migrateFileBackedBlobLifecycleIfNeeded()
             try await migratePhysicalBlobCASLifecycleIfNeeded()
+            try await migratePublicRepositoryRequestIntegrityIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -1291,6 +1293,64 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                 _ = try await connection.query(statement)
             }
         }
+    }
+
+    private func migratePublicRepositoryRequestIntegrityIfNeeded() async throws {
+        let columns = try await connection.query(
+            "PRAGMA table_info(public_repository_mutation_requests)"
+        )
+        guard !columns.contains(where: {
+            $0.column("name")?.string == "integrity_digest"
+        }) else {
+            return
+        }
+        let rows = try await connection.query(
+            "SELECT COUNT(*) AS count FROM public_repository_mutation_requests"
+        )
+        guard case let .integer(count)? = rows.first?.column("count"),
+              count == 0 else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "legacy public repository request rows require offline recovery"
+            )
+        }
+        _ = try await connection.query(
+            """
+            ALTER TABLE public_repository_mutation_requests
+            RENAME TO public_repository_mutation_requests_pre_integrity
+            """
+        )
+        _ = try await connection.query(
+            """
+            CREATE TABLE public_repository_mutation_requests (
+                request_id TEXT PRIMARY KEY,
+                request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
+                base_commit_cid TEXT NOT NULL,
+                base_revision TEXT NOT NULL,
+                next_revision TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK(status IN ('reserved', 'committed')),
+                committed_commit_cid TEXT,
+                committed_data_cid TEXT,
+                committed_projection BLOB,
+                committed_projection_digest BLOB CHECK(
+                    committed_projection_digest IS NULL
+                    OR length(committed_projection_digest) = 32
+                ),
+                integrity_digest BLOB NOT NULL CHECK(length(integrity_digest) = 32),
+                CHECK(
+                    (status = 'reserved' AND committed_commit_cid IS NULL
+                        AND committed_data_cid IS NULL AND committed_projection IS NULL
+                        AND committed_projection_digest IS NULL)
+                    OR
+                    (status = 'committed' AND committed_commit_cid IS NOT NULL
+                        AND committed_data_cid IS NOT NULL AND committed_projection IS NOT NULL
+                        AND committed_projection_digest IS NOT NULL)
+                )
+            )
+            """
+        )
+        _ = try await connection.query(
+            "DROP TABLE public_repository_mutation_requests_pre_integrity"
+        )
     }
 
     /// Upgrades rows written before the persistence API owned its state marker

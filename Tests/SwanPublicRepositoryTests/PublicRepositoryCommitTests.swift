@@ -213,6 +213,26 @@ final class PublicRepositoryCommitTests: XCTestCase {
         }
     }
 
+    func testStructuralValidationDoesNotAssumeP256SignatureSemantics() throws {
+        let root = CID.fromDAGCBOR(PublicRepositoryGenesisCodec.canonicalEmptyMST)
+        let opaqueWireSignature = Data(repeating: 0xff, count: 64)
+        let bytes = try signedCommit(
+            did: did,
+            revision: revision,
+            dataCID: root,
+            signature: opaqueWireSignature
+        )
+        let structurallyValidated = try PublicRepositoryCommitCodec.structurallyValidate(
+            signedCommitBytes: bytes,
+            expectedCommitCID: CID.fromDAGCBOR(bytes)
+        )
+
+        XCTAssertEqual(structurallyValidated.descriptor.did, did)
+        XCTAssertEqual(structurallyValidated.descriptor.revision.value, revision)
+        XCTAssertEqual(structurallyValidated.descriptor.dataCID, root)
+        XCTAssertEqual(structurallyValidated.signature, opaqueWireSignature)
+    }
+
     func testUnsupportedAlgorithmsFailBeforeSignerOrVerifierSideEffects() async throws {
         let root = CID.fromDAGCBOR(PublicRepositoryGenesisCodec.canonicalEmptyMST)
         let unsupportedSigner = RecordingUnsupportedSigner()

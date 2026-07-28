@@ -309,47 +309,96 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
     }
 
     func testInjectedFailureRollsBackBlocksIndexStateAndReservationStatus() async throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let key = P256.Signing.PrivateKey()
-        let database = try await installedDatabase(root: root, key: key)
-        let maybeInitial = try await database.loadPublicRepositoryState()
-        let initial = try XCTUnwrap(maybeInitial)
-        let candidate = try await prepareCreate(
-            database: database,
-            state: initial,
-            key: key,
-            requestID: "rollback",
-            digestByte: 0x44,
-            rkey: "rollback",
-            clock: 1_750_000_000_000_000
-        )
-        await database.installTestingHooks(SQLiteTestingHooks(
-            beforePublicRepositoryCommit: { throw InjectedFailure.expected }
-        ))
-        await XCTAssertThrowsAsync(
-            try await database.applyPublicRepositoryMutation(
-                reservation: candidate.reservation,
-                prepared: candidate.prepared
+        for target in 1...6 {
+            let root = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let key = P256.Signing.PrivateKey()
+            let database = try await installedDatabase(root: root, key: key)
+            let maybeInitial = try await database.loadPublicRepositoryState()
+            let initial = try XCTUnwrap(maybeInitial)
+            let candidate = try await prepareCreate(
+                database: database,
+                state: initial,
+                key: key,
+                requestID: "rollback-\(target)",
+                digestByte: UInt8(0x40 + target),
+                rkey: "rollback-\(target)",
+                clock: 1_750_000_000_000_000
             )
-        ) { error in
-            XCTAssertEqual(error as? InjectedFailure, .expected)
-        }
-        await database.installTestingHooks(SQLiteTestingHooks())
+            XCTAssertEqual(candidate.prepared.newBlocks.count + 3, 6)
+            await database.installTestingHooks(SQLiteTestingHooks(
+                afterPublicRepositoryMutatingSQL: { index in
+                    if index == target { throw InjectedFailure.expected }
+                }
+            ))
+            await XCTAssertThrowsAsync(
+                try await database.applyPublicRepositoryMutation(
+                    reservation: candidate.reservation,
+                    prepared: candidate.prepared
+                )
+            ) { error in
+                XCTAssertEqual(error as? InjectedFailure, .expected)
+            }
+            try await database.close()
 
-        let stateAfterFailure = try await database.loadPublicRepositoryState()
-        let blockAfterFailure = try await database.block(for: candidate.prepared.state.commitCID)
-        let indexAfterFailure = try await database.publicRepositoryRecordCID(for: candidate.path)
-        XCTAssertEqual(stateAfterFailure, initial)
-        XCTAssertNil(blockAfterFailure)
-        XCTAssertNil(indexAfterFailure)
-        guard case .reserved = try await database.reservePublicRepositoryRevision(
-            candidate.reservation.request,
-            wallClockMicroseconds: 1
-        ) else {
-            return XCTFail("rolled-back request was falsely committed")
+            let reopened = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+            let stateAfterFailure = try await reopened.loadPublicRepositoryState()
+            XCTAssertEqual(stateAfterFailure, initial)
+            for cid in candidate.prepared.newBlocks.cids {
+                let stored = try await reopened.block(for: cid)
+                XCTAssertNil(stored)
+            }
+            let indexed = try await reopened.publicRepositoryRecordCID(
+                for: candidate.path
+            )
+            XCTAssertNil(indexed)
+            guard case .reserved = try await reopened.reservePublicRepositoryRevision(
+                candidate.reservation.request,
+                wallClockMicroseconds: 1
+            ) else {
+                return XCTFail("rolled-back request was falsely committed")
+            }
+            try await reopened.close()
         }
-        try await database.close()
+    }
+
+    func testReservationFailpointsRollbackAllocatorAndRequestTogether() async throws {
+        for target in 1...2 {
+            let root = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let key = P256.Signing.PrivateKey()
+            let database = try await installedDatabase(root: root, key: key)
+            let maybeState = try await database.loadPublicRepositoryState()
+            let state = try XCTUnwrap(maybeState)
+            let request = try PublicRepositoryMutationRequest(
+                id: "reserve-failure-\(target)",
+                canonicalDigest: Data(repeating: UInt8(target), count: 32),
+                baseCommitCID: state.commitCID
+            )
+            await database.installTestingHooks(SQLiteTestingHooks(
+                afterPublicRepositoryMutatingSQL: { index in
+                    if index == target { throw InjectedFailure.expected }
+                }
+            ))
+            await XCTAssertThrowsAsync(
+                try await database.reservePublicRepositoryRevision(
+                    request,
+                    wallClockMicroseconds: 1_750_000_000_000_000
+                )
+            ) {
+                XCTAssertEqual($0 as? InjectedFailure, .expected)
+            }
+            try await database.close()
+
+            let reopened = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+            guard case .reserved = try await reopened.reservePublicRepositoryRevision(
+                request,
+                wallClockMicroseconds: 1_750_000_000_000_000
+            ) else {
+                return XCTFail("rolled-back reservation persisted")
+            }
+            try await reopened.close()
+        }
     }
 
     func testInvalidRequestsAndOutOfAllocatableRangeFailTyped() async throws {
@@ -396,7 +445,12 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
             storage: .file(path: SQLiteLayout.accountDatabase(in: root, did: did).path)
         )
         _ = try await raw.query(
-            "UPDATE public_repository_state SET revision = 'jzzzzzzzzzzzz'"
+            """
+            INSERT INTO public_repository_revision_allocator(singleton, highest_value)
+            VALUES (1, ?)
+            ON CONFLICT(singleton) DO UPDATE SET highest_value = excluded.highest_value
+            """,
+            [.integer(Int.max)]
         )
         try await raw.close()
         let reopened = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
@@ -545,6 +599,247 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
         try await corrupted.close()
     }
 
+    func testValidMetadataSubstitutionsFailClosedAcrossStateReservationAndReplay() async throws {
+        enum StateField {
+            case revision
+            case commitCID
+            case dataCID
+        }
+        for field in [StateField.revision, .commitCID, .dataCID] {
+            let root = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let key = P256.Signing.PrivateKey()
+            let database = try await installedDatabase(root: root, key: key)
+            let maybeInitial = try await database.loadPublicRepositoryState()
+            let initial = try XCTUnwrap(maybeInitial)
+            let candidate = try await prepareCreate(
+                database: database,
+                state: initial,
+                key: key,
+                requestID: "state-substitution",
+                digestByte: 0x91,
+                rkey: "state-substitution",
+                clock: 1_750_000_000_000_000
+            )
+            _ = try await database.applyPublicRepositoryMutation(
+                reservation: candidate.reservation,
+                prepared: candidate.prepared
+            )
+            try await database.close()
+
+            let raw = try await openRawAccountDatabase(root: root)
+            switch field {
+            case .revision:
+                _ = try await raw.query(
+                    "UPDATE public_repository_state SET revision = ?",
+                    [.text(initial.revision)]
+                )
+            case .commitCID:
+                _ = try await raw.query(
+                    "UPDATE public_repository_state SET commit_cid = ?",
+                    [.text(candidate.prepared.state.dataCID.string)]
+                )
+            case .dataCID:
+                _ = try await raw.query(
+                    "UPDATE public_repository_state SET data_cid = ?",
+                    [.text(initial.dataCID.string)]
+                )
+            }
+            try await raw.close()
+
+            let corrupted = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+            await XCTAssertThrowsAsync(
+                try await corrupted.loadPublicRepositoryState()
+            ) {
+                XCTAssertEqual(
+                    $0 as? PublicRepositoryMutationStoreError,
+                    .corruptRepository
+                )
+            }
+            try await corrupted.close()
+        }
+
+        let reservationRoot = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: reservationRoot) }
+        let reservationKey = P256.Signing.PrivateKey()
+        let reservationDatabase = try await installedDatabase(
+            root: reservationRoot,
+            key: reservationKey
+        )
+        let maybeReservationState = try await reservationDatabase
+            .loadPublicRepositoryState()
+        let reservationState = try XCTUnwrap(maybeReservationState)
+        let reservationRequest = try PublicRepositoryMutationRequest(
+            id: "reserved-next-substitution",
+            canonicalDigest: Data(repeating: 0x92, count: 32),
+            baseCommitCID: reservationState.commitCID
+        )
+        _ = try await reservationDatabase.reservePublicRepositoryRevision(
+            reservationRequest,
+            wallClockMicroseconds: 1_750_000_000_000_000
+        )
+        try await reservationDatabase.close()
+        let reservationRaw = try await openRawAccountDatabase(root: reservationRoot)
+        _ = try await reservationRaw.query(
+            """
+            UPDATE public_repository_mutation_requests
+            SET next_revision = ? WHERE request_id = ?
+            """,
+            [.text(genesisRevision), .text(reservationRequest.id)]
+        )
+        try await reservationRaw.close()
+        let corruptedReservation = try await SQLiteAccountDatabase(
+            dataDirectory: reservationRoot,
+            did: did
+        )
+        await XCTAssertThrowsAsync(
+            try await corruptedReservation.reservePublicRepositoryRevision(
+                reservationRequest,
+                wallClockMicroseconds: 1
+            )
+        ) {
+            XCTAssertEqual(
+                $0 as? PublicRepositoryMutationStoreError,
+                .corruptRepository
+            )
+        }
+        try await corruptedReservation.close()
+
+        for column in [
+            "committed_commit_cid",
+            "committed_data_cid",
+            "committed_projection",
+        ] {
+            let root = try temporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let key = P256.Signing.PrivateKey()
+            let database = try await installedDatabase(root: root, key: key)
+            let maybeState = try await database.loadPublicRepositoryState()
+            let state = try XCTUnwrap(maybeState)
+            let candidate = try await prepareCreate(
+                database: database,
+                state: state,
+                key: key,
+                requestID: "replay-\(column)",
+                digestByte: 0x93,
+                rkey: "replay-\(column)",
+                clock: 1_750_000_000_000_000
+            )
+            _ = try await database.applyPublicRepositoryMutation(
+                reservation: candidate.reservation,
+                prepared: candidate.prepared
+            )
+            try await database.close()
+            let raw = try await openRawAccountDatabase(root: root)
+            if column == "committed_projection" {
+                let substituted = Data("[]".utf8)
+                _ = try await raw.query(
+                    """
+                    UPDATE public_repository_mutation_requests
+                    SET committed_projection = ?, committed_projection_digest = ?
+                    WHERE request_id = ?
+                    """,
+                    [
+                        substituted.sqliteData!,
+                        Data(SHA256.hash(data: substituted)).sqliteData!,
+                        .text(candidate.reservation.request.id),
+                    ]
+                )
+            } else {
+                let substituted = column == "committed_commit_cid"
+                    ? candidate.prepared.state.dataCID.string
+                    : candidate.prepared.state.commitCID.string
+                _ = try await raw.query(
+                    """
+                    UPDATE public_repository_mutation_requests
+                    SET \(column) = ? WHERE request_id = ?
+                    """,
+                    [.text(substituted), .text(candidate.reservation.request.id)]
+                )
+            }
+            try await raw.close()
+            let corrupted = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+            await XCTAssertThrowsAsync(
+                try await corrupted.reservePublicRepositoryRevision(
+                    candidate.reservation.request,
+                    wallClockMicroseconds: 1
+                )
+            ) {
+                XCTAssertEqual(
+                    $0 as? PublicRepositoryMutationStoreError,
+                    .corruptRepository
+                )
+            }
+            try await corrupted.close()
+        }
+    }
+
+    func testLegacyRequestTableUpgradeIsEmptyOnlyAndFailsClosedWithRows() async throws {
+        let emptyRoot = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: emptyRoot) }
+        let emptyKey = P256.Signing.PrivateKey()
+        let emptyDatabase = try await installedDatabase(root: emptyRoot, key: emptyKey)
+        try await emptyDatabase.close()
+        let emptyRaw = try await openRawAccountDatabase(root: emptyRoot)
+        try await replaceRequestTableWithLegacySchema(connection: emptyRaw)
+        try await emptyRaw.close()
+
+        let upgraded = try await SQLiteAccountDatabase(dataDirectory: emptyRoot, did: did)
+        let maybeState = try await upgraded.loadPublicRepositoryState()
+        let state = try XCTUnwrap(maybeState)
+        let request = try PublicRepositoryMutationRequest(
+            id: "after-empty-upgrade",
+            canonicalDigest: Data(repeating: 0xa1, count: 32),
+            baseCommitCID: state.commitCID
+        )
+        guard case .reserved = try await upgraded.reservePublicRepositoryRevision(
+            request,
+            wallClockMicroseconds: 1
+        ) else {
+            return XCTFail("empty legacy request table did not upgrade")
+        }
+        try await upgraded.close()
+
+        let occupiedRoot = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: occupiedRoot) }
+        let occupiedKey = P256.Signing.PrivateKey()
+        let occupiedDatabase = try await installedDatabase(
+            root: occupiedRoot,
+            key: occupiedKey
+        )
+        let maybeOccupiedState = try await occupiedDatabase.loadPublicRepositoryState()
+        let occupiedState = try XCTUnwrap(maybeOccupiedState)
+        try await occupiedDatabase.close()
+        let occupiedRaw = try await openRawAccountDatabase(root: occupiedRoot)
+        try await replaceRequestTableWithLegacySchema(connection: occupiedRaw)
+        _ = try await occupiedRaw.query(
+            """
+            INSERT INTO public_repository_mutation_requests(
+                request_id, request_digest, base_commit_cid, base_revision,
+                next_revision, status
+            ) VALUES (?, ?, ?, ?, ?, 'reserved')
+            """,
+            [
+                .text("legacy-row"),
+                Data(repeating: 0xa2, count: 32).sqliteData!,
+                .text(occupiedState.commitCID.string),
+                .text(occupiedState.revision),
+                .text("3jzfcijpj2z2b"),
+            ]
+        )
+        try await occupiedRaw.close()
+        await XCTAssertThrowsAsync(
+            try await SQLiteAccountDatabase(dataDirectory: occupiedRoot, did: did)
+        ) {
+            XCTAssertEqual(
+                $0 as? SQLiteRepositoryError,
+                .corruptDatabase(
+                    "legacy public repository request rows require offline recovery"
+                )
+            )
+        }
+    }
+
     func testRepositoryTruthUsesAccountWALAndNeverControlDatabase() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -652,6 +947,48 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
                 signer: P256PublicRepositoryCommitSigner(privateKey: key)
             ),
             path: path
+        )
+    }
+
+    private func openRawAccountDatabase(root: URL) async throws -> SQLiteConnection {
+        try await SQLiteConnection.open(
+            storage: .file(path: SQLiteLayout.accountDatabase(in: root, did: did).path)
+        )
+    }
+
+    private func replaceRequestTableWithLegacySchema(
+        connection: SQLiteConnection
+    ) async throws {
+        _ = try await connection.query(
+            "DROP TABLE public_repository_mutation_requests"
+        )
+        _ = try await connection.query(
+            """
+            CREATE TABLE public_repository_mutation_requests (
+                request_id TEXT PRIMARY KEY,
+                request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
+                base_commit_cid TEXT NOT NULL,
+                base_revision TEXT NOT NULL,
+                next_revision TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK(status IN ('reserved', 'committed')),
+                committed_commit_cid TEXT,
+                committed_data_cid TEXT,
+                committed_projection BLOB,
+                committed_projection_digest BLOB CHECK(
+                    committed_projection_digest IS NULL
+                    OR length(committed_projection_digest) = 32
+                ),
+                CHECK(
+                    (status = 'reserved' AND committed_commit_cid IS NULL
+                        AND committed_data_cid IS NULL AND committed_projection IS NULL
+                        AND committed_projection_digest IS NULL)
+                    OR
+                    (status = 'committed' AND committed_commit_cid IS NOT NULL
+                        AND committed_data_cid IS NOT NULL AND committed_projection IS NOT NULL
+                        AND committed_projection_digest IS NOT NULL)
+                )
+            )
+            """
         )
     }
 
