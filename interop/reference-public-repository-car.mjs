@@ -27,10 +27,8 @@ if (fixture.pin !== '3f6c96d5d2d25438bd40fa89d6ecc37865f8e354') {
 const repo = await import(
   pathToFileURL(path.join(options.reference, 'packages/repo/dist/index.js')).href
 )
-for (const [producer, entry] of [
-  ['TypeScript', fixture],
-  ['Swift', fixture.swift],
-]) {
+
+async function verifyEntry(producer, entry, expectedRecords) {
   const car = Buffer.from(entry.carBase64, 'base64')
   if (car.length === 0 || car.toString('base64') !== entry.carBase64) {
     fail(`${producer} fixture CAR is not canonical base64`)
@@ -46,15 +44,30 @@ for (const [producer, entry] of [
   if (verified.commit.rev !== fixture.revision) {
     fail(`${producer} verified revision differs`)
   }
-  if (verified.creates.length !== 1) {
-    fail(`${producer} fixture does not contain exactly one create`)
+  if (verified.creates.length !== expectedRecords.length) {
+    fail(`${producer} fixture create count differs`)
   }
-  const create = verified.creates[0]
-  if (
-    create.collection !== fixture.record.collection ||
-    create.rkey !== fixture.record.rkey
-  ) {
-    fail(`${producer} verified record path differs`)
+  const actualPaths = verified.creates
+    .map((create) => `${create.collection}/${create.rkey}`)
+    .sort()
+  const expectedPaths = expectedRecords
+    .map((record) => `${record.collection}/${record.rkey}`)
+    .sort()
+  if (JSON.stringify(actualPaths) !== JSON.stringify(expectedPaths)) {
+    fail(`${producer} verified record paths differ`)
+  }
+  if (entry.blockOrder) {
+    const parsed = await repo.readCarWithRoot(car)
+    const actualOrder = []
+    for (const block of parsed.blocks.entries()) {
+      actualOrder.push(block.cid.toString())
+    }
+    if (JSON.stringify(actualOrder) !== JSON.stringify(entry.blockOrder)) {
+      fail(`${producer} CAR block order differs`)
+    }
+    if (entry.blockOrder[0] !== entry.commitCID || entry.blockOrder[1] !== entry.dataCID) {
+      fail(`${producer} CAR root ordering facts differ`)
+    }
   }
 
   const storage = new repo.MemoryBlockstore()
@@ -66,5 +79,13 @@ for (const [producer, entry] of [
     fail(`${producer} pinned TypeScript full-repository re-export differs`)
   }
 }
+
+for (const [producer, entry] of [
+  ['TypeScript', fixture],
+  ['Swift', fixture.swift],
+]) {
+  await verifyEntry(producer, entry, [fixture.record])
+}
+await verifyEntry('TypeScript multi-layer', fixture.multiLayer, fixture.multiLayer.records)
 
 console.log(`REFERENCE PUBLIC REPOSITORY CAR OK: ${path.basename(options.fixture)}`)

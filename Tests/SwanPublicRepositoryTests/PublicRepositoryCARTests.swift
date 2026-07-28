@@ -24,6 +24,52 @@ final class PublicRepositoryCARTests: XCTestCase {
         }
     }
 
+    func testImportParserCoversEveryUInt64VarintTransitionAndOverlongForm() async {
+        let transitions: [UInt64] = [
+            0,
+            (1 << 7) - 1, 1 << 7,
+            (1 << 14) - 1, 1 << 14,
+            (1 << 21) - 1, 1 << 21,
+            (1 << 28) - 1, 1 << 28,
+            (1 << 35) - 1, 1 << 35,
+            (1 << 42) - 1, 1 << 42,
+            (1 << 49) - 1, 1 << 49,
+            (1 << 56) - 1, 1 << 56,
+            (1 << 63) - 1, 1 << 63,
+            UInt64.max,
+        ]
+
+        for value in transitions {
+            let encoded = PublicRepositoryCAR.canonicalUnsignedVarint(value)
+            let expected: PublicRepositoryCARError =
+                value == 0 ? .invalidRootCount
+                : value <= 1_024 ? .malformedFrame
+                : .malformedHeader
+            await assertImportError(expected, encoded)
+
+            if encoded.count < 10 {
+                var overlong = encoded
+                overlong[overlong.count - 1] |= 0x80
+                overlong.append(0)
+                await assertImportError(.nonCanonicalVarint, overlong)
+            }
+        }
+    }
+
+    func testImportParserRejectsMalformedTenthByteAndTenByteOverlongForms() async {
+        let cases: [(Data, PublicRepositoryCARError)] = [
+            (Data(repeating: 0x80, count: 9) + Data([0x02]), .malformedVarint),
+            (Data(repeating: 0x80, count: 10), .malformedVarint),
+            (Data(repeating: 0xff, count: 9) + Data([0x81]), .malformedVarint),
+            (Data(repeating: 0x80, count: 9) + Data([0x00]), .nonCanonicalVarint),
+            (Data(repeating: 0x80, count: 9) + Data([0x01]), .malformedHeader),
+            (Data(repeating: 0xff, count: 9) + Data([0x01]), .malformedHeader),
+        ]
+        for (encoded, expected) in cases {
+            await assertImportError(expected, encoded)
+        }
+    }
+
     func testWriterEmitsCanonicalHeaderAndSeparateBoundedChunks() async throws {
         let blockBytes = Data([0xa1, 0x61, 0x78, 0x01])
         let blockCID = CID.fromDAGCBOR(blockBytes)
@@ -227,6 +273,82 @@ final class PublicRepositoryCARTests: XCTestCase {
         XCTAssertLessThan(bytesWritten, bytes.count)
     }
 
+    func testWriterIndependentlyEnforcesTotalByteAndBlockCountLimits() async throws {
+        let oneMiB = Data(repeating: 0x31, count: 1_000_000)
+        let large = PublicRepositoryBlock(cid: CID.fromDAGCBOR(oneMiB), bytes: oneMiB)
+        let totalLimited = try PublicRepositoryLimits(
+            maximumRecordBlockBytes: 1_000_000,
+            maximumCARBytes: PublicRepositoryLimits.requiredStreamingCARBytes,
+            maximumCARBlocks: 1_000,
+            maximumMSTNodes: 500,
+            maximumMSTEntriesPerNode: 100,
+            maximumCBORNestingDepth: 16
+        )
+        do {
+            _ = try await PublicRepositoryCAR.write(
+                rootCID: large.cid,
+                blocks: RepeatingCARBlockStream(block: large, count: 269),
+                to: CountingCARSink(),
+                limits: totalLimited
+            )
+            XCTFail("expected total byte limit")
+        } catch {
+            XCTAssertEqual(error as? PublicRepositoryCARError, .byteLimitExceeded)
+        }
+
+        let smallBytes = Data([0xa1, 0x61, 0x78, 0x01])
+        let small = PublicRepositoryBlock(cid: CID.fromDAGCBOR(smallBytes), bytes: smallBytes)
+        let blockLimited = try PublicRepositoryLimits(
+            maximumRecordBlockBytes: 1_000,
+            maximumCARBytes: PublicRepositoryLimits.requiredStreamingCARBytes,
+            maximumCARBlocks: 1,
+            maximumMSTNodes: 1,
+            maximumMSTEntriesPerNode: 10,
+            maximumCBORNestingDepth: 8
+        )
+        do {
+            _ = try await PublicRepositoryCAR.write(
+                rootCID: small.cid,
+                blocks: RepeatingCARBlockStream(block: small, count: 2),
+                to: CountingCARSink(),
+                limits: blockLimited
+            )
+            XCTFail("expected block count limit")
+        } catch {
+            XCTAssertEqual(error as? PublicRepositoryCARError, .blockLimitExceeded)
+        }
+    }
+
+    func testImportIndependentlyRejectsDeclaredBodyCapAndMultipleRoots() async throws {
+        let root = CID.fromDAGCBOR(Data([0xa0]))
+        let header = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "roots", value: [ATProtoLink(cid: root)]),
+            (key: "version", value: 1),
+        ]))
+        let declaredOversize = PublicRepositoryCAR.canonicalUnsignedVarint(UInt64(header.count))
+            + header
+            + PublicRepositoryCAR.canonicalUnsignedVarint(UInt64(36 + 1_001))
+        let limits = try PublicRepositoryLimits(
+            maximumRecordBlockBytes: 1_000,
+            maximumCARBytes: PublicRepositoryLimits.requiredStreamingCARBytes,
+            maximumCARBlocks: 10,
+            maximumMSTNodes: 10,
+            maximumMSTEntriesPerNode: 10,
+            maximumCBORNestingDepth: 8
+        )
+        await assertImportError(.blockBodyLimitExceeded, declaredOversize, limits: limits)
+
+        let other = CID.fromDAGCBOR(Data([0xa1, 0x61, 0x78, 0x01]))
+        let multipleRootsHeader = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "roots", value: [ATProtoLink(cid: root), ATProtoLink(cid: other)]),
+            (key: "version", value: 1),
+        ]))
+        let multipleRoots =
+            PublicRepositoryCAR.canonicalUnsignedVarint(UInt64(multipleRootsHeader.count))
+            + multipleRootsHeader
+        await assertImportError(.invalidRootCount, multipleRoots)
+    }
+
     func testLargeWriterUsesBoundedChunksAndPropagatesSinkFailure() async throws {
         let oneMiB = Data(repeating: 0x7a, count: 1_000_000)
         let block = PublicRepositoryBlock(cid: CID.fromDAGCBOR(oneMiB), bytes: oneMiB)
@@ -414,6 +536,38 @@ final class PublicRepositoryCARTests: XCTestCase {
         )
         XCTAssertEqual(importedSwift.state.commitCID.string, fixture.swift.commitCID)
         XCTAssertEqual(importedSwift.repository.leaves.map(\.path), imported.repository.leaves.map(\.path))
+    }
+
+    func testPinnedTypeScriptMultiLayerCARHasExactIndependentBlockOrderAndRecords() async throws {
+        let fixture = try PinnedNonEmptyCARFixture.load()
+        let vector = fixture.multiLayer
+        let car = try XCTUnwrap(Data(base64Encoded: vector.carBase64))
+        let key = try P256.Signing.PrivateKey(rawRepresentation: Data(repeating: 1, count: 32))
+        let imported = try await PublicRepositoryCAR.importRepository(
+            from: ChunkedCARSource(car, chunkSizes: [1, 5, 2, 31, 3]),
+            verifier: P256PublicRepositoryCommitVerifier(publicKey: key.publicKey)
+        )
+
+        XCTAssertEqual(imported.state.commitCID.string, vector.commitCID)
+        XCTAssertEqual(imported.state.dataCID.string, vector.dataCID)
+        let actualOrder = try framedBlockCIDs(car).map(\.string)
+        XCTAssertEqual(actualOrder, vector.blockOrder)
+        XCTAssertGreaterThan(Set(imported.repository.leaves.map {
+            RepositoryMSTCodec.keyDepth(for: $0.path)
+        }).count, 1)
+        XCTAssertEqual(
+            imported.repository.leaves.map(\.path.mstKey),
+            vector.records.map { "\($0.collection)/\($0.rkey)" }.sorted()
+        )
+
+        let sink = RecordingCARSink()
+        _ = try await PublicRepositoryCAR.export(
+            signedCommit: imported.signedCommit,
+            blocks: imported.reachableBlocks,
+            to: sink
+        )
+        let reexported = await sink.dataValue()
+        XCTAssertEqual(reexported, car)
     }
 
     private func makeRepositoryFixture() async throws -> (
@@ -627,6 +781,26 @@ final class PublicRepositoryCARTests: XCTestCase {
             XCTAssertTrue(error is PublicRepositoryCARError, "\(error)", file: file, line: line)
         }
     }
+
+    private func assertImportError(
+        _ expected: PublicRepositoryCARError,
+        _ car: Data,
+        limits: PublicRepositoryLimits = .standard,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            let key = try P256.Signing.PrivateKey(rawRepresentation: Data(repeating: 1, count: 32))
+            _ = try await PublicRepositoryCAR.importRepository(
+                from: ChunkedCARSource(car, chunkSizes: [1, 2, 3]),
+                verifier: P256PublicRepositoryCommitVerifier(publicKey: key.publicKey),
+                limits: limits
+            )
+            XCTFail("expected \(expected)", file: file, line: line)
+        } catch {
+            XCTAssertEqual(error as? PublicRepositoryCARError, expected, file: file, line: line)
+        }
+    }
 }
 
 private actor RecordingCARSink: PublicRepositoryCARByteSink {
@@ -638,6 +812,7 @@ private actor RecordingCARSink: PublicRepositoryCARByteSink {
 
     var data: Data { writes.reduce(into: Data(), { $0.append($1) }) }
     var byteCount: Int { writes.reduce(0) { $0 + $1.count } }
+    func dataValue() -> Data { data }
 }
 
 private actor ArrayCARBlockStream: PublicRepositoryCARBlockStream {
@@ -786,12 +961,21 @@ private struct PinnedNonEmptyCARFixture: Decodable {
         let text: String
     }
 
+    struct MultiLayer: Decodable {
+        let commitCID: String
+        let dataCID: String
+        let carBase64: String
+        let blockOrder: [String]
+        let records: [Record]
+    }
+
     let did: String
     let revision: String
     let commitCID: String
     let carBase64: String
     let record: Record
     let swift: CAR
+    let multiLayer: MultiLayer
 
     static func load() throws -> Self {
         let packageRoot = URL(fileURLWithPath: #filePath)
