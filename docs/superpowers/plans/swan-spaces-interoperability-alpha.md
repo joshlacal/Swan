@@ -127,11 +127,20 @@ checksum-verified way to populate the ignored reference cache.
   enforce a bound space credential, and verify public/private blob namespace
   isolation. The artifact is summary-only and explicitly does not claim that
   the pinned TypeScript PDS participated.
+- The callable `swan lab live` runner now drives selector-bound public
+  `repo.putRecord`/`repo.getRecord` and permissioned delegation/credential
+  `space.createRecord`/`space.getRecord` flows. It keeps OAuth DPoP proofs and
+  bearer credentials out of artifacts and compares returned record CIDs. Its
+  XRPC path construction is covered directly, including DPoP-bound query
+  ordering.
 - Task 43's independent rereview is recorded under
   `.superpowers/sdd/swan-spaces-interoperability-alpha/task-43-rereview-2026-07-28.md`.
   Its scoped public-read verdict is PASS: `PublicRepositoryReadHTTPTests`
   executes 8/8, the opt-in 256 MiB production-directory RSS gate passes, and
   the serialized macOS suite passes.
+- The explicit 256 MiB bounded-transfer gates pass for the permissioned CAR
+  spool, private blob CAS stream, and staged CAR import. These are local
+  memory/streaming gates; they do not replace Docker or Linux evidence.
 - The pinned TypeScript source cache was booted in a disposable localhost
   smoke runtime. Account creation, authenticated public record creation,
   record read/list, and `sync.getRepo` succeeded. Blob upload remained staged

@@ -49,6 +49,10 @@ Using the pinned Xcode toolchain with `--jobs 1`:
   `Scripts/test-verify-interop-lab.sh`: passed.
 - `git diff --check`: passed.
 - `swift build`: passed.
+- The explicit private-transfer gates also pass with the pinned Xcode
+  toolchain: the 256 MiB permissioned CAR spool, 256 MiB private CAS blob
+  stream, and 256 MiB staged CAR import all complete with bounded chunks and
+  no failures.
 - The offline `swan lab semantic` command now runs two independent durable
   SQLite roots through incremental replay, duplicate/reordered delivery,
   retention-gap full recovery, two-root CAR verification/corruption rejection,
@@ -121,3 +125,10 @@ response digests. A CLI test exercises the failure path against an unavailable
 loopback endpoint and verifies that the private record value is absent from
 the artifact. This is a runnable harness, not live matrix evidence: Docker,
 Linux, and the pinned TypeScript cross-host run remain required external gates.
+
+## 2026-07-28 live-client correctness checkpoint
+
+The live runner now constructs the actual `/xrpc/<nsid>` path rather than a
+literal placeholder. A direct test covers the NSID and canonical query
+ordering, which is important because OAuth DPoP proofs bind to that exact
+request target. The fix is committed as `0ec5467e` in the Swan jj history.
