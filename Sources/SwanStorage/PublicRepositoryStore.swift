@@ -94,4 +94,7 @@ public protocol PublicRepositoryMutationStore: PublicRepositoryBlockSource {
         reservation: PublicRepositoryMutationReservation,
         prepared: PreparedPublicRepositoryMutation
     ) async throws -> CommittedPublicRepositoryMutation
+    func abandonPublicRepositoryReservation(
+        _ reservation: PublicRepositoryMutationReservation
+    ) async throws
 }

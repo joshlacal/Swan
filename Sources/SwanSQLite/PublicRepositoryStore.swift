@@ -396,6 +396,39 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         }
     }
 
+    public func abandonPublicRepositoryReservation(
+        _ reservation: PublicRepositoryMutationReservation
+    ) async throws {
+        guard reservation.repositoryDID == accountDID else {
+            throw PublicRepositoryMutationStoreError.ownershipMismatch
+        }
+        try await withConnectionGate {
+            try await transaction {
+                let rows = try await connection.query(
+                    "SELECT status, base_commit_cid, base_revision, next_revision, request_digest FROM public_repository_mutation_requests WHERE request_id = ?",
+                    [.text(reservation.request.id)]
+                )
+                guard let row = rows.first,
+                      try requiredText(row, "status") == "reserved" else { return }
+                let digest = Data(sqliteData: row.column("request_digest")!)!
+                let baseCID = try requiredText(row, "base_commit_cid")
+                let baseRevision = try requiredText(row, "base_revision")
+                let nextRevision = try requiredText(row, "next_revision")
+                let integrity = Self.requestIntegrityDigest(
+                    requestID: reservation.request.id, requestDigest: digest,
+                    baseCommitCID: baseCID, baseRevision: baseRevision,
+                    nextRevision: nextRevision, status: "abandoned",
+                    committedCommitCID: nil, committedDataCID: nil,
+                    projection: nil
+                )
+                _ = try await connection.query(
+                    "UPDATE public_repository_mutation_requests SET status = 'abandoned', integrity_digest = ? WHERE request_id = ? AND status = 'reserved'",
+                    [integrity.sqliteData!, .text(reservation.request.id)]
+                )
+            }
+        }
+    }
+
     private func publicRepositorySQLDidMutate(index: inout Int) async throws {
         index += 1
         try await testingHooks.afterPublicRepositoryMutatingSQL?(index)
@@ -629,6 +662,8 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 state: state,
                 recordResults: try decodeProjection(projection)
             ))
+        case "abandoned":
+            throw PublicRepositoryMutationStoreError.reservationMismatch
         default:
             throw PublicRepositoryMutationStoreError.corruptRepository
         }

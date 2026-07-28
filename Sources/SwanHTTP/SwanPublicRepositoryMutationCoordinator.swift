@@ -61,8 +61,10 @@ public enum SwanPublicRepositoryMutationCoordinator {
                     )
                     return try await store.applyPublicRepositoryMutation(reservation: reservation, prepared: prepared)
                 } catch let error as PublicRepositoryMutationStoreError where error == .commitCASConflict && !callerSuppliedSwap && attempts < 2 {
+                    try? await store.abandonPublicRepositoryReservation(reservation)
                     continue
                 } catch {
+                    try? await store.abandonPublicRepositoryReservation(reservation)
                     throw map(error)
                 }
             }
@@ -194,9 +196,11 @@ public enum SwanPublicRepositoryMutationCoordinator {
                     guard error == .commitCASConflict,
                           !callerSuppliedSwap,
                           attempts < 2 else {
+                        try? await store.abandonPublicRepositoryReservation(reservation)
                         throw map(error)
                     }
                 } catch {
+                    try? await store.abandonPublicRepositoryReservation(reservation)
                     throw map(error)
                 }
             }

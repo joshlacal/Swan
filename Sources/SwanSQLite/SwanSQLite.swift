@@ -363,7 +363,7 @@ public enum SQLiteLayout {
             base_commit_cid TEXT NOT NULL,
             base_revision TEXT NOT NULL,
             next_revision TEXT NOT NULL UNIQUE,
-            status TEXT NOT NULL CHECK(status IN ('reserved', 'committed')),
+            status TEXT NOT NULL CHECK(status IN ('reserved', 'committed', 'abandoned')),
             committed_commit_cid TEXT,
             committed_data_cid TEXT,
             committed_projection BLOB,
@@ -373,7 +373,7 @@ public enum SQLiteLayout {
             ),
             integrity_digest BLOB NOT NULL CHECK(length(integrity_digest) = 32),
             CHECK(
-                (status = 'reserved' AND committed_commit_cid IS NULL
+                    (status IN ('reserved', 'abandoned') AND committed_commit_cid IS NULL
                     AND committed_data_cid IS NULL AND committed_projection IS NULL
                     AND committed_projection_digest IS NULL)
                 OR
@@ -1419,7 +1419,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                 base_commit_cid TEXT NOT NULL,
                 base_revision TEXT NOT NULL,
                 next_revision TEXT NOT NULL UNIQUE,
-                status TEXT NOT NULL CHECK(status IN ('reserved', 'committed')),
+                status TEXT NOT NULL CHECK(status IN ('reserved', 'committed', 'abandoned')),
                 committed_commit_cid TEXT,
                 committed_data_cid TEXT,
                 committed_projection BLOB,
@@ -1429,7 +1429,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                 ),
                 integrity_digest BLOB NOT NULL CHECK(length(integrity_digest) = 32),
                 CHECK(
-                    (status = 'reserved' AND committed_commit_cid IS NULL
+                    (status IN ('reserved', 'abandoned') AND committed_commit_cid IS NULL
                         AND committed_data_cid IS NULL AND committed_projection IS NULL
                         AND committed_projection_digest IS NULL)
                     OR
