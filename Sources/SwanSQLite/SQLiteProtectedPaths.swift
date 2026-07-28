@@ -321,6 +321,57 @@ enum SQLiteProtectedPaths {
         throw SwanError.unavailable("public CAR spool is unavailable")
     }
 
+    /// Creates an owner-only anonymous staging file for a public blob upload.
+    /// The file is unlinked before its descriptor leaves this function, so a
+    /// request body can never be reached through a pathname or confused with
+    /// a public CAS reference before its digest has been verified.
+    static func makeUnlinkedPublicBlobSpool(
+        in dataDirectory: URL
+    ) throws -> FileHandle {
+        let root = try openRoot(dataDirectory)
+        defer { _ = close(root) }
+        let spoolDirectory = try openOrCreateDirectory(
+            parent: root,
+            name: "public-blob-spool"
+        )
+        defer { _ = close(spoolDirectory) }
+
+        for _ in 0 ..< 16 {
+            let name = "blob-\(UUID().uuidString.lowercased()).spool"
+            let descriptor = name.withCString { path in
+                openat(
+                    spoolDirectory,
+                    path,
+                    O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                    ownerOnlyFileMode
+                )
+            }
+            if descriptor < 0 {
+                guard errno == EEXIST else {
+                    throw SwanError.unavailable("public blob staging is unavailable")
+                }
+                continue
+            }
+            do {
+                try requireOwnerOnlyRegularFile(descriptor)
+                guard fchmod(descriptor, ownerOnlyFileMode) == 0,
+                      name.withCString({ unlinkat(spoolDirectory, $0, 0) }) == 0
+                else {
+                    throw SwanError.unavailable("public blob staging is unavailable")
+                }
+                return FileHandle(
+                    fileDescriptor: descriptor,
+                    closeOnDealloc: true
+                )
+            } catch {
+                _ = close(descriptor)
+                _ = name.withCString { unlinkat(spoolDirectory, $0, 0) }
+                throw error
+            }
+        }
+        throw SwanError.unavailable("public blob staging is unavailable")
+    }
+
     // MARK: Permissioned blob CAS
 
     /// Creates one immutable content-addressed payload below the already
@@ -362,6 +413,89 @@ enum SQLiteProtectedPaths {
             try requireOwnerOnlyRegularFile(descriptor)
             try writeAll(payload, to: descriptor)
             guard fsync(descriptor) == 0,
+                  fchmod(descriptor, ownerOnlyFileMode) == 0 else {
+                throw SwanError.unavailable("permissioned blob storage is unavailable")
+            }
+            _ = close(descriptor)
+            return true
+        } catch {
+            _ = close(descriptor)
+            _ = filename.withCString { unlinkat(directory, $0, 0) }
+            throw error
+        }
+    }
+
+    /// Copies a verified anonymous upload spool into its content-addressed
+    /// CAS entry without materializing the payload. The source descriptor is
+    /// never reopened by path, and the copy re-hashes the bytes as it writes
+    /// them so an unexpected in-process mutation cannot publish a wrong CID.
+    @discardableResult
+    static func createPrivateBlobFromFile(
+        accountDirectoryDescriptor: Int32,
+        accountNamespace: String,
+        digestHex: String,
+        sourceDescriptor: Int32,
+        expectedLength: Int,
+        expectedDigest: Data
+    ) throws -> Bool {
+        guard expectedLength >= 0, expectedDigest.count == 32 else {
+            throw SwanError.unavailable("permissioned blob storage is unavailable")
+        }
+        var sourceMetadata = stat()
+        guard fstat(sourceDescriptor, &sourceMetadata) == 0,
+              (sourceMetadata.st_mode & S_IFMT) == S_IFREG,
+              sourceMetadata.st_uid == geteuid(),
+              (sourceMetadata.st_mode & 0o777) == ownerOnlyFileMode,
+              sourceMetadata.st_size >= 0,
+              sourceMetadata.st_size <= off_t(Int.max),
+              Int(sourceMetadata.st_size) == expectedLength,
+              lseek(sourceDescriptor, 0, SEEK_SET) == 0 else {
+            throw SwanError.unavailable("permissioned blob storage is unavailable")
+        }
+
+        let (directory, filename) = try privateBlobLocation(
+            accountDirectoryDescriptor: accountDirectoryDescriptor,
+            accountNamespace: accountNamespace,
+            digestHex: digestHex
+        )
+        defer { _ = close(directory) }
+        let descriptor = filename.withCString { path in
+            openat(
+                directory,
+                path,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                ownerOnlyFileMode
+            )
+        }
+        if descriptor < 0 {
+            guard errno == EEXIST else {
+                throw SwanError.unavailable("permissioned blob storage is unavailable")
+            }
+            return false
+        }
+
+        do {
+            try requireOwnerOnlyRegularFile(descriptor)
+            var digest = SHA256()
+            var copied = 0
+            var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+            while copied < expectedLength {
+                let requested = min(buffer.count, expectedLength - copied)
+                let readCount = buffer.withUnsafeMutableBytes { bytes -> Int in
+                    guard let base = bytes.baseAddress else { return -1 }
+                    return read(sourceDescriptor, base, requested)
+                }
+                guard readCount > 0 else {
+                    throw SwanError.unavailable("permissioned blob storage is unavailable")
+                }
+                let chunk = Data(buffer[0 ..< readCount])
+                digest.update(data: chunk)
+                try writeAll(chunk, to: descriptor)
+                copied += readCount
+            }
+            guard copied == expectedLength,
+                  Data(digest.finalize()) == expectedDigest,
+                  fsync(descriptor) == 0,
                   fchmod(descriptor, ownerOnlyFileMode) == 0 else {
                 throw SwanError.unavailable("permissioned blob storage is unavailable")
             }

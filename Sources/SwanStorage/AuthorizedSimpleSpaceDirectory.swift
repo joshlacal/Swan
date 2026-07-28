@@ -229,7 +229,7 @@ public protocol AuthorizedHostedSpaceDirectory: Sendable {
 /// owns the underlying descriptor and never exposes a path or a `Data` value,
 /// so an HTTP route cannot accidentally buffer a private blob or retarget a
 /// file after authorization has completed.
-public protocol AuthorizedSpaceBlobBody: Sendable {
+public protocol AuthorizedSpaceBlobBody: StreamingBlobBody {
     /// File metadata was validated against the descriptor before this body was
     /// returned.  It is therefore safe for the HTTP adapter to emit it as a
     /// content length without looking the path up again.

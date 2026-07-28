@@ -24,6 +24,48 @@ public protocol BlobStore: Sendable {
     func remove(_ reference: BlobReference) async throws
 }
 
+/// A bounded-memory body backed by an already verified immutable payload.
+/// Implementations must close and release their underlying resource on every
+/// terminal path, including cancellation and writer failure.
+public protocol StreamingBlobBody: Sendable {
+    var contentLength: Int { get }
+
+    func streamBody(
+        maximumChunkBytes: Int,
+        consume: (Data) async throws -> Void
+    ) async throws
+}
+
+/// The public namespace projection returned to an HTTP adapter. It contains
+/// only sanitized metadata and a one-shot body; it never exposes a path,
+/// descriptor, database, or namespace reference.
+public struct PublicBlob: Sendable {
+    public let mimeType: String?
+    public let body: any StreamingBlobBody
+
+    public init(mimeType: String?, body: any StreamingBlobBody) {
+        self.mimeType = mimeType
+        self.body = body
+    }
+}
+
+/// Optional streaming extension for durable blob stores. The source closure
+/// is called once and must feed serial chunks to the supplied sink. The store
+/// owns staging, hashing, content-addressed adoption, and cleanup; callers
+/// only choose the byte limit and namespace.
+public protocol StreamingBlobStore: BlobStore {
+    func putStreaming(
+        namespace: BlobNamespace,
+        mimeType: String?,
+        maximumBytes: Int,
+        source: @escaping @Sendable (
+            @escaping (Data) async throws -> Void
+        ) async throws -> Void
+    ) async throws -> BlobReference
+
+    func publicBlob(cid: String) async throws -> PublicBlob?
+}
+
 /// Local immutable content-addressed blobs. File contents are shared, while
 /// their public and permissioned reachability is tracked separately.
 public actor FileBlobStore: BlobStore {

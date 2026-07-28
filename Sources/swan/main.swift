@@ -343,11 +343,11 @@ private struct ServePublicMutationDirectory: PublicRepositoryMutationDirectory {
         return try PublicRepositoryMutationTarget(did: account.did, status: account.status, store: store)
     }
 
-    func publicBlobData(cid: String) async throws -> Data? {
+    func publicBlob(cid: String) async throws -> PublicBlob? {
         for did in try await controls.activeAccountDIDs() {
             guard let store = await directory.preopenedPublicMutationStore(did: did),
-                  let blobs = store as? any BlobStore else { continue }
-            if let data = try await blobs.publicData(cid: cid) { return data }
+                  let blobs = store as? any StreamingBlobStore else { continue }
+            if let blob = try await blobs.publicBlob(cid: cid) { return blob }
         }
         return nil
     }

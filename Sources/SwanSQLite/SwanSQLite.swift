@@ -1125,7 +1125,7 @@ public enum SQLiteAccountDatabaseOpenMode: Sendable, Equatable {
     @_spi(PortableRestore) case descriptorBackedOperatorRestoreSource(rootDescriptor: Int32)
 }
 
-public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
+public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisStore {
     private static let permissionedRepositoryStorageMigrationVersion = 1
     private static let permissionedOutboxLeaseMigrationVersion = 2
     private static let simpleSpaceAuthoritySchemaMigrationVersion = 3
@@ -2897,7 +2897,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         let columns = blobNamespaceColumns(namespace)
         return try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
             try await putBlobLocked(
-                data,
+                .memory(data),
                 cid: expectedCID,
                 digestHex: digestHex,
                 byteCount: byteCount,
@@ -4530,7 +4530,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         let columns = blobNamespaceColumns(namespace)
         return try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
             try await putBlobLocked(
-                data,
+                .memory(data),
                 cid: cid,
                 digestHex: digestHex,
                 byteCount: byteCount,
@@ -4538,6 +4538,67 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                 namespaceKind: columns.kind,
                 spaceURI: columns.spaceURI,
                 mimeType: storedMIMEType
+            )
+        }
+    }
+
+    /// Streams an upload into an anonymous owner-only spool, hashes it while
+    /// it arrives, and adopts it into the same durable CAS/reference
+    /// transaction used by ordinary blob writes. No request-sized `Data` is
+    /// created, and every failure path closes the descriptor and leaves no
+    /// reachable public reference.
+    public func putStreaming(
+        namespace: BlobNamespace,
+        mimeType: String?,
+        maximumBytes: Int,
+        source: @escaping @Sendable (
+            @escaping (Data) async throws -> Void
+        ) async throws -> Void
+    ) async throws -> BlobReference {
+        guard maximumBytes > 0 else {
+            throw SwanError.malformed("blob upload limit is invalid")
+        }
+        let spoolHandle = try SQLiteProtectedPaths.makeUnlinkedPublicBlobSpool(
+            in: dataDirectory
+        )
+        let spool = SQLiteBlobUploadSpool(
+            handle: spoolHandle,
+            maximumBytes: maximumBytes
+        )
+        defer { spool.close() }
+
+        let sink: (Data) async throws -> Void = { chunk in
+            try spool.append(chunk)
+        }
+        try await source(sink)
+        let summary = try spool.finish()
+        guard summary.byteCount > 0 else {
+            throw SwanError.malformed("blob upload is empty")
+        }
+        let cid = CID(
+            codec: .raw,
+            multihash: Multihash(
+                algorithm: Multihash.sha256Code,
+                length: Multihash.sha256Length,
+                digest: summary.digest
+            )
+        )
+        let digestHex = Hex.encode(summary.digest)
+        let columns = blobNamespaceColumns(namespace)
+        return try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
+            try await putBlobLocked(
+                .file(
+                    descriptor: spool.fileDescriptor,
+                    length: summary.byteCount,
+                    digest: summary.digest
+                ),
+                cid: cid.string,
+                digestHex: digestHex,
+                byteCount: summary.byteCount,
+                namespace: namespace,
+                namespaceKind: columns.kind,
+                spaceURI: columns.spaceURI,
+                mimeType: safeBlobMIMEType(mimeType)
             )
         }
     }
@@ -4561,6 +4622,24 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             return nil
         }
         return try await materializeBlobData(stored)
+    }
+
+    /// Opens an already reachable public CAS entry as a verified one-shot
+    /// stream. Legacy SQLite payload rows are intentionally not exposed by
+    /// this path: serving them through `Data` would violate the bounded-memory
+    /// public transfer contract, so they fail closed until migrated by an
+    /// explicit maintenance operation.
+    public func publicBlob(cid: String) async throws -> PublicBlob? {
+        _ = try canonicalRawBlobCID(cid)
+        guard let stored = try await publicBlobMetadataIfReachable(
+            cid: cid,
+            namespaceKind: "public",
+            spaceURI: ""
+        ) else {
+            return nil
+        }
+        let body = try await fileBackedBlobBody(stored)
+        return PublicBlob(mimeType: stored.mimeType, body: body)
     }
 
     public func removeBlobReference(_ reference: BlobReference) async throws {
@@ -4681,6 +4760,11 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         case staging
     }
 
+    private enum BlobCASPayloadSource: Sendable {
+        case memory(Data)
+        case file(descriptor: Int32, length: Int, digest: Data)
+    }
+
     /// Holds both halves of the lifecycle lock over a file stage/adoption and
     /// its SQLite commit.  The async coordinator is required even though a
     /// descriptor `flock` is also held: same-process `flock` behavior for
@@ -4720,7 +4804,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     }
 
     private func putBlobLocked(
-        _ data: Data,
+        _ source: BlobCASPayloadSource,
         cid: String,
         digestHex: String,
         byteCount: Int,
@@ -4766,12 +4850,25 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                     expectedLength: byteCount
                 )
             case .staging:
-                let created = try SQLiteProtectedPaths.createPrivateBlob(
-                    accountDirectoryDescriptor: accountDirectoryDescriptor,
-                    accountNamespace: accountBlobNamespace,
-                    digestHex: digestHex,
-                    payload: data
-                )
+                let created: Bool
+                switch source {
+                case let .memory(data):
+                    created = try SQLiteProtectedPaths.createPrivateBlob(
+                        accountDirectoryDescriptor: accountDirectoryDescriptor,
+                        accountNamespace: accountBlobNamespace,
+                        digestHex: digestHex,
+                        payload: data
+                    )
+                case let .file(descriptor, length, digest):
+                    created = try SQLiteProtectedPaths.createPrivateBlobFromFile(
+                        accountDirectoryDescriptor: accountDirectoryDescriptor,
+                        accountNamespace: accountBlobNamespace,
+                        digestHex: digestHex,
+                        sourceDescriptor: descriptor,
+                        expectedLength: length,
+                        expectedDigest: digest
+                    )
+                }
                 if !created {
                     // An unreferenced orphan can be adopted only after a full
                     // digest/length check while this CID lock is held.
@@ -5056,6 +5153,67 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         }
     }
 
+    /// Metadata-only lookup for bounded HTTP projections.  Selecting the
+    /// legacy SQLite payload here would let a public request materialize an
+    /// arbitrarily large row before the caller can fail closed.  The public
+    /// streaming surface therefore accepts only CAS-v1 rows and verifies the
+    /// reference, digest, length, and MIME metadata without selecting
+    /// `payload` at all.
+    private func publicBlobMetadataIfReachable(
+        cid: String,
+        namespaceKind: String,
+        spaceURI: String
+    ) async throws -> StoredBlobPayload? {
+        try await withConnectionGate {
+            let rows = try await connection.query(
+                """
+                SELECT blob_payloads.cid, blob_payloads.storage_kind,
+                       blob_payloads.cas_digest, blob_payloads.byte_count,
+                       blob_payloads.mime_type
+                FROM blob_payloads
+                JOIN blob_namespace_references USING(cid)
+                WHERE blob_payloads.cid = ? AND namespace_kind = ? AND space_uri = ?
+                """,
+                [.text(cid), .text(namespaceKind), .text(spaceURI)]
+            )
+            guard let row = rows.first else { return nil }
+            let storedCID = try requiredText(row, "cid")
+            guard storedCID == cid,
+                  try requiredText(row, "storage_kind") == StoredBlobPayload.StorageKind.casV1.rawValue else {
+                throw SwanError.unavailable("public blob storage is unavailable")
+            }
+            guard let byteValue = row.column("byte_count"),
+                  !byteValue.isNull,
+                  let byteCount = byteValue.integer,
+                  byteCount >= 0 else {
+                throw SQLiteRepositoryError.corruptDatabase("missing public blob size")
+            }
+            let digest = try blobDigestHex(cid: storedCID, allowLegacy: false)
+            guard let storedDigest = row.column("cas_digest")?.string,
+                  storedDigest == digest,
+                  legacyBlobDigest("sha256:\(storedDigest)") != nil else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid public blob CID")
+            }
+            let mimeType: String?
+            if let value = row.column("mime_type"), !value.isNull {
+                guard let raw = value.string else {
+                    throw SQLiteRepositoryError.corruptDatabase("invalid public blob MIME type")
+                }
+                mimeType = safeBlobMIMEType(raw)
+            } else {
+                mimeType = nil
+            }
+            return StoredBlobPayload(
+                cid: storedCID,
+                storageKind: .casV1,
+                byteCount: byteCount,
+                mimeType: mimeType,
+                casDigest: storedDigest,
+                legacyPayload: nil
+            )
+        }
+    }
+
     private func blobPayloadIfReachableWithoutGate(
         cid: String,
         namespaceKind: String,
@@ -5151,15 +5309,15 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             return payload
         case .casV1:
             let body = try await fileBackedBlobBody(stored)
-            var output = Data()
-            output.reserveCapacity(stored.byteCount)
+            let output = SQLiteDataAccumulator(capacity: stored.byteCount)
             try await body.streamBody(maximumChunkBytes: 64 * 1_024) { chunk in
                 output.append(chunk)
             }
-            guard output.count == stored.byteCount else {
+            let data = output.data
+            guard data.count == stored.byteCount else {
                 throw SwanError.unavailable("permissioned blob storage is unavailable")
             }
-            return output
+            return data
         }
     }
 
@@ -6842,6 +7000,83 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
     private func blob(_ data: Data) -> SQLiteData {
         // SQLiteNIO's Foundation conformance binds Data as a native BLOB.
         data.sqliteData!
+    }
+}
+
+private final class SQLiteDataAccumulator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Data
+
+    init(capacity: Int) {
+        value = Data()
+        value.reserveCapacity(max(0, capacity))
+    }
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        value.append(chunk)
+        lock.unlock()
+    }
+
+    var data: Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
+/// A process-local, bounded upload accumulator. It owns only a fixed-size
+/// staging descriptor and a digest/counter; chunks are never retained after
+/// they are written.
+private final class SQLiteBlobUploadSpool: @unchecked Sendable {
+    private let lock = NSLock()
+    private let handle: FileHandle
+    private let maximumBytes: Int
+    private var digest = SHA256()
+    private var byteCount = 0
+    private var isClosed = false
+
+    init(handle: FileHandle, maximumBytes: Int) {
+        self.handle = handle
+        self.maximumBytes = maximumBytes
+    }
+
+    var fileDescriptor: Int32 { handle.fileDescriptor }
+
+    func append(_ chunk: Data) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed else {
+            throw SwanError.unavailable("public blob staging is unavailable")
+        }
+        guard chunk.count <= maximumBytes - byteCount else {
+            throw SwanError.malformed("blob upload exceeds its limit")
+        }
+        guard !chunk.isEmpty else { return }
+        try handle.write(contentsOf: chunk)
+        digest.update(data: chunk)
+        byteCount += chunk.count
+    }
+
+    func finish() throws -> (digest: Data, byteCount: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed else {
+            throw SwanError.unavailable("public blob staging is unavailable")
+        }
+        try handle.synchronize()
+        guard lseek(handle.fileDescriptor, 0, SEEK_SET) == 0 else {
+            throw SwanError.unavailable("public blob staging is unavailable")
+        }
+        return (Data(digest.finalize()), byteCount)
+    }
+
+    func close() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isClosed else { return }
+        isClosed = true
+        try? handle.close()
     }
 }
 

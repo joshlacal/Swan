@@ -14,7 +14,7 @@ public protocol PublicRepositoryMutationDirectory: Sendable {
 }
 
 public extension PublicRepositoryMutationDirectory {
-    func publicBlobData(cid: String) async throws -> Data? { nil }
+    func publicBlob(cid: String) async throws -> PublicBlob? { nil }
 }
 
 public struct PublicRepositoryMutationTarget: Sendable {

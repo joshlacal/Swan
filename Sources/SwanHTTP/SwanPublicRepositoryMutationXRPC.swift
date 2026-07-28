@@ -7,6 +7,7 @@ import Petrel
 import SwanOAuth
 import SwanPublicRepository
 import SwanPublicWire
+import SwanCore
 import SwanStorage
 import SwanSpaces
 
@@ -19,6 +20,26 @@ private enum PublicMutationFailure: Error {
     case unavailable
 }
 
+private final class PublicBlobUploadCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func add(_ amount: Int, maximum: Int) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard amount >= 0, amount <= maximum - value else {
+            throw PublicMutationFailure.invalidRequest
+        }
+        value += amount
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 private struct PublicMutationHandlers {
     let capability: SwanPublicRepositoryMutationCapability
 
@@ -27,20 +48,55 @@ private struct PublicMutationHandlers {
             request: request, method: "POST", path: "/xrpc/com.atproto.repo.uploadBlob"
         )
         guard let target = try await capability.directory.publicRepositoryMutationTarget(selector: subject),
-              let blobStore = target.store as? any BlobStore else {
+              target.did == subject,
+              target.status == .active,
+              let blobStore = target.store as? any StreamingBlobStore else {
             throw PublicMutationFailure.notFound
         }
-        let body = try await request.body.collect(upTo: 256 * 1024 * 1024)
-        guard let bytes = body.getBytes(at: body.readerIndex, length: body.readableBytes), !bytes.isEmpty else {
+        let contentTypes = request.headers[values: .contentType]
+        guard contentTypes.count <= 1 else {
             throw PublicMutationFailure.invalidRequest
         }
-        let mimeType = request.headers[.contentType]?.split(separator: ";", maxSplits: 1).first.map(String.init)
+        let mimeType = contentTypes.first?.split(separator: ";", maxSplits: 1).first.map(String.init)
             ?? "application/octet-stream"
-        _ = try await blobStore.put(Data(bytes), namespace: .public)
-        let cid = CID.fromBlob(Data(bytes))
+        let maximumBytes = 256 * 1024 * 1024
+        let counter = PublicBlobUploadCounter()
+        let body = request.body
+        let reference = try await blobStore.putStreaming(
+            namespace: .public,
+            mimeType: mimeType,
+            maximumBytes: maximumBytes
+        ) { sink in
+            var iterator = body.makeAsyncIterator()
+            while let next = try await iterator.next() {
+                var buffer = next
+                try Task.checkCancellation()
+                let count = buffer.readableBytes
+                try counter.add(count, maximum: maximumBytes)
+                guard count > 0,
+                      let bytes = buffer.readBytes(length: count) else {
+                    continue
+                }
+                try await sink(Data(bytes))
+            }
+            guard counter.count > 0 else {
+                throw PublicMutationFailure.invalidRequest
+            }
+        }
+        let cid: CID
+        do {
+            cid = try CID.parse(reference.cid)
+        } catch {
+            throw PublicMutationFailure.unavailable
+        }
+        guard cid.codec == .raw,
+              cid.multihash.algorithm == Multihash.sha256Code,
+              cid.multihash.length == Multihash.sha256Length else {
+            throw PublicMutationFailure.unavailable
+        }
         return .init(blob: Blob(
             type: "blob", ref: ATProtoLink(cid: cid), mimeType: mimeType,
-            size: bytes.count, cid: nil
+            size: counter.count, cid: nil
         ))
     }
 
@@ -271,6 +327,8 @@ func registerPublicRepositoryMutationEndpoints(
             return publicMutationJSON(.ok, try await handlers.uploadBlob(request))
         } catch let failure as PublicMutationFailure {
             return publicMutationResponse(failure, authorizer: capability.authorizer)
+        } catch let error as SwanError {
+            return publicMutationResponse(error)
         } catch {
             return publicMutationError(.badRequest, "InvalidRequest")
         }
@@ -299,25 +357,44 @@ func registerPublicRepositoryMutationEndpoints(
             guard let cid = publicQueryValue("cid", request: request) else {
                 return publicMutationError(.notFound, "BlobNotFound")
             }
-            let maybeData: Data?
-            do { maybeData = try await capability.directory.publicBlobData(cid: cid) }
-            catch { return publicMutationError(.notFound, "BlobNotFound") }
-            guard let data = maybeData else {
+            let blob: PublicBlob?
+        do { blob = try await capability.directory.publicBlob(cid: cid) }
+            catch let error as SwanError {
+                return publicMutationResponse(error)
+            } catch {
+                return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
+            }
+            guard let blob else {
                 return publicMutationError(.notFound, "BlobNotFound")
             }
-            var headers: HTTPFields = [.contentType: "application/octet-stream", .cacheControl: "no-store"]
-            headers[.contentLength] = String(data.count)
-            return Response(status: .ok, headers: headers, body: .init(byteBuffer: ByteBuffer(data: data)))
+            var headers: HTTPFields = [
+                .contentType: safePublicBlobMIMEType(blob.mimeType),
+                .cacheControl: "no-store",
+            ]
+            headers[.contentLength] = String(blob.body.contentLength)
+            headers[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"
+            return Response(status: .ok, headers: headers, body: .init { writer in
+                try await blob.body.streamBody(maximumChunkBytes: 64 * 1_024) { chunk in
+                    try await writer.write(ByteBuffer(data: chunk))
+                }
+                try await writer.finish(nil)
+            })
         }
     
 }
 
 private func publicQueryValue(_ name: String, request: Request) -> String? {
-    request.uri.query?.split(separator: "&").compactMap { pair in
+    guard let query = request.uri.query else { return nil }
+    var value: String?
+    for pair in query.split(separator: "&", omittingEmptySubsequences: false) {
         let pieces = pair.split(separator: "=", maxSplits: 1)
-        guard pieces.first == Substring(name), pieces.count == 2 else { return nil }
-        return String(pieces[1])
-    }.first
+        guard pieces.first == Substring(name) else { continue }
+        guard pieces.count == 2,
+              let decoded = String(pieces[1]).removingPercentEncoding,
+              value == nil else { return nil }
+        value = decoded
+    }
+    return value
 }
 
 private func publicMutationInput<Value: Decodable>(
@@ -351,6 +428,17 @@ private func publicMutationResponse(
     }
 }
 
+private func publicMutationResponse(_ error: SwanError) -> Response {
+    switch error {
+    case .unavailable, .conflict:
+        return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
+    case .unauthorized, .expired:
+        return publicMutationError(.unauthorized, "Unauthorized")
+    case .invalidIdentifier, .invalidProfile, .malformed:
+        return publicMutationError(.badRequest, "InvalidRequest")
+    }
+}
+
 private func publicMutationResponse(
     _ failure: PublicRepositoryMutationCoordinatorError
 ) -> Response {
@@ -368,4 +456,21 @@ private func publicMutationJSON(_ status: HTTPResponse.Status, _ value: some Enc
 
 private func publicMutationError(_ status: HTTPResponse.Status, _ code: String) -> Response {
     authenticatedGetSpaceJSON(status, ["error": code])
+}
+
+private func safePublicBlobMIMEType(_ value: String?) -> String {
+    guard let value,
+          !value.isEmpty,
+          value.utf8.count <= 255,
+          value.utf8.allSatisfy({ byte in
+              (byte >= UInt8(ascii: "A") && byte <= UInt8(ascii: "Z"))
+                  || (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "z"))
+                  || (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+                  || "!#$&^_.+-/".utf8.contains(byte)
+          }),
+          value.filter({ $0 == "/" }).count == 1,
+          !value.hasPrefix("/"), !value.hasSuffix("/") else {
+        return "application/octet-stream"
+    }
+    return value
 }

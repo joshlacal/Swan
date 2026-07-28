@@ -1414,6 +1414,73 @@ final class SwanSQLiteTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: privateCASPath.path))
     }
 
+    func testPublicStreamingBlobUploadUsesBoundedCASAndPublicNamespaceOnly() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+
+        let chunks = [
+            Data(repeating: 0x11, count: 37 * 1_024),
+            Data(repeating: 0x22, count: 53 * 1_024),
+            Data(repeating: 0x33, count: 19 * 1_024),
+        ]
+        let expected = chunks.reduce(into: Data()) { $0.append($1) }
+        let source: @Sendable (
+            @escaping (Data) async throws -> Void
+        ) async throws -> Void = { sink in
+            for chunk in chunks {
+                try await sink(chunk)
+            }
+        }
+
+        let reference = try await database.putStreaming(
+            namespace: .public,
+            mimeType: "image/test",
+            maximumBytes: 256 * 1_024 * 1_024,
+            source: source
+        )
+        XCTAssertEqual(reference.cid, CID.fromBlob(expected).string)
+
+        let maybePublicBlob = try await database.publicBlob(cid: reference.cid)
+        let publicBlob = try XCTUnwrap(maybePublicBlob)
+        XCTAssertEqual(publicBlob.mimeType, "image/test")
+        XCTAssertEqual(publicBlob.body.contentLength, expected.count)
+        var received = Data()
+        var maximumChunk = 0
+        try await publicBlob.body.streamBody(maximumChunkBytes: 8 * 1_024) { chunk in
+            maximumChunk = max(maximumChunk, chunk.count)
+            received.append(chunk)
+        }
+        XCTAssertEqual(received, expected)
+        XCTAssertLessThanOrEqual(maximumChunk, 8 * 1_024)
+
+        let privatePayload = Data(repeating: 0x7a, count: 17 * 1_024)
+        let privateReference = try await database.putBlob(
+            privatePayload,
+            namespace: .space(fixture.space)
+        )
+        let privateBlob = try await database.publicBlob(cid: privateReference.cid)
+        XCTAssertNil(privateBlob)
+
+        let tooLargeSource: @Sendable (
+            @escaping (Data) async throws -> Void
+        ) async throws -> Void = { sink in
+            try await sink(Data(repeating: 0x44, count: 6))
+        }
+        await XCTAssertThrowsErrorAsync(
+            try await database.putStreaming(
+                namespace: .public,
+                mimeType: nil,
+                maximumBytes: 5,
+                source: tooLargeSource
+            )
+        ) { error in
+            guard case .malformed = error as? SwanError else {
+                return XCTFail("oversized streamed upload must be malformed")
+            }
+        }
+    }
+
     func testPrivateCASRefusesCorruptOrSymlinkedPayloadsAndReleasesCancelledStreams() async throws {
         let fixture = try Fixture()
         let database = try await fixture.open()
