@@ -62,7 +62,9 @@ boundary.
 
 ## Remaining gates
 
-- Finish durable PLC rotation history and rotated `describeRepo`.
+- Exercise the durable PLC rotation service and `swan account rotate-plc`
+  against a live/local PLC fixture; the service, CLI path, storage,
+  verifier, and public-read slice are now implemented and covered locally.
 - Replace the probe-only interop runner with semantic cross-host record/blob
   exchange and run the matrix under Docker on macOS and Linux.
 - Run the complete suite after the next mutation slice; do not claim alpha

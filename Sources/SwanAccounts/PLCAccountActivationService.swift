@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import SwanCore
 import SwanPublicRepository
 import SwanStorage
 
@@ -90,6 +91,11 @@ public actor PLCAccountActivationService {
             operation: operation,
             keys: keys
         )
+        try await persistGenesisHistoryIfSupported(
+            store: store,
+            operation: operation,
+            now: now
+        )
         do {
             _ = try await handleVerifier.verify(
                 plcState: state,
@@ -160,6 +166,40 @@ public actor PLCAccountActivationService {
             throw PLCAccountActivationError.conflict
         }
         return installation
+    }
+
+    private func persistGenesisHistoryIfSupported(
+        store: any PLCAccountPreparationAccountStore,
+        operation: PLCSignedOperation,
+        now: Date
+    ) async throws {
+        guard let historyStore = store as? any PublicPLCIdentityHistoryStore,
+              let regular = operation.regular else {
+            return
+        }
+        do {
+            let entry = try PublicPLCOperationHistoryEntry(
+                cid: try operation.cid.string,
+                previousCID: operation.prev,
+                canonicalJSON: try operation.canonicalJSON,
+                createdAt: now,
+                signingKeyGeneration: 1,
+                rotationKeyGeneration: 1
+            )
+            _ = try await historyStore.installPublicPLCOperation(entry)
+            guard regular.prev == nil else {
+                throw PLCAccountActivationError.conflict
+            }
+        } catch let error as PLCAccountActivationError {
+            throw error
+        } catch let error as SwanError {
+            if case .conflict = error {
+                throw PLCAccountActivationError.conflict
+            }
+            throw PLCAccountActivationError.unavailable
+        } catch {
+            throw PLCAccountActivationError.unavailable
+        }
     }
 
     private func submittedIntent(

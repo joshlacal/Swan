@@ -36,6 +36,7 @@ public enum SQLiteControlDatabaseOpenMode: Sendable, Equatable {
 /// process while `BEGIN IMMEDIATE` makes consume/rotate/revoke semantics hold
 /// across independently reopened Swan processes as well.
 public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
+    AccountControlKeyRotationStore,
     SpaceDelegationReplayStore, SpaceClientAttestationReplayStore
 {
     private static let microsecondsPerSecond = 1_000_000.0

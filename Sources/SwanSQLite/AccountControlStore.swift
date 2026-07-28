@@ -226,6 +226,59 @@ extension SQLiteControlDatabase {
         }
     }
 
+    public func rotateAccountKeys(
+        did: String,
+        request: AccountControlKeyRotationRequest,
+        now: Date
+    ) async throws -> AccountControlAccount {
+        guard AccountControlIdentifiers.isDID(did) else {
+            throw AccountControlStoreError.invalidInput
+        }
+        let timestamp = try controlTimestamp(now)
+        return try await withConnectionGate {
+            try await transaction {
+                let account = try await requiredAccount(did: did)
+                guard account.status.authorizesAccount else {
+                    throw AccountControlStoreError.invalidTransition
+                }
+                guard let signing = account.signingKey,
+                      let rotation = account.rotationKey,
+                      signing.generation == request.expectedGeneration,
+                      rotation.generation == request.expectedGeneration,
+                      signing.purpose == .signing,
+                      rotation.purpose == .rotation else {
+                    throw AccountControlStoreError.invalidTransition
+                }
+                _ = try await connection.query(
+                    """
+                    UPDATE accounts
+                    SET signing_key_generation = ?, signing_key_reference = ?,
+                        rotation_key_generation = ?, rotation_key_reference = ?,
+                        updated_at = ?
+                    WHERE did = ?
+                      AND signing_key_generation = ?
+                      AND rotation_key_generation = ?
+                    """,
+                    [
+                        .integer(try controlGeneration(request.signingKey.generation)),
+                        .text(request.signingKey.reference),
+                        .integer(try controlGeneration(request.rotationKey.generation)),
+                        .text(request.rotationKey.reference),
+                        .integer(timestamp), .text(did),
+                        .integer(try controlGeneration(request.expectedGeneration)),
+                        .integer(try controlGeneration(request.expectedGeneration)),
+                    ]
+                )
+                let updated = try await requiredAccount(did: did)
+                guard updated.signingKey == request.signingKey,
+                      updated.rotationKey == request.rotationKey else {
+                    throw AccountControlStoreError.invalidTransition
+                }
+                return updated
+            }
+        }
+    }
+
     public func account(did: String) async throws -> AccountControlAccount? {
         guard AccountControlIdentifiers.isDID(did) else { throw AccountControlStoreError.invalidInput }
         return try await withConnectionGate {

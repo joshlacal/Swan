@@ -114,6 +114,12 @@ checksum-verified way to populate the ignored reference cache.
   or an exact Bearer space credential. Credential reads are cross-repository
   only within their bound space and remain read-only; Bearer tokens never
   satisfy the DPoP OAuth authorizer. `getDelegationToken` remains closed.
+- PLC identity history is now durable per account: genesis and signed
+  rotations are stored as a linear CID-bound chain, verified fail-closed, and
+  used by public repository description reads to expose the authenticated
+  terminal DID document. Rotation records the pending operation before PLC
+  network I/O and promotes control key generations with a compare-and-swap;
+  local tests cover restart, idempotency, tampering, and rotated public reads.
 
 ## Completion gates
 

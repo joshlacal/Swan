@@ -495,6 +495,17 @@ public enum SQLiteLayout {
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS plc_identity_operations (
+            sequence INTEGER PRIMARY KEY CHECK(sequence > 0),
+            cid TEXT NOT NULL UNIQUE,
+            previous_cid TEXT,
+            canonical_json BLOB NOT NULL CHECK(length(canonical_json) > 0 AND length(canonical_json) <= 32768),
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            signing_key_generation INTEGER NOT NULL CHECK(signing_key_generation > 0),
+            rotation_key_generation INTEGER NOT NULL CHECK(rotation_key_generation = signing_key_generation)
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS permissioned_repository_state (
             space_uri TEXT NOT NULL,
             author_did TEXT NOT NULL,

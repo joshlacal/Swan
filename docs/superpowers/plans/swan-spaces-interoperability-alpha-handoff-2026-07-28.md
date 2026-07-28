@@ -298,3 +298,56 @@ is retained as historical context for the handoff snapshot; the dated
 follow-up note and `2026-07-28-swan-public-blob-reference-isolation.md` are the
 authoritative current status. Durable PLC rotation history and semantic live
 interoperability are still required before alpha completion.
+
+## Follow-up verification: durable PLC rotation history
+
+The next local slice is now implemented in the current working copy:
+
+- `plc_identity_operations` is a per-account SQLite/WAL linear history with
+  CID-idempotent insertion, conflicting-body rejection, restart persistence,
+  and generation/parent constraints.
+- `SwanPublicPLCGenesisVerifier.verifyIdentityHistory` reconstructs and
+  verifies the genesis plus every signed rotation, rejects branches, gaps,
+  non-canonical bodies, tombstones, and invalid terminal aliases/services,
+  and returns the authenticated terminal DID document facts.
+- Account rotation uses `PLCAccountRotationService`; it provisions the next
+  generation, records the exact pending operation before network I/O, verifies
+  the remote audit/state, and promotes control references with a generation
+  compare-and-swap. A retry recovers a pending operation after a crash.
+- Public `describeRepo`/repository description consumes the authenticated
+  terminal identity while preserving the genesis commit binding. Legacy
+  genesis-only rows remain supported; a history row without the history
+  verifier fails closed.
+- Local tests cover rotated identity verification and rejection cases,
+  SQLite idempotency/restart behavior, control-key CAS promotion, and the
+  rotated public repository description.
+
+Focused verification (Xcode toolchain, SwiftPM `--jobs 1`) passed:
+
+- `PLCOperationTests.testPublicIdentityHistoryAuthenticatesRotationAndRejectsBranches`
+- `PLCIdentityHistorySQLiteTests.testHistoryIsLinearIdempotentAndSurvivesRestart`
+- `PublicRepositoryRotatedIdentityTests.testPublicDescriptionUsesAuthenticatedTerminalPLCIdentity`
+- `PLCAccountRotationServiceTests.testRotationPersistsPendingHistoryAndPromotesControlGeneration`
+- `ManagementPLCProvisioningRuntimeHTTPTests.testConcreteManagementRoutesPrepareActivateRetryAndAdmitWithoutRestart`
+- `PublicRepositoryReadHTTPTests` (8/8), including the filtered command that
+  previously appeared to hang under default SwiftPM resolution
+- `PublicRepositoryReadDirectoryTests.testOptIn256MiBProductionDirectoryGetRepoHasBoundedRSS`
+
+The complete serialized macOS suite now passes with exit code 0. The
+timestamp-independent history replay fix also makes repeated activation and
+rotation retries idempotent across process restarts. The negative PLC signature
+test was made deterministic after a random-signature edge case was observed.
+
+Static/profile checks pass:
+
+- `Scripts/verify-profile.sh`
+- `Scripts/verify-interop-lab.sh`
+- `Scripts/test-verify-interop-lab.sh`
+- `git diff --check`
+
+This does not close the alpha. A local/live PLC-client recovery run still
+needs to be performed against the supported fixture, and the operator/CLI
+surface is implemented but has not yet been exercised against that live
+fixture. Semantic cross-host interop, Docker/Compose, Linux, Petrel
+regeneration, and the remaining public/private acceptance matrix are still
+outstanding.

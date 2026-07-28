@@ -49,10 +49,9 @@ extension SQLiteAccountDatabase {
                       let identityRow,
                       try publicReadRequiredInteger(identityRow, "stage")
                         == PLCAccountPreparationStage.submitted.rawValue,
+                      let storedGenesisCID,
                       let signingKey = account.signingKey,
                       let rotationKey = account.rotationKey,
-                      signingKey.reference == storedSigningReference,
-                      rotationKey.reference == storedRotationReference,
                       account.publicGenesisCommitCID == storedGenesisCID else {
                     throw PublicRepositoryReadError.unavailable
                 }
@@ -76,16 +75,55 @@ extension SQLiteAccountDatabase {
                     ),
                     expectedDID: account.did
                 )
-                let identity = try PublicRepositoryReadIdentity(
-                    canonicalHandle: plcHandle,
-                    pdsOrigin: try publicReadRequiredText(identityRow, "pds_origin"),
-                    signingDIDKey: signingDIDKey,
-                    handleIsCorrect: plcHandle == account.canonicalHandle,
-                    preparationRequestID: try publicReadRequiredText(
-                        identityRow, "request_id"
-                    ),
-                    genesisOperationCID: genesisOperationCID
-                )
+                let history = try await publicPLCOperationHistoryWithoutGate()
+                let identity: PublicRepositoryReadIdentity
+                if history.isEmpty {
+                    guard signingKey.reference == storedSigningReference,
+                          rotationKey.reference == storedRotationReference else {
+                        throw PublicRepositoryReadError.unavailable
+                    }
+                    identity = try PublicRepositoryReadIdentity(
+                        canonicalHandle: plcHandle,
+                        pdsOrigin: try publicReadRequiredText(identityRow, "pds_origin"),
+                        signingDIDKey: signingDIDKey,
+                        handleIsCorrect: plcHandle == account.canonicalHandle,
+                        preparationRequestID: try publicReadRequiredText(
+                            identityRow, "request_id"
+                        ),
+                        genesisOperationCID: genesisOperationCID
+                    )
+                } else {
+                    guard let historyVerifier = identityVerifier
+                        as? any PublicPLCIdentityVerifying else {
+                        throw PublicRepositoryReadError.unavailable
+                    }
+                    let terminal = try historyVerifier.verifyIdentityHistory(
+                        history,
+                        expectedDID: account.did
+                    )
+                    guard storedSigningReference == "account-signing:1",
+                          storedRotationReference == "account-rotation:1",
+                          terminal.genesisOperationCID == genesisOperationCID,
+                          signingKey.generation == terminal.keyGeneration,
+                          rotationKey.generation == terminal.keyGeneration,
+                          signingKey.reference
+                            == "\(signingKey.purpose.rawValue):\(terminal.keyGeneration)",
+                          rotationKey.reference
+                            == "\(rotationKey.purpose.rawValue):\(terminal.keyGeneration)" else {
+                        throw PublicRepositoryReadError.unavailable
+                    }
+                    identity = try PublicRepositoryReadIdentity(
+                        canonicalHandle: terminal.canonicalHandle,
+                        pdsOrigin: terminal.pdsOrigin,
+                        signingDIDKey: terminal.signingDIDKey,
+                        handleIsCorrect: terminal.canonicalHandle == account.canonicalHandle,
+                        preparationRequestID: try publicReadRequiredText(
+                            identityRow, "request_id"
+                        ),
+                        genesisOperationCID: terminal.genesisOperationCID,
+                        terminalOperationCID: terminal.terminalOperationCID
+                    )
+                }
                 return try PublicRepositoryReadDescription(
                     did: accountDID,
                     canonicalHandle: account.canonicalHandle,

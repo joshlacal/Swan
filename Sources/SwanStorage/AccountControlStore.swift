@@ -409,6 +409,36 @@ public struct AccountControlRegistration: Sendable {
     }
 }
 
+/// The only durable control-plane key transition permitted by the alpha.
+/// Rotation is a compare-and-swap from one generation to the immediately
+/// following generation; callers cannot move an account backwards or skip a
+/// generation.
+public struct AccountControlKeyRotationRequest: Sendable, Equatable {
+    public let expectedGeneration: UInt64
+    public let signingKey: AccountControlKeyReference
+    public let rotationKey: AccountControlKeyReference
+
+    public init(
+        expectedGeneration: UInt64,
+        signingKey: AccountControlKeyReference,
+        rotationKey: AccountControlKeyReference
+    ) throws {
+        guard expectedGeneration > 0,
+              expectedGeneration < UInt64.max,
+              signingKey.purpose == .signing,
+              rotationKey.purpose == .rotation,
+              signingKey.generation == rotationKey.generation,
+              signingKey.generation == expectedGeneration + 1,
+              signingKey.isCanonicalValue,
+              rotationKey.isCanonicalValue else {
+            throw AccountControlStoreError.invalidInput
+        }
+        self.expectedGeneration = expectedGeneration
+        self.signingKey = signingKey
+        self.rotationKey = rotationKey
+    }
+}
+
 /// Authentication-only credential material. It is deliberately separate from
 /// `AccountControlAccount` so ordinary DID/handle lookups cannot leak it.
 public struct AccountControlCredential: Sendable {
@@ -491,6 +521,18 @@ public protocol AccountControlStore: Sendable {
         did: String,
         to status: AccountControlStatus,
         declaration: AccountLifecycleDeclaration,
+        now: Date
+    ) async throws -> AccountControlAccount
+}
+
+/// Optional extension implemented by durable stores that can atomically
+/// promote a verified PLC rotation. Keeping it separate preserves the
+/// read/authentication boundary for stores that intentionally do not support
+/// lifecycle mutation.
+public protocol AccountControlKeyRotationStore: AccountControlStore {
+    func rotateAccountKeys(
+        did: String,
+        request: AccountControlKeyRotationRequest,
         now: Date
     ) async throws -> AccountControlAccount
 }

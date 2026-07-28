@@ -50,6 +50,7 @@ public struct PublicRepositoryReadIdentity: Sendable, Equatable {
     public let handleIsCorrect: Bool
     public let preparationRequestID: String
     public let genesisOperationCID: String
+    public let terminalOperationCID: String
 
     public init(
         canonicalHandle: String,
@@ -57,7 +58,8 @@ public struct PublicRepositoryReadIdentity: Sendable, Equatable {
         signingDIDKey: String,
         handleIsCorrect: Bool,
         preparationRequestID: String,
-        genesisOperationCID: String
+        genesisOperationCID: String,
+        terminalOperationCID: String? = nil
     ) throws {
         guard AccountControlIdentifiers.isCanonicalHandle(canonicalHandle),
               let origin = URL(string: pdsOrigin),
@@ -69,7 +71,8 @@ public struct PublicRepositoryReadIdentity: Sendable, Equatable {
               signingDIDKey.hasPrefix("did:key:z"),
               signingDIDKey.count == 57,
               !preparationRequestID.isEmpty,
-              (try? CID.parse(genesisOperationCID)) != nil else {
+              (try? CID.parse(genesisOperationCID)) != nil,
+              (try? CID.parse(terminalOperationCID ?? genesisOperationCID)) != nil else {
             throw PublicRepositoryReadError.unavailable
         }
         self.canonicalHandle = canonicalHandle
@@ -78,6 +81,7 @@ public struct PublicRepositoryReadIdentity: Sendable, Equatable {
         self.handleIsCorrect = handleIsCorrect
         self.preparationRequestID = preparationRequestID
         self.genesisOperationCID = genesisOperationCID
+        self.terminalOperationCID = terminalOperationCID ?? genesisOperationCID
     }
 }
 

@@ -1707,7 +1707,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(
             abstract: "Inspect or manage a provisioned Swan account",
             subcommands: [
-                InstallLocal.self, PreparePLC.self, ActivatePLC.self, Show.self,
+                InstallLocal.self, PreparePLC.self, ActivatePLC.self, RotatePLC.self, Show.self,
                 Deactivate.self, Reactivate.self, DeclareExport.self, Delete.self,
             ]
         )
@@ -2132,6 +2132,127 @@ extension SwanCommand {
                     try AccountCommandSupport.write(installation)
                 } catch {
                     try? await runtime?.close()
+                    try? await control.close()
+                    throw AccountCommandSupport.validationError(for: error)
+                }
+            }
+        }
+
+        /// Rotates the active account's PLC signing/rotation pair and updates
+        /// the durable public identity history. The command never accepts a
+        /// private key or password as an argument; encrypted envelopes remain
+        /// behind the mounted account-KEK boundary.
+        struct RotatePLC: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "rotate-plc",
+                abstract: "Rotate an active account's PLC identity keys"
+            )
+
+            @Option(name: .long, help: "Swan data directory containing the active account")
+            var dataDirectory: String
+
+            @Option(name: .long, help: "Active account DID to rotate")
+            var did: String
+
+            @Option(name: .long, help: "PLC directory origin")
+            var plcOrigin: String = PLCClientConfiguration.defaultProductionOrigin.absoluteString
+
+            @Flag(name: .long, help: "Select explicit literal-loopback HTTP PLC laboratory policy")
+            var plcLaboratory = false
+
+            @Option(name: .long, help: "Pinned PLC submit compatibility; only did-plc-server-0.0.1 is supported")
+            var plcReferenceCompatibility: String?
+
+            @Option(name: .long, help: "Mounted operator-secret file; never accepted as a literal argument")
+            var operatorSecretFile: String?
+
+            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64); SWAN_ACCOUNT_KEK is the alternative")
+            var accountKEKFile: String?
+
+            @Option(name: .customLong("account-kek-id"), help: "Account-KEK identifier used by encrypted envelopes")
+            var accountKEKID: String = "primary"
+
+            @Option(name: .long, help: "Protected key-envelope directory; defaults to <data-directory>/keys")
+            var accountKeyDirectory: String?
+
+            func run() async throws {
+                guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw ValidationError("--data-directory must not be empty")
+                }
+                guard let directoryOrigin = URL(string: plcOrigin) else {
+                    throw ValidationError("--plc-origin must be a URL")
+                }
+                let responsePolicy: PLCSubmitSuccessResponsePolicy
+                switch plcReferenceCompatibility {
+                case nil:
+                    responsePolicy = .strict
+                case PLCSubmitSuccessResponsePolicy.didPLCServer001.rawValue:
+                    guard plcLaboratory else {
+                        throw ValidationError(
+                            "--plc-reference-compatibility requires --plc-laboratory"
+                        )
+                    }
+                    responsePolicy = .didPLCServer001
+                case .some:
+                    throw ValidationError("--plc-reference-compatibility is unsupported")
+                }
+                let plcConfiguration: PLCClientConfiguration
+                do {
+                    plcConfiguration = plcLaboratory
+                        ? try .laboratory(
+                            origin: directoryOrigin,
+                            submitSuccessResponsePolicy: responsePolicy
+                        )
+                        : try .production(origin: directoryOrigin)
+                } catch {
+                    throw AccountCommandSupport.validationError(for: error)
+                }
+
+                _ = try AccountCommandSupport.authorization(
+                    secretFilePath: operatorSecretFile
+                )
+                let keyConfiguration: AccountKeyEncryptionConfiguration
+                do {
+                    keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
+                        activeKeyID: accountKEKID,
+                        secretFile: accountKEKFile.map { URL(fileURLWithPath: $0) }
+                    )
+                } catch {
+                    throw AccountCommandSupport.validationError(for: error)
+                }
+                let dataURL = URL(fileURLWithPath: dataDirectory)
+                let keyURL = accountKeyDirectory.map { URL(fileURLWithPath: $0) }
+                    ?? dataURL.appending(path: "keys")
+                let control: SQLiteControlDatabase
+                do {
+                    control = try await SQLiteControlDatabase(dataDirectory: dataURL)
+                } catch {
+                    throw ValidationError("unable to open Swan control database")
+                }
+                let opener = SQLitePLCAccountPreparationStoreOpener(
+                    dataDirectory: dataURL
+                )
+                do {
+                    let keyStore = try FileAccountKeyStore(
+                        root: keyURL,
+                        configuration: keyConfiguration
+                    )
+                    let service = PLCAccountRotationService(
+                        controlStore: control,
+                        accountStoreOpener: opener,
+                        keyStore: keyStore,
+                        plcClient: try PLCDirectoryClient(
+                            configuration: plcConfiguration
+                        )
+                    )
+                    let result = try await service.rotate(did: did)
+                    try await opener.close()
+                    try await control.close()
+                    try AccountCommandSupport.write(
+                        try RotatedPLCAccountView(result: result)
+                    )
+                } catch {
+                    try? await opener.close()
                     try? await control.close()
                     throw AccountCommandSupport.validationError(for: error)
                 }
@@ -2598,6 +2719,22 @@ private struct PreparedPLCAccountIdentityView: Encodable {
         repositoryRevision = result.repositoryRevision
         plcOperationCID = result.plcOperationCID
         publicGenesisCommitCID = result.publicGenesisCommitCID
+    }
+}
+
+private struct RotatedPLCAccountView: Encodable {
+    let did: String
+    let status: String
+    let generation: UInt64
+    let operationCID: String
+    let previousOperationCID: String?
+
+    init(result: RotatedPLCAccountIdentity) throws {
+        did = result.account.did
+        status = result.account.status.rawValue
+        generation = result.generation
+        operationCID = try result.operation.cid.string
+        previousOperationCID = result.operation.prev
     }
 }
 
