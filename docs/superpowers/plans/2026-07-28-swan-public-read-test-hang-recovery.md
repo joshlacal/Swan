@@ -414,7 +414,7 @@ env -u SDKROOT -u TOOLCHAINS \
 
 Expected: zero failures.
 
-- [ ] **Step 3: Re-run the real 256 MiB gate once**
+- [x] **Step 3: Re-run the real 256 MiB gate once**
 
 Run only after the focused suites are stable:
 
@@ -434,7 +434,7 @@ Expected:
 - peak RSS delta below 128 MiB;
 - HTTP writes no larger than 64 KiB.
 
-- [ ] **Step 4: Run immutable profile/interoperability checks**
+- [x] **Step 4: Run immutable profile/interoperability checks**
 
 Run:
 
@@ -453,6 +453,26 @@ Expected:
 - reference public CAR verified;
 - no whitespace errors;
 - clean or intentionally scoped working copy.
+
+## 2026-07-28 execution evidence
+
+The original hang was environmental: orphaned Swift 6.2.3 `swift-test`
+processes held the default SwiftPM state while compiling manifests against the
+Xcode-beta SDK. The exact processes were terminated, and a fresh scratch tree
+was resolved and built with Xcode-beta Swift 6.4, `--jobs 1`.
+
+- XCTest bundle code-signature verification passed.
+- `PublicRepositoryReadHTTPTests`: 8 tests passed in 0.202 seconds.
+- Opt-in 256 MiB production-directory CAR/RSS test: passed in 11.075 seconds.
+- Complete prebuilt Swift suite: exit 0 after the `swan` executable was made
+  available at the CLI tests' expected `.build/debug/swan` path. The suite's
+  only skips are the existing lab/environment-gated cases.
+- `swan lab validate`: passed for pinned reference SHA
+  `3f6c96d5d2d25438bd40fa89d6ecc37865f8e354`.
+- Offline lab matrix: passed and wrote a sanitized artifact.
+- Docker/Compose is not installed in this environment; live cross-host Swan /
+  TypeScript matrix execution remains an external gate and must not be marked
+  complete from these local results.
 
 - [ ] **Step 5: Complete the interrupted independent rereview**
 
