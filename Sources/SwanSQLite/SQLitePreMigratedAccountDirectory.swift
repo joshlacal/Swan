@@ -27,6 +27,14 @@ public actor SQLitePreMigratedAccountDirectory:
     private var databases: [String: SQLiteAccountDatabase]
     private var isClosed = false
 
+    /// Returns only a startup-preopened public mutation store. HTTP adapters
+    /// must still bind the selector to the OAuth subject and lifecycle status;
+    /// this method never opens a database on demand.
+    public func preopenedPublicMutationStore(did: String) async -> (any PublicRepositoryMutationStore)? {
+        guard !isClosed else { return nil }
+        return databases[did]
+    }
+
     private init(
         dataDirectory: URL,
         controlStore: any AccountControlStore,
