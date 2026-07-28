@@ -149,6 +149,15 @@ checksum-verified way to populate the ignored reference cache.
   record read/list, and `sync.getRepo` succeeded. Blob upload remained staged
   until a valid record reference; the smoke result is reference-host evidence,
   not Swan/TypeScript convergence evidence.
+- A disposable TypeScript member account completed the cross-host permissioned
+  path on 2026-07-28: the reference PDS wrote the member repository, Swan's
+  authority verified the delegation with an operator-supplied static public-key
+  pin and issued a space credential, and the reference member host accepted
+  that credential for `space.getRecord` with a matching CID. The new
+  `--permissioned-read-host member` runner option makes the repository-host
+  boundary explicit. This is a real credential/read interop proof, but it does
+  not claim public repository import, dynamic remote DID/PLC/JWKS discovery,
+  or the complete TypeScript semantic matrix.
 - The Linux Compose laboratory was run from a clean disposable Swan data
   volume with the pinned PLC/PDS cache, Caddy TLS, Mailpit, and Toxiproxy
   healthy. Bootstrap now creates real PLC-backed Swan accounts through the
@@ -196,7 +205,9 @@ that the complete live interop matrix has passed.
   transport/profile summaries. Stateful Swan-to-Swan public, permissioned, and
   isolation evidence is recorded separately in ignored local artifacts; no
   secret, token, proof, or recoverable record value is committed. The pinned
-  TypeScript service was included in the endpoint/fault matrix and its local
-  smoke runtime passed reference-only account/public operations, but a complete
-  Swan-to-TypeScript permissioned semantic convergence run remains a distinct
+  TypeScript service was included in the endpoint/fault matrix, its local
+  smoke runtime passed reference-only account/public operations, and the
+  cross-host permissioned credential/read smoke passed with a static operator
+  key pin. A complete Swan-to-TypeScript semantic convergence run, including
+  public repository import and dynamic remote key discovery, remains a distinct
   follow-up gate.

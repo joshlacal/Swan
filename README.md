@@ -34,7 +34,11 @@ subsequent `repo.getRecord` on the consumer. In `permissioned` mode the member
 writes its repository with member OAuth/DPoP, obtains a delegation, exchanges
 it at the authority for a space credential, and reads the member repository
 through the authority with that read-only credential. Space credentials are
-never used as write capabilities. Add `--provision-space` for a disposable
+never used as write capabilities. The default read host is `authority`; pass
+`--permissioned-read-host member` when the member repository is hosted by a
+different implementation, so the credential is verified at the repository
+host rather than against a second authority-local copy. Add
+`--provision-space` for a disposable
 authority/member setup when running against the Compose Swan host. Use
 `--producer-auth oauth` for Swan account OAuth; the handle/password values are
 read from the environment and fresh DPoP proofs are minted per request.
@@ -42,6 +46,14 @@ read from the environment and fresh DPoP proofs are minted per request.
 a pinned reference host. The output artifact keeps only statuses, CIDs,
 response digests, and sanitized endpoint events; request bodies, values,
 credentials, and proofs are never written.
+
+The cross-host TypeScript permissioned smoke uses the pinned reference PDS as
+the member repository and Swan as the authority. Swan's fail-closed remote key
+policy requires an operator-supplied static delegation public-key pin for that
+run (via the server's `--notification-config`); the pin contains verification
+material only and must remain outside the repository. This proves credential
+issuance and repository-host verification, but is not a substitute for the
+full TypeScript semantic matrix or dynamic DID/PLC/JWKS discovery.
 
 ## Disposable Compose interoperability lab
 
@@ -124,8 +136,11 @@ The Linux Compose gate has been exercised with a clean cache: health checks,
 PLC-backed account bootstrap, stateful public and permissioned Swan-to-Swan
 round trips, public/private isolation, and the offline/disconnected/delayed/
 duplicated/reordered/corrupted endpoint matrix all pass. The pinned TypeScript
-host remains a separate reference-protocol matrix; the sanitized transport
-artifact is not a claim of full Swan-to-TypeScript semantic convergence.
+host also passed a disposable public record smoke and a cross-host permissioned
+round trip: it wrote on the reference member PDS, received a Swan-issued space
+credential, and read the same CID back from that member host. The sanitized
+transport artifact is not a claim of full Swan-to-TypeScript semantic
+convergence.
 
 ### Pinned wire generation
 

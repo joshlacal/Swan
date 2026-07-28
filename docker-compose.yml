@@ -30,7 +30,9 @@ services:
       dockerfile: Swan/Dockerfile
     user: root
     entrypoint: ["/bin/sh", "-ec"]
-    command: "install -d -o swan -g swan -m 0700 /var/lib/swan/data"
+    # The entrypoint is `sh -ec`; keep the complete script in one argument so
+    # Compose does not split `install` flags into `$0`/`$1` shell parameters.
+    command: ["install -d -o swan -g swan -m 0700 /var/lib/swan/data"]
     volumes:
       - swan-data:/var/lib/swan
     network_mode: "none"

@@ -2845,6 +2845,12 @@ extension SwanCommand {
             @Option(name: .long, help: "Permissioned space URI; required in permissioned mode")
             var space: String = ""
 
+            @Option(
+                name: .customLong("permissioned-read-host"),
+                help: "Permissioned repository host for the credential read: authority (default) or member"
+            )
+            var permissionedReadHost: String = "authority"
+
             @Flag(
                 name: .customLong("provision-space"),
                 help: "Create the permissioned space and add the read-query repository DID before the round trip"
@@ -2953,6 +2959,15 @@ extension SwanCommand {
                         member: producer.client,
                         authority: consumer.client
                     )
+                    let readHost: LiveInteropHost?
+                    switch permissionedReadHost.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+                    case "authority":
+                        readHost = consumer
+                    case "member":
+                        readHost = producer
+                    default:
+                        throw ValidationError("--permissioned-read-host must be authority or member")
+                    }
                     let result = await LiveInteropRunner.permissionedCreateAndRead(
                         scenario: normalizedScenario,
                         member: producer,
@@ -2960,7 +2975,8 @@ extension SwanCommand {
                         broker: broker,
                         space: parsedSpace,
                         createBody: body,
-                        readQuery: query
+                        readQuery: query,
+                        readHost: readHost
                     )
                     artifact = result
                     status = result.status

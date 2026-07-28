@@ -800,6 +800,7 @@ public enum LiveInteropRunner {
         space: SpaceURI,
         createBody: Data,
         readQuery: [String: String],
+        readHost: LiveInteropHost? = nil,
         clientAttestation: String? = nil,
         recorder: InteropFixtureRecorder? = nil
     ) async -> LiveInteropPermissionedRoundTripArtifact {
@@ -883,7 +884,15 @@ public enum LiveInteropRunner {
                 )
             }
             let credentialAuthorization = InteropAuthorization.bearer(token: credential)
-            let read = try await authority.client.query(
+            // A space credential is presented to the repository host.  In a
+            // local laboratory the authority may also host the member repo,
+            // which is the historical default.  Cross-implementation runs
+            // must be able to select the member host explicitly so the test
+            // proves that the pinned TypeScript PDS can verify and serve a
+            // Swan-issued credential rather than accidentally reading a
+            // second local copy from the authority.
+            let repositoryHost = readHost ?? authority
+            let read = try await repositoryHost.client.query(
                 "com.atproto.space.getRecord",
                 query: readQuery,
                 authorization: credentialAuthorization
@@ -891,7 +900,7 @@ public enum LiveInteropRunner {
             readStatus = read.status
             readDigest = responseDigest(read)
             await recorder.record(
-                host: authority.label,
+                host: repositoryHost.label,
                 method: "GET",
                 path: "/xrpc/com.atproto.space.getRecord",
                 response: read

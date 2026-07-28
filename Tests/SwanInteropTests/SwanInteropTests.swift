@@ -274,7 +274,8 @@ final class SwanInteropTests: XCTestCase {
                 "repo": "did:plc:abcdefghijklmnopqrstuvwx",
                 "collection": "app.bsky.feed.post",
                 "rkey": "r1",
-            ]
+            ],
+            readHost: consumer
         )
         XCTAssertEqual(permissionedArtifact.status, "failed")
         XCTAssertEqual(permissionedArtifact.errorCode, "InvalidRequest")
