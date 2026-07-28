@@ -1,9 +1,29 @@
 name: swan-interop-alpha
 
-# This file is intentionally launched through ./interop/compose.sh. That
-# wrapper verifies the ignored reference cache before Docker receives a build
-# context, so the normal build never fetches TypeScript source from the network.
+# Launch only through ./interop/compose.sh. The wrapper validates the pinned
+# reference archive before Docker receives a build context. Secret values come
+# exclusively from owner-only files below SWAN_INTEROP_SECRETS_DIR; Compose
+# interpolates only that directory path, never a secret value.
 services:
+  swan-secrets-init:
+    build:
+      context: ..
+      dockerfile: Swan/Dockerfile
+    user: root
+    entrypoint: ["/usr/local/bin/swan-interop-prepare-secrets"]
+    environment:
+      EXTERNAL_SECRETS_DIR: /external-secrets
+      SWAN_RUNTIME_SECRETS_DIR: /prepared/swan-runtime
+      SWAN_BOOTSTRAP_SECRETS_DIR: /prepared/swan-bootstrap
+      REFERENCE_PDS_SECRETS_DIR: /prepared/reference-pds
+    volumes:
+      - ${SWAN_INTEROP_SECRETS_DIR:?set the owner-only lab interop secret directory path}:/external-secrets:ro
+      - swan-runtime-secrets:/prepared/swan-runtime
+      - swan-bootstrap-secrets:/prepared/swan-bootstrap
+      - reference-pds-secrets:/prepared/reference-pds
+    network_mode: "none"
+    restart: "no"
+
   swan-data-init:
     build:
       context: ..
@@ -25,11 +45,13 @@ services:
     command: []
     environment:
       DATA_DIRECTORY: /var/lib/swan/data
-      SWAN_INTEROP_SECRETS_DIR: ${SWAN_INTEROP_SECRETS_DIR:?set the lab interop secret directory path}
+      SWAN_INTEROP_SECRETS_DIR: /run/secrets/swan-bootstrap
     volumes:
       - swan-data:/var/lib/swan
-      - ${SWAN_INTEROP_SECRETS_DIR:?set the lab interop secret directory path}:/swan-interoperability-secrets:ro
+      - swan-bootstrap-secrets:/run/secrets/swan-bootstrap:ro
     depends_on:
+      swan-secrets-init:
+        condition: service_completed_successfully
       swan-data-init:
         condition: service_completed_successfully
     restart: "no"
@@ -38,6 +60,7 @@ services:
     build:
       context: ..
       dockerfile: Swan/Dockerfile
+    user: swan
     command:
       - serve
       - --host
@@ -46,31 +69,25 @@ services:
       - "3000"
       - --public-url
       - "https://swan.test"
-      - --notification-config
-      - ${SWAN_INTEROP_NOTIFICATION_CONFIG:-/swan-notification-config.json}
       - --data-directory
       - /var/lib/swan/data
       - --enable-local-space-interop
       - --space-account-kek-file
-      - /swan-interoperability-secrets/account-kek
+      - /run/secrets/swan-runtime/account-kek
       - --space-account-kek-id
       - primary
       - --oauth-server-key-file
-      - /swan-interoperability-secrets/oauth-server-key
+      - /run/secrets/swan-runtime/oauth-server-key
       - --enable-localhost-oauth
     volumes:
       - swan-data:/var/lib/swan
-      - ./interop/notification-config.json:/swan-notification-config.json:ro
-      - ${SWAN_INTEROP_SECRETS_DIR:?set the lab interop secret directory path}:/swan-interoperability-secrets:ro
-    networks:
-      swan:
-        aliases:
-          - swan.test
+      - swan-runtime-secrets:/run/secrets/swan-runtime:ro
+    networks: [swan]
     depends_on:
       swan-bootstrap:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", "test -e /usr/local/bin/swan"]
+      test: ["CMD-SHELL", "test -x /usr/local/bin/swan"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -85,21 +102,17 @@ services:
       PDS_DATA_DIRECTORY: /pds
       PDS_BLOBSTORE_DISK_LOCATION: /pds/blocks
       PDS_DID_PLC_URL: http://reference-plc:2582
-      PDS_DPOP_SECRET: ${PDS_DPOP_SECRET:?set a disposable PDS DPoP secret outside the repository}
-      PDS_JWT_SECRET: ${PDS_JWT_SECRET:?set a disposable PDS JWT secret outside the repository}
-      PDS_ADMIN_PASSWORD: ${PDS_ADMIN_PASSWORD:?set a disposable PDS administrator password outside the repository}
-      PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX: ${PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX:?set a disposable PDS signing key outside the repository}
-      PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX: ${PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX:?set a disposable PDS PLC rotation key outside the repository}
       PDS_INVITE_REQUIRED: "true"
       PDS_DISABLE_SSRF_PROTECTION: "false"
       LOG_ENABLED: "false"
+      REFERENCE_PDS_SECRETS_DIR: /run/secrets/reference-pds
     volumes:
       - reference-pds-data:/pds
-    networks:
-      swan:
-        aliases:
-          - pds.test
+      - reference-pds-secrets:/run/secrets/reference-pds:ro
+    networks: [swan]
     depends_on:
+      swan-secrets-init:
+        condition: service_completed_successfully
       reference-plc:
         condition: service_started
 
@@ -117,28 +130,48 @@ services:
   caddy:
     image: caddy:2.10.2-alpine
     ports:
-      - "443:443"
+      - "127.0.0.1:443:443"
     volumes:
       - ./interop/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
-    networks: [swan]
+    networks:
+      swan:
+        aliases:
+          - swan.test
+          - pds.test
     depends_on:
-      swan-bootstrap:
-        condition: service_completed_successfully
       swan:
         condition: service_started
       toxiproxy-setup:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /data/caddy/pki/authorities/local/root.crt"]
+      interval: 1s
+      timeout: 1s
+      retries: 60
+
+  caddy-ca-ready:
+    build:
+      context: ..
+      dockerfile: Swan/Dockerfile
+    user: root
+    entrypoint: ["/usr/local/bin/swan-interop-caddy-trust"]
+    volumes:
+      - caddy-data:/caddy-data:ro
+      - caddy-trust:/prepared-trust
+    network_mode: "none"
+    depends_on:
+      caddy:
+        condition: service_healthy
+    restart: "no"
 
   mailpit:
     image: axllent/mailpit:v1.27.1
-    ports: ["127.0.0.1:8025:8025"]
     networks: [swan]
 
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.12.0
-    ports: ["127.0.0.1:8474:8474"]
     networks: [swan]
 
   toxiproxy-setup:
@@ -158,54 +191,38 @@ services:
       - reference-pds
     restart: "no"
 
+  # Task 28 deliberately does not execute the cross-host matrix. This profile
+  # is an inert trust-handoff proof: it has no network and never invokes Swan.
   scenario-runner:
+    profiles: ["planned-not-executed"]
     build:
       context: ..
       dockerfile: Swan/Dockerfile
+    user: swan
     entrypoint: ["/bin/sh", "-ec"]
-    user: root
     command: >
-      CADDY_CA_PATH="$(find /caddy-data -type f -name root.crt | head -n 1)"
-      if [ -z "$CADDY_CA_PATH" ] || [ ! -f "$CADDY_CA_PATH" ]; then
-        echo "caddy local CA certificate was not available" >&2
-        exit 1
-      fi
-      SSL_CERT_FILE="$CADDY_CA_PATH"
-      export SSL_CERT_FILE
-      /usr/local/bin/swan lab matrix --name reference-matrix --output-directory /artifacts --fail-on-failure
+      test -r /etc/ssl/certs/caddy-local-root.crt
+      && test "$(head -n 1 /etc/ssl/certs/caddy-local-root.crt)" = "-----BEGIN CERTIFICATE-----"
+      && SSL_CERT_FILE=/etc/ssl/certs/caddy-local-root.crt
+      && export SSL_CERT_FILE
+      && echo "planned-not-executed: CA trust prepared; no probes or faults were run"
     volumes:
-      - scenario-artifacts:/artifacts
-      - caddy-data:/caddy-data:ro
-    networks: [swan]
-    depends_on:
-      swan:
-        condition: service_started
-      caddy:
-        condition: service_started
-      scenario-artifacts-init:
-        condition: service_completed_successfully
-    restart: "no"
-
-  # Docker creates a fresh named volume as root. Prepare it with the runtime
-  # account's ownership before the unprivileged scenario runner mounts it.
-  scenario-artifacts-init:
-    build:
-      context: ..
-      dockerfile: Swan/Dockerfile
-    user: root
-    entrypoint: ["/bin/sh", "-ec"]
-    command: "install -d -o swan -g swan -m 0700 /artifacts"
-    volumes:
-      - scenario-artifacts:/artifacts
+      - caddy-trust:/etc/ssl/certs:ro
     network_mode: "none"
+    depends_on:
+      caddy-ca-ready:
+        condition: service_completed_successfully
     restart: "no"
 
 volumes:
   swan-data:
+  swan-runtime-secrets:
+  swan-bootstrap-secrets:
   reference-pds-data:
+  reference-pds-secrets:
   caddy-data:
   caddy-config:
-  scenario-artifacts:
+  caddy-trust:
 
 networks:
   swan:

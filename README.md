@@ -16,11 +16,76 @@ swift run swan verify
 swift run swan serve --data-directory .swan-data
 ```
 
-The interoperability compose lab binds `swan` with a lab notification material
-configuration from `${SWAN_INTEROP_NOTIFICATION_CONFIG}` by default. If unset,
-it falls back to `interop/notification-config.json`, which enables
-`com.atproto.simplespace.checkUserAccess` with non-sensitive placeholder
-audience and destination data.
+## Disposable Compose interoperability lab
+
+The lab accepts no secret values through Compose environment interpolation.
+Before invoking `interop/compose.sh`, create an owner-only directory **outside
+this repository**, set it to mode `0700`, and create these owner-only regular
+files at mode `0600`:
+
+- `oauth-server-key`
+- `account-kek`
+- `operator-secret`
+- `authority.did`
+- `authority.handle`
+- `authority.password`
+- `member.did`
+- `member.handle`
+- `member.password`
+- `public-repo-revision`
+- `pds-dpop-secret`
+- `pds-jwt-secret`
+- `pds-admin-password`
+- `pds-repo-signing-key`
+- `pds-plc-rotation-key`
+
+Both `oauth-server-key` and `account-kek` contain URL-safe Base64 encodings of
+32-byte keys. The account identity files must contain canonical DIDs/handles,
+and `public-repo-revision` must be a valid repository-v3 revision. PDS files
+use the formats required by the pinned reference PDS; all files must be
+nonempty even though this preflight intentionally never prints their values.
+
+Set `SWAN_INTEROP_SECRETS_DIR` to that directory's absolute path. The wrapper
+rejects in-repository paths, symlinks, non-owner files, and group/other
+permissions before Docker is invoked:
+
+```sh
+export SWAN_INTEROP_SECRETS_DIR=/absolute/path/outside/this/repository
+./interop/compose.sh up
+```
+
+Host file UIDs normally do not match the image's `swan` or `node` UIDs. The
+network-isolated `swan-secrets-init` service therefore copies the validated
+external files into named volumes with container ownership and mode `0400`.
+This root service runs only the dedicated copy wrapper; it never invokes the
+Swan executable. `swan-bootstrap` receives the bootstrap-only copy, while the
+long-running `swan` service receives only `oauth-server-key` and `account-kek`.
+The reference PDS loads its prepared files internally through an unprivileged
+wrapper, so secret values never appear in the Compose model.
+
+Startup is ordered as follows:
+
+1. `swan-secrets-init` and `swan-data-init` prepare owner-correct secret/data
+   volumes without network access.
+2. Unprivileged `swan-bootstrap` installs the disposable authority and member
+   accounts idempotently using supported `swan account` commands.
+3. Unprivileged `swan` starts with local-space interop enabled behind Caddy.
+4. Caddy creates its local CA; its healthcheck gates `caddy-ca-ready`, which
+   copies the public root certificate into an unprivileged read-only trust
+   volume.
+
+Caddy on loopback port 443 is the sole host ingress and owns the in-network
+`swan.test` and `pds.test` aliases. Mailpit and Toxiproxy have no published
+ports. The `scenario-runner` belongs to the opt-in `planned-not-executed`
+profile, has no network, and only validates the prepared CA trust file. Task 28
+does not run probes, the cross-host matrix, or fault mutations.
+
+`Scripts/verify-interop-lab.sh` statically enforces this topology, and
+`Scripts/test-verify-interop-lab.sh` pressure-tests the verifier with unsafe
+privilege, dependency, interpolation, mount, runner, and readiness mutations.
+Docker/Compose startup, Linux UID behavior, TLS requests, reference account
+setup, and the real cross-host/fault matrix remain explicit future gates on a
+Docker-capable Linux host.
 
 ### Pinned wire generation
 

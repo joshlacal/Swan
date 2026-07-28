@@ -19,10 +19,13 @@ FROM node:24.15-alpine3.23
 RUN apk add --no-cache dumb-init
 ENTRYPOINT ["dumb-init", "--"]
 COPY --from=build /app /app
+COPY Swan/interop/run-reference-pds.sh /usr/local/bin/reference-pds-with-file-secrets
 WORKDIR /app/services/pds
-RUN mkdir /pds && chown node /pds
+RUN mkdir /pds \
+    && chown node /pds \
+    && chmod +x /usr/local/bin/reference-pds-with-file-secrets
 VOLUME /pds
 EXPOSE 3000
 ENV NODE_ENV=production UV_USE_IO_URING=0
 USER node
-CMD ["node", "--heapsnapshot-signal=SIGUSR2", "--enable-source-maps", "--import=./tracer.ts", "index.ts"]
+CMD ["/usr/local/bin/reference-pds-with-file-secrets", "node", "--heapsnapshot-signal=SIGUSR2", "--enable-source-maps", "--import=./tracer.ts", "index.ts"]
