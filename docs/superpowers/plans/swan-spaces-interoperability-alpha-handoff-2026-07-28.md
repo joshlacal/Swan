@@ -385,3 +385,30 @@ the expected staged blob response; a retrieval attempt before a valid record
 reference returned `Blob not found`, and an invalid plain-text profile
 attachment was rejected. No cross-host Swan/TypeScript exchange is claimed by
 this smoke run, and all temporary service processes were stopped afterward.
+
+## Follow-up verification: stateful live runner and bounded private transfers
+
+The current Swan successor commits extend the harness beyond endpoint probes:
+
+- `d484298b` adds the callable `swan lab live` command. Public mode performs a
+  selector-bound `repo.putRecord`/`repo.getRecord` round trip; permissioned
+  mode exchanges a member delegation for a space credential and performs a
+  `space.createRecord`/`space.getRecord` round trip. Artifacts contain only
+  statuses, commitments, sizes, and response digests.
+- `0ec5467e` fixes the live client's XRPC path construction to use the actual
+  `/xrpc/<nsid>` target. A direct test covers the NSID and canonical query
+  ordering used by DPoP-bound requests.
+- The explicit 256 MiB local transfer gates pass for permissioned CAR spooling,
+  private CAS blob streaming, and staged CAR import. The public production
+  directory RSS gate also remains green.
+- The complete serialized macOS suite passes after the live-client fix, as do
+  `swift build`, profile verification, the static Compose verifier, its
+  mutation tests, both pinned TypeScript public CAR/genesis verifiers, and the
+  offline durable Swan-to-Swan semantic artifact.
+
+The live runner is now executable when two hosts and disposable credentials
+are supplied, but no claim of cross-host convergence is made from these local
+checks. Docker/Compose, a Linux Swift environment, and a live
+Swan-to-pinned-TypeScript public/permissioned matrix are still unavailable in
+this workspace (`docker`, `podman`, and `colima` are not installed). Those
+external gates must be run before the alpha can be marked complete.

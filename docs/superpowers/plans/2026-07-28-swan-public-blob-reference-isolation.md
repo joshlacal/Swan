@@ -78,8 +78,9 @@ boundary.
   verifier, and public-read slice are now implemented and covered locally.
 - Run the new stateful live runner against cross-host record/blob scenarios and
   execute the fault matrix under Docker on macOS and Linux.
-- Run the complete suite after the next mutation slice; do not claim alpha
-  completion until the live Compose/reference matrix and Linux gates pass.
+- Re-run the complete suite after any further mutation slice; do not claim
+  alpha completion until the live Compose/reference matrix and Linux gates
+  pass.
 
 ## 2026-07-28 runtime and harness checkpoint
 
