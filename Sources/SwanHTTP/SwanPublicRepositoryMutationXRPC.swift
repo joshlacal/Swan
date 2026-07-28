@@ -57,8 +57,9 @@ private struct PublicMutationHandlers {
         guard contentTypes.count <= 1 else {
             throw PublicMutationFailure.invalidRequest
         }
-        let mimeType = contentTypes.first?.split(separator: ";", maxSplits: 1).first.map(String.init)
+        let requestedMIMEType = contentTypes.first?.split(separator: ";", maxSplits: 1).first.map(String.init)
             ?? "application/octet-stream"
+        let mimeType = safePublicBlobMIMEType(requestedMIMEType)
         let maximumBytes = 256 * 1024 * 1024
         let counter = PublicBlobUploadCounter()
         let body = request.body
@@ -83,13 +84,17 @@ private struct PublicMutationHandlers {
                 throw PublicMutationFailure.invalidRequest
             }
         }
+        guard case .public = reference.namespace else {
+            throw PublicMutationFailure.unavailable
+        }
         let cid: CID
         do {
             cid = try CID.parse(reference.cid)
         } catch {
             throw PublicMutationFailure.unavailable
         }
-        guard cid.codec == .raw,
+        guard cid.string == reference.cid,
+              cid.codec == .raw,
               cid.multihash.algorithm == Multihash.sha256Code,
               cid.multihash.length == Multihash.sha256Length else {
             throw PublicMutationFailure.unavailable
