@@ -585,20 +585,20 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
               ) else {
             throw PublicRepositoryMutationStoreError.corruptRepository
         }
+        guard storedRequestID == request.id,
+              storedRequestDigest == request.canonicalDigest,
+              storedBaseCommitCID == request.baseCommitCID.string else {
+            throw PublicRepositoryMutationStoreError.conflictingRequestReuse
+        }
         switch status {
         case "reserved":
             guard committedCommitString == nil,
                   committedDataString == nil,
                   projection == nil,
                   row.column("committed_projection_digest").flatMap(Data.init(sqliteData:)) == nil
-        else {
-            throw PublicRepositoryMutationStoreError.corruptRepository
-        }
-        guard storedRequestID == request.id,
-              storedRequestDigest == request.canonicalDigest,
-              storedBaseCommitCID == request.baseCommitCID.string else {
-            throw PublicRepositoryMutationStoreError.conflictingRequestReuse
-        }
+            else {
+                throw PublicRepositoryMutationStoreError.corruptRepository
+            }
             return .reserved(reservation)
         case "committed":
             guard let projection,

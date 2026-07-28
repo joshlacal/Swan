@@ -375,6 +375,24 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
                 canonicalDigest: Data(repeating: UInt8(target), count: 32),
                 baseCommitCID: state.commitCID
             )
+            let clock: UInt64 = 1_750_000_000_000_000
+            let beforeRaw = try await openRawAccountDatabase(root: root)
+            let beforeRequests = try await beforeRaw.query(
+                """
+                SELECT request_id FROM public_repository_mutation_requests
+                WHERE request_id = ?
+                """,
+                [.text(request.id)]
+            )
+            XCTAssertTrue(beforeRequests.isEmpty)
+            let beforeAllocator = try await beforeRaw.query(
+                """
+                SELECT highest_value FROM public_repository_revision_allocator
+                WHERE singleton = 1
+                """
+            )
+            XCTAssertTrue(beforeAllocator.isEmpty)
+            try await beforeRaw.close()
             await database.installTestingHooks(SQLiteTestingHooks(
                 afterPublicRepositoryMutatingSQL: { index in
                     if index == target { throw InjectedFailure.expected }
@@ -383,20 +401,49 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
             await XCTAssertThrowsAsync(
                 try await database.reservePublicRepositoryRevision(
                     request,
-                    wallClockMicroseconds: 1_750_000_000_000_000
+                    wallClockMicroseconds: clock
                 )
             ) {
                 XCTAssertEqual($0 as? InjectedFailure, .expected)
             }
             try await database.close()
 
+            let afterRaw = try await openRawAccountDatabase(root: root)
+            let afterRequests = try await afterRaw.query(
+                """
+                SELECT request_id FROM public_repository_mutation_requests
+                WHERE request_id = ?
+                """,
+                [.text(request.id)]
+            )
+            XCTAssertTrue(
+                afterRequests.isEmpty,
+                "failure after SQL boundary \(target) persisted the request"
+            )
+            let afterAllocator = try await afterRaw.query(
+                """
+                SELECT highest_value FROM public_repository_revision_allocator
+                WHERE singleton = 1
+                """
+            )
+            XCTAssertTrue(
+                afterAllocator.isEmpty,
+                "failure after SQL boundary \(target) persisted the allocator"
+            )
+            try await afterRaw.close()
+
             let reopened = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
-            guard case .reserved = try await reopened.reservePublicRepositoryRevision(
+            guard case let .reserved(reservation) =
+                try await reopened.reservePublicRepositoryRevision(
                 request,
-                wallClockMicroseconds: 1_750_000_000_000_000
+                wallClockMicroseconds: clock
             ) else {
                 return XCTFail("rolled-back reservation persisted")
             }
+            XCTAssertEqual(
+                reservation.nextRevision,
+                expectedRevision(clock << 10)
+            )
             try await reopened.close()
         }
     }
@@ -954,6 +1001,17 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
         try await SQLiteConnection.open(
             storage: .file(path: SQLiteLayout.accountDatabase(in: root, did: did).path)
         )
+    }
+
+    private func expectedRevision(_ raw: UInt64) -> String {
+        let alphabet = Array("234567abcdefghijklmnopqrstuvwxyz".utf8)
+        var value = raw
+        var bytes = Array(repeating: UInt8(ascii: "2"), count: 13)
+        for index in stride(from: 12, through: 0, by: -1) {
+            bytes[index] = alphabet[Int(value & 31)]
+            value >>= 5
+        }
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     private func replaceRequestTableWithLegacySchema(
