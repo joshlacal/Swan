@@ -276,6 +276,51 @@ final class PLCAccountPreparationCLITests: XCTestCase {
         )
     }
 
+    func testRotatePLCUsesDurableHistoryAndReturnsOnlySanitizedIdentity() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let server = try TestPLCDirectory(submitBody: Data("OK".utf8))
+        defer { server.shutdown() }
+
+        let preparation = try runPrepare(
+            fixture: fixture,
+            server: server,
+            compatibility: "did-plc-server-0.0.1",
+            handle: "alice.test"
+        )
+        XCTAssertEqual(preparation.status, 0, preparation.error)
+        let prepared = try decode(preparation.output)
+        let did = try XCTUnwrap(prepared["did"] as? String)
+
+        let activation = try runActivate(fixture: fixture, server: server)
+        XCTAssertEqual(activation.status, 0, activation.error)
+
+        let rotation = try runRotate(fixture: fixture, server: server, did: did)
+        XCTAssertEqual(rotation.status, 0, rotation.error)
+        let result = try decode(rotation.output)
+        XCTAssertEqual(Set(result.keys), [
+            "did", "status", "generation", "operationCID", "previousOperationCID",
+        ])
+        XCTAssertEqual(result["did"] as? String, did)
+        XCTAssertEqual(result["status"] as? String, "active")
+        XCTAssertEqual(result["generation"] as? Int, 2)
+        XCTAssertEqual(result["previousOperationCID"] as? String, prepared["plcOperationCID"] as? String)
+        XCTAssertNotEqual(result["operationCID"] as? String, result["previousOperationCID"] as? String)
+        XCTAssertEqual(server.submitCount, 2)
+
+        let account = try await SQLiteControlDatabase(dataDirectory: fixture.data)
+        let control = try await account.account(did: did)
+        XCTAssertEqual(control?.signingKey?.generation, 2)
+        XCTAssertEqual(control?.rotationKey?.generation, 2)
+        try await account.close()
+
+        for rendered in [rotation.output, rotation.error] {
+            for sentinel in fixture.renderedSecretSentinels {
+                XCTAssertFalse(rendered.contains(sentinel))
+            }
+        }
+    }
+
     func testWrongOrMissingWellKnownProofDoesNotActivateSubmittedIdentity() async throws {
         for proof in [
             TestWellKnownResponse.body(
@@ -518,6 +563,42 @@ final class PLCAccountPreparationCLITests: XCTestCase {
         )
     }
 
+    private func runRotate(
+        fixture: Fixture,
+        server: TestPLCDirectory,
+        did: String
+    ) throws -> ProcessResult {
+        let process = Process()
+        process.executableURL = try XCTUnwrap(executableURL())
+        process.arguments = [
+            "account", "rotate-plc",
+            "--data-directory", fixture.data.path,
+            "--did", did,
+            "--plc-origin", "http://127.0.0.1:\(server.port)",
+            "--plc-laboratory",
+            "--plc-reference-compatibility", "did-plc-server-0.0.1",
+            "--operator-secret-file", fixture.operatorSecretFile.path,
+            "--account-kek-file", fixture.kekFile.path,
+            "--account-kek-id", "test-primary",
+            "--account-key-directory", fixture.data.appending(path: "account-keys").path,
+        ]
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "SWAN_OPERATOR_SECRET")
+        environment.removeValue(forKey: "SWAN_ACCOUNT_KEK")
+        process.environment = environment
+        let output = Pipe()
+        let error = Pipe()
+        process.standardOutput = output
+        process.standardError = error
+        try process.run()
+        process.waitUntilExit()
+        return ProcessResult(
+            status: process.terminationStatus,
+            output: String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
+            error: String(decoding: error.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        )
+    }
+
     private func runServe(
         fixture: Fixture,
         arguments: [String]
@@ -753,13 +834,21 @@ private final class TestPLCState: @unchecked Sendable {
               let services = operationObject["services"] else {
             throw TestPLCError.malformedOperation
         }
-        let body = try JSONSerialization.data(withJSONObject: [[
+        let entry: [String: Any] = [
             "did": did,
             "operation": rawOperation,
             "cid": try operation.cid.string,
             "nullified": false,
             "createdAt": Self.responseBodySentinel,
-        ]], options: [.sortedKeys])
+        ]
+        var entries: [[String: Any]] = []
+        if let existingData = locked({ audit }),
+           let existing = try JSONSerialization.jsonObject(with: existingData)
+                as? [[String: Any]] {
+            entries = existing
+        }
+        entries.append(entry)
+        let body = try JSONSerialization.data(withJSONObject: entries, options: [.sortedKeys])
         let document = try JSONSerialization.data(withJSONObject: [
             "did": did,
             "rotationKeys": rotationKeys,
