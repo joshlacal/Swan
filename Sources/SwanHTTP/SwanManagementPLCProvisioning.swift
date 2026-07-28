@@ -29,17 +29,20 @@ public struct SwanManagementPLCActivateInput: Sendable {
     public let password: String
     public let plcConfiguration: PLCClientConfiguration
     public let handlePolicy: ATHandleResolutionPolicy
+    public let useStaticLaboratoryHandleVerifier: Bool
 
     public init(
         requestID: String,
         password: String,
         plcConfiguration: PLCClientConfiguration,
-        handlePolicy: ATHandleResolutionPolicy
+        handlePolicy: ATHandleResolutionPolicy,
+        useStaticLaboratoryHandleVerifier: Bool = false
     ) {
         self.requestID = requestID
         self.password = password
         self.plcConfiguration = plcConfiguration
         self.handlePolicy = handlePolicy
+        self.useStaticLaboratoryHandleVerifier = useStaticLaboratoryHandleVerifier
     }
 }
 
@@ -138,11 +141,13 @@ public actor SwanManagementPLCProvisioningRuntime:
         let password: String
         let plcConfiguration: PLCClientConfiguration
         let handlePolicy: ATHandleResolutionPolicy
+        let useStaticLaboratoryHandleVerifier: Bool
 
         init(_ input: SwanManagementPLCActivateInput) {
             password = input.password
             plcConfiguration = input.plcConfiguration
             handlePolicy = input.handlePolicy
+            useStaticLaboratoryHandleVerifier = input.useStaticLaboratoryHandleVerifier
         }
     }
 
@@ -233,10 +238,15 @@ public actor SwanManagementPLCProvisioningRuntime:
     private func performActivation(
         _ input: SwanManagementPLCActivateInput
     ) async throws -> SwanManagementPLCActivateResult {
-        let handleVerifier = ATProtocolHandleVerifier(
-            policy: input.handlePolicy,
-            http: try NIOPeerPinnedATHandleHTTPTransport()
-        )
+        let handleVerifier: any PLCHandleVerifying
+        if input.useStaticLaboratoryHandleVerifier {
+            handleVerifier = StaticLaboratoryHandleVerifier()
+        } else {
+            handleVerifier = ATProtocolHandleVerifier(
+                policy: input.handlePolicy,
+                http: try NIOPeerPinnedATHandleHTTPTransport()
+            )
+        }
         let service = PLCAccountActivationService(
             intentStore: controlDatabase,
             accountStoreOpener: opener,

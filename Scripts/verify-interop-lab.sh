@@ -208,7 +208,10 @@ rg -q 'reverse_proxy toxiproxy:8666' interop/Caddyfile
 
 rg -qx 'FROM swift:6\.1-jammy AS build' Dockerfile
 rg -q 'libsodium-dev pkg-config' Dockerfile
-rg -qx 'FROM ubuntu:24\.04' Dockerfile
+# The runtime keeps the Swift 6.1 standard-library surface alongside the
+# release executable. A minimal Ubuntu runtime would omit those libraries and
+# fail only after the container passes image build.
+rg -qx 'FROM swift:6\.1-jammy' Dockerfile
 rg -q 'libsodium23' Dockerfile
 rg -q 'COPY Swan/interop/bootstrap-local-space\.sh /usr/local/bin/swan-interop-bootstrap' Dockerfile
 rg -q 'COPY Swan/interop/prepare-interop-secrets\.sh /usr/local/bin/swan-interop-prepare-secrets' Dockerfile

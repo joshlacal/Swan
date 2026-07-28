@@ -1,6 +1,7 @@
 import AsyncHTTPClient
 import Foundation
 import NIOCore
+import NIOFoundationCompat
 import Petrel
 import SwanCore
 
@@ -157,6 +158,7 @@ public struct PLCClientConfiguration: Sendable, Equatable {
     private init(
         origin: URL,
         laboratory: Bool,
+        allowlistedLaboratoryHost: String? = nil,
         submitSuccessResponsePolicy: PLCSubmitSuccessResponsePolicy,
         timeout: TimeInterval,
         maximumStateBytes: Int,
@@ -174,7 +176,11 @@ public struct PLCClientConfiguration: Sendable, Equatable {
                 "PLC reference submit compatibility requires a laboratory origin"
             )
         }
-        self.origin = try Self.validateOrigin(origin, laboratory: laboratory)
+        self.origin = try Self.validateOrigin(
+            origin,
+            laboratory: laboratory,
+            allowlistedLaboratoryHost: allowlistedLaboratoryHost
+        )
         self.timeout = timeout
         self.maximumStateBytes = maximumStateBytes
         self.maximumAuditBytes = maximumAuditBytes
@@ -203,6 +209,7 @@ public struct PLCClientConfiguration: Sendable, Equatable {
     public static func laboratory(
         origin: URL,
         submitSuccessResponsePolicy: PLCSubmitSuccessResponsePolicy = .strict,
+        allowlistedHost: String? = nil,
         timeout: TimeInterval = 5,
         maximumStateBytes: Int = 256 * 1_024,
         maximumAuditBytes: Int = 512 * 1_024,
@@ -211,6 +218,7 @@ public struct PLCClientConfiguration: Sendable, Equatable {
         try .init(
             origin: origin,
             laboratory: true,
+            allowlistedLaboratoryHost: allowlistedHost,
             submitSuccessResponsePolicy: submitSuccessResponsePolicy,
             timeout: timeout,
             maximumStateBytes: maximumStateBytes,
@@ -219,7 +227,11 @@ public struct PLCClientConfiguration: Sendable, Equatable {
         )
     }
 
-    private static func validateOrigin(_ origin: URL, laboratory: Bool) throws -> URL {
+    private static func validateOrigin(
+        _ origin: URL,
+        laboratory: Bool,
+        allowlistedLaboratoryHost: String? = nil
+    ) throws -> URL {
         guard let components = URLComponents(url: origin, resolvingAgainstBaseURL: false),
               let scheme = components.scheme?.lowercased(),
               let host = components.host,
@@ -232,9 +244,20 @@ public struct PLCClientConfiguration: Sendable, Equatable {
             throw SwanError.malformed("PLC directory must be configured as an origin")
         }
         if laboratory {
-            guard scheme == "http", plcIsLoopbackLiteral(host),
-                  let port = components.port, (1_024 ... 65_535).contains(port) else {
-                throw SwanError.malformed("PLC laboratory origin must be an HTTP literal-loopback origin")
+            let dotCharacters = CharacterSet(charactersIn: ".")
+            let normalizedHost = host.lowercased().trimmingCharacters(in: dotCharacters)
+            let normalizedAllowlist = allowlistedLaboratoryHost?.lowercased()
+                .trimmingCharacters(in: dotCharacters)
+            guard scheme == "http",
+                  (plcIsLoopbackLiteral(host) ||
+                      (normalizedAllowlist != nil && normalizedHost == normalizedAllowlist)),
+                  let port = components.port, (1_024 ... 65_535).contains(port),
+                  allowlistedLaboratoryHost == nil ||
+                      (normalizedAllowlist?.isEmpty == false &&
+                          normalizedHost == normalizedAllowlist) else {
+                throw SwanError.malformed(
+                    "PLC laboratory origin must be an HTTP literal-loopback origin or an explicitly allowlisted lab host"
+                )
             }
         } else {
             guard scheme == "https", !plcIsLoopbackLiteral(host),

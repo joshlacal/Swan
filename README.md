@@ -30,15 +30,18 @@ does not count as the pinned TypeScript PDS matrix.
 
 `lab live` is the stateful network-backed runner. In `public` mode it performs
 `repo.putRecord` on the producer and compares its returned CID with a
-subsequent `repo.getRecord` on the consumer. In `permissioned` mode it obtains
-a delegation from the producer/member, exchanges it for a space credential on
-the consumer/authority, then compares the CIDs from `space.createRecord` and
-`space.getRecord`. Use `--producer-auth oauth` for Swan account OAuth; the
-handle/password values are read from the environment and fresh DPoP proofs are
-minted per request. `bearer` mode reads only the named token environment
-variable and is useful for a pinned reference host. The output artifact keeps
-only statuses, CIDs, response digests, and sanitized endpoint events; request
-bodies, values, credentials, and proofs are never written.
+subsequent `repo.getRecord` on the consumer. In `permissioned` mode the member
+writes its repository with member OAuth/DPoP, obtains a delegation, exchanges
+it at the authority for a space credential, and reads the member repository
+through the authority with that read-only credential. Space credentials are
+never used as write capabilities. Add `--provision-space` for a disposable
+authority/member setup when running against the Compose Swan host. Use
+`--producer-auth oauth` for Swan account OAuth; the handle/password values are
+read from the environment and fresh DPoP proofs are minted per request.
+`bearer` mode reads only the named token environment variable and is useful for
+a pinned reference host. The output artifact keeps only statuses, CIDs,
+response digests, and sanitized endpoint events; request bodies, values,
+credentials, and proofs are never written.
 
 ## Disposable Compose interoperability lab
 
@@ -91,8 +94,12 @@ Startup is ordered as follows:
 
 1. `swan-secrets-init` and `swan-data-init` prepare owner-correct secret/data
    volumes without network access.
-2. Unprivileged `swan-bootstrap` installs the disposable authority and member
-   accounts idempotently using supported `swan account` commands.
+2. Unprivileged `swan-bootstrap` creates disposable authority and member
+   accounts through the reference PLC's prepare/activate lifecycle. It uses a
+   static handle proof only for this local laboratory bootstrap; production
+   account activation continues to use network handle verification. The
+   generated PLC-backed identities and signed public genesis records are
+   durable under the Swan data volume.
 3. Unprivileged `swan` starts with local-space interop enabled behind Caddy;
    its healthcheck performs a bounded HTTP request to `/health`, so an
    executable that has not bound the listener cannot satisfy Compose readiness.
@@ -105,16 +112,20 @@ Startup is ordered as follows:
 
 Caddy on loopback port 443 is the sole host ingress and owns the in-network
 `swan.test` and `pds.test` aliases. Mailpit and Toxiproxy have no published
-ports. The `scenario-runner` belongs to the opt-in `planned-not-executed`
-profile, has no network, and only validates the prepared CA trust file. Task 28
-does not run probes, the cross-host matrix, or fault mutations.
+ports. The Compose `scenario-runner` remains an inert trust-handoff service;
+stateful runs use an explicit one-shot `docker run` on the lab network so the
+runner's credentials and request bodies are never part of the Compose model.
+The same one-shot path runs the sanitized six-fault endpoint matrix.
 
 `Scripts/verify-interop-lab.sh` statically enforces this topology, and
 `Scripts/test-verify-interop-lab.sh` pressure-tests the verifier with unsafe
 privilege, dependency, interpolation, mount, runner, and readiness mutations.
-Docker/Compose startup, Linux UID behavior, TLS requests, reference account
-setup, and the real cross-host/fault matrix remain explicit future gates on a
-Docker-capable Linux host.
+The Linux Compose gate has been exercised with a clean cache: health checks,
+PLC-backed account bootstrap, stateful public and permissioned Swan-to-Swan
+round trips, public/private isolation, and the offline/disconnected/delayed/
+duplicated/reordered/corrupted endpoint matrix all pass. The pinned TypeScript
+host remains a separate reference-protocol matrix; the sanitized transport
+artifact is not a claim of full Swan-to-TypeScript semantic convergence.
 
 ### Pinned wire generation
 

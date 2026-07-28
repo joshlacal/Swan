@@ -3,6 +3,21 @@ import Foundation
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+
+// Glibc's Swift overlay does not currently declare renameat2 even though the
+// symbol is exported by the Linux libc used by the Swift 6.1/Jammy image.
+// Keep the declaration local and retain RENAME_NOREPLACE so publication never
+// overwrites a pre-existing export target.
+@_silgen_name("renameat2")
+private func swanRenameAt2(
+    _ oldDirectory: Int32,
+    _ oldPath: UnsafePointer<CChar>,
+    _ newDirectory: Int32,
+    _ newPath: UnsafePointer<CChar>,
+    _ flags: UInt32
+) -> Int32
+
+private let swanRenameNoReplace: UInt32 = 1
 #endif
 
 /// A preflighted archive destination whose parent directory remains anchored
@@ -676,12 +691,12 @@ enum SwanPortableExportFilesystem {
                     UInt32(RENAME_EXCL)
                 )
                 #else
-                renameat2(
+                swanRenameAt2(
                     parent,
                     sourcePath,
                     parent,
                     destinationPath,
-                    UInt32(RENAME_NOREPLACE)
+                    swanRenameNoReplace
                 )
                 #endif
             }

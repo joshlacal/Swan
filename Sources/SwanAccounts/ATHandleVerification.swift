@@ -376,6 +376,43 @@ public protocol PLCHandleVerifying: Sendable {
     ) async throws -> VerifiedATHandleIdentity
 }
 
+/// A deliberately explicit laboratory-only handle verifier. It authenticates
+/// the PLC document's DID, handle, and PDS service binding but does not make a
+/// DNS or HTTP ownership request. The disposable Compose bootstrap uses this
+/// only while the account is being created before a public Swan listener can
+/// answer the handle proof. Production activation always uses
+/// ``ATProtocolHandleVerifier``.
+public struct StaticLaboratoryHandleVerifier: PLCHandleVerifying, Sendable {
+    public init() {}
+
+    public func verify(
+        plcState: PLCDocumentData,
+        expectedDID: String,
+        handle rawHandle: String,
+        pdsOrigin: String
+    ) async throws -> VerifiedATHandleIdentity {
+        do {
+            let did = try AccountIdentifiers.validateDID(expectedDID)
+            let handle = try AccountIdentifiers.canonicalHandle(rawHandle)
+            guard plcState.did == did,
+                  plcState.alsoKnownAs == ["at://\(handle)"],
+                  plcState.services == [
+                      "atproto_pds": PLCService(
+                          type: "AtprotoPersonalDataServer",
+                          endpoint: pdsOrigin
+                      ),
+                  ] else {
+                throw ATHandleVerificationError.verificationFailed
+            }
+            return .init(did: did, canonicalHandle: handle, pdsOrigin: pdsOrigin)
+        } catch let error as ATHandleVerificationError {
+            throw error
+        } catch {
+            throw ATHandleVerificationError.verificationFailed
+        }
+    }
+}
+
 public struct ATProtocolHandleVerifier: PLCHandleVerifying, Sendable {
     private static let reservedTLDs = Set([
         "alt", "arpa", "example", "internal", "invalid", "local",

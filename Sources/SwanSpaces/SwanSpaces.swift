@@ -407,7 +407,11 @@ public struct SignedSpaceCredential: Codable, Sendable, Equatable {
     public let mac: Data
 }
 
-public struct HMACSpaceCredentialAuthority: Sendable {
+// Crypto.SymmetricKey is immutable for this use, but the Swift Crypto 3.15
+// Linux overlay does not yet declare it Sendable. The authority never mutates
+// or exposes the key after initialization, so make that invariant explicit at
+// this boundary rather than weakening the package's strict-concurrency mode.
+public struct HMACSpaceCredentialAuthority: @unchecked Sendable {
     private let key: SymmetricKey
 
     public init(key: Data) { self.key = SymmetricKey(data: key) }

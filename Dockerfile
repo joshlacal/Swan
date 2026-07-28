@@ -2,7 +2,10 @@ FROM swift:6.1-jammy AS build
 # Keep the Swift 6.1/Jammy build baseline explicit and install the same
 # system-library development surface SwiftPM uses on a clean Linux builder.
 RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libsodium-dev pkg-config \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libsodium-dev pkg-config \
+        libsecret-1-dev \
+        libglib2.0-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /workspace
 COPY Petrel /workspace/Petrel
@@ -10,12 +13,13 @@ COPY Swan /workspace/Swan
 WORKDIR /workspace/Swan
 RUN swift build -c release --product swan
 
-FROM ubuntu:24.04
+FROM swift:6.1-jammy
 RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl libsodium23 \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl libsodium23 libsecret-1-0 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --home-dir /var/lib/swan swan
 COPY --from=build /workspace/Swan/.build/release/swan /usr/local/bin/swan
+COPY Swan/Profiles /usr/local/share/swan/Profiles
 COPY Swan/interop/bootstrap-local-space.sh /usr/local/bin/swan-interop-bootstrap
 COPY Swan/interop/prepare-interop-secrets.sh /usr/local/bin/swan-interop-prepare-secrets
 COPY Swan/interop/prepare-caddy-trust.sh /usr/local/bin/swan-interop-caddy-trust

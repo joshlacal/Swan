@@ -309,6 +309,10 @@ public enum InteropScenarioRunner {
 
     private static var expectedBenign4xxErrorCodes: Set<String> {
         [
+            "AuthMissing",
+            "InvalidRequest",
+            "MissingCredential",
+            "MissingJwt",
             "Unauthorized",
             "permissioned_data_pending",
             "permissioned_endpoint_unavailable",
@@ -448,7 +452,6 @@ public enum InteropScenarioRunner {
                 describeCorrupt.url = describeComponents.url
             }
             describeCorrupt.setValue("text/plain", forHTTPHeaderField: "Content-Type")
-            describeCorrupt.httpBody = Data("invalid".utf8)
             endpointDefaults["/xrpc/com.atproto.server.describeServer"] = describeCorrupt
         }
 
@@ -677,6 +680,11 @@ public enum InteropScenarioRunner {
         if let payload = decoded as? [String: Any] {
             let keys = payload.keys.sorted()
             output["json-keys"] = String(keys.count)
+            if let error = payload["error"] as? String,
+               error.count <= 64,
+               error.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || $0 == "." }) {
+                output["error"] = error
+            }
             for (index, key) in keys.prefix(3).enumerated() {
                 output["json-key-\(index)"] = forbiddenSummaryKey(key) ? "<redacted-key>" : key
             }

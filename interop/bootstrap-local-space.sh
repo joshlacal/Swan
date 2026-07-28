@@ -16,21 +16,46 @@ read_secret() {
 }
 
 ensure_account() {
-    did="$1"
+    label="$1"
     handle="$2"
     revision="$3"
     password_file="$4"
-    if "${SWAN_BIN}" account show --data-directory "${DATA_DIRECTORY}" --did "${did}" >/dev/null 2>&1; then
+    request_id="interop-${label}-plc"
+    identity_file="${DATA_DIRECTORY}/interop-${label}-identity.json"
+    if "${SWAN_BIN}" account show --data-directory "${DATA_DIRECTORY}" --handle "${handle}" >/dev/null 2>&1; then
         return 0
     fi
-    "${SWAN_BIN}" account install-local \
+
+    # The Compose account must be a real PLC-backed identity. `install-local`
+    # is intentionally offline and therefore leaves public reads fail-closed;
+    # prepare/activate records the signed genesis and its request binding.
+    "${SWAN_BIN}" account prepare-plc \
         --data-directory "${DATA_DIRECTORY}" \
-        --did "${did}" \
         --handle "${handle}" \
-        --revision "${revision}" \
-        --password-file "${password_file}" \
+        --request-id "${request_id}" \
+        --pds-origin "https://swan.test" \
+        --repository-revision "${revision}" \
+        --plc-origin "http://reference-plc:2582" \
+        --plc-laboratory \
+        --plc-laboratory-allowlisted-host "reference-plc" \
+        --plc-reference-compatibility "did-plc-server-0.0.1" \
         --operator-secret-file "${SECRETS_DIR}/operator-secret" \
-        --account-kek-file "${SECRETS_DIR}/account-kek"
+        --account-kek-file "${SECRETS_DIR}/account-kek" \
+        > "${identity_file}.tmp"
+    chmod 0600 "${identity_file}.tmp"
+    mv -f "${identity_file}.tmp" "${identity_file}"
+
+    "${SWAN_BIN}" account activate-plc \
+        --data-directory "${DATA_DIRECTORY}" \
+        --request-id "${request_id}" \
+        --password-file "${password_file}" \
+        --plc-origin "http://reference-plc:2582" \
+        --plc-laboratory \
+        --plc-laboratory-allowlisted-host "reference-plc" \
+        --static-laboratory-handle-proof \
+        --operator-secret-file "${SECRETS_DIR}/operator-secret" \
+        --account-kek-file "${SECRETS_DIR}/account-kek" \
+        >/dev/null
 }
 
 empty_revision="$(read_secret "public-repo-revision")"
@@ -40,13 +65,13 @@ if [ -z "${empty_revision}" ]; then
 fi
 
 ensure_account \
-    "$(read_secret authority.did)" \
+    authority \
     "$(read_secret authority.handle)" \
     "${empty_revision}" \
     "${SECRETS_DIR}/authority.password"
 
 ensure_account \
-    "$(read_secret member.did)" \
+    member \
     "$(read_secret member.handle)" \
     "${empty_revision}" \
     "${SECRETS_DIR}/member.password"

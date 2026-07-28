@@ -1985,6 +1985,12 @@ extension SwanCommand {
             @Flag(name: .long, help: "Select explicit literal-loopback HTTP PLC laboratory policy")
             var plcLaboratory = false
 
+            @Option(
+                name: .customLong("plc-laboratory-allowlisted-host"),
+                help: "Explicit Docker/service DNS host allowed for the PLC laboratory origin"
+            )
+            var plcLaboratoryAllowlistedHost: String?
+
             @Option(name: .long, help: "Pinned PLC submit compatibility; only did-plc-server-0.0.1 is supported")
             var plcReferenceCompatibility: String?
 
@@ -2044,9 +2050,15 @@ extension SwanCommand {
                     if plcLaboratory {
                         plcConfiguration = try .laboratory(
                             origin: directoryOrigin,
-                            submitSuccessResponsePolicy: responsePolicy
+                            submitSuccessResponsePolicy: responsePolicy,
+                            allowlistedHost: plcLaboratoryAllowlistedHost
                         )
                     } else {
+                        guard plcLaboratoryAllowlistedHost == nil else {
+                            throw SwanError.malformed(
+                                "--plc-laboratory-allowlisted-host requires --plc-laboratory"
+                            )
+                        }
                         plcConfiguration = try .production(origin: directoryOrigin)
                     }
                     preparedConfiguration = (
@@ -2140,6 +2152,18 @@ extension SwanCommand {
             var plcLaboratory = false
 
             @Option(
+                name: .customLong("plc-laboratory-allowlisted-host"),
+                help: "Explicit Docker/service DNS host allowed for the PLC laboratory origin"
+            )
+            var plcLaboratoryAllowlistedHost: String?
+
+            @Flag(
+                name: .customLong("static-laboratory-handle-proof"),
+                help: "Use the explicit no-network handle proof for disposable bootstrap only"
+            )
+            var useStaticLaboratoryHandleVerifier = false
+
+            @Option(
                 name: .long,
                 help: "Literal-loopback HTTP origin for laboratory /.well-known/atproto-did proof"
             )
@@ -2192,18 +2216,34 @@ extension SwanCommand {
                     let plcConfiguration: PLCClientConfiguration
                     let handlePolicy: ATHandleResolutionPolicy
                     if plcLaboratory {
-                        guard let rawHandleOrigin = handleLaboratoryOrigin,
-                              let handleOrigin = URL(string: rawHandleOrigin) else {
-                            throw SwanError.malformed(
-                                "--handle-laboratory-origin is required with --plc-laboratory"
+                        plcConfiguration = try .laboratory(
+                            origin: directoryOrigin,
+                            allowlistedHost: plcLaboratoryAllowlistedHost
+                        )
+                        if useStaticLaboratoryHandleVerifier {
+                            guard handleLaboratoryOrigin == nil else {
+                                throw SwanError.malformed(
+                                    "--handle-laboratory-origin cannot be combined with --static-laboratory-handle-proof"
+                                )
+                            }
+                            handlePolicy = try .laboratory(
+                                origin: URL(string: "http://127.0.0.1:3000")!
                             )
+                        } else {
+                            guard let rawHandleOrigin = handleLaboratoryOrigin,
+                                  let handleOrigin = URL(string: rawHandleOrigin) else {
+                                throw SwanError.malformed(
+                                    "--handle-laboratory-origin is required with --plc-laboratory"
+                                )
+                            }
+                            handlePolicy = try .laboratory(origin: handleOrigin)
                         }
-                        plcConfiguration = try .laboratory(origin: directoryOrigin)
-                        handlePolicy = try .laboratory(origin: handleOrigin)
                     } else {
-                        guard handleLaboratoryOrigin == nil else {
+                        guard handleLaboratoryOrigin == nil,
+                              plcLaboratoryAllowlistedHost == nil,
+                              !useStaticLaboratoryHandleVerifier else {
                             throw SwanError.malformed(
-                                "--handle-laboratory-origin requires --plc-laboratory"
+                                "laboratory PLC options require --plc-laboratory"
                             )
                         }
                         plcConfiguration = try .production(origin: directoryOrigin)
@@ -2264,7 +2304,8 @@ extension SwanCommand {
                         requestID: requestID,
                         password: password,
                         plcConfiguration: preparedConfiguration.plc,
-                        handlePolicy: preparedConfiguration.handle
+                        handlePolicy: preparedConfiguration.handle,
+                        useStaticLaboratoryHandleVerifier: useStaticLaboratoryHandleVerifier
                     ))
                     try await createdRuntime.close()
                     try await control.close()
@@ -2804,6 +2845,12 @@ extension SwanCommand {
             @Option(name: .long, help: "Permissioned space URI; required in permissioned mode")
             var space: String = ""
 
+            @Flag(
+                name: .customLong("provision-space"),
+                help: "Create the permissioned space and add the read-query repository DID before the round trip"
+            )
+            var provisionSpace = false
+
             @Option(name: .long, help: "JSON request body file for the write")
             var bodyFile: String
 
@@ -2892,6 +2939,16 @@ extension SwanCommand {
                         throw ValidationError("--space is not a valid space URI")
                     }
                     let query = try LabLiveSupport.query(readQuery)
+                    if provisionSpace {
+                        guard let memberDID = query["repo"], !memberDID.isEmpty else {
+                            throw ValidationError("--provision-space requires --read-query repo=<member DID>")
+                        }
+                        try await LabLiveSupport.provisionSpace(
+                            authority: consumer,
+                            space: parsedSpace,
+                            member: memberDID
+                        )
+                    }
                     let broker = SpaceCredentialBroker(
                         member: producer.client,
                         authority: consumer.client
@@ -3077,14 +3134,18 @@ private enum LabLiveSupport {
         return url
     }
 
-    static func requiredURL(_ raw: String, label: String) throws -> URL {
+    static func requiredURL(
+        _ raw: String,
+        label: String,
+        allowQuery: Bool = false
+    ) throws -> URL {
         guard let url = URL(string: raw),
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let scheme = components.scheme?.lowercased(),
               scheme == "https" || scheme == "http",
               components.host?.isEmpty == false,
               components.user == nil, components.password == nil,
-              components.query == nil, components.fragment == nil else {
+              (allowQuery || components.query == nil), components.fragment == nil else {
             throw ValidationError("\(label) URL is invalid")
         }
         return url
@@ -3118,7 +3179,15 @@ private enum LabLiveSupport {
         case "oauth":
             let handle = try environmentValue(handleEnvironment, label: "OAuth handle")
             let password = try environmentValue(passwordEnvironment, label: "OAuth password")
-            let clientIDURL = try requiredURL(clientID, label: "OAuth client metadata")
+            // The AT Protocol localhost development client encodes its
+            // requested scope and redirect URI in the client-id query. Remote
+            // metadata URLs remain query-free and are validated by Swan's
+            // metadata fetcher.
+            let clientIDURL = try requiredURL(
+                clientID,
+                label: "OAuth client metadata",
+                allowQuery: true
+            )
             let redirectURL = try requiredURL(redirectURI, label: "OAuth redirect")
             let requestedScopes = Set(scopes.map {
                 $0.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3188,6 +3257,81 @@ private enum LabLiveSupport {
             }
         }
         return result
+    }
+
+    static func provisionSpace(
+        authority: LiveInteropHost,
+        space: SpaceURI,
+        member rawMember: String
+    ) async throws {
+        let member: String
+        do {
+            member = try AccountIdentifiers.validateDID(rawMember)
+        } catch {
+            throw ValidationError("--read-query repo must be a canonical member DID")
+        }
+        guard authority.authorizationProvider != nil || authority.authorization != .none else {
+            throw ValidationError("--consumer-auth oauth is required with --provision-space")
+        }
+
+        let createBody = try JSONSerialization.data(
+            withJSONObject: [
+                "did": space.authority,
+                "type": space.spaceType,
+                "skey": space.skey,
+            ],
+            options: [.sortedKeys]
+        )
+        let create = try await authorizedProcedure(
+            host: authority,
+            nsid: "com.atproto.simplespace.createSpace",
+            body: createBody
+        )
+        guard (200 ... 299).contains(create.status) ||
+            responseError(create) == "SpaceAlreadyExists" else {
+            throw ValidationError("permissioned space creation failed")
+        }
+
+        let addBody = try JSONSerialization.data(
+            withJSONObject: ["space": space.rawValue, "did": member],
+            options: [.sortedKeys]
+        )
+        let add = try await authorizedProcedure(
+            host: authority,
+            nsid: "com.atproto.simplespace.addMember",
+            body: addBody
+        )
+        guard (200 ... 299).contains(add.status) else {
+            throw ValidationError("permissioned space membership failed")
+        }
+    }
+
+    private static func authorizedProcedure(
+        host: LiveInteropHost,
+        nsid: String,
+        body: Data
+    ) async throws -> InteropHTTPResponse {
+        let path = try host.client.xrpcPath(nsid)
+        guard let target = URL(string: path, relativeTo: host.client.http.baseURL)?.absoluteURL else {
+            throw ValidationError("permissioned setup target is invalid")
+        }
+        let authorization: InteropAuthorization
+        if let provider = host.authorizationProvider {
+            authorization = try await provider(.post, target, body)
+        } else {
+            authorization = host.authorization
+        }
+        return try await host.client.procedure(
+            nsid,
+            body: body,
+            authorization: authorization
+        )
+    }
+
+    private static func responseError(_ response: InteropHTTPResponse) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: response.body)
+            as? [String: Any] else { return nil }
+        return object["error"] as? String
     }
 
     private static func environmentValue(_ name: String, label: String) throws -> String {

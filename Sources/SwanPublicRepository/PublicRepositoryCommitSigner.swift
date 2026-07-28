@@ -31,7 +31,11 @@ public protocol PublicRepositoryCommitVerifier: Sendable {
 }
 
 /// Swan's current account repository-key adapter.
-public struct P256PublicRepositoryCommitSigner: PublicRepositoryCommitSigner {
+// Swift Crypto's P256 key wrappers are immutable but are not annotated
+// Sendable on the Linux toolchain used by the Compose builder. The signer only
+// captures the key and invokes the pure signing operation, so assert that
+// immutable ownership at the protocol boundary.
+public struct P256PublicRepositoryCommitSigner: @unchecked Sendable, PublicRepositoryCommitSigner {
     public let signingAlgorithm: PublicRepositorySigningAlgorithm = .p256
     private let privateKey: P256.Signing.PrivateKey
 
@@ -46,7 +50,7 @@ public struct P256PublicRepositoryCommitSigner: PublicRepositoryCommitSigner {
 
 /// A verifier for an already-resolved P-256 repository signing key. DID
 /// resolution and key rotation remain outside this pure repository target.
-public struct P256PublicRepositoryCommitVerifier: PublicRepositoryCommitVerifier {
+public struct P256PublicRepositoryCommitVerifier: @unchecked Sendable, PublicRepositoryCommitVerifier {
     public let signingAlgorithm: PublicRepositorySigningAlgorithm = .p256
     public let verificationIdentity: String
     private let publicKey: P256.Signing.PublicKey

@@ -149,6 +149,23 @@ checksum-verified way to populate the ignored reference cache.
   record read/list, and `sync.getRepo` succeeded. Blob upload remained staged
   until a valid record reference; the smoke result is reference-host evidence,
   not Swan/TypeScript convergence evidence.
+- The Linux Compose laboratory was run from a clean disposable Swan data
+  volume with the pinned PLC/PDS cache, Caddy TLS, Mailpit, and Toxiproxy
+  healthy. Bootstrap now creates real PLC-backed Swan accounts through the
+  prepare/activate lifecycle and stores their signed public genesis before
+  traffic is accepted. The stateful public Swan-to-Swan round trip passed with
+  matching write/read CIDs. The stateful permissioned round trip passed with a
+  member OAuth write, authority delegation/credential exchange, and authority
+  credential read returning the same CID; credentials remained read-only.
+- Public/private isolation was checked against the live Linux host: the public
+  authority list contained the public CID and no permissioned CID, the member
+  public list was empty, a permissioned record returned `RecordNotFound` from
+  the public record endpoint, and the member public CAR contained neither the
+  permissioned record nor the authority's public record. The sanitized fault
+  matrix covered offline, disconnected, delayed, duplicated, reordered, and
+  corrupted traffic across both Swan and the pinned reference host (156
+  convergence comparisons, 416 endpoint events); it is transport/profile
+  evidence and does not claim full TypeScript semantic convergence.
 
 ## Completion gates
 
@@ -173,9 +190,13 @@ that the complete live interop matrix has passed.
   the pinned PLC must answer `GET /_health`. The reference PDS waits for a
   healthy PLC, Toxiproxy setup waits for a healthy reference PDS, and Caddy
   waits for a healthy Swan listener before creating the TLS trust handoff.
-- A live matrix is still unverified in this environment. It requires Docker
-  Compose v2, locally supplied disposable secrets (never committed or included
-  in artifacts), trust of Caddy's laboratory CA by the runner, and cross-host
-  execution under the pinned faults. The scenario artifact records transport
-  and endpoint status only and must not be interpreted as full protocol
-  interoperability proof on its own.
+- The Linux live gates are now verified with Docker Compose v2, disposable
+  owner-only secrets outside the repository, and an explicit Caddy CA trust
+  handoff. `artifacts/linux-compose-matrix.json` records only sanitized
+  transport/profile summaries. Stateful Swan-to-Swan public, permissioned, and
+  isolation evidence is recorded separately in ignored local artifacts; no
+  secret, token, proof, or recoverable record value is committed. The pinned
+  TypeScript service was included in the endpoint/fault matrix and its local
+  smoke runtime passed reference-only account/public operations, but a complete
+  Swan-to-TypeScript permissioned semantic convergence run remains a distinct
+  follow-up gate.

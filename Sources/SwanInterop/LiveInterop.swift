@@ -2,6 +2,7 @@ import AsyncHTTPClient
 import Crypto
 import Foundation
 import NIOCore
+import NIOFoundationCompat
 import NIOHTTP1
 import Petrel
 import SwanCore
@@ -784,11 +785,13 @@ public enum LiveInteropRunner {
     }
 
     /// Exercises the permissioned cross-host sequence without baking a
-    /// particular authority placement into the runner: a member mints a
-    /// delegation, the authority exchanges it for a reader credential, and a
-    /// credential-authenticated write/read pair is checked for successful
-    /// responses. The caller supplies the exact generated request bodies so
-    /// this remains compatible with the pinned lexicon branch.
+    /// particular authority placement into the runner: the member writes its
+    /// repository with member OAuth/DPoP, mints a delegation, the authority
+    /// exchanges it for a read credential, and that credential reads the
+    /// member repository. Space credentials are intentionally read-only; the
+    /// runner must not turn them into a write capability merely to make a
+    /// round trip pass. The caller supplies the exact generated request
+    /// bodies so this remains compatible with the pinned lexicon branch.
     public static func permissionedCreateAndRead(
         scenario: String,
         member: LiveInteropHost,
@@ -834,18 +837,27 @@ public enum LiveInteropRunner {
             )
             credentialIssued = !credential.isEmpty
             guard credentialIssued else { throw InteropHTTPError.unexpectedStatus(502) }
-            let credentialAuthorization = InteropAuthorization.bearer(token: credential)
-            let write = try await authority.client.procedure(
+            // The proposal's space credential authorizes reads only. The
+            // repository write is therefore made by the member account using
+            // the same fresh OAuth/DPoP provider used to mint its delegation.
+            let writePath = "/xrpc/com.atproto.space.createRecord"
+            let memberWriteAuthorization = try await authorization(
+                for: member,
+                method: .post,
+                path: writePath,
+                body: createBody
+            )
+            let write = try await member.client.procedure(
                 "com.atproto.space.createRecord",
                 body: createBody,
-                authorization: credentialAuthorization
+                authorization: memberWriteAuthorization
             )
             writeStatus = write.status
             writeDigest = responseDigest(write)
             await recorder.record(
-                host: authority.label,
+                host: member.label,
                 method: "POST",
-                path: "/xrpc/com.atproto.space.createRecord",
+                path: writePath,
                 requestBody: createBody,
                 response: write
             )
@@ -870,6 +882,7 @@ public enum LiveInteropRunner {
                     converged: false, errorCode: errorCode, recorder: recorder
                 )
             }
+            let credentialAuthorization = InteropAuthorization.bearer(token: credential)
             let read = try await authority.client.query(
                 "com.atproto.space.getRecord",
                 query: readQuery,

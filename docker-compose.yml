@@ -54,6 +54,9 @@ services:
         condition: service_completed_successfully
       swan-data-init:
         condition: service_completed_successfully
+      reference-plc:
+        condition: service_healthy
+    networks: [swan]
     restart: "no"
 
   swan:
@@ -69,6 +72,8 @@ services:
       - "3000"
       - --public-url
       - "https://swan.test"
+      - --profile
+      - /usr/local/share/swan/Profiles/permissioned-data-0016-2026-07-03.json
       - --data-directory
       - /var/lib/swan/data
       - --enable-local-space-interop

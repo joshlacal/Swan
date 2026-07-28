@@ -4,6 +4,45 @@
 !Swan/**
 !Petrel/
 !Petrel/**
+# Petrel's generated Swift package is the only dependency needed by this
+# image. Keep its build caches, server fixtures, and local history out.
+Petrel/.build
+Petrel/.build*/
+Petrel/.build*/**
+Petrel/**/.build*
+Petrel/.claude
+Petrel/.claude/**
+Petrel/Server
+Petrel/Server/**
+Petrel/_trash
+Petrel/_trash/**
+Petrel/.git
+Petrel/.git/**
+Petrel/**/.git*
+Petrel/.jj
+Petrel/.jj/**
+Petrel/**/.jj*
+Petrel/.venv
+Petrel/.venv/**
+Petrel/venv
+Petrel/venv/**
+Petrel/build
+Petrel/build/**
+# The parent checkout contains several isolated Swift build workspaces. They
+# are local caches, never inputs to the release image, and can otherwise make
+# a clean BuildKit context many gigabytes larger than the source tree.
+Swan/.build
+Swan/.build*/
+Swan/.build*/**
+Swan/**/.build*
+Swan/.git
+Swan/.git/**
+Swan/**/.git*
+Swan/.jj
+Swan/.jj/**
+Swan/**/.jj*
+Swan/.DS_Store
+Swan/**/.DS_Store
 **/.env*
 !**/.env.example
 **/.swan-data/
@@ -21,3 +60,4 @@
 **/.swan-interop-secrets/**
 Swan/.interop-cache/
 Swan/.interop-cache/**
+Swan/**/.interop-cache*

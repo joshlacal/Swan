@@ -77,8 +77,8 @@ mutate_and_require_rejection \
 
 mutate_and_require_rejection \
   reference-pds-started-only \
-  $'      reference-plc:\n        condition: service_healthy' \
-  $'      reference-plc:\n        condition: service_started'
+  $'      reference-plc:\n        condition: service_healthy\n    healthcheck:' \
+  $'      reference-plc:\n        condition: service_started\n    healthcheck:'
 
 mutate_and_require_rejection \
   caddy-started-only-swan \

@@ -2,6 +2,8 @@
 .build-*/
 .swiftpm/
 .interop-cache/
+.interop-live/
+artifacts/
 .swan-data/
 .env
 .env.*
