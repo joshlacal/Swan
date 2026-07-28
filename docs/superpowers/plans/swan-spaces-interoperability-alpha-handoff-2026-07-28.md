@@ -424,3 +424,10 @@ before Toxiproxy setup, and a healthy Swan listener before Caddy. The static
 topology verifier and its mutation tests enforce these contracts. This is
 static/readiness evidence only; Docker execution remains unavailable in the
 current workspace.
+
+The readiness hardening is committed as
+`90ad537dd42ad1f90baf8b4572411d9709b3293c`. The serialized macOS package
+suite on that clean parent executed 602 tests with 0 failures and 5 expected
+skips (four opt-in 256 MiB/cache gates and the environment-gated lab
+validation). The filtered `PublicRepositoryReadHTTPTests` command executed
+8/8, and the static/profile/interop verifiers remained green.
