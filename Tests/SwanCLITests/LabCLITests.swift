@@ -223,6 +223,35 @@ final class LabCLITests: XCTestCase {
         XCTAssertFalse(serialized.contains("access_token"))
     }
 
+    func testLabLiveFailureExitsNonzeroByDefault() throws {
+        let directory = try temporaryDirectory()
+        let body = directory.appending(path: "record.json")
+        let output = directory.appending(path: "live.json")
+        try Data(#"{"repo":"did:plc:abcdefghijklmnopqrstuvwx","collection":"app.bsky.feed.post","rkey":"r1","record":{"text":"failure fixture"}}"#.utf8).write(to: body)
+
+        let result = try runCLI(
+            command: [
+                "live",
+                "--mode", "public",
+                "--body-file", body.path,
+                "--repository", "did:plc:abcdefghijklmnopqrstuvwx",
+                "--collection", "app.bsky.feed.post",
+                "--rkey", "r1",
+                "--producer-url", "https://127.0.0.1:1",
+                "--consumer-url", "https://127.0.0.1:1",
+                "--request-timeout-seconds", "0.2",
+                "--output", output.path,
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: output)) as? [String: Any]
+        )
+        XCTAssertEqual(object["status"] as? String, "failed")
+        let combined = String(decoding: result.stdout, as: UTF8.self) + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertTrue(combined.contains("live interoperability did not pass"), combined)
+    }
+
     private func runCLI(command: [String]) throws -> (status: Int32, stdout: Data, stderr: Data) {
         let process = Process()
         process.executableURL = try XCTUnwrap(executableURL())
