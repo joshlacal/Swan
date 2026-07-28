@@ -1026,6 +1026,13 @@ public enum SimpleSpaceAppAccess: Sendable, Codable, Equatable {
     case allowList(Set<String>)
 }
 
+/// A durable credential-policy denial whose wire meaning is narrower than a
+/// generic user authorization failure. It intentionally carries no client,
+/// space, or policy material.
+public enum SimpleSpaceCredentialPolicyError: Error, Sendable, Equatable {
+    case appNotAuthorized
+}
+
 /// The pinned `com.atproto.simplespace` policy surface. A policy decision is
 /// made only by the authority; repo hosts merely verify the resulting read
 /// credential and never infer membership from a record request.

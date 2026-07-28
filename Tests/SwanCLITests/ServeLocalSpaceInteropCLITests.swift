@@ -128,6 +128,7 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
             "--space-account-key-directory", data.appending(path: "keys").path,
             "--notification-config", notification.path,
             "--enable-notification-delivery",
+            "--oauth-allow-metadata-ip", "127.0.0.1",
         ])
 
         XCTAssertTrue(result.started, result.error)

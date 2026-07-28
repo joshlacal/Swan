@@ -351,6 +351,8 @@ public actor SQLitePreMigratedAccountDirectory:
             throw error
         } catch let error as AuthorizedSimpleSpaceLifecycleError {
             throw error
+        } catch let error as SimpleSpaceCredentialPolicyError {
+            throw error
         } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }

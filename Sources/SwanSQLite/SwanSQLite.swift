@@ -4151,7 +4151,7 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
                     break
                 case let .allowList(clients):
                     guard let clientID, clients.contains(clientID) else {
-                        throw SwanError.unauthorized("app is not authorized for this space")
+                        throw SimpleSpaceCredentialPolicyError.appNotAuthorized
                     }
                 }
                 switch stored.state.space.configuration.policy {

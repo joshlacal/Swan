@@ -463,7 +463,9 @@ struct ServePermissionedRuntime {
 
     static func compose(
         local: ServeLocalSpaceRuntime?,
-        notification: ServeNotificationRuntime?
+        notification: ServeNotificationRuntime?,
+        clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy =
+            UnavailableSpaceCredentialClientAttestationPolicy()
     ) async throws -> ServePermissionedRuntime {
         let credentialPublicKeys: (any SpaceCredentialPublicKeyResolver)?
         let delegationPublicKeys: (any SpaceDelegationPublicKeyResolver)?
@@ -544,7 +546,8 @@ struct ServePermissionedRuntime {
                     delegationPublicKeys: delegationPublicKeys
                         ?? UnavailableSpaceDelegationPublicKeyResolver(),
                     credentialPublicKeys: credentialPublicKeys
-                        ?? UnavailableSpaceCredentialPublicKeyResolver()
+                        ?? UnavailableSpaceCredentialPublicKeyResolver(),
+                    clientAttestationPolicy: clientAttestationPolicy
                 )
             },
             delegationConfiguration: local?.delegationConfiguration,
@@ -1266,24 +1269,24 @@ extension SwanCommand {
                 } else {
                     localhostOAuthConfiguration = nil
                 }
-                let authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration?
-                if enableOAuthAuthorizationServer {
+                let needsRemoteClientMetadata =
+                    enableOAuthAuthorizationServer || enableLocalSpaceInterop
+                let clientMetadataLoader: OAuthClientMetadataLoader?
+                if needsRemoteClientMetadata {
                     do {
                         var allowlistedIPs = Set<OAuthIPAddress>()
                         for text in oauthMetadataAllowedIPs {
                             guard let address = OAuthIPAddress(literal: text) else {
-                                throw ValidationError("--oauth-allow-metadata-ip must be a literal IPv4 or IPv6 address")
+                                throw ValidationError(
+                                    "--oauth-allow-metadata-ip must be a literal IPv4 or IPv6 address"
+                                )
                             }
                             allowlistedIPs.insert(address)
                         }
-                        let passwordHasher = try LibsodiumArgon2idHasher()
-                        let accounts = DurableAccountDirectory(
-                            store: controlDatabase,
-                            passwordHasher: passwordHasher,
-                            verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher)
-                        )
                         let fetchPolicy = try OAuthRemoteFetchPolicy(
-                            allowLocalhostDevelopment: oauthAllowLocalhostDevelopmentClient,
+                            allowLocalhostDevelopment:
+                                enableOAuthAuthorizationServer
+                                    && oauthAllowLocalhostDevelopmentClient,
                             networkAllowlist: .init(addresses: allowlistedIPs)
                         )
                         let fetcher = OAuthRemoteDocumentFetcher(
@@ -1292,15 +1295,50 @@ extension SwanCommand {
                                 maximumTransportTimeout: fetchPolicy.timeout
                             )
                         )
-                        let metadataLoader = try OAuthClientMetadataLoader(
+                        clientMetadataLoader = try OAuthClientMetadataLoader(
                             fetcher: fetcher,
                             controlStore: controlDatabase
+                        )
+                    } catch let error as ValidationError {
+                        throw error
+                    } catch {
+                        throw ValidationError(
+                            "hardened OAuth metadata fetch runtime is unavailable"
+                        )
+                    }
+                } else {
+                    guard oauthMetadataAllowedIPs.isEmpty else {
+                        throw ValidationError(
+                            "--oauth-allow-metadata-ip requires --enable-oauth-authorization-server or --enable-local-space-interop"
+                        )
+                    }
+                    clientMetadataLoader = nil
+                }
+                guard enableOAuthAuthorizationServer
+                        || !oauthAllowLocalhostDevelopmentClient else {
+                    throw ValidationError(
+                        "--oauth-allow-localhost-development-client requires --enable-oauth-authorization-server"
+                    )
+                }
+                let authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration?
+                if enableOAuthAuthorizationServer {
+                    do {
+                        guard let clientMetadataLoader else {
+                            throw SwanError.unavailable(
+                                "OAuth client metadata loader is unavailable"
+                            )
+                        }
+                        let passwordHasher = try LibsodiumArgon2idHasher()
+                        let accounts = DurableAccountDirectory(
+                            store: controlDatabase,
+                            passwordHasher: passwordHasher,
+                            verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher)
                         )
                         authorizationServerConfiguration = try SwanOAuthAuthorizationServerConfiguration(
                             issuer: baseURL,
                             protectedResource: baseURL,
                             accounts: accounts,
-                            clientMetadataLoader: metadataLoader
+                            clientMetadataLoader: clientMetadataLoader
                         )
                     } catch let error as ValidationError {
                         throw error
@@ -1308,10 +1346,29 @@ extension SwanCommand {
                         throw ValidationError("--enable-oauth-authorization-server requires an HTTPS issuer, durable password verification, and a hardened metadata fetch runtime")
                     }
                 } else {
-                    guard !oauthAllowLocalhostDevelopmentClient, oauthMetadataAllowedIPs.isEmpty else {
-                        throw ValidationError("OAuth metadata fetch options require --enable-oauth-authorization-server")
-                    }
                     authorizationServerConfiguration = nil
+                }
+                let clientAttestationPolicy:
+                    any SpaceCredentialClientAttestationPolicy
+                if enableLocalSpaceInterop, let clientMetadataLoader {
+                    do {
+                        clientAttestationPolicy =
+                            try DurableSpaceCredentialClientAttestationPolicy(
+                                metadataLoader: clientMetadataLoader,
+                                replayStore:
+                                    try DurableSpaceClientAttestationReplayStore(
+                                        controlStore: controlDatabase,
+                                        serverKey: serverKey
+                                    )
+                            )
+                    } catch {
+                        throw ValidationError(
+                            "permissioned client attestation runtime is unavailable"
+                        )
+                    }
+                } else {
+                    clientAttestationPolicy =
+                        UnavailableSpaceCredentialClientAttestationPolicy()
                 }
                 let notificationRuntime: ServeNotificationRuntime?
                 if let notificationConfig {
@@ -1328,7 +1385,8 @@ extension SwanCommand {
                 do {
                     permissionedRuntime = try await .compose(
                         local: localSpaceRuntime,
-                        notification: notificationRuntime
+                        notification: notificationRuntime,
+                        clientAttestationPolicy: clientAttestationPolicy
                     )
                 } catch {
                     throw ValidationError("permissioned runtime key composition is invalid")

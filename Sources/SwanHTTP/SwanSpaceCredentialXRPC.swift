@@ -47,6 +47,7 @@ private enum SpaceCredentialExchangeFailure: Error {
     case invalidDelegation
     case invalidClientAttestation
     case spaceNotFound
+    case appNotAuthorized
     case notAuthorized
     case unavailable
 }
@@ -138,10 +139,17 @@ private struct AuthenticatedGetSpaceCredentialHandler:
                 now: Date()
             )
             return .init(credential: credential)
-        } catch is SpaceCredentialClientAttestationFailure {
-            throw SpaceCredentialExchangeFailure.invalidClientAttestation
+        } catch let failure as SpaceCredentialClientAttestationFailure {
+            switch failure {
+            case .invalid:
+                throw SpaceCredentialExchangeFailure.invalidClientAttestation
+            case .unavailable:
+                throw SpaceCredentialExchangeFailure.unavailable
+            }
         } catch is AuthorizedSimpleSpaceLifecycleError {
             throw SpaceCredentialExchangeFailure.spaceNotFound
+        } catch is SimpleSpaceCredentialPolicyError {
+            throw SpaceCredentialExchangeFailure.appNotAuthorized
         } catch let error as SwanError {
             switch error {
             case .unavailable:
@@ -312,6 +320,8 @@ private func getSpaceCredentialResponse(
         getSpaceCredentialError(.badRequest, code: "InvalidClientAttestation")
     case .spaceNotFound:
         getSpaceCredentialError(.notFound, code: "SpaceNotFound")
+    case .appNotAuthorized:
+        getSpaceCredentialError(.unauthorized, code: "AppNotAuthorized")
     case .notAuthorized:
         getSpaceCredentialError(.unauthorized, code: "NotAuthorized")
     case .unavailable:
