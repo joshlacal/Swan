@@ -113,7 +113,10 @@ checksum-verified way to populate the ignored reference cache.
   `getRecord` and `listRecords` accept either their existing DPoP OAuth path
   or an exact Bearer space credential. Credential reads are cross-repository
   only within their bound space and remain read-only; Bearer tokens never
-  satisfy the DPoP OAuth authorizer. `getDelegationToken` remains closed.
+  satisfy the DPoP OAuth authorizer. `getDelegationToken` is separately
+  capability-gated: the local `serve` composition installs it only with
+  durable DPoP OAuth, a startup-preopened account, and an account-key signer;
+  the default/incomplete server remains closed.
 - PLC identity history is now durable per account: genesis and signed
   rotations are stored as a linear CID-bound chain, verified fail-closed, and
   used by public repository description reads to expose the authenticated

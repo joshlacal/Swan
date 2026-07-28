@@ -107,8 +107,10 @@ Catbird UI work.
   consumes that JTI in `control.sqlite` before policy/signing, so duplicate
   exchanges fail without a second credential. The issued credential is accepted by `getRecord`/`listRecords`
   without DPoP and can read another active preopened member repository only in
-  its bound space. It cannot write records. `getDelegationToken` remains
-  unavailable because user-PDS account-key OAuth binding is separate work.
+  its bound space. It cannot write records. `getDelegationToken` is not part
+  of this authority exchange: it is a separately capability-gated user-PDS
+  route and remains unavailable on the ordinary/default server when durable
+  account-key OAuth binding is not composed.
   Focused tests cover durable public/member policy, app and managing-app
   denial, wrong issuer/key/audience/space, expiry/tampering, single-use
   replay rejection across reopen, cross-repository reads, duplicate/oversized
