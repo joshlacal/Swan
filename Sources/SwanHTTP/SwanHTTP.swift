@@ -283,6 +283,10 @@ public struct SwanHTTPServer: Sendable {
     /// Public-only read capability selected from the startup-preopened account
     /// inventory. It contains no authorization or permissioned-data fallback.
     public let publicRepositoryReadDirectory: (any PublicRepositoryReadDirectory)?
+    /// Explicitly opt-in public mutation capability. Public reads never imply
+    /// this capability, and it is only formed alongside the server-bound
+    /// OAuth resource authorizer.
+    public let publicRepositoryMutations: SwanPublicRepositoryMutationCapability?
 
     public init(
         profile: ProtocolProfile,
@@ -302,7 +306,9 @@ public struct SwanHTTPServer: Sendable {
         spaceRepositoryCredentialConfiguration: SwanSpaceCredentialVerificationHTTPConfiguration? = nil,
         spaceNotificationConfiguration: SwanSpaceNotificationHTTPConfiguration? = nil,
         simpleSpaceCheckUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration? = nil,
-        publicRepositoryReadDirectory: (any PublicRepositoryReadDirectory)? = nil
+        publicRepositoryReadDirectory: (any PublicRepositoryReadDirectory)? = nil,
+        publicRepositoryMutationDirectory: (any PublicRepositoryMutationDirectory)? = nil,
+        publicRepositoryMutationSignerProvider: (any PublicRepositoryMutationSignerProvider)? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -371,6 +377,16 @@ public struct SwanHTTPServer: Sendable {
                 authorizer: authorizer,
                 directory: authenticatedGetSpaceDirectory
             )
+            if let mutationDirectory = publicRepositoryMutationDirectory,
+               let signerProvider = publicRepositoryMutationSignerProvider {
+                publicRepositoryMutations = SwanPublicRepositoryMutationCapability(
+                    authorizer: authorizer,
+                    directory: mutationDirectory,
+                    signerProvider: signerProvider
+                )
+            } else {
+                publicRepositoryMutations = nil
+            }
             if let repositoryDirectory = authenticatedGetSpaceDirectory
                 as? any AuthorizedSpaceRepositoryDirectory {
                 let credentialVerifier: (any SpaceCredentialAuthorizationVerifier)?
@@ -500,6 +516,7 @@ public struct SwanHTTPServer: Sendable {
             }
         } else {
             authenticatedGetSpace = nil
+            publicRepositoryMutations = nil
             authenticatedSpaceRecords = nil
             authenticatedSpaceList = nil
             authenticatedSimpleSpaceLifecycle = nil
