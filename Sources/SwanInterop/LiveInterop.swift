@@ -415,7 +415,7 @@ public struct InteropXRPCClient: Sendable {
             throw SwanError.malformed("interop XRPC NSID is invalid")
         }
         var components = URLComponents()
-        components.path = "/xrpc/(nsid)"
+        components.path = "/xrpc/\(nsid)"
         let items = query.keys.sorted().map { key in
             URLQueryItem(name: key, value: query[key] ?? "")
         }

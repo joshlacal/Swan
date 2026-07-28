@@ -281,6 +281,21 @@ final class SwanInteropTests: XCTestCase {
         XCTAssertTrue(permissionedArtifact.events.isEmpty)
     }
 
+    func testXRPCPathUsesNSIDAndCanonicalQueryOrdering() throws {
+        let client = try InteropXRPCClient(
+            baseURL: URL(string: "https://swan.test")!,
+            timeout: 1
+        )
+
+        XCTAssertEqual(
+            try client.xrpcPath(
+                "com.atproto.repo.getRecord",
+                query: ["rkey": "3k", "repo": "did:plc:alice"]
+            ),
+            "/xrpc/com.atproto.repo.getRecord?repo=did:plc:alice&rkey=3k"
+        )
+    }
+
     func testLiveReplicaRejectsReorderingAndVerifiesReaderCommitBeforePublication() async throws {
         let space = try SpaceURI(
             authority: "did:plc:alice",
