@@ -22,6 +22,28 @@ private enum PublicMutationFailure: Error {
 private struct PublicMutationHandlers {
     let capability: SwanPublicRepositoryMutationCapability
 
+    func uploadBlob(_ request: Request) async throws -> SwanPublicWire.ComAtprotoRepoUploadBlob.Output {
+        let subject = try await authorizedSubject(
+            request: request, method: "POST", path: "/xrpc/com.atproto.repo.uploadBlob"
+        )
+        guard let target = try await capability.directory.publicRepositoryMutationTarget(selector: subject),
+              let blobStore = target.store as? any BlobStore else {
+            throw PublicMutationFailure.notFound
+        }
+        let body = try await request.body.collect(upTo: 256 * 1024 * 1024)
+        guard let bytes = body.getBytes(at: body.readerIndex, length: body.readableBytes), !bytes.isEmpty else {
+            throw PublicMutationFailure.invalidRequest
+        }
+        let mimeType = request.headers[.contentType]?.split(separator: ";", maxSplits: 1).first.map(String.init)
+            ?? "application/octet-stream"
+        _ = try await blobStore.put(Data(bytes), namespace: .public)
+        let cid = CID.fromBlob(Data(bytes))
+        return .init(blob: Blob(
+            type: "blob", ref: ATProtoLink(cid: cid), mimeType: mimeType,
+            size: bytes.count, cid: nil
+        ))
+    }
+
     func applyWrites(
         _ input: SwanPublicWire.ComAtprotoRepoApplyWrites.Input,
         bodyDigest: Data,
@@ -166,6 +188,24 @@ private struct PublicMutationHandlers {
         method: String,
         path: String
     ) async throws -> PublicRepositoryMutationTarget {
+        let authorization = try await authorizedContext(request: request, method: method, path: path)
+        guard case let .accountOAuth(subject, scopes) = authorization,
+              scopes.contains("atproto") else { throw PublicMutationFailure.unauthorized }
+        guard let target = try await capability.directory.publicRepositoryMutationTarget(selector: selector) else {
+            throw PublicMutationFailure.notFound
+        }
+        guard target.status == .active, target.did == subject else { throw PublicMutationFailure.notFound }
+        return target
+    }
+
+    private func authorizedSubject(request: Request, method: String, path: String) async throws -> String {
+        let authorization = try await authorizedContext(request: request, method: method, path: path)
+        guard case let .accountOAuth(subject, scopes) = authorization,
+              scopes.contains("atproto") else { throw PublicMutationFailure.unauthorized }
+        return subject
+    }
+
+    private func authorizedContext(request: Request, method: String, path: String) async throws -> AuthorizationContext {
         let authorization: AuthorizationContext
         do {
             authorization = try await capability.authorizer.authorize(
@@ -176,17 +216,7 @@ private struct PublicMutationHandlers {
         } catch {
             throw PublicMutationFailure.unavailable
         }
-        guard case let .accountOAuth(subject, scopes) = authorization,
-              scopes.contains("atproto") else {
-            throw PublicMutationFailure.unauthorized
-        }
-        guard let target = try await capability.directory.publicRepositoryMutationTarget(
-            selector: selector
-        ) else { throw PublicMutationFailure.notFound }
-        guard target.status == .active, target.did == subject else {
-            throw PublicMutationFailure.notFound
-        }
-        return target
+        return authorization
     }
 }
 
@@ -198,6 +228,7 @@ func registerPublicRepositoryMutationEndpoints(
     let putPath: RouterPath = "/xrpc/com.atproto.repo.putRecord"
     let createPath: RouterPath = "/xrpc/com.atproto.repo.createRecord"
     let applyPath: RouterPath = "/xrpc/com.atproto.repo.applyWrites"
+    let uploadPath: RouterPath = "/xrpc/com.atproto.repo.uploadBlob"
     let deletePath: RouterPath = "/xrpc/com.atproto.repo.deleteRecord"
     router.post(putPath) { request, _ async -> Response in
         do {
@@ -235,6 +266,15 @@ func registerPublicRepositoryMutationEndpoints(
         catch let failure as PublicRepositoryMutationCoordinatorError { return publicMutationResponse(failure) }
         catch { return publicMutationError(.badRequest, "InvalidRequest") }
     }
+    router.post(uploadPath) { request, _ async -> Response in
+        do {
+            return publicMutationJSON(.ok, try await handlers.uploadBlob(request))
+        } catch let failure as PublicMutationFailure {
+            return publicMutationResponse(failure, authorizer: capability.authorizer)
+        } catch {
+            return publicMutationError(.badRequest, "InvalidRequest")
+        }
+    }
     router.post(deletePath) { request, _ async -> Response in
         do {
             let (input, digest) = try await publicMutationInput(
@@ -249,7 +289,7 @@ func registerPublicRepositoryMutationEndpoints(
             return publicMutationError(.badRequest, "InvalidRequest")
         }
     }
-    for path in [putPath, createPath, applyPath, deletePath] {
+    for path in [putPath, createPath, applyPath, uploadPath, deletePath] {
         for method: HTTPRequest.Method in [.get, .head, .put, .patch, .delete, .options, .connect, .trace] {
             router.on(path, method: method) { _, _ in publicMutationError(.notFound, "public_endpoint_unavailable") }
         }
