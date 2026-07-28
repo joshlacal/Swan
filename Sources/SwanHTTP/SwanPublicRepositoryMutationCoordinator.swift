@@ -185,8 +185,13 @@ public enum SwanPublicRepositoryMutationCoordinator {
            error == .commitCASConflict {
             return .unavailable
         }
-        if error is PublicRepositoryEngineError {
-            return .unavailable
+        if let error = error as? PublicRepositoryEngineError {
+            switch error {
+            case .commitCIDMismatch, .recordCIDMismatch:
+                return .invalidSwap
+            default:
+                return .unavailable
+            }
         }
         return .unavailable
     }

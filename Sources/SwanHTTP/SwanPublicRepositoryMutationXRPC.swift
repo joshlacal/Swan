@@ -132,6 +132,8 @@ func registerPublicRepositoryMutationEndpoints(
             return publicMutationJSON(.ok, try await handlers.put(input, bodyDigest: digest, request: request))
         } catch let failure as PublicMutationFailure {
             return publicMutationResponse(failure, authorizer: capability.authorizer)
+        } catch let failure as PublicRepositoryMutationCoordinatorError {
+            return publicMutationResponse(failure)
         } catch {
             return publicMutationError(.badRequest, "InvalidRequest")
         }
@@ -144,6 +146,8 @@ func registerPublicRepositoryMutationEndpoints(
             return publicMutationJSON(.ok, try await handlers.delete(input, bodyDigest: digest, request: request))
         } catch let failure as PublicMutationFailure {
             return publicMutationResponse(failure, authorizer: capability.authorizer)
+        } catch let failure as PublicRepositoryMutationCoordinatorError {
+            return publicMutationResponse(failure)
         } catch {
             return publicMutationError(.badRequest, "InvalidRequest")
         }
@@ -182,6 +186,17 @@ private func publicMutationResponse(
     case .nonce: return authenticatedGetSpaceNonceChallenge(authorizer: authorizer)
     case .notFound: return publicMutationError(.notFound, "RepoNotFound")
     case .invalidSwap: return publicMutationError(.badRequest, "InvalidSwap")
+    case .unavailable: return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
+    }
+}
+
+private func publicMutationResponse(
+    _ failure: PublicRepositoryMutationCoordinatorError
+) -> Response {
+    switch failure {
+    case .invalidSwap: return publicMutationError(.badRequest, "InvalidSwap")
+    case .repositoryNotFound: return publicMutationError(.notFound, "RepoNotFound")
+    case .inactiveAccount: return publicMutationError(.forbidden, "AccountInactive")
     case .unavailable: return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
     }
 }
