@@ -174,7 +174,7 @@ public enum PublicRepositoryCommitCodec {
             dataCID: dataCID,
             currentRevision: currentRevision
         )
-        try validateSupportedAlgorithm(signingAlgorithm)
+        try validateSupportedSigningAlgorithm(signingAlgorithm)
         return try encodeSigned(descriptor, signature: Data(repeating: 0, count: 64)).count
     }
 
@@ -206,7 +206,7 @@ public enum PublicRepositoryCommitCodec {
             dataCID: dataCID,
             currentRevision: currentRevision
         )
-        try validateSupportedAlgorithm(signer.signingAlgorithm)
+        try validateSupportedSigningAlgorithm(signer.signingAlgorithm)
         let unsigned = try encodeUnsigned(descriptor)
         let signature = try await signer.sign(unsignedCommitBytes: unsigned)
         try validateSignature(signature, algorithm: signer.signingAlgorithm)
@@ -247,7 +247,7 @@ public enum PublicRepositoryCommitCodec {
             revision: decoded.revision,
             dataCID: decoded.dataCID
         )
-        try validateSupportedAlgorithm(verifier.signingAlgorithm)
+        try validateSupportedVerifierAlgorithm(verifier.signingAlgorithm)
         try validateSignature(decoded.signature, algorithm: verifier.signingAlgorithm)
         let unsigned = try encodeUnsigned(descriptor)
         let canonicalSigned = try encodeSigned(descriptor, signature: decoded.signature)
@@ -334,16 +334,55 @@ public enum PublicRepositoryCommitCodec {
                 throw PublicRepositoryCommitError.invalidSignature
             }
         case .secp256k1:
+            guard isCanonicalSecp256k1Signature(signature) else {
+                throw PublicRepositoryCommitError.invalidSignature
+            }
+        }
+    }
+
+    private static func validateSupportedSigningAlgorithm(
+        _ algorithm: PublicRepositorySigningAlgorithm
+    ) throws {
+        // Swan's repository writer still emits P-256 commits. The verifier
+        // path below accepts the pinned TypeScript secp256k1 form without
+        // silently claiming that Swan can produce it yet.
+        guard algorithm == .p256 else {
             throw PublicRepositoryCommitError.unsupportedSigningAlgorithm
         }
     }
 
-    private static func validateSupportedAlgorithm(
+    private static func validateSupportedVerifierAlgorithm(
         _ algorithm: PublicRepositorySigningAlgorithm
     ) throws {
-        guard algorithm == .p256 else {
+        guard algorithm == .p256 || algorithm == .secp256k1 else {
             throw PublicRepositoryCommitError.unsupportedSigningAlgorithm
         }
+    }
+
+    /// The pinned TypeScript repository implementation emits compact
+    /// secp256k1 signatures in low-S form. Keep this structural check in the
+    /// public-repository target so a verifier cannot be called with a
+    /// malleable signature, while the concrete verifier remains responsible
+    /// for checking the public key and message.
+    private static func isCanonicalSecp256k1Signature(_ signature: Data) -> Bool {
+        let bytes = Array(signature)
+        guard bytes.count == 64 else { return false }
+        let halfOrder: [UInt8] = [
+            0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d,
+            0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
+        ]
+        let r = bytes[..<32]
+        let s = bytes[32...]
+        guard r.contains(where: { $0 != 0 }),
+              s.contains(where: { $0 != 0 }) else {
+            return false
+        }
+        for (value, maximum) in zip(s, halfOrder) {
+            if value != maximum { return value < maximum }
+        }
+        return true
     }
 }
 

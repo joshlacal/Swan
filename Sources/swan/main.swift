@@ -2798,6 +2798,30 @@ extension SwanCommand {
             @Option(name: .customLong("commit-key-algorithm"), help: "Repository signature algorithm: p256 or secp256k1")
             var commitKeyAlgorithm: String = "p256"
 
+            @Flag(
+                name: .customLong("resolve-commit-key"),
+                help: "Resolve the repository's atproto verification key from PLC instead of reading --commit-key-env"
+            )
+            var resolveCommitKey = false
+
+            @Option(
+                name: .customLong("plc-origin"),
+                help: "PLC directory origin used with --resolve-commit-key (default: https://plc.directory)"
+            )
+            var plcOrigin: String = PLCClientConfiguration.defaultProductionOrigin.absoluteString
+
+            @Flag(
+                name: .customLong("plc-laboratory"),
+                help: "Allow an explicitly loopback/allowlisted HTTP PLC origin for the lab"
+            )
+            var plcLaboratory = false
+
+            @Option(
+                name: .customLong("plc-laboratory-allowlisted-host"),
+                help: "Explicit Docker/service DNS host allowed for --plc-laboratory"
+            )
+            var plcLaboratoryAllowlistedHost: String?
+
             @Option(name: .long, help: "Idempotency request identifier; defaults to the current base commit")
             var requestID: String = ""
 
@@ -2829,6 +2853,15 @@ extension SwanCommand {
                 guard normalizedAlgorithm == "p256" || normalizedAlgorithm == "secp256k1" else {
                     throw ValidationError("--commit-key-algorithm must be p256 or secp256k1")
                 }
+                if !resolveCommitKey {
+                    guard !plcLaboratory,
+                          plcLaboratoryAllowlistedHost == nil,
+                          plcOrigin == PLCClientConfiguration.defaultProductionOrigin.absoluteString else {
+                        throw ValidationError(
+                            "--plc-origin and laboratory PLC options require --resolve-commit-key"
+                        )
+                    }
+                }
                 let baseURL = try LabLiveSupport.url(
                     explicit: remoteURL,
                     environment: "SWAN_LAB_PUBLIC_REPOSITORY_URL",
@@ -2839,28 +2872,36 @@ extension SwanCommand {
                       requestTimeoutSeconds.isFinite else {
                     throw ValidationError("--request-timeout-seconds is invalid")
                 }
-                let encodedKey = try LabLiveSupport.environmentValue(
-                    commitKeyEnvironment,
-                    label: "public repository commit key"
-                )
-                guard let keyBytes = Data(base64URLEncoded: encodedKey),
-                      keyBytes.base64URLEncodedString() == encodedKey else {
-                    throw ValidationError("public repository commit key is not canonical base64url")
-                }
-                let verificationKey: PermissionedDataJWTVerificationKey
-                do {
-                    switch normalizedAlgorithm {
-                    case "p256":
-                        verificationKey = .p256(
-                            try P256.Signing.PublicKey(x963Representation: keyBytes)
-                        )
-                    default:
-                        verificationKey = try PermissionedDataJWTVerificationKey(
-                            secp256k1PublicKey: keyBytes
-                        )
+                let keyResolver: (any PublicRepositoryCommitKeyResolving)?
+                if resolveCommitKey {
+                    guard let origin = URL(string: plcOrigin) else {
+                        throw ValidationError("--plc-origin must be a URL")
                     }
-                } catch {
-                    throw ValidationError("public repository commit key is invalid")
+                    let configuration: PLCClientConfiguration
+                    do {
+                        if plcLaboratory {
+                            configuration = try .laboratory(
+                                origin: origin,
+                                allowlistedHost: plcLaboratoryAllowlistedHost
+                            )
+                        } else {
+                            guard plcLaboratoryAllowlistedHost == nil else {
+                                throw ValidationError(
+                                    "--plc-laboratory-allowlisted-host requires --plc-laboratory"
+                                )
+                            }
+                            configuration = try .production(origin: origin)
+                        }
+                        keyResolver = try PLCPublicRepositoryCommitKeyResolver(
+                            configuration: configuration
+                        )
+                    } catch let error as ValidationError {
+                        throw error
+                    } catch {
+                        throw ValidationError("--plc-origin is not an allowed PLC origin")
+                    }
+                } else {
+                    keyResolver = nil
                 }
 
                 let database = try await SQLiteAccountDatabase(
@@ -2878,15 +2919,47 @@ extension SwanCommand {
                 let importer = RemotePublicRepositoryCARImporter(
                     client: try InteropXRPCClient(baseURL: baseURL, timeout: requestTimeoutSeconds)
                 )
-                let verifier = PermissionedDataPublicRepositoryCommitVerifier(key: verificationKey)
                 let result: PublicRepositoryCARImportArtifact
                 do {
-                    let imported = try await importer.importRepository(
-                        did: canonicalDID,
-                        database: database,
-                        verifier: verifier,
-                        requestID: id
-                    )
+                    let imported: CommittedPublicRepositoryImport
+                    if let keyResolver {
+                        imported = try await importer.importRepository(
+                            did: canonicalDID,
+                            database: database,
+                            keyResolver: keyResolver,
+                            requestID: id
+                        )
+                    } else {
+                        let encodedKey = try LabLiveSupport.environmentValue(
+                            commitKeyEnvironment,
+                            label: "public repository commit key"
+                        )
+                        guard let keyBytes = Data(base64URLEncoded: encodedKey),
+                              keyBytes.base64URLEncodedString() == encodedKey else {
+                            throw ValidationError("public repository commit key is not canonical base64url")
+                        }
+                        let verificationKey: PermissionedDataJWTVerificationKey
+                        do {
+                            switch normalizedAlgorithm {
+                            case "p256":
+                                verificationKey = .p256(
+                                    try P256.Signing.PublicKey(x963Representation: keyBytes)
+                                )
+                            default:
+                                verificationKey = try PermissionedDataJWTVerificationKey(
+                                    secp256k1PublicKey: keyBytes
+                                )
+                            }
+                        } catch {
+                            throw ValidationError("public repository commit key is invalid")
+                        }
+                        imported = try await importer.importRepository(
+                            did: canonicalDID,
+                            database: database,
+                            verifier: PermissionedDataPublicRepositoryCommitVerifier(key: verificationKey),
+                            requestID: id
+                        )
+                    }
                     result = PublicRepositoryCARImportArtifact(
                         remoteHost: baseURL.host ?? "remote",
                         repositoryDID: canonicalDID,

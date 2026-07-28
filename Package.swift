@@ -122,6 +122,7 @@ let package = Package(
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOSSL", package: "swift-nio-ssl"),
+                .product(name: "secp256k1", package: "secp256k1.swift"),
                 .product(name: "Petrel", package: "Petrel"),
             ]
         ),
@@ -161,7 +162,7 @@ let package = Package(
         .target(
             name: "SwanInterop",
             dependencies: [
-                "SwanCore", "SwanPublicRepository", "SwanSpaces", "SwanSpacesWire", "SwanSQLite", "SwanStorage", "SwanOAuth",
+                "SwanAccounts", "SwanCore", "SwanPublicRepository", "SwanSpaces", "SwanSpacesWire", "SwanSQLite", "SwanStorage", "SwanOAuth",
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),
@@ -262,7 +263,7 @@ let package = Package(
         .testTarget(
             name: "SwanInteropTests",
             dependencies: [
-                "SwanInterop", "SwanOAuth", "SwanSpaces",
+                "SwanAccounts", "SwanInterop", "SwanOAuth", "SwanSpaces",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),
             ]
@@ -280,6 +281,7 @@ let package = Package(
                 "SwanPublicRepository",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Petrel", package: "Petrel"),
+                .product(name: "secp256k1", package: "secp256k1.swift"),
             ]
         ),
     ]

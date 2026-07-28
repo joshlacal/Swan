@@ -216,6 +216,19 @@ checksum-verified way to populate the ignored reference cache.
   them only after selector/blob validation. The alpha public codec deliberately
   accepts the raw-CID link form used by its current tests and rejects typed
   blob objects, so that boundary is explicit rather than silently normalized.
+- A disposable pinned-TypeScript reference-only probe also passed the standard
+  typed-blob path: account provisioning, blob upload, an
+  `app.bsky.feed.post` commit, unauthenticated record retrieval, and streamed
+  blob retrieval all returned the expected status and bytes. This is evidence
+  for the reference host's own public behavior, not Swan/TypeScript
+  convergence. Swan's raw-CID public fixture codec still rejects the typed blob
+  object, so full cross-host typed-blob interoperability remains open.
+- Public repository verification now accepts canonical low-S secp256k1
+  signatures emitted by the pinned TypeScript implementation while retaining
+  P-256-only local signing. PLC `did:key` decoding and
+  `PLCPublicRepositoryCommitKeyResolver` provide a tested, fail-closed
+  PLC-backed key-discovery seam; the importer still requires an explicit key
+  until the remote discovery path is wired into a live CAR import.
 - Final macOS verification after the rereview passes the serialized Swift
   suite with zero failures, profile verification, the 18-check semantic lab,
   static/mutation interop checks, and `PublicRepositoryReadHTTPTests` 8/8. The

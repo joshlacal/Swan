@@ -1,6 +1,7 @@
 import Crypto
 import Foundation
 import Petrel
+import secp256k1
 import SwanCore
 @testable import SwanPublicRepository
 import XCTest
@@ -254,16 +255,48 @@ final class PublicRepositoryCommitTests: XCTestCase {
             dataCID: root,
             signer: P256PublicRepositoryCommitSigner(privateKey: key)
         )
-        let unsupportedVerifier = RecordingUnsupportedVerifier()
-        await assertCommitError(.unsupportedSigningAlgorithm) {
-            _ = try await PublicRepositoryCommitCodec.verify(
-                signedCommitBytes: prepared.signedCommitBytes,
-                expectedCommitCID: prepared.commitCID,
-                verifier: unsupportedVerifier
-            )
-        }
-        let verifierCalls = await unsupportedVerifier.callCount()
-        XCTAssertEqual(verifierCalls, 0)
+        // Verification accepts the pinned TypeScript secp256k1 algorithm;
+        // the concrete verifier still owns the public-key check. The writer
+        // path above remains P-256-only until Swan has a secp256k1 signer.
+        let referenceVerifier = RecordingUnsupportedVerifier()
+        _ = try await PublicRepositoryCommitCodec.verify(
+            signedCommitBytes: prepared.signedCommitBytes,
+            expectedCommitCID: prepared.commitCID,
+            verifier: referenceVerifier
+        )
+        let verifierCalls = await referenceVerifier.callCount()
+        XCTAssertEqual(verifierCalls, 1)
+    }
+
+    func testSecp256k1CommitVerifierAcceptsCompactLowSSignature() async throws {
+        let key = try secp256k1.Signing.PrivateKey(
+            dataRepresentation: Data(repeating: 2, count: 32)
+        )
+        let root = CID.fromDAGCBOR(PublicRepositoryGenesisCodec.canonicalEmptyMST)
+        let unsigned = try PublicRepositoryCommitCodec.encodeUnsigned(
+            did: did,
+            revision: revision,
+            dataCID: root
+        )
+        let signature = normalizeSecp256k1LowS(
+            try key.signature(for: unsigned).compactRepresentation
+        )
+        let signed = try signedCommit(
+            did: did,
+            revision: revision,
+            dataCID: root,
+            signature: signature
+        )
+        let commitCID = CID.fromDAGCBOR(signed)
+
+        let verified = try await PublicRepositoryCommitCodec.verify(
+            signedCommitBytes: signed,
+            expectedCommitCID: commitCID,
+            verifier: Secp256k1Verifier(publicKeyBytes: key.publicKey.dataRepresentation)
+        )
+
+        XCTAssertEqual(verified.signingAlgorithm, .secp256k1)
+        XCTAssertEqual(verified.signature, signature)
     }
 
     private enum Previous { case null, missing, link }
@@ -358,6 +391,29 @@ final class PublicRepositoryCommitTests: XCTestCase {
         }
         return Data(signature.prefix(32)) + Data(result)
     }
+
+    private func normalizeSecp256k1LowS(_ signature: Data) -> Data {
+        precondition(signature.count == 64)
+        let halfOrder = Data(hex: "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0")
+        let s = Data(signature.suffix(32))
+        guard s.lexicographicallyPrecedes(halfOrder) || s == halfOrder else {
+            let order = Data(hex: "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+            var result = [UInt8](repeating: 0, count: 32)
+            var borrow = 0
+            for index in result.indices.reversed() {
+                let value = Int(order[index]) - borrow - Int(s[index])
+                if value < 0 {
+                    result[index] = UInt8(value + 256)
+                    borrow = 1
+                } else {
+                    result[index] = UInt8(value)
+                    borrow = 0
+                }
+            }
+            return Data(signature.prefix(32)) + Data(result)
+        }
+        return signature
+    }
 }
 
 private actor RecordingSigner: PublicRepositoryCommitSigner {
@@ -397,6 +453,29 @@ private actor RecordingUnsupportedVerifier: PublicRepositoryCommitVerifier {
     }
 
     func callCount() -> Int { calls }
+}
+
+private struct Secp256k1Verifier: PublicRepositoryCommitVerifier {
+    let signingAlgorithm: PublicRepositorySigningAlgorithm = .secp256k1
+    let verificationIdentity = "test-secp256k1"
+    let publicKeyBytes: Data
+
+    func verify(
+        signature: Data,
+        unsignedCommitBytes: Data,
+        did _: String
+    ) async throws {
+        let publicKey = try secp256k1.Signing.PublicKey(
+            dataRepresentation: publicKeyBytes,
+            format: .compressed
+        )
+        let compact = try secp256k1.Signing.ECDSASignature(
+            compactRepresentation: signature
+        )
+        guard publicKey.isValidSignature(compact, for: unsignedCommitBytes) else {
+            throw PublicRepositoryCommitError.invalidSignature
+        }
+    }
 }
 
 private extension Data {

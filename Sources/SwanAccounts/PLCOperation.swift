@@ -1,7 +1,75 @@
 import Crypto
 import Foundation
 import Petrel
+import secp256k1
 import SwanCore
+
+/// The PLC wire format uses `did:key` multicodec values for both the local
+/// P-256 identity and the pinned TypeScript PDS's secp256k1 identity. Keep the
+/// decoding rule in one place so state/audit verification cannot accidentally
+/// accept a key-shaped string without proving its curve and point encoding.
+public enum PLCDIDVerificationKey: @unchecked Sendable {
+    case p256(P256.Signing.PublicKey)
+    case secp256k1(Data)
+
+    public var didKeyBytes: Data {
+        switch self {
+        case let .p256(key):
+            return Data([0x80, 0x24]) + key.compressedRepresentation
+        case let .secp256k1(bytes):
+            return Data([0xe7, 0x01]) + bytes
+        }
+    }
+}
+
+public enum PLCDIDKeyCodec {
+    public static func decode(_ value: String) throws -> PLCDIDVerificationKey {
+        guard value.hasPrefix("did:key:z"), value.utf8.count <= 256 else {
+            throw SwanError.invalidIdentifier("did:key")
+        }
+        let encoded = String(value.dropFirst("did:key:z".count))
+        let decoded = try Base58BTC.decode(encoded)
+        guard Base58BTC.encode(decoded) == encoded else {
+            throw SwanError.invalidIdentifier("did:key")
+        }
+
+        if decoded.count == 35, decoded.prefix(2) == Data([0x80, 0x24]) {
+            do {
+                let key = try P256.Signing.PublicKey(
+                    compressedRepresentation: decoded.dropFirst(2)
+                )
+                guard key.compressedRepresentation == decoded.dropFirst(2) else {
+                    throw SwanError.invalidIdentifier("P-256 did:key")
+                }
+                return .p256(key)
+            } catch {
+                throw SwanError.invalidIdentifier("P-256 did:key")
+            }
+        }
+
+        guard decoded.count == 35, decoded.prefix(2) == Data([0xe7, 0x01]) else {
+            throw SwanError.invalidIdentifier("secp256k1 did:key")
+        }
+        let point = Data(decoded.dropFirst(2))
+        do {
+            _ = try secp256k1.Signing.PublicKey(
+                dataRepresentation: point,
+                format: .compressed
+            )
+        } catch {
+            throw SwanError.invalidIdentifier("secp256k1 did:key")
+        }
+        return .secp256k1(point)
+    }
+
+    public static func validate(_ value: String) throws {
+        _ = try decode(value)
+    }
+
+    public static func isCanonical(_ value: String) -> Bool {
+        (try? decode(value)) != nil
+    }
+}
 
 public struct P256DIDKey: Sendable, Equatable, Hashable, Codable {
     public let value: String
@@ -331,12 +399,28 @@ public enum PLCOperationCodec {
         case let .tombstoneOperation(value): signatureText = value.signature
         }
         let signatureBytes = try decodeCanonicalSignature(signatureText)
-        let signature = try P256WireSignature.decodeCanonical(signatureBytes)
         let signingBytes = try operation.signingDAGCBOR
         for (index, keyText) in authorizedRotationKeys.enumerated() {
-            let key = try P256DIDKey(keyText)
-            if try key.publicKey.isValidSignature(signature, for: signingBytes) {
-                return index
+            switch try PLCDIDKeyCodec.decode(keyText) {
+            case let .p256(key):
+                let signature = try P256WireSignature.decodeCanonical(signatureBytes)
+                if key.isValidSignature(signature, for: signingBytes) {
+                    return index
+                }
+            case let .secp256k1(publicKeyBytes):
+                guard isCanonicalSecp256k1Signature(signatureBytes) else {
+                    throw SwanError.unauthorized("PLC operation signature is not low-S")
+                }
+                let publicKey = try secp256k1.Signing.PublicKey(
+                    dataRepresentation: publicKeyBytes,
+                    format: .compressed
+                )
+                let signature = try secp256k1.Signing.ECDSASignature(
+                    compactRepresentation: signatureBytes
+                )
+                if publicKey.isValidSignature(signature, for: signingBytes) {
+                    return index
+                }
             }
         }
         throw SwanError.unauthorized("PLC operation signature is invalid")
@@ -419,7 +503,7 @@ public enum PLCOperationCodec {
               Set(operation.rotationKeys).count == operation.rotationKeys.count else {
             throw SwanError.malformed("PLC operation must contain 1...5 unique rotation keys")
         }
-        try operation.rotationKeys.forEach { _ = try P256DIDKey($0) }
+        try operation.rotationKeys.forEach { _ = try PLCDIDKeyCodec.decode($0) }
         guard !operation.verificationMethods.isEmpty,
               operation.verificationMethods.count <= 32,
               operation.alsoKnownAs.count <= 32,
@@ -428,7 +512,7 @@ public enum PLCOperationCodec {
         }
         for (name, value) in operation.verificationMethods {
             try validateMapName(name)
-            _ = try P256DIDKey(value)
+            _ = try PLCDIDKeyCodec.decode(value)
         }
         for alias in operation.alsoKnownAs {
             try validateWireString(alias, field: "alsoKnownAs")
@@ -516,15 +600,31 @@ public enum PLCOperationCodec {
 
     private static func validateSigned(_ operation: PLCSignedOperation) throws {
         let signature: String
+        let rotationKeys: [String]?
         switch operation {
         case let .regularOperation(value):
             _ = try value.unsigned
             signature = value.signature
+            rotationKeys = value.rotationKeys
         case let .tombstoneOperation(value):
             _ = try value.unsigned
             signature = value.signature
+            rotationKeys = nil
         }
-        _ = try decodeCanonicalSignature(signature)
+        let signatureBytes = try decodeCanonicalSignature(signature)
+        if let rotationKeys {
+            guard rotationKeys.contains(where: {
+                guard let key = try? PLCDIDKeyCodec.decode($0) else { return false }
+                switch key {
+                case .p256:
+                    return (try? P256WireSignature.decodeCanonical(signatureBytes)) != nil
+                case .secp256k1:
+                    return isCanonicalSecp256k1Signature(signatureBytes)
+                }
+            }) else {
+                throw SwanError.malformed("PLC operation signature is not canonical")
+            }
+        }
         guard try encodeSigned(operation).count <= maximumDAGCBORBytes else {
             throw SwanError.malformed("PLC operation exceeds 7,500 DAG-CBOR bytes")
         }
@@ -536,8 +636,26 @@ public enum PLCOperationCodec {
               decoded.plcBase64URL == value else {
             throw SwanError.malformed("PLC operation signature encoding is invalid")
         }
-        _ = try P256WireSignature.decodeCanonical(decoded)
         return decoded
+    }
+
+    private static func isCanonicalSecp256k1Signature(_ signature: Data) -> Bool {
+        let bytes = Array(signature)
+        guard bytes.count == 64 else { return false }
+        let halfOrder: [UInt8] = [
+            0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d,
+            0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
+        ]
+        let r = bytes[..<32]
+        let s = bytes[32...]
+        guard r.contains(where: { $0 != 0 }),
+              s.contains(where: { $0 != 0 }) else { return false }
+        for (value, maximum) in zip(s, halfOrder) {
+            if value != maximum { return value < maximum }
+        }
+        return true
     }
 
     private static func regularMap(

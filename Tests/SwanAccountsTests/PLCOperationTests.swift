@@ -33,6 +33,20 @@ final class PLCOperationTests: XCTestCase {
         }
     }
 
+    func testSecp256k1DIDKeyCodecAcceptsPinnedTypeScriptFormOnly() throws {
+        let value = "did:key:zQ3shqwJEJyMBsBXCWyCBpUBMqxcon9oHB7mCvx4sSpMdLJwc"
+        let key = try PLCDIDKeyCodec.decode(value)
+        guard case let .secp256k1(bytes) = key else {
+            return XCTFail("expected secp256k1 key")
+        }
+        XCTAssertEqual(bytes.count, 33)
+        XCTAssertEqual(bytes.first, 0x03)
+        XCTAssertTrue(PLCDIDKeyCodec.isCanonical(value))
+        XCTAssertThrowsError(try PLCDIDKeyCodec.decode(
+            value.replacingOccurrences(of: "zQ3s", with: "zDna")
+        ))
+    }
+
     func testATProfileCreatesExactGenesisMapsAndOriginPolicy() throws {
         let unsigned = try PLCATProfile.regularOperation(
             handle: "Alice.Example.COM",

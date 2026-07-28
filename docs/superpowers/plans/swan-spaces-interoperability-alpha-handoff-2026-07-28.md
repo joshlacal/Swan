@@ -493,3 +493,20 @@ the reference PDS/PLC, and Swan are healthy; `/health` returns `OK` through
 local TLS and the reference PDS returns version `0.5.7`. This refresh does not
 close the remaining TypeScript semantic, dynamic-key, blob, reverse-authority,
 or full lifecycle/security gates listed above.
+
+## Follow-up verification: reference typed-blob probe and PLC key seam
+
+A disposable pinned-TypeScript reference-only run now passes its standard
+public typed-blob flow: account provisioning, blob upload, an
+`app.bsky.feed.post` commit, unauthenticated record retrieval, and streamed
+blob retrieval all returned the expected status and bytes. This is reference
+host evidence only. It does not prove Swan/TypeScript convergence because the
+current Swan public codec intentionally accepts its raw-CID fixture form and
+rejects the TypeScript typed blob object.
+
+The public repository verifier now accepts canonical low-S secp256k1 commit
+signatures while Swan's local writer remains P-256. PLC `did:key` decoding and
+`PLCPublicRepositoryCommitKeyResolver` have focused tests for the pinned
+TypeScript secp256k1 key, missing-key rejection, and invalid repository
+identities. The importer still takes an explicit verification key; live
+remote DID/PLC discovery and a TypeScript CAR import remain open gates.

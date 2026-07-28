@@ -280,6 +280,20 @@ public struct PLCDocumentData: Sendable, Equatable {
     public let verificationMethods: [String: String]
     public let alsoKnownAs: [String]
     public let services: [String: PLCService]
+
+    public init(
+        did: String,
+        rotationKeys: [String],
+        verificationMethods: [String: String],
+        alsoKnownAs: [String],
+        services: [String: PLCService]
+    ) {
+        self.did = did
+        self.rotationKeys = rotationKeys
+        self.verificationMethods = verificationMethods
+        self.alsoKnownAs = alsoKnownAs
+        self.services = services
+    }
 }
 
 public struct PLCAuditEntry: Sendable, Equatable {

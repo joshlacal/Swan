@@ -82,9 +82,9 @@ extension SwanPublicPLCGenesisVerifier: PublicPLCIdentityVerifying {
             }
 
             guard regular.verificationMethods.count == 1,
-                  regular.verificationMethods["atproto"] != nil,
+                  regular.verificationMethods["atproto"].map(PLCDIDKeyCodec.isCanonical) == true,
                   regular.rotationKeys.count >= 1,
-                  regular.rotationKeys.allSatisfy({ (try? P256DIDKey($0)) != nil }) else {
+                  regular.rotationKeys.allSatisfy({ PLCDIDKeyCodec.isCanonical($0) }) else {
                 throw SwanError.unauthorized("PLC operation identity keys are invalid")
             }
             previousDate = entry.createdAt

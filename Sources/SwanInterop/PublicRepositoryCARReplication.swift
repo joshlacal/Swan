@@ -231,4 +231,27 @@ public struct RemotePublicRepositoryCARImporter: Sendable {
             throw error
         }
     }
+
+    /// Resolves the repository signing key from an authenticated PLC state,
+    /// then delegates to the same bounded CAR/import transaction. Resolution
+    /// happens before the request binding and no network work occurs inside
+    /// SQLite publication.
+    public func importRepository(
+        did: String,
+        database: SQLiteAccountDatabase,
+        keyResolver: any PublicRepositoryCommitKeyResolving,
+        requestID: String,
+        lifetime: Int64 = 300,
+        now: Int64 = Int64(Date().timeIntervalSince1970)
+    ) async throws -> CommittedPublicRepositoryImport {
+        let verifier = try await keyResolver.resolveCommitVerifier(for: did)
+        return try await importRepository(
+            did: did,
+            database: database,
+            verifier: verifier,
+            requestID: requestID,
+            lifetime: lifetime,
+            now: now
+        )
+    }
 }

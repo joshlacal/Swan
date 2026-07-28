@@ -81,11 +81,28 @@ boundary.
   public Swan-to-Swan record/blob scenario now passes: upload, public raw-link
   write, unauthenticated record read, and streamed blob read all converge with
   the blob bytes verified. The checked-in fixture is DID-independent through
-  `{{REPOSITORY_DID}}` and `{{BLOB_CID}}` placeholders. The same live proof has
-  not yet been reproduced against the pinned TypeScript host.
+  `{{REPOSITORY_DID}}` and `{{BLOB_CID}}` placeholders. A disposable
+  reference-only TypeScript run also passes its typed-blob form: upload, a
+  standard `app.bsky.feed.post` commit, unauthenticated record read, and
+  streamed blob read all returned the expected status and bytes. This is not a
+  Swan/TypeScript convergence result; Swan's current public codec deliberately
+  accepts its raw-CID fixture form and still rejects the TypeScript typed blob
+  object.
 - Re-run the complete suite after any further mutation slice; do not claim
   alpha completion until the live Compose/reference matrix and Linux gates
   pass.
+
+## 2026-07-28 public-key interoperability checkpoint
+
+The public repository verifier now accepts canonical low-S secp256k1 commit
+signatures in addition to Swan's P-256 writer format. PLC `did:key` decoding
+validates both the P-256 and secp256k1 multicodec forms, and
+`PLCPublicRepositoryCommitKeyResolver` can select the `atproto` key from a
+PLC-backed document without retaining private material. Focused tests cover
+the pinned TypeScript secp256k1 `did:key` form, resolver selection, invalid
+identities, and missing signing keys. The CLI importer still requires an
+explicit verification key; wiring remote discovery into a live import remains
+a separate gate.
 
 ## 2026-07-28 runtime and harness checkpoint
 
