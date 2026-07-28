@@ -10,6 +10,7 @@ import SwanCore
 import SwanOAuth
 import SwanPublicRepository
 import SwanSQLite
+import SwanStorage
 import ServiceLifecycle
 
 #if canImport(Darwin)
@@ -340,6 +341,15 @@ private struct ServePublicMutationDirectory: PublicRepositoryMutationDirectory {
         guard let account = try await controls.account(did: selector),
               let store = await directory.preopenedPublicMutationStore(did: selector) else { return nil }
         return try PublicRepositoryMutationTarget(did: account.did, status: account.status, store: store)
+    }
+
+    func publicBlobData(cid: String) async throws -> Data? {
+        for did in try await controls.activeAccountDIDs() {
+            guard let store = await directory.preopenedPublicMutationStore(did: did),
+                  let blobs = store as? any BlobStore else { continue }
+            if let data = try await blobs.publicData(cid: cid) { return data }
+        }
+        return nil
     }
 }
 

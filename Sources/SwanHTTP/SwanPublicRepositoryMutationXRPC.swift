@@ -294,14 +294,13 @@ func registerPublicRepositoryMutationEndpoints(
             router.on(path, method: method) { _, _ in publicMutationError(.notFound, "public_endpoint_unavailable") }
         }
     }
-    if let blobStore = capability.blobStore {
-        let blobPath: RouterPath = "/xrpc/com.atproto.sync.getBlob"
+    let blobPath: RouterPath = "/xrpc/com.atproto.sync.getBlob"
         router.get(blobPath) { request, _ async -> Response in
             guard let cid = publicQueryValue("cid", request: request) else {
                 return publicMutationError(.notFound, "BlobNotFound")
             }
             let maybeData: Data?
-            do { maybeData = try await blobStore.publicData(cid: cid) }
+            do { maybeData = try await capability.directory.publicBlobData(cid: cid) }
             catch { return publicMutationError(.notFound, "BlobNotFound") }
             guard let data = maybeData else {
                 return publicMutationError(.notFound, "BlobNotFound")
@@ -310,7 +309,7 @@ func registerPublicRepositoryMutationEndpoints(
             headers[.contentLength] = String(data.count)
             return Response(status: .ok, headers: headers, body: .init(byteBuffer: ByteBuffer(data: data)))
         }
-    }
+    
 }
 
 private func publicQueryValue(_ name: String, request: Request) -> String? {

@@ -779,7 +779,7 @@ public struct SwanHTTPServer: Sendable {
                Self.isInstalledPublicMutationMethod(descriptor.nsid) {
                 continue
             }
-            if publicRepositoryMutations?.blobStore != nil,
+            if publicRepositoryMutations != nil,
                descriptor.nsid == "com.atproto.sync.getBlob" {
                 continue
             }

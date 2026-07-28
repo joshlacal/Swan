@@ -13,6 +13,10 @@ public protocol PublicRepositoryMutationDirectory: Sendable {
         -> PublicRepositoryMutationTarget?
 }
 
+public extension PublicRepositoryMutationDirectory {
+    func publicBlobData(cid: String) async throws -> Data? { nil }
+}
+
 public struct PublicRepositoryMutationTarget: Sendable {
     public let did: String
     public let status: AccountControlStatus
