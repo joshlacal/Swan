@@ -36,7 +36,7 @@ public enum SQLiteControlDatabaseOpenMode: Sendable, Equatable {
 /// process while `BEGIN IMMEDIATE` makes consume/rotate/revoke semantics hold
 /// across independently reopened Swan processes as well.
 public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
-    SpaceDelegationReplayStore
+    SpaceDelegationReplayStore, SpaceClientAttestationReplayStore
 {
     private static let microsecondsPerSecond = 1_000_000.0
     /// Cold control connections can contend during WAL configuration or the
@@ -757,6 +757,46 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         }
     }
 
+    /// One attestation claim is one `BEGIN IMMEDIATE` transaction containing
+    /// only bounded local SQLite work. Metadata/JWKS resolution and signature
+    /// verification must already be complete before this method is invoked.
+    public func claimSpaceClientAttestation(
+        digest: Data,
+        expiresAt: Date,
+        now: Date = Date()
+    ) async throws -> Bool {
+        try validateDigest(digest)
+        guard expiresAt > now else { throw OAuthControlStoreError.expired }
+        return try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredLocked(now: now)
+                let rows = try await connection.query(
+                    """
+                    SELECT expires_at
+                    FROM permissioned_space_client_attestation_replays
+                    WHERE replay_digest = ?
+                    """,
+                    [blob(digest)]
+                )
+                if let row = rows.first {
+                    guard try requiredDate(row, "expires_at") > now else {
+                        throw OAuthControlStoreError.malformedRecord
+                    }
+                    return false
+                }
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_space_client_attestation_replays(
+                        replay_digest, expires_at
+                    ) VALUES (?, ?)
+                    """,
+                    [blob(digest), .integer(try timestamp(expiresAt))]
+                )
+                return true
+            }
+        }
+    }
+
     public func purgeExpiredOAuthControlState(now: Date = Date()) async throws {
         try await withConnectionGate {
             try await transaction {
@@ -935,6 +975,21 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         )
         _ = try await connection.query(
             "DELETE FROM permissioned_space_delegation_replays WHERE expires_at <= ?",
+            [.integer(nowTimestamp)]
+        )
+        // Bound cleanup work per claim/startup pass so an attacker cannot turn
+        // expiry maintenance into an unbounded request-time transaction.
+        _ = try await connection.query(
+            """
+            DELETE FROM permissioned_space_client_attestation_replays
+            WHERE replay_digest IN (
+                SELECT replay_digest
+                FROM permissioned_space_client_attestation_replays
+                WHERE expires_at <= ?
+                ORDER BY expires_at, replay_digest
+                LIMIT 512
+            )
+            """,
             [.integer(nowTimestamp)]
         )
         _ = try await connection.query(

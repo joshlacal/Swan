@@ -381,6 +381,29 @@ public enum PermissionedDataJWT {
         public let jti: String
     }
 
+    /// Bounded JOSE and claim material discovered before signature
+    /// verification. The deliberately explicit `Untrusted` name is a security
+    /// boundary: this value is only a key-resolution hint and must never be
+    /// accepted as an authorization result.
+    public struct UntrustedClientAttestationInspection: Sendable, Equatable {
+        public let clientID: URL
+        public let keyID: String
+        public let claims: ClientAttestationClaims
+        public let replayExpiresAt: Date
+
+        public init(
+            clientID: URL,
+            keyID: String,
+            claims: ClientAttestationClaims,
+            replayExpiresAt: Date
+        ) {
+            self.clientID = clientID
+            self.keyID = keyID
+            self.claims = claims
+            self.replayExpiresAt = replayExpiresAt
+        }
+    }
+
     public static func createDelegationToken(
         issuer: String,
         audience: String,
@@ -578,18 +601,74 @@ public enum PermissionedDataJWT {
         return SpaceCredentialInspection(header: parsed.header, claims: claims)
     }
 
-    /// Parses structural attestation claims before the metadata/JWKS component
-    /// resolves and verifies the app key. This intentionally does not assert
-    /// attestation authenticity until that network-bound step succeeds.
-    public static func parseClientAttestation(_ token: String, now: Date = Date(), clockSkew: TimeInterval = 60) throws -> ClientAttestationClaims {
-        let parsed = try parse(token)
-        guard parsed.header.typ == clientAttestationType else { throw SwanError.unauthorized("wrong client attestation type") }
-        let claims = try decode(ClientAttestationClaims.self, from: parsed.payload)
-        guard claims.iss == claims.sub, URL(string: claims.iss)?.scheme == "https", !claims.aud.isEmpty else {
-            throw SwanError.malformed("invalid client attestation claims")
+    /// Performs strict, bounded, duplicate-free local discovery before a
+    /// client metadata URL may become a fetch target. This does not verify the
+    /// signature and therefore returns an explicitly untrusted type.
+    public static func inspectUntrustedClientAttestation(
+        _ token: String,
+        authority: String,
+        now: Date = Date(),
+        maximumLifetime: TimeInterval = 300,
+        clockSkew: TimeInterval = 60
+    ) throws -> UntrustedClientAttestationInspection {
+        guard token.utf8.count <= 8 * 1_024,
+              maximumLifetime > 0,
+              maximumLifetime <= 600,
+              maximumLifetime.rounded(.towardZero) == maximumLifetime,
+              clockSkew >= 0,
+              clockSkew <= 120,
+              clockSkew.rounded(.towardZero) == clockSkew else {
+            throw SwanError.malformed("client attestation policy is invalid")
         }
-        try validateTimes(iat: claims.iat, exp: claims.exp, now: now, clockSkew: clockSkew)
-        return claims
+        let pieces = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard pieces.count == 3 else {
+            throw SwanError.malformed("client attestation must use compact serialization")
+        }
+        let headerData = try OAuthBase64URL.decode(String(pieces[0]), maxBytes: 4 * 1_024)
+        let payload = try OAuthBase64URL.decode(String(pieces[1]), maxBytes: 4 * 1_024)
+        let signature = try OAuthBase64URL.decode(String(pieces[2]), maxBytes: 64)
+        guard signature.count == 64 else {
+            throw SwanError.malformed("client attestation signature length is invalid")
+        }
+        let header = try StrictJSON.decode(OAuthJWTHeader.self, from: headerData)
+        guard header.type == clientAttestationType,
+              header.algorithm == "ES256",
+              let keyID = header.keyID,
+              !keyID.isEmpty,
+              keyID.utf8.count <= 1_024,
+              keyID.utf8.allSatisfy({ $0 >= 0x20 && $0 != 0x7f }),
+              header.jwk == nil,
+              header.criticalHeaders == nil,
+              header.base64Payload == nil else {
+            throw SwanError.unauthorized("client attestation JOSE header is invalid")
+        }
+        let claims = try StrictJSON.decode(ClientAttestationClaims.self, from: payload)
+        let expectedAudience = "\(authority)#atproto_space_host"
+        guard claims.iss == claims.sub,
+              claims.aud == expectedAudience,
+              claims.jti.isValidPermissionedDataJTI,
+              let clientID = URL(string: claims.iss),
+              clientID.absoluteString == claims.iss else {
+            throw SwanError.unauthorized("client attestation claims are invalid")
+        }
+        try OAuthClientMetadata.validateStandardClientID(clientID)
+        try validateTimes(
+            iat: claims.iat,
+            exp: claims.exp,
+            now: now,
+            clockSkew: clockSkew,
+            maximumLifetime: Int64(maximumLifetime)
+        )
+        let replayTimestamp = Double(claims.exp) + clockSkew
+        guard replayTimestamp.isFinite else {
+            throw SwanError.malformed("client attestation expiry is invalid")
+        }
+        return UntrustedClientAttestationInspection(
+            clientID: clientID,
+            keyID: keyID,
+            claims: claims,
+            replayExpiresAt: Date(timeIntervalSince1970: replayTimestamp)
+        )
     }
 
     private struct ParsedJWT: Sendable {

@@ -499,8 +499,20 @@ public struct UnavailableSpaceDelegationPublicKeyResolver:
 /// durable policy or key-store failure so an HTTP adapter can render the
 /// profile's `InvalidClientAttestation` error without exposing implementation
 /// details. The enum carries no token, client, or metadata material.
-public enum SpaceCredentialClientAttestationFailure: Error, Sendable, Equatable {
+public enum SpaceCredentialClientAttestationFailure:
+    Error, Sendable, Equatable, CustomStringConvertible
+{
     case invalid
+    case unavailable
+
+    public var description: String {
+        switch self {
+        case .invalid:
+            "invalid client attestation"
+        case .unavailable:
+            "client attestation service unavailable"
+        }
+    }
 }
 
 /// Issues proposal-shaped space credentials after the authority's durable
@@ -576,8 +588,10 @@ public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
                 authority: space.authority,
                 now: now
             )
+        } catch let failure as SpaceCredentialClientAttestationFailure {
+            throw failure
         } catch {
-            throw SpaceCredentialClientAttestationFailure.invalid
+            throw SpaceCredentialClientAttestationFailure.unavailable
         }
         try await policyDirectory.authorizeSimpleSpaceCredentialRead(
             space: space,

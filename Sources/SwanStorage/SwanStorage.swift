@@ -474,3 +474,15 @@ public protocol SpaceDelegationReplayStore: Sendable {
         now: Date
     ) async throws -> Bool
 }
+
+/// Durable single-use reservation for a cryptographically verified
+/// proposal-0016 client attestation. The storage boundary accepts only a
+/// keyed 32-byte digest and expiry; raw JWT, JTI, client identity, signature,
+/// delegation, credential, and private-key material are not representable.
+public protocol SpaceClientAttestationReplayStore: Sendable {
+    func claimSpaceClientAttestation(
+        digest: Data,
+        expiresAt: Date,
+        now: Date
+    ) async throws -> Bool
+}

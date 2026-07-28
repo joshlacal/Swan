@@ -167,6 +167,7 @@ extension SQLiteControlDatabase {
                 "oauth_control_dpop_replays",
                 "oauth_control_client_assertion_replays",
                 "permissioned_space_delegation_replays",
+                "permissioned_space_client_attestation_replays",
                 "plc_account_preparation_intents",
             ] {
                 let rows = try await connection.query(

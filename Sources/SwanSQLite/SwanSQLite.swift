@@ -153,6 +153,12 @@ public enum SQLiteLayout {
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS permissioned_space_client_attestation_replays (
+            replay_digest BLOB PRIMARY KEY CHECK(length(replay_digest) = 32),
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0)
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS plc_account_preparation_intents (
             request_id TEXT PRIMARY KEY,
             did TEXT NOT NULL UNIQUE,
