@@ -24,18 +24,17 @@ public struct PublicRecord: Sendable, Equatable, ExpressibleByDictionaryLiteral 
     }
 
     public init(dictionaryLiteral elements: (String, PublicRecordValue)...) {
-        fields = Dictionary(uniqueKeysWithValues: elements)
+        var fields: [String: PublicRecordValue] = [:]
+        for (key, value) in elements {
+            fields[key] = value
+        }
+        self.fields = fields
     }
 }
 
 public struct PreparedPublicRecord: Sendable, Equatable {
     public let bytes: Data
     public let cid: CID
-
-    public init(bytes: Data, cid: CID) {
-        self.bytes = bytes
-        self.cid = cid
-    }
 }
 
 public enum PublicRepositoryRecordCodec {

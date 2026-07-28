@@ -138,6 +138,35 @@ final class PublicRepositoryDomainTests: XCTestCase {
         )
     }
 
+    func testRecordEncodingMatchesIndependentCanonicalWireVector() throws {
+        let path = try PublicRepositoryPath(collection: collection, recordKey: "vector")
+        let prepared = try PublicRepositoryRecordCodec.prepare(
+            PublicRecord([
+                "$type": .string(collection),
+                "text": .string("hello"),
+            ]),
+            for: path
+        )
+        XCTAssertEqual(
+            prepared.bytes.map { String(format: "%02x", $0) }.joined(),
+            "a264746578746568656c6c6f652474797065726170702e62736b792e666565642e706f7374"
+        )
+        XCTAssertEqual(prepared.cid.string, "bafyreicl5wcgzaefpu23bimapxa4lj7kbx7dczrtbmh6haqztpqkjk6uza")
+    }
+
+    func testRecordDictionaryLiteralDuplicateKeysUseLastValueWithoutTrapping() throws {
+        let record: PublicRecord = [
+            "$type": .string("wrong.collection"),
+            "$type": .string(collection),
+            "text": .string("first"),
+            "text": .string("last"),
+        ]
+        XCTAssertEqual(record.fields["$type"], .string(collection))
+        XCTAssertEqual(record.fields["text"], .string("last"))
+        let path = try PublicRepositoryPath(collection: collection, recordKey: "duplicate-literal")
+        XCTAssertNoThrow(try PublicRepositoryRecordCodec.prepare(record, for: path))
+    }
+
     func testRecordCodecEnforcesDepthSizeAndEmbeddedLinkValidity() throws {
         let path = try PublicRepositoryPath(collection: collection, recordKey: "limits")
         let tinyLimits = try PublicRepositoryLimits(
@@ -256,6 +285,40 @@ final class PublicRepositoryDomainTests: XCTestCase {
         XCTAssertThrowsError(try PublicRepositoryBlockMap(blocks: blocks, maximumRelevantBytes: 1)) {
             XCTAssertEqual($0 as? PublicRepositoryDomainError, .relevantBlockBudgetExceeded)
         }
+    }
+
+    func testBlockMapFreezesPinnedOrStricterBudgetWithoutWidening() throws {
+        let empty = try PublicRepositoryBlockMap(blocks: [], maximumRelevantBytes: 0)
+        XCTAssertEqual(empty.maximumRelevantBytes, 0)
+        let oneByte = Data([0xa0])
+        let oneBlock = PublicRepositoryBlock(cid: CID.fromDAGCBOR(oneByte), bytes: oneByte)
+        XCTAssertThrowsError(try empty.adding([oneBlock])) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .relevantBlockBudgetExceeded)
+        }
+
+        let pinnedBytes = Data(repeating: 0, count: PublicRepositoryLimits.pinnedMaximumRelevantBlockBytes)
+        let pinned = try PublicRepositoryBlockMap(
+            blocks: [.init(cid: CID.fromDAGCBOR(pinnedBytes), bytes: pinnedBytes)],
+            maximumRelevantBytes: PublicRepositoryLimits.pinnedMaximumRelevantBlockBytes
+        )
+        XCTAssertEqual(pinned.relevantByteCount, PublicRepositoryLimits.pinnedMaximumRelevantBlockBytes)
+        XCTAssertEqual(pinned.maximumRelevantBytes, PublicRepositoryLimits.pinnedMaximumRelevantBlockBytes)
+
+        XCTAssertThrowsError(try PublicRepositoryBlockMap(
+            blocks: [],
+            maximumRelevantBytes: PublicRepositoryLimits.pinnedMaximumRelevantBlockBytes + 1
+        )) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .relevantBlockBudgetExceeded)
+        }
+
+        let strict = try PublicRepositoryBlockMap(blocks: [oneBlock], maximumRelevantBytes: 1)
+        let secondBytes = Data([0x80])
+        let secondBlock = PublicRepositoryBlock(cid: CID.fromDAGCBOR(secondBytes), bytes: secondBytes)
+        XCTAssertThrowsError(try strict.adding([secondBlock])) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .relevantBlockBudgetExceeded)
+        }
+        XCTAssertEqual(strict.maximumRelevantBytes, 1)
+        XCTAssertEqual(strict.relevantByteCount, 1)
     }
 
     func testBatchPreflightRejectsEmptyTooManyDuplicateAndMalformedCAS() throws {

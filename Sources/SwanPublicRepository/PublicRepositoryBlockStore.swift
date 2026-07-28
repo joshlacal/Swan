@@ -19,12 +19,14 @@ public struct PublicRepositoryBlock: Sendable, Equatable {
 public struct PublicRepositoryBlockMap: Sendable, Equatable, PublicRepositoryBlockSource {
     private let storage: [CID: Data]
     public let relevantByteCount: Int
+    /// The immutable effective budget selected when this map was created.
+    public let maximumRelevantBytes: Int
 
     public init(
         blocks: [PublicRepositoryBlock] = [],
         maximumRelevantBytes: Int = PublicRepositoryLimits.pinnedMaximumRelevantBlockBytes
     ) throws {
-        guard maximumRelevantBytes >= 0 else {
+        guard (0...PublicRepositoryLimits.pinnedMaximumRelevantBlockBytes).contains(maximumRelevantBytes) else {
             throw PublicRepositoryDomainError.relevantBlockBudgetExceeded
         }
         var storage: [CID: Data] = [:]
@@ -46,6 +48,7 @@ public struct PublicRepositoryBlockMap: Sendable, Equatable, PublicRepositoryBlo
         }
         self.storage = storage
         self.relevantByteCount = relevantByteCount
+        self.maximumRelevantBytes = maximumRelevantBytes
     }
 
     public var count: Int { storage.count }
@@ -59,10 +62,7 @@ public struct PublicRepositoryBlockMap: Sendable, Equatable, PublicRepositoryBlo
         storage[cid]
     }
 
-    public func adding(
-        _ blocks: [PublicRepositoryBlock],
-        maximumRelevantBytes: Int = PublicRepositoryLimits.pinnedMaximumRelevantBlockBytes
-    ) throws -> Self {
+    public func adding(_ blocks: [PublicRepositoryBlock]) throws -> Self {
         let existing = storage.map { PublicRepositoryBlock(cid: $0.key, bytes: $0.value) }
         return try Self(blocks: existing + blocks, maximumRelevantBytes: maximumRelevantBytes)
     }
