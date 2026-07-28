@@ -65,6 +65,11 @@ public struct ProtocolProfileVerificationReport: Sendable, Equatable {
 /// regeneration happens in CI.
 public enum OfflineProtocolProfileVerifier {
     public static let stableProfileID = "permissioned-data-0016-2026-07-03"
+    public static let publicProfileID = "public-data-testing-2026-07-27"
+
+    private struct ProfileIdentity: Decodable {
+        let id: String
+    }
 
     private struct ArtifactPins: Decodable {
         let id: String
@@ -91,6 +96,26 @@ public enum OfflineProtocolProfileVerifier {
         let contentBinding: String
     }
 
+    private struct PublicArtifactPins: Decodable {
+        struct Divergence: Decodable {
+            let endpoint: String
+            let referenceBehavior: String
+            let swanBehavior: String
+        }
+
+        let id: String
+        let referenceImplementationCommit: String
+        let petrelGeneratorCommit: String
+        let petrelCommit: String
+        let referenceArchiveSHA256: String?
+        let lexiconManifest: String?
+        let lexiconManifestSHA256: String?
+        let generatedWireManifest: String?
+        let generatedWireManifestSHA256: String?
+        let intentionalDivergences: [Divergence]
+        let endpoints: [String]
+    }
+
     private struct ManifestEntry: Equatable {
         let checksum: String
         let path: String
@@ -106,6 +131,8 @@ public enum OfflineProtocolProfileVerifier {
     private static let expectedReferenceArchiveSHA256 = "1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea"
     private static let expectedLexiconManifestSHA256 = "9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f"
     private static let expectedGeneratedWireManifestSHA256 = "c1d5697f351a4209c7f8a9faaf460d423f9f44f37845ae2c92e150e78c552609"
+    private static let expectedPublicLexiconManifestSHA256 = "bd94660a2c2c05fc23185059329194ff6c29635f74ce2efcf97351c1be98fe97"
+    private static let expectedPublicGeneratedWireManifestSHA256 = "c68177a315f6a3d6f01419f48be5e0beedf76d1e4ae21ebe5de52ac49ad80d3b"
     private static let expectedEndpoints = [
         "com.atproto.space.applyWrites",
         "com.atproto.space.createRecord",
@@ -133,12 +160,25 @@ public enum OfflineProtocolProfileVerifier {
         "com.atproto.simplespace.removeMember",
         "com.atproto.simplespace.updateSpace",
     ]
+    private static let expectedPublicEndpoints = [
+        "com.atproto.repo.applyWrites",
+        "com.atproto.repo.createRecord",
+        "com.atproto.repo.deleteRecord",
+        "com.atproto.repo.describeRepo",
+        "com.atproto.repo.getRecord",
+        "com.atproto.repo.listRecords",
+        "com.atproto.repo.putRecord",
+        "com.atproto.repo.uploadBlob",
+        "com.atproto.sync.getBlob",
+        "com.atproto.sync.getLatestCommit",
+        "com.atproto.sync.getRepo",
+        "com.atproto.sync.getRepoStatus",
+    ]
 
     public static func verify(
         profileURL: URL,
         sourceRoot: URL? = nil
     ) -> ProtocolProfileVerificationReport {
-        var diagnostics: [ProtocolProfileVerificationDiagnostic] = []
         let profileData: Data
         guard !isSymbolicLink(profileURL) else {
             return .init(profileID: nil, diagnostics: [.init(.unreadableProfile, artifact: "profile")])
@@ -149,36 +189,108 @@ public enum OfflineProtocolProfileVerifier {
             return .init(profileID: nil, diagnostics: [.init(.unreadableProfile, artifact: "profile")])
         }
 
-        let artifactPins: ArtifactPins
+        let identity: ProfileIdentity
         do {
-            artifactPins = try JSONDecoder().decode(ArtifactPins.self, from: profileData)
+            identity = try JSONDecoder().decode(ProfileIdentity.self, from: profileData)
         } catch {
             return .init(profileID: nil, diagnostics: [.init(.malformedProfile, artifact: "profile")])
         }
+        switch identity.id {
+        case stableProfileID:
+            return verifyPermissioned(profileData, profileURL: profileURL, sourceRoot: sourceRoot)
+        case publicProfileID:
+            return verifyPublic(profileData, profileURL: profileURL, sourceRoot: sourceRoot)
+        default:
+            return .init(
+                profileID: identity.id,
+                diagnostics: [.init(.unsupportedProfileID, artifact: "profile")]
+            )
+        }
+    }
 
-        if artifactPins.id != stableProfileID {
-            diagnostics.append(.init(.unsupportedProfileID, artifact: "profile"))
+    /// Verifies the selected source bytes for the public profile without
+    /// widening `ProtocolProfile`, which intentionally models proposal 0016.
+    public static func verifyPinnedPublicLexicons(
+        profileURL: URL,
+        referenceRoot: URL
+    ) throws {
+        let data = try Data(contentsOf: profileURL)
+        let pins = try JSONDecoder().decode(PublicArtifactPins.self, from: data)
+        guard hasExpectedPublicPins(pins),
+              let manifestName = pins.lexiconManifest,
+              let manifestChecksum = pins.lexiconManifestSHA256 else {
+            throw ProtocolProfileVerificationDiagnostic(.immutableProfilePinMismatch, artifact: "profile")
+        }
+        let manifestURL = profileURL.deletingLastPathComponent().appending(path: manifestName)
+        guard !isSymbolicLink(manifestURL) else {
+            throw ProtocolProfileVerificationDiagnostic(.unreadableLexiconManifest, artifact: "lexicon manifest")
+        }
+        let manifestData = try Data(contentsOf: manifestURL)
+        guard Hex.encode(SHA256.hash(data: manifestData)) == manifestChecksum,
+              let text = String(data: manifestData, encoding: .utf8),
+              let entries = parseManifest(
+                  text,
+                  kind: .lexicon,
+                  expectedSourcePrefix: "com/atproto/"
+              ),
+              entries.count == 14 else {
+            throw ProtocolProfileVerificationDiagnostic(.malformedLexiconManifest, artifact: "lexicon manifest")
+        }
+        for entry in entries {
+            let source = referenceRoot.appending(path: "lexicons/\(entry.path)")
+            guard !isSymbolicLink(source),
+                  let bytes = try? Data(contentsOf: source),
+                  Hex.encode(SHA256.hash(data: bytes)) == entry.checksum else {
+                throw ProtocolProfileVerificationDiagnostic(.malformedLexiconManifest, artifact: "lexicon source")
+            }
+        }
+    }
+
+    private static func verifyPermissioned(
+        _ profileData: Data,
+        profileURL: URL,
+        sourceRoot: URL?
+    ) -> ProtocolProfileVerificationReport {
+        var diagnostics: [ProtocolProfileVerificationDiagnostic] = []
+        let pins: ArtifactPins
+        do {
+            pins = try JSONDecoder().decode(ArtifactPins.self, from: profileData)
+        } catch {
+            return .init(profileID: stableProfileID, diagnostics: [.init(.malformedProfile, artifact: "profile")])
+        }
+        let expectedKeys: Set<String> = [
+            "id", "proposalCommit", "referenceImplementationCommit", "petrelGeneratorCommit",
+            "petrelCommit", "migrationCompatibility", "crypto",
+            "permissionedDataIsEncrypted", "oplogRetention", "referenceArchiveSHA256",
+            "lexiconManifest", "lexiconManifestSHA256", "generatedWireManifest",
+            "generatedWireManifestSHA256", "intentionalDivergences",
+            "compatibilityExceptions", "endpoints",
+        ]
+        let actualKeys = ((try? JSONSerialization.jsonObject(with: profileData)) as? [String: Any])
+            .map { Set($0.keys) }
+        if actualKeys != expectedKeys {
+            diagnostics.append(.init(.malformedProfile, artifact: "profile"))
         }
         for revision in [
-            artifactPins.proposalCommit,
-            artifactPins.referenceImplementationCommit,
-            artifactPins.petrelGeneratorCommit,
-            artifactPins.petrelCommit,
+            pins.proposalCommit,
+            pins.referenceImplementationCommit,
+            pins.petrelGeneratorCommit,
+            pins.petrelCommit,
         ] where !isLowercaseHex(revision, count: 40) {
             diagnostics.append(.init(.invalidRevisionPin, artifact: "profile"))
             break
         }
-        if let archiveChecksum = artifactPins.referenceArchiveSHA256 {
+        if let archiveChecksum = pins.referenceArchiveSHA256 {
             if !isLowercaseHex(archiveChecksum, count: 64) {
                 diagnostics.append(.init(.invalidChecksumPin, artifact: "reference archive"))
             }
         } else {
             diagnostics.append(.init(.missingArtifactPin, artifact: "reference archive"))
         }
-        if artifactPins.endpoints.isEmpty || Set(artifactPins.endpoints).count != artifactPins.endpoints.count {
+        if pins.endpoints.isEmpty || Set(pins.endpoints).count != pins.endpoints.count {
             diagnostics.append(.init(.malformedProfile, artifact: "profile"))
         }
-        if !hasExpectedImmutablePins(artifactPins) {
+        if !hasExpectedImmutablePins(pins) {
             diagnostics.append(.init(.immutableProfilePinMismatch, artifact: "profile"))
         }
         do {
@@ -189,29 +301,94 @@ public enum OfflineProtocolProfileVerifier {
 
         let expectedLexiconManifest = "\(stableProfileID).lexicons.sha256"
         verifyManifest(
-            name: artifactPins.lexiconManifest,
-            checksum: artifactPins.lexiconManifestSHA256,
+            name: pins.lexiconManifest,
+            checksum: pins.lexiconManifestSHA256,
             expectedName: expectedLexiconManifest,
             profileDirectory: profileURL.deletingLastPathComponent(),
             sourceRoot: nil,
             kind: .lexicon,
+            expectedSourcePrefix: "com/atproto/",
+            generatedTargetRoot: nil,
             diagnostics: &diagnostics
         )
 
         let expectedWireManifest = "\(stableProfileID).generated-wire.sha256"
         verifyManifest(
-            name: artifactPins.generatedWireManifest,
-            checksum: artifactPins.generatedWireManifestSHA256,
+            name: pins.generatedWireManifest,
+            checksum: pins.generatedWireManifestSHA256,
             expectedName: expectedWireManifest,
             profileDirectory: profileURL.deletingLastPathComponent(),
             sourceRoot: sourceRoot ?? profileURL
                 .deletingLastPathComponent()
                 .deletingLastPathComponent(),
             kind: .generatedWire,
+            expectedSourcePrefix: "Sources/SwanSpacesWire/",
+            generatedTargetRoot: "Sources/SwanSpacesWire",
             diagnostics: &diagnostics
         )
 
-        return .init(profileID: artifactPins.id, diagnostics: diagnostics)
+        return .init(profileID: pins.id, diagnostics: diagnostics)
+    }
+
+    private static func verifyPublic(
+        _ profileData: Data,
+        profileURL: URL,
+        sourceRoot: URL?
+    ) -> ProtocolProfileVerificationReport {
+        var diagnostics: [ProtocolProfileVerificationDiagnostic] = []
+        let pins: PublicArtifactPins
+        do {
+            pins = try JSONDecoder().decode(PublicArtifactPins.self, from: profileData)
+        } catch {
+            return .init(profileID: publicProfileID, diagnostics: [.init(.malformedProfile, artifact: "profile")])
+        }
+        let expectedKeys: Set<String> = [
+            "id", "referenceImplementationCommit", "petrelGeneratorCommit", "petrelCommit",
+            "referenceArchiveSHA256", "lexiconManifest", "lexiconManifestSHA256",
+            "generatedWireManifest", "generatedWireManifestSHA256",
+            "intentionalDivergences", "endpoints",
+        ]
+        let actualKeys = ((try? JSONSerialization.jsonObject(with: profileData)) as? [String: Any])
+            .map { Set($0.keys) }
+        if actualKeys != expectedKeys {
+            diagnostics.append(.init(.malformedProfile, artifact: "profile"))
+        }
+        if ![
+            pins.referenceImplementationCommit,
+            pins.petrelGeneratorCommit,
+            pins.petrelCommit,
+        ].allSatisfy({ isLowercaseHex($0, count: 40) }) {
+            diagnostics.append(.init(.invalidRevisionPin, artifact: "profile"))
+        }
+        if pins.referenceArchiveSHA256.map({ !isLowercaseHex($0, count: 64) }) ?? true {
+            diagnostics.append(.init(.invalidChecksumPin, artifact: "reference archive"))
+        }
+        if !hasExpectedPublicPins(pins) {
+            diagnostics.append(.init(.immutableProfilePinMismatch, artifact: "profile"))
+        }
+        verifyManifest(
+            name: pins.lexiconManifest,
+            checksum: pins.lexiconManifestSHA256,
+            expectedName: "\(publicProfileID).lexicons.sha256",
+            profileDirectory: profileURL.deletingLastPathComponent(),
+            sourceRoot: nil,
+            kind: .lexicon,
+            expectedSourcePrefix: "com/atproto/",
+            generatedTargetRoot: nil,
+            diagnostics: &diagnostics
+        )
+        verifyManifest(
+            name: pins.generatedWireManifest,
+            checksum: pins.generatedWireManifestSHA256,
+            expectedName: "\(publicProfileID).generated-wire.sha256",
+            profileDirectory: profileURL.deletingLastPathComponent(),
+            sourceRoot: sourceRoot ?? profileURL.deletingLastPathComponent().deletingLastPathComponent(),
+            kind: .generatedWire,
+            expectedSourcePrefix: "Sources/SwanPublicWire/",
+            generatedTargetRoot: "Sources/SwanPublicWire",
+            diagnostics: &diagnostics
+        )
+        return .init(profileID: pins.id, diagnostics: diagnostics)
     }
 
     private enum ManifestKind: Equatable {
@@ -226,6 +403,8 @@ public enum OfflineProtocolProfileVerifier {
         profileDirectory: URL,
         sourceRoot: URL?,
         kind: ManifestKind,
+        expectedSourcePrefix: String,
+        generatedTargetRoot: String?,
         diagnostics: inout [ProtocolProfileVerificationDiagnostic]
     ) {
         let artifact = kind == .lexicon ? "lexicon manifest" : "generated wire manifest"
@@ -269,7 +448,11 @@ public enum OfflineProtocolProfileVerifier {
             return
         }
         guard let manifestText = String(data: manifestData, encoding: .utf8),
-              let entries = parseManifest(manifestText, kind: kind) else {
+              let entries = parseManifest(
+                  manifestText,
+                  kind: kind,
+                  expectedSourcePrefix: expectedSourcePrefix
+              ) else {
             diagnostics.append(.init(
                 kind == .lexicon ? .malformedLexiconManifest : .malformedGeneratedWireManifest,
                 artifact: artifact
@@ -278,10 +461,23 @@ public enum OfflineProtocolProfileVerifier {
         }
 
         guard kind == .generatedWire, let sourceRoot else { return }
-        verifyGeneratedWireSources(entries, sourceRoot: sourceRoot, diagnostics: &diagnostics)
+        guard let generatedTargetRoot else {
+            diagnostics.append(.init(.malformedGeneratedWireManifest, artifact: artifact))
+            return
+        }
+        verifyGeneratedWireSources(
+            entries,
+            sourceRoot: sourceRoot,
+            generatedTargetRoot: generatedTargetRoot,
+            diagnostics: &diagnostics
+        )
     }
 
-    private static func parseManifest(_ text: String, kind: ManifestKind) -> [ManifestEntry]? {
+    private static func parseManifest(
+        _ text: String,
+        kind: ManifestKind,
+        expectedSourcePrefix: String
+    ) -> [ManifestEntry]? {
         guard text.unicodeScalars.allSatisfy({ $0.value != 13 }) else { return nil }
         let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
         guard !lines.isEmpty else { return nil }
@@ -292,9 +488,8 @@ public enum OfflineProtocolProfileVerifier {
             guard fields.count == 3, fields[1].isEmpty,
                   isLowercaseHex(String(fields[0]), count: 64) else { return nil }
             let path = String(fields[2])
-            let expectedPrefix = kind == .lexicon ? "com/atproto/" : "Sources/SwanSpacesWire/"
             let expectedSuffix = kind == .lexicon ? ".json" : ".swift"
-            guard path.hasPrefix(expectedPrefix), path.hasSuffix(expectedSuffix),
+            guard path.hasPrefix(expectedSourcePrefix), path.hasSuffix(expectedSuffix),
                   isSafeRelativePath(path), paths.insert(path).inserted else { return nil }
             entries.append(.init(checksum: String(fields[0]), path: path))
         }
@@ -305,6 +500,7 @@ public enum OfflineProtocolProfileVerifier {
     private static func verifyGeneratedWireSources(
         _ entries: [ManifestEntry],
         sourceRoot: URL,
+        generatedTargetRoot: String,
         diagnostics: inout [ProtocolProfileVerificationDiagnostic]
     ) {
         let canonicalRoot = sourceRoot.resolvingSymlinksInPath().standardizedFileURL
@@ -337,7 +533,7 @@ public enum OfflineProtocolProfileVerifier {
             }
         }
 
-        let wireRoot = canonicalRoot.appending(path: "Sources/SwanSpacesWire", directoryHint: .isDirectory)
+        let wireRoot = canonicalRoot.appending(path: generatedTargetRoot, directoryHint: .isDirectory)
         if let enumerator = FileManager.default.enumerator(
             at: wireRoot,
             includingPropertiesForKeys: [.isRegularFileKey],
@@ -406,6 +602,23 @@ public enum OfflineProtocolProfileVerifier {
             pins.generatedWireManifest == "\(stableProfileID).generated-wire.sha256" &&
             pins.generatedWireManifestSHA256 == expectedGeneratedWireManifestSHA256 &&
             pins.endpoints == expectedEndpoints
+    }
+
+    private static func hasExpectedPublicPins(_ pins: PublicArtifactPins) -> Bool {
+        pins.id == publicProfileID &&
+            pins.referenceImplementationCommit == expectedReferenceImplementationCommit &&
+            pins.petrelGeneratorCommit == expectedPetrelGeneratorCommit &&
+            pins.petrelCommit == expectedPetrelCommit &&
+            pins.referenceArchiveSHA256 == expectedReferenceArchiveSHA256 &&
+            pins.lexiconManifest == "\(publicProfileID).lexicons.sha256" &&
+            pins.lexiconManifestSHA256 == expectedPublicLexiconManifestSHA256 &&
+            pins.generatedWireManifest == "\(publicProfileID).generated-wire.sha256" &&
+            pins.generatedWireManifestSHA256 == expectedPublicGeneratedWireManifestSHA256 &&
+            pins.endpoints == expectedPublicEndpoints &&
+            pins.intentionalDivergences.count == 1 &&
+            pins.intentionalDivergences.first?.endpoint == "com.atproto.sync.getRepo" &&
+            !(pins.intentionalDivergences.first?.referenceBehavior.isEmpty ?? true) &&
+            !(pins.intentionalDivergences.first?.swanBehavior.isEmpty ?? true)
     }
 }
 

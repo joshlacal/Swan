@@ -1638,10 +1638,17 @@ extension SwanCommand {
                 throw ValidationError("offline protocol profile verification failed")
             }
             if let referenceDirectory {
-                try ProtocolProfile.verifyPinnedLexicons(
-                    profileURL: profileURL,
-                    referenceRoot: URL(fileURLWithPath: referenceDirectory)
-                )
+                if profileID == OfflineProtocolProfileVerifier.publicProfileID {
+                    try OfflineProtocolProfileVerifier.verifyPinnedPublicLexicons(
+                        profileURL: profileURL,
+                        referenceRoot: URL(fileURLWithPath: referenceDirectory)
+                    )
+                } else {
+                    try ProtocolProfile.verifyPinnedLexicons(
+                        profileURL: profileURL,
+                        referenceRoot: URL(fileURLWithPath: referenceDirectory)
+                    )
+                }
             }
             let suffix = referenceDirectory == nil
                 ? "offline artifacts verified"

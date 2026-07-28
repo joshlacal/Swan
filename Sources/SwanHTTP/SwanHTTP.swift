@@ -6,6 +6,7 @@ import ServiceLifecycle
 import SwanAccounts
 import SwanCore
 import SwanOAuth
+import SwanPublicWire
 import SwanSpaces
 import SwanSpacesWire
 import SwanStorage
@@ -729,6 +730,16 @@ public struct SwanHTTPServer: Sendable {
         // rather than being mistaken for its method-correct 503 gate.
         registerUnknownPermissionedEndpointGuards(on: router)
 
+        // Public repository/sync stays a finite, separately generated surface.
+        // P1 deliberately installs only method-correct unavailable gates; no
+        // public route receives permissioned repositories or credential
+        // readers, and streaming endpoints never invoke Data-shaped generated
+        // handlers.
+        for descriptor in PublicDataTesting20260727.methods {
+            registerUnavailablePublicEndpoint(descriptor, on: router)
+        }
+        registerUnknownPublicEndpointGuards(on: router)
+
         return router
     }
 
@@ -881,7 +892,7 @@ private func permissionedDataUnavailable() -> Response {
     jsonResponseWithStatus(.serviceUnavailable, body: ["error": "permissioned_data_pending"])
 }
 
-private func jsonResponseWithStatus(_ status: HTTPResponse.Status, body: some Encodable) -> Response {
+func jsonResponseWithStatus(_ status: HTTPResponse.Status, body: some Encodable) -> Response {
     let encoder = JSONEncoder()
     let data = (try? encoder.encode(body)) ?? Data("{}".utf8)
     return Response(status: status, headers: [.contentType: "application/json", .cacheControl: "no-store"], body: .init(byteBuffer: ByteBuffer(data: data)))

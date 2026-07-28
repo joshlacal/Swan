@@ -1,0 +1,16 @@
+{
+  "package": {
+    "name": "SwanPublicWire",
+    "kind": "overlay",
+    "core_namespace_roots": []
+  },
+  "lexicons": {
+    "emit": ["PUBLIC_STAGED_LEXICONS/com/atproto/repo", "PUBLIC_STAGED_LEXICONS/com/atproto/sync"],
+    "reference": ["PUBLIC_REFERENCE_LEXICONS"],
+    "exclude_namespaces": ["tools.ozone"]
+  },
+  "swift": {
+    "output": "PUBLIC_GENERATED_OUTPUT",
+    "emit_server_contracts": true
+  }
+}

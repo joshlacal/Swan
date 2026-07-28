@@ -7,6 +7,7 @@ import NIOCore
 @testable import SwanCore
 @testable import SwanHTTP
 import SwanOAuth
+import SwanPublicWire
 import SwanSpacesWire
 import SwanSQLite
 import SwanStorage
@@ -68,6 +69,57 @@ final class SwanHTTPTests: XCTestCase {
                     "/xrpc/com.atproto.simplespace.unpinnedMethod",
                 ] {
                     for method in methods {
+                        try await client.execute(uri: path, method: method) { response in
+                            XCTAssertEqual(response.status, .notFound, "\(method.rawValue) \(path)")
+                        }
+                    }
+                }
+            }
+            try await controlDatabase.close()
+        } catch {
+            try? await controlDatabase.close()
+            throw error
+        }
+    }
+
+    func testEveryPinnedPublicEndpointIsMethodCorrectAndFailClosed() async throws {
+        let profile = try loadPinnedProfile()
+        let (server, controlDatabase, root) = try await makeServer(profile: profile)
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let app = server.buildApplication(logger: Logger(label: "SwanPublicHTTPTests"))
+            try await app.test(.router) { client in
+                for descriptor in PublicDataTesting20260727.methods {
+                    let path = "/xrpc/\(descriptor.nsid)"
+                    let method: HTTPRequest.Method = descriptor.kind == .query ? .get : .post
+                    try await client.execute(uri: path, method: method) { response in
+                        XCTAssertEqual(response.status, .serviceUnavailable, "\(method.rawValue) \(path)")
+                    }
+                    let wrongMethod: HTTPRequest.Method = method == .get ? .post : .get
+                    try await client.execute(uri: path, method: wrongMethod) { response in
+                        XCTAssertEqual(response.status, .notFound, "\(wrongMethod.rawValue) \(path)")
+                    }
+                }
+            }
+            try await controlDatabase.close()
+        } catch {
+            try? await controlDatabase.close()
+            throw error
+        }
+    }
+
+    func testUnknownPublicRepositoryAndSyncMethodsRemainClosed() async throws {
+        let profile = try loadPinnedProfile()
+        let (server, controlDatabase, root) = try await makeServer(profile: profile)
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let app = server.buildApplication(logger: Logger(label: "SwanPublicHTTPTests"))
+            try await app.test(.router) { client in
+                for path in [
+                    "/xrpc/com.atproto.repo.unpinnedMethod",
+                    "/xrpc/com.atproto.sync.unpinnedMethod",
+                ] {
+                    for method: HTTPRequest.Method in [.get, .post, .put, .delete, .options] {
                         try await client.execute(uri: path, method: method) { response in
                             XCTAssertEqual(response.status, .notFound, "\(method.rawValue) \(path)")
                         }

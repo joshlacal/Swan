@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "SwanCore", targets: ["SwanCore"]),
         .library(name: "SwanSpacesWire", targets: ["SwanSpacesWire"]),
+        .library(name: "SwanPublicWire", targets: ["SwanPublicWire"]),
         .library(name: "SwanPublicRepository", targets: ["SwanPublicRepository"]),
         .library(name: "SwanSpaces", targets: ["SwanSpaces"]),
         .library(name: "SwanStorage", targets: ["SwanStorage"]),
@@ -77,6 +78,7 @@ let package = Package(
             ]
         ),
         .target(name: "SwanSpacesWire", dependencies: ["SwanCore", .product(name: "Petrel", package: "Petrel")]),
+        .target(name: "SwanPublicWire", dependencies: ["SwanCore", .product(name: "Petrel", package: "Petrel")]),
         .target(
             name: "SwanPublicRepository",
             dependencies: [
@@ -147,7 +149,7 @@ let package = Package(
         .target(
             name: "SwanHTTP",
             dependencies: [
-                "SwanAccounts", "SwanCore", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth", "SwanSQLite",
+                "SwanAccounts", "SwanCore", "SwanPublicWire", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth", "SwanSQLite",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "Petrel", package: "Petrel"),
                 .product(name: "Logging", package: "swift-log"),
@@ -240,7 +242,7 @@ let package = Package(
         .testTarget(
             name: "SwanHTTPTests",
             dependencies: [
-                "swan", "SwanAccounts", "SwanHTTP", "SwanOAuth", "SwanSQLite", "SwanSpacesWire",
+                "swan", "SwanAccounts", "SwanHTTP", "SwanOAuth", "SwanPublicWire", "SwanSQLite", "SwanSpacesWire",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
                 .product(name: "Logging", package: "swift-log"),
@@ -255,6 +257,13 @@ let package = Package(
             dependencies: [
                 "SwanInterop",
                 .product(name: "Crypto", package: "swift-crypto"),
+            ]
+        ),
+        .testTarget(
+            name: "SwanPublicWireTests",
+            dependencies: [
+                "SwanCore", "SwanPublicWire",
+                .product(name: "Petrel", package: "Petrel"),
             ]
         ),
         .testTarget(
