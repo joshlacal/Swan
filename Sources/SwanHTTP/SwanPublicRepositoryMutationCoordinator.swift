@@ -35,6 +35,40 @@ public struct PublicRepositoryMutationResult: Sendable, Equatable {
 /// Storage-facing public mutation orchestration. It deliberately accepts a
 /// mutation store and a key provider, never a database handle or private key.
 public enum SwanPublicRepositoryMutationCoordinator {
+    public static func applyBatch(
+        store: any PublicRepositoryMutationStore,
+        did: String,
+        batch: PublicRepositoryWriteBatch,
+        requestID: String,
+        bodyDigest: Data,
+        signerProvider: any PublicRepositoryMutationSignerProvider,
+        now: @Sendable () -> UInt64 = currentWallClockMicroseconds
+    ) async throws -> CommittedPublicRepositoryMutation {
+        var attempts = 0
+        let callerSuppliedSwap = batch.expectedCommitCID != nil
+        while true {
+            attempts += 1
+            guard let current = try await store.loadPublicRepositoryState() else { throw PublicRepositoryMutationCoordinatorError.repositoryNotFound }
+            let request = try PublicRepositoryMutationRequest(id: requestID, canonicalDigest: bodyDigest, baseCommitCID: current.commitCID)
+            switch try await store.reservePublicRepositoryRevision(request, wallClockMicroseconds: now()) {
+            case let .committed(committed): return committed
+            case let .reserved(reservation):
+                do {
+                    let prepared = try await PublicRepositoryEngine.apply(
+                        repositoryDID: did, currentState: current, blocks: store,
+                        revision: reservation.nextRevision, batch: batch,
+                        signer: try await signerProvider.signer(for: did)
+                    )
+                    return try await store.applyPublicRepositoryMutation(reservation: reservation, prepared: prepared)
+                } catch let error as PublicRepositoryMutationStoreError where error == .commitCASConflict && !callerSuppliedSwap && attempts < 2 {
+                    continue
+                } catch {
+                    throw map(error)
+                }
+            }
+        }
+    }
+
     public static func put(
         store: any PublicRepositoryMutationStore,
         did: String,

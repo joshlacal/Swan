@@ -22,6 +22,46 @@ private enum PublicMutationFailure: Error {
 private struct PublicMutationHandlers {
     let capability: SwanPublicRepositoryMutationCapability
 
+    func applyWrites(
+        _ input: SwanPublicWire.ComAtprotoRepoApplyWrites.Input,
+        bodyDigest: Data,
+        request: Request
+    ) async throws -> SwanPublicWire.ComAtprotoRepoApplyWrites.Output {
+        let target = try await authorizedTarget(selector: input.repo.stringValue(), request: request, method: "POST", path: "/xrpc/com.atproto.repo.applyWrites")
+        var writes: [PublicRepositoryWrite] = []
+        for union in input.writes {
+            switch union {
+            case let .comAtprotoRepoApplyWritesCreate(value):
+                let rkey: RecordKey
+                if let supplied = value.rkey { rkey = supplied }
+                else { rkey = try RecordKey(keyString: try await capability.tidAllocator.next().toString()) }
+                let path = try PublicRepositoryPath(collection: value.collection.nsidString(), recordKey: rkey.value)
+                writes.append(.create(path: path, record: try PublicRepositoryRecordCodec.publicRecord(from: value.value, collection: path.collection)))
+            case let .comAtprotoRepoApplyWritesUpdate(value):
+                let path = try PublicRepositoryPath(collection: value.collection.nsidString(), recordKey: value.rkey.value)
+                writes.append(.update(path: path, record: try PublicRepositoryRecordCodec.publicRecord(from: value.value, collection: path.collection), expectedRecordCID: nil))
+            case let .comAtprotoRepoApplyWritesDelete(value):
+                writes.append(.delete(path: try PublicRepositoryPath(collection: value.collection.nsidString(), recordKey: value.rkey.value), expectedRecordCID: nil))
+            case .unexpected: throw PublicMutationFailure.invalidRequest
+            }
+        }
+        let committed = try await SwanPublicRepositoryMutationCoordinator.applyBatch(
+            store: target.store, did: target.did,
+            batch: try PublicRepositoryWriteBatch(writes: writes, expectedCommitCID: input.swapCommit),
+            requestID: UUID().uuidString, bodyDigest: bodyDigest,
+            signerProvider: capability.signerProvider
+        )
+        let results: [SwanPublicWire.ComAtprotoRepoApplyWrites.OutputResultsUnion] = committed.recordResults.map { result in
+            let uri = try! ATProtocolURI(uriString: "at://\(target.did)/\(result.path.mstKey)")
+            switch result.action {
+            case .create: return .comAtprotoRepoApplyWritesCreateResult(.init(uri: uri, cid: result.recordCID!, validationStatus: input.validate == nil ? nil : "valid"))
+            case .update: return .comAtprotoRepoApplyWritesUpdateResult(.init(uri: uri, cid: result.recordCID!, validationStatus: input.validate == nil ? nil : "valid"))
+            case .delete: return .comAtprotoRepoApplyWritesDeleteResult(.init())
+            }
+        }
+        return .init(commit: .init(cid: committed.state.commitCID, rev: try TID(tidString: committed.state.revision)), results: results)
+    }
+
     func create(
         _ input: SwanPublicWire.ComAtprotoRepoCreateRecord.Input,
         bodyDigest: Data,
@@ -157,6 +197,7 @@ func registerPublicRepositoryMutationEndpoints(
     let handlers = PublicMutationHandlers(capability: capability)
     let putPath: RouterPath = "/xrpc/com.atproto.repo.putRecord"
     let createPath: RouterPath = "/xrpc/com.atproto.repo.createRecord"
+    let applyPath: RouterPath = "/xrpc/com.atproto.repo.applyWrites"
     let deletePath: RouterPath = "/xrpc/com.atproto.repo.deleteRecord"
     router.post(putPath) { request, _ async -> Response in
         do {
@@ -186,6 +227,14 @@ func registerPublicRepositoryMutationEndpoints(
             return publicMutationError(.badRequest, "InvalidRequest")
         }
     }
+    router.post(applyPath) { request, _ async -> Response in
+        do {
+            let (input, digest) = try await publicMutationInput(request, as: SwanPublicWire.ComAtprotoRepoApplyWrites.Input.self)
+            return publicMutationJSON(.ok, try await handlers.applyWrites(input, bodyDigest: digest, request: request))
+        } catch let failure as PublicMutationFailure { return publicMutationResponse(failure, authorizer: capability.authorizer) }
+        catch let failure as PublicRepositoryMutationCoordinatorError { return publicMutationResponse(failure) }
+        catch { return publicMutationError(.badRequest, "InvalidRequest") }
+    }
     router.post(deletePath) { request, _ async -> Response in
         do {
             let (input, digest) = try await publicMutationInput(
@@ -200,7 +249,7 @@ func registerPublicRepositoryMutationEndpoints(
             return publicMutationError(.badRequest, "InvalidRequest")
         }
     }
-    for path in [putPath, createPath, deletePath] {
+    for path in [putPath, createPath, applyPath, deletePath] {
         for method: HTTPRequest.Method in [.get, .head, .put, .patch, .delete, .options, .connect, .trace] {
             router.on(path, method: method) { _, _ in publicMutationError(.notFound, "public_endpoint_unavailable") }
         }
