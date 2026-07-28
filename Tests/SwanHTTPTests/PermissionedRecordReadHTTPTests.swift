@@ -514,6 +514,108 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testValidateTrueMatchesPinnedSpaceWriteParityWithoutWeakeningAtomicity() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let app = try makeServer(fixture).buildApplication(
+                logger: Logger(label: "PermissionedRecordWriteValidateTrueTests")
+            )
+            let schemaInvalidRecord = #"{"$type":"app.bsky.feed.post","text":7}"#
+            let createdRKey = "validate-created"
+            let batchRKey = "validate-batch"
+            try await app.test(.router) { client in
+                let create = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","collection":"\#(Self.collection)","rkey":"\#(createdRKey)","validate":true,"record":\#(schemaInvalidRecord)}"#
+                try await client.execute(
+                    uri: Self.createPath,
+                    method: .post,
+                    headers: try self.writeHeaders(fixture, path: Self.createPath, jti: "validate-create"),
+                    body: ByteBuffer(string: create)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let body = try self.jsonObject(response.body)
+                    XCTAssertNil(body["validationStatus"])
+                }
+                try await client.execute(
+                    uri: self.getURI(fixture, collection: Self.collection, rkey: createdRKey),
+                    method: .get,
+                    headers: try self.signedHeaders(fixture, subject: Self.alice, path: Self.getPath, jti: "validate-create-read")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let value = try XCTUnwrap((try self.jsonObject(response.body))["value"] as? [String: Any])
+                    XCTAssertEqual(value["$type"] as? String, "app.bsky.feed.post")
+                    XCTAssertEqual(value["text"] as? Int, 7)
+                }
+
+                let put = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","collection":"\#(Self.collection)","rkey":"\#(createdRKey)","validate":true,"record":{"$type":"app.bsky.feed.post","text":8}}"#
+                try await client.execute(
+                    uri: Self.putPath,
+                    method: .post,
+                    headers: try self.writeHeaders(fixture, path: Self.putPath, jti: "validate-put"),
+                    body: ByteBuffer(string: put)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertNil((try self.jsonObject(response.body))["validationStatus"])
+                }
+                try await client.execute(
+                    uri: self.getURI(fixture, collection: Self.collection, rkey: createdRKey),
+                    method: .get,
+                    headers: try self.signedHeaders(fixture, subject: Self.alice, path: Self.getPath, jti: "validate-put-read")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(((try self.jsonObject(response.body))["value"] as? [String: Any])?["text"] as? Int, 8)
+                }
+
+                let apply = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","validate":true,"writes":[{"$type":"com.atproto.space.applyWrites#create","collection":"\#(Self.collection)","rkey":"\#(batchRKey)","value":{"$type":"app.bsky.feed.post","text":9}},{"$type":"com.atproto.space.applyWrites#update","collection":"\#(Self.collection)","rkey":"\#(batchRKey)","value":{"$type":"app.bsky.feed.post","text":10}}]}"#
+                try await client.execute(
+                    uri: Self.applyPath,
+                    method: .post,
+                    headers: try self.writeHeaders(fixture, path: Self.applyPath, jti: "validate-apply"),
+                    body: ByteBuffer(string: apply)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let results = try XCTUnwrap((try self.jsonObject(response.body))["results"] as? [[String: Any]])
+                    XCTAssertEqual(results.map { $0["$type"] as? String }, [
+                        "com.atproto.space.applyWrites#createResult",
+                        "com.atproto.space.applyWrites#updateResult",
+                    ])
+                    XCTAssertTrue(results.allSatisfy { $0["validationStatus"] == nil })
+                }
+                try await client.execute(
+                    uri: self.getURI(fixture, collection: Self.collection, rkey: batchRKey),
+                    method: .get,
+                    headers: try self.signedHeaders(fixture, subject: Self.alice, path: Self.getPath, jti: "validate-apply-read")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(((try self.jsonObject(response.body))["value"] as? [String: Any])?["text"] as? Int, 10)
+                }
+
+                let atomicFailure = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","validate":true,"writes":[{"$type":"com.atproto.space.applyWrites#create","collection":"\#(Self.collection)","rkey":"validate-must-not-appear","value":\#(schemaInvalidRecord)},{"$type":"com.atproto.space.applyWrites#update","collection":"\#(Self.collection)","rkey":"validate-missing","value":\#(schemaInvalidRecord)}]}"#
+                try await client.execute(
+                    uri: Self.applyPath,
+                    method: .post,
+                    headers: try self.writeHeaders(fixture, path: Self.applyPath, jti: "validate-atomic"),
+                    body: ByteBuffer(string: atomicFailure)
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                }
+                try await client.execute(
+                    uri: self.getURI(fixture, collection: Self.collection, rkey: "validate-must-not-appear"),
+                    method: .get,
+                    headers: try self.signedHeaders(fixture, subject: Self.alice, path: Self.getPath, jti: "validate-atomic-read")
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(try self.errorCode(response.body), "RecordNotFound")
+                }
+            }
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
     func testOmittedApplyWriteRKeysRemainUniquePastPetrelCounterRange() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }

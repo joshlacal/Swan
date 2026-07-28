@@ -683,7 +683,6 @@ private struct AuthenticatedCreateRecordHandler: ComAtprotoSpaceCreateRecord.Ser
     let capability: SwanAuthenticatedSpaceRecordsCapability
 
     func handle(parameters: Void, input: ComAtprotoSpaceCreateRecord.Input, context request: Request) async throws -> ComAtprotoSpaceCreateRecord.Output {
-        guard input.validate != true else { throw AuthenticatedSpaceWriteFailure.invalidRequest }
         let rkey = if let supplied = input.rkey {
             supplied
         } else {
@@ -720,7 +719,6 @@ private struct AuthenticatedPutRecordHandler: ComAtprotoSpacePutRecord.ServerHan
     let capability: SwanAuthenticatedSpaceRecordsCapability
 
     func handle(parameters: Void, input: ComAtprotoSpacePutRecord.Input, context request: Request) async throws -> ComAtprotoSpacePutRecord.Output {
-        guard input.validate != true else { throw AuthenticatedSpaceWriteFailure.invalidRequest }
         let uri = try makeWriteURI(space: input.space, repo: input.repo, collection: input.collection, rkey: input.rkey)
         let value = try canonicalRecordValue(input.record)
         let authorization = try await authorizeWrite(
@@ -770,8 +768,7 @@ private struct AuthenticatedApplyWritesHandler: ComAtprotoSpaceApplyWrites.Serve
     let capability: SwanAuthenticatedSpaceRecordsCapability
 
     func handle(parameters: Void, input: ComAtprotoSpaceApplyWrites.Input, context request: Request) async throws -> ComAtprotoSpaceApplyWrites.Output {
-        guard input.validate != true,
-              !input.writes.isEmpty,
+        guard !input.writes.isEmpty,
               input.writes.count <= authenticatedSpaceWriteMaximumOperations
         else { throw AuthenticatedSpaceWriteFailure.invalidRequest }
         let space: SpaceURI
