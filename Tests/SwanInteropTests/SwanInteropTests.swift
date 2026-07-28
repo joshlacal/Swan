@@ -342,6 +342,32 @@ final class SwanInteropTests: XCTestCase {
         )
     }
 
+    func testLiveFixtureRecordingStripsSelectorsAndKeepsOnlyResponseDigests() async throws {
+        let recorder = InteropFixtureRecorder()
+        let response = InteropHTTPResponse(
+            status: 200,
+            headers: ["content-type": "application/json"],
+            body: Data(#"{"cid":"bafkreigh2akiscaildc3"}"#.utf8),
+            finalURL: URL(string: "https://swan.example")!,
+            redirectCount: 0
+        )
+        await recorder.record(
+            host: "swan",
+            method: "GET",
+            path: "/xrpc/com.atproto.repo.getRecord?repo=did%3Aplc%3Aalice&collection=app.bsky.feed.post&rkey=secret",
+            requestBody: Data(#"{"password":"never-record"}"#.utf8),
+            response: response
+        )
+        let events = await recorder.snapshot()
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events[0].path, "/xrpc/com.atproto.repo.getRecord?keys=collection,repo,rkey")
+        XCTAssertEqual(events[0].requestBytes, 27)
+        XCTAssertEqual(events[0].responseBytes, response.body.count)
+        XCTAssertFalse(events[0].path.contains("alice"))
+        XCTAssertFalse(events[0].path.contains("secret"))
+        XCTAssertFalse(events[0].responseSHA256.isEmpty)
+    }
+
     func testDuplicatedFaultModeProbesEachEndpointTwice() async throws {
         let runtime = InteropScenarioRunner.RuntimeConfiguration(
             swanBaseURL: URL(string: "https://127.0.0.1:1")!,

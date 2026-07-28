@@ -483,7 +483,7 @@ public actor InteropFixtureRecorder {
             InteropFixtureEvent(
                 host: host,
                 method: method,
-                path: path,
+                path: FixtureSanitizer.path(path),
                 status: response.status,
                 requestBytes: requestBody?.count ?? 0,
                 responseBytes: response.body.count,
@@ -501,6 +501,246 @@ public actor InteropFixtureRecorder {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         try encoder.encode(events).write(to: url, options: .atomic)
+    }
+}
+
+/// A host plus its already-established authorization. Tokens and DPoP proofs
+/// stay in this value only for the duration of a live run; artifacts contain
+/// endpoint labels, statuses, sizes, and digests instead.
+public struct LiveInteropHost: Sendable {
+    public let label: String
+    public let client: InteropXRPCClient
+    public let authorization: InteropAuthorization
+
+    public init(
+        label: String,
+        client: InteropXRPCClient,
+        authorization: InteropAuthorization = .none
+    ) {
+        self.label = label
+        self.client = client
+        self.authorization = authorization
+    }
+}
+
+public struct LiveInteropPublicRoundTripArtifact: Codable, Sendable, Equatable {
+    public let scenario: String
+    public let profileID: String
+    public let producer: String
+    public let consumer: String
+    public let putStatus: Int?
+    public let readStatus: Int?
+    public let putCID: String?
+    public let readCID: String?
+    public let putResponseSHA256: String?
+    public let readResponseSHA256: String?
+    public let converged: Bool
+    public let status: String
+    public let errorCode: String?
+    public let fixturePolicy: String
+    public let events: [InteropFixtureEvent]
+
+    public init(
+        scenario: String,
+        producer: String,
+        consumer: String,
+        putStatus: Int?,
+        readStatus: Int?,
+        putCID: String?,
+        readCID: String?,
+        putResponseSHA256: String?,
+        readResponseSHA256: String?,
+        converged: Bool,
+        status: String,
+        errorCode: String?,
+        events: [InteropFixtureEvent]
+    ) {
+        self.scenario = FixtureSanitizer.sanitize(["scenario": scenario])["scenario"] ?? "<redacted>"
+        self.profileID = OfflineProtocolProfileVerifier.stableProfileID
+        self.producer = FixtureSanitizer.sanitize(["host": producer])["host"] ?? "<redacted>"
+        self.consumer = FixtureSanitizer.sanitize(["host": consumer])["host"] ?? "<redacted>"
+        self.putStatus = putStatus
+        self.readStatus = readStatus
+        self.putCID = putCID
+        self.readCID = readCID
+        self.putResponseSHA256 = putResponseSHA256
+        self.readResponseSHA256 = readResponseSHA256
+        self.converged = converged
+        self.status = status
+        self.errorCode = errorCode.map { FixtureSanitizer.sanitize(["error": $0])["error"] ?? "<redacted>" }
+        self.fixturePolicy = "semantic-summary-only; no request bodies, record values, credentials, tokens, DPoP proofs, or personal selectors"
+        self.events = events
+    }
+}
+
+/// Stateful public-data interop that proves a write response and a subsequent
+/// read response agree on the record CID. It is intentionally separate from
+/// the older endpoint-probe runner: a probe can be useful diagnostically, but
+/// this runner reports failure when data semantics do not converge.
+public enum LiveInteropRunner {
+    private struct RecordResponse: Decodable {
+        let cid: String?
+    }
+
+    public static func publicPutAndRead(
+        scenario: String,
+        producer: LiveInteropHost,
+        consumer: LiveInteropHost,
+        repository: String,
+        collection: String,
+        rkey: String,
+        putBody: Data,
+        recorder: InteropFixtureRecorder? = nil
+    ) async -> LiveInteropPublicRoundTripArtifact {
+        let recorder = recorder ?? InteropFixtureRecorder()
+        let putPath = "/xrpc/com.atproto.repo.putRecord"
+        let getPath = "/xrpc/com.atproto.repo.getRecord"
+        var putStatus: Int?
+        var readStatus: Int?
+        var putCID: String?
+        var readCID: String?
+        var putDigest: String?
+        var readDigest: String?
+        var errorCode: String?
+
+        do {
+            let response = try await producer.client.procedure(
+                "com.atproto.repo.putRecord",
+                body: putBody,
+                authorization: producer.authorization
+            )
+            putStatus = response.status
+            putDigest = responseDigest(response)
+            await recorder.record(
+                host: producer.label,
+                method: "POST",
+                path: putPath,
+                requestBody: putBody,
+                response: response
+            )
+            guard (200 ... 299).contains(response.status) else {
+                errorCode = responseErrorCode(response)
+                return await artifact(
+                    scenario: scenario, producer: producer, consumer: consumer,
+                    putStatus: putStatus, readStatus: nil, putCID: nil, readCID: nil,
+                    putDigest: putDigest, readDigest: nil, converged: false,
+                    errorCode: errorCode, recorder: recorder
+                )
+            }
+            putCID = try StrictJSON.decode(RecordResponse.self, from: response.body).cid
+            guard putCID != nil else {
+                errorCode = "InvalidResponse"
+                return await artifact(
+                    scenario: scenario, producer: producer, consumer: consumer,
+                    putStatus: putStatus, readStatus: nil, putCID: nil, readCID: nil,
+                    putDigest: putDigest, readDigest: nil, converged: false,
+                    errorCode: errorCode, recorder: recorder
+                )
+            }
+        } catch {
+            errorCode = liveErrorCode(error)
+            return await artifact(
+                scenario: scenario, producer: producer, consumer: consumer,
+                putStatus: putStatus, readStatus: readStatus, putCID: nil, readCID: nil,
+                putDigest: putDigest, readDigest: readDigest, converged: false,
+                errorCode: errorCode, recorder: recorder
+            )
+        }
+
+        do {
+            let response = try await consumer.client.query(
+                "com.atproto.repo.getRecord",
+                query: ["repo": repository, "collection": collection, "rkey": rkey],
+                authorization: consumer.authorization
+            )
+            readStatus = response.status
+            readDigest = responseDigest(response)
+            await recorder.record(
+                host: consumer.label,
+                method: "GET",
+                path: getPath,
+                response: response
+            )
+            guard (200 ... 299).contains(response.status) else {
+                errorCode = responseErrorCode(response)
+                return await artifact(
+                    scenario: scenario, producer: producer, consumer: consumer,
+                    putStatus: putStatus, readStatus: readStatus, putCID: putCID, readCID: nil,
+                    putDigest: putDigest, readDigest: readDigest, converged: false,
+                    errorCode: errorCode, recorder: recorder
+                )
+            }
+            readCID = try StrictJSON.decode(RecordResponse.self, from: response.body).cid
+        } catch {
+            errorCode = liveErrorCode(error)
+        }
+
+        let converged = putCID != nil && putCID == readCID
+        return await artifact(
+            scenario: scenario, producer: producer, consumer: consumer,
+            putStatus: putStatus, readStatus: readStatus, putCID: putCID, readCID: readCID,
+            putDigest: putDigest, readDigest: readDigest, converged: converged,
+            errorCode: converged ? nil : (errorCode ?? "CommitmentMismatch"), recorder: recorder
+        )
+    }
+
+    private static func artifact(
+        scenario: String,
+        producer: LiveInteropHost,
+        consumer: LiveInteropHost,
+        putStatus: Int?,
+        readStatus: Int?,
+        putCID: String?,
+        readCID: String?,
+        putDigest: String?,
+        readDigest: String?,
+        converged: Bool,
+        errorCode: String?,
+        recorder: InteropFixtureRecorder
+    ) async -> LiveInteropPublicRoundTripArtifact {
+        LiveInteropPublicRoundTripArtifact(
+            scenario: scenario,
+            producer: producer.label,
+            consumer: consumer.label,
+            putStatus: putStatus,
+            readStatus: readStatus,
+            putCID: putCID,
+            readCID: readCID,
+            putResponseSHA256: putDigest,
+            readResponseSHA256: readDigest,
+            converged: converged,
+            status: converged ? "passed" : "failed",
+            errorCode: errorCode,
+            events: await recorder.snapshot()
+        )
+    }
+}
+
+private func responseDigest(_ response: InteropHTTPResponse) -> String {
+    Hex.encode(Data(SHA256.hash(data: response.body)))
+}
+
+private func responseErrorCode(_ response: InteropHTTPResponse) -> String? {
+    guard let object = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any] else {
+        return nil
+    }
+    return (object["error"] as? String).map { FixtureSanitizer.sanitize(["error": $0])["error"] ?? "<redacted>" }
+}
+
+private func liveErrorCode(_ error: Error) -> String {
+    switch error {
+    case let error as InteropHTTPError:
+        switch error {
+        case .invalidURL: return "InvalidURL"
+        case .responseTooLarge: return "ResponseTooLarge"
+        case .unexpectedRedirect: return "UnexpectedRedirect"
+        case .unexpectedContentType: return "UnexpectedContentType"
+        case let .unexpectedStatus(status): return "HTTP\(status)"
+        case .transportFailure: return "TransportFailure"
+        case .fileFailure: return "FileFailure"
+        }
+    default:
+        return "InteropFailure"
     }
 }
 
@@ -819,5 +1059,19 @@ private func requireJSONSuccess(_ response: InteropHTTPResponse) throws {
 private extension FixtureSanitizer {
     static func sanitize(_ value: String) -> String {
         FixtureSanitizer.sanitize(["value": value])["value"] ?? "<redacted>"
+    }
+
+    static func path(_ value: String) -> String {
+        guard var components = URLComponents(string: value),
+              !components.path.isEmpty else {
+            return "<invalid-path>"
+        }
+        // XRPC query values can contain DIDs, handles, record keys, and
+        // selectors. Keep only the endpoint path and sorted parameter names.
+        let names = Set(components.queryItems?.map(\.name) ?? []).sorted()
+        components.query = nil
+        let path = components.path
+        guard !names.isEmpty else { return path }
+        return path + "?keys=" + names.joined(separator: ",")
     }
 }
