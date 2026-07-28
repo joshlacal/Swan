@@ -502,7 +502,15 @@ public enum SpaceCommitCodec {
     public static func verifyContextSignature(_ envelope: SpaceCommitEnvelope, publicKey: P256.Signing.PublicKey) throws -> Bool {
         guard envelope.ver == 1 else { return false }
         let signature = try P256WireSignature.decodeCanonical(envelope.contextSignature)
-        return publicKey.isValidSignature(signature, for: try encodedContext(envelope.context))
+        return publicKey.isValidSignature(signature, for: try contextSigningBytes(envelope.context))
+    }
+
+    /// Returns the exact proposal-0016 context bytes signed by a repository
+    /// author.  Cross-implementation consumers use this to select the
+    /// author-key algorithm (for example ES256K) without duplicating the
+    /// length-prefix/domain encoding.
+    public static func contextSigningBytes(_ context: SpaceCommitContext) throws -> Data {
+        try encodedContext(context)
     }
 
     /// Verifies the deniable HMAC content binding. This must never be called a
@@ -517,9 +525,18 @@ public enum SpaceCommitCodec {
     }
 
     private static func contentBinding(ikm: Data, context: Data, commitment: Data) -> Data {
-        let derived = HKDF<SHA256>.deriveKey(
-            inputKeyMaterial: SymmetricKey(data: ikm), info: context, outputByteCount: 32
-        )
+        // The pinned proposal/TypeScript implementation uses the 32-byte IKM
+        // directly as the HKDF-Expand pseudorandom key.  CryptoKit's
+        // `HKDF.deriveKey` convenience performs an additional Extract step,
+        // which is a different wire value even when the IKM is already the
+        // required PRK.  This is the one-block HKDF-Expand construction from
+        // RFC 5869: HMAC(PRK, info || 0x01).
+        var expandInput = context
+        expandInput.append(0x01)
+        let derived = SymmetricKey(data: Data(HMAC<SHA256>.authenticationCode(
+            for: expandInput,
+            using: SymmetricKey(data: ikm)
+        )))
         return Data(HMAC<SHA256>.authenticationCode(for: commitment, using: derived))
     }
 

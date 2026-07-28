@@ -454,6 +454,16 @@ clean-cache Linux aarch64 lab now passes the following gates:
   `--permissioned-read-host member`. The authority used an explicit static
   public-key pin for the remote delegation; no private material or tokens were
   persisted in the repository.
+- A fresh disposable TypeScript member account also passed the terminal
+  `space.listRepoOps` boundary with `--permissioned-list-ops` and
+  `--permissioned-list-ops-exclude-values`: one operation and its signed
+  commit returned HTTP 200, and Swan verified the LtHash commitment, the
+  deniable content-binding MAC, and the ES256K context signature against the
+  static public-key pin. The sanitized artifact reported
+  `syncCommitVerified: true` and `syncValuesIncluded: false`. The pinned
+  TypeScript value-including form remains a known reference defect
+  (`ambiguous column name: space` in its joined query), so the lab does not
+  silently turn that failure into a false complete-values claim.
 
 The runner/API and Compose lifecycle fix are committed in
 `ea47ba82` (`feat(interop): select permissioned repository read host`), on top
@@ -464,6 +474,22 @@ the service failed with “missing file operand.” The restored normal Compose
 stack is healthy after the fix.
 
 The alpha is still not complete. Full TypeScript public repository import,
-dynamic remote DID/PLC/JWKS resolution, blobs, incremental sync and
-compaction-gap recovery, reverse authority placement, and the complete
+dynamic remote DID/PLC/JWKS resolution, value-bearing incremental updates,
+compaction-gap recovery, blobs, reverse authority placement, and the complete
 cross-implementation security/lifecycle/export matrix remain follow-up gates.
+
+## Final verification after the Task 43 rereview handoff
+
+The proposal-0016 content-binding implementation and immutable profile pin are
+now aligned: Swan uses the pinned one-block HKDF-Expand/HMAC-SHA-256 behavior,
+and the fixed cross-language vector passes. The serialized macOS suite passes
+with zero failures (including the CLI export/restore tests after refreshing
+their preferred `.build-task19`/`.build-task20` binaries), as do profile
+verification, the 18-check semantic lab, the static interop verifier and its
+mutation suite, and `PublicRepositoryReadHTTPTests` (8/8).
+
+The Linux Compose Swan image was rebuilt from this source and restarted. Caddy,
+the reference PDS/PLC, and Swan are healthy; `/health` returns `OK` through
+local TLS and the reference PDS returns version `0.5.7`. This refresh does not
+close the remaining TypeScript semantic, dynamic-key, blob, reverse-authority,
+or full lifecycle/security gates listed above.

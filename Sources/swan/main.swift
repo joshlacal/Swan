@@ -2857,6 +2857,24 @@ extension SwanCommand {
             )
             var provisionSpace = false
 
+            @Flag(
+                name: .customLong("permissioned-list-ops"),
+                help: "Fetch and cryptographically verify the repository host's terminal space.listRepoOps page"
+            )
+            var permissionedListOps = false
+
+            @Flag(
+                name: .customLong("permissioned-list-ops-exclude-values"),
+                help: "Request the metadata-only listRepoOps form (required by the pinned TypeScript branch until its joined-query bug is fixed)"
+            )
+            var permissionedListOpsExcludeValues = false
+
+            @Option(
+                name: .customLong("permissioned-commit-key-env"),
+                help: "Environment variable containing the repository author's base64url secp256k1 public key"
+            )
+            var permissionedCommitKeyEnvironment = "SWAN_LAB_PERMISSIONED_COMMIT_KEY"
+
             @Option(name: .long, help: "JSON request body file for the write")
             var bodyFile: String
 
@@ -2892,6 +2910,9 @@ extension SwanCommand {
                     environment: "SWAN_LAB_CONSUMER_URL",
                     fallback: "https://pds.test"
                 )
+                let permissionedCommitKey = try permissionedListOps
+                    ? LabLiveSupport.permissionedCommitVerificationKey(environment: permissionedCommitKeyEnvironment)
+                    : nil
                 let producer = try await LabLiveSupport.host(
                     label: normalizedMode == "permissioned" ? "member" : "producer",
                     url: producerURL,
@@ -2902,7 +2923,8 @@ extension SwanCommand {
                     clientID: producerClientID,
                     redirectURI: producerRedirectURI,
                     scopes: scope,
-                    timeout: requestTimeoutSeconds
+                    timeout: requestTimeoutSeconds,
+                    permissionedCommitVerificationKey: permissionedCommitKey
                 )
                 let consumer = try await LabLiveSupport.host(
                     label: normalizedMode == "permissioned" ? "authority" : "consumer",
@@ -2976,7 +2998,9 @@ extension SwanCommand {
                         space: parsedSpace,
                         createBody: body,
                         readQuery: query,
-                        readHost: readHost
+                        readHost: readHost,
+                        verifyIncrementalSync: permissionedListOps,
+                        includeIncrementalValues: !permissionedListOpsExcludeValues
                     )
                     artifact = result
                     status = result.status
@@ -3177,7 +3201,8 @@ private enum LabLiveSupport {
         clientID: String,
         redirectURI: String,
         scopes: [String],
-        timeout: Double
+        timeout: Double,
+        permissionedCommitVerificationKey: PermissionedDataJWTVerificationKey? = nil
     ) async throws -> LiveInteropHost {
         guard timeout > 0, timeout <= 120, timeout.isFinite else {
             throw ValidationError("--request-timeout-seconds is invalid")
@@ -3185,12 +3210,17 @@ private enum LabLiveSupport {
         let client = try InteropXRPCClient(baseURL: url, timeout: timeout)
         switch auth.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "none":
-            return LiveInteropHost(label: label, client: client)
+            return LiveInteropHost(
+                label: label,
+                client: client,
+                permissionedCommitVerificationKey: permissionedCommitVerificationKey
+            )
         case "bearer":
             return LiveInteropHost(
                 label: label,
                 client: client,
-                authorization: .bearer(token: try environmentValue(tokenEnvironment, label: "bearer token"))
+                authorization: .bearer(token: try environmentValue(tokenEnvironment, label: "bearer token")),
+                permissionedCommitVerificationKey: permissionedCommitVerificationKey
             )
         case "oauth":
             let handle = try environmentValue(handleEnvironment, label: "OAuth handle")
@@ -3226,10 +3256,25 @@ private enum LabLiveSupport {
             return LiveInteropHost(
                 label: label,
                 client: client,
-                authorizationProvider: provider
+                authorizationProvider: provider,
+                permissionedCommitVerificationKey: permissionedCommitVerificationKey
             )
         default:
             throw ValidationError("live auth must be none, bearer, or oauth")
+        }
+    }
+
+    static func permissionedCommitVerificationKey(
+        environment: String
+    ) throws -> PermissionedDataJWTVerificationKey {
+        let encoded = try environmentValue(environment, label: "permissioned commit public key")
+        guard let data = Data(base64URLEncoded: encoded) else {
+            throw ValidationError("permissioned commit public key is not canonical base64url")
+        }
+        do {
+            return try PermissionedDataJWTVerificationKey(secp256k1PublicKey: data)
+        } catch {
+            throw ValidationError("permissioned commit public key is invalid")
         }
     }
 

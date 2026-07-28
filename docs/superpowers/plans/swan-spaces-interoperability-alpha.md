@@ -36,7 +36,9 @@ checksum-verified way to populate the ignored reference cache.
 - LtHash is 1,024 little-endian UInt16 lanes with modular add/remove; its empty
   commitment is checked against the pinned TypeScript test vector.
 - Commit contexts use the proposal domain prefix, big-endian TLS vector lengths,
-  ES256 context signatures, and HKDF-SHA256/HMAC-SHA256 content bindings.
+  ES256 context signatures, and the pinned one-block HKDF-Expand/HMAC-SHA256
+  content binding (the 32-byte IKM is the Expand PRK, matching TypeScript).
+  A fixed cross-language vector protects this distinction from regression.
 - Full-recovery CARs use the required ordered two roots (signed commit then
   index), validate root/record CIDs, recompute LtHash from the index, and reject
   an altered record block before recovery data is returned.
@@ -135,7 +137,9 @@ checksum-verified way to populate the ignored reference cache.
   `space.createRecord`/`space.getRecord` flows. It keeps OAuth DPoP proofs and
   bearer credentials out of artifacts and compares returned record CIDs. Its
   XRPC path construction is covered directly, including DPoP-bound query
-  ordering.
+  ordering. `--permissioned-list-ops` additionally verifies a terminal
+  incremental page, LtHash commitment, deniable content binding, and the
+  author context signature using an explicit public-key pin.
 - Task 43's independent rereview is recorded under
   `.superpowers/sdd/swan-spaces-interoperability-alpha/task-43-rereview-2026-07-28.md`.
   Its scoped public-read verdict is PASS: `PublicRepositoryReadHTTPTests`
@@ -158,6 +162,18 @@ checksum-verified way to populate the ignored reference cache.
   boundary explicit. This is a real credential/read interop proof, but it does
   not claim public repository import, dynamic remote DID/PLC/JWKS discovery,
   or the complete TypeScript semantic matrix.
+- A fresh disposable TypeScript member account also completed the
+  cross-host `space.listRepoOps` boundary on 2026-07-28. With
+  `--permissioned-list-ops-exclude-values`, the reference member host returned
+  one operation and a terminal signed commit; Swan matched the write/read CID,
+  recomputed the commitment, verified the proposal content binding, and
+  verified the ES256K context signature against the operator-supplied public
+  key pin. The sanitized artifact reported `syncStatus: 200`,
+  `syncCommitVerified: true`, and `syncValuesIncluded: false`. The ordinary
+  value-including TypeScript request was separately observed to fail with
+  `InternalServerError` (`ambiguous column name: space`) in the pinned branch;
+  Swan does not mutate that cache and exposes the metadata-only workaround as
+  an explicit CLI option.
 - The Linux Compose laboratory was run from a clean disposable Swan data
   volume with the pinned PLC/PDS cache, Caddy TLS, Mailpit, and Toxiproxy
   healthy. Bootstrap now creates real PLC-backed Swan accounts through the
@@ -175,6 +191,16 @@ checksum-verified way to populate the ignored reference cache.
   corrupted traffic across both Swan and the pinned reference host (156
   convergence comparisons, 416 endpoint events); it is transport/profile
   evidence and does not claim full TypeScript semantic convergence.
+- The proposal-0016 content-binding profile is pinned as
+  `HKDF-Expand/HMAC-SHA-256`, with a fixed cross-language vector and a live
+  TypeScript `space.listRepoOps` proof that verifies the LtHash, deniable MAC,
+  and ES256K context signature. The pinned values-including TypeScript form is
+  recorded as an explicit upstream SQLite ambiguity and is exercised only via
+  the explicit `excludeValues=true` compatibility path.
+- Final macOS verification after the rereview passes the serialized Swift
+  suite with zero failures, profile verification, the 18-check semantic lab,
+  static/mutation interop checks, and `PublicRepositoryReadHTTPTests` 8/8. The
+  rebuilt Linux Compose Swan image is healthy behind Caddy local TLS.
 
 ## Completion gates
 

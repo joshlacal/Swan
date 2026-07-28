@@ -95,6 +95,42 @@ final class SwanSpacesTests: XCTestCase {
         XCTAssertNotEqual(firstReaderEnvelope.contentBinding, secondReaderEnvelope.contentBinding)
     }
 
+    func testContentBindingMatchesPermissionedData0016ExpandVector() throws {
+        let space = try SpaceURI(
+            authority: "did:plc:alice",
+            spaceType: "app.swan.interop",
+            skey: "vector"
+        )
+        let context = try SpaceCommitContext(
+            space: space,
+            author: "did:plc:bob",
+            rev: "3jzfcj2zq2m2a",
+            ikm: Data(0..<32)
+        )
+        let commitment = Data(1...32)
+        let expectedBinding = Data([
+            0xd1, 0x9d, 0x21, 0x4e, 0x46, 0xe6, 0x7f, 0x85,
+            0x13, 0xb9, 0xbe, 0xfc, 0xe7, 0x2b, 0xaf, 0x7a,
+            0xa7, 0x52, 0xa8, 0x0a, 0x3c, 0xb1, 0x2a, 0x32,
+            0x20, 0xa8, 0xd0, 0x4a, 0xdd, 0x41, 0x41, 0x5e,
+        ])
+        let envelope = SpaceCommitEnvelope(
+            context: context,
+            contextSignature: Data(),
+            contentBinding: expectedBinding,
+            commitment: commitment
+        )
+        XCTAssertTrue(SpaceCommitCodec.verifyContentBinding(envelope))
+        var corrupted = expectedBinding
+        corrupted[0] ^= 0x01
+        XCTAssertFalse(SpaceCommitCodec.verifyContentBinding(SpaceCommitEnvelope(
+            context: context,
+            contextSignature: Data(),
+            contentBinding: corrupted,
+            commitment: commitment
+        )))
+    }
+
     func testContextSignaturesEmitAndRequireCanonicalLowSValues() throws {
         let space = try SpaceURI(authority: "did:plc:alice", spaceType: "app.bsky.bookmarks", skey: "shared")
         let key = P256.Signing.PrivateKey()

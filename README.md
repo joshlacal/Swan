@@ -47,6 +47,17 @@ a pinned reference host. The output artifact keeps only statuses, CIDs,
 response digests, and sanitized endpoint events; request bodies, values,
 credentials, and proofs are never written.
 
+To verify the terminal incremental-sync page and its reader-bound commit, add
+`--permissioned-list-ops`. The verifier recomputes the LtHash commitment,
+content-binding MAC, and author context signature; provide the repository
+author's public key through `SWAN_LAB_PERMISSIONED_COMMIT_KEY` (base64url
+secp256k1 bytes). The pinned TypeScript revision currently returns HTTP 500
+when `listRepoOps` includes values because its joined SQLite query leaves
+`space` ambiguous. Its supported metadata-only form can be exercised with
+`--permissioned-list-ops-exclude-values`; the artifact records
+`syncValuesIncluded: false` so this limitation is visible rather than hidden.
+Swan's own endpoint remains value-capable and is covered by its HTTP tests.
+
 The cross-host TypeScript permissioned smoke uses the pinned reference PDS as
 the member repository and Swan as the authority. Swan's fail-closed remote key
 policy requires an operator-supplied static delegation public-key pin for that

@@ -8,6 +8,7 @@ import Petrel
 import SwanCore
 import SwanOAuth
 import SwanSpaces
+import SwanSpacesWire
 
 /// A bounded, redirect-free HTTP response used by the stateful interop
 /// harness.  The body is present only for small JSON/XRPC responses; CAR and
@@ -529,17 +530,23 @@ public struct LiveInteropHost: Sendable {
     public let client: InteropXRPCClient
     public let authorization: InteropAuthorization
     public let authorizationProvider: InteropAuthorizationProvider?
+    /// Optional operator-pinned key for verifying permissioned repository
+    /// commits returned by this host. A missing key is an intentional
+    /// fail-closed condition when an incremental sync assertion is requested.
+    public let permissionedCommitVerificationKey: PermissionedDataJWTVerificationKey?
 
     public init(
         label: String,
         client: InteropXRPCClient,
         authorization: InteropAuthorization = .none,
-        authorizationProvider: InteropAuthorizationProvider? = nil
+        authorizationProvider: InteropAuthorizationProvider? = nil,
+        permissionedCommitVerificationKey: PermissionedDataJWTVerificationKey? = nil
     ) {
         self.label = label
         self.client = client
         self.authorization = authorization
         self.authorizationProvider = authorizationProvider
+        self.permissionedCommitVerificationKey = permissionedCommitVerificationKey
     }
 }
 
@@ -605,6 +612,16 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
     public let readCID: String?
     public let writeResponseSHA256: String?
     public let readResponseSHA256: String?
+    public let syncStatus: Int?
+    public let syncOpsCount: Int?
+    public let syncOperationCID: String?
+    public let syncCommitVerified: Bool?
+    /// Whether the incremental-sync response included record values.  The
+    /// pinned TypeScript branch currently has an ambiguous SQLite query when
+    /// values are requested; callers can explicitly exercise its supported
+    /// metadata-only form with `excludeValues=true` and this field keeps that
+    /// limitation visible in the sanitized artifact.
+    public let syncValuesIncluded: Bool?
     public let converged: Bool
     public let status: String
     public let errorCode: String?
@@ -622,6 +639,11 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
         readCID: String?,
         writeResponseSHA256: String?,
         readResponseSHA256: String?,
+        syncStatus: Int? = nil,
+        syncOpsCount: Int? = nil,
+        syncOperationCID: String? = nil,
+        syncCommitVerified: Bool? = nil,
+        syncValuesIncluded: Bool? = nil,
         converged: Bool,
         status: String,
         errorCode: String?,
@@ -638,6 +660,11 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
         self.readCID = readCID
         self.writeResponseSHA256 = writeResponseSHA256
         self.readResponseSHA256 = readResponseSHA256
+        self.syncStatus = syncStatus
+        self.syncOpsCount = syncOpsCount
+        self.syncOperationCID = syncOperationCID
+        self.syncCommitVerified = syncCommitVerified
+        self.syncValuesIncluded = syncValuesIncluded
         self.converged = converged
         self.status = status
         self.errorCode = errorCode.map { FixtureSanitizer.sanitize(["error": $0])["error"] ?? "<redacted>" }
@@ -653,6 +680,20 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
 public enum LiveInteropRunner {
     private struct RecordResponse: Decodable {
         let cid: String?
+    }
+
+    private struct PermissionedSyncResult: Sendable {
+        let status: Int?
+        let opsCount: Int?
+        let operationCID: String?
+        let commitVerified: Bool?
+        let valuesIncluded: Bool?
+        let errorCode: String?
+
+        static let notRequested = Self(
+            status: nil, opsCount: nil, operationCID: nil,
+            commitVerified: nil, valuesIncluded: nil, errorCode: nil
+        )
     }
 
     public static func publicPutAndRead(
@@ -801,6 +842,8 @@ public enum LiveInteropRunner {
         createBody: Data,
         readQuery: [String: String],
         readHost: LiveInteropHost? = nil,
+        verifyIncrementalSync: Bool = false,
+        includeIncrementalValues: Bool = true,
         clientAttestation: String? = nil,
         recorder: InteropFixtureRecorder? = nil
     ) async -> LiveInteropPermissionedRoundTripArtifact {
@@ -826,6 +869,7 @@ public enum LiveInteropRunner {
         var writeDigest: String?
         var readDigest: String?
         var errorCode: String?
+        var syncResult = PermissionedSyncResult.notRequested
         do {
             let credential = try await broker.exchange(
                 space: space,
@@ -926,13 +970,25 @@ public enum LiveInteropRunner {
                     converged: false, errorCode: errorCode, recorder: recorder
                 )
             }
-            let converged = writeCID == readCID
+            if verifyIncrementalSync {
+                syncResult = await verifyPermissionedListRepoOps(
+                    repositoryHost: repositoryHost,
+                    space: space,
+                    author: readQuery["repo"] ?? "",
+                    expectedCID: writeCID,
+                    authorization: credentialAuthorization,
+                    includeValues: includeIncrementalValues,
+                    recorder: recorder
+                )
+            }
+            let converged = writeCID == readCID && syncResult.errorCode == nil
             return await permissionedArtifact(
                 scenario: scenario, member: member, authority: authority,
                 credentialIssued: credentialIssued, writeStatus: writeStatus,
                 readStatus: readStatus, writeCID: writeCID, readCID: readCID,
                 writeDigest: writeDigest, readDigest: readDigest,
-                converged: converged, errorCode: nil, recorder: recorder
+                syncResult: syncResult,
+                converged: converged, errorCode: syncResult.errorCode, recorder: recorder
             )
         } catch {
             errorCode = liveErrorCode(error)
@@ -941,7 +997,173 @@ public enum LiveInteropRunner {
                 credentialIssued: credentialIssued, writeStatus: writeStatus,
                 readStatus: readStatus, writeCID: writeCID, readCID: readCID,
                 writeDigest: writeDigest, readDigest: readDigest,
+                syncResult: syncResult,
                 converged: false, errorCode: errorCode, recorder: recorder
+            )
+        }
+    }
+
+    private static func verifyPermissionedListRepoOps(
+        repositoryHost: LiveInteropHost,
+        space: SpaceURI,
+        author: String,
+        expectedCID: String?,
+        authorization: InteropAuthorization,
+        includeValues: Bool,
+        recorder: InteropFixtureRecorder
+    ) async -> PermissionedSyncResult {
+        guard let expectedCID else {
+            return PermissionedSyncResult(
+                status: nil, opsCount: nil, operationCID: nil,
+                commitVerified: false, valuesIncluded: includeValues,
+                errorCode: "InvalidResponse"
+            )
+        }
+        var query: [String: String] = [
+            "space": space.rawValue,
+            "repo": author,
+            // The pinned TypeScript implementation emits its signed commit
+            // on a short terminal page. A fresh disposable repo is below this
+            // bound, so the response is also a complete hash witness.
+            "limit": "100",
+        ]
+        if !includeValues {
+            query["excludeValues"] = "true"
+        }
+        do {
+            let response = try await repositoryHost.client.query(
+                "com.atproto.space.listRepoOps",
+                query: query,
+                authorization: authorization
+            )
+            await recorder.record(
+                host: repositoryHost.label,
+                method: "GET",
+                path: "/xrpc/com.atproto.space.listRepoOps",
+                response: response
+            )
+            guard (200 ... 299).contains(response.status) else {
+                return PermissionedSyncResult(
+                    status: response.status, opsCount: nil, operationCID: nil,
+                    commitVerified: false, valuesIncluded: includeValues,
+                    errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
+                )
+            }
+            let output = try StrictJSON.decode(
+                ComAtprotoSpaceListRepoOps.Output.self,
+                from: response.body
+            )
+            let operation = output.ops.first(where: { $0.cid?.string == expectedCID })
+            guard let operation else {
+                return PermissionedSyncResult(
+                    status: response.status, opsCount: output.ops.count,
+                    operationCID: output.ops.first?.cid?.string,
+                    commitVerified: false, valuesIncluded: includeValues,
+                    errorCode: "OperationMismatch"
+                )
+            }
+            guard let commit = output.commit else {
+                return PermissionedSyncResult(
+                    status: response.status, opsCount: output.ops.count,
+                    operationCID: operation.cid?.string,
+                    commitVerified: false, valuesIncluded: includeValues,
+                    errorCode: "CommitMissing"
+                )
+            }
+            guard commit.ver == 1,
+                  commit.hash.data.count == 32,
+                  commit.ikm.data.count == 32,
+                  commit.sig.data.count == 64,
+                  commit.mac.data.count == 32 else {
+                return PermissionedSyncResult(
+                    status: response.status, opsCount: output.ops.count,
+                    operationCID: operation.cid?.string,
+                    commitVerified: false, valuesIncluded: includeValues,
+                    errorCode: "InvalidCommit"
+                )
+            }
+            var lthash = LtHash()
+            for entry in output.ops {
+                guard let cid = entry.cid?.string else {
+                    guard let previous = entry.prev?.string else {
+                        return PermissionedSyncResult(
+                            status: response.status, opsCount: output.ops.count,
+                            operationCID: operation.cid?.string,
+                            commitVerified: false, valuesIncluded: includeValues,
+                            errorCode: "InvalidOperation"
+                        )
+                    }
+                    lthash.remove(element: "\(entry.collection)/\(entry.rkey)/\(previous)")
+                    continue
+                }
+                if let previous = entry.prev?.string {
+                    lthash.remove(element: "\(entry.collection)/\(entry.rkey)/\(previous)")
+                }
+                lthash.add(element: "\(entry.collection)/\(entry.rkey)/\(cid)")
+            }
+            guard lthash.commitment == commit.hash.data else {
+                return PermissionedSyncResult(
+                    status: response.status, opsCount: output.ops.count,
+                    operationCID: operation.cid?.string,
+                    commitVerified: false, valuesIncluded: includeValues,
+                    errorCode: "CommitmentMismatch"
+                )
+            }
+            let context = try SpaceCommitContext(
+                space: space,
+                author: author,
+                rev: commit.rev,
+                ikm: commit.ikm.data
+            )
+            let envelope = SpaceCommitEnvelope(
+                ver: commit.ver,
+                context: context,
+                contextSignature: commit.sig.data,
+                contentBinding: commit.mac.data,
+                commitment: commit.hash.data
+            )
+            guard SpaceCommitCodec.verifyContentBinding(envelope) else {
+                return PermissionedSyncResult(
+                    status: response.status, opsCount: output.ops.count,
+                    operationCID: operation.cid?.string,
+                    commitVerified: false, valuesIncluded: includeValues,
+                    errorCode: "ContentBindingMismatch"
+                )
+            }
+            guard let key = repositoryHost.permissionedCommitVerificationKey else {
+                return PermissionedSyncResult(
+                    status: response.status, opsCount: output.ops.count,
+                    operationCID: operation.cid?.string,
+                    commitVerified: false, valuesIncluded: includeValues,
+                    errorCode: "MissingCommitKey"
+                )
+            }
+            let algorithm: String = switch key {
+            case .p256: "ES256"
+            case .secp256k1PublicKey: "ES256K"
+            }
+            guard try key.verify(
+                signature: commit.sig.data,
+                signingInput: try SpaceCommitCodec.contextSigningBytes(context),
+                algorithm: algorithm
+            ) else {
+                return PermissionedSyncResult(
+                    status: response.status, opsCount: output.ops.count,
+                    operationCID: operation.cid?.string,
+                    commitVerified: false, valuesIncluded: includeValues,
+                    errorCode: "ContextSignatureMismatch"
+                )
+            }
+            return PermissionedSyncResult(
+                status: response.status, opsCount: output.ops.count,
+                operationCID: operation.cid?.string,
+                commitVerified: true, valuesIncluded: includeValues, errorCode: nil
+            )
+        } catch {
+            return PermissionedSyncResult(
+                status: nil, opsCount: nil, operationCID: nil,
+                commitVerified: false, valuesIncluded: includeValues,
+                errorCode: liveErrorCode(error)
             )
         }
     }
@@ -988,6 +1210,7 @@ public enum LiveInteropRunner {
         readCID: String?,
         writeDigest: String?,
         readDigest: String?,
+        syncResult: PermissionedSyncResult = .notRequested,
         converged: Bool,
         errorCode: String?,
         recorder: InteropFixtureRecorder
@@ -1003,6 +1226,11 @@ public enum LiveInteropRunner {
             readCID: readCID,
             writeResponseSHA256: writeDigest,
             readResponseSHA256: readDigest,
+            syncStatus: syncResult.status,
+            syncOpsCount: syncResult.opsCount,
+            syncOperationCID: syncResult.operationCID,
+            syncCommitVerified: syncResult.commitVerified,
+            syncValuesIncluded: syncResult.valuesIncluded,
             converged: converged,
             status: converged ? "passed" : "failed",
             errorCode: errorCode,

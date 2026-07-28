@@ -592,7 +592,7 @@ public enum OfflineProtocolProfileVerifier {
                 lthashBytes: 2_048,
                 lthashHash: "BLAKE3-XOF",
                 commitmentHash: "SHA-256",
-                contentBinding: "HMAC-SHA-256"
+                contentBinding: "HKDF-Expand/HMAC-SHA-256"
             ) &&
             pins.permissionedDataIsEncrypted == false &&
             pins.oplogRetention == 10_000 &&

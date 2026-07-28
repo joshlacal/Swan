@@ -14,6 +14,28 @@ public enum PermissionedDataJWTVerificationKey: Sendable {
     case p256(P256.Signing.PublicKey)
     case secp256k1PublicKey(Data)
 
+    /// Creates a pinned secp256k1 verification key from the compressed or
+    /// uncompressed public bytes used by the reference TypeScript PDS.
+    /// Private key material is never accepted by this API.
+    public init(secp256k1PublicKey: Data) throws {
+        guard Self.validatesSecp256k1PublicKey(secp256k1PublicKey) else {
+            throw SwanError.malformed("invalid secp256k1 public key")
+        }
+        self = .secp256k1PublicKey(secp256k1PublicKey)
+    }
+
+    /// Verifies one compact signature with the algorithm bound to this
+    /// pinned public-key representation.  Callers must choose the key from a
+    /// local account projection or an operator-supplied pin; this method does
+    /// not resolve identities or fetch remote metadata.
+    public func verify(
+        signature: Data,
+        signingInput: Data,
+        algorithm: String
+    ) throws -> Bool {
+        try verifies(signature: signature, signingInput: signingInput, algorithm: algorithm)
+    }
+
     var deterministicIdentity: Data {
         switch self {
         case let .p256(publicKey):

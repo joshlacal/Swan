@@ -9,7 +9,7 @@
     "lthashBytes": 2048,
     "lthashHash": "BLAKE3-XOF",
     "commitmentHash": "SHA-256",
-    "contentBinding": "HMAC-SHA-256"
+    "contentBinding": "HKDF-Expand/HMAC-SHA-256"
   },
   "permissionedDataIsEncrypted": false,
   "oplogRetention": 10000,
@@ -36,6 +36,12 @@
       "pinnedComponent": "@did-plc/server@0.0.1 from reference implementation 3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
       "referenceBehavior": "POST /:did ends in Express res.sendStatus(200), producing status 200, Content-Type text/plain; charset=utf-8, and the two ASCII bytes OK.",
       "swanBehavior": "Only explicit laboratory policy did-plc-server-0.0.1 accepts that exact no-redirect response at the requested URL; production and all PLC JSON reads retain strict validation."
+    },
+    {
+      "id": "typescript-space-list-repo-ops-values-ambiguous-space",
+      "pinnedComponent": "packages/pds/src/actor-store/space/reader.ts from reference implementation 3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
+      "referenceBehavior": "com.atproto.space.listRepoOps returns InternalServerError when values are included because the joined SQLite query leaves the space selector ambiguous; excludeValues=true remains callable.",
+      "swanBehavior": "Qualifies the joined space selector and serves value-bearing operations. The interop runner exposes an explicit excludeValues mode for the pinned branch and never mutates the reference cache."
     }
   ],
   "endpoints": [
