@@ -59,6 +59,23 @@ final class PublicProtocolProfileVerifierTests: XCTestCase {
         ))
     }
 
+    func testPublicProfileRejectsNonemptyDivergenceSemanticDrift() throws {
+        let fixture = try PublicProfileFixture()
+        defer { fixture.remove() }
+        try fixture.editProfile { profile in
+            var divergences = profile["intentionalDivergences"] as! [[String: Any]]
+            divergences[0]["swanBehavior"] = "Still nonempty, but no longer the frozen behavior."
+            profile["intentionalDivergences"] = divergences
+        }
+        let report = OfflineProtocolProfileVerifier.verify(
+            profileURL: fixture.profileURL,
+            sourceRoot: fixture.root
+        )
+        XCTAssertTrue(report.diagnostics.contains(
+            .init(.immutableProfilePinMismatch, artifact: "profile")
+        ))
+    }
+
     func testPublicProfileRejectsInjectedAndSymlinkedSwiftSources() throws {
         let fixture = try PublicProfileFixture()
         defer { fixture.remove() }

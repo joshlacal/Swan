@@ -617,8 +617,10 @@ public enum OfflineProtocolProfileVerifier {
             pins.endpoints == expectedPublicEndpoints &&
             pins.intentionalDivergences.count == 1 &&
             pins.intentionalDivergences.first?.endpoint == "com.atproto.sync.getRepo" &&
-            !(pins.intentionalDivergences.first?.referenceBehavior.isEmpty ?? true) &&
-            !(pins.intentionalDivergences.first?.swanBehavior.isEmpty ?? true)
+            pins.intentionalDivergences.first?.referenceBehavior ==
+                "Accepts an optional since revision for an incremental repository CAR." &&
+            pins.intentionalDivergences.first?.swanBehavior ==
+                "Rejects a nonempty since until retained-history incremental CARs are implemented; it never returns a full CAR while claiming to honor since."
     }
 }
 

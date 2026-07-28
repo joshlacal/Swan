@@ -385,7 +385,8 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                     uri: "/xrpc/com.atproto.repo.getRecord?repo=\(Self.alice)&collection=\(Self.collection)&rkey=first",
                     method: .get
                 ) { response in
-                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    XCTAssertEqual(try self.errorCode(response.body), "public_data_pending")
                     XCTAssertFalse(String(decoding: response.body.readableBytesView, as: UTF8.self).contains("first"))
                 }
             }
@@ -779,7 +780,8 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                 var wrongTargetJSON = wrongTarget; wrongTargetJSON[.contentType] = "application/json"
                 try await client.execute(uri: Self.createPath, method: .post, headers: wrongTargetJSON, body: ByteBuffer(string: createBody.replacingOccurrences(of: "scoped", with: "wrong-target"))) { response in XCTAssertEqual(response.status, .unauthorized) }
                 try await client.execute(uri: "/xrpc/com.atproto.repo.getRecord?repo=\(Self.alice)&collection=\(Self.collection)&rkey=scoped", method: .get) { response in
-                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    XCTAssertEqual(try self.errorCode(response.body), "public_data_pending")
                     XCTAssertFalse(String(decoding: response.body.readableBytesView, as: UTF8.self).contains("scoped"))
                 }
             }

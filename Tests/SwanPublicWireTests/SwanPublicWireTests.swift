@@ -1,24 +1,44 @@
+import Foundation
 import Testing
 @testable import SwanPublicWire
 
 @Suite("Swan public wire profile")
 struct SwanPublicWireTests {
     @Test
-    func profileIsFiniteAndOrdered() {
+    func profileIsFiniteOrderedAndExact() throws {
         let methods = PublicDataTesting20260727.methods
-        let expected = [
-            "com.atproto.repo.applyWrites", "com.atproto.repo.createRecord",
-            "com.atproto.repo.deleteRecord", "com.atproto.repo.describeRepo",
-            "com.atproto.repo.getRecord", "com.atproto.repo.listRecords",
-            "com.atproto.repo.putRecord", "com.atproto.repo.uploadBlob",
-            "com.atproto.sync.getBlob", "com.atproto.sync.getLatestCommit",
-            "com.atproto.sync.getRepo", "com.atproto.sync.getRepoStatus",
+        let expected: [PublicXRPCMethodDescriptor] = [
+            .init(nsid: "com.atproto.repo.applyWrites", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["InvalidSwap"]),
+            .init(nsid: "com.atproto.repo.createRecord", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["InvalidSwap"]),
+            .init(nsid: "com.atproto.repo.deleteRecord", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["InvalidSwap"]),
+            .init(nsid: "com.atproto.repo.describeRepo", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: []),
+            .init(nsid: "com.atproto.repo.getRecord", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["RecordNotFound"]),
+            .init(nsid: "com.atproto.repo.listRecords", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: []),
+            .init(nsid: "com.atproto.repo.putRecord", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["InvalidSwap"]),
+            .init(nsid: "com.atproto.repo.uploadBlob", kind: .procedure, inputEncoding: "*/*", outputEncoding: "application/json", declaredErrors: []),
+            .init(nsid: "com.atproto.sync.getBlob", kind: .query, inputEncoding: nil, outputEncoding: "*/*", declaredErrors: ["BlobNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
+            .init(nsid: "com.atproto.sync.getLatestCommit", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
+            .init(nsid: "com.atproto.sync.getRepo", kind: .query, inputEncoding: nil, outputEncoding: "application/vnd.ipld.car", declaredErrors: ["RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
+            .init(nsid: "com.atproto.sync.getRepoStatus", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["RepoNotFound"]),
         ]
         #expect(methods.count == 12)
         #expect(Set(methods.map(\.nsid)).count == methods.count)
-        #expect(methods.map(\.nsid) == expected)
-        #expect(methods.allSatisfy { !($0.outputEncoding?.isEmpty ?? false) })
-        #expect(methods.first?.declaredErrors == ["InvalidSwap"])
+        #expect(methods == expected)
+
+        struct Profile: Decodable {
+            let id: String
+            let endpoints: [String]
+        }
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let profile = try JSONDecoder().decode(
+            Profile.self,
+            from: Data(contentsOf: root.appending(path: "Profiles/public-data-testing-2026-07-27.json"))
+        )
+        #expect(profile.id == PublicDataTesting20260727.profileID)
+        #expect(profile.endpoints == expected.map(\.nsid))
     }
 }
 

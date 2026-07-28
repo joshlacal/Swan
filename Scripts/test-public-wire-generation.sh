@@ -24,13 +24,20 @@ public_wire_verify_checked_in_manifest
 
 temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/swan-public-rejections.XXXXXX")"
 wrong_generator="${temporary_root}/wrong-generator"
+jj git init --colocate "${wrong_generator}" >/dev/null
 mkdir -p "${wrong_generator}/generator"
 cp "${PETREL_GENERATOR_ROOT}/run.py" "${wrong_generator}/run.py"
 cp "${PETREL_GENERATOR_ROOT}/generator/main.py" "${wrong_generator}/generator/main.py"
-mkdir -p "${wrong_generator}/.jj"
-if PETREL_GENERATOR_ROOT="${wrong_generator}" "${root}/Scripts/regenerate-public-wire.sh"; then
+wrong_parent_diagnostic=""
+if wrong_parent_diagnostic="$(
+  PETREL_GENERATOR_ROOT="${wrong_generator}" "${root}/Scripts/regenerate-public-wire.sh" 2>&1
+)"; then
   public_wire_die "wrong jj parent unexpectedly succeeded"
 fi
+grep -F "Petrel generator parent is not pinned" <<<"${wrong_parent_diagnostic}" >/dev/null || {
+  echo "${wrong_parent_diagnostic}" >&2
+  public_wire_die "wrong-parent fixture did not reach the parent-pin rejection"
+}
 public_wire_verify_checked_in_manifest
 
 reference_copy="${temporary_root}/reference"
