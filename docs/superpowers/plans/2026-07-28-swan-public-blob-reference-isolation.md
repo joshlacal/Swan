@@ -76,3 +76,27 @@ boundary.
   exchange and run the matrix under Docker on macOS and Linux.
 - Run the complete suite after the next mutation slice; do not claim alpha
   completion until the live Compose/reference matrix and Linux gates pass.
+
+## 2026-07-28 runtime and harness checkpoint
+
+The next execution slice is now checkpointed in the Swan jj history:
+
+- `e6e4692f` isolates public repository mutation keys behind the explicit
+  `--enable-public-repository-mutations` capability and adds separate
+  mounted-KEK/key-directory options. Permissioned-space interop no longer
+  implicitly enables public writes. DID and canonical local-handle selectors
+  resolve through the startup control registry only.
+- `e6e4692f` also rejects a supplied `swapRecord` when the selected put path is
+  absent and abandons a no-swap reservation before a bounded CAS retry.
+- `cd92f9df` adds a stateful `SwanInterop` public put/read round-trip runner.
+  It compares producer and consumer CIDs and records only endpoint paths,
+  statuses, sizes, and response digests. Query selector values are removed
+  from fixture paths.
+
+Focused put/delete/no-op/swap HTTP tests, the separate CLI opt-in guard,
+stateful interop fixture-sanitization tests, the complete macOS Swift suite,
+profile verification, interop topology verification, and `git diff --check`
+are green with the pinned Xcode toolchain. Docker/Compose, Linux, and a live
+Swan-to-TypeScript run remain unexecuted because those runtimes are not
+available in this environment; they must be run before alpha completion is
+claimed.
