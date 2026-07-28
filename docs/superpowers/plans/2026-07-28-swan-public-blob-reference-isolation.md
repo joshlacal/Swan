@@ -72,8 +72,8 @@ boundary.
 - Exercise the durable PLC rotation service and `swan account rotate-plc`
   against a live/local PLC fixture; the service, CLI path, storage,
   verifier, and public-read slice are now implemented and covered locally.
-- Replace the probe-only interop runner with semantic cross-host record/blob
-  exchange and run the matrix under Docker on macOS and Linux.
+- Run the new stateful live runner against cross-host record/blob scenarios and
+  execute the fault matrix under Docker on macOS and Linux.
 - Run the complete suite after the next mutation slice; do not claim alpha
   completion until the live Compose/reference matrix and Linux gates pass.
 
@@ -92,6 +92,10 @@ The next execution slice is now checkpointed in the Swan jj history:
   It compares producer and consumer CIDs and records only endpoint paths,
   statuses, sizes, and response digests. Query selector values are removed
   from fixture paths.
+- `d484298b` extends that seam with permissioned delegation/credential
+  exchange, selector-bound public and permissioned writes, per-request OAuth
+  DPoP authorization, and the callable `swan lab live` command. Its artifacts
+  carry commitments and digests only.
 
 Focused put/delete/no-op/swap HTTP tests, the separate CLI opt-in guard,
 stateful interop fixture-sanitization tests, the complete macOS Swift suite,
