@@ -123,6 +123,7 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
             "--port", "0",
             "--public-url", "https://swan.example",
             "--enable-local-space-interop",
+            "--enable-oauth-authorization-server",
             "--space-account-kek-file", mountedKEK.path,
             "--space-account-kek-id", "mixed",
             "--space-account-key-directory", data.appending(path: "keys").path,
@@ -133,6 +134,57 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
 
         XCTAssertTrue(result.started, result.error)
         XCTAssertFalse(result.error.contains(root.path))
+    }
+
+    func testMetadataFetchOptionsRejectInapplicableAndNonliteralModes() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let inapplicableIP = try runServe(
+            data: root.appending(path: "inapplicable-ip"),
+            arguments: ["--oauth-allow-metadata-ip", "127.0.0.1"]
+        )
+        XCTAssertNotEqual(inapplicableIP.status, 0)
+        XCTAssertTrue(inapplicableIP.output.isEmpty)
+        XCTAssertTrue(
+            inapplicableIP.error.contains(
+                "--oauth-allow-metadata-ip requires "
+                    + "--enable-oauth-authorization-server or "
+                    + "--enable-local-space-interop"
+            )
+        )
+
+        let nonliteralIP = try runServe(
+            data: root.appending(path: "nonliteral-ip"),
+            arguments: [
+                "--enable-oauth-authorization-server",
+                "--public-url", "https://swan.example",
+                "--oauth-allow-metadata-ip", "metadata.example",
+            ]
+        )
+        XCTAssertNotEqual(nonliteralIP.status, 0)
+        XCTAssertTrue(nonliteralIP.output.isEmpty)
+        XCTAssertTrue(
+            nonliteralIP.error.contains(
+                "--oauth-allow-metadata-ip must be a literal IPv4 or IPv6 address"
+            )
+        )
+
+        let inapplicableLocalhost = try runServe(
+            data: root.appending(path: "inapplicable-localhost"),
+            arguments: ["--oauth-allow-localhost-development-client"]
+        )
+        XCTAssertNotEqual(inapplicableLocalhost.status, 0)
+        XCTAssertTrue(inapplicableLocalhost.output.isEmpty)
+        XCTAssertTrue(
+            inapplicableLocalhost.error.contains(
+                "--oauth-allow-localhost-development-client requires "
+                    + "--enable-oauth-authorization-server"
+            )
+        )
+        for result in [inapplicableIP, nonliteralIP, inapplicableLocalhost] {
+            XCTAssertFalse(result.error.contains(root.path))
+        }
     }
 
     func testNotificationDeliveryRejectsPartialFlagAndKeyConfigurations() throws {

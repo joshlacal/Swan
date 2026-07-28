@@ -118,6 +118,36 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase {
         }
     }
 
+    func testExactServeCompositionRetainsExplicitAttestationPolicy() async throws {
+        let fixture = try await Fixture.make(localDID: localDID)
+        defer { fixture.cleanup() }
+        do {
+            let marker = "https://composed-reader.example/client-metadata.json"
+            let policy = CompositionAttestationPolicy(marker: marker)
+            let composition = try await ServePermissionedRuntime.compose(
+                local: fixture.localRuntime,
+                notification: nil,
+                clientAttestationPolicy: policy
+            )
+            let exchange = try XCTUnwrap(
+                composition.credentialExchangeConfiguration
+            )
+            let resolved = try await exchange.clientAttestationPolicy
+                .verifiedClientID(
+                    for: "opaque-test-proof",
+                    authority: localDID,
+                    now: Date(timeIntervalSince1970: 1_750_000_000)
+            )
+            XCTAssertEqual(resolved, marker)
+            let invocationCount = await policy.invocationCount()
+            XCTAssertEqual(invocationCount, 1)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     func testManagingServiceAudienceMustBeExplicit() async throws {
         let fixture = try await Fixture.make(localDID: localDID)
         defer { fixture.cleanup() }
@@ -324,6 +354,30 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
+    }
+}
+
+private actor CompositionAttestationPolicy:
+    SpaceCredentialClientAttestationPolicy
+{
+    let marker: String
+    private var count = 0
+
+    init(marker: String) {
+        self.marker = marker
+    }
+
+    func verifiedClientID(
+        for _: String?,
+        authority _: String,
+        now _: Date
+    ) async throws -> String? {
+        count += 1
+        return marker
+    }
+
+    func invocationCount() -> Int {
+        count
     }
 }
 

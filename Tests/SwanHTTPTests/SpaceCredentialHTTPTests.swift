@@ -265,6 +265,60 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(
                     uri: Self.credentialPath,
                     method: .post,
+                    headers: self.exchangeHeaders("malformed-delegation"),
+                    body: self.exchangeBody(
+                        space: fixture.allowListSpace,
+                        clientAttestation: attestation
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(
+                        try self.errorCode(response.body),
+                        "InvalidDelegationToken"
+                    )
+                }
+                let malformedRequestCount = await transport.requestCount()
+                XCTAssertEqual(malformedRequestCount, 0)
+
+                let consumedWithoutAttestation = try self.delegation(
+                    fixture,
+                    user: Self.outsider,
+                    space: fixture.allowListSpace
+                )
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: self.exchangeHeaders(consumedWithoutAttestation),
+                    body: self.exchangeBody(space: fixture.allowListSpace)
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(
+                        try self.errorCode(response.body),
+                        "AppNotAuthorized"
+                    )
+                }
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: self.exchangeHeaders(consumedWithoutAttestation),
+                    body: self.exchangeBody(
+                        space: fixture.allowListSpace,
+                        clientAttestation: attestation
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(
+                        try self.errorCode(response.body),
+                        "InvalidDelegationToken"
+                    )
+                }
+                let replayedDelegationRequestCount =
+                    await transport.requestCount()
+                XCTAssertEqual(replayedDelegationRequestCount, 0)
+
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
                     headers: self.exchangeHeaders(wrongSpaceDelegation),
                     body: self.exchangeBody(
                         space: fixture.allowListSpace,
@@ -360,6 +414,510 @@ final class SpaceCredentialHTTPTests: XCTestCase, @unchecked Sendable {
         } catch {
             try? await fixture.close()
             throw error
+        }
+    }
+
+    func testRemoteJWKSAndTypedRealPolicyFailuresAtHTTPBoundary() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let clientID = "https://reader.example/client-metadata.json"
+            let jwksURI = "https://keys.example/remote-jwks.json"
+            let clientKey = P256.Signing.PrivateKey()
+            let metadata = try credentialAttestationMetadata(
+                clientID: clientID,
+                jwksURI: jwksURI
+            )
+            let keySet = try JSONEncoder().encode(
+                OAuthJSONWebKeySet(keys: [
+                    try credentialAttestationJWK(
+                        key: clientKey,
+                        keyID: "key-1"
+                    ),
+                ])
+            )
+            let transport = CredentialAttestationTransport(responseQueues: [
+                clientID: [
+                    try credentialAttestationResponse(body: metadata, url: clientID),
+                ],
+                jwksURI: [
+                    try credentialAttestationResponse(body: keySet, url: jwksURI),
+                ],
+            ])
+            let app = try makeServer(
+                fixture,
+                clientAttestationPolicy: try credentialAttestationPolicy(
+                    control: fixture.control,
+                    transport: transport
+                )
+            ).buildApplication(
+                logger: Logger(label: "SpaceCredentialHTTPTests.remote-jwks")
+            )
+            let attestation = try signedClientAttestation(
+                key: clientKey,
+                clientID: clientID,
+                authority: Self.authority,
+                now: Date(),
+                jti: "remote-jwks-http-success"
+            )
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: self.exchangeHeaders(
+                        try self.delegation(
+                            fixture,
+                            user: Self.outsider,
+                            space: fixture.allowListSpace
+                        )
+                    ),
+                    body: self.exchangeBody(
+                        space: fixture.allowListSpace,
+                        clientAttestation: attestation
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertNotNil(
+                        try self.jsonObject(response.body)["credential"] as? String
+                    )
+                }
+            }
+            let requests = await transport.requestCount()
+            XCTAssertEqual(requests, 2)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    func testBadSignatureUnknownKeyAndRealOutagesMapExactErrors() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let clientID = "https://reader.example/client-metadata.json"
+            let publishedKey = P256.Signing.PrivateKey()
+            let metadata = try credentialAttestationMetadata(
+                clientID: clientID,
+                key: publishedKey
+            )
+            let signatureTransport = CredentialAttestationTransport(
+                responseQueues: [
+                    clientID: [
+                        try credentialAttestationResponse(body: metadata, url: clientID),
+                        try credentialAttestationResponse(body: metadata, url: clientID),
+                        try credentialAttestationResponse(body: metadata, url: clientID),
+                    ],
+                ]
+            )
+            let signatureApp = try makeServer(
+                fixture,
+                clientAttestationPolicy: try credentialAttestationPolicy(
+                    control: fixture.control,
+                    transport: signatureTransport
+                )
+            ).buildApplication(
+                logger: Logger(label: "SpaceCredentialHTTPTests.bad-attestation")
+            )
+            let badSignature = try signedClientAttestation(
+                key: P256.Signing.PrivateKey(),
+                clientID: clientID,
+                authority: Self.authority,
+                now: Date(),
+                jti: "bad-signature-http"
+            )
+            let unknownKey = try signedClientAttestation(
+                key: publishedKey,
+                clientID: clientID,
+                authority: Self.authority,
+                now: Date(),
+                jti: "unknown-key-http",
+                keyID: "unknown-key"
+            )
+            try await signatureApp.test(.router) { client in
+                for token in [badSignature, unknownKey] {
+                    try await client.execute(
+                        uri: Self.credentialPath,
+                        method: .post,
+                        headers: self.exchangeHeaders(
+                            try self.delegation(
+                                fixture,
+                                user: Self.outsider,
+                                space: fixture.allowListSpace
+                            )
+                        ),
+                        body: self.exchangeBody(
+                            space: fixture.allowListSpace,
+                            clientAttestation: token
+                        )
+                    ) { response in
+                        XCTAssertEqual(response.status, .badRequest)
+                        XCTAssertEqual(
+                            try self.errorCode(response.body),
+                            "InvalidClientAttestation"
+                        )
+                    }
+                }
+            }
+
+            let metadataOutageTransport = CredentialAttestationTransport(
+                failure: SwanError.unavailable("private metadata outage sentinel")
+            )
+            let metadataOutageApp = try makeServer(
+                fixture,
+                clientAttestationPolicy: try credentialAttestationPolicy(
+                    control: fixture.control,
+                    transport: metadataOutageTransport
+                )
+            ).buildApplication(
+                logger: Logger(label: "SpaceCredentialHTTPTests.metadata-outage")
+            )
+            let uncachedClientID =
+                "https://outage-reader.example/client-metadata.json"
+            let outageToken = try signedClientAttestation(
+                key: publishedKey,
+                clientID: uncachedClientID,
+                authority: Self.authority,
+                now: Date(),
+                jti: "metadata-outage-http"
+            )
+            try await metadataOutageApp.test(.router) { client in
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: self.exchangeHeaders(
+                        try self.delegation(
+                            fixture,
+                            user: Self.outsider,
+                            space: fixture.publicSpace
+                        )
+                    ),
+                    body: self.exchangeBody(
+                        space: fixture.publicSpace,
+                        clientAttestation: outageToken
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(
+                        try self.errorCode(response.body),
+                        "temporarily_unavailable"
+                    )
+                    XCTAssertFalse(
+                        String(buffer: response.body).contains("outage")
+                    )
+                }
+            }
+
+            let replayTransport = CredentialAttestationTransport(responseQueues: [
+                uncachedClientID: [
+                    try credentialAttestationResponse(
+                        body: credentialAttestationMetadata(
+                            clientID: uncachedClientID,
+                            key: publishedKey
+                        ),
+                        url: uncachedClientID
+                    ),
+                ],
+            ])
+            let replayOutageApp = try makeServer(
+                fixture,
+                clientAttestationPolicy: try credentialAttestationPolicy(
+                    control: fixture.control,
+                    transport: replayTransport,
+                    replayControlStore:
+                        FailingCredentialAttestationReplayStore()
+                )
+            ).buildApplication(
+                logger: Logger(label: "SpaceCredentialHTTPTests.replay-outage")
+            )
+            let replayOutageToken = try signedClientAttestation(
+                key: publishedKey,
+                clientID: uncachedClientID,
+                authority: Self.authority,
+                now: Date(),
+                jti: "replay-outage-http"
+            )
+            try await replayOutageApp.test(.router) { client in
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: self.exchangeHeaders(
+                        try self.delegation(
+                            fixture,
+                            user: Self.outsider,
+                            space: fixture.publicSpace
+                        )
+                    ),
+                    body: self.exchangeBody(
+                        space: fixture.publicSpace,
+                        clientAttestation: replayOutageToken
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(
+                        try self.errorCode(response.body),
+                        "temporarily_unavailable"
+                    )
+                }
+            }
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    func testLocalhostAttestationRejectsWithoutTransportIO() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let transport = CredentialAttestationTransport(responseQueues: [:])
+            let app = try makeServer(
+                fixture,
+                clientAttestationPolicy: try credentialAttestationPolicy(
+                    control: fixture.control,
+                    transport: transport,
+                    allowLocalhostDevelopment: true
+                )
+            ).buildApplication(
+                logger: Logger(label: "SpaceCredentialHTTPTests.localhost")
+            )
+            let token = try signedClientAttestation(
+                key: P256.Signing.PrivateKey(),
+                clientID: "http://localhost",
+                authority: Self.authority,
+                now: Date(),
+                jti: "localhost-http-zero-io"
+            )
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: self.exchangeHeaders(
+                        try self.delegation(
+                            fixture,
+                            user: Self.outsider,
+                            space: fixture.publicSpace
+                        )
+                    ),
+                    body: self.exchangeBody(
+                        space: fixture.publicSpace,
+                        clientAttestation: token
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(
+                        try self.errorCode(response.body),
+                        "InvalidClientAttestation"
+                    )
+                }
+            }
+            let requests = await transport.requestCount()
+            XCTAssertEqual(requests, 0)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    func testAttestationReplaySurvivesControlAndServerReopen() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        let clientID = "https://reader.example/client-metadata.json"
+        let clientKey = P256.Signing.PrivateKey()
+        let token = try signedClientAttestation(
+            key: clientKey,
+            clientID: clientID,
+            authority: Self.authority,
+            now: Date(),
+            jti: "restart-persistent-http-replay"
+        )
+        let initialTransport = CredentialAttestationTransport(
+            response: try credentialAttestationResponse(
+                body: credentialAttestationMetadata(
+                    clientID: clientID,
+                    key: clientKey
+                ),
+                url: clientID
+            )
+        )
+        let initialApp = try makeServer(
+            fixture,
+            clientAttestationPolicy: try credentialAttestationPolicy(
+                control: fixture.control,
+                transport: initialTransport
+            )
+        ).buildApplication(
+            logger: Logger(label: "SpaceCredentialHTTPTests.replay-initial")
+        )
+        try await initialApp.test(.router) { client in
+            try await client.execute(
+                uri: Self.credentialPath,
+                method: .post,
+                headers: self.exchangeHeaders(
+                    try self.delegation(
+                        fixture,
+                        user: Self.outsider,
+                        space: fixture.allowListSpace
+                    )
+                ),
+                body: self.exchangeBody(
+                    space: fixture.allowListSpace,
+                    clientAttestation: token
+                )
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+        try await fixture.close()
+
+        let reopened = try await fixture.reopened()
+        do {
+            let postRestartTransport =
+                CredentialAttestationTransport(responseQueues: [:])
+            let reopenedApp = try makeServer(
+                reopened,
+                clientAttestationPolicy: try credentialAttestationPolicy(
+                    control: reopened.control,
+                    transport: postRestartTransport
+                )
+            ).buildApplication(
+                logger: Logger(label: "SpaceCredentialHTTPTests.replay-reopen")
+            )
+            try await reopenedApp.test(.router) { client in
+                try await client.execute(
+                    uri: Self.credentialPath,
+                    method: .post,
+                    headers: self.exchangeHeaders(
+                        try self.delegation(
+                            reopened,
+                            user: Self.outsider,
+                            space: reopened.allowListSpace
+                        )
+                    ),
+                    body: self.exchangeBody(
+                        space: reopened.allowListSpace,
+                        clientAttestation: token
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(
+                        try self.errorCode(response.body),
+                        "InvalidClientAttestation"
+                    )
+                }
+            }
+            let requests = await postRestartTransport.requestCount()
+            XCTAssertEqual(requests, 0)
+            try await reopened.close()
+        } catch {
+            try? await reopened.close()
+            throw error
+        }
+    }
+
+    func testFailedExchangePersistsOnlyValidatedPublicMetadata() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        let clientID =
+            "https://reader.example/client-metadata.json"
+        let publishedKey = P256.Signing.PrivateKey()
+        let privateFailureKey = try P256.Signing.PrivateKey(
+            rawRepresentation: Data((33 ... 64).map(UInt8.init))
+        )
+        let jti = "raw-jti-must-not-persist-http"
+        let attestation = try signedClientAttestation(
+            key: privateFailureKey,
+            clientID: clientID,
+            authority: Self.authority,
+            now: Date(),
+            jti: jti
+        )
+        let metadata = try credentialAttestationMetadata(
+            clientID: clientID,
+            key: publishedKey
+        )
+        let transport = CredentialAttestationTransport(responseQueues: [
+            clientID: [
+                try credentialAttestationResponse(body: metadata, url: clientID),
+                try credentialAttestationResponse(body: metadata, url: clientID),
+            ],
+        ])
+        let app = try makeServer(
+            fixture,
+            clientAttestationPolicy: try credentialAttestationPolicy(
+                control: fixture.control,
+                transport: transport
+            )
+        ).buildApplication(
+            logger: Logger(label: "SpaceCredentialHTTPTests.persistence-boundary")
+        )
+        let delegation = try self.delegation(
+            fixture,
+            user: Self.outsider,
+            space: fixture.allowListSpace
+        )
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: Self.credentialPath,
+                method: .post,
+                headers: self.exchangeHeaders(delegation),
+                body: self.exchangeBody(
+                    space: fixture.allowListSpace,
+                    clientAttestation: attestation
+                )
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest)
+                self.assertNoStore(response)
+                XCTAssertEqual(
+                    try self.errorCode(response.body),
+                    "InvalidClientAttestation"
+                )
+                let rendered = String(buffer: response.body)
+                XCTAssertFalse(rendered.contains(jti))
+                XCTAssertFalse(rendered.contains(clientID))
+            }
+        }
+        let credentialHeader = try PermissionedDataJWT.createSpaceCredential(
+            issuer: Self.authority,
+            space: fixture.allowListSpace,
+            key: fixture.authorityKey
+        ).split(separator: ".", maxSplits: 1).first.map(String.init)!
+        let publicJWK = try credentialAttestationJWK(
+            key: publishedKey,
+            keyID: "key-1"
+        )
+        let liveFiles = credentialSQLiteFiles(in: fixture.root)
+        let liveNames = Set(liveFiles.map(\.lastPathComponent))
+        XCTAssertTrue(liveNames.contains("control.sqlite"))
+        XCTAssertTrue(liveNames.contains("control.sqlite-wal"))
+        XCTAssertTrue(liveNames.contains("control.sqlite-shm"))
+        let liveDatabaseBytes = try liveFiles.map { try Data(contentsOf: $0) }
+        try await fixture.close()
+
+        let databaseBytes =
+            liveDatabaseBytes + (try credentialSQLiteBytes(in: fixture.root))
+        XCTAssertTrue(
+            databaseBytes.contains { $0.range(of: Data(clientID.utf8)) != nil }
+        )
+        XCTAssertTrue(
+            databaseBytes.contains {
+                $0.range(of: Data(publicJWK.x.utf8)) != nil
+            }
+        )
+        for bytes in databaseBytes {
+            for prohibited in [
+                Data(attestation.utf8),
+                Data(jti.utf8),
+                Data(delegation.utf8),
+                privateFailureKey.rawRepresentation,
+                Data(credentialHeader.utf8),
+            ] {
+                XCTAssertNil(bytes.range(of: prohibited))
+            }
         }
     }
 
@@ -792,11 +1350,15 @@ private struct FailingClientAttestationPolicy:
 
 private func credentialAttestationPolicy(
     control: SQLiteControlDatabase,
-    transport: CredentialAttestationTransport
+    transport: CredentialAttestationTransport,
+    replayControlStore: (any SpaceClientAttestationReplayStore)? = nil,
+    allowLocalhostDevelopment: Bool = false
 ) throws -> DurableSpaceCredentialClientAttestationPolicy {
     let address = OAuthIPAddress(literal: "93.184.216.34")!
     let fetcher = OAuthRemoteDocumentFetcher(
-        policy: try OAuthRemoteFetchPolicy(),
+        policy: try OAuthRemoteFetchPolicy(
+            allowLocalhostDevelopment: allowLocalhostDevelopment
+        ),
         resolver: CredentialAttestationResolver(address: address),
         transport: transport
     )
@@ -806,7 +1368,7 @@ private func credentialAttestationPolicy(
             controlStore: control
         ),
         replayStore: DurableSpaceClientAttestationReplayStore(
-            controlStore: control,
+            controlStore: replayControlStore ?? control,
             serverKey: Data(repeating: 0xD4, count: 32)
         )
     )
@@ -814,14 +1376,15 @@ private func credentialAttestationPolicy(
 
 private func credentialAttestationMetadata(
     clientID: String,
-    key: P256.Signing.PrivateKey
+    key: P256.Signing.PrivateKey? = nil,
+    jwksURI: String? = nil
 ) throws -> Data {
-    let bytes = key.publicKey.x963Representation
-    let jwk = try OAuthJSONWebKey(
-        x: Data(bytes[1 ..< 33]).base64URLEncodedString(),
-        y: Data(bytes[33 ..< 65]).base64URLEncodedString(),
-        keyID: "key-1"
-    )
+    let jwk: OAuthJSONWebKey?
+    if let key {
+        jwk = try credentialAttestationJWK(key: key, keyID: "key-1")
+    } else {
+        jwk = nil
+    }
     return try JSONEncoder().encode(
         OAuthClientMetadata(
             clientID: URL(string: clientID)!,
@@ -832,8 +1395,21 @@ private func credentialAttestationMetadata(
             tokenEndpointAuthMethod: .privateKeyJWT,
             tokenEndpointAuthSigningAlgorithm: "ES256",
             dpopBoundAccessTokens: true,
-            jwks: OAuthJSONWebKeySet(keys: [jwk])
+            jwks: try jwk.map { try OAuthJSONWebKeySet(keys: [$0]) },
+            jwksURI: jwksURI.flatMap(URL.init(string:))
         )
+    )
+}
+
+private func credentialAttestationJWK(
+    key: P256.Signing.PrivateKey,
+    keyID: String
+) throws -> OAuthJSONWebKey {
+    let bytes = key.publicKey.x963Representation
+    return try OAuthJSONWebKey(
+        x: Data(bytes[1 ..< 33]).base64URLEncodedString(),
+        y: Data(bytes[33 ..< 65]).base64URLEncodedString(),
+        keyID: keyID
     )
 }
 
@@ -855,14 +1431,15 @@ private func signedClientAttestation(
     clientID: String,
     authority: String,
     now: Date,
-    jti: String
+    jti: String,
+    keyID: String = "key-1"
 ) throws -> String {
     let issuedAt = Int64(now.timeIntervalSince1970)
     let header = try JSONSerialization.data(
         withJSONObject: [
             "alg": "ES256",
             "typ": PermissionedDataJWT.clientAttestationType,
-            "kid": "key-1",
+            "kid": keyID,
         ],
         options: [.sortedKeys, .withoutEscapingSlashes]
     ).base64URLEncodedString()
@@ -898,25 +1475,75 @@ private actor CredentialAttestationResolver: OAuthHostnameResolving {
 }
 
 private actor CredentialAttestationTransport: OAuthRemoteTransport {
-    let response: OAuthRemoteHTTPResponse
+    private var responseQueues: [String: [OAuthRemoteHTTPResponse]]
+    private let failure: (any Error)?
     private var requests = 0
 
     init(response: OAuthRemoteHTTPResponse) {
-        self.response = response
+        responseQueues = [response.responseURL.absoluteString: [response]]
+        failure = nil
+    }
+
+    init(responseQueues: [String: [OAuthRemoteHTTPResponse]]) {
+        self.responseQueues = responseQueues
+        failure = nil
+    }
+
+    init(failure: any Error) {
+        responseQueues = [:]
+        self.failure = failure
     }
 
     func get(
-        url _: URL,
+        url: URL,
         approvedPeers _: Set<OAuthIPAddress>,
         timeout _: TimeInterval,
         maximumBodyBytes _: Int
     ) async throws -> OAuthRemoteHTTPResponse {
         requests += 1
+        if let failure {
+            throw failure
+        }
+        guard var queue = responseQueues[url.absoluteString],
+              !queue.isEmpty else {
+            throw SwanError.unavailable("credential attestation transport unavailable")
+        }
+        let response = queue.removeFirst()
+        responseQueues[url.absoluteString] = queue
         return response
     }
 
     func requestCount() -> Int {
         requests
+    }
+}
+
+private struct FailingCredentialAttestationReplayStore:
+    SpaceClientAttestationReplayStore
+{
+    func claimSpaceClientAttestation(
+        digest _: Data,
+        expiresAt _: Date,
+        now _: Date
+    ) async throws -> Bool {
+        throw SwanError.unavailable("private replay outage sentinel")
+    }
+}
+
+private func credentialSQLiteBytes(in root: URL) throws -> [Data] {
+    try credentialSQLiteFiles(in: root).map { try Data(contentsOf: $0) }
+}
+
+private func credentialSQLiteFiles(in root: URL) -> [URL] {
+    let files = FileManager.default.enumerator(
+        at: root,
+        includingPropertiesForKeys: [.isRegularFileKey]
+    )?.allObjects as? [URL] ?? []
+    return files.filter {
+        let name = $0.lastPathComponent
+        return name.hasSuffix(".sqlite")
+            || name.hasSuffix(".sqlite-wal")
+            || name.hasSuffix(".sqlite-shm")
     }
 }
 
@@ -1124,6 +1751,37 @@ private struct Fixture: Sendable {
     func close() async throws {
         try await directory.close()
         try await control.close()
+    }
+
+    func reopened() async throws -> Fixture {
+        let reopenedControl = try await SQLiteControlDatabase(
+            dataDirectory: root
+        )
+        do {
+            return Fixture(
+                root: root,
+                publicSpace: publicSpace,
+                memberSpace: memberSpace,
+                allowListSpace: allowListSpace,
+                managingSpace: managingSpace,
+                publicRecord: publicRecord,
+                control: reopenedControl,
+                directory: try await .bootstrap(
+                    dataDirectory: root,
+                    controlStore: reopenedControl
+                ),
+                runtime: try SwanOAuthRuntime(
+                    controlStore: reopenedControl,
+                    serverKey: Data(repeating: 0xC3, count: 32)
+                ),
+                authorityKey: authorityKey,
+                memberKey: memberKey,
+                outsiderKey: outsiderKey
+            )
+        } catch {
+            try? await reopenedControl.close()
+            throw error
+        }
     }
 
     func cleanup() {
