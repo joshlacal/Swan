@@ -11,6 +11,7 @@ import SwanOAuth
 import SwanPublicRepository
 import SwanSQLite
 import SwanStorage
+import SwanSpaces
 import ServiceLifecycle
 
 #if canImport(Darwin)
@@ -2563,7 +2564,7 @@ extension SwanCommand {
     struct Lab: ParsableCommand {
         static let configuration = CommandConfiguration(
             abstract: "Validate and record sanitized Compose laboratory scenarios",
-            subcommands: [Validate.self, Matrix.self, Scenario.self, Semantic.self],
+            subcommands: [Validate.self, Matrix.self, Scenario.self, Semantic.self, Live.self],
             defaultSubcommand: Validate.self
         )
 
@@ -2735,6 +2736,193 @@ extension SwanCommand {
             }
         }
 
+        struct Live: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                abstract: "Run one stateful public or permissioned cross-host round trip"
+            )
+
+            @Option(name: .long, help: "Round-trip mode: public or permissioned")
+            var mode: String = "public"
+
+            @Option(name: .long, help: "Scenario identifier (letters, numbers, hyphen, and underscore only)")
+            var name: String = "live-round-trip"
+
+            @Option(name: .long, help: "Producer URL, or member URL in permissioned mode")
+            var producerURL: String = ""
+
+            @Option(name: .long, help: "Consumer URL, or authority URL in permissioned mode")
+            var consumerURL: String = ""
+
+            @Option(name: .long, help: "Producer/member auth: none, bearer, or oauth")
+            var producerAuth: String = "none"
+
+            @Option(name: .long, help: "Consumer auth: none or bearer (ignored for permissioned credential reads)")
+            var consumerAuth: String = "none"
+
+            @Option(name: .long, help: "Environment variable containing producer/member bearer token")
+            var producerTokenEnv: String = "SWAN_LAB_PRODUCER_TOKEN"
+
+            @Option(name: .long, help: "Environment variable containing consumer bearer token")
+            var consumerTokenEnv: String = "SWAN_LAB_CONSUMER_TOKEN"
+
+            @Option(name: .long, help: "Producer/member OAuth handle environment variable")
+            var producerHandleEnv: String = "SWAN_LAB_PRODUCER_HANDLE"
+
+            @Option(name: .long, help: "Producer/member OAuth password environment variable")
+            var producerPasswordEnv: String = "SWAN_LAB_PRODUCER_PASSWORD"
+
+            @Option(name: .long, help: "Consumer OAuth handle environment variable")
+            var consumerHandleEnv: String = "SWAN_LAB_CONSUMER_HANDLE"
+
+            @Option(name: .long, help: "Consumer OAuth password environment variable")
+            var consumerPasswordEnv: String = "SWAN_LAB_CONSUMER_PASSWORD"
+
+            @Option(name: .long, help: "Producer/member OAuth client metadata URL")
+            var producerClientID: String = ""
+
+            @Option(name: .long, help: "Producer/member OAuth redirect URI")
+            var producerRedirectURI: String = ""
+
+            @Option(name: .long, help: "Consumer OAuth client metadata URL")
+            var consumerClientID: String = ""
+
+            @Option(name: .long, help: "Consumer OAuth redirect URI")
+            var consumerRedirectURI: String = ""
+
+            @Option(name: .long, parsing: .upToNextOption, help: "OAuth scope to request; repeatable")
+            var scope: [String] = ["atproto"]
+
+            @Option(name: .long, help: "Public repository DID; required in public mode")
+            var repository: String = ""
+
+            @Option(name: .long, help: "Public record collection NSID; required in public mode")
+            var collection: String = ""
+
+            @Option(name: .long, help: "Public record key; required in public mode")
+            var rkey: String = ""
+
+            @Option(name: .long, help: "Permissioned space URI; required in permissioned mode")
+            var space: String = ""
+
+            @Option(name: .long, help: "JSON request body file for the write")
+            var bodyFile: String
+
+            @Option(name: .long, parsing: .upToNextOption, help: "Permissioned read query item key=value; repeatable")
+            var readQuery: [String] = []
+
+            @Option(name: .long, help: "Destination for the sanitized JSON artifact")
+            var output: String = "artifacts/live-round-trip.json"
+
+            @Option(name: .long, help: "Per-request timeout in seconds")
+            var requestTimeoutSeconds: Double = 15
+
+            @Flag(
+                name: .customLong("fail-on-failure"),
+                inversion: .prefixedNo,
+                help: "Return non-zero when the semantic artifact is not passed (default)"
+            )
+            var failOnFailure: Bool = true
+
+            func run() async throws {
+                let normalizedMode = mode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                guard normalizedMode == "public" || normalizedMode == "permissioned" else {
+                    throw ValidationError("live mode must be public or permissioned")
+                }
+                let normalizedScenario = try LabLiveSupport.identifier(name, label: "scenario")
+                let producerURL = try LabLiveSupport.url(
+                    explicit: producerURL,
+                    environment: "SWAN_LAB_PRODUCER_URL",
+                    fallback: "https://swan.test"
+                )
+                let consumerURL = try LabLiveSupport.url(
+                    explicit: consumerURL,
+                    environment: "SWAN_LAB_CONSUMER_URL",
+                    fallback: "https://pds.test"
+                )
+                let producer = try await LabLiveSupport.host(
+                    label: normalizedMode == "permissioned" ? "member" : "producer",
+                    url: producerURL,
+                    auth: producerAuth,
+                    tokenEnvironment: producerTokenEnv,
+                    handleEnvironment: producerHandleEnv,
+                    passwordEnvironment: producerPasswordEnv,
+                    clientID: producerClientID,
+                    redirectURI: producerRedirectURI,
+                    scopes: scope,
+                    timeout: requestTimeoutSeconds
+                )
+                let consumer = try await LabLiveSupport.host(
+                    label: normalizedMode == "permissioned" ? "authority" : "consumer",
+                    url: consumerURL,
+                    auth: consumerAuth,
+                    tokenEnvironment: consumerTokenEnv,
+                    handleEnvironment: consumerHandleEnv,
+                    passwordEnvironment: consumerPasswordEnv,
+                    clientID: consumerClientID,
+                    redirectURI: consumerRedirectURI,
+                    scopes: scope,
+                    timeout: requestTimeoutSeconds
+                )
+                let body = try LabLiveSupport.body(at: URL(fileURLWithPath: bodyFile))
+                let artifact: any Encodable
+                let status: String
+                if normalizedMode == "public" {
+                    guard !repository.isEmpty, !collection.isEmpty, !rkey.isEmpty else {
+                        throw ValidationError("public live mode requires --repository, --collection, and --rkey")
+                    }
+                    let result = await LiveInteropRunner.publicPutAndRead(
+                        scenario: normalizedScenario,
+                        producer: producer,
+                        consumer: consumer,
+                        repository: repository,
+                        collection: collection,
+                        rkey: rkey,
+                        putBody: body
+                    )
+                    artifact = result
+                    status = result.status
+                } else {
+                    guard !space.isEmpty else {
+                        throw ValidationError("permissioned live mode requires --space")
+                    }
+                    let parsedSpace: SpaceURI
+                    do {
+                        parsedSpace = try SpaceURI(space)
+                    } catch {
+                        throw ValidationError("--space is not a valid space URI")
+                    }
+                    let query = try LabLiveSupport.query(readQuery)
+                    let broker = SpaceCredentialBroker(
+                        member: producer.client,
+                        authority: consumer.client
+                    )
+                    let result = await LiveInteropRunner.permissionedCreateAndRead(
+                        scenario: normalizedScenario,
+                        member: producer,
+                        authority: consumer,
+                        broker: broker,
+                        space: parsedSpace,
+                        createBody: body,
+                        readQuery: query
+                    )
+                    artifact = result
+                    status = result.status
+                }
+                let outputURL = URL(fileURLWithPath: output)
+                try FileManager.default.createDirectory(
+                    at: outputURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                try encoder.encode(AnyEncodable(artifact)).write(to: outputURL, options: .atomic)
+                print("LIVE INTEROP ARTIFACT WRITTEN: \(outputURL.path) status=\(status)")
+                guard !failOnFailure || status == "passed" else {
+                    throw ValidationError("live interoperability did not pass; inspect \(outputURL.lastPathComponent)")
+                }
+            }
+        }
+
         struct Matrix: AsyncParsableCommand {
             static let configuration = CommandConfiguration(
                 abstract: "Run multiple interoperability fault modes and write one sanitized artifact per mode"
@@ -2854,6 +3042,176 @@ extension SwanCommand {
                 }
             }
         }
+    }
+}
+
+private enum LabLiveSupport {
+    static func identifier(_ rawValue: String, label: String) throws -> String {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty,
+              value.unicodeScalars.allSatisfy({
+                  CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_" )).contains($0)
+              }) else {
+            throw ValidationError("\(label) must be an alphanumeric identifier using only letters, numbers, '-' and '_'")
+        }
+        return value
+    }
+
+    static func url(
+        explicit: String,
+        environment: String,
+        fallback: String
+    ) throws -> URL {
+        let raw = explicit.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? (ProcessInfo.processInfo.environment[environment] ?? fallback)
+            : explicit
+        guard let url = URL(string: raw),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              let host = components.host, !host.isEmpty,
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil else {
+            throw ValidationError("live endpoint URL is invalid")
+        }
+        return url
+    }
+
+    static func requiredURL(_ raw: String, label: String) throws -> URL {
+        guard let url = URL(string: raw),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              components.host?.isEmpty == false,
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil else {
+            throw ValidationError("\(label) URL is invalid")
+        }
+        return url
+    }
+
+    static func host(
+        label: String,
+        url: URL,
+        auth: String,
+        tokenEnvironment: String,
+        handleEnvironment: String,
+        passwordEnvironment: String,
+        clientID: String,
+        redirectURI: String,
+        scopes: [String],
+        timeout: Double
+    ) async throws -> LiveInteropHost {
+        guard timeout > 0, timeout <= 120, timeout.isFinite else {
+            throw ValidationError("--request-timeout-seconds is invalid")
+        }
+        let client = try InteropXRPCClient(baseURL: url, timeout: timeout)
+        switch auth.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "none":
+            return LiveInteropHost(label: label, client: client)
+        case "bearer":
+            return LiveInteropHost(
+                label: label,
+                client: client,
+                authorization: .bearer(token: try environmentValue(tokenEnvironment, label: "bearer token"))
+            )
+        case "oauth":
+            let handle = try environmentValue(handleEnvironment, label: "OAuth handle")
+            let password = try environmentValue(passwordEnvironment, label: "OAuth password")
+            let clientIDURL = try requiredURL(clientID, label: "OAuth client metadata")
+            let redirectURL = try requiredURL(redirectURI, label: "OAuth redirect")
+            let requestedScopes = Set(scopes.map {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            }.filter { !$0.isEmpty })
+            guard !requestedScopes.isEmpty else {
+                throw ValidationError("OAuth scope must not be empty")
+            }
+            let oauth = try SwanOAuthLabClient(
+                issuer: url,
+                clientID: clientIDURL,
+                redirectURI: redirectURL,
+                timeout: timeout
+            )
+            let token = try await oauth.authorizationCode(
+                handle: handle,
+                password: password,
+                scopes: requestedScopes
+            )
+            let provider = await oauth.authorizationProvider(for: token)
+            return LiveInteropHost(
+                label: label,
+                client: client,
+                authorizationProvider: provider
+            )
+        default:
+            throw ValidationError("live auth must be none, bearer, or oauth")
+        }
+    }
+
+    static func body(at url: URL) throws -> Data {
+        let attributes: [FileAttributeKey: Any]
+        do {
+            attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        } catch {
+            throw ValidationError("live body file is unavailable")
+        }
+        guard (attributes[.type] as? FileAttributeType) == .typeRegular,
+              let size = attributes[.size] as? NSNumber,
+              size.intValue <= 2 * 1024 * 1024 else {
+            throw ValidationError("live body file must be a regular file no larger than 2 MiB")
+        }
+        do {
+            return try Data(contentsOf: url, options: [.mappedIfSafe])
+        } catch {
+            throw ValidationError("live body file is unavailable")
+        }
+    }
+
+    static func query(_ rawValues: [String]) throws -> [String: String] {
+        var result: [String: String] = [:]
+        for raw in rawValues {
+            let pieces = raw.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard pieces.count == 2 else {
+                throw ValidationError("--read-query values must use key=value")
+            }
+            let key = String(pieces[0])
+            let value = String(pieces[1])
+            guard !key.isEmpty, key.utf8.count <= 256, value.utf8.count <= 4_096,
+                  result[key] == nil else {
+                throw ValidationError("--read-query contains an invalid or duplicate key")
+            }
+            result[key] = value
+        }
+        for required in ["space", "repo", "collection", "rkey"] {
+            guard result[required]?.isEmpty == false else {
+                throw ValidationError("permissioned live mode requires --read-query \(required)=...")
+            }
+        }
+        return result
+    }
+
+    private static func environmentValue(_ name: String, label: String) throws -> String {
+        guard name.utf8.count <= 128,
+              name.utf8.allSatisfy({
+                  ($0 >= 0x41 && $0 <= 0x5a) || ($0 >= 0x30 && $0 <= 0x39) || $0 == 0x5f
+              }),
+              let value = ProcessInfo.processInfo.environment[name],
+              !value.isEmpty else {
+            throw ValidationError("live \(label) environment variable is unavailable")
+        }
+        return value
+    }
+}
+
+private struct AnyEncodable: Encodable {
+    private let encodeValue: (Encoder) throws -> Void
+
+    init(_ value: any Encodable) {
+        encodeValue = value.encode(to:)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        try encodeValue(encoder)
     }
 }
 

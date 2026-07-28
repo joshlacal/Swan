@@ -216,6 +216,22 @@ public actor SwanOAuthLabClient {
         return try await tokenRequest(body: body)
     }
 
+    /// Produces a per-request authorization provider for a live interop host.
+    /// The provider binds each proof to the exact method/URL supplied by the
+    /// runner; the token and DPoP key remain inside this actor and are never
+    /// passed to fixture serialization.
+    public func authorizationProvider(
+        for token: InteropOAuthToken
+    ) -> InteropAuthorizationProvider {
+        { [self] method, target, _ in
+            try await self.resourceAuthorization(
+                token: token,
+                method: method.rawValue,
+                target: target
+            )
+        }
+    }
+
     /// Performs one resource request with a fresh DPoP proof and transparently
     /// retries once after a valid `DPoP-Nonce` challenge.
     public func resourceAuthorization(

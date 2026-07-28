@@ -210,6 +210,77 @@ final class SwanInteropTests: XCTestCase {
         XCTAssertTrue((object["fixturePolicy"] as? String ?? "").hasPrefix("summary-only"))
     }
 
+    func testPermissionedRoundTripArtifactCarriesCommitmentsOnly() throws {
+        let artifact = LiveInteropPermissionedRoundTripArtifact(
+            scenario: "permissioned-cross-host",
+            member: "member-host",
+            authority: "authority-host",
+            credentialIssued: true,
+            writeStatus: 200,
+            readStatus: 200,
+            writeCID: "bafywrite",
+            readCID: "bafywrite",
+            writeResponseSHA256: String(repeating: "a", count: 64),
+            readResponseSHA256: String(repeating: "b", count: 64),
+            converged: true,
+            status: "passed",
+            errorCode: nil,
+            events: []
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(artifact)) as? [String: Any]
+        )
+        XCTAssertEqual(object["writeCID"] as? String, "bafywrite")
+        XCTAssertEqual(object["readCID"] as? String, "bafywrite")
+        XCTAssertEqual(object["status"] as? String, "passed")
+        let keys = Set(Self.sanitizedKeys(in: object).map { $0.lowercased() })
+        for forbidden in ["access_token", "refresh_token", "dpop", "private_key", "record_value"] {
+            XCTAssertFalse(keys.contains { $0.contains(forbidden) }, "artifact leaked forbidden key: \(forbidden)")
+        }
+    }
+
+    func testLiveRoundTripRejectsSelectorBodyMismatchBeforeNetwork() async throws {
+        let url = URL(string: "https://127.0.0.1:1")!
+        let client = try InteropXRPCClient(baseURL: url, timeout: 0.2)
+        let producer = LiveInteropHost(label: "producer", client: client)
+        let consumer = LiveInteropHost(label: "consumer", client: client)
+        let publicArtifact = await LiveInteropRunner.publicPutAndRead(
+            scenario: "selector-mismatch",
+            producer: producer,
+            consumer: consumer,
+            repository: "did:plc:abcdefghijklmnopqrstuvwx",
+            collection: "app.bsky.feed.post",
+            rkey: "expected",
+            putBody: Data(#"{"repo":"did:plc:abcdefghijklmnopqrstuvwx","collection":"app.bsky.feed.post","rkey":"other"}"#.utf8)
+        )
+        XCTAssertEqual(publicArtifact.status, "failed")
+        XCTAssertEqual(publicArtifact.errorCode, "InvalidRequest")
+        XCTAssertTrue(publicArtifact.events.isEmpty)
+
+        let space = try SpaceURI(
+            authority: "did:plc:abcdefghijklmnopqrstuvwx",
+            spaceType: "app.swan.interop",
+            skey: "selector-mismatch"
+        )
+        let permissionedArtifact = await LiveInteropRunner.permissionedCreateAndRead(
+            scenario: "permissioned-selector-mismatch",
+            member: producer,
+            authority: consumer,
+            broker: SpaceCredentialBroker(member: client, authority: client),
+            space: space,
+            createBody: Data(#"{"space":"wrong-space","repo":"did:plc:abcdefghijklmnopqrstuvwx","collection":"app.bsky.feed.post","rkey":"r1"}"#.utf8),
+            readQuery: [
+                "space": space.rawValue,
+                "repo": "did:plc:abcdefghijklmnopqrstuvwx",
+                "collection": "app.bsky.feed.post",
+                "rkey": "r1",
+            ]
+        )
+        XCTAssertEqual(permissionedArtifact.status, "failed")
+        XCTAssertEqual(permissionedArtifact.errorCode, "InvalidRequest")
+        XCTAssertTrue(permissionedArtifact.events.isEmpty)
+    }
+
     func testLiveReplicaRejectsReorderingAndVerifiesReaderCommitBeforePublication() async throws {
         let space = try SpaceURI(
             authority: "did:plc:alice",

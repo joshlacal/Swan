@@ -67,6 +67,15 @@ public enum InteropAuthorization: Sendable, Equatable {
     case service(token: String)
 }
 
+/// Optional per-request authorization used by live OAuth runs. A static
+/// bearer/DPoP value is useful for reference fixtures, but Swan's resource
+/// server binds DPoP proofs to the exact target and nonce. Keeping this as a
+/// callback lets the runner mint a fresh proof without ever serializing the
+/// token or private key into an artifact.
+public typealias InteropAuthorizationProvider = @Sendable (
+    InteropHTTPMethod, URL, Data?
+) async throws -> InteropAuthorization
+
 /// A small AsyncHTTPClient adapter with strict bounds and no redirect
 /// following.  It is deliberately independent of the Hummingbird server so
 /// the same client can drive Swan, the pinned TypeScript PDS, or a faultable
@@ -358,7 +367,7 @@ public struct InteropXRPCClient: Sendable {
         to destination: URL,
         maximumResponseBytes: Int
     ) async throws -> InteropHTTPResponse {
-        let path = try makeXRPCPath(nsid, query: query)
+        let path = try xrpcPath(nsid, query: query)
         var headers = ["Accept": "application/vnd.ipld.car, application/octet-stream, */*"]
         addAuthorization(authorization, to: &headers)
         return try await http.executeStreaming(
@@ -368,6 +377,13 @@ public struct InteropXRPCClient: Sendable {
             to: destination,
             maximumResponseBytes: maximumResponseBytes
         )
+    }
+
+    /// Returns the exact path used for an XRPC request. Callers that bind
+    /// DPoP proofs to the request target should use this instead of rebuilding
+    /// query encoding independently.
+    public func xrpcPath(_ nsid: String, query: [String: String] = [:]) throws -> String {
+        try makeXRPCPath(nsid, query: query)
     }
 
     private func request(
@@ -511,15 +527,18 @@ public struct LiveInteropHost: Sendable {
     public let label: String
     public let client: InteropXRPCClient
     public let authorization: InteropAuthorization
+    public let authorizationProvider: InteropAuthorizationProvider?
 
     public init(
         label: String,
         client: InteropXRPCClient,
-        authorization: InteropAuthorization = .none
+        authorization: InteropAuthorization = .none,
+        authorizationProvider: InteropAuthorizationProvider? = nil
     ) {
         self.label = label
         self.client = client
         self.authorization = authorization
+        self.authorizationProvider = authorizationProvider
     }
 }
 
@@ -573,6 +592,59 @@ public struct LiveInteropPublicRoundTripArtifact: Codable, Sendable, Equatable {
     }
 }
 
+public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equatable {
+    public let scenario: String
+    public let profileID: String
+    public let member: String
+    public let authority: String
+    public let credentialIssued: Bool
+    public let writeStatus: Int?
+    public let readStatus: Int?
+    public let writeCID: String?
+    public let readCID: String?
+    public let writeResponseSHA256: String?
+    public let readResponseSHA256: String?
+    public let converged: Bool
+    public let status: String
+    public let errorCode: String?
+    public let fixturePolicy: String
+    public let events: [InteropFixtureEvent]
+
+    public init(
+        scenario: String,
+        member: String,
+        authority: String,
+        credentialIssued: Bool,
+        writeStatus: Int?,
+        readStatus: Int?,
+        writeCID: String?,
+        readCID: String?,
+        writeResponseSHA256: String?,
+        readResponseSHA256: String?,
+        converged: Bool,
+        status: String,
+        errorCode: String?,
+        events: [InteropFixtureEvent]
+    ) {
+        self.scenario = FixtureSanitizer.sanitize(["scenario": scenario])["scenario"] ?? "<redacted>"
+        self.profileID = OfflineProtocolProfileVerifier.stableProfileID
+        self.member = FixtureSanitizer.sanitize(["host": member])["host"] ?? "<redacted>"
+        self.authority = FixtureSanitizer.sanitize(["host": authority])["host"] ?? "<redacted>"
+        self.credentialIssued = credentialIssued
+        self.writeStatus = writeStatus
+        self.readStatus = readStatus
+        self.writeCID = writeCID
+        self.readCID = readCID
+        self.writeResponseSHA256 = writeResponseSHA256
+        self.readResponseSHA256 = readResponseSHA256
+        self.converged = converged
+        self.status = status
+        self.errorCode = errorCode.map { FixtureSanitizer.sanitize(["error": $0])["error"] ?? "<redacted>" }
+        self.fixturePolicy = "semantic-summary-only; no credentials, tokens, DPoP proofs, request bodies, record values, or personal selectors"
+        self.events = events
+    }
+}
+
 /// Stateful public-data interop that proves a write response and a subsequent
 /// read response agree on the record CID. It is intentionally separate from
 /// the older endpoint-probe runner: a probe can be useful diagnostically, but
@@ -595,6 +667,18 @@ public enum LiveInteropRunner {
         let recorder = recorder ?? InteropFixtureRecorder()
         let putPath = "/xrpc/com.atproto.repo.putRecord"
         let getPath = "/xrpc/com.atproto.repo.getRecord"
+        guard jsonFields(putBody, equalTo: [
+            "repo": repository,
+            "collection": collection,
+            "rkey": rkey,
+        ]) else {
+            return await artifact(
+                scenario: scenario, producer: producer, consumer: consumer,
+                putStatus: nil, readStatus: nil, putCID: nil, readCID: nil,
+                putDigest: nil, readDigest: nil, converged: false,
+                errorCode: "InvalidRequest", recorder: recorder
+            )
+        }
         var putStatus: Int?
         var readStatus: Int?
         var putCID: String?
@@ -604,10 +688,16 @@ public enum LiveInteropRunner {
         var errorCode: String?
 
         do {
+            let authorization = try await authorization(
+                for: producer,
+                method: .post,
+                path: putPath,
+                body: putBody
+            )
             let response = try await producer.client.procedure(
                 "com.atproto.repo.putRecord",
                 body: putBody,
-                authorization: producer.authorization
+                authorization: authorization
             )
             putStatus = response.status
             putDigest = responseDigest(response)
@@ -648,10 +738,19 @@ public enum LiveInteropRunner {
         }
 
         do {
+            let authorization = try await authorization(
+                for: consumer,
+                method: .get,
+                path: try consumer.client.xrpcPath(
+                    "com.atproto.repo.getRecord",
+                    query: ["repo": repository, "collection": collection, "rkey": rkey]
+                ),
+                body: nil
+            )
             let response = try await consumer.client.query(
                 "com.atproto.repo.getRecord",
                 query: ["repo": repository, "collection": collection, "rkey": rkey],
-                authorization: consumer.authorization
+                authorization: authorization
             )
             readStatus = response.status
             readDigest = responseDigest(response)
@@ -684,6 +783,147 @@ public enum LiveInteropRunner {
         )
     }
 
+    /// Exercises the permissioned cross-host sequence without baking a
+    /// particular authority placement into the runner: a member mints a
+    /// delegation, the authority exchanges it for a reader credential, and a
+    /// credential-authenticated write/read pair is checked for successful
+    /// responses. The caller supplies the exact generated request bodies so
+    /// this remains compatible with the pinned lexicon branch.
+    public static func permissionedCreateAndRead(
+        scenario: String,
+        member: LiveInteropHost,
+        authority: LiveInteropHost,
+        broker: SpaceCredentialBroker,
+        space: SpaceURI,
+        createBody: Data,
+        readQuery: [String: String],
+        clientAttestation: String? = nil,
+        recorder: InteropFixtureRecorder? = nil
+    ) async -> LiveInteropPermissionedRoundTripArtifact {
+        let recorder = recorder ?? InteropFixtureRecorder()
+        guard jsonFields(createBody, equalTo: [
+            "space": space.rawValue,
+            "repo": readQuery["repo"] ?? "",
+            "collection": readQuery["collection"] ?? "",
+            "rkey": readQuery["rkey"] ?? "",
+        ]) else {
+            return await permissionedArtifact(
+                scenario: scenario, member: member, authority: authority,
+                credentialIssued: false, writeStatus: nil, readStatus: nil,
+                writeCID: nil, readCID: nil, writeDigest: nil, readDigest: nil,
+                converged: false, errorCode: "InvalidRequest", recorder: recorder
+            )
+        }
+        var credentialIssued = false
+        var writeStatus: Int?
+        var readStatus: Int?
+        var writeCID: String?
+        var readCID: String?
+        var writeDigest: String?
+        var readDigest: String?
+        var errorCode: String?
+        do {
+            let credential = try await broker.exchange(
+                space: space,
+                memberAuthorization: member.authorization,
+                clientAttestation: clientAttestation,
+                recorder: recorder,
+                memberAuthorizationProvider: member.authorizationProvider,
+                memberLabel: member.label,
+                authorityLabel: authority.label
+            )
+            credentialIssued = !credential.isEmpty
+            guard credentialIssued else { throw InteropHTTPError.unexpectedStatus(502) }
+            let credentialAuthorization = InteropAuthorization.bearer(token: credential)
+            let write = try await authority.client.procedure(
+                "com.atproto.space.createRecord",
+                body: createBody,
+                authorization: credentialAuthorization
+            )
+            writeStatus = write.status
+            writeDigest = responseDigest(write)
+            await recorder.record(
+                host: authority.label,
+                method: "POST",
+                path: "/xrpc/com.atproto.space.createRecord",
+                requestBody: createBody,
+                response: write
+            )
+            guard (200 ... 299).contains(write.status) else {
+                errorCode = responseErrorCode(write)
+                return await permissionedArtifact(
+                    scenario: scenario, member: member, authority: authority,
+                    credentialIssued: credentialIssued, writeStatus: writeStatus,
+                    readStatus: nil, writeCID: nil, readCID: nil,
+                    writeDigest: writeDigest, readDigest: nil,
+                    converged: false, errorCode: errorCode, recorder: recorder
+                )
+            }
+            writeCID = try StrictJSON.decode(RecordResponse.self, from: write.body).cid
+            guard writeCID != nil else {
+                errorCode = "InvalidResponse"
+                return await permissionedArtifact(
+                    scenario: scenario, member: member, authority: authority,
+                    credentialIssued: credentialIssued, writeStatus: writeStatus,
+                    readStatus: nil, writeCID: nil, readCID: nil,
+                    writeDigest: writeDigest, readDigest: nil,
+                    converged: false, errorCode: errorCode, recorder: recorder
+                )
+            }
+            let read = try await authority.client.query(
+                "com.atproto.space.getRecord",
+                query: readQuery,
+                authorization: credentialAuthorization
+            )
+            readStatus = read.status
+            readDigest = responseDigest(read)
+            await recorder.record(
+                host: authority.label,
+                method: "GET",
+                path: "/xrpc/com.atproto.space.getRecord",
+                response: read
+            )
+            guard (200 ... 299).contains(read.status) else {
+                errorCode = responseErrorCode(read)
+                return await permissionedArtifact(
+                    scenario: scenario, member: member, authority: authority,
+                    credentialIssued: credentialIssued, writeStatus: writeStatus,
+                    readStatus: readStatus, writeCID: writeCID, readCID: nil,
+                    writeDigest: writeDigest, readDigest: readDigest,
+                    converged: false, errorCode: errorCode, recorder: recorder
+                )
+            }
+            readCID = try StrictJSON.decode(RecordResponse.self, from: read.body).cid
+            guard readCID != nil else {
+                errorCode = "InvalidResponse"
+                return await permissionedArtifact(
+                    scenario: scenario, member: member, authority: authority,
+                    credentialIssued: credentialIssued, writeStatus: writeStatus,
+                    readStatus: readStatus, writeCID: writeCID, readCID: nil,
+                    writeDigest: writeDigest, readDigest: readDigest,
+                    converged: false, errorCode: errorCode, recorder: recorder
+                )
+            }
+            let converged = writeCID == readCID
+            return await permissionedArtifact(
+                scenario: scenario, member: member, authority: authority,
+                credentialIssued: credentialIssued, writeStatus: writeStatus,
+                readStatus: readStatus, writeCID: writeCID, readCID: readCID,
+                writeDigest: writeDigest, readDigest: readDigest,
+                converged: converged, errorCode: nil, recorder: recorder
+            )
+        } catch {
+            errorCode = liveErrorCode(error)
+            return await permissionedArtifact(
+                scenario: scenario, member: member, authority: authority,
+                credentialIssued: credentialIssued, writeStatus: writeStatus,
+                readStatus: readStatus, writeCID: writeCID, readCID: readCID,
+                writeDigest: writeDigest, readDigest: readDigest,
+                converged: false, errorCode: errorCode, recorder: recorder
+            )
+        }
+    }
+
     private static func artifact(
         scenario: String,
         producer: LiveInteropHost,
@@ -713,6 +953,64 @@ public enum LiveInteropRunner {
             errorCode: errorCode,
             events: await recorder.snapshot()
         )
+    }
+
+    private static func permissionedArtifact(
+        scenario: String,
+        member: LiveInteropHost,
+        authority: LiveInteropHost,
+        credentialIssued: Bool,
+        writeStatus: Int?,
+        readStatus: Int?,
+        writeCID: String?,
+        readCID: String?,
+        writeDigest: String?,
+        readDigest: String?,
+        converged: Bool,
+        errorCode: String?,
+        recorder: InteropFixtureRecorder
+    ) async -> LiveInteropPermissionedRoundTripArtifact {
+        LiveInteropPermissionedRoundTripArtifact(
+            scenario: scenario,
+            member: member.label,
+            authority: authority.label,
+            credentialIssued: credentialIssued,
+            writeStatus: writeStatus,
+            readStatus: readStatus,
+            writeCID: writeCID,
+            readCID: readCID,
+            writeResponseSHA256: writeDigest,
+            readResponseSHA256: readDigest,
+            converged: converged,
+            status: converged ? "passed" : "failed",
+            errorCode: errorCode,
+            events: await recorder.snapshot()
+        )
+    }
+
+    private static func authorization(
+        for host: LiveInteropHost,
+        method: InteropHTTPMethod,
+        path: String,
+        body: Data?,
+        fallback: InteropAuthorization? = nil
+    ) async throws -> InteropAuthorization {
+        guard let provider = host.authorizationProvider else {
+            return fallback ?? host.authorization
+        }
+        guard let target = URL(string: path, relativeTo: host.client.http.baseURL)?.absoluteURL else {
+            throw InteropHTTPError.invalidURL
+        }
+        return try await provider(method, target, body)
+    }
+
+    private static func jsonFields(_ body: Data, equalTo expected: [String: String]) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+            return false
+        }
+        return expected.allSatisfy { key, value in
+            (object[key] as? String) == value
+        }
     }
 }
 
@@ -994,21 +1292,52 @@ public struct SpaceCredentialBroker: Sendable {
         space: SpaceURI,
         memberAuthorization: InteropAuthorization,
         delegationAuthorization: InteropAuthorization? = nil,
-        clientAttestation: String? = nil
+        clientAttestation: String? = nil,
+        recorder: InteropFixtureRecorder? = nil,
+        memberAuthorizationProvider: InteropAuthorizationProvider? = nil,
+        memberLabel: String = "member",
+        authorityLabel: String = "authority"
     ) async throws -> String {
+        let delegationPath = try member.xrpcPath(
+            "com.atproto.space.getDelegationToken",
+            query: ["space": space.rawValue]
+        )
+        let effectiveMemberAuthorization: InteropAuthorization
+        if let memberAuthorizationProvider,
+           let target = URL(string: delegationPath, relativeTo: member.http.baseURL)?.absoluteURL {
+            effectiveMemberAuthorization = try await memberAuthorizationProvider(
+                .get, target, nil
+            )
+        } else {
+            effectiveMemberAuthorization = memberAuthorization
+        }
         let delegation = try await member.query(
             "com.atproto.space.getDelegationToken",
             query: ["space": space.rawValue],
-            authorization: memberAuthorization
+            authorization: effectiveMemberAuthorization
+        )
+        await recorder?.record(
+            host: memberLabel,
+            method: "GET",
+            path: "/xrpc/com.atproto.space.getDelegationToken",
+            response: delegation
         )
         try requireJSONSuccess(delegation)
         let delegationObject = try StrictJSON.decode(TokenResponse.self, from: delegation.body)
         let credentialAuthorization = delegationAuthorization ?? .bearer(token: delegationObject.token)
         let input = CredentialRequest(space: space.rawValue, clientAttestation: clientAttestation)
+        let inputBody = try encode(input)
         let credential = try await authority.procedure(
             "com.atproto.space.getSpaceCredential",
-            body: try encode(input),
+            body: inputBody,
             authorization: credentialAuthorization
+        )
+        await recorder?.record(
+            host: authorityLabel,
+            method: "POST",
+            path: "/xrpc/com.atproto.space.getSpaceCredential",
+            requestBody: inputBody,
+            response: credential
         )
         try requireJSONSuccess(credential)
         return try StrictJSON.decode(TokenResponse.self, from: credential.body).token

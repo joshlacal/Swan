@@ -15,6 +15,11 @@ swift test
 swift run swan verify
 swift run swan serve --data-directory .swan-data
 swift run swan lab semantic --output /tmp/swan-semantic.json
+# A real host-to-host run (tokens stay in environment variables):
+swift run swan lab live --mode public --body-file ./fixtures/public-put.json \
+  --repository did:plc:... --collection app.bsky.feed.post --rkey fixture-1 \
+  --producer-auth bearer --consumer-auth bearer \
+  --output /tmp/swan-live-public.json
 ```
 
 `lab semantic` is an offline local gate: it uses two independent durable
@@ -22,6 +27,18 @@ SQLite roots to exercise replay, ordering, retention-gap recovery, CAR
 verification, permissioned credentials, and public/private blob reachability.
 Its summary artifact is explicitly labeled `swan-durable-to-swan-durable` and
 does not count as the pinned TypeScript PDS matrix.
+
+`lab live` is the stateful network-backed runner. In `public` mode it performs
+`repo.putRecord` on the producer and compares its returned CID with a
+subsequent `repo.getRecord` on the consumer. In `permissioned` mode it obtains
+a delegation from the producer/member, exchanges it for a space credential on
+the consumer/authority, then compares the CIDs from `space.createRecord` and
+`space.getRecord`. Use `--producer-auth oauth` for Swan account OAuth; the
+handle/password values are read from the environment and fresh DPoP proofs are
+minted per request. `bearer` mode reads only the named token environment
+variable and is useful for a pinned reference host. The output artifact keeps
+only statuses, CIDs, response digests, and sanitized endpoint events; request
+bodies, values, credentials, and proofs are never written.
 
 ## Disposable Compose interoperability lab
 

@@ -179,6 +179,50 @@ final class LabCLITests: XCTestCase {
         XCTAssertTrue(combined.contains("unsupported lab fault mode"))
     }
 
+    func testLabLiveRejectsUnknownModeBeforeReadingBody() throws {
+        let result = try runCLI(
+            command: [
+                "live",
+                "--mode", "unsupported",
+                "--body-file", "/definitely/missing/live-body.json",
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0)
+        let combined = String(decoding: result.stdout, as: UTF8.self) + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertTrue(combined.contains("live mode must be public or permissioned"), combined)
+    }
+
+    func testLabLiveWritesSanitizedFailureArtifactWithoutNetwork() throws {
+        let directory = try temporaryDirectory()
+        let body = directory.appending(path: "record.json")
+        let output = directory.appending(path: "live.json")
+        try Data(#"{"repo":"did:plc:abcdefghijklmnopqrstuvwx","collection":"app.bsky.feed.post","rkey":"r1","record":{"text":"private fixture value"}}"#.utf8).write(to: body)
+
+        let result = try runCLI(
+            command: [
+                "live",
+                "--mode", "public",
+                "--body-file", body.path,
+                "--repository", "did:plc:abcdefghijklmnopqrstuvwx",
+                "--collection", "app.bsky.feed.post",
+                "--rkey", "r1",
+                "--producer-url", "https://127.0.0.1:1",
+                "--consumer-url", "https://127.0.0.1:1",
+                "--request-timeout-seconds", "0.2",
+                "--output", output.path,
+                "--no-fail-on-failure",
+            ]
+        )
+        XCTAssertEqual(result.status, 0, String(decoding: result.stderr, as: UTF8.self))
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: output)) as? [String: Any]
+        )
+        XCTAssertEqual(object["status"] as? String, "failed")
+        let serialized = String(decoding: try Data(contentsOf: output), as: UTF8.self)
+        XCTAssertFalse(serialized.contains("private fixture value"))
+        XCTAssertFalse(serialized.contains("access_token"))
+    }
+
     private func runCLI(command: [String]) throws -> (status: Int32, stdout: Data, stderr: Data) {
         let process = Process()
         process.executableURL = try XCTUnwrap(executableURL())

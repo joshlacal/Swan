@@ -100,3 +100,20 @@ are green with the pinned Xcode toolchain. Docker/Compose, Linux, and a live
 Swan-to-TypeScript run remain unexecuted because those runtimes are not
 available in this environment; they must be run before alpha completion is
 claimed.
+
+## 2026-07-28 stateful live-runner checkpoint
+
+The interop seam now supports a callable `swan lab live` command. Public mode
+performs a producer `repo.putRecord` followed by a consumer `repo.getRecord`;
+permissioned mode obtains a member delegation, exchanges it for a space
+credential, then performs `space.createRecord` and `space.getRecord`. Both
+modes compare returned record CIDs, and reject a request body whose selectors
+do not match the requested record before any network request. OAuth mode uses
+the in-memory `SwanOAuthLabClient` and creates a fresh method/target-bound DPoP
+proof for each request; bearer mode reads only a named environment variable.
+
+Artifacts contain only sanitized endpoint events, statuses, commitments, and
+response digests. A CLI test exercises the failure path against an unavailable
+loopback endpoint and verifies that the private record value is absent from
+the artifact. This is a runnable harness, not live matrix evidence: Docker,
+Linux, and the pinned TypeScript cross-host run remain required external gates.
