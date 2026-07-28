@@ -1391,16 +1391,17 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
         let columns = try await connection.query(
             "PRAGMA table_info(public_repository_mutation_requests)"
         )
-        guard !columns.contains(where: {
-            $0.column("name")?.string == "integrity_digest"
-        }) else {
-            return
-        }
+        let hasIntegrity = columns.contains { $0.column("name")?.string == "integrity_digest" }
+        let schemaRows = try await connection.query(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'public_repository_mutation_requests'"
+        )
+        let schema = schemaRows.first?.column("sql")?.string ?? ""
+        if schema.contains("'abandoned'") { return }
         let rows = try await connection.query(
             "SELECT COUNT(*) AS count FROM public_repository_mutation_requests"
         )
         guard case let .integer(count)? = rows.first?.column("count"),
-              count == 0 else {
+              hasIntegrity || count == 0 else {
             throw SQLiteRepositoryError.corruptDatabase(
                 "legacy public repository request rows require offline recovery"
             )
@@ -1440,9 +1441,12 @@ public actor SQLiteAccountDatabase: BlobStore, PublicRepositoryGenesisStore {
             )
             """
         )
-        _ = try await connection.query(
-            "DROP TABLE public_repository_mutation_requests_pre_integrity"
-        )
+        if hasIntegrity {
+            _ = try await connection.query(
+                "INSERT INTO public_repository_mutation_requests SELECT * FROM public_repository_mutation_requests_pre_integrity"
+            )
+        }
+        _ = try await connection.query("DROP TABLE public_repository_mutation_requests_pre_integrity")
     }
 
     /// Task 42 originally shipped staging tables before the exact projection
