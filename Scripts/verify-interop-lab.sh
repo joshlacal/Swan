@@ -151,7 +151,15 @@ reject_contains "$reference_block" 'PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX:' 
 reject_contains "$reference_block" 'PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX:' "PDS rotation key must not be in Compose environment"
 
 # Caddy is the only host ingress. Its health is the deterministic CA creation
-# gate, then a root shell copies only the public CA to an unprivileged volume.
+# gate, and its upstream dependencies must be genuinely ready before TLS can
+# report healthy. A root shell then copies only the public CA to an
+# unprivileged volume.
+require_contains "$swan_block" 'curl --fail --silent --show-error --max-time 2 http://127.0.0.1:3000/health' "Swan healthcheck must probe the live HTTP listener"
+require_contains "$reference_block" "fetch('http://127.0.0.1:3000/xrpc/_health')" "reference PDS healthcheck must probe the live HTTP listener"
+require_contains "$(service_block reference-plc)" "fetch('http://127.0.0.1:2582/_health')" "reference PLC healthcheck must probe the live HTTP listener"
+require_contains "$reference_block" $'reference-plc:\n        condition: service_healthy' "reference PDS must wait for a healthy PLC"
+require_contains "$(service_block toxiproxy-setup)" $'reference-pds:\n        condition: service_healthy' "Toxiproxy setup must wait for a healthy reference PDS"
+require_contains "$caddy_block" $'swan:\n        condition: service_healthy' "Caddy must wait for a healthy Swan listener"
 require_contains "$caddy_block" '"127.0.0.1:443:443"' "Caddy must be the loopback-only host ingress"
 require_contains "$caddy_block" 'test -s /data/caddy/pki/authorities/local/root.crt' "Caddy CA healthcheck is missing"
 require_contains "$caddy_block" 'aliases:' "Caddy TLS aliases are missing"

@@ -71,6 +71,21 @@ mutate_and_require_rejection \
   $'      caddy:\n        condition: service_started'
 
 mutate_and_require_rejection \
+  swan-executable-only-healthcheck \
+  'curl --fail --silent --show-error --max-time 2 http://127.0.0.1:3000/health >/dev/null' \
+  'test -x /usr/local/bin/swan'
+
+mutate_and_require_rejection \
+  reference-pds-started-only \
+  $'      reference-plc:\n        condition: service_healthy' \
+  $'      reference-plc:\n        condition: service_started'
+
+mutate_and_require_rejection \
+  caddy-started-only-swan \
+  $'      swan:\n        condition: service_healthy' \
+  $'      swan:\n        condition: service_started'
+
+mutate_and_require_rejection \
   overbroad-runtime-secret-source \
   'swan-runtime-secrets:/run/secrets/swan-runtime:ro' \
   '${SWAN_INTEROP_SECRETS_DIR}:/run/secrets/swan-runtime:ro'

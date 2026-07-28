@@ -12,7 +12,7 @@ RUN swift build -c release --product swan
 
 FROM ubuntu:24.04
 RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libsodium23 \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl libsodium23 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --home-dir /var/lib/swan swan
 COPY --from=build /workspace/Swan/.build/release/swan /usr/local/bin/swan

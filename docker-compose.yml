@@ -95,7 +95,7 @@ services:
       swan-bootstrap:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", "test -x /usr/local/bin/swan"]
+      test: ["CMD-SHELL", "curl --fail --silent --show-error --max-time 2 http://127.0.0.1:3000/health >/dev/null"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -122,7 +122,12 @@ services:
       swan-secrets-init:
         condition: service_completed_successfully
       reference-plc:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/xrpc/_health').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 5s
+      timeout: 3s
+      retries: 24
 
   # The PLC package is pinned by the same reference lockfile as the PDS. It is
   # private to the lab network; Caddy exposes no PLC route.
@@ -134,6 +139,11 @@ services:
       PORT: "2582"
       LOG_ENABLED: "false"
     networks: [swan]
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:2582/_health').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 5s
+      timeout: 3s
+      retries: 24
 
   caddy:
     image: caddy:2.10.2-alpine
@@ -150,7 +160,7 @@ services:
           - pds.test
     depends_on:
       swan:
-        condition: service_started
+        condition: service_healthy
       toxiproxy-setup:
         condition: service_completed_successfully
     healthcheck:
@@ -195,8 +205,10 @@ services:
           || curl --fail --silent http://toxiproxy:8474/proxies/reference-pds >/dev/null
     networks: [swan]
     depends_on:
-      - toxiproxy
-      - reference-pds
+      toxiproxy:
+        condition: service_started
+      reference-pds:
+        condition: service_healthy
     restart: "no"
 
   # Task 28 deliberately does not execute the cross-host matrix. This profile

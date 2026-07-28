@@ -93,8 +93,13 @@ Startup is ordered as follows:
    volumes without network access.
 2. Unprivileged `swan-bootstrap` installs the disposable authority and member
    accounts idempotently using supported `swan account` commands.
-3. Unprivileged `swan` starts with local-space interop enabled behind Caddy.
-4. Caddy creates its local CA; its healthcheck gates `caddy-ca-ready`, which
+3. Unprivileged `swan` starts with local-space interop enabled behind Caddy;
+   its healthcheck performs a bounded HTTP request to `/health`, so an
+   executable that has not bound the listener cannot satisfy Compose readiness.
+4. The pinned reference PLC and PDS must answer their own `/_health` and
+   `/xrpc/_health` endpoints before the reference PDS or Toxiproxy setup is
+   considered ready.
+5. Caddy creates its local CA; its healthcheck gates `caddy-ca-ready`, which
    copies the public root certificate into an unprivileged read-only trust
    volume.
 

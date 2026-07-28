@@ -412,3 +412,15 @@ checks. Docker/Compose, a Linux Swift environment, and a live
 Swan-to-pinned-TypeScript public/permissioned matrix are still unavailable in
 this workspace (`docker`, `podman`, and `colima` are not installed). Those
 external gates must be run before the alpha can be marked complete.
+
+## Follow-up verification: Compose readiness gates
+
+The lab topology was hardened after the stateful runner review. The Swan
+container now includes the small runtime `curl` dependency needed for a
+bounded `GET /health` healthcheck. The pinned reference PDS and PLC use their
+native `/_health` endpoints through Node's built-in fetch. Compose ordering
+now requires a healthy PLC before the reference PDS, a healthy reference PDS
+before Toxiproxy setup, and a healthy Swan listener before Caddy. The static
+topology verifier and its mutation tests enforce these contracts. This is
+static/readiness evidence only; Docker execution remains unavailable in the
+current workspace.

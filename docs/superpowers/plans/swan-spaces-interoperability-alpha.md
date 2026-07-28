@@ -168,6 +168,11 @@ that the complete live interop matrix has passed.
   has only local-CA TLS routes for `swan.test` and `pds.test`; PDS traffic goes
   through its named Toxiproxy listener. No permissioned route gains a public
   fallback.
+- Compose startup now uses real readiness probes: Swan must answer
+  `GET /health`, the pinned reference PDS must answer `GET /xrpc/_health`, and
+  the pinned PLC must answer `GET /_health`. The reference PDS waits for a
+  healthy PLC, Toxiproxy setup waits for a healthy reference PDS, and Caddy
+  waits for a healthy Swan listener before creating the TLS trust handoff.
 - A live matrix is still unverified in this environment. It requires Docker
   Compose v2, locally supplied disposable secrets (never committed or included
   in artifacts), trust of Caddy's laboratory CA by the runner, and cross-host
