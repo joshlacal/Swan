@@ -329,6 +329,7 @@ Focused verification (Xcode toolchain, SwiftPM `--jobs 1`) passed:
 - `PublicRepositoryRotatedIdentityTests.testPublicDescriptionUsesAuthenticatedTerminalPLCIdentity`
 - `PLCAccountRotationServiceTests.testRotationPersistsPendingHistoryAndPromotesControlGeneration`
 - `ManagementPLCProvisioningRuntimeHTTPTests.testConcreteManagementRoutesPrepareActivateRetryAndAdmitWithoutRestart`
+- `PLCAccountPreparationCLITests.testRotatePLCUsesDurableHistoryAndReturnsOnlySanitizedIdentity`
 - `PublicRepositoryReadHTTPTests` (8/8), including the filtered command that
   previously appeared to hang under default SwiftPM resolution
 - `PublicRepositoryReadDirectoryTests.testOptIn256MiBProductionDirectoryGetRepoHasBoundedRSS`
