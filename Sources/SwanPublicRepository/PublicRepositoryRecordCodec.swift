@@ -43,6 +43,135 @@ public enum PublicRepositoryRecordCodec {
     public static let maximumSafeInteger = 9_007_199_254_740_991
     public static let minimumSafeInteger = -9_007_199_254_740_991
 
+    /// Converts Petrel's transport container without passing through JSON.
+    /// This is deliberately kept at the repository boundary so public writes
+    /// and permissioned writes cannot accidentally share a permissive JSON
+    /// bridge. Typed blobs and unresolved/failed typed values are rejected.
+    public static func publicRecord(
+        from value: ATProtocolValueContainer,
+        collection: String,
+        limits: PublicRepositoryLimits = .standard
+    ) throws -> PublicRecord {
+        let converted: PublicRecordValue
+        switch value {
+        case .knownType:
+            converted = try convertCBOR(value.toCBORValue(), depth: 1, limits: limits)
+        case let .object(fields):
+            converted = try convertObject(fields, depth: 1, limits: limits)
+        case .unknownType, .decodeError:
+            throw PublicRepositoryDomainError.invalidRecordType
+        default:
+            throw PublicRepositoryDomainError.invalidRecordType
+        }
+        guard case var .object(fields) = converted else {
+            throw PublicRepositoryDomainError.invalidRecordType
+        }
+        if let existing = fields["$type"] {
+            guard case let .string(type) = existing, type == collection else {
+                throw PublicRepositoryDomainError.invalidRecordType
+            }
+        } else {
+            fields["$type"] = .string(collection)
+        }
+        return PublicRecord(fields)
+    }
+
+    private static func convertObject(
+        _ fields: [String: ATProtocolValueContainer],
+        depth: Int,
+        limits: PublicRepositoryLimits
+    ) throws -> PublicRecordValue {
+        guard depth <= limits.maximumCBORNestingDepth else {
+            throw PublicRepositoryDomainError.recordNestingTooDeep
+        }
+        var output: [String: PublicRecordValue] = [:]
+        for (key, value) in fields {
+            output[key] = try convert(value, depth: depth, limits: limits)
+        }
+        return .object(output)
+    }
+
+    private static func convert(
+        _ value: ATProtocolValueContainer,
+        depth: Int,
+        limits: PublicRepositoryLimits
+    ) throws -> PublicRecordValue {
+        switch value {
+        case .knownType:
+            return try convertCBOR(value.toCBORValue(), depth: depth, limits: limits)
+        case let .string(value): return .string(value)
+        case let .number(value):
+            guard (minimumSafeInteger...maximumSafeInteger).contains(value) else {
+                throw PublicRepositoryDomainError.invalidRecordInteger
+            }
+            return .integer(value)
+        case .bigNumber: throw PublicRepositoryDomainError.invalidRecordInteger
+        case let .object(fields): return try convertObject(fields, depth: depth, limits: limits)
+        case let .array(values):
+            guard depth < limits.maximumCBORNestingDepth else {
+                throw PublicRepositoryDomainError.recordNestingTooDeep
+            }
+            return .array(try values.map { try convert($0, depth: depth + 1, limits: limits) })
+        case let .bool(value): return .bool(value)
+        case .null: return .null
+        case let .link(link): return .link(try validatedLink(link.cid))
+        case let .bytes(bytes): return .bytes(bytes.data)
+        case .unknownType, .decodeError:
+            throw PublicRepositoryDomainError.invalidRecordType
+        }
+    }
+
+    private static func convertCBOR(
+        _ value: Any,
+        depth: Int,
+        limits: PublicRepositoryLimits
+    ) throws -> PublicRecordValue {
+        if let map = value as? OrderedCBORMap {
+            var fields: [String: PublicRecordValue] = [:]
+            for entry in map.entries {
+                guard fields[entry.key] == nil else {
+                    throw PublicRepositoryDomainError.invalidRecordType
+                }
+                fields[entry.key] = try convertCBOR(entry.value, depth: depth, limits: limits)
+            }
+            return .object(fields)
+        }
+        if let map = value as? [String: Any] {
+            var fields: [String: PublicRecordValue] = [:]
+            for (key, item) in map {
+                fields[key] = try convertCBOR(item, depth: depth, limits: limits)
+            }
+            return .object(fields)
+        }
+        if let link = value as? ATProtoLink { return .link(try validatedLink(link.cid)) }
+        if let data = value as? Data { return .bytes(data) }
+        if let string = value as? String { return .string(string) }
+        if let bool = value as? Bool { return .bool(bool) }
+        if value is NSNull { return .null }
+        if let integer = value as? Int {
+            guard (minimumSafeInteger...maximumSafeInteger).contains(integer) else {
+                throw PublicRepositoryDomainError.invalidRecordInteger
+            }
+            return .integer(integer)
+        }
+        if let values = value as? [Any] {
+            guard depth < limits.maximumCBORNestingDepth else {
+                throw PublicRepositoryDomainError.recordNestingTooDeep
+            }
+            return .array(try values.map { try convertCBOR($0, depth: depth + 1, limits: limits) })
+        }
+        throw PublicRepositoryDomainError.invalidRecordType
+    }
+
+    private static func validatedLink(_ cid: CID) throws -> CID {
+        guard cid.multihash.algorithm == Multihash.sha256Code,
+              cid.multihash.length == Multihash.sha256Length,
+              cid.codec == .raw || cid.codec == .dagCBOR else {
+            throw PublicRepositoryDomainError.invalidRecordLink
+        }
+        return cid
+    }
+
     public static func prepare(
         _ record: PublicRecord,
         for path: PublicRepositoryPath,

@@ -6,6 +6,41 @@ import XCTest
 final class PublicRepositoryDomainTests: XCTestCase {
     private let collection = "app.bsky.feed.post"
 
+    func testPetrelRecordConversionAddsAndBindsCollectionTypeWithoutJSON() throws {
+        let value: ATProtocolValueContainer = .object([
+            "text": .string("hello"),
+            "count": .number(3),
+            "enabled": .bool(true),
+            "nested": .object(["value": .null]),
+            "items": .array([.string("a"), .number(2)]),
+        ])
+        let record = try PublicRepositoryRecordCodec.publicRecord(
+            from: value,
+            collection: collection
+        )
+        XCTAssertEqual(record.fields["$type"], .string(collection))
+        XCTAssertEqual(record.fields["text"], .string("hello"))
+        XCTAssertEqual(record.fields["count"], .integer(3))
+        XCTAssertEqual(record.fields["enabled"], .bool(true))
+    }
+
+    func testPetrelRecordConversionRejectsTypedUnknownAndUnsafeValues() {
+        for value in [
+            ATProtocolValueContainer.unknownType("app.example.unknown", .object([:])),
+            ATProtocolValueContainer.decodeError("bad"),
+            ATProtocolValueContainer.bigNumber("9007199254740992"),
+        ] {
+            XCTAssertThrowsError(try PublicRepositoryRecordCodec.publicRecord(
+                from: value,
+                collection: collection
+            ))
+        }
+        XCTAssertThrowsError(try PublicRepositoryRecordCodec.publicRecord(
+            from: .object(["$type": .string("app.other.record")]),
+            collection: collection
+        ))
+    }
+
     func testPathAcceptsPinnedBoundarySyntax() throws {
         let longCollection = String(repeating: "a", count: 63)
             + "." + Array(repeating: String(repeating: "b", count: 63), count: 3).joined(separator: ".")
