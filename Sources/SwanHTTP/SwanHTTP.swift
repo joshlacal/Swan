@@ -801,7 +801,8 @@ public struct SwanHTTPServer: Sendable {
     }
 
     private static func isInstalledPublicMutationMethod(_ nsid: String) -> Bool {
-        nsid == SwanPublicWire.ComAtprotoRepoPutRecord.typeIdentifier ||
+        nsid == SwanPublicWire.ComAtprotoRepoCreateRecord.typeIdentifier ||
+            nsid == SwanPublicWire.ComAtprotoRepoPutRecord.typeIdentifier ||
             nsid == SwanPublicWire.ComAtprotoRepoDeleteRecord.typeIdentifier
     }
 

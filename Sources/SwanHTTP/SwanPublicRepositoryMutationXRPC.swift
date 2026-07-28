@@ -22,6 +22,39 @@ private enum PublicMutationFailure: Error {
 private struct PublicMutationHandlers {
     let capability: SwanPublicRepositoryMutationCapability
 
+    func create(
+        _ input: SwanPublicWire.ComAtprotoRepoCreateRecord.Input,
+        bodyDigest: Data,
+        request: Request
+    ) async throws -> SwanPublicWire.ComAtprotoRepoCreateRecord.Output {
+        let target = try await authorizedTarget(
+            selector: input.repo.stringValue(), request: request,
+            method: "POST", path: "/xrpc/com.atproto.repo.createRecord"
+        )
+        let rkey: RecordKey
+        if let supplied = input.rkey {
+            rkey = supplied
+        } else {
+            rkey = try RecordKey(keyString: try await capability.tidAllocator.next().toString())
+        }
+        let path = try PublicRepositoryPath(collection: input.collection.nsidString(), recordKey: rkey.value)
+        let record = try PublicRepositoryRecordCodec.publicRecord(from: input.record, collection: path.collection)
+        let result = try await SwanPublicRepositoryMutationCoordinator.put(
+            store: target.store, did: target.did, path: path, record: record,
+            swapRecord: nil, swapCommit: input.swapCommit,
+            requestID: UUID().uuidString, bodyDigest: bodyDigest,
+            signerProvider: capability.signerProvider
+        )
+        guard result.action == .create else { throw PublicMutationFailure.invalidRequest }
+        let uri = try ATProtocolURI(uriString: "at://\(target.did)/\(path.mstKey)")
+        return SwanPublicWire.ComAtprotoRepoCreateRecord.Output(
+            uri: uri, cid: try result.recordCID ?? PublicRepositoryRecordCodec.prepare(record, for: path).cid,
+            commit: SwanPublicWire.ComAtprotoRepoDefs.CommitMeta(
+                cid: result.state.commitCID, rev: try TID(tidString: result.state.revision)
+            ), validationStatus: input.validate == nil ? nil : "valid"
+        )
+    }
+
     func put(
         _ input: SwanPublicWire.ComAtprotoRepoPutRecord.Input,
         bodyDigest: Data,
@@ -123,6 +156,7 @@ func registerPublicRepositoryMutationEndpoints(
 ) {
     let handlers = PublicMutationHandlers(capability: capability)
     let putPath: RouterPath = "/xrpc/com.atproto.repo.putRecord"
+    let createPath: RouterPath = "/xrpc/com.atproto.repo.createRecord"
     let deletePath: RouterPath = "/xrpc/com.atproto.repo.deleteRecord"
     router.post(putPath) { request, _ async -> Response in
         do {
@@ -130,6 +164,20 @@ func registerPublicRepositoryMutationEndpoints(
                 request, as: SwanPublicWire.ComAtprotoRepoPutRecord.Input.self
             )
             return publicMutationJSON(.ok, try await handlers.put(input, bodyDigest: digest, request: request))
+        } catch let failure as PublicMutationFailure {
+            return publicMutationResponse(failure, authorizer: capability.authorizer)
+        } catch let failure as PublicRepositoryMutationCoordinatorError {
+            return publicMutationResponse(failure)
+        } catch {
+            return publicMutationError(.badRequest, "InvalidRequest")
+        }
+    }
+    router.post(createPath) { request, _ async -> Response in
+        do {
+            let (input, digest) = try await publicMutationInput(
+                request, as: SwanPublicWire.ComAtprotoRepoCreateRecord.Input.self
+            )
+            return publicMutationJSON(.ok, try await handlers.create(input, bodyDigest: digest, request: request))
         } catch let failure as PublicMutationFailure {
             return publicMutationResponse(failure, authorizer: capability.authorizer)
         } catch let failure as PublicRepositoryMutationCoordinatorError {
@@ -152,7 +200,7 @@ func registerPublicRepositoryMutationEndpoints(
             return publicMutationError(.badRequest, "InvalidRequest")
         }
     }
-    for path in [putPath, deletePath] {
+    for path in [putPath, createPath, deletePath] {
         for method: HTTPRequest.Method in [.get, .head, .put, .patch, .delete, .options, .connect, .trace] {
             router.on(path, method: method) { _, _ in publicMutationError(.notFound, "public_endpoint_unavailable") }
         }

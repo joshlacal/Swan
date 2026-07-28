@@ -50,6 +50,7 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
     let authorizer: SwanOAuthResourceAuthorizer
     let directory: any PublicRepositoryMutationDirectory
     let signerProvider: any PublicRepositoryMutationSignerProvider
+    let tidAllocator = SwanPermissionedTIDAllocator()
 
     public init(
         authorizer: SwanOAuthResourceAuthorizer,
