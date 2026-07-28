@@ -161,7 +161,7 @@ let package = Package(
         .target(
             name: "SwanInterop",
             dependencies: [
-                "SwanCore", "SwanSpaces", "SwanSpacesWire", "SwanSQLite", "SwanStorage", "SwanOAuth",
+                "SwanCore", "SwanPublicRepository", "SwanSpaces", "SwanSpacesWire", "SwanSQLite", "SwanStorage", "SwanOAuth",
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),

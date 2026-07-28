@@ -3,6 +3,7 @@ import XCTest
 import Crypto
 import Petrel
 @testable import SwanInterop
+import SwanCore
 import SwanOAuth
 import SwanSpaces
 
@@ -282,6 +283,25 @@ final class SwanInteropTests: XCTestCase {
         XCTAssertTrue(permissionedArtifact.events.isEmpty)
     }
 
+    func testLiveRoundTripMaterializesRepositoryPlaceholderBeforeNetwork() async throws {
+        let url = URL(string: "https://127.0.0.1:1")!
+        let client = try InteropXRPCClient(baseURL: url, timeout: 0.2)
+        let producer = LiveInteropHost(label: "producer", client: client)
+        let consumer = LiveInteropHost(label: "consumer", client: client)
+        let artifact = await LiveInteropRunner.publicPutAndRead(
+            scenario: "repository-placeholder",
+            producer: producer,
+            consumer: consumer,
+            repository: "did:plc:abcdefghijklmnopqrstuvwx",
+            collection: "app.bsky.feed.post",
+            rkey: "placeholder",
+            putBody: Data(#"{"repo":"{{REPOSITORY_DID}}","collection":"app.bsky.feed.post","rkey":"placeholder"}"#.utf8)
+        )
+        XCTAssertEqual(artifact.status, "failed")
+        XCTAssertNotEqual(artifact.errorCode, "InvalidRequest")
+        XCTAssertTrue(artifact.events.isEmpty)
+    }
+
     func testXRPCPathUsesNSIDAndCanonicalQueryOrdering() throws {
         let client = try InteropXRPCClient(
             baseURL: URL(string: "https://swan.test")!,
@@ -295,6 +315,15 @@ final class SwanInteropTests: XCTestCase {
             ),
             "/xrpc/com.atproto.repo.getRecord?repo=did:plc:alice&rkey=3k"
         )
+    }
+
+    func testStreamingCARClientAllowsThePinned512MiBBoundSeparatelyFromJSON() throws {
+        let http = try InteropHTTPClient(
+            baseURL: URL(string: "https://pds.test")!,
+            timeout: 1
+        )
+        XCTAssertEqual(http.maximumResponseBytes, 2 * 1_024 * 1_024)
+        XCTAssertEqual(http.maximumStreamingResponseBytes, 512 * 1_024 * 1_024)
     }
 
     func testLiveReplicaRejectsReorderingAndVerifiesReaderCommitBeforePublication() async throws {
@@ -725,6 +754,64 @@ final class SwanInteropTests: XCTestCase {
                 forbidden.contains(where: { key.lowercased().contains($0) })
             }
         )
+    }
+
+    func testPublicRepositoryRemoteVerifierUsesRepositorySignatureBytes() async throws {
+        let signingKey = P256.Signing.PrivateKey()
+        let verifier = PermissionedDataPublicRepositoryCommitVerifier(
+            key: .p256(signingKey.publicKey)
+        )
+        let unsigned = Data("repository-commit-bytes".utf8)
+        let signature = try P256WireSignature.sign(unsigned, using: signingKey)
+
+        try await verifier.verify(
+            signature: signature,
+            unsignedCommitBytes: unsigned,
+            did: "did:plc:abcdefghijklmnopqrstuvwx"
+        )
+        XCTAssertEqual(verifier.signingAlgorithm, .p256)
+        XCTAssertTrue(verifier.verificationIdentity.hasPrefix("p256-sha256:"))
+    }
+
+    func testPublicRepositoryCARFileSourceIsBoundedAndEOFIsNil() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appending(path: "swan-car-source-\(UUID().uuidString).car")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try Data([1, 2, 3, 4, 5]).write(to: url)
+
+        let source = try FilePublicRepositoryCARByteSource(url: url)
+        let first = try await source.read(maximumBytes: 2)
+        let second = try await source.read(maximumBytes: 2)
+        let third = try await source.read(maximumBytes: 2)
+        let end = try await source.read(maximumBytes: 2)
+        XCTAssertEqual(first, Data([1, 2]))
+        XCTAssertEqual(second, Data([3, 4]))
+        XCTAssertEqual(third, Data([5]))
+        XCTAssertNil(end)
+        try await source.close()
+    }
+
+    func testPublicRepositoryImportArtifactContainsNoSecretFields() throws {
+        let artifact = PublicRepositoryCARImportArtifact(
+            remoteHost: "pds.test",
+            repositoryDID: "did:plc:abcdefghijklmnopqrstuvwx",
+            httpStatus: 200,
+            baseCommitCID: "bafybase",
+            importedCommitCID: "bafycommit",
+            importedDataCID: "bafydata",
+            importedRevision: "2222222222222",
+            reachableBlockCount: 3,
+            recordCount: 1,
+            status: "passed",
+            errorCode: nil
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(artifact)) as? [String: Any]
+        )
+        let forbidden = ["password", "token", "private", "secret", "value", "path"]
+        XCTAssertFalse(Self.sanitizedKeys(in: object).contains { key in
+            forbidden.contains { key.lowercased().contains($0) }
+        })
     }
 
     private static func sanitizedKeys(in value: Any) -> [String] {

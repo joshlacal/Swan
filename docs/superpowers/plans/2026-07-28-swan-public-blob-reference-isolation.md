@@ -77,7 +77,12 @@ boundary.
   against a live/local PLC fixture; the service, CLI path, storage,
   verifier, and public-read slice are now implemented and covered locally.
 - Run the new stateful live runner against cross-host record/blob scenarios and
-  execute the fault matrix under Docker on macOS and Linux.
+  execute the fault matrix under Docker on macOS and Linux. The Linux Compose
+  public Swan-to-Swan record/blob scenario now passes: upload, public raw-link
+  write, unauthenticated record read, and streamed blob read all converge with
+  the blob bytes verified. The checked-in fixture is DID-independent through
+  `{{REPOSITORY_DID}}` and `{{BLOB_CID}}` placeholders. The same live proof has
+  not yet been reproduced against the pinned TypeScript host.
 - Re-run the complete suite after any further mutation slice; do not claim
   alpha completion until the live Compose/reference matrix and Linux gates
   pass.

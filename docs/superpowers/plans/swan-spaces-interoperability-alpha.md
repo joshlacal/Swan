@@ -197,6 +197,25 @@ checksum-verified way to populate the ignored reference cache.
   and ES256K context signature. The pinned values-including TypeScript form is
   recorded as an explicit upstream SQLite ambiguity and is exercised only via
   the explicit `excludeValues=true` compatibility path.
+- The interop runner now has two bounded recovery seams. `swan lab live
+  --permissioned-get-repo` streams and verifies a Swan two-root permissioned
+  CAR after the credential read, recording only status, record count, and the
+  commitment. `swan lab import-public` streams a remote
+  `com.atproto.sync.getRepo` CAR into per-account SQLite import staging and
+  publishes it only after commit-signature, MST, CID, and revision-CAS checks.
+  The public importer accepts an explicitly supplied P-256 or secp256k1
+  verification key; it does not silently resolve a remote DID/PLC key.
+- The rebuilt Linux Compose Swan image passes a live public blob round trip on
+  2026-07-28: OAuth-authenticated `repo.uploadBlob` returned a validated raw
+  CID, `repo.putRecord` committed a record containing that public raw link,
+  unauthenticated `repo.getRecord` returned the same record CID, and streamed
+  `sync.getBlob` returned the same 25 bytes. The sanitized artifact records
+  HTTP 200 for upload/read/download, `blobVerified: true`, and no request body,
+  credential, or record value. Disposable public fixtures use
+  `{{REPOSITORY_DID}}` and `{{BLOB_CID}}` placeholders; the runner materializes
+  them only after selector/blob validation. The alpha public codec deliberately
+  accepts the raw-CID link form used by its current tests and rejects typed
+  blob objects, so that boundary is explicit rather than silently normalized.
 - Final macOS verification after the rereview passes the serialized Swift
   suite with zero failures, profile verification, the 18-check semantic lab,
   static/mutation interop checks, and `PublicRepositoryReadHTTPTests` 8/8. The
@@ -234,6 +253,6 @@ that the complete live interop matrix has passed.
   TypeScript service was included in the endpoint/fault matrix, its local
   smoke runtime passed reference-only account/public operations, and the
   cross-host permissioned credential/read smoke passed with a static operator
-  key pin. A complete Swan-to-TypeScript semantic convergence run, including
-  public repository import and dynamic remote key discovery, remains a distinct
-  follow-up gate.
+  key pin. A complete Swan-to-TypeScript semantic convergence run, including a
+  live public repository import, blob transfer, compaction-gap recovery, and
+  dynamic remote key discovery, remains a distinct follow-up gate.

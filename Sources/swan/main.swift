@@ -2605,7 +2605,7 @@ extension SwanCommand {
     struct Lab: ParsableCommand {
         static let configuration = CommandConfiguration(
             abstract: "Validate and record sanitized Compose laboratory scenarios",
-            subcommands: [Validate.self, Matrix.self, Scenario.self, Semantic.self, Live.self],
+            subcommands: [Validate.self, Matrix.self, Scenario.self, Semantic.self, ImportPublic.self, Live.self],
             defaultSubcommand: Validate.self
         )
 
@@ -2777,6 +2777,159 @@ extension SwanCommand {
             }
         }
 
+        struct ImportPublic: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "import-public",
+                abstract: "Stream and durably import a public sync.getRepo CAR"
+            )
+
+            @Option(name: .long, help: "Reference or remote PDS base URL (default: https://pds.test)")
+            var remoteURL: String = ""
+
+            @Option(name: .long, help: "Swan data directory containing the target account database")
+            var dataDirectory: String
+
+            @Option(name: .long, help: "Repository DID to fetch and install")
+            var did: String
+
+            @Option(name: .customLong("commit-key-env"), help: "Environment variable containing the repository public key as canonical base64url")
+            var commitKeyEnvironment: String = "SWAN_LAB_PUBLIC_REPO_KEY"
+
+            @Option(name: .customLong("commit-key-algorithm"), help: "Repository signature algorithm: p256 or secp256k1")
+            var commitKeyAlgorithm: String = "p256"
+
+            @Option(name: .long, help: "Idempotency request identifier; defaults to the current base commit")
+            var requestID: String = ""
+
+            @Option(name: .long, help: "Destination for the sanitized import artifact")
+            var output: String = "artifacts/public-repository-import.json"
+
+            @Option(name: .long, help: "Per-request timeout in seconds")
+            var requestTimeoutSeconds: Double = 15
+
+            @Flag(
+                name: .customLong("fail-on-failure"),
+                inversion: .prefixedNo,
+                help: "Return non-zero when the import does not commit (default)"
+            )
+            var failOnFailure: Bool = true
+
+            func run() async throws {
+                let canonicalDID: String
+                do {
+                    canonicalDID = try AccountIdentifiers.validateDID(did)
+                } catch {
+                    throw ValidationError("--did is not a canonical DID")
+                }
+                guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw ValidationError("--data-directory is required")
+                }
+                let normalizedAlgorithm = commitKeyAlgorithm
+                    .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                guard normalizedAlgorithm == "p256" || normalizedAlgorithm == "secp256k1" else {
+                    throw ValidationError("--commit-key-algorithm must be p256 or secp256k1")
+                }
+                let baseURL = try LabLiveSupport.url(
+                    explicit: remoteURL,
+                    environment: "SWAN_LAB_PUBLIC_REPOSITORY_URL",
+                    fallback: "https://pds.test"
+                )
+                guard requestTimeoutSeconds > 0,
+                      requestTimeoutSeconds <= 120,
+                      requestTimeoutSeconds.isFinite else {
+                    throw ValidationError("--request-timeout-seconds is invalid")
+                }
+                let encodedKey = try LabLiveSupport.environmentValue(
+                    commitKeyEnvironment,
+                    label: "public repository commit key"
+                )
+                guard let keyBytes = Data(base64URLEncoded: encodedKey),
+                      keyBytes.base64URLEncodedString() == encodedKey else {
+                    throw ValidationError("public repository commit key is not canonical base64url")
+                }
+                let verificationKey: PermissionedDataJWTVerificationKey
+                do {
+                    switch normalizedAlgorithm {
+                    case "p256":
+                        verificationKey = .p256(
+                            try P256.Signing.PublicKey(x963Representation: keyBytes)
+                        )
+                    default:
+                        verificationKey = try PermissionedDataJWTVerificationKey(
+                            secp256k1PublicKey: keyBytes
+                        )
+                    }
+                } catch {
+                    throw ValidationError("public repository commit key is invalid")
+                }
+
+                let database = try await SQLiteAccountDatabase(
+                    dataDirectory: URL(fileURLWithPath: dataDirectory),
+                    did: canonicalDID,
+                    openMode: .existingPortableExportSource
+                )
+                defer { Task { try? await database.close() } }
+                guard let current = try await database.loadPublicRepositoryState() else {
+                    throw ValidationError("target account public repository is unavailable")
+                }
+                let id = requestID.isEmpty
+                    ? "sync-\(current.commitCID.string)"
+                    : requestID
+                let importer = RemotePublicRepositoryCARImporter(
+                    client: try InteropXRPCClient(baseURL: baseURL, timeout: requestTimeoutSeconds)
+                )
+                let verifier = PermissionedDataPublicRepositoryCommitVerifier(key: verificationKey)
+                let result: PublicRepositoryCARImportArtifact
+                do {
+                    let imported = try await importer.importRepository(
+                        did: canonicalDID,
+                        database: database,
+                        verifier: verifier,
+                        requestID: id
+                    )
+                    result = PublicRepositoryCARImportArtifact(
+                        remoteHost: baseURL.host ?? "remote",
+                        repositoryDID: canonicalDID,
+                        httpStatus: 200,
+                        baseCommitCID: current.commitCID.string,
+                        importedCommitCID: imported.state.commitCID.string,
+                        importedDataCID: imported.state.dataCID.string,
+                        importedRevision: imported.state.revision,
+                        reachableBlockCount: imported.reachableBlockCount,
+                        recordCount: imported.recordCount,
+                        status: "passed",
+                        errorCode: nil
+                    )
+                } catch {
+                    result = PublicRepositoryCARImportArtifact(
+                        remoteHost: baseURL.host ?? "remote",
+                        repositoryDID: canonicalDID,
+                        httpStatus: nil,
+                        baseCommitCID: current.commitCID.string,
+                        importedCommitCID: nil,
+                        importedDataCID: nil,
+                        importedRevision: nil,
+                        reachableBlockCount: nil,
+                        recordCount: nil,
+                        status: "failed",
+                        errorCode: "ImportFailed"
+                    )
+                }
+                let outputURL = URL(fileURLWithPath: output)
+                try FileManager.default.createDirectory(
+                    at: outputURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                try encoder.encode(result).write(to: outputURL, options: .atomic)
+                print("PUBLIC REPOSITORY IMPORT ARTIFACT WRITTEN: \(outputURL.path) status=\(result.status)")
+                guard !failOnFailure || result.status == "passed" else {
+                    throw ValidationError("public repository import did not pass; inspect \(outputURL.lastPathComponent)")
+                }
+            }
+        }
+
         struct Live: AsyncParsableCommand {
             static let configuration = CommandConfiguration(
                 abstract: "Run one stateful public or permissioned cross-host round trip"
@@ -2869,6 +3022,12 @@ extension SwanCommand {
             )
             var permissionedListOpsExcludeValues = false
 
+            @Flag(
+                name: .customLong("permissioned-get-repo"),
+                help: "Fetch and cryptographically verify the repository host's full two-root permissioned CAR"
+            )
+            var permissionedGetRepo = false
+
             @Option(
                 name: .customLong("permissioned-commit-key-env"),
                 help: "Environment variable containing the repository author's base64url secp256k1 public key"
@@ -2877,6 +3036,9 @@ extension SwanCommand {
 
             @Option(name: .long, help: "JSON request body file for the write")
             var bodyFile: String
+
+            @Option(name: .customLong("blob-file"), help: "Optional public blob body file to upload before the record write")
+            var blobFile: String?
 
             @Option(name: .long, parsing: .upToNextOption, help: "Permissioned read query item key=value; repeatable")
             var readQuery: [String] = []
@@ -2910,7 +3072,7 @@ extension SwanCommand {
                     environment: "SWAN_LAB_CONSUMER_URL",
                     fallback: "https://pds.test"
                 )
-                let permissionedCommitKey = try permissionedListOps
+                let permissionedCommitKey = try (permissionedListOps || permissionedGetRepo)
                     ? LabLiveSupport.permissionedCommitVerificationKey(environment: permissionedCommitKeyEnvironment)
                     : nil
                 let producer = try await LabLiveSupport.host(
@@ -2939,6 +3101,9 @@ extension SwanCommand {
                     timeout: requestTimeoutSeconds
                 )
                 let body = try LabLiveSupport.body(at: URL(fileURLWithPath: bodyFile))
+                let blobBody = try blobFile.map {
+                    try LabLiveSupport.body(at: URL(fileURLWithPath: $0))
+                }
                 let artifact: any Encodable
                 let status: String
                 if normalizedMode == "public" {
@@ -2952,7 +3117,8 @@ extension SwanCommand {
                         repository: repository,
                         collection: collection,
                         rkey: rkey,
-                        putBody: body
+                        putBody: body,
+                        blobBody: blobBody
                     )
                     artifact = result
                     status = result.status
@@ -3000,7 +3166,8 @@ extension SwanCommand {
                         readQuery: query,
                         readHost: readHost,
                         verifyIncrementalSync: permissionedListOps,
-                        includeIncrementalValues: !permissionedListOpsExcludeValues
+                        includeIncrementalValues: !permissionedListOpsExcludeValues,
+                        verifyFullCAR: permissionedGetRepo
                     )
                     artifact = result
                     status = result.status
@@ -3395,7 +3562,7 @@ private enum LabLiveSupport {
         return object["error"] as? String
     }
 
-    private static func environmentValue(_ name: String, label: String) throws -> String {
+    static func environmentValue(_ name: String, label: String) throws -> String {
         guard name.utf8.count <= 128,
               name.utf8.allSatisfy({
                   ($0 >= 0x41 && $0 <= 0x5a) || ($0 >= 0x30 && $0 <= 0x39) || $0 == 0x5f

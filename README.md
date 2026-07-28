@@ -58,6 +58,37 @@ when `listRepoOps` includes values because its joined SQLite query leaves
 `syncValuesIncluded: false` so this limitation is visible rather than hidden.
 Swan's own endpoint remains value-capable and is covered by its HTTP tests.
 
+Add `--permissioned-get-repo` to stream and verify the full two-root recovery
+CAR from the selected permissioned repository host. It uses the same explicit
+repository-author key pin and records only the HTTP status, record count, and
+commitment in the artifact.
+
+Public live runs can include `--blob-file <path>`. Put the literal
+`{{BLOB_CID}}` wherever the uploaded blob CID belongs in the JSON record body;
+the runner replaces that placeholder only after the upload response is
+validated, then verifies the blob bytes through `sync.getBlob`. The live blob
+fixture is intentionally bounded to 2 MiB; production HTTP upload/download
+paths remain streamed. A disposable body may also use the literal
+`{{REPOSITORY_DID}}` for its `repo` field; the runner replaces it with the
+freshly bootstrapped account DID so clean Compose runs do not depend on a
+generated identity being checked into a fixture.
+
+For public repository handoff testing, `lab import-public` streams the pinned
+reference host's `com.atproto.sync.getRepo` response into durable per-account
+SQLite staging and publishes it only after signature, MST, CID, and revision
+CAS verification:
+
+```sh
+SWAN_LAB_PUBLIC_REPO_KEY="$PUBLIC_REPO_KEY" \
+swift run swan lab import-public --remote-url https://pds.test \
+  --data-directory .swan-data --did did:plc:... \
+  --commit-key-algorithm secp256k1 --output /tmp/swan-public-import.json
+```
+
+The public import command requires an operator-supplied verification key; it
+does not resolve remote DID/PLC keys implicitly. Its output is sanitized and
+contains no record values, tokens, passwords, or private key material.
+
 The cross-host TypeScript permissioned smoke uses the pinned reference PDS as
 the member repository and Swan as the authority. Swan's fail-closed remote key
 policy requires an operator-supplied static delegation public-key pin for that

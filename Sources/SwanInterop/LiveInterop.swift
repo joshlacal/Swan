@@ -86,22 +86,28 @@ public final class InteropHTTPClient: @unchecked Sendable {
     public let baseURL: URL
     public let timeout: TimeInterval
     public let maximumResponseBytes: Int
+    /// File-backed CAR/blob responses may be larger than JSON responses. The
+    /// limit remains finite and is enforced one received buffer at a time.
+    public let maximumStreamingResponseBytes: Int
 
     private let client: HTTPClient
 
     public init(
         baseURL: URL,
         timeout: TimeInterval = 15,
-        maximumResponseBytes: Int = 2 * 1024 * 1024
+        maximumResponseBytes: Int = 2 * 1024 * 1024,
+        maximumStreamingResponseBytes: Int = 512 * 1024 * 1024
     ) throws {
         guard Self.validBaseURL(baseURL),
               timeout > 0, timeout <= 120, timeout.isFinite,
-              (1 ... 256 * 1024 * 1024).contains(maximumResponseBytes) else {
+              (1 ... 256 * 1024 * 1024).contains(maximumResponseBytes),
+              (1 ... 512 * 1024 * 1024).contains(maximumStreamingResponseBytes) else {
             throw SwanError.malformed("interop HTTP client bounds are invalid")
         }
         self.baseURL = baseURL
         self.timeout = timeout
         self.maximumResponseBytes = maximumResponseBytes
+        self.maximumStreamingResponseBytes = maximumStreamingResponseBytes
         client = HTTPClient(configuration: .init(
             redirectConfiguration: .disallow,
             timeout: .init(
@@ -185,7 +191,7 @@ public final class InteropHTTPClient: @unchecked Sendable {
         to destination: URL,
         maximumResponseBytes: Int
     ) async throws -> InteropHTTPResponse {
-        guard (1 ... 256 * 1024 * 1024).contains(maximumResponseBytes) else {
+        guard (1 ... self.maximumStreamingResponseBytes).contains(maximumResponseBytes) else {
             throw SwanError.malformed("interop streaming bound is invalid")
         }
         let url = try makeURL(path)
@@ -333,6 +339,34 @@ public struct InteropXRPCClient: Sendable {
             query: [:],
             body: body,
             authorization: authorization,
+            maximumResponseBytes: maximumResponseBytes
+        )
+    }
+
+    /// Bounded binary XRPC procedure used by the public blob interop slice.
+    /// The live fixture runner intentionally keeps request bodies small; the
+    /// production HTTP upload route has its own streaming staging path.
+    public func binaryProcedure(
+        _ nsid: String,
+        body: Data,
+        contentType: String,
+        authorization: InteropAuthorization = .none,
+        maximumResponseBytes: Int? = nil
+    ) async throws -> InteropHTTPResponse {
+        guard body.count <= 2 * 1024 * 1024 else {
+            throw InteropHTTPError.responseTooLarge
+        }
+        let path = try makeXRPCPath(nsid, query: [:])
+        var headers = [
+            "Accept": "application/json",
+            "Content-Type": contentType,
+        ]
+        addAuthorization(authorization, to: &headers)
+        return try await http.execute(
+            method: .post,
+            path: path,
+            headers: headers,
+            body: body,
             maximumResponseBytes: maximumResponseBytes
         )
     }
@@ -561,6 +595,11 @@ public struct LiveInteropPublicRoundTripArtifact: Codable, Sendable, Equatable {
     public let readCID: String?
     public let putResponseSHA256: String?
     public let readResponseSHA256: String?
+    public let blobUploadStatus: Int?
+    public let blobDownloadStatus: Int?
+    public let blobCID: String?
+    public let blobBytes: Int?
+    public let blobVerified: Bool?
     public let converged: Bool
     public let status: String
     public let errorCode: String?
@@ -577,6 +616,11 @@ public struct LiveInteropPublicRoundTripArtifact: Codable, Sendable, Equatable {
         readCID: String?,
         putResponseSHA256: String?,
         readResponseSHA256: String?,
+        blobUploadStatus: Int? = nil,
+        blobDownloadStatus: Int? = nil,
+        blobCID: String? = nil,
+        blobBytes: Int? = nil,
+        blobVerified: Bool? = nil,
         converged: Bool,
         status: String,
         errorCode: String?,
@@ -592,6 +636,11 @@ public struct LiveInteropPublicRoundTripArtifact: Codable, Sendable, Equatable {
         self.readCID = readCID
         self.putResponseSHA256 = putResponseSHA256
         self.readResponseSHA256 = readResponseSHA256
+        self.blobUploadStatus = blobUploadStatus
+        self.blobDownloadStatus = blobDownloadStatus
+        self.blobCID = blobCID
+        self.blobBytes = blobBytes
+        self.blobVerified = blobVerified
         self.converged = converged
         self.status = status
         self.errorCode = errorCode.map { FixtureSanitizer.sanitize(["error": $0])["error"] ?? "<redacted>" }
@@ -622,6 +671,10 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
     /// metadata-only form with `excludeValues=true` and this field keeps that
     /// limitation visible in the sanitized artifact.
     public let syncValuesIncluded: Bool?
+    public let fullCARStatus: Int?
+    public let fullCARRecordCount: Int?
+    public let fullCARCommitment: String?
+    public let fullCARVerified: Bool?
     public let converged: Bool
     public let status: String
     public let errorCode: String?
@@ -644,6 +697,10 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
         syncOperationCID: String? = nil,
         syncCommitVerified: Bool? = nil,
         syncValuesIncluded: Bool? = nil,
+        fullCARStatus: Int? = nil,
+        fullCARRecordCount: Int? = nil,
+        fullCARCommitment: String? = nil,
+        fullCARVerified: Bool? = nil,
         converged: Bool,
         status: String,
         errorCode: String?,
@@ -665,6 +722,10 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
         self.syncOperationCID = syncOperationCID
         self.syncCommitVerified = syncCommitVerified
         self.syncValuesIncluded = syncValuesIncluded
+        self.fullCARStatus = fullCARStatus
+        self.fullCARRecordCount = fullCARRecordCount
+        self.fullCARCommitment = fullCARCommitment
+        self.fullCARVerified = fullCARVerified
         self.converged = converged
         self.status = status
         self.errorCode = errorCode.map { FixtureSanitizer.sanitize(["error": $0])["error"] ?? "<redacted>" }
@@ -696,6 +757,33 @@ public enum LiveInteropRunner {
         )
     }
 
+    private struct PermissionedCARResult: Sendable {
+        let status: Int?
+        let recordCount: Int?
+        let commitment: String?
+        let verified: Bool?
+        let errorCode: String?
+
+        static let notRequested = Self(
+            status: nil, recordCount: nil, commitment: nil,
+            verified: nil, errorCode: nil
+        )
+    }
+
+    private struct PublicBlobResult: Sendable {
+        let uploadStatus: Int?
+        let downloadStatus: Int?
+        let cid: String?
+        let byteCount: Int?
+        let verified: Bool?
+        let errorCode: String?
+
+        static let notRequested = Self(
+            uploadStatus: nil, downloadStatus: nil, cid: nil,
+            byteCount: nil, verified: nil, errorCode: nil
+        )
+    }
+
     public static func publicPutAndRead(
         scenario: String,
         producer: LiveInteropHost,
@@ -704,12 +792,22 @@ public enum LiveInteropRunner {
         collection: String,
         rkey: String,
         putBody: Data,
+        blobBody: Data? = nil,
         recorder: InteropFixtureRecorder? = nil
     ) async -> LiveInteropPublicRoundTripArtifact {
         let recorder = recorder ?? InteropFixtureRecorder()
         let putPath = "/xrpc/com.atproto.repo.putRecord"
         let getPath = "/xrpc/com.atproto.repo.getRecord"
-        guard jsonFields(putBody, equalTo: [
+        let materializedBody: Data
+        if let bodyText = String(data: putBody, encoding: .utf8),
+           bodyText.contains("{{REPOSITORY_DID}}") {
+            materializedBody = Data(
+                bodyText.replacingOccurrences(of: "{{REPOSITORY_DID}}", with: repository).utf8
+            )
+        } else {
+            materializedBody = putBody
+        }
+        guard jsonFields(materializedBody, equalTo: [
             "repo": repository,
             "collection": collection,
             "rkey": rkey,
@@ -717,7 +815,8 @@ public enum LiveInteropRunner {
             return await artifact(
                 scenario: scenario, producer: producer, consumer: consumer,
                 putStatus: nil, readStatus: nil, putCID: nil, readCID: nil,
-                putDigest: nil, readDigest: nil, converged: false,
+                putDigest: nil, readDigest: nil,
+                converged: false,
                 errorCode: "InvalidRequest", recorder: recorder
             )
         }
@@ -728,17 +827,45 @@ public enum LiveInteropRunner {
         var putDigest: String?
         var readDigest: String?
         var errorCode: String?
+        var blobResult = PublicBlobResult.notRequested
+        var putRequestBody = materializedBody
+
+        if let blobBody {
+            blobResult = await uploadPublicBlob(
+                producer: producer,
+                body: blobBody,
+                recorder: recorder
+            )
+            guard blobResult.errorCode == nil,
+                  let blobCID = blobResult.cid,
+                  let bodyText = String(data: materializedBody, encoding: .utf8),
+                  bodyText.contains(blobCID) || bodyText.contains("{{BLOB_CID}}") else {
+                return await artifact(
+                    scenario: scenario, producer: producer, consumer: consumer,
+                    putStatus: nil, readStatus: nil, putCID: nil, readCID: nil,
+                    putDigest: nil, readDigest: nil, blobResult: blobResult,
+                    converged: false,
+                    errorCode: blobResult.errorCode ?? "BlobReferenceMissing",
+                    recorder: recorder
+                )
+            }
+            if bodyText.contains("{{BLOB_CID}}") {
+                putRequestBody = Data(
+                    bodyText.replacingOccurrences(of: "{{BLOB_CID}}", with: blobCID).utf8
+                )
+            }
+        }
 
         do {
             let authorization = try await authorization(
                 for: producer,
                 method: .post,
                 path: putPath,
-                body: putBody
+                body: putRequestBody
             )
             let response = try await producer.client.procedure(
                 "com.atproto.repo.putRecord",
-                body: putBody,
+                body: putRequestBody,
                 authorization: authorization
             )
             putStatus = response.status
@@ -747,7 +874,7 @@ public enum LiveInteropRunner {
                 host: producer.label,
                 method: "POST",
                 path: putPath,
-                requestBody: putBody,
+                requestBody: putRequestBody,
                 response: response
             )
             guard (200 ... 299).contains(response.status) else {
@@ -755,7 +882,8 @@ public enum LiveInteropRunner {
                 return await artifact(
                     scenario: scenario, producer: producer, consumer: consumer,
                     putStatus: putStatus, readStatus: nil, putCID: nil, readCID: nil,
-                    putDigest: putDigest, readDigest: nil, converged: false,
+                    putDigest: putDigest, readDigest: nil, blobResult: blobResult,
+                    converged: false,
                     errorCode: errorCode, recorder: recorder
                 )
             }
@@ -765,7 +893,8 @@ public enum LiveInteropRunner {
                 return await artifact(
                     scenario: scenario, producer: producer, consumer: consumer,
                     putStatus: putStatus, readStatus: nil, putCID: nil, readCID: nil,
-                    putDigest: putDigest, readDigest: nil, converged: false,
+                    putDigest: putDigest, readDigest: nil, blobResult: blobResult,
+                    converged: false,
                     errorCode: errorCode, recorder: recorder
                 )
             }
@@ -774,7 +903,8 @@ public enum LiveInteropRunner {
             return await artifact(
                 scenario: scenario, producer: producer, consumer: consumer,
                 putStatus: putStatus, readStatus: readStatus, putCID: nil, readCID: nil,
-                putDigest: putDigest, readDigest: readDigest, converged: false,
+                putDigest: putDigest, readDigest: readDigest, blobResult: blobResult,
+                converged: false,
                 errorCode: errorCode, recorder: recorder
             )
         }
@@ -807,7 +937,8 @@ public enum LiveInteropRunner {
                 return await artifact(
                     scenario: scenario, producer: producer, consumer: consumer,
                     putStatus: putStatus, readStatus: readStatus, putCID: putCID, readCID: nil,
-                    putDigest: putDigest, readDigest: readDigest, converged: false,
+                    putDigest: putDigest, readDigest: readDigest, blobResult: blobResult,
+                    converged: false,
                     errorCode: errorCode, recorder: recorder
                 )
             }
@@ -816,13 +947,184 @@ public enum LiveInteropRunner {
             errorCode = liveErrorCode(error)
         }
 
+        if let blobBody, let blobCID = blobResult.cid {
+            blobResult = await downloadPublicBlob(
+                consumer: consumer,
+                repository: repository,
+                cid: blobCID,
+                expectedBody: blobBody,
+                uploadStatus: blobResult.uploadStatus,
+                recorder: recorder
+            )
+        }
         let converged = putCID != nil && putCID == readCID
+            && blobResult.errorCode == nil
         return await artifact(
             scenario: scenario, producer: producer, consumer: consumer,
             putStatus: putStatus, readStatus: readStatus, putCID: putCID, readCID: readCID,
-            putDigest: putDigest, readDigest: readDigest, converged: converged,
-            errorCode: converged ? nil : (errorCode ?? "CommitmentMismatch"), recorder: recorder
+            putDigest: putDigest, readDigest: readDigest, blobResult: blobResult,
+            converged: converged,
+            errorCode: converged ? nil : (errorCode ?? blobResult.errorCode ?? "CommitmentMismatch"), recorder: recorder
         )
+    }
+
+    private static func uploadPublicBlob(
+        producer: LiveInteropHost,
+        body: Data,
+        recorder: InteropFixtureRecorder
+    ) async -> PublicBlobResult {
+        let path = "/xrpc/com.atproto.repo.uploadBlob"
+        do {
+            let authorization = try await authorization(
+                for: producer,
+                method: .post,
+                path: path,
+                body: body
+            )
+            let response = try await producer.client.binaryProcedure(
+                "com.atproto.repo.uploadBlob",
+                body: body,
+                contentType: "application/octet-stream",
+                authorization: authorization
+            )
+            await recorder.record(
+                host: producer.label,
+                method: "POST",
+                path: path,
+                requestBody: body,
+                response: response
+            )
+            guard (200 ... 299).contains(response.status) else {
+                return PublicBlobResult(
+                    uploadStatus: response.status, downloadStatus: nil,
+                    cid: nil, byteCount: nil, verified: false,
+                    errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
+                )
+            }
+            guard let cid = blobCID(from: response.body) else {
+                return PublicBlobResult(
+                    uploadStatus: response.status, downloadStatus: nil,
+                    cid: nil, byteCount: body.count, verified: false,
+                    errorCode: "InvalidBlobResponse"
+                )
+            }
+            return PublicBlobResult(
+                uploadStatus: response.status, downloadStatus: nil,
+                cid: cid, byteCount: body.count, verified: nil, errorCode: nil
+            )
+        } catch {
+            return PublicBlobResult(
+                uploadStatus: nil, downloadStatus: nil, cid: nil,
+                byteCount: nil, verified: false, errorCode: liveErrorCode(error)
+            )
+        }
+    }
+
+    private static func downloadPublicBlob(
+        consumer: LiveInteropHost,
+        repository: String,
+        cid: String,
+        expectedBody: Data,
+        uploadStatus: Int?,
+        recorder: InteropFixtureRecorder
+    ) async -> PublicBlobResult {
+        let url = FileManager.default.temporaryDirectory
+            .appending(path: "swan-public-blob-\(UUID().uuidString).blob")
+        defer { try? FileManager.default.removeItem(at: url) }
+        do {
+            let path = try consumer.client.xrpcPath(
+                "com.atproto.sync.getBlob",
+                query: ["did": repository, "cid": cid]
+            )
+            let authorization = try await authorization(
+                for: consumer,
+                method: .get,
+                path: path,
+                body: nil
+            )
+            let response = try await consumer.client.stream(
+                "com.atproto.sync.getBlob",
+                query: ["did": repository, "cid": cid],
+                authorization: authorization,
+                to: url,
+                maximumResponseBytes: 256 * 1024 * 1024
+            )
+            await recorder.record(
+                host: consumer.label,
+                method: "GET",
+                path: "/xrpc/com.atproto.sync.getBlob",
+                response: response
+            )
+            guard (200 ... 299).contains(response.status) else {
+                return PublicBlobResult(
+                    uploadStatus: uploadStatus, downloadStatus: response.status,
+                    cid: cid, byteCount: nil, verified: false,
+                    errorCode: "HTTP\(response.status)"
+                )
+            }
+            guard response.header("content-type")?.lowercased()
+                .contains("application/octet-stream") == true else {
+                return PublicBlobResult(
+                    uploadStatus: uploadStatus, downloadStatus: response.status,
+                    cid: cid, byteCount: nil, verified: false,
+                    errorCode: "UnexpectedContentType"
+                )
+            }
+            let received = try fileDigest(url)
+            let expectedDigest = Hex.encode(SHA256.hash(data: expectedBody))
+            let verified = received.bytes == expectedBody.count
+                && received.digest == expectedDigest
+            return PublicBlobResult(
+                uploadStatus: uploadStatus, downloadStatus: response.status,
+                cid: cid, byteCount: received.bytes, verified: verified,
+                errorCode: verified ? nil : "BlobMismatch"
+            )
+        } catch {
+            return PublicBlobResult(
+                uploadStatus: uploadStatus, downloadStatus: nil, cid: cid,
+                byteCount: nil, verified: false, errorCode: liveErrorCode(error)
+            )
+        }
+    }
+
+    private static func blobCID(from body: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: body) else {
+            return nil
+        }
+        func find(_ value: Any) -> String? {
+            if let string = value as? String, (try? CID.parse(string)) != nil {
+                return string
+            }
+            if let object = value as? [String: Any] {
+                for key in ["$link", "cid"] {
+                    if let candidate = object[key] as? String,
+                       (try? CID.parse(candidate)) != nil {
+                        return candidate
+                    }
+                }
+                for nested in object.values {
+                    if let found = find(nested) { return found }
+                }
+            } else if let values = value as? [Any] {
+                for nested in values {
+                    if let found = find(nested) { return found }
+                }
+            }
+            return nil
+        }
+        return find(object)
+    }
+
+    private static func fileDigest(_ url: URL) throws -> (bytes: Int, digest: String) {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var digest = SHA256()
+        var count = 0
+        while let chunk = try handle.read(upToCount: 64 * 1_024), !chunk.isEmpty {
+            count += chunk.count
+            digest.update(data: chunk)
+        }
+        return (count, Hex.encode(Data(digest.finalize())))
     }
 
     /// Exercises the permissioned cross-host sequence without baking a
@@ -844,6 +1146,7 @@ public enum LiveInteropRunner {
         readHost: LiveInteropHost? = nil,
         verifyIncrementalSync: Bool = false,
         includeIncrementalValues: Bool = true,
+        verifyFullCAR: Bool = false,
         clientAttestation: String? = nil,
         recorder: InteropFixtureRecorder? = nil
     ) async -> LiveInteropPermissionedRoundTripArtifact {
@@ -870,6 +1173,7 @@ public enum LiveInteropRunner {
         var readDigest: String?
         var errorCode: String?
         var syncResult = PermissionedSyncResult.notRequested
+        var fullCARResult = PermissionedCARResult.notRequested
         do {
             let credential = try await broker.exchange(
                 space: space,
@@ -981,14 +1285,28 @@ public enum LiveInteropRunner {
                     recorder: recorder
                 )
             }
-            let converged = writeCID == readCID && syncResult.errorCode == nil
+            if verifyFullCAR {
+                fullCARResult = await verifyPermissionedGetRepo(
+                    repositoryHost: repositoryHost,
+                    space: space,
+                    author: readQuery["repo"] ?? "",
+                    authorization: credentialAuthorization,
+                    recorder: recorder
+                )
+            }
+            let converged = writeCID == readCID
+                && syncResult.errorCode == nil
+                && fullCARResult.errorCode == nil
             return await permissionedArtifact(
                 scenario: scenario, member: member, authority: authority,
                 credentialIssued: credentialIssued, writeStatus: writeStatus,
                 readStatus: readStatus, writeCID: writeCID, readCID: readCID,
                 writeDigest: writeDigest, readDigest: readDigest,
                 syncResult: syncResult,
-                converged: converged, errorCode: syncResult.errorCode, recorder: recorder
+                fullCARResult: fullCARResult,
+                converged: converged,
+                errorCode: syncResult.errorCode ?? fullCARResult.errorCode,
+                recorder: recorder
             )
         } catch {
             errorCode = liveErrorCode(error)
@@ -998,6 +1316,7 @@ public enum LiveInteropRunner {
                 readStatus: readStatus, writeCID: writeCID, readCID: readCID,
                 writeDigest: writeDigest, readDigest: readDigest,
                 syncResult: syncResult,
+                fullCARResult: fullCARResult,
                 converged: false, errorCode: errorCode, recorder: recorder
             )
         }
@@ -1168,6 +1487,76 @@ public enum LiveInteropRunner {
         }
     }
 
+    private static func verifyPermissionedGetRepo(
+        repositoryHost: LiveInteropHost,
+        space: SpaceURI,
+        author: String,
+        authorization: InteropAuthorization,
+        recorder: InteropFixtureRecorder
+    ) async -> PermissionedCARResult {
+        guard let key = repositoryHost.permissionedCommitVerificationKey else {
+            return PermissionedCARResult(
+                status: nil, recordCount: nil, commitment: nil,
+                verified: false, errorCode: "MissingCommitKey"
+            )
+        }
+        guard case let .p256(publicKey) = key else {
+            return PermissionedCARResult(
+                status: nil, recordCount: nil, commitment: nil,
+                verified: false, errorCode: "UnsupportedCommitKey"
+            )
+        }
+        let spoolURL = FileManager.default.temporaryDirectory
+            .appending(path: "swan-permissioned-recovery-\(UUID().uuidString).car")
+        defer { try? FileManager.default.removeItem(at: spoolURL) }
+        do {
+            let response = try await repositoryHost.client.stream(
+                "com.atproto.space.getRepo",
+                query: ["space": space.rawValue, "repo": author],
+                authorization: authorization,
+                to: spoolURL,
+                maximumResponseBytes: 256 * 1024 * 1024
+            )
+            await recorder.record(
+                host: repositoryHost.label,
+                method: "GET",
+                path: "/xrpc/com.atproto.space.getRepo",
+                response: response
+            )
+            guard (200 ... 299).contains(response.status) else {
+                return PermissionedCARResult(
+                    status: response.status, recordCount: nil, commitment: nil,
+                    verified: false, errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
+                )
+            }
+            guard response.header("content-type")?.lowercased()
+                .contains("application/vnd.ipld.car") == true else {
+                return PermissionedCARResult(
+                    status: response.status, recordCount: nil, commitment: nil,
+                    verified: false, errorCode: "UnexpectedContentType"
+                )
+            }
+            let recovery = try SwanCARConsumer().verify(
+                fileURL: spoolURL,
+                space: space,
+                author: author,
+                publicKey: publicKey
+            )
+            return PermissionedCARResult(
+                status: response.status,
+                recordCount: recovery.records.count,
+                commitment: Hex.encode(recovery.commitment),
+                verified: true,
+                errorCode: nil
+            )
+        } catch {
+            return PermissionedCARResult(
+                status: nil, recordCount: nil, commitment: nil,
+                verified: false, errorCode: liveErrorCode(error)
+            )
+        }
+    }
+
     private static func artifact(
         scenario: String,
         producer: LiveInteropHost,
@@ -1178,6 +1567,7 @@ public enum LiveInteropRunner {
         readCID: String?,
         putDigest: String?,
         readDigest: String?,
+        blobResult: PublicBlobResult = .notRequested,
         converged: Bool,
         errorCode: String?,
         recorder: InteropFixtureRecorder
@@ -1192,6 +1582,11 @@ public enum LiveInteropRunner {
             readCID: readCID,
             putResponseSHA256: putDigest,
             readResponseSHA256: readDigest,
+            blobUploadStatus: blobResult.uploadStatus,
+            blobDownloadStatus: blobResult.downloadStatus,
+            blobCID: blobResult.cid,
+            blobBytes: blobResult.byteCount,
+            blobVerified: blobResult.verified,
             converged: converged,
             status: converged ? "passed" : "failed",
             errorCode: errorCode,
@@ -1211,6 +1606,7 @@ public enum LiveInteropRunner {
         writeDigest: String?,
         readDigest: String?,
         syncResult: PermissionedSyncResult = .notRequested,
+        fullCARResult: PermissionedCARResult = .notRequested,
         converged: Bool,
         errorCode: String?,
         recorder: InteropFixtureRecorder
@@ -1231,6 +1627,10 @@ public enum LiveInteropRunner {
             syncOperationCID: syncResult.operationCID,
             syncCommitVerified: syncResult.commitVerified,
             syncValuesIncluded: syncResult.valuesIncluded,
+            fullCARStatus: fullCARResult.status,
+            fullCARRecordCount: fullCARResult.recordCount,
+            fullCARCommitment: fullCARResult.commitment,
+            fullCARVerified: fullCARResult.verified,
             converged: converged,
             status: converged ? "passed" : "failed",
             errorCode: errorCode,

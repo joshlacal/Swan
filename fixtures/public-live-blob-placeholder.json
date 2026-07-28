@@ -1,0 +1,11 @@
+{
+  "repo": "{{REPOSITORY_DID}}",
+  "collection": "app.bsky.feed.post",
+  "rkey": "blob-live-fixture",
+  "record": {
+    "text": "Swan public blob interoperability fixture",
+    "blob": {
+      "$link": "{{BLOB_CID}}"
+    }
+  }
+}
