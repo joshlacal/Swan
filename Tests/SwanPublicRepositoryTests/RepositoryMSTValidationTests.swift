@@ -425,7 +425,7 @@ final class RepositoryMSTValidationTests: XCTestCase {
         XCTAssertFalse(singleBytes.isEmpty)
     }
 
-    func testEnforcesNodeEntryAndRelevantByteBudgetsAtBoundary() async throws {
+    func testEnforcesNodeEntryAndReachableRepositoryByteBudgetsAtBoundary() async throws {
         let path = try path(withDepth: 0)
         let record = try recordBytes(for: path)
         let recordCID = CID.fromDAGCBOR(record)
@@ -440,7 +440,7 @@ final class RepositoryMSTValidationTests: XCTestCase {
             rootCID: nodeCID,
             blocks: source,
             limits: exact,
-            maximumRelevantBytesOverride: nodeBytes.count + record.count
+            maximumReachableRepositoryBytes: nodeBytes.count + record.count
         )
 
         let noNodes = try limits(nodes: 1, entries: 1)
@@ -460,12 +460,66 @@ final class RepositoryMSTValidationTests: XCTestCase {
                 maximumMSTEntriesPerNodeOverride: 0
             )
         }
-        await XCTAssertThrowsMSTError(.relevantByteLimitExceeded) {
+        await XCTAssertThrowsMSTError(.reachableRepositoryByteLimitExceeded) {
             try await RepositoryMSTValidation.validate(
                 rootCID: nodeCID,
                 blocks: source,
                 limits: exact,
-                maximumRelevantBytesOverride: nodeBytes.count + record.count - 1
+                maximumReachableRepositoryBytes: nodeBytes.count + record.count - 1
+            )
+        }
+    }
+
+    func testFullRepositoryTraversalIsNotLimitedByMutationByteBudget() async throws {
+        var paths: [PublicRepositoryPath] = []
+        while paths.count < 3 {
+            paths.append(try path(withDepth: 0, excluding: Set(paths)))
+        }
+        paths.sort { $0.mstKey < $1.mstKey }
+
+        var leaves: [RepositoryMSTLeaf] = []
+        var storage: [CID: Data] = [:]
+        for (index, path) in paths.enumerated() {
+            let record = try PublicRepositoryRecordCodec.prepare(
+                PublicRecord([
+                    "$type": .string(path.collection),
+                    "text": .string(String(repeating: Character(String(index)), count: 740_000)),
+                ]),
+                for: path
+            ).bytes
+            let cid = CID.fromDAGCBOR(record)
+            storage[cid] = record
+            leaves.append(.init(path: path, recordCID: cid))
+        }
+        let node = try RepositoryMSTCodec.node(leaves: leaves)
+        let nodeBytes = try RepositoryMSTCodec.encode(node)
+        let nodeCID = CID.fromDAGCBOR(nodeBytes)
+        storage[nodeCID] = nodeBytes
+        let source = TestBlockSource(storage: storage)
+
+        let validated = try await RepositoryMSTValidation.validate(rootCID: nodeCID, blocks: source)
+        XCTAssertGreaterThan(
+            validated.reachableRepositoryByteCount,
+            PublicRepositoryLimits.pinnedMaximumRelevantBlockBytes
+        )
+
+        _ = try await RepositoryMSTValidation.validate(
+            rootCID: nodeCID,
+            blocks: source,
+            maximumReachableRepositoryBytes: validated.reachableRepositoryByteCount
+        )
+        await XCTAssertThrowsMSTError(.reachableRepositoryByteLimitExceeded) {
+            try await RepositoryMSTValidation.validate(
+                rootCID: nodeCID,
+                blocks: source,
+                maximumReachableRepositoryBytes: validated.reachableRepositoryByteCount - 1
+            )
+        }
+        await XCTAssertThrowsMSTError(.invalidReachableRepositoryByteBudget) {
+            try await RepositoryMSTValidation.validate(
+                rootCID: nodeCID,
+                blocks: source,
+                maximumReachableRepositoryBytes: PublicRepositoryLimits.standard.maximumCARBytes + 1
             )
         }
     }

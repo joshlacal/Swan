@@ -30,7 +30,8 @@ public enum RepositoryMSTValidationError: Error, Sendable, Equatable {
     case nodeLimitExceeded
     case entryLimitExceeded
     case cborDepthLimitExceeded
-    case relevantByteLimitExceeded
+    case invalidReachableRepositoryByteBudget
+    case reachableRepositoryByteLimitExceeded
 }
 
 public struct ValidatedPublicRepositoryMST: Sendable, Equatable {
@@ -39,22 +40,23 @@ public struct ValidatedPublicRepositoryMST: Sendable, Equatable {
     public let leaves: [RepositoryMSTLeaf]
     public let reachableMSTBlocks: [CID: Data]
     public let reachableRecordCIDs: Set<CID>
-    public let relevantByteCount: Int
+    public let reachableRepositoryByteCount: Int
 }
 
 public enum RepositoryMSTValidation {
     public static func validate(
         rootCID: CID,
         blocks: any PublicRepositoryBlockSource,
-        limits: PublicRepositoryLimits = .standard
+        limits: PublicRepositoryLimits = .standard,
+        maximumReachableRepositoryBytes: Int? = nil
     ) async throws -> ValidatedPublicRepositoryMST {
         try await validate(
             rootCID: rootCID,
             blocks: blocks,
             limits: limits,
+            maximumReachableRepositoryBytes: maximumReachableRepositoryBytes,
             maximumMSTNodesOverride: nil,
-            maximumMSTEntriesPerNodeOverride: nil,
-            maximumRelevantBytesOverride: nil
+            maximumMSTEntriesPerNodeOverride: nil
         )
     }
 
@@ -64,9 +66,9 @@ public enum RepositoryMSTValidation {
         rootCID: CID,
         blocks: any PublicRepositoryBlockSource,
         limits: PublicRepositoryLimits,
+        maximumReachableRepositoryBytes: Int? = nil,
         maximumMSTNodesOverride: Int? = nil,
-        maximumMSTEntriesPerNodeOverride: Int? = nil,
-        maximumRelevantBytesOverride: Int? = nil
+        maximumMSTEntriesPerNodeOverride: Int? = nil
     ) async throws -> ValidatedPublicRepositoryMST {
         do {
             try PublicRepositoryCID.validate(rootCID)
@@ -79,7 +81,10 @@ public enum RepositoryMSTValidation {
 
         let maximumNodes = maximumMSTNodesOverride ?? limits.maximumMSTNodes
         let maximumEntries = maximumMSTEntriesPerNodeOverride ?? limits.maximumMSTEntriesPerNode
-        let maximumRelevantBytes = maximumRelevantBytesOverride ?? limits.maximumRelevantBlockBytes
+        let maximumReachableBytes = maximumReachableRepositoryBytes ?? limits.maximumCARBytes
+        guard maximumReachableBytes >= 0, maximumReachableBytes <= limits.maximumCARBytes else {
+            throw RepositoryMSTValidationError.invalidReachableRepositoryByteBudget
+        }
 
         struct WorkItem {
             let cid: CID
@@ -102,7 +107,7 @@ public enum RepositoryMSTValidation {
         var leaves: [RepositoryMSTLeaf] = []
         var recordCIDs = Set<CID>()
         var recordBlocks: [CID: Data] = [:]
-        var relevantBytes = 0
+        var reachableBytes = 0
         var rootLayer: Int?
 
         while let item = work.popLast() {
@@ -120,7 +125,7 @@ public enum RepositoryMSTValidation {
             } catch {
                 throw RepositoryMSTValidationError.blockCIDMismatch
             }
-            relevantBytes = try adding(bytes.count, to: relevantBytes, maximum: maximumRelevantBytes)
+            reachableBytes = try adding(bytes.count, to: reachableBytes, maximum: maximumReachableBytes)
 
             let node = try RepositoryMSTCodec.decode(bytes)
             guard node.entries.count <= maximumEntries else {
@@ -234,7 +239,7 @@ public enum RepositoryMSTValidation {
                 throw RepositoryMSTValidationError.recordBlockTooLarge
             }
             recordBlocks[cid] = bytes
-            relevantBytes = try adding(bytes.count, to: relevantBytes, maximum: maximumRelevantBytes)
+            reachableBytes = try adding(bytes.count, to: reachableBytes, maximum: maximumReachableBytes)
         }
 
         leaves.sort { Data($0.path.mstKey.utf8).lexicographicallyPrecedes(Data($1.path.mstKey.utf8)) }
@@ -266,7 +271,7 @@ public enum RepositoryMSTValidation {
             leaves: leaves,
             reachableMSTBlocks: mstBlocks,
             reachableRecordCIDs: recordCIDs,
-            relevantByteCount: relevantBytes
+            reachableRepositoryByteCount: reachableBytes
         )
     }
 
@@ -289,7 +294,7 @@ public enum RepositoryMSTValidation {
     private static func adding(_ count: Int, to total: Int, maximum: Int) throws -> Int {
         let (result, overflow) = total.addingReportingOverflow(count)
         guard !overflow, count >= 0, result <= maximum else {
-            throw RepositoryMSTValidationError.relevantByteLimitExceeded
+            throw RepositoryMSTValidationError.reachableRepositoryByteLimitExceeded
         }
         return result
     }
