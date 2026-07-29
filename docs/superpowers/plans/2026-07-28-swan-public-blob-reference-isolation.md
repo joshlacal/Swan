@@ -110,7 +110,26 @@ boundary.
   live reference account was then imported into a fresh managed Swan account
   through `com.atproto.sync.getRepo`; the sanitized import artifact reports
   HTTP 200, one record, three reachable blocks, and a verified commit. The
-  receiver-side public-blob promotion step after CAR import remains required.
+receiver-side public-blob promotion step after CAR import remains required.
+
+## 2026-07-29 receiver-side promotion closed
+
+`swan lab import-public --resolve-commit-key --promote-public-blobs` now passes
+against the pinned reference PDS in the disposable Compose lab. The target is
+a normal managed account, not a read-only portable-export source. After the
+three-block public CAR was verified and published, Swan enumerated the typed
+raw-CID links from its durable public MST projection, requested the reference
+blob with both `did` and `cid`, streamed it to a bounded temporary file, and
+verified the SHA-256 content address before writing the public CAS. The
+sanitized ignored artifact reports `promotedBlobCount: 1` and no secret or
+record-value fields.
+
+The corresponding path is covered by the raw-link projection test and the
+canonical `sync.getBlob` query-ordering test. This closes the live public CAR
+and public-blob transfer seams; it does not imply private-blob exposure or
+full alpha completion. Incremental value pages, compaction-gap recovery,
+reverse authority, and the full TypeScript/OAuth/lifecycle/export matrix are
+still open.
 - Re-run the complete suite after any further mutation slice; do not claim
   alpha completion until the live Compose/reference matrix and Linux gates
   pass.

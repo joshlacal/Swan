@@ -237,6 +237,69 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
         try await intentFixture.control.close()
     }
 
+    func testPublicRepositoryBlobCIDsExtractsTypedRawLinksFromInstalledRecords() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root, did: did
+        )
+        let payload = Data("imported-public-blob".utf8)
+        let reference = try await database.putStreaming(
+            namespace: .public,
+            mimeType: "application/octet-stream",
+            maximumBytes: PublicRepositoryLimits.requiredStreamingCARBytes
+        ) { sink in
+            try await sink(payload)
+        }
+        let path = try PublicRepositoryPath(
+            collection: collection, recordKey: "typed-blob"
+        )
+        let record: PublicRecord = [
+            "$type": .string(collection),
+            "blob": .object([
+                "$type": .string("blob"),
+                "ref": .link(try CID.parse(reference.cid)),
+                "mimeType": .string("application/octet-stream"),
+                "size": .integer(payload.count),
+            ]),
+        ]
+        let maybeCurrent = try await database.loadPublicRepositoryState()
+        let current = try XCTUnwrap(maybeCurrent)
+        let request = try PublicRepositoryMutationRequest(
+            id: "typed-blob-read-projection",
+            canonicalDigest: Data(repeating: 0x74, count: 32),
+            baseCommitCID: current.commitCID
+        )
+        guard case let .reserved(reservation) = try await database
+            .reservePublicRepositoryRevision(
+                request, wallClockMicroseconds: 1_750_000_002_000_000
+            ) else {
+            return XCTFail("typed blob projection reservation should be fresh")
+        }
+        let prepared = try await PublicRepositoryEngine.apply(
+            repositoryDID: did,
+            currentState: current,
+            blocks: database,
+            revision: reservation.nextRevision,
+            batch: try PublicRepositoryWriteBatch(
+                writes: [.create(path: path, record: record)],
+                expectedCommitCID: current.commitCID
+            ),
+            signer: P256PublicRepositoryCommitSigner(privateKey: fixture.key)
+        )
+        _ = try await database.applyPublicRepositoryMutation(
+            reservation: reservation, prepared: prepared
+        )
+
+        let cids = try await database.publicRepositoryBlobCIDs()
+        XCTAssertEqual(cids, [try CID.parse(reference.cid)])
+        let isReachable = try await database.publicBlobExists(cid: reference.cid)
+        XCTAssertTrue(isReachable)
+        try await database.close()
+        try await fixture.directory.close()
+        try await fixture.control.close()
+    }
+
     func testOptIn256MiBProductionDirectoryGetRepoHasBoundedRSS() async throws {
         guard ProcessInfo.processInfo.environment[
             "SWAN_RUN_256MIB_PUBLIC_GET_REPO"

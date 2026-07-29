@@ -545,3 +545,24 @@ for export but cannot stage writes. The command now opens the normal managed
 account database, preserving the read-only export mode for export-only paths.
 The CAR import gate is closed; fetching and promoting referenced blob bytes
 into the receiver's public blob namespace remains a separate follow-up.
+
+## Follow-up verification: dynamic PLC import and receiver blob promotion
+
+The rebuilt Compose Swan image now passes the previously open receiver-side
+blob seam. A disposable managed target used the pinned reference PLC resolver
+with the explicit laboratory origin/host allowlist, fetched the reference
+`com.atproto.sync.getRepo` CAR over local TLS, and then promoted its one raw-CID
+blob. The reference `sync.getBlob` request includes both required selectors,
+`did` and `cid`; the response is streamed through an owner-only temporary file,
+checked for a non-JSON content type, and adopted only when the resulting public
+CAS CID equals the requested CID. The sanitized artifact reports HTTP 200,
+three reachable blocks, one record, and `promotedBlobCount: 1`.
+
+The implementation is in `PublicRepositoryCARReplication.swift`, with
+`publicRepositoryBlobCIDs()` extracting typed raw links one record at a time
+from the durable MST projection. The public-blob promotion path is an
+explicit opt-in (`--promote-public-blobs`) after CAR publication; it does not
+promote permissioned references. Focused Swift tests and the macOS build pass,
+and the live Compose proof passes. The alpha remains open for value-bearing
+incremental updates, compaction-gap/full-CAR recovery, reverse authority, and
+the complete cross-implementation OAuth/security/lifecycle/export matrix.

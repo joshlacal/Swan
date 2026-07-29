@@ -2825,6 +2825,12 @@ extension SwanCommand {
             @Option(name: .long, help: "Idempotency request identifier; defaults to the current base commit")
             var requestID: String = ""
 
+            @Flag(
+                name: .customLong("promote-public-blobs"),
+                help: "Fetch raw-CID blobs from the remote PDS and adopt them in the receiver's public namespace after CAR import"
+            )
+            var promotePublicBlobs = false
+
             @Option(name: .long, help: "Destination for the sanitized import artifact")
             var output: String = "artifacts/public-repository-import.json"
 
@@ -2918,6 +2924,7 @@ extension SwanCommand {
                 let importer = RemotePublicRepositoryCARImporter(
                     client: try InteropXRPCClient(baseURL: baseURL, timeout: requestTimeoutSeconds)
                 )
+                let blobPromoter = RemotePublicRepositoryBlobPromoter(client: importer.client)
                 let result: PublicRepositoryCARImportArtifact
                 do {
                     let imported: CommittedPublicRepositoryImport
@@ -2959,6 +2966,14 @@ extension SwanCommand {
                             requestID: id
                         )
                     }
+                    let promotedBlobCount: Int?
+                    if promotePublicBlobs {
+                        promotedBlobCount = try await blobPromoter
+                            .promoteReferencedBlobs(in: database, did: canonicalDID)
+                            .promotedBlobCount
+                    } else {
+                        promotedBlobCount = nil
+                    }
                     result = PublicRepositoryCARImportArtifact(
                         remoteHost: baseURL.host ?? "remote",
                         repositoryDID: canonicalDID,
@@ -2969,6 +2984,7 @@ extension SwanCommand {
                         importedRevision: imported.state.revision,
                         reachableBlockCount: imported.reachableBlockCount,
                         recordCount: imported.recordCount,
+                        promotedBlobCount: promotedBlobCount,
                         status: "passed",
                         errorCode: nil
                     )
@@ -2983,6 +2999,7 @@ extension SwanCommand {
                         importedRevision: nil,
                         reachableBlockCount: nil,
                         recordCount: nil,
+                        promotedBlobCount: nil,
                         status: "failed",
                         errorCode: PublicRepositoryCARImportFailureCode.code(for: error)
                     )

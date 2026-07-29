@@ -20,6 +20,19 @@ public enum PublicRepositoryCARReplicationError: Error, Sendable, Equatable {
     case responseTooLarge
 }
 
+/// Errors from the optional receiver-side public-blob promotion step. The
+/// repository CAR is already durable when this step runs; each blob is still
+/// fetched into an owner-only temporary file and adopted through the normal
+/// content-addressed public namespace transaction.
+public enum PublicRepositoryBlobPromotionError: Error, Sendable, Equatable {
+    case invalidRepositoryDID
+    case invalidCID
+    case unexpectedStatus(Int)
+    case unexpectedContentType
+    case responseTooLarge
+    case digestMismatch
+}
+
 /// Stable, secret-free failure labels for the import artifact. The CLI must
 /// not serialize `localizedDescription` or a reflected arbitrary error: those
 /// strings can contain a remote URL, selector, database path, or future
@@ -45,6 +58,15 @@ public enum PublicRepositoryCARImportFailureCode {
             case .unexpectedStatus: return "UnexpectedStatus"
             case .unexpectedContentType: return "UnexpectedContentType"
             case .responseTooLarge: return "ResponseTooLarge"
+            }
+        case let error as PublicRepositoryBlobPromotionError:
+            switch error {
+            case .invalidRepositoryDID: return "BlobInvalidRepositoryDID"
+            case .invalidCID: return "BlobInvalidCID"
+            case let .unexpectedStatus(status): return "BlobUnexpectedStatus_\(status)"
+            case .unexpectedContentType: return "BlobUnexpectedContentType"
+            case .responseTooLarge: return "BlobResponseTooLarge"
+            case .digestMismatch: return "BlobDigestMismatch"
             }
         case let error as InteropHTTPError:
             switch error {
@@ -201,6 +223,7 @@ public struct PublicRepositoryCARImportArtifact: Codable, Sendable, Equatable {
     public let importedRevision: String?
     public let reachableBlockCount: Int?
     public let recordCount: Int?
+    public let promotedBlobCount: Int?
     public let status: String
     public let errorCode: String?
 
@@ -214,6 +237,7 @@ public struct PublicRepositoryCARImportArtifact: Codable, Sendable, Equatable {
         importedRevision: String?,
         reachableBlockCount: Int?,
         recordCount: Int?,
+        promotedBlobCount: Int? = nil,
         status: String,
         errorCode: String?
     ) {
@@ -227,8 +251,19 @@ public struct PublicRepositoryCARImportArtifact: Codable, Sendable, Equatable {
         self.importedRevision = importedRevision
         self.reachableBlockCount = reachableBlockCount
         self.recordCount = recordCount
+        self.promotedBlobCount = promotedBlobCount
         self.status = status
         self.errorCode = errorCode.map { FixtureSanitizer.sanitize(["error": $0])["error"] ?? "<redacted>" }
+    }
+}
+
+public struct PublicRepositoryBlobPromotionResult: Sendable, Equatable {
+    public let referencedBlobCount: Int
+    public let promotedBlobCount: Int
+
+    public init(referencedBlobCount: Int, promotedBlobCount: Int) {
+        self.referencedBlobCount = referencedBlobCount
+        self.promotedBlobCount = promotedBlobCount
     }
 }
 
@@ -419,6 +454,117 @@ public struct RemotePublicRepositoryCARImporter: Sendable {
             requestID: requestID,
             lifetime: lifetime,
             now: now
+        )
+    }
+}
+
+/// Fetches raw-CID values from a verified public repository and adopts them in
+/// the receiver's public blob namespace. Network I/O completes before the
+/// SQLite CAS transaction starts; the temporary file and the store's bounded
+/// streaming source keep memory independent of blob size.
+public struct RemotePublicRepositoryBlobPromoter: Sendable {
+    public let client: InteropXRPCClient
+    public let limits: PublicRepositoryLimits
+
+    public init(
+        client: InteropXRPCClient,
+        limits: PublicRepositoryLimits = .standard
+    ) {
+        self.client = client
+        self.limits = limits
+    }
+
+    public func promoteReferencedBlobs(
+        in database: SQLiteAccountDatabase,
+        did: String
+    ) async throws -> PublicRepositoryBlobPromotionResult {
+        guard (try? DID(didString: did)) != nil else {
+            throw PublicRepositoryBlobPromotionError.invalidRepositoryDID
+        }
+        let referenced = try await database.publicRepositoryBlobCIDs()
+        var promoted = 0
+        for cid in referenced {
+            guard cid.codec == .raw,
+                  cid.multihash.algorithm == Multihash.sha256Code,
+                  cid.multihash.length == Multihash.sha256Length else {
+                throw PublicRepositoryBlobPromotionError.invalidCID
+            }
+            if try await database.publicBlobExists(cid: cid.string) {
+                continue
+            }
+            let temporaryURL = FileManager.default.temporaryDirectory
+                .appending(path: "swan-public-blob-promotion-\(UUID().uuidString).blob")
+            defer { try? FileManager.default.removeItem(at: temporaryURL) }
+            let path: String
+            do {
+                path = try client.xrpcPath(
+                    "com.atproto.sync.getBlob",
+                    query: ["cid": cid.string, "did": did]
+                )
+            } catch {
+                throw PublicRepositoryBlobPromotionError.invalidCID
+            }
+            let response: InteropHTTPResponse
+            do {
+                response = try await client.http.executeStreaming(
+                    method: .get,
+                    path: path,
+                    headers: [
+                        "Accept": "application/octet-stream, application/json, */*",
+                    ],
+                    to: temporaryURL,
+                    maximumResponseBytes: limits.maximumCARBytes
+                )
+            } catch let error as InteropHTTPError {
+                switch error {
+                case .responseTooLarge: throw PublicRepositoryBlobPromotionError.responseTooLarge
+                case let .unexpectedStatus(status):
+                    throw PublicRepositoryBlobPromotionError.unexpectedStatus(status)
+                case .unexpectedContentType: throw PublicRepositoryBlobPromotionError.unexpectedContentType
+                default: throw PublicRepositoryBlobPromotionError.unexpectedStatus(0)
+                }
+            } catch {
+                throw PublicRepositoryBlobPromotionError.unexpectedStatus(0)
+            }
+            guard (200 ... 299).contains(response.status) else {
+                throw PublicRepositoryBlobPromotionError.unexpectedStatus(response.status)
+            }
+            guard let responseContentType = response.header("content-type"),
+                  !responseContentType.lowercased().contains("application/json") else {
+                throw PublicRepositoryBlobPromotionError.unexpectedContentType
+            }
+            let mimeType = responseContentType
+                .split(separator: ";", maxSplits: 1)
+                .first
+                .map(String.init)
+                ?? "application/octet-stream"
+            let source = try FilePublicRepositoryCARByteSource(url: temporaryURL)
+            do {
+                let reference = try await database.putStreaming(
+                    namespace: .public,
+                    mimeType: mimeType,
+                    maximumBytes: limits.maximumCARBytes
+                ) { sink in
+                    while let chunk = try await source.read(maximumBytes: 64 * 1_024) {
+                        try await sink(chunk)
+                    }
+                }
+                try await source.close()
+                guard reference.namespace == .public, reference.cid == cid.string else {
+                    throw PublicRepositoryBlobPromotionError.digestMismatch
+                }
+                promoted += 1
+            } catch {
+                try? await source.close()
+                if let error = error as? PublicRepositoryBlobPromotionError {
+                    throw error
+                }
+                throw PublicRepositoryBlobPromotionError.digestMismatch
+            }
+        }
+        return PublicRepositoryBlobPromotionResult(
+            referencedBlobCount: referenced.count,
+            promotedBlobCount: promoted
         )
     }
 }

@@ -5,6 +5,48 @@ import SwanPublicRepository
 import SwanStorage
 
 extension SQLiteAccountDatabase {
+    /// Returns the canonical raw-CID references embedded in the installed
+    /// public records. Record bytes are decoded one at a time under the
+    /// connection gate; callers receive identifiers only, never a materialized
+    /// repository projection. Raw CIDs are the AT Protocol blob namespace,
+    /// while DAG-CBOR links remain repository blocks and are ignored by the
+    /// codec projection.
+    public func publicRepositoryBlobCIDs() async throws -> [CID] {
+        try await withConnectionGate {
+            try await transaction {
+                let rows = try await connection.query(
+                    """
+                    SELECT collection, rkey, record_cid
+                    FROM public_repository_record_index
+                    ORDER BY collection ASC, rkey ASC
+                    """
+                )
+                var cidsByString: [String: CID] = [:]
+                for row in rows {
+                    let collection = try publicReadRequiredText(row, "collection")
+                    let rkey = try publicReadRequiredText(row, "rkey")
+                    let path = try PublicRepositoryPath(
+                        collection: collection, recordKey: rkey
+                    )
+                    let recordCID = try publicReadCID(
+                        try publicReadRequiredText(row, "record_cid")
+                    )
+                    let bytes = try await blockBytesWithoutGate(recordCID)
+                    let value = try RepositoryMSTValidation.decodeRecordBlock(
+                        bytes, for: path
+                    )
+                    let record = try PublicRepositoryRecordCodec.publicRecord(
+                        from: value, collection: collection
+                    )
+                    for cid in PublicRepositoryRecordCodec.publicBlobCIDs(in: record) {
+                        cidsByString[cid.string] = cid
+                    }
+                }
+                return cidsByString.keys.sorted().compactMap { cidsByString[$0] }
+            }
+        }
+    }
+
     func readPublicRepositoryDescription(
         account: AccountControlAccount,
         identityVerifier: any PublicPLCGenesisVerifying

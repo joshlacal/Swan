@@ -315,6 +315,16 @@ final class SwanInteropTests: XCTestCase {
             ),
             "/xrpc/com.atproto.repo.getRecord?repo=did:plc:alice&rkey=3k"
         )
+        XCTAssertEqual(
+            try client.xrpcPath(
+                "com.atproto.sync.getBlob",
+                query: [
+                    "cid": "bafkreiblob",
+                    "did": "did:plc:alice",
+                ]
+            ),
+            "/xrpc/com.atproto.sync.getBlob?cid=bafkreiblob&did=did:plc:alice"
+        )
     }
 
     func testStreamingCARClientAllowsThePinned512MiBBoundSeparatelyFromJSON() throws {

@@ -89,6 +89,16 @@ The public import command requires an operator-supplied verification key; it
 does not resolve remote DID/PLC keys implicitly. Its output is sanitized and
 contains no record values, tokens, passwords, or private key material.
 
+For the disposable Compose laboratory, `--resolve-commit-key` enables the
+explicit pinned PLC resolver. It is permitted only with the laboratory PLC
+origin and host allowlist; production runs must provide an operator-approved
+key resolver instead. Add `--promote-public-blobs` to fetch each raw-CID blob
+referenced by the imported public records through
+`com.atproto.sync.getBlob?did=<repo-did>&cid=<cid>`, verify its SHA-256 CID,
+and adopt it in the receiver's public blob namespace. Promotion runs after
+the CAR commit is durable and reports only `promotedBlobCount` in the
+sanitized artifact.
+
 The cross-host TypeScript permissioned smoke uses the pinned reference PDS as
 the member repository and Swan as the authority. Swan's fail-closed remote key
 policy requires an operator-supplied static delegation public-key pin for that

@@ -281,3 +281,24 @@ that the complete live interop matrix has passed.
   key pin. A complete Swan-to-TypeScript semantic convergence run, including a
   live public repository import, blob transfer, compaction-gap recovery, and
   dynamic remote key discovery, remains a distinct follow-up gate.
+
+## 2026-07-29 live public CAR and blob-promotion checkpoint
+
+The rebuilt Swan image passed a disposable reference-to-Swan public handoff
+with dynamic PLC key resolution enabled explicitly for the lab. A fresh
+managed receiver imported the pinned TypeScript repository over Caddy TLS:
+HTTP 200, one record, three reachable blocks, and a verified commit. With
+`--promote-public-blobs`, the receiver then called the reference
+`com.atproto.sync.getBlob` endpoint using both the repository DID and raw blob
+CID, streamed the response into a bounded temporary file, verified the
+content-addressed SHA-256 CID, and adopted one blob in the receiver's public
+namespace. The ignored sanitized artifact is
+`artifacts/reference-public-import-live.json` and records
+`promotedBlobCount: 1`; no credentials, values, proofs, or private key
+material are present.
+
+This closes the live public CAR-import and receiver-side public-blob
+promotion seams. It does not close the broader alpha: complete TypeScript
+semantic convergence, value-bearing incremental updates, compaction-gap
+recovery, reverse authority placement, and the full OAuth/security/lifecycle/
+export matrix remain required.
