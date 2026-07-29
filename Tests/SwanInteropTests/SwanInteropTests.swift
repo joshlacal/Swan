@@ -5,6 +5,7 @@ import Petrel
 @testable import SwanInterop
 import SwanCore
 import SwanOAuth
+import SwanSQLite
 import SwanSpaces
 
 final class SwanInteropTests: XCTestCase {
@@ -822,6 +823,32 @@ final class SwanInteropTests: XCTestCase {
         XCTAssertFalse(Self.sanitizedKeys(in: object).contains { key in
             forbidden.contains { key.lowercased().contains($0) }
         })
+    }
+
+    func testPublicBlobPromotionBindsRequestDIDToManagedAccountBeforeNetwork() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(
+                path: "swan-blob-promotion-did-" + UUID().uuidString,
+                directoryHint: .isDirectory
+            )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let accountDID = "did:plc:abcdefghijklmnopqrstuvwx"
+        let database = try await SQLiteAccountDatabase(dataDirectory: root, did: accountDID)
+        let promoter = try RemotePublicRepositoryBlobPromoter(
+            client: InteropXRPCClient(baseURL: URL(string: "https://pds.test")!)
+        )
+
+        do {
+            _ = try await promoter.promoteReferencedBlobs(
+                in: database,
+                did: "did:plc:zyxwvutsrqponmlkjihgfedc"
+            )
+            XCTFail("a valid but different repository DID must be rejected")
+        } catch let error as PublicRepositoryBlobPromotionError {
+            XCTAssertEqual(error, .invalidRepositoryDID)
+        }
+        try await database.close()
     }
 
     private static func sanitizedKeys(in value: Any) -> [String] {

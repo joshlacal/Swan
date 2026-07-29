@@ -5,6 +5,13 @@ import SwanPublicRepository
 import SwanStorage
 
 extension SQLiteAccountDatabase {
+    /// Returns the DID bound to this managed account database. Replication
+    /// callers use this before any network fetch so a valid-but-different DID
+    /// cannot cause public blobs to be adopted into the wrong account.
+    public func publicRepositoryDID() -> String {
+        accountDID
+    }
+
     /// Returns the canonical raw-CID references embedded in the installed
     /// public records. Record bytes are decoded one at a time under the
     /// connection gate; callers receive identifiers only, never a materialized

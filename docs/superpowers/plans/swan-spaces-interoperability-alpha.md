@@ -302,3 +302,29 @@ promotion seams. It does not close the broader alpha: complete TypeScript
 semantic convergence, value-bearing incremental updates, compaction-gap
 recovery, reverse authority placement, and the full OAuth/security/lifecycle/
 export matrix remain required.
+
+## 2026-07-29 account-bound promotion and reverse-authority boundary
+
+Receiver-side public-blob promotion now checks that the supplied repository DID
+matches the managed SQLite account before fetching `sync.getBlob`. The mismatch
+path is covered by a no-network regression test and preserves the stable
+`BlobInvalidRepositoryDID` artifact code. The focused public-read suite, full
+macOS suite, explicit 256 MiB RSS gate, semantic lab, profile verification, and
+static interop verifier all pass after this change.
+
+The reverse-authority Compose probe now passes with explicit trust material:
+after resolving the current Swan member DID (rather than stale external DID
+files), the pinned TypeScript authority issued a credential, Swan wrote on the
+member host, and a temporary `credentialPublicKeys` pin for the authority's
+PLC `#atproto` secp256k1 key made the member-host read return HTTP 200 with the
+same CID. The sanitized result is kept only in the ignored
+`artifacts/reverse-authority-pinned-20260729.json` artifact.
+
+The ordinary checked-in notification configuration still has no remote key
+pin, so this is not yet a turnkey reverse-host matrix: an operator must supply
+the authority key explicitly, or Swan must gain a profile-approved DID/JWKS
+resolver. Separately, the reference OAuth authorization page uses a
+client-side CSRF/API contract that the current minimal Swan form driver does
+not implement. Reverse key provisioning and the cross-implementation OAuth
+matrix remain explicit alpha gates rather than being inferred from this one
+controlled proof.

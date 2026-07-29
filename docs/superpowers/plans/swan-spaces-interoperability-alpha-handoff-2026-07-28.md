@@ -602,3 +602,57 @@ supports it; then run the clean-cache macOS/Linux acceptance and full Compose
 matrix. The pinned TypeScript values-including `listRepoOps` SQLite ambiguity
 is an upstream divergence already recorded in the profile and must not be
 silently represented as a passing values test.
+
+## Current resume point: 2026-07-29 DID-bound promotion and reverse-authority probe
+
+The public blob promotion seam now binds the request selector to the managed
+SQLite account before it performs any network I/O. `SQLiteAccountDatabase`
+exposes the account-bound public repository DID, and
+`RemotePublicRepositoryBlobPromoter` rejects a valid-but-different DID with
+the same stable `BlobInvalidRepositoryDID` boundary used for malformed
+selectors. `SwanInteropTests.testPublicBlobPromotionBindsRequestDIDToManagedAccountBeforeNetwork`
+proves this without contacting a remote host.
+
+The post-change gates are green: `PublicRepositoryReadHTTPTests` is 8/8, the
+full serialized macOS suite has zero failures, the explicit
+`SWAN_RUN_256MIB_PUBLIC_GET_REPO=1` RSS test passes, `lab semantic` passes, and
+profile/static verification plus `git diff --check` pass. These commands must
+continue to use the coherent Xcode toolchain and `--jobs 1`; the default
+SwiftPM invocation can appear hung while Xcode-beta compiles dependency
+manifests.
+
+A disposable reverse-authority probe reached the real cross-implementation
+trust boundary. The first attempt used stale external `member.did` and
+`authority.did` files and produced a misleading `UserNotAuthorized` result.
+After resolving the current Swan member DID from its durable account registry,
+the reference authority issued the credential and the member write returned
+HTTP 200. The reference authority's PLC document exposed its uncompressed
+65-byte secp256k1 `#atproto` key; injecting that public key as a temporary
+Swan `credentialPublicKeys` pin made the reverse read return HTTP 200 with the
+same CID. The sanitized artifact is
+`artifacts/reverse-authority-pinned-20260729.json` (ignored by the repository).
+
+The checked-in Compose notification configuration intentionally has no remote
+credential pins, so the ordinary stack still returns HTTP 503 for this reverse
+read until an operator supplies the authority key. This is an explicit trust
+configuration gap, not a public/private isolation failure: the next code or
+lab step must make pinned remote-key provisioning reproducible, or implement a
+profile-approved DID/JWKS resolver. The reference OAuth authorization page is
+also a client-side provider UI with a different CSRF/API contract; Swan's
+minimal form driver reports `OAuth form is missing CSRF field` against it. Use
+bearer sessions for protocol-only probes, or add a pinned-TypeScript OAuth
+browser/API adapter before claiming the cross-implementation OAuth matrix.
+
+Next continuation should therefore:
+
+1. Make the successful remote-authority key pin reproducible in the lab
+   without editing a running container, then decide whether the profile should
+   also specify a dynamic DID/JWKS resolver.
+2. Add a TypeScript OAuth-provider UI/API adapter (or a clearly scoped
+   bearer-only fixture mode) and run the negative OAuth/lifecycle matrix.
+3. Run value-bearing incremental sync, compaction-gap full-CAR recovery,
+   corrupted-operation rejection, and the clean-cache Linux acceptance gates.
+
+The disposable reverse-authority credentials used for this probe remain only
+in the owner-only external lab secret directory; no token, password, selector,
+or body was checked into Swan.

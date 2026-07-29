@@ -481,6 +481,9 @@ public struct RemotePublicRepositoryBlobPromoter: Sendable {
         guard (try? DID(didString: did)) != nil else {
             throw PublicRepositoryBlobPromotionError.invalidRepositoryDID
         }
+        guard await database.publicRepositoryDID() == did else {
+            throw PublicRepositoryBlobPromotionError.invalidRepositoryDID
+        }
         let referenced = try await database.publicRepositoryBlobCIDs()
         var promoted = 0
         for cid in referenced {
