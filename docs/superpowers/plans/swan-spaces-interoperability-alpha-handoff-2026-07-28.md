@@ -566,3 +566,39 @@ promote permissioned references. Focused Swift tests and the macOS build pass,
 and the live Compose proof passes. The alpha remains open for value-bearing
 incremental updates, compaction-gap/full-CAR recovery, reverse authority, and
 the complete cross-implementation OAuth/security/lifecycle/export matrix.
+
+## Current resume point: 2026-07-29
+
+The current Swan jj working copy is clean. The latest committed slice is
+`17fe2ed5439a2b335d82f292f0a65a770de82836`
+(`feat(interop): promote public blobs after CAR import`). Task 44's explicit-
+rkey public `putRecord`/`deleteRecord` capability, subsequent public
+`createRecord`/`applyWrites` and blob lifecycle work, PLC rotation history, and
+the stateful live-runner/runtime hardening are already present in the ancestor
+history; do not restart those tasks from the old resume paragraph above.
+
+The latest verified evidence is:
+
+- `swift test --jobs 1` passed all affected Swift targets with zero failures;
+  the normal suite reported 1 skipped opt-in test in `SwanSpacesTests`, 1 in
+  public CAR staging, 1 in the public-read directory suite, and 1 environment-
+  gated lab-validation skip. The explicit 256 MiB public-directory RSS test
+  passed.
+- `PublicRepositoryReadHTTPTests` passed 8/8, the canonical `sync.getBlob`
+  `did`+`cid` path test passed, and the typed raw-link SQLite projection test
+  passed.
+- `Scripts/verify-profile.sh`, `Scripts/verify-interop-lab.sh`, the offline
+  semantic lab, and `git diff --check` passed.
+- The rebuilt Compose lab passed a disposable dynamic-PLC reference CAR import
+  and receiver public-blob promotion: HTTP 200, one record, three reachable
+  blocks, verified commit, and `promotedBlobCount: 1` in the ignored sanitized
+  artifact `artifacts/reference-public-import-live.json`.
+
+Continue from this clean commit by closing or explicitly documenting the
+remaining cross-implementation gates: a complete Swan/TypeScript semantic
+matrix for records, credentials, blobs, incremental sync, compaction-gap CAR
+recovery, corrupted traffic, and reverse authority where the pinned branch
+supports it; then run the clean-cache macOS/Linux acceptance and full Compose
+matrix. The pinned TypeScript values-including `listRepoOps` SQLite ambiguity
+is an upstream divergence already recorded in the profile and must not be
+silently represented as a passing values test.
