@@ -500,9 +500,10 @@ A disposable pinned-TypeScript reference-only run now passes its standard
 public typed-blob flow: account provisioning, blob upload, an
 `app.bsky.feed.post` commit, unauthenticated record retrieval, and streamed
 blob retrieval all returned the expected status and bytes. This is reference
-host evidence only. It does not prove Swan/TypeScript convergence because the
-current Swan public codec intentionally accepts its raw-CID fixture form and
-rejects the TypeScript typed blob object.
+host evidence only. It does not prove Swan/TypeScript convergence. Swan's
+public codec now accepts the modern typed blob object with strict
+shape/CID/MIME/size validation; a live reference-account CAR import and
+receiver-side public-blob promotion remain open.
 
 The public repository verifier now accepts canonical low-S secp256k1 commit
 signatures while Swan's local writer remains P-256. PLC `did:key` decoding and
@@ -510,3 +511,37 @@ signatures while Swan's local writer remains P-256. PLC `did:key` decoding and
 TypeScript secp256k1 key, missing-key rejection, and invalid repository
 identities. The importer still takes an explicit verification key; live
 remote DID/PLC discovery and a TypeScript CAR import remain open gates.
+
+## Follow-up verification: modern typed-blob acceptance and live Swan round trip
+
+The public repository boundary now accepts the modern typed blob shape from
+Petrel's JSON decoder (`.unknownType("blob", ...)`) and preserves its nested
+raw CID link without a JSON round trip. Strict codec tests cover wrong shape,
+unsafe MIME, negative size, and the direct decoder path.
+
+The rebuilt Linux Compose Swan image passed the typed public fixture after the
+runner selected the active DID from Swan's durable account registry: upload,
+typed `repo.putRecord`, unauthenticated `repo.getRecord`, and streamed
+`sync.getBlob` all returned HTTP 200; the record CID matched and the 25-byte
+blob was verified. The summary-only artifact is
+`artifacts/live-typed-blob.json`. The stale external DID selector that caused
+the first `RepoNotFound` result was not copied into the fixture or logs.
+
+This closes Swan's local modern typed-blob boundary but does not yet claim
+reference-PDS-to-Swan blob convergence or full alpha completion.
+
+## Follow-up verification: live reference CAR import and managed-target fix
+
+The pinned TypeScript PDS was exercised with a fresh disposable account,
+public `image/png` blob, and a valid typed `app.bsky.feed.post` record. Swan
+then fetched `com.atproto.sync.getRepo` over the Compose TLS network and
+imported the CAR into a newly installed target account. The sanitized artifact
+reported HTTP 200, one record, three reachable blocks, and a verified commit.
+
+The first importer attempts failed with `SQLiteReadOnly`: `swan lab
+import-public` had opened the target with
+`SQLiteAccountDatabaseOpenMode.existingPortableExportSource`, which is correct
+for export but cannot stage writes. The command now opens the normal managed
+account database, preserving the read-only export mode for export-only paths.
+The CAR import gate is closed; fetching and promoting referenced blob bytes
+into the receiver's public blob namespace remains a separate follow-up.

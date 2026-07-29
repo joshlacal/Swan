@@ -48,6 +48,83 @@ final class PublicRepositoryDomainTests: XCTestCase {
         ))
     }
 
+    func testPetrelModernTypedBlobIsAcceptedAndRetainsRawReference() throws {
+        let cid = CID.fromBlob(Data("typed-blob".utf8))
+        let record = try PublicRepositoryRecordCodec.publicRecord(
+            from: .object([
+                "embed": .unknownType(
+                    "blob",
+                    .object([
+                        "ref": .link(ATProtoLink(cid: cid)),
+                        "mimeType": .string("image/png"),
+                        "size": .number(10),
+                    ])
+                ),
+            ]),
+            collection: collection
+        )
+        XCTAssertEqual(record.fields["$type"], PublicRecordValue.string(collection))
+        XCTAssertEqual(
+            PublicRepositoryRecordCodec.publicBlobCIDs(in: record).map(\.string),
+            [cid.string]
+        )
+        let path = try PublicRepositoryPath(collection: collection, recordKey: "typed-blob")
+        XCTAssertNoThrow(try PublicRepositoryRecordCodec.prepare(record, for: path))
+    }
+
+    func testPetrelJSONDecoderPreservesModernTypedBlobForRepositoryCodec() throws {
+        let cid = CID.fromBlob(Data("decoded-typed-blob".utf8))
+        let json = try JSONSerialization.data(withJSONObject: [
+            "embed": [
+                "$type": "blob",
+                "ref": ["$link": cid.string],
+                "mimeType": "image/png",
+                "size": 18,
+            ],
+        ])
+        let value = try JSONDecoder().decode(ATProtocolValueContainer.self, from: json)
+        guard case let .object(fields) = value,
+              case let .unknownType(type, payload)? = fields["embed"] else {
+            return XCTFail("Petrel must preserve an unregistered typed blob as unknownType")
+        }
+        XCTAssertEqual(type, "blob")
+        guard case let .object(payloadFields) = payload,
+              case let .link(link)? = payloadFields["ref"] else {
+            return XCTFail("Petrel must preserve the blob ref as a CID link")
+        }
+        XCTAssertEqual(link.cid, cid)
+
+        let record = try PublicRepositoryRecordCodec.publicRecord(
+            from: value,
+            collection: collection
+        )
+        XCTAssertEqual(
+            PublicRepositoryRecordCodec.publicBlobCIDs(in: record).map(\.string),
+            [cid.string]
+        )
+    }
+
+    func testTypedBlobRejectsWrongShapeAndMIME() throws {
+        let cid = CID.fromBlob(Data("typed-blob-invalid".utf8))
+        let base: [String: ATProtocolValueContainer] = [
+            "$type": .string("blob"),
+            "ref": .object(["$link": .string(cid.string)]),
+            "mimeType": .string("image/png"),
+            "size": .number(10),
+        ]
+        for (key, value) in [
+            ("extra", ATProtocolValueContainer.bool(true)),
+            ("mimeType", .string("not a mime type")),
+            ("size", .number(-1)),
+        ] {
+            var fields = base
+            fields[key] = value
+            XCTAssertThrowsError(try PublicRepositoryRecordCodec.publicRecord(
+                from: .object(fields), collection: collection
+            ))
+        }
+    }
+
     func testPathAcceptsPinnedBoundarySyntax() throws {
         let longCollection = String(repeating: "a", count: 63)
             + "." + Array(repeating: String(repeating: "b", count: 63), count: 3).joined(separator: ".")

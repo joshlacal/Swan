@@ -2906,8 +2906,7 @@ extension SwanCommand {
 
                 let database = try await SQLiteAccountDatabase(
                     dataDirectory: URL(fileURLWithPath: dataDirectory),
-                    did: canonicalDID,
-                    openMode: .existingPortableExportSource
+                    did: canonicalDID
                 )
                 defer { Task { try? await database.close() } }
                 guard let current = try await database.loadPublicRepositoryState() else {
@@ -2985,7 +2984,7 @@ extension SwanCommand {
                         reachableBlockCount: nil,
                         recordCount: nil,
                         status: "failed",
-                        errorCode: "ImportFailed"
+                        errorCode: PublicRepositoryCARImportFailureCode.code(for: error)
                     )
                 }
                 let outputURL = URL(fileURLWithPath: output)

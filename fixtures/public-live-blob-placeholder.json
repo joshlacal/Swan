@@ -5,7 +5,12 @@
   "record": {
     "text": "Swan public blob interoperability fixture",
     "blob": {
-      "$link": "{{BLOB_CID}}"
+      "$type": "blob",
+      "ref": {
+        "$link": "{{BLOB_CID}}"
+      },
+      "mimeType": "application/octet-stream",
+      "size": 25
     }
   }
 }

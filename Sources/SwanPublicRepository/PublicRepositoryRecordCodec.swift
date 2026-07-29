@@ -46,7 +46,9 @@ public enum PublicRepositoryRecordCodec {
     /// Converts Petrel's transport container without passing through JSON.
     /// This is deliberately kept at the repository boundary so public writes
     /// and permissioned writes cannot accidentally share a permissive JSON
-    /// bridge. Typed blobs and unresolved/failed typed values are rejected.
+    /// bridge. Typed blob references are accepted only in the modern,
+    /// content-addressed form used by the public blob endpoint. Unresolved
+    /// typed values remain rejected.
     public static func publicRecord(
         from value: ATProtocolValueContainer,
         collection: String,
@@ -58,7 +60,11 @@ public enum PublicRepositoryRecordCodec {
             converted = try convertCBOR(value.toCBORValue(), depth: 1, limits: limits)
         case let .object(fields):
             converted = try convertObject(fields, depth: 1, limits: limits)
-        case .unknownType, .decodeError:
+        case let .unknownType(type, value):
+            converted = try convertUnknownType(
+                type, value: value, depth: 1, limits: limits
+            )
+        case .decodeError:
             throw PublicRepositoryDomainError.invalidRecordType
         default:
             throw PublicRepositoryDomainError.invalidRecordType
@@ -89,7 +95,7 @@ public enum PublicRepositoryRecordCodec {
             output[key] = try convert(value, depth: depth, limits: limits)
         }
         if case let .string(type)? = output["$type"], type == "blob" {
-            throw PublicRepositoryDomainError.invalidRecordType
+            try validateTypedBlob(output)
         }
         return .object(output)
     }
@@ -119,9 +125,36 @@ public enum PublicRepositoryRecordCodec {
         case .null: return .null
         case let .link(link): return .link(try validatedLink(link.cid))
         case let .bytes(bytes): return .bytes(bytes.data)
-        case .unknownType, .decodeError:
+        case let .unknownType(type, value):
+            return try convertUnknownType(type, value: value, depth: depth, limits: limits)
+        case .decodeError:
             throw PublicRepositoryDomainError.invalidRecordType
         }
+    }
+
+    private static func convertUnknownType(
+        _ type: String,
+        value: ATProtocolValueContainer,
+        depth: Int,
+        limits: PublicRepositoryLimits
+    ) throws -> PublicRecordValue {
+        guard type == "blob", case let .object(fields) = value else {
+            throw PublicRepositoryDomainError.invalidRecordType
+        }
+        guard case var .object(object) = try convertObject(
+            fields, depth: depth, limits: limits
+        ) else {
+            throw PublicRepositoryDomainError.invalidRecordType
+        }
+        if let existing = object["$type"] {
+            guard existing == .string(type) else {
+                throw PublicRepositoryDomainError.invalidRecordType
+            }
+        } else {
+            object["$type"] = .string(type)
+        }
+        try validateTypedBlob(object)
+        return .object(object)
     }
 
     private static func convertCBOR(
@@ -138,7 +171,7 @@ public enum PublicRepositoryRecordCodec {
                 fields[entry.key] = try convertCBOR(entry.value, depth: depth, limits: limits)
             }
             if case let .string(type)? = fields["$type"], type == "blob" {
-                throw PublicRepositoryDomainError.invalidRecordType
+                try validateTypedBlob(fields)
             }
             return .object(fields)
         }
@@ -148,7 +181,7 @@ public enum PublicRepositoryRecordCodec {
                 fields[key] = try convertCBOR(item, depth: depth, limits: limits)
             }
             if case let .string(type)? = fields["$type"], type == "blob" {
-                throw PublicRepositoryDomainError.invalidRecordType
+                try validateTypedBlob(fields)
             }
             return .object(fields)
         }
@@ -170,6 +203,45 @@ public enum PublicRepositoryRecordCodec {
             return .array(try values.map { try convertCBOR($0, depth: depth + 1, limits: limits) })
         }
         throw PublicRepositoryDomainError.invalidRecordType
+    }
+
+    /// Validates the modern AT Protocol blob object without resolving or
+    /// opening the referenced payload. Reachability is checked by the HTTP
+    /// mutation layer against the public blob namespace before the record is
+    /// committed.
+    private static func validateTypedBlob(
+        _ fields: [String: PublicRecordValue]
+    ) throws {
+        let allowedKeys: Set<String> = ["$type", "ref", "mimeType", "size"]
+        guard Set(fields.keys) == allowedKeys,
+              fields["$type"] == .string("blob"),
+              case let .link(cid)? = fields["ref"],
+              cid.codec == .raw,
+              cid.multihash.algorithm == Multihash.sha256Code,
+              cid.multihash.length == Multihash.sha256Length,
+              case let .string(mimeType)? = fields["mimeType"],
+              validBlobMIMEType(mimeType),
+              case let .integer(size)? = fields["size"],
+              (0...PublicRepositoryLimits.requiredStreamingCARBytes).contains(size)
+        else {
+            throw PublicRepositoryDomainError.invalidRecordType
+        }
+    }
+
+    private static func validBlobMIMEType(_ value: String) -> Bool {
+        guard !value.isEmpty,
+              value.utf8.count <= 255,
+              value.filter({ $0 == "/" }).count == 1,
+              !value.hasPrefix("/"),
+              !value.hasSuffix("/") else {
+            return false
+        }
+        return value.utf8.allSatisfy { byte in
+            (byte >= UInt8(ascii: "A") && byte <= UInt8(ascii: "Z"))
+                || (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "z"))
+                || (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+                || "!#$&^_.+-/".utf8.contains(byte)
+        }
     }
 
     private static func validatedLink(_ cid: CID) throws -> CID {

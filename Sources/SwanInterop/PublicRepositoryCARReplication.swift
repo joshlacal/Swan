@@ -20,6 +20,173 @@ public enum PublicRepositoryCARReplicationError: Error, Sendable, Equatable {
     case responseTooLarge
 }
 
+/// Stable, secret-free failure labels for the import artifact. The CLI must
+/// not serialize `localizedDescription` or a reflected arbitrary error: those
+/// strings can contain a remote URL, selector, database path, or future
+/// sensitive context. This projection intentionally preserves only the
+/// protocol/storage boundary that rejected the untrusted CAR.
+public enum PublicRepositoryCARImportFailureCode {
+    public static func code(for error: Error) -> String {
+        switch error {
+        case let error as PublicRepositoryDIDResolutionError:
+            switch error {
+            case .invalidRepositoryDID: return "InvalidRepositoryDID"
+            case .missingSigningKey: return "MissingSigningKey"
+            case .unsupportedSigningKey: return "UnsupportedSigningKey"
+            case .identityMismatch: return "IdentityMismatch"
+            case .pdsServiceMismatch: return "PDSServicesMismatch"
+            }
+        case let error as PublicRepositoryCARReplicationError:
+            switch error {
+            case .repositoryUnavailable: return "RepositoryUnavailable"
+            case .invalidRepositoryDID: return "InvalidRepositoryDID"
+            case .invalidRequestID: return "InvalidRequestID"
+            case .invalidLifetime: return "InvalidLifetime"
+            case .unexpectedStatus: return "UnexpectedStatus"
+            case .unexpectedContentType: return "UnexpectedContentType"
+            case .responseTooLarge: return "ResponseTooLarge"
+            }
+        case let error as InteropHTTPError:
+            switch error {
+            case .invalidURL: return "HTTPInvalidURL"
+            case .responseTooLarge: return "HTTPResponseTooLarge"
+            case .unexpectedRedirect: return "HTTPUnexpectedRedirect"
+            case .unexpectedContentType: return "HTTPUnexpectedContentType"
+            case let .unexpectedStatus(status): return "HTTPUnexpectedStatus_\(status)"
+            case .transportFailure: return "HTTPTransportFailure"
+            case .fileFailure: return "HTTPFileFailure"
+            }
+        case let error as PublicRepositoryMutationStoreError:
+            switch error {
+            case .invalidRequest: return "MutationInvalidRequest"
+            case .invalidRequestDigest: return "MutationInvalidRequestDigest"
+            case .ownershipMismatch: return "MutationOwnershipMismatch"
+            case .reservationMismatch: return "MutationReservationMismatch"
+            case .conflictingRequestReuse: return "MutationConflictingRequestReuse"
+            case .commitCASConflict: return "MutationCommitCASConflict"
+            case .preparedMutationMismatch: return "MutationPreparedMismatch"
+            case .corruptRepository: return "MutationCorruptRepository"
+            case .repositoryNotInstalled: return "MutationRepositoryNotInstalled"
+            case .revisionExhausted: return "MutationRevisionExhausted"
+            }
+        case let error as SQLiteRepositoryError:
+            switch error {
+            case .duplicateRequest: return "SQLiteDuplicateRequest"
+            case .corruptDatabase: return "SQLiteCorruptDatabase"
+            case .revisionOutOfRange: return "SQLiteRevisionOutOfRange"
+            }
+        case let error as SwanError:
+            switch error {
+            case .invalidIdentifier: return "SwanInvalidIdentifier"
+            case .invalidProfile: return "SwanInvalidProfile"
+            case .unauthorized: return "SwanUnauthorized"
+            case .conflict: return "SwanConflict"
+            case .expired: return "SwanExpired"
+            case .malformed: return "SwanMalformed"
+            case .unavailable: return "SwanUnavailable"
+            }
+        case let error as PublicRepositoryImportStagingError:
+            switch error {
+            case .invalidBinding: return "InvalidBinding"
+            case .invalidTimestamp: return "InvalidTimestamp"
+            case .unknownSession: return "UnknownSession"
+            case .expiredSession: return "ExpiredSession"
+            case .consumedSession: return "ConsumedSession"
+            case .importInProgress: return "ImportInProgress"
+            case .poisonedSession: return "PoisonedSession"
+            case .bindingMismatch: return "BindingMismatch"
+            case .conflictingRequestReuse: return "ConflictingRequestReuse"
+            case .duplicateBlockConflict: return "DuplicateBlockConflict"
+            case .headerConflict: return "HeaderConflict"
+            case .verificationRequired: return "VerificationRequired"
+            case .repositoryNotInstalled: return "RepositoryNotInstalled"
+            case .commitCASConflict: return "CommitCASConflict"
+            case .importedCommitMismatch: return "ImportedCommitMismatch"
+            case .corruptStaging: return "CorruptStaging"
+            case .corruptRepository: return "CorruptRepository"
+            }
+        case let error as PublicRepositoryCARError:
+            switch error {
+            case .invalidChunkSize: return "CARInvalidChunkSize"
+            case .invalidRootCID: return "CARInvalidRootCID"
+            case .invalidBlockCID: return "CARInvalidBlockCID"
+            case .blockCIDMismatch: return "CARBlockCIDMismatch"
+            case .blockBodyLimitExceeded: return "CARBlockBodyLimitExceeded"
+            case .byteLimitExceeded: return "CARByteLimitExceeded"
+            case .blockLimitExceeded: return "CARBlockLimitExceeded"
+            case .malformedVarint: return "CARMalformedVarint"
+            case .nonCanonicalVarint: return "CARNonCanonicalVarint"
+            case .malformedHeader: return "CARMalformedHeader"
+            case .unsupportedVersion: return "CARUnsupportedVersion"
+            case .invalidRootCount: return "CARInvalidRootCount"
+            case .malformedFrame: return "CARMalformedFrame"
+            case .duplicateBlockConflict: return "CARDuplicateBlockConflict"
+            case .missingCommit: return "CARMissingCommit"
+            case let .commit(commit): return "CARCommit_\(commitCode(commit))"
+            case let .repository(repository): return "CARRepository_\(repositoryCode(repository))"
+            }
+        default:
+            let description = error.localizedDescription.lowercased()
+            if description.contains("constraint") {
+                return "SQLiteConstraint"
+            }
+            if description.contains("no such table") {
+                return "SQLiteMissingTable"
+            }
+            if description.contains("readonly") || description.contains("read-only") {
+                return "SQLiteReadOnly"
+            }
+            if description.contains("locked") || description.contains("busy") {
+                return "SQLiteBusy"
+            }
+            return "ImportFailed"
+        }
+    }
+
+    private static func commitCode(_ error: PublicRepositoryCommitError) -> String {
+        switch error {
+        case .invalidDID: return "InvalidDID"
+        case .invalidRevision: return "InvalidRevision"
+        case .revisionNotIncreasing: return "RevisionNotIncreasing"
+        case .invalidDataCID: return "InvalidDataCID"
+        case .invalidCommitCID: return "InvalidCommitCID"
+        case .invalidSchema: return "InvalidSchema"
+        case .nonCanonicalCBOR: return "NonCanonicalCBOR"
+        case .invalidSignature: return "InvalidSignature"
+        case .unsupportedSigningAlgorithm: return "UnsupportedSigningAlgorithm"
+        }
+    }
+
+    private static func repositoryCode(_ error: RepositoryMSTValidationError) -> String {
+        switch error {
+        case .unsupportedCID: return "UnsupportedCID"
+        case .missingBlock: return "MissingBlock"
+        case .blockCIDMismatch: return "BlockCIDMismatch"
+        case .invalidNodeSchema: return "InvalidNodeSchema"
+        case .invalidEntrySchema: return "InvalidEntrySchema"
+        case .nonCanonicalNode: return "NonCanonicalNode"
+        case .invalidCIDLink: return "InvalidCIDLink"
+        case .invalidPrefixCompression: return "InvalidPrefixCompression"
+        case .keysNotStrictlyIncreasing: return "KeysNotStrictlyIncreasing"
+        case .invalidPath: return "InvalidPath"
+        case .leafLayerMismatch: return "LeafLayerMismatch"
+        case .subtreeOutOfRange: return "SubtreeOutOfRange"
+        case .invalidLayer: return "InvalidLayer"
+        case .invalidEmptyTopology: return "InvalidEmptyTopology"
+        case .repeatedNode: return "RepeatedNode"
+        case .missingRecordBlock: return "MissingRecordBlock"
+        case .recordBlockCIDMismatch: return "RecordBlockCIDMismatch"
+        case .recordBlockTooLarge: return "RecordBlockTooLarge"
+        case .invalidRecordBlock: return "InvalidRecordBlock"
+        case .nodeLimitExceeded: return "NodeLimitExceeded"
+        case .entryLimitExceeded: return "EntryLimitExceeded"
+        case .cborDepthLimitExceeded: return "CBORDepthLimitExceeded"
+        case .invalidReachableRepositoryByteBudget: return "InvalidReachableRepositoryByteBudget"
+        case .reachableRepositoryByteLimitExceeded: return "ReachableRepositoryByteLimitExceeded"
+        }
+    }
+}
+
 /// Sanitized result for `swan lab import-public`.  It carries repository
 /// commitments and counts only; no record path, value, token, or key bytes
 /// are suitable for inclusion in a fixture.

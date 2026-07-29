@@ -213,16 +213,28 @@ checksum-verified way to populate the ignored reference cache.
   HTTP 200 for upload/read/download, `blobVerified: true`, and no request body,
   credential, or record value. Disposable public fixtures use
   `{{REPOSITORY_DID}}` and `{{BLOB_CID}}` placeholders; the runner materializes
-  them only after selector/blob validation. The alpha public codec deliberately
-  accepts the raw-CID link form used by its current tests and rejects typed
-  blob objects, so that boundary is explicit rather than silently normalized.
+  them only after selector/blob validation. The public codec accepts both the
+  legacy raw-CID link form and the modern typed `blob` object, but validates
+  the latter strictly (raw SHA-256 CID, bounded size, safe MIME type, and exact
+  shape) before the HTTP layer checks public-namespace reachability.
+- The rebuilt Linux Compose Swan image also passes the modern typed-blob
+  fixture: OAuth-authenticated upload, typed `repo.putRecord`, unauthenticated
+  `repo.getRecord`, and streamed `sync.getBlob` all return HTTP 200, matching
+  record CIDs, and the original 25 bytes. The sanitized artifact is
+  `artifacts/live-typed-blob.json`; the initial failure was a stale bootstrap
+  DID selector, not a protocol or storage failure.
 - A disposable pinned-TypeScript reference-only probe also passed the standard
   typed-blob path: account provisioning, blob upload, an
   `app.bsky.feed.post` commit, unauthenticated record retrieval, and streamed
   blob retrieval all returned the expected status and bytes. This is evidence
   for the reference host's own public behavior, not Swan/TypeScript
-  convergence. Swan's raw-CID public fixture codec still rejects the typed blob
-  object, so full cross-host typed-blob interoperability remains open.
+  convergence. A follow-up live reference account was imported into a fresh
+  managed Swan account through `com.atproto.sync.getRepo`: HTTP 200, one
+  record, three reachable blocks, and a verified imported commit were recorded
+  in the sanitized `artifacts/reference-public-import-live.json` artifact. The importer
+  initially opened the target as a read-only portable-export source; the CLI
+  now uses the managed account mode required for durable staging. Receiver-side
+  public-blob byte promotion after CAR import remains a separate gate.
 - Public repository verification now accepts canonical low-S secp256k1
   signatures emitted by the pinned TypeScript implementation while retaining
   P-256-only local signing. PLC `did:key` decoding and

@@ -163,6 +163,24 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
                 XCTAssertNotNil(object["cid"] as? String)
             }
 
+            let typedHeaders = try fixture.headers(
+                jti: "public-typed-record", method: "POST", path: Self.mutationPath
+            )
+            let typedBody = self.typedRecordBody(
+                rkey: "public-typed", cid: publicReference.cid, size: 12
+            )
+            try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: typedHeaders,
+                body: ByteBuffer(string: typedBody)
+            ) { response in
+                XCTAssertEqual(response.status, .ok, String(decoding: response.body.readableBytesView, as: UTF8.self))
+                let object = try self.jsonObject(response.body)
+                XCTAssertEqual(object["uri"] as? String, "at://" + Self.did + "/" + Self.collection + "/public-typed")
+                XCTAssertNotNil(object["cid"] as? String)
+            }
+
             let privateHeaders = try fixture.headers(
                 jti: "private-record", method: "POST", path: Self.mutationPath
             )
@@ -301,6 +319,12 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
 
     private func recordBody(rkey: String, cid: String) -> String {
         "{\"repo\":\"" + Self.did + "\",\"collection\":\"" + Self.collection + "\",\"rkey\":\"" + rkey + "\",\"record\":{\"blob\":{\"$link\":\"" + cid + "\"}}}"
+    }
+
+    private func typedRecordBody(rkey: String, cid: String, size: Int) -> String {
+        "{\"repo\":\"" + Self.did + "\",\"collection\":\"" + Self.collection
+            + "\",\"rkey\":\"" + rkey + "\",\"record\":{\"blob\":{\"$type\":\"blob\",\"ref\":{\"$link\":\""
+            + cid + "\"},\"mimeType\":\"application/octet-stream\",\"size\":" + String(size) + "}}}"
     }
 
     private func putBody(

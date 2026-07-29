@@ -61,6 +61,28 @@ Using the pinned Xcode toolchain with `--jobs 1`:
   counts, commitments, and digests; it is local semantic evidence, not a
   TypeScript PDS interop result.
 
+## 2026-07-29 modern typed-blob boundary
+
+The public repository codec now accepts the modern AT Protocol typed blob
+shape (`$type`, `ref`, `mimeType`, `size`) in addition to the legacy raw-CID
+link form. It does not resolve or open the payload during value conversion:
+the mutation layer performs the separate public-CAS reachability check. The
+codec rejects unknown typed values, mismatched `$type`, extra/missing fields,
+non-raw or non-SHA-256 references, unsafe MIME values, and out-of-range sizes.
+
+The Petrel JSON decoder path is covered directly, including preservation of
+an unregistered typed blob as `.unknownType` and its nested `ref` as a CID
+link. The rebuilt Linux Compose Swan image was exercised with the typed
+fixture: upload 200, typed `repo.putRecord` 200, unauthenticated
+`repo.getRecord` 200, and streamed `sync.getBlob` 200 with matching record CID
+and verified 25-byte payload. The sanitized result is
+`artifacts/live-typed-blob.json`.
+
+The first live attempt returned `RepoNotFound` because the external bootstrap
+DID file no longer matched the active DID in the persistent volume. Rerunning
+against the DID read from Swan's sanitized account registry passed; no secret
+or token was written to the artifact.
+
 ## Deliberate boundary
 
 The public upload endpoint establishes a public reference as part of the
@@ -84,10 +106,11 @@ boundary.
   `{{REPOSITORY_DID}}` and `{{BLOB_CID}}` placeholders. A disposable
   reference-only TypeScript run also passes its typed-blob form: upload, a
   standard `app.bsky.feed.post` commit, unauthenticated record read, and
-  streamed blob read all returned the expected status and bytes. This is not a
-  Swan/TypeScript convergence result; Swan's current public codec deliberately
-  accepts its raw-CID fixture form and still rejects the TypeScript typed blob
-  object.
+  streamed blob read all returned the expected status and bytes. A separate
+  live reference account was then imported into a fresh managed Swan account
+  through `com.atproto.sync.getRepo`; the sanitized import artifact reports
+  HTTP 200, one record, three reachable blocks, and a verified commit. The
+  receiver-side public-blob promotion step after CAR import remains required.
 - Re-run the complete suite after any further mutation slice; do not claim
   alpha completion until the live Compose/reference matrix and Linux gates
   pass.
