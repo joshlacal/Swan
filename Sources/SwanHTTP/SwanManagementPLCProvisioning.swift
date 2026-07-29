@@ -271,6 +271,12 @@ public actor SwanManagementPLCProvisioningRuntime:
             do {
                 try await liveAccountDirectory.admitActivatedAccount(admission)
             } catch {
+                // `admitActivatedAccount` closes a rejected transfer. Drop
+                // the opener's replay token as well, otherwise an exact
+                // activation retry receives that same closed actor forever.
+                await opener.discardActivatedAccountAdmission(
+                    did: installation.account.did
+                )
                 throw PLCAccountActivationError.unavailable
             }
         }

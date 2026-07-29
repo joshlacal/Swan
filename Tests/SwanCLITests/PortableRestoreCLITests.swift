@@ -5,6 +5,7 @@ import SwanAccountExport
 import SwanAccounts
 import SwanPublicRepository
 import SwanSpaces
+import SwanSpacesWire
 import XCTest
 
 final class PortableRestoreCLITests: XCTestCase {
@@ -64,7 +65,7 @@ final class PortableRestoreCLITests: XCTestCase {
         XCTAssertEqual(decoded.canonicalHandle, "alice.example.com")
         XCTAssertEqual(decoded.fileCount, 3)
         XCTAssertFalse(decoded.includesPrivateKeys)
-        XCTAssertEqual(decoded.profileID, "permissioned-data-0016-2026-07-03")
+        XCTAssertEqual(decoded.profileID, PermissionedData0016.profileID)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         XCTAssertEqual(result.stdout, try encoder.encode(decoded) + Data("\n".utf8))
@@ -159,6 +160,11 @@ final class PortableRestoreCLITests: XCTestCase {
     }
 
     private func executableURL() -> URL? {
+        if let override = ProcessInfo.processInfo.environment["SWAN_TEST_EXECUTABLE"],
+           !override.isEmpty,
+           FileManager.default.isExecutableFile(atPath: override) {
+            return URL(filePath: override)
+        }
         let packageRoot = URL(filePath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -253,7 +259,7 @@ private struct PortableRestoreCLIArchiveFixture {
             (spacePath, .spaceCAR, spaceCAR),
         ]
         let manifest = try SwanPortableExportManifest(
-            profileID: "permissioned-data-0016-2026-07-03",
+            profileID: PermissionedData0016.profileID,
             did: did,
             canonicalHandle: "alice.example.com",
             createdAt: "2026-07-27T12:34:56.000Z",

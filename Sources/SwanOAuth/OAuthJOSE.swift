@@ -352,31 +352,98 @@ public enum OAuthCompactJWT {
                 throw SwanError.unauthorized("JWT audience is invalid")
             }
         }
-        let now = Int64(constraints.now.timeIntervalSince1970)
-        let skew = Int64(constraints.clockSkew)
+        let now = try integerTimestamp(
+            constraints.now,
+            error: "JWT current time policy is invalid"
+        )
+        let skew = try integerInterval(
+            constraints.clockSkew,
+            permitsZero: true,
+            error: "JWT clock skew policy is invalid"
+        )
         if constraints.requireIssuedAt, claims.issuedAt == nil { throw SwanError.malformed("JWT iat is required") }
         if constraints.requireExpiration, claims.expiresAt == nil { throw SwanError.malformed("JWT exp is required") }
         if let issuedAt = claims.issuedAt {
-            guard issuedAt <= now + skew else { throw SwanError.unauthorized("JWT iat is in the future") }
+            let latestIssuedAt = now.addingReportingOverflow(skew)
+            guard !latestIssuedAt.overflow else {
+                throw SwanError.malformed("JWT time policy is invalid")
+            }
+            guard issuedAt <= latestIssuedAt.partialValue else {
+                throw SwanError.unauthorized("JWT iat is in the future")
+            }
             if let maximumAge = constraints.maximumAge {
-                guard maximumAge > 0, maximumAge.isFinite,
-                      issuedAt >= now - Int64(maximumAge) - skew else {
+                let age = try integerInterval(
+                    maximumAge,
+                    permitsZero: false,
+                    error: "JWT maximum age policy is invalid"
+                )
+                let ageCutoff = now.subtractingReportingOverflow(age)
+                guard !ageCutoff.overflow else {
+                    throw SwanError.malformed("JWT time policy is invalid")
+                }
+                let skewedAgeCutoff =
+                    ageCutoff.partialValue.subtractingReportingOverflow(skew)
+                guard !skewedAgeCutoff.overflow else {
+                    throw SwanError.malformed("JWT time policy is invalid")
+                }
+                guard issuedAt >= skewedAgeCutoff.partialValue else {
                     throw SwanError.expired
                 }
             }
         }
         if let expiresAt = claims.expiresAt {
-            guard expiresAt >= now - skew else { throw SwanError.expired }
+            let earliestExpiration = now.subtractingReportingOverflow(skew)
+            guard !earliestExpiration.overflow else {
+                throw SwanError.malformed("JWT time policy is invalid")
+            }
+            guard expiresAt >= earliestExpiration.partialValue else {
+                throw SwanError.expired
+            }
             if let issuedAt = claims.issuedAt {
                 guard expiresAt >= issuedAt else { throw SwanError.malformed("JWT exp precedes iat") }
                 if let maxLifetime = constraints.maxLifetime {
-                    guard maxLifetime > 0, maxLifetime.isFinite,
-                          expiresAt - issuedAt <= Int64(maxLifetime) else {
+                    let maximum = try integerInterval(
+                        maxLifetime,
+                        permitsZero: false,
+                        error: "JWT maximum lifetime policy is invalid"
+                    )
+                    let lifetime =
+                        expiresAt.subtractingReportingOverflow(issuedAt)
+                    guard !lifetime.overflow,
+                          lifetime.partialValue <= maximum else {
                         throw SwanError.unauthorized("JWT lifetime is too long")
                     }
                 }
             }
         }
+    }
+
+    private static func integerTimestamp(
+        _ date: Date,
+        error message: String
+    ) throws -> Int64 {
+        let timestamp = date.timeIntervalSince1970
+        // Double(Int64.max) rounds up to 2^63, which cannot be converted back
+        // to Int64. Keep that upper bound exclusive.
+        guard timestamp.isFinite,
+              timestamp >= Double(Int64.min),
+              timestamp < Double(Int64.max) else {
+            throw SwanError.malformed(message)
+        }
+        return Int64(timestamp)
+    }
+
+    private static func integerInterval(
+        _ interval: TimeInterval,
+        permitsZero: Bool,
+        error message: String
+    ) throws -> Int64 {
+        guard interval.isFinite,
+              (permitsZero ? interval >= 0 : interval > 0),
+              interval < Double(Int64.max) else {
+            throw SwanError.malformed(message)
+        }
+        return Int64(interval)
     }
 }
 
@@ -420,6 +487,8 @@ public enum StrictJSON {
     }
 
     private struct Parser {
+        static let maximumNestingDepth = 64
+
         let bytes: [UInt8]
         let topLevelIntegerMembers: Set<String>
         var index = 0
@@ -433,7 +502,8 @@ public enum StrictJSON {
 
         mutating func parseValue(
             isTopLevel: Bool = false,
-            requiresIntegerToken: Bool = false
+            requiresIntegerToken: Bool = false,
+            nestingDepth: Int = 0
         ) throws {
             skipWhitespace()
             guard let byte = bytes[safe: index] else { throw SwanError.malformed("invalid JSON") }
@@ -447,12 +517,17 @@ public enum StrictJSON {
                 guard !requiresIntegerToken else {
                     throw SwanError.malformed("JSON member must be an integer")
                 }
-                try parseObject(isTopLevel: isTopLevel)
+                let nestedDepth = try nextNestingDepth(after: nestingDepth)
+                try parseObject(
+                    isTopLevel: isTopLevel,
+                    nestingDepth: nestedDepth
+                )
             case 0x5B:
                 guard !requiresIntegerToken else {
                     throw SwanError.malformed("JSON member must be an integer")
                 }
-                try parseArray()
+                let nestedDepth = try nextNestingDepth(after: nestingDepth)
+                try parseArray(nestingDepth: nestedDepth)
             case 0x22: _ = try parseString()
             case 0x74: try consumeLiteral("true")
             case 0x66: try consumeLiteral("false")
@@ -467,7 +542,10 @@ public enum StrictJSON {
             }
         }
 
-        mutating func parseObject(isTopLevel: Bool) throws {
+        mutating func parseObject(
+            isTopLevel: Bool,
+            nestingDepth: Int
+        ) throws {
             try consume(0x7B)
             skipWhitespace()
             if consumeIf(0x7D) { return }
@@ -480,7 +558,8 @@ public enum StrictJSON {
                 try consume(0x3A)
                 try parseValue(
                     requiresIntegerToken: isTopLevel
-                        && topLevelIntegerMembers.contains(key)
+                        && topLevelIntegerMembers.contains(key),
+                    nestingDepth: nestingDepth
                 )
                 skipWhitespace()
                 if consumeIf(0x7D) { return }
@@ -488,16 +567,23 @@ public enum StrictJSON {
             }
         }
 
-        mutating func parseArray() throws {
+        mutating func parseArray(nestingDepth: Int) throws {
             try consume(0x5B)
             skipWhitespace()
             if consumeIf(0x5D) { return }
             while true {
-                try parseValue()
+                try parseValue(nestingDepth: nestingDepth)
                 skipWhitespace()
                 if consumeIf(0x5D) { return }
                 try consume(0x2C)
             }
+        }
+
+        func nextNestingDepth(after currentDepth: Int) throws -> Int {
+            guard currentDepth < Self.maximumNestingDepth else {
+                throw SwanError.malformed("JSON exceeds maximum nesting depth")
+            }
+            return currentDepth + 1
         }
 
         mutating func parseString() throws -> String {

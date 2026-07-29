@@ -10,10 +10,37 @@ public struct CompositeSpaceCredentialPublicKeyResolver:
     SpaceCredentialPublicKeyResolver
 {
     private let local: any SpaceCredentialPublicKeyResolver
-    private let pinned: PinnedSpaceCredentialPublicKeyResolver
+    private let remote: (any SpaceCredentialPublicKeyResolver)?
+    private let pinned: any SpaceCredentialPublicKeyResolver
+
+    /// Core composition boundary for an already validated offline pin
+    /// resolver. It remains module-internal so external callers must use the
+    /// public pin-value initializers and their startup conflict preflight.
+    init(
+        local: any SpaceCredentialPublicKeyResolver,
+        remote: (any SpaceCredentialPublicKeyResolver)?,
+        prevalidatedPinned pinned: any SpaceCredentialPublicKeyResolver
+    ) {
+        self.local = local
+        self.remote = remote
+        self.pinned = pinned
+    }
 
     public init(
         local: any SpaceCredentialPublicKeyResolver,
+        pinned pins: [PinnedSpaceCredentialPublicKey]
+    ) async throws {
+        try await self.init(local: local, remote: nil, pinned: pins)
+    }
+
+    /// Compose the managed-account projection with an optional, explicitly
+    /// configured PLC resolver and operator pins.  The remote resolver is
+    /// consulted only after the local and pinned worlds have no answer; this
+    /// keeps local account verification deterministic while allowing a lab to
+    /// discover a reference host's rotated `#atproto` key through PLC.
+    public init(
+        local: any SpaceCredentialPublicKeyResolver,
+        remote: (any SpaceCredentialPublicKeyResolver)?,
         pinned pins: [PinnedSpaceCredentialPublicKey]
     ) async throws {
         let pinned = try PinnedSpaceCredentialPublicKeyResolver(pins: pins)
@@ -22,11 +49,15 @@ public struct CompositeSpaceCredentialPublicKeyResolver:
                 issuer: pin.authority,
                 keyID: pin.keyID,
                 local: local,
+                remote: nil,
                 pinned: pinned
             )
         }
-        self.local = local
-        self.pinned = pinned
+        self.init(
+            local: local,
+            remote: remote,
+            prevalidatedPinned: pinned
+        )
     }
 
     public func publicKey(
@@ -37,6 +68,7 @@ public struct CompositeSpaceCredentialPublicKeyResolver:
             issuer: issuer,
             keyID: keyID,
             local: local,
+            remote: remote,
             pinned: pinned
         )
     }
@@ -45,13 +77,21 @@ public struct CompositeSpaceCredentialPublicKeyResolver:
         issuer: String,
         keyID: String,
         local: any SpaceCredentialPublicKeyResolver,
-        pinned: PinnedSpaceCredentialPublicKeyResolver
+        remote: (any SpaceCredentialPublicKeyResolver)?,
+        pinned: any SpaceCredentialPublicKeyResolver
     ) async throws -> PermissionedDataJWTVerificationKey? {
-        try uniqueVerificationKey(
-            local: try await local.publicKey(for: issuer, keyID: keyID),
-            pinned: try await pinned.publicKey(for: issuer, keyID: keyID),
+        // `nil` is the local resolver's explicit unmanaged-issuer result. Any
+        // thrown authoritative-local negative is terminal and therefore
+        // prevents both operator-pin and remote PLC fallback.
+        let localKey = try await local.publicKey(for: issuer, keyID: keyID)
+        let pinnedKey = try await pinned.publicKey(for: issuer, keyID: keyID)
+        let known = try uniqueVerificationKey(
+            local: localKey,
+            pinned: pinnedKey,
             conflict: "conflicting space credential verification keys"
         )
+        if let known { return known }
+        return try await remote?.publicKey(for: issuer, keyID: keyID)
     }
 }
 

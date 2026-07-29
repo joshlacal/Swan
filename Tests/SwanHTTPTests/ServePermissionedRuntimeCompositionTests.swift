@@ -194,6 +194,107 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase {
         }
     }
 
+    func testNotificationConfigurationRejectsUnknownKeysRecursively() throws {
+        let encoded = P256.Signing.PrivateKey().publicKey.x963Representation
+            .base64URLEncodedString()
+        let credential: [String: Any] = [
+            "issuer": remoteDID,
+            "generation": 1,
+            "algorithm": "ES256",
+            "publicKey": encoded,
+        ]
+        let service: [String: Any] = [
+            "issuer": remoteDID,
+            "generation": 1,
+            "algorithm": "ES256",
+            "publicKey": encoded,
+        ]
+        let destination: [String: Any] = [
+            "key": remoteDID,
+            "endpoint": "http://localhost:3000",
+            "audience": managingAudience,
+            "finalPeer": "127.0.0.1",
+        ]
+        let recipient: [String: Any] = [
+            "serviceIdentity": recipientService,
+            "recipientAccount": localDID,
+        ]
+        let base: [String: Any] = [
+            "credentialPublicKeys": [credential],
+            "delegationPublicKeys": [credential],
+            "servicePublicKeys": [service],
+            "authorityDestinations": [destination],
+            "registrationDestinations": [],
+            "recipientServiceBindings": [recipient],
+            "managingServiceAudience": managingAudience,
+        ]
+        var cases: [(String, [String: Any])] = []
+
+        var root = base
+        root["token"] = "must-not-be-accepted"
+        cases.append(("top-level", root))
+
+        var credentials = credential
+        credentials["privateKey"] = "must-not-be-accepted"
+        var credentialConfig = base
+        credentialConfig["credentialPublicKeys"] = [credentials]
+        cases.append(("credential key", credentialConfig))
+
+        var delegations = credential
+        delegations["token"] = "must-not-be-accepted"
+        var delegationConfig = base
+        delegationConfig["delegationPublicKeys"] = [delegations]
+        cases.append(("delegation key", delegationConfig))
+
+        var services = service
+        services["privateKey"] = "must-not-be-accepted"
+        var serviceConfig = base
+        serviceConfig["servicePublicKeys"] = [services]
+        cases.append(("service key", serviceConfig))
+
+        var authority = destination
+        authority["token"] = "must-not-be-accepted"
+        var authorityConfig = base
+        authorityConfig["authorityDestinations"] = [authority]
+        cases.append(("authority destination", authorityConfig))
+
+        var registration = destination
+        registration["privateKey"] = "must-not-be-accepted"
+        var registrationConfig = base
+        registrationConfig["registrationDestinations"] = [registration]
+        cases.append(("registration destination", registrationConfig))
+
+        var recipientWithUnknownKey = recipient
+        recipientWithUnknownKey["token"] = "must-not-be-accepted"
+        var recipientConfig = base
+        recipientConfig["recipientServiceBindings"] = [recipientWithUnknownKey]
+        cases.append(("recipient binding", recipientConfig))
+
+        var plcConfig = base
+        plcConfig["credentialKeyPLC"] = [
+            "origin": "https://plc.example",
+            "laboratory": false,
+            "privateKey": "must-not-be-accepted",
+        ]
+        cases.append(("PLC configuration", plcConfig))
+
+        for (label, object) in cases {
+            let url = FileManager.default.temporaryDirectory.appending(
+                path: "swan-notification-shape-\(UUID().uuidString).json"
+            )
+            defer { try? FileManager.default.removeItem(at: url) }
+            try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+                .write(to: url)
+            XCTAssertThrowsError(
+                try ServeNotificationRuntime.load(
+                    from: url,
+                    continuityStore: TestPLCCredentialKeyContinuityStore()
+                ),
+                "\(label) must reject unknown keys"
+            )
+        }
+    }
+
     func testLocalRuntimeCanEnableManagingAppAndNotificationCapabilitiesWithoutPinnedFile() async throws {
         let fixture = try await Fixture.make(localDID: localDID)
         defer { fixture.cleanup() }
@@ -406,7 +507,10 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase {
         }
         try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
             .write(to: config)
-        return try ServeNotificationRuntime.load(from: config)
+        return try ServeNotificationRuntime.load(
+            from: config,
+            continuityStore: TestPLCCredentialKeyContinuityStore()
+        )
     }
 
     private func makeTypeScriptNotificationRuntime(root: URL) throws -> ServeNotificationRuntime {
@@ -443,7 +547,10 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase {
         ]
         try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
             .write(to: config)
-        return try ServeNotificationRuntime.load(from: config)
+        return try ServeNotificationRuntime.load(
+            from: config,
+            continuityStore: TestPLCCredentialKeyContinuityStore()
+        )
     }
 
     private static let remoteDelegation =
@@ -482,6 +589,34 @@ private actor CompositionAttestationPolicy:
 
     func invocationCount() -> Int {
         count
+    }
+}
+
+/// Explicitly test-scoped continuity storage for synchronous configuration
+/// parsing tests. The production `serve` path always supplies
+/// `SQLiteControlDatabase`.
+private actor TestPLCCredentialKeyContinuityStore:
+    PLCCredentialKeyContinuityStore
+{
+    private var checkpoints:
+        [String: PLCCredentialKeyContinuityCheckpoint] = [:]
+
+    func advancePLCCredentialKeyContinuity(
+        _ advance: PLCCredentialKeyContinuityAdvance
+    ) async throws -> PLCCredentialKeyContinuityCheckpoint {
+        if let existing = checkpoints[advance.checkpoint.issuer],
+           existing.terminalCID != advance.checkpoint.terminalCID,
+           !advance.auditCIDs.contains(existing.terminalCID) {
+            throw PLCCredentialKeyContinuityStoreError.continuityViolation
+        }
+        checkpoints[advance.checkpoint.issuer] = advance.checkpoint
+        return advance.checkpoint
+    }
+
+    func plcCredentialKeyContinuityCheckpoint(
+        for issuer: String
+    ) async throws -> PLCCredentialKeyContinuityCheckpoint? {
+        checkpoints[issuer]
     }
 }
 
@@ -549,7 +684,8 @@ private struct Fixture {
                 control: control,
                 directory: try await .bootstrap(
                     dataDirectory: root,
-                    controlStore: control
+                    controlStore: control,
+                    publicIdentityVerifier: nil
                 ),
                 oauthRuntime: try SwanOAuthRuntime(
                     controlStore: control,

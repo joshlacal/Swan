@@ -36,7 +36,7 @@ prepare_directory "$runtime_directory" swan swan
 prepare_directory "$bootstrap_directory" swan swan
 prepare_directory "$pds_directory" 1000 1000
 
-for name in oauth-server-key account-kek; do
+for name in oauth-server-key account-kek email-proof-key; do
     copy_secret "$name" "$runtime_directory" swan swan
 done
 

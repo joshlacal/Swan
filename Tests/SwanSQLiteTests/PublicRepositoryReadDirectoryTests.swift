@@ -3,11 +3,13 @@ import Foundation
 import Hummingbird
 import HTTPTypes
 import Petrel
+import SQLiteNIO
+import SwanCore
+import SwanHTTP
 import SwanPublicRepository
 @testable import SwanSQLite
 import SwanSpaces
 import SwanStorage
-import SwanHTTP
 import XCTest
 
 #if canImport(Darwin)
@@ -204,8 +206,18 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
     }
 
     func testBoundedExportRejectsCorruptIndexWithoutPublishingCAR() async throws {
-        let fixture = try await makeFixture(tamperPublicIndex: true)
+        let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let store = await fixture.directory.preopenedPublicMutationStore(
+            did: did
+        )
+        let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
+        try await corruptPublicProjectionIndex(
+            connection: database.connection,
+            collection: collection,
+            recordKey: "one",
+            replacementCID: fixture.state.dataCID.string
+        )
         await XCTAssertThrowsPublicReadUnavailable(
             try await fixture.directory.publicRepositoryCAR(selector: did)
         )
@@ -213,28 +225,262 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
         try await fixture.control.close()
     }
 
-    func testDescribeRepoFailsClosedForTamperedGenesisAndIntentCID() async throws {
-        let signatureFixture = try await makeFixture(
-            tamperJournalSignature: true
-        )
-        defer { try? FileManager.default.removeItem(at: signatureFixture.root) }
-        await XCTAssertThrowsPublicReadUnavailable(
-            try await signatureFixture.directory.describePublicRepository(
-                selector: did
-            )
-        )
-        try await signatureFixture.directory.close()
-        try await signatureFixture.control.close()
+    // Production mutation caught: `bootstrap` returns an active preopened
+    // database without first calling `verifyPublicRepositoryProjection()`.
+    func testBootstrapRejectsCorruptPublicProjectionBeforeDirectoryActivation() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try await fixture.directory.close()
 
-        let intentFixture = try await makeFixture(tamperIntentCID: true)
-        defer { try? FileManager.default.removeItem(at: intentFixture.root) }
-        await XCTAssertThrowsPublicReadUnavailable(
-            try await intentFixture.directory.describePublicRepository(
-                selector: did
+        let raw = try await SQLiteConnection.open(
+            storage: .file(
+                path: SQLiteLayout.accountDatabase(
+                    in: fixture.root, did: did
+                ).path
             )
         )
-        try await intentFixture.directory.close()
-        try await intentFixture.control.close()
+        do {
+            try await corruptPublicProjectionIndex(
+                connection: raw,
+                collection: collection,
+                recordKey: "one",
+                replacementCID: fixture.state.dataCID.string
+            )
+            try await raw.close()
+        } catch {
+            try? await raw.close()
+            throw error
+        }
+
+        do {
+            let unexpected = try await SQLitePreMigratedAccountDirectory
+                .bootstrap(
+                    dataDirectory: fixture.root,
+                    controlStore: fixture.control,
+                    publicIdentityVerifier: TestPublicPLCGenesisVerifier(
+                        operationCID: fixture.genesisOperationCID
+                    )
+                )
+            try? await unexpected.close()
+            XCTFail(
+                "corrupt public projection must fail before the directory becomes active"
+            )
+        } catch let error as SwanError {
+            guard case .unavailable = error else {
+                XCTFail("expected unavailable, got \(error)")
+                try await fixture.control.close()
+                return
+            }
+        } catch {
+            XCTFail("expected SwanError.unavailable, got \(error)")
+        }
+
+        try await fixture.control.close()
+    }
+
+    // Production mutation caught: `admitActivatedAccount` stores the opened
+    // database in `databases[did]` without first validating its public
+    // repository projection.
+    func testActivatedAccountAdmissionRejectsCorruptPublicProjectionBeforeExposure() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        try await fixture.directory.close()
+        _ = try await fixture.control.transitionStatus(
+            did: did,
+            to: .deactivated,
+            declaration: .init(),
+            now: Date(timeIntervalSince1970: 1_750_000_020)
+        )
+        let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+            dataDirectory: fixture.root,
+            controlStore: fixture.control,
+            publicIdentityVerifier: TestPublicPLCGenesisVerifier(
+                operationCID: fixture.genesisOperationCID
+            )
+        )
+        let database = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root, did: did
+        )
+        try await corruptPublicProjectionIndex(
+            connection: database.connection,
+            collection: collection,
+            recordKey: "one",
+            replacementCID: fixture.state.dataCID.string
+        )
+        _ = try await fixture.control.transitionStatus(
+            did: did,
+            to: .active,
+            declaration: .init(),
+            now: Date(timeIntervalSince1970: 1_750_000_021)
+        )
+
+        await XCTAssertThrowsSwanUnavailable(
+            try await directory.admitActivatedAccount(
+                SQLiteActivatedAccountAdmission(did: did, database: database)
+            )
+        )
+        let exposed = await directory.preopenedPublicMutationStore(did: did)
+        XCTAssertNil(exposed)
+
+        try await directory.close()
+        try? await database.close()
+        try await fixture.control.close()
+    }
+
+    // Production mutation caught: `readPublicRepositoryRecord` or the
+    // description projection used by the JSON handler uses the write-reserving
+    // `transaction` helper (`BEGIN IMMEDIATE`) after admission.
+    func testBoundedPublicRecordReadProceedsWhileSQLiteWriterIsReserved() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let store = await fixture.directory.preopenedPublicMutationStore(
+            did: did
+        )
+        let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
+        _ = try await database.connection.query("PRAGMA busy_timeout=0")
+
+        do {
+            try await withReservedSQLiteWriter(
+                databaseURL: SQLiteLayout.accountDatabase(
+                    in: fixture.root, did: did
+                )
+            ) {
+                let path = try PublicRepositoryPath(
+                    collection: collection, recordKey: "one"
+                )
+                let maybeRecord = try await fixture.directory.publicRepositoryRecord(
+                    selector: did,
+                    path: path,
+                    expectedCID: nil
+                )
+                let record = try XCTUnwrap(maybeRecord)
+                XCTAssertEqual(record.path, path)
+                let maybeDescription = try await fixture.directory
+                    .describePublicRepository(
+                        selector: did
+                    )
+                let description = try XCTUnwrap(maybeDescription)
+                XCTAssertEqual(description.did, did)
+            }
+        } catch {
+            XCTFail(
+                "bounded public read attempted to reserve the SQLite writer: \(error)"
+            )
+        }
+
+        try await fixture.directory.close()
+        try await fixture.control.close()
+    }
+
+    // Production mutation caught: listRecords selects the next record BLOB
+    // before checking whether its scalar length would exceed the aggregate
+    // anonymous-response budget.
+    func testListRecordsDoesNotMaterializeBodyBeyondAggregateBudget() async throws {
+        let fixture = try await makeFixture(
+            publicRecordKeys: ["one", "two", "three", "four", "five"],
+            publicRecordTextPaddingBytes: 900_000
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let store = await fixture.directory.preopenedPublicMutationStore(
+            did: did
+        )
+        let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
+        let maybeAccount = try await fixture.control.account(did: did)
+        let account = try XCTUnwrap(maybeAccount)
+        let generation = try await database.admitPublicRepositoryGeneration(
+            account: account,
+            identityVerifier: TestPublicPLCGenesisVerifier(
+                operationCID: fixture.genesisOperationCID
+            )
+        )
+
+        let cleanRead = try await database.readPublicRepositoryRecords(
+            collection: collection,
+            limit: 100,
+            cursor: nil,
+            reverse: false,
+            generation: generation
+        )
+        XCTAssertEqual(cleanRead.page.records.count, 4)
+        let emittedPaths = Set(cleanRead.page.records.map(\.path))
+        let allPaths = try Set(
+            ["one", "two", "three", "four", "five"].map {
+                try PublicRepositoryPath(
+                    collection: collection, recordKey: $0
+                )
+            }
+        )
+        let excludedPaths = allPaths.subtracting(emittedPaths)
+        XCTAssertEqual(excludedPaths.count, 1)
+        let excludedPath = try XCTUnwrap(excludedPaths.first)
+        let maybeExcludedCID =
+            try await database.publicRepositoryRecordCID(for: excludedPath)
+        let excludedCID = try XCTUnwrap(maybeExcludedCID)
+        let maybeExcludedBytes = try await database.block(for: excludedCID)
+        let excludedBytes = try XCTUnwrap(maybeExcludedBytes)
+
+        // Preserve SQLite LENGTH(bytes), but make selecting this value fail
+        // closed as a canonical block. A correct reader never selects it
+        // because the preceding four bodies already consume the page budget.
+        _ = try await database.connection.query(
+            """
+            UPDATE public_repository_blocks
+            SET bytes = ?
+            WHERE cid = ?
+            """,
+            [
+                .text(String(repeating: "x", count: excludedBytes.count)),
+                .text(excludedCID.string),
+            ]
+        )
+
+        let boundedRead = try await database.readPublicRepositoryRecords(
+            collection: collection,
+            limit: 100,
+            cursor: nil,
+            reverse: false,
+            generation: generation
+        )
+        XCTAssertEqual(
+            boundedRead.page.records.map(\.path),
+            cleanRead.page.records.map(\.path)
+        )
+        XCTAssertLessThanOrEqual(
+            boundedRead.page.records.reduce(0) {
+                $0 + $1.canonicalBytes.count
+            },
+            PublicRepositoryJSONReadLimits.maximumAggregateRecordBlockBytes
+        )
+
+        try await fixture.directory.close()
+        try await fixture.control.close()
+    }
+
+    func testDescribeRepoFailsClosedForTamperedGenesisAndIntentCID() async throws {
+        // Startup admission authenticates both the signed PLC genesis facts
+        // and the durable preparation intent before publishing a directory.
+        // Tampering either value must therefore fail before a request can
+        // observe a half-admitted account.
+        for tamper in ["signature", "intent"] {
+            do {
+                _ = try await makeFixture(
+                    tamperJournalSignature: tamper == "signature",
+                    tamperIntentCID: tamper == "intent"
+                )
+                XCTFail(
+                    "tampered PLC \(tamper) must be rejected during bootstrap"
+                )
+            } catch {
+                guard let swanError = error as? SwanError else {
+                    XCTFail("expected SwanError.unavailable, got \(error)")
+                    continue
+                }
+                guard case .unavailable = swanError else {
+                    XCTFail("expected unavailable, got \(swanError)")
+                    continue
+                }
+            }
+        }
     }
 
     func testPublicRepositoryBlobCIDsExtractsTypedRawLinksFromInstalledRecords() async throws {
@@ -453,6 +699,14 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
             in: fixture.root, did: did
         )
         try FileManager.default.removeItem(at: databaseURL)
+        let regularReplacement = Data("must-not-be-opened-as-the-database".utf8)
+        try regularReplacement.write(to: databaseURL)
+        await XCTAssertThrowsPublicReadUnavailable(
+            try await fixture.directory.describePublicRepository(selector: did)
+        )
+        XCTAssertEqual(try Data(contentsOf: databaseURL), regularReplacement)
+
+        try FileManager.default.removeItem(at: databaseURL)
         let outside = fixture.root.appending(path: "outside-replacement.sqlite")
         let outsideMarker = Data("must-not-be-opened".utf8)
         try outsideMarker.write(to: outside)
@@ -480,9 +734,10 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
 
     private func makeFixture(
         admission: PublicRepositorySpoolAdmission? = nil,
-        tamperPublicIndex: Bool = false,
         tamperJournalSignature: Bool = false,
-        tamperIntentCID: Bool = false
+        tamperIntentCID: Bool = false,
+        publicRecordKeys: [String] = ["one", "two", "three"],
+        publicRecordTextPaddingBytes: Int = 0
     ) async throws -> (
         root: URL,
         control: SQLiteControlDatabase,
@@ -517,46 +772,72 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
         )
         let maybeInitial = try await database.loadPublicRepositoryState()
         let initial = try XCTUnwrap(maybeInitial)
-        let request = try PublicRepositoryMutationRequest(
-            id: "public-read-fixture",
-            canonicalDigest: Data(repeating: 0x43, count: 32),
-            baseCommitCID: initial.commitCID
-        )
-        guard case let .reserved(reservation) =
-            try await database.reservePublicRepositoryRevision(
-                request,
-                wallClockMicroseconds: 1_750_000_001_000_000
-            ) else {
-            throw PublicRepositoryReadError.unavailable
-        }
-        let writes: [PublicRepositoryWrite] = try ["one", "two", "three"].map {
+        let writes: [PublicRepositoryWrite] = try publicRecordKeys.map {
             let path = try PublicRepositoryPath(
                 collection: collection, recordKey: $0
             )
+            let text = publicRecordTextPaddingBytes == 0
+                ? "public-\($0)"
+                : "public-\($0)-"
+                    + String(
+                        repeating: "x",
+                        count: publicRecordTextPaddingBytes
+                    )
             return .create(
                 path: path,
                 record: [
                     "$type": .string(collection),
-                    "text": .string("public-\($0)"),
+                    "text": .string(text),
                 ]
             )
         }
-        let prepared = try await PublicRepositoryEngine.apply(
-            repositoryDID: did,
-            currentState: initial,
-            blocks: database,
-            revision: reservation.nextRevision,
-            batch: try PublicRepositoryWriteBatch(
-                writes: writes,
-                expectedCommitCID: initial.commitCID
-            ),
-            signer: P256PublicRepositoryCommitSigner(privateKey: key)
+        // Commit one record at a time so the hostile large-record fixture can
+        // exceed the read-page budget without violating the pinned 2 MB
+        // relevant-block limit on any individual mutation.
+        var currentState = initial
+        for (index, write) in writes.enumerated() {
+            let request = try PublicRepositoryMutationRequest(
+                id: "public-read-fixture-\(index)",
+                canonicalDigest: Data(
+                    repeating: UInt8(truncatingIfNeeded: 0x43 + index),
+                    count: 32
+                ),
+                baseCommitCID: currentState.commitCID
+            )
+            guard case let .reserved(reservation) =
+                try await database.reservePublicRepositoryRevision(
+                    request,
+                    wallClockMicroseconds:
+                        1_750_000_001_000_000 + UInt64(index)
+                ) else {
+                throw PublicRepositoryReadError.unavailable
+            }
+            let prepared = try await PublicRepositoryEngine.apply(
+                repositoryDID: did,
+                currentState: currentState,
+                blocks: database,
+                revision: reservation.nextRevision,
+                batch: try PublicRepositoryWriteBatch(
+                    writes: [write],
+                    expectedCommitCID: currentState.commitCID
+                ),
+                signer: P256PublicRepositoryCommitSigner(privateKey: key)
+            )
+            _ = try await database.applyPublicRepositoryMutation(
+                reservation: reservation, prepared: prepared
+            )
+            currentState = prepared.state
+        }
+        let privateCollision = try DAGCBOR.encodeValue(
+            OrderedCBORMap(entries: [
+                (key: "secret", value: "permissioned-private-one"),
+            ])
         )
-        _ = try await database.applyPublicRepositoryMutation(
-            reservation: reservation, prepared: prepared
+        let privateOnly = try DAGCBOR.encodeValue(
+            OrderedCBORMap(entries: [
+                (key: "secret", value: "permissioned-private-only"),
+            ])
         )
-        let privateCollision = Data("permissioned-private-one".utf8)
-        let privateOnly = Data("permissioned-private-only".utf8)
         let privateSpace = try SpaceURI(
             authority: did,
             spaceType: "app.bsky.bookmarks",
@@ -584,12 +865,12 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
                 .put(
                     uri: privateCollisionURI,
                     value: privateCollision,
-                    cid: "cid:permissioned-collision"
+                    cid: CID.fromDAGCBOR(privateCollision).string
                 ),
                 .put(
                     uri: privateOnlyURI,
                     value: privateOnly,
-                    cid: "cid:permissioned-only"
+                    cid: CID.fromDAGCBOR(privateOnly).string
                 ),
             ],
             eventID: UUID()
@@ -633,19 +914,6 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
             to: .submitted,
             publicGenesisCommitCID: nil
         )
-        if tamperPublicIndex {
-            _ = try await database.connection.query(
-                """
-                UPDATE public_repository_record_index
-                SET record_cid = ?
-                WHERE collection = ? AND rkey = ?
-                """,
-                [
-                    .text(genesis.emptyMSTCID.string),
-                    .text(collection), .text("one"),
-                ]
-            )
-        }
         if tamperJournalSignature {
             _ = try await database.connection.query(
                 """
@@ -694,23 +962,37 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
                 to: next
             )
         }
-        let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
-            dataDirectory: root,
-            controlStore: control,
-            publicIdentityVerifier: TestPublicPLCGenesisVerifier(
-                operationCID: genesis.commitCID.string
-            ),
-            publicCARSpoolAdmission: admission
-        )
+        let directory: SQLitePreMigratedAccountDirectory
+        do {
+            directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+                dataDirectory: root,
+                controlStore: control,
+                publicIdentityVerifier: TestPublicPLCGenesisVerifier(
+                    operationCID: genesis.commitCID.string
+                ),
+                publicCARSpoolAdmission: admission
+            )
+        } catch {
+            // Bootstrap owns and closes account databases on admission
+            // failure, but the caller still owns the control connection. Do
+            // not let a deliberately invalid identity fixture abort in
+            // SQLiteControlDatabase.deinit before XCTest can assert the
+            // fail-closed outcome.
+            try? await control.close()
+            throw error
+        }
         return (
-            root, control, directory, key, prepared.state,
+            root, control, directory, key, currentState,
             genesis.commitCID.string,
             privateCollision, privateOnly
         )
     }
 }
 
-private struct TestPublicPLCGenesisVerifier: PublicPLCGenesisVerifying {
+private struct TestPublicPLCGenesisVerifier:
+    PublicPLCGenesisVerifying,
+    PublicPLCRepositoryAuthenticating
+{
     let operationCID: String
 
     func verifyGenesis(
@@ -729,6 +1011,26 @@ private struct TestPublicPLCGenesisVerifier: PublicPLCGenesisVerifying {
             throw PublicRepositoryReadError.unavailable
         }
         return operationCID
+    }
+
+    func authenticateRepositoryCommit(
+        signedCommitBytes: Data,
+        expectedCommitCID: CID,
+        expectedDID: String,
+        signingDIDKey _: String
+    ) async throws -> PublicRepositoryCommitAuthentication {
+        let commit = try PublicRepositoryCommitCodec.structurallyValidate(
+            signedCommitBytes: signedCommitBytes,
+            expectedCommitCID: expectedCommitCID
+        )
+        guard commit.descriptor.did == expectedDID else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        return try PublicRepositoryCommitAuthentication(
+            descriptor: commit.descriptor,
+            commitCID: commit.commitCID,
+            verificationIdentity: "test-structural-verifier"
+        )
     }
 }
 
@@ -835,6 +1137,60 @@ private actor PublicReadCARSource: PublicRepositoryCARByteSource {
     }
 }
 
+private func corruptPublicProjectionIndex(
+    connection: SQLiteConnection,
+    collection: String,
+    recordKey: String,
+    replacementCID: String
+) async throws {
+    _ = try await connection.query(
+        """
+        UPDATE public_repository_record_index
+        SET record_cid = ?
+        WHERE collection = ? AND rkey = ?
+        """,
+        [
+            .text(replacementCID),
+            .text(collection),
+            .text(recordKey),
+        ]
+    )
+    let rows = try await connection.query(
+        """
+        SELECT record_cid
+        FROM public_repository_record_index
+        WHERE collection = ? AND rkey = ?
+        """,
+        [.text(collection), .text(recordKey)]
+    )
+    guard rows.count == 1,
+          rows[0].column("record_cid")?.string == replacementCID else {
+        throw PublicRepositoryReadError.unavailable
+    }
+}
+
+private func withReservedSQLiteWriter(
+    databaseURL: URL,
+    operation: () async throws -> Void
+) async throws {
+    let writer = try await SQLiteConnection.open(
+        storage: .file(path: databaseURL.path)
+    )
+    var capturedError: Error?
+    do {
+        _ = try await writer.query("PRAGMA busy_timeout=0")
+        _ = try await writer.query("BEGIN IMMEDIATE")
+        try await operation()
+    } catch {
+        capturedError = error
+    }
+    _ = try? await writer.query("ROLLBACK")
+    try? await writer.close()
+    if let capturedError {
+        throw capturedError
+    }
+}
+
 private func XCTAssertThrowsPublicReadUnavailable<T>(
     _ expression: @autoclosure () async throws -> T,
     file: StaticString = #filePath,
@@ -847,5 +1203,30 @@ private func XCTAssertThrowsPublicReadUnavailable<T>(
         XCTAssertEqual(error, .unavailable, file: file, line: line)
     } catch {
         XCTFail("expected public read unavailable, got \(error)", file: file, line: line)
+    }
+}
+
+private func XCTAssertThrowsSwanUnavailable<T>(
+    _ expression: @autoclosure () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("expected unavailable", file: file, line: line)
+    } catch let error as SwanError {
+        guard case .unavailable = error else {
+            return XCTFail(
+                "expected unavailable, got \(error)",
+                file: file,
+                line: line
+            )
+        }
+    } catch {
+        XCTFail(
+            "expected SwanError.unavailable, got \(error)",
+            file: file,
+            line: line
+        )
     }
 }

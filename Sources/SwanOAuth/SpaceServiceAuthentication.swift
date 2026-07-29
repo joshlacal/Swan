@@ -330,12 +330,22 @@ public enum SpaceServiceJWT {
               lifetime.rounded(.towardZero) == lifetime else {
             throw SwanError.malformed("service authentication claims are invalid")
         }
-        let iat = Int64(now.timeIntervalSince1970)
+        guard let iat = integerServiceTimestamp(now) else {
+            throw SwanError.malformed(
+                "service authentication current time is invalid"
+            )
+        }
+        let expiration = iat.addingReportingOverflow(Int64(lifetime))
+        guard !expiration.overflow else {
+            throw SwanError.malformed(
+                "service authentication claims are invalid"
+            )
+        }
         let claims = Claims(
             iss: issuer,
             aud: audience,
             iat: iat,
-            exp: iat + Int64(lifetime),
+            exp: expiration.partialValue,
             lxm: method,
             jti: eventID
         )
@@ -379,19 +389,45 @@ public enum SpaceServiceJWT {
         ) else {
             throw SwanError.unauthorized("service authentication signature is invalid")
         }
-        let nowSeconds = Int64(now.timeIntervalSince1970)
+        guard let nowSeconds = integerServiceTimestamp(now) else {
+            throw SwanError.malformed(
+                "service authentication current time is invalid"
+            )
+        }
         let skew = Int64(clockSkew)
-        guard parsed.claims.exp >= nowSeconds - skew else {
+        let expirationCutoff =
+            nowSeconds.subtractingReportingOverflow(skew)
+        guard !expirationCutoff.overflow else {
+            throw SwanError.malformed(
+                "service authentication time policy is invalid"
+            )
+        }
+        guard parsed.claims.exp >= expirationCutoff.partialValue else {
             throw SwanError.expired
         }
         if let issuedAt = parsed.claims.iat {
-            guard issuedAt <= nowSeconds + skew,
+            let latestIssuedAt = nowSeconds.addingReportingOverflow(skew)
+            let lifetime =
+                parsed.claims.exp.subtractingReportingOverflow(issuedAt)
+            guard !latestIssuedAt.overflow,
+                  issuedAt <= latestIssuedAt.partialValue,
                   parsed.claims.exp >= issuedAt,
-                  parsed.claims.exp - issuedAt <= Int64(maximumLifetime) else {
+                  !lifetime.overflow,
+                  lifetime.partialValue <= Int64(maximumLifetime) else {
                 throw SwanError.unauthorized("service authentication time claims are invalid")
             }
         }
         return parsed.claims
+    }
+
+    private static func integerServiceTimestamp(_ date: Date) -> Int64? {
+        let timestamp = date.timeIntervalSince1970
+        guard timestamp.isFinite,
+              timestamp >= Double(Int64.min),
+              timestamp < Double(Int64.max) else {
+            return nil
+        }
+        return Int64(timestamp)
     }
 
     private static func parse(_ compact: String) throws -> Parsed {

@@ -571,7 +571,8 @@ private struct Fixture: Sendable {
             )
             let preopened = try await SQLitePreMigratedAccountDirectory.bootstrap(
                 dataDirectory: root,
-                controlStore: control
+                controlStore: control,
+                publicIdentityVerifier: nil
             )
             let runtime = try SwanOAuthRuntime(
                 controlStore: control,

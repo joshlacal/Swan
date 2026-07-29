@@ -16,6 +16,7 @@ public enum AccountOperatorError: Error, Sendable, Equatable, LocalizedError {
     case operatorSecretFileUnavailable
     case unknownAccount
     case accountInactive
+    case permanentDeletionUnavailable
 
     public var errorDescription: String? {
         switch self {
@@ -29,6 +30,8 @@ public enum AccountOperatorError: Error, Sendable, Equatable, LocalizedError {
             "account not found"
         case .accountInactive:
             "account is not active"
+        case .permanentDeletionUnavailable:
+            "permanent account deletion is unavailable"
         }
     }
 }
@@ -237,10 +240,11 @@ public enum AccountOperatorLookup: Sendable, Equatable {
 /// sessions, OAuth state, or repository data.
 public struct AccountOperatorView: Codable, Sendable, Equatable {
     public let did: String
-    public let canonicalHandle: String
+    public let canonicalHandle: String?
     public let status: String
-    public let createdAt: Date
-    public let updatedAt: Date
+    public let createdAt: Date?
+    public let updatedAt: Date?
+    public let finalizedAt: Date?
     public let tombstone: AccountTombstoneMetadata?
     public let export: AccountExportMetadata?
 
@@ -250,8 +254,23 @@ public struct AccountOperatorView: Codable, Sendable, Equatable {
         status = account.status.rawValue
         createdAt = account.createdAt
         updatedAt = account.updatedAt
+        finalizedAt = nil
         tombstone = account.tombstone
         export = account.export
+    }
+
+    /// A completed permanent deletion cannot expose the scrubbed account's
+    /// former handle, creation time, credentials, keys, or repository state.
+    /// Project only the durable tombstone allow-list retained by control.sqlite.
+    public init(permanentDeletion tombstone: AccountDeletionTombstone) {
+        did = tombstone.did
+        canonicalHandle = nil
+        status = AccountControlStatus.deleted.rawValue
+        createdAt = nil
+        updatedAt = nil
+        finalizedAt = tombstone.finalizedAt
+        self.tombstone = tombstone.tombstone
+        export = tombstone.export
     }
 }
 
@@ -272,9 +291,16 @@ public enum AccountOperatorJSON {
 /// transaction rather than creating any raw SQLite tables or queries itself.
 public struct AccountOperatorService: Sendable {
     private let store: any AccountControlStore
+    private let permanentDeletionCoordinator:
+        (any AccountPermanentDeletionCoordinating)?
 
-    public init(store: any AccountControlStore) {
+    public init(
+        store: any AccountControlStore,
+        permanentDeletionCoordinator:
+            (any AccountPermanentDeletionCoordinating)? = nil
+    ) {
         self.store = store
+        self.permanentDeletionCoordinator = permanentDeletionCoordinator
     }
 
     /// Read-only lookup is intentionally separate from lifecycle authority.
@@ -328,19 +354,39 @@ public struct AccountOperatorService: Sendable {
         authorization: AccountOperatorAuthorization,
         now: Date = Date()
     ) async throws -> AccountOperatorView {
+        guard authorization.isVerified else {
+            throw AccountOperatorError.operatorSecretRejected
+        }
+        let did = try AccountIdentifiers.validateDID(did)
         let declaration = AccountLifecycleDeclaration(
             tombstone: try AccountTombstoneMetadata(declaredAt: now, reason: tombstoneReason),
             export: try exportReference.map {
                 try AccountExportMetadata(declaredAt: now, reference: $0)
             }
         )
-        return try await transition(
-            did: did,
-            to: .deleted,
-            declaration: declaration,
-            authorization: authorization,
-            now: now
-        )
+        guard let permanentDeletionCoordinator else {
+            throw AccountOperatorError.permanentDeletionUnavailable
+        }
+        do {
+            let tombstone = try await permanentDeletionCoordinator.beginAndResume(
+                did: did,
+                declaration: declaration,
+                now: now
+            )
+            // Treat the injected coordinator as a capability boundary, not as
+            // an unchecked source of operator output. A mismatched terminal
+            // record must never be projected as deletion of the requested DID.
+            guard tombstone.did == did,
+                  tombstone.tombstone == declaration.tombstone,
+                  tombstone.export == declaration.export else {
+                throw AccountOperatorError.permanentDeletionUnavailable
+            }
+            return AccountOperatorView(permanentDeletion: tombstone)
+        } catch AccountDeletionStoreError.notFound {
+            throw AccountOperatorError.unknownAccount
+        } catch AccountDeletionStoreError.unavailable {
+            throw AccountOperatorError.permanentDeletionUnavailable
+        }
     }
 
     /// Records only the digest declaration for a successfully published

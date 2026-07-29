@@ -1356,7 +1356,12 @@ private struct Fixture: Sendable {
                 passwordHasher: hasher,
                 verificationExecutor: try Argon2idVerificationExecutor(hasher: hasher, maximumConcurrentVerifications: 1, maximumQueuedVerifications: 1)
             )
-            let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(dataDirectory: root, controlStore: control, oplogRetention: retention)
+            let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+                dataDirectory: root,
+                controlStore: control,
+                oplogRetention: retention,
+                publicIdentityVerifier: nil
+            )
             let runtime = try SwanOAuthRuntime(controlStore: control, serverKey: Data(repeating: 0x92, count: 32))
             return Fixture(
                 root: root, space: space, control: control, keyStore: keyStore,

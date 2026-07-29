@@ -35,7 +35,20 @@ public struct Input: ATProtocolCodable {
             self.repo = try container.decode(DID.self, forKey: .repo)
             self.collection = try container.decode(NSID.self, forKey: .collection)
             self.rkey = try container.decode(RecordKey.self, forKey: .rkey)
-            self.validate = try container.decodeIfPresent(Bool.self, forKey: .validate)
+            if container.contains(.validate) {
+                guard try !container.decodeNil(forKey: .validate) else {
+                    throw DecodingError.valueNotFound(
+                        Bool.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'validate' must not be null"
+                        )
+                    )
+                }
+                self.validate = try container.decode(Bool.self, forKey: .validate)
+            } else {
+                self.validate = nil
+            }
             self.record = try container.decode(ATProtocolValueContainer.self, forKey: .record)
         }
 

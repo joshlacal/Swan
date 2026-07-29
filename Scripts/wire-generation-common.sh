@@ -8,9 +8,14 @@ wire_generation_die() {
 }
 
 wire_generation_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-wire_generation_profile="${wire_generation_root}/Profiles/permissioned-data-0016-2026-07-03.json"
-readonly wire_generation_expected_petrel_generator_commit="d011ccf0029457434e659ec48c8024baa7b5c4e4"
+wire_generation_profile="${wire_generation_root}/Profiles/permissioned-data-0016-2026-07-30.json"
+readonly wire_generation_expected_petrel_generator_commit="c2a1cdbee8c621c7682416114700f032cc7e2b37"
 readonly wire_generation_sha256="${wire_generation_root}/Scripts/sha256.sh"
+readonly wire_generation_expected_profile_sha256="937ed10ef7a40717746f752204eba1e30d7bfe12e4deda006ce9236b6e10f001"
+readonly wire_generation_expected_petrel_manifest_sha256="ac3c8b006e0e771f6e3cb0b5cbe6e93a78101dc49ce95ea9b3e1ed734a97636f"
+readonly wire_generation_legacy_profile_sha256="30a696e78f62b11f22dd669f6ebb9f7e08d6c1d3346ebd71ad5cf0cd49b3f4d0"
+readonly wire_generation_legacy_lexicons_sha256="9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f"
+readonly wire_generation_legacy_generated_sha256="c1d5697f351a4209c7f8a9faaf460d423f9f44f37845ae2c92e150e78c552609"
 
 wire_generation_profile_value() {
   local key="$1"
@@ -28,12 +33,53 @@ PY
 }
 
 wire_generation_verify_profile_lexicons() {
+  wire_generation_verify_successor_profile
   "${wire_generation_root}/Scripts/verify-profile.sh"
 }
 
+wire_generation_verify_successor_profile() {
+  local actual
+  [[ -f "${wire_generation_profile}" && ! -L "${wire_generation_profile}" ]] || wire_generation_die \
+    "successor profile is missing or symlinked"
+  actual="$("${wire_generation_sha256}" "${wire_generation_profile}" | awk '{print $1}')"
+  [[ "${actual}" == "${wire_generation_expected_profile_sha256}" ]] || wire_generation_die \
+    "successor profile checksum mismatch"
+  [[ "$(wire_generation_profile_value petrelGeneratorCommit)" == \
+      "${wire_generation_expected_petrel_generator_commit}" ]] || wire_generation_die \
+    "successor profile generator pin mismatch"
+  [[ "$(wire_generation_profile_value petrelManifest)" == "PetrelManifest.json" ]] || wire_generation_die \
+    "successor profile Petrel manifest name mismatch"
+  actual="$("${wire_generation_sha256}" "${wire_generation_root}/PetrelManifest.json" | awk '{print $1}')"
+  [[ "${actual}" == "${wire_generation_expected_petrel_manifest_sha256}" ]] || wire_generation_die \
+    "Petrel manifest checksum mismatch"
+  [[ "$(wire_generation_profile_value petrelManifestSHA256)" == "${actual}" ]] || wire_generation_die \
+    "successor profile Petrel manifest pin mismatch"
+}
+
+wire_generation_verify_legacy_profile_immutable() {
+  local relative expected actual
+  while read -r relative expected; do
+    [[ -f "${wire_generation_root}/${relative}" ]] || wire_generation_die \
+      "legacy profile artifact is missing: ${relative}"
+    [[ ! -L "${wire_generation_root}/${relative}" ]] || wire_generation_die \
+      "legacy profile artifact may not be a symlink: ${relative}"
+    actual="$("${wire_generation_sha256}" "${wire_generation_root}/${relative}" | awk '{print $1}')"
+    [[ "${actual}" == "${expected}" ]] || wire_generation_die \
+      "legacy profile artifact changed: ${relative}"
+  done <<EOF
+Profiles/permissioned-data-0016-2026-07-03.json ${wire_generation_legacy_profile_sha256}
+Profiles/permissioned-data-0016-2026-07-03.lexicons.sha256 ${wire_generation_legacy_lexicons_sha256}
+Profiles/permissioned-data-0016-2026-07-03.generated-wire.sha256 ${wire_generation_legacy_generated_sha256}
+EOF
+}
+
 wire_generation_verify_checked_in_manifest() {
-  local output_root="${1:-${wire_generation_root}}" manifest
-  manifest="${wire_generation_root}/Profiles/permissioned-data-0016-2026-07-03.generated-wire.sha256"
+  local output_root="${1:-${wire_generation_root}}" manifest manifest_hash
+  wire_generation_verify_legacy_profile_immutable
+  manifest="${wire_generation_root}/Profiles/permissioned-data-0016-2026-07-30.generated-wire.sha256"
+  manifest_hash="$("${wire_generation_sha256}" "${manifest}" | awk '{print $1}')"
+  [[ "$(wire_generation_profile_value generatedWireManifestSHA256)" == "${manifest_hash}" ]] || \
+    wire_generation_die "successor generated-wire manifest pin mismatch"
   wire_generation_assert_exact_generated_file_set "${output_root}" "${manifest}"
   (
     cd "${output_root}"
@@ -104,7 +150,8 @@ wire_generation_require_pinned_generator() {
     "Petrel generator entrypoint is missing under ${requested_root}"
 
   # The isolated workspace intentionally has an empty @ child whose parent is
-  # d011ccf0. Reject any source edits or a different parent before generation.
+  # the successor profile's pinned generator. Reject source edits or a
+  # different parent before generation.
   parent_commit="$(jj -R "${requested_root}" log -r '@-' --no-graph -T 'commit_id' | tr -d '\n')"
   [[ "${parent_commit}" == "${wire_generation_expected_petrel_generator_commit}" ]] || wire_generation_die \
     "Petrel generator parent ${parent_commit:-<none>} does not match pinned ${wire_generation_expected_petrel_generator_commit}"

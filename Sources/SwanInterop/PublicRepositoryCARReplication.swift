@@ -253,7 +253,7 @@ public struct PublicRepositoryCARImportArtifact: Codable, Sendable, Equatable {
         self.recordCount = recordCount
         self.promotedBlobCount = promotedBlobCount
         self.status = status
-        self.errorCode = errorCode.map { FixtureSanitizer.sanitize(["error": $0])["error"] ?? "<redacted>" }
+        self.errorCode = errorCode.map(FixtureSanitizer.errorCode)
     }
 }
 

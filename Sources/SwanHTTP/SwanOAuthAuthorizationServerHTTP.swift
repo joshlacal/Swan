@@ -118,15 +118,17 @@ private struct OAuthServerTokenSuccess: Encodable {
 func registerOAuthAuthorizationServerEndpoints(
   on router: Router<BasicRequestContext>,
   configuration: SwanOAuthAuthorizationServerConfiguration,
-  runtime: SwanOAuthRuntime
+  runtime: SwanOAuthRuntime,
+  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
 ) {
   router.get("/oauth/authorize") { request, _ async -> Response in
     await beginOAuthServerAuthorization(
       request: request, configuration: configuration, runtime: runtime)
   }
-  router.post("/oauth/authorize") { request, _ async -> Response in
+  router.post("/oauth/authorize") { request, context async -> Response in
     await loginOAuthServerAuthorization(
-      request: request, configuration: configuration, runtime: runtime)
+      request: request, context: context, configuration: configuration, runtime: runtime,
+      loginClientIdentityPolicy: loginClientIdentityPolicy)
   }
   router.post("/oauth/authorize/consent") { request, _ async -> Response in
     await consentOAuthServerAuthorization(
@@ -274,8 +276,10 @@ private func beginOAuthServerAuthorization(
 
 private func loginOAuthServerAuthorization(
   request: Request,
+  context: SwanHTTPRequestContext,
   configuration: SwanOAuthAuthorizationServerConfiguration,
-  runtime: SwanOAuthRuntime
+  runtime: SwanOAuthRuntime,
+  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
 ) async -> Response {
   do {
     let form = try await parseOAuthServerLoginForm(request)
@@ -288,22 +292,51 @@ private func loginOAuthServerAuthorization(
     else {
       return oauthServerAuthorizationError(.badRequest)
     }
-    guard
-      let authenticated = await configuration.accounts.authenticate(
-        handle: form.handle, password: form.password)
-    else {
+    let clientIPAddress = try loginClientIdentityPolicy.clientIPAddress(
+      directPeer: context.remoteAddress?.ipAddress,
+      headers: request.headers
+    )
+    switch try await configuration.accounts.admitLogin(
+      handle: form.handle,
+      directPeer: clientIPAddress
+    ) {
+    case .rateLimited:
+      return oauthServerAuthorizationError(.tooManyRequests)
+    case .allowed:
+      break
+    }
+    let authenticated: AccountAuthenticationSuccess
+    switch try await configuration.accounts.authenticateForLogin(
+      handle: form.handle,
+      password: form.password
+    ) {
+    case .rejected:
       return oauthServerAuthorizationError(.unauthorized)
+    case let .authenticated(success):
+      authenticated = success
     }
     let issued = try runtime.browserSessionService.issue(
       requestURI: session.requestURI,
       subject: authenticated.account.did,
+      subjectUpdatedAt: authenticated.account.updatedAt,
       lifetime: session.expiresAt.timeIntervalSinceNow
     )
     return oauthServerHTML(
       .ok,
-      oauthServerConsentPage(csrf: issued.session.csrfToken, subject: authenticated.account.did),
+      oauthServerConsentPage(
+        csrf: issued.session.csrfToken,
+        subject: authenticated.account.did,
+        clientID: pushed.binding.clientID,
+        scopes: pushed.binding.scopes
+      ),
       setCookie: oauthServerCookie(issued.value)
     )
+  } catch is AccountLoginAdmissionError {
+    return oauthServerAuthorizationError(.serviceUnavailable)
+  } catch is AccountLoginAuthenticationError {
+    return oauthServerAuthorizationError(.serviceUnavailable)
+  } catch is SwanLoginClientIdentityError {
+    return oauthServerAuthorizationError(.serviceUnavailable)
   } catch {
     return oauthServerAuthorizationError(.badRequest)
   }
@@ -319,9 +352,13 @@ private func consentOAuthServerAuthorization(
     let form = try await parseOAuthServerConsentForm(request)
     let session = try oauthServerBrowserSession(request, runtime: runtime)
     guard let subject = session.subject,
+      let subjectRevision = session.subjectRevisionMicroseconds,
       form.csrf == session.csrfToken,
       let account = try await configuration.accounts.account(did: subject),
       account.status.authorizesAccount,
+      OAuthBrowserSessionService.subjectRevisionMicroseconds(
+        for: account.updatedAt
+      ) == subjectRevision,
       let pushed = try await runtime.tokenService.activePushedAuthorizationRequest(
         session.requestURI),
       pushed.binding.issuer == configuration.issuer.absoluteString
@@ -338,7 +375,8 @@ private func consentOAuthServerAuthorization(
       let code = try await runtime.tokenService.issueAuthorizationCode(
         subject: account.did,
         binding: consumed.binding,
-        codeChallengeS256: consumed.codeChallengeS256
+        codeChallengeS256: consumed.codeChallengeS256,
+        activeSubjectRevisionMicroseconds: subjectRevision
       )
       destination = try oauthServerAuthorizationRedirect(
         base: consumed.binding.redirectURI,
@@ -917,8 +955,16 @@ private func oauthServerLoginPage(csrf: String) -> String {
   "<!doctype html><html><head><meta charset=\"utf-8\"><title>Swan sign in</title></head><body><main><h1>Sign in to Swan</h1><form method=\"post\" action=\"/oauth/authorize\"><input type=\"hidden\" name=\"csrf\" value=\"\(csrf)\"><label>Handle <input name=\"handle\" autocomplete=\"username\" required></label><label>Password <input name=\"password\" type=\"password\" autocomplete=\"current-password\" required></label><button type=\"submit\">Continue</button></form></main></body></html>"
 }
 
-private func oauthServerConsentPage(csrf: String, subject: String) -> String {
-  "<!doctype html><html><head><meta charset=\"utf-8\"><title>Authorize Swan client</title></head><body><main><h1>Authorize client</h1><p>Signed in as \(oauthServerEscape(subject)).</p><form method=\"post\" action=\"/oauth/authorize/consent\"><input type=\"hidden\" name=\"csrf\" value=\"\(csrf)\"><button name=\"decision\" value=\"approve\" type=\"submit\">Approve</button><button name=\"decision\" value=\"deny\" type=\"submit\">Deny</button></form></main></body></html>"
+private func oauthServerConsentPage(
+  csrf: String,
+  subject: String,
+  clientID: String,
+  scopes: Set<String>
+) -> String {
+  let scopeItems = scopes.sorted().map {
+    "<li><code>\(oauthServerEscape($0))</code></li>"
+  }.joined()
+  return "<!doctype html><html><head><meta charset=\"utf-8\"><title>Authorize Swan client</title></head><body><main><h1>Authorize client</h1><p>Signed in as \(oauthServerEscape(subject)).</p><p>Client: <code>\(oauthServerEscape(clientID))</code></p><p>Requested access:</p><ul>\(scopeItems)</ul><form method=\"post\" action=\"/oauth/authorize/consent\"><input type=\"hidden\" name=\"csrf\" value=\"\(oauthServerEscape(csrf))\"><button name=\"decision\" value=\"approve\" type=\"submit\">Approve</button><button name=\"decision\" value=\"deny\" type=\"submit\">Deny</button></form></main></body></html>"
 }
 
 private func oauthServerEscape(_ value: String) -> String {
@@ -930,14 +976,15 @@ private func oauthServerEscape(_ value: String) -> String {
 private func oauthServerHTML(
   _ status: HTTPResponse.Status, _ body: String, setCookie: String? = nil
 ) -> Response {
-  var headers: HTTPFields = [.contentType: "text/html; charset=utf-8", .cacheControl: "no-store"]
+  var headers = oauthServerBrowserHeaders(contentType: "text/html; charset=utf-8")
   if let setCookie { headers[HTTPField.Name("Set-Cookie")!] = setCookie }
   return Response(
     status: status, headers: headers, body: .init(byteBuffer: ByteBuffer(string: body)))
 }
 
 private func oauthServerRedirect(_ destination: URL, clearCookie: Bool) -> Response {
-  var headers: HTTPFields = [.location: destination.absoluteString, .cacheControl: "no-store"]
+  var headers = oauthServerBrowserHeaders()
+  headers[.location] = destination.absoluteString
   if clearCookie { headers[HTTPField.Name("Set-Cookie")!] = oauthServerExpiredCookie() }
   return Response(status: .found, headers: headers)
 }
@@ -945,11 +992,22 @@ private func oauthServerRedirect(_ destination: URL, clearCookie: Bool) -> Respo
 private func oauthServerAuthorizationError(_ status: HTTPResponse.Status, clearCookie: Bool = false)
   -> Response
 {
-  var headers: HTTPFields = [.contentType: "text/plain; charset=utf-8", .cacheControl: "no-store"]
+  var headers = oauthServerBrowserHeaders(contentType: "text/plain; charset=utf-8")
   if clearCookie { headers[HTTPField.Name("Set-Cookie")!] = oauthServerExpiredCookie() }
   return Response(
     status: status, headers: headers,
     body: .init(byteBuffer: ByteBuffer(string: "authorization request rejected")))
+}
+
+private func oauthServerBrowserHeaders(contentType: String? = nil) -> HTTPFields {
+  var headers: HTTPFields = [.cacheControl: "no-store"]
+  if let contentType { headers[.contentType] = contentType }
+  headers[HTTPField.Name("Content-Security-Policy")!] =
+    "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+  headers[HTTPField.Name("X-Frame-Options")!] = "DENY"
+  headers[HTTPField.Name("Referrer-Policy")!] = "no-referrer"
+  headers[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"
+  return headers
 }
 
 private func oauthServerNonceChallenge(runtime: SwanOAuthRuntime) -> Response {

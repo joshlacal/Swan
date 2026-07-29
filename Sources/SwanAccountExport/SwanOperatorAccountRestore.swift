@@ -15,6 +15,9 @@ import SwanStorage
 /// persistence details are deliberately indistinguishable.
 public enum SwanOperatorAccountRestoreError: Error, Sendable, Equatable {
     case failed
+    /// The backup authenticated, but its encrypted payload predates mandatory
+    /// PLC credential-key continuity preservation.
+    case unsupportedVersion
 }
 
 /// Opaque active KEK for newly written account-key envelopes. It is never
@@ -49,9 +52,10 @@ public struct SwanOperatorAccountRestoreResult: Codable, Sendable, Equatable {
     public let targetDataDirectory: String
 }
 
-/// Restores exactly one verified V1 operator backup into an absent Swan data
-/// root. Permissioned repository payloads are preserved but remain
-/// HTTP-closed because V1 carries no authenticated authority policy.
+/// Restores exactly one verified outer-V1/inner-V2 operator backup into an
+/// absent Swan data root. Permissioned repository payloads are preserved but
+/// remain HTTP-closed because this format carries no authenticated authority
+/// policy.
 public struct SwanOperatorAccountRestorer: Sendable {
     private let afterStagingBeforeInstall: (@Sendable () throws -> Void)?
     private let afterStagingPathValidatedBeforeStorageOpen: (@Sendable () throws -> Void)?
@@ -98,6 +102,8 @@ public struct SwanOperatorAccountRestorer: Sendable {
                 accountKEKID: accountKEKID,
                 to: targetDataDirectory
             )
+        } catch is SwanOperatorAccountBackupCompatibilityError {
+            throw SwanOperatorAccountRestoreError.unsupportedVersion
         } catch {
             throw SwanOperatorAccountRestoreError.failed
         }
@@ -202,6 +208,41 @@ public struct SwanOperatorAccountRestorer: Sendable {
                     signingPublicKey: signingPrivateKey.publicKey,
                     installedAt: artifacts.createdAt
                 )
+                let initialJournal = try PLCAccountPreparationJournal(
+                    requestID: artifacts.preparationJournal.requestID,
+                    canonicalHandle: artifacts.preparationJournal.canonicalHandle,
+                    pdsOrigin: artifacts.preparationJournal.pdsOrigin,
+                    repositoryRevision: artifacts.preparationJournal.repositoryRevision,
+                    operation: artifacts.preparationJournal.operation,
+                    signingKey: artifacts.preparationJournal.signingKey,
+                    rotationKey: artifacts.preparationJournal.rotationKey,
+                    publicGenesisCommitCID: nil,
+                    stage: .keysStored
+                )
+                _ = try await database.installPLCAccountPreparationJournal(
+                    initialJournal
+                )
+                _ = try await database.advancePLCAccountPreparationJournal(
+                    requestID: initialJournal.requestID,
+                    expectedStage: .keysStored,
+                    to: .repositoryInstalled,
+                    publicGenesisCommitCID: artifacts.publicGenesis.commitCID.string
+                )
+                _ = try await database.advancePLCAccountPreparationJournal(
+                    requestID: initialJournal.requestID,
+                    expectedStage: .repositoryInstalled,
+                    to: .submissionPending,
+                    publicGenesisCommitCID: nil
+                )
+                _ = try await database.advancePLCAccountPreparationJournal(
+                    requestID: initialJournal.requestID,
+                    expectedStage: .submissionPending,
+                    to: .submitted,
+                    publicGenesisCommitCID: nil
+                )
+                _ = try await database.installPublicPLCOperation(
+                    artifacts.plcHistoryEntry
+                )
                 try await database.restorePortableRepositories(artifacts.repositories)
                 for blob in artifacts.blobs {
                     _ = try await database.restorePortableBlob(
@@ -233,24 +274,39 @@ public struct SwanOperatorAccountRestorer: Sendable {
                 )
             )
             do {
-                let account = try await control.createAccount(
-                    AccountControlRegistration(
-                        did: payload.secrets.did,
-                        canonicalHandle: payload.secrets.canonicalHandle,
-                        passwordVerifier: payload.secrets.passwordVerifier,
-                        signingKey: payload.secrets.signingKeyReference,
-                        rotationKey: payload.secrets.rotationKeyReference,
-                        publicGenesisCommitCID:
-                            payload.secrets.publicGenesisCommitCID,
-                        createdAt: artifacts.createdAt
-                    )
-                )
+                let account =
+                    try await control
+                        .restoreOperatorAccountAndPLCCredentialKeyContinuity(
+                            AccountControlRegistration(
+                                did: payload.secrets.did,
+                                canonicalHandle:
+                                    payload.secrets.canonicalHandle,
+                                passwordVerifier:
+                                    payload.secrets.passwordVerifier,
+                                signingKey:
+                                    payload.secrets.signingKeyReference,
+                                rotationKey:
+                                    payload.secrets.rotationKeyReference,
+                                publicGenesisCommitCID:
+                                    payload.secrets.publicGenesisCommitCID,
+                                createdAt: artifacts.createdAt
+                            ),
+                            checkpoints:
+                                payload.secrets.plcCredentialKeyContinuity
+                                    .checkpoints,
+                            plcAccountPreparationIntent:
+                                artifacts.preparationIntent
+                        )
                 guard account.status == .active,
                       try await control.activeAccountDIDs() == [payload.secrets.did] else {
                     throw SwanOperatorAccountRestoreError.failed
                 }
                 try await control.validateOperatorRestoreOnlyAccount(
-                    did: payload.secrets.did
+                    did: payload.secrets.did,
+                    plcCredentialKeyContinuity:
+                        payload.secrets.plcCredentialKeyContinuity.checkpoints,
+                    plcAccountPreparationIntent:
+                        artifacts.preparationIntent
                 )
                 try await control.close()
             } catch {
@@ -336,6 +392,9 @@ public struct SwanOperatorAccountRestorer: Sendable {
         let repositories: [SQLitePortableRestoreRepository]
         let blobs: [RestoredBlob]
         let createdAt: Date
+        let preparationJournal: PLCAccountPreparationJournal
+        let preparationIntent: PLCAccountPreparationIntent
+        let plcHistoryEntry: PublicPLCOperationHistoryEntry
     }
 
     private func readAndReverifyArtifacts(
@@ -357,6 +416,54 @@ public struct SwanOperatorAccountRestorer: Sendable {
               publicGenesis.commitCID.string
                 == payload.verification.publicGenesisCommitCID else {
             throw SwanOperatorAccountRestoreError.failed
+        }
+        guard let historyEntry = manifest.files.first(where: {
+            $0.type == .plcHistory && $0.path == "plc/history.json"
+        }) else {
+            throw SwanOperatorAccountRestoreError.failed
+        }
+        let plcHistory = try read(entry: historyEntry, root: portableRoot)
+        let identity = try readPLCIdentity(
+            plcHistory,
+            expectedDID: manifest.did,
+            expectedHandle: manifest.canonicalHandle,
+            expectedRepositoryRevision: publicGenesis.revision,
+            expectedPublicGenesisCID: publicGenesis.commitCID.string,
+            signingPublicKey: payload.portable.signingPublicKey,
+            rotationPublicKey: try P256.Signing.PrivateKey(
+                rawRepresentation: payload.secrets.rotationPrivateScalar
+            ).publicKey
+        )
+        let requestID = "operator-restore-" + identity.operationCID
+        let preparationIntent: PLCAccountPreparationIntent
+        do {
+            preparationIntent = try PLCAccountPreparationIntent(
+                requestID: requestID,
+                did: manifest.did,
+                canonicalHandle: manifest.canonicalHandle,
+                pdsOrigin: identity.pdsOrigin,
+                repositoryRevision: publicGenesis.revision,
+                operationCID: identity.operationCID,
+                stage: .submitted
+            )
+        } catch {
+            throw error
+        }
+        let preparationJournal: PLCAccountPreparationJournal
+        do {
+            preparationJournal = try PLCAccountPreparationJournal(
+                requestID: requestID,
+                canonicalHandle: manifest.canonicalHandle,
+                pdsOrigin: identity.pdsOrigin,
+                repositoryRevision: publicGenesis.revision,
+                operation: identity.operationFacts,
+                signingKey: payload.secrets.signingKeyReference,
+                rotationKey: payload.secrets.rotationKeyReference,
+                publicGenesisCommitCID: publicGenesis.commitCID.string,
+                stage: .submitted
+            )
+        } catch {
+            throw error
         }
 
         var repositories: [SQLitePortableRestoreRepository] = []
@@ -422,7 +529,87 @@ public struct SwanOperatorAccountRestorer: Sendable {
             publicGenesis: publicGenesis,
             repositories: repositories,
             blobs: blobs,
-            createdAt: try canonicalDate(manifest.createdAt)
+            createdAt: try canonicalDate(manifest.createdAt),
+            preparationJournal: preparationJournal,
+            preparationIntent: preparationIntent,
+            plcHistoryEntry: identity.historyEntry
+        )
+    }
+
+    private struct PLCIdentity: Sendable {
+        let operationCID: String
+        let pdsOrigin: String
+        let operationFacts: PLCAccountPreparationOperationFacts
+        let historyEntry: PublicPLCOperationHistoryEntry
+    }
+
+    private func readPLCIdentity(
+        _ data: Data,
+        expectedDID: String,
+        expectedHandle: String,
+        expectedRepositoryRevision: String,
+        expectedPublicGenesisCID: String,
+        signingPublicKey: P256.Signing.PublicKey,
+        rotationPublicKey: P256.Signing.PublicKey
+    ) throws -> PLCIdentity {
+        let keys = Set([
+            "format", "scope", "did", "operationCID", "operation",
+            "canonicalHandle", "pdsOrigin", "repositoryRevision",
+            "publicGenesisCommitCID", "signingKeyBinding",
+        ])
+        guard let object = try JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              Set(object.keys) == keys,
+              object["format"] as? String == "swan-plc-history-v1",
+              object["scope"] as? String
+                == SwanPortableExportManifest.plcHistoryScopeValue,
+              object["signingKeyBinding"] as? String == "plc-atproto-current-v1",
+              object["did"] as? String == expectedDID,
+              object["canonicalHandle"] as? String == expectedHandle,
+              object["repositoryRevision"] as? String == expectedRepositoryRevision,
+              object["publicGenesisCommitCID"] as? String == expectedPublicGenesisCID,
+              let operationCID = object["operationCID"] as? String,
+              let pdsOrigin = object["pdsOrigin"] as? String,
+              let operationObject = object["operation"] else {
+            throw SwanOperatorAccountRestoreError.failed
+        }
+        let operationData = try JSONSerialization.data(
+            withJSONObject: operationObject,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        let operation = try PLCOperationCodec.decodeSignedJSON(operationData)
+        try PLCOperationCodec.verifyGenesis(operation, expectedDID: expectedDID)
+        guard let regular = operation.regular,
+              try operation.cid.string == operationCID,
+              regular.verificationMethods["atproto"]
+                == P256DIDKey(publicKey: signingPublicKey).value,
+              regular.rotationKeys == [
+                  P256DIDKey(publicKey: rotationPublicKey).value
+              ],
+              regular.alsoKnownAs == ["at://\(expectedHandle)"],
+              regular.services["atproto_pds"]?.endpoint == pdsOrigin,
+              let signingDIDKey = regular.verificationMethods["atproto"],
+              let rotationDIDKey = regular.rotationKeys.first else {
+            throw SwanOperatorAccountRestoreError.failed
+        }
+        let facts = try PLCAccountPreparationOperationFacts(
+            signingDIDKey: signingDIDKey,
+            rotationDIDKey: rotationDIDKey,
+            signature: regular.signature
+        )
+        let historyEntry = try PublicPLCOperationHistoryEntry(
+            cid: operationCID,
+            previousCID: nil,
+            canonicalJSON: operation.canonicalJSON,
+            createdAt: Date(timeIntervalSince1970: 0),
+            signingKeyGeneration: 1,
+            rotationKeyGeneration: 1
+        )
+        return PLCIdentity(
+            operationCID: operationCID,
+            pdsOrigin: pdsOrigin,
+            operationFacts: facts,
+            historyEntry: historyEntry
         )
     }
 
@@ -505,7 +692,10 @@ public struct SwanOperatorAccountRestorer: Sendable {
                 throw SwanOperatorAccountRestoreError.failed
             }
             try await control.validateOperatorRestoreOnlyAccount(
-                did: payload.secrets.did
+                did: payload.secrets.did,
+                plcCredentialKeyContinuity:
+                    payload.secrets.plcCredentialKeyContinuity.checkpoints,
+                plcAccountPreparationIntent: artifacts.preparationIntent
             )
             try await control.close()
         } catch {
@@ -553,6 +743,12 @@ public struct SwanOperatorAccountRestorer: Sendable {
                 signingPublicKey: signing.publicKey
             )
             guard genesis?.genesis == artifacts.publicGenesis else {
+                throw SwanOperatorAccountRestoreError.failed
+            }
+            guard try await database.plcAccountPreparationJournal()
+                    == artifacts.preparationJournal,
+                  try await database.publicPLCOperationHistory()
+                    == [artifacts.plcHistoryEntry] else {
                 throw SwanOperatorAccountRestoreError.failed
             }
             try await database.validatePortableRestore(

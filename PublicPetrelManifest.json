@@ -5,7 +5,11 @@
     "core_namespace_roots": []
   },
   "lexicons": {
-    "emit": ["PUBLIC_STAGED_LEXICONS/com/atproto/repo", "PUBLIC_STAGED_LEXICONS/com/atproto/sync"],
+    "emit": [
+      "PUBLIC_STAGED_LEXICONS/com/atproto/repo",
+      "PUBLIC_STAGED_LEXICONS/com/atproto/server",
+      "PUBLIC_STAGED_LEXICONS/com/atproto/sync"
+    ],
     "reference": ["PUBLIC_REFERENCE_LEXICONS"],
     "exclude_namespaces": ["tools.ozone"]
   },

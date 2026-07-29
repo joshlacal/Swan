@@ -516,6 +516,11 @@ private func cliTreeSnapshot(_ root: URL) throws -> [String: Data] {
 }
 
 private func cliExecutableURL() -> URL? {
+    if let override = ProcessInfo.processInfo.environment["SWAN_TEST_EXECUTABLE"],
+       !override.isEmpty,
+       FileManager.default.isExecutableFile(atPath: override) {
+        return URL(filePath: override)
+    }
     let packageRoot = URL(filePath: #filePath)
         .deletingLastPathComponent()
         .deletingLastPathComponent()

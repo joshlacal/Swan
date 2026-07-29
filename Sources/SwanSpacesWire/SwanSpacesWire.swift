@@ -26,7 +26,7 @@ public struct XRPCMethodDescriptor: Sendable, Codable, Equatable {
 }
 
 public enum PermissionedData0016 {
-    public static let profileID = "permissioned-data-0016-2026-07-03"
+    public static let profileID = "permissioned-data-0016-2026-07-30"
 
     /// Mechanically transcribed bootstrap registry from the profile's verified
     /// lexicon manifest. Petrel's opt-in server-contract generation replaces

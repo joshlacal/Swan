@@ -264,10 +264,14 @@ final class OAuthResourceAuthorizationTests: XCTestCase {
 
         let deleted = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: deleted.root) }
-        _ = try await deleted.control.transitionStatus(
+        _ = try await deleted.control.beginDeletion(
             did: Self.subject,
-            to: .deleted,
-            declaration: .init(tombstone: try AccountTombstoneMetadata(declaredAt: now, reason: "test")),
+            declaration: .init(
+                tombstone: try AccountTombstoneMetadata(
+                    declaredAt: now,
+                    reason: "test"
+                )
+            ),
             now: now
         )
         try await assertFailure(.denied, fixture: deleted, request: try validRequest(for: deleted, jti: "resource-deleted", now: now), now: now)

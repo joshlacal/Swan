@@ -33,10 +33,49 @@ public struct Input: ATProtocolCodable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.repo = try container.decode(ATIdentifier.self, forKey: .repo)
             self.collection = try container.decode(NSID.self, forKey: .collection)
-            self.rkey = try container.decodeIfPresent(RecordKey.self, forKey: .rkey)
-            self.validate = try container.decodeIfPresent(Bool.self, forKey: .validate)
+            if container.contains(.rkey) {
+                guard try !container.decodeNil(forKey: .rkey) else {
+                    throw DecodingError.valueNotFound(
+                        RecordKey.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'rkey' must not be null"
+                        )
+                    )
+                }
+                self.rkey = try container.decode(RecordKey.self, forKey: .rkey)
+            } else {
+                self.rkey = nil
+            }
+            if container.contains(.validate) {
+                guard try !container.decodeNil(forKey: .validate) else {
+                    throw DecodingError.valueNotFound(
+                        Bool.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'validate' must not be null"
+                        )
+                    )
+                }
+                self.validate = try container.decode(Bool.self, forKey: .validate)
+            } else {
+                self.validate = nil
+            }
             self.record = try container.decode(ATProtocolValueContainer.self, forKey: .record)
-            self.swapCommit = try container.decodeIfPresent(CID.self, forKey: .swapCommit)
+            if container.contains(.swapCommit) {
+                guard try !container.decodeNil(forKey: .swapCommit) else {
+                    throw DecodingError.valueNotFound(
+                        CID.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'swapCommit' must not be null"
+                        )
+                    )
+                }
+                self.swapCommit = try container.decode(CID.self, forKey: .swapCommit)
+            } else {
+                self.swapCommit = nil
+            }
         }
 
         public func encode(to encoder: Encoder) throws {

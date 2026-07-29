@@ -198,7 +198,7 @@ public enum InteropScenarioRunner {
         let activeModes: [FaultMode] = faultModes
         let modeLabels = activeModes.map(\.rawValue)
 
-        let targets = [
+        let targetInputs: [(label: String, baseURL: URL)] = [
             ("swan", runtime.swanBaseURL),
             ("reference-pds", runtime.referenceBaseURL),
         ]
@@ -211,7 +211,37 @@ public enum InteropScenarioRunner {
         let allowedConvergenceDivergences = Set(runtime.allowedConvergenceDivergences.map { $0.lowercased() })
 
         let executionModes = modeLabels.isEmpty ? ["normal"] : modeLabels
-        for (hostLabel, baseURL) in targets {
+        let validatedTargets = targetInputs.map { target in
+            (
+                label: target.label,
+                baseURL: target.baseURL,
+                originLabel: sanitizedOriginLabel(for: target.baseURL)
+            )
+        }
+        guard validatedTargets.allSatisfy({ $0.originLabel != nil }) else {
+            hostResults = validatedTargets.map { target in
+                ScenarioHostResult(
+                    host: target.label,
+                    baseURL: target.originLabel ?? "<invalid-origin>",
+                    endpointResults: []
+                )
+            }
+            return InteropScenarioFixtureArtifact(
+                scenario: normalizedScenario,
+                profileID: OfflineProtocolProfileVerifier.stableProfileID,
+                faultModes: executionModes,
+                convergence: [],
+                hostResults: hostResults,
+                status: "failed",
+                startedAt: startTime,
+                completedAt: Date(),
+                warnings: ["invalid_endpoint_origin"]
+            )
+        }
+
+        for target in validatedTargets {
+            let hostLabel = target.label
+            let baseURL = target.baseURL
             var endpointResults: [EndpointResult] = []
 
             for modeLabel in executionModes {
@@ -256,8 +286,8 @@ public enum InteropScenarioRunner {
 
             hostResults.append(
                 ScenarioHostResult(
-                host: hostLabel,
-                    baseURL: baseURL.absoluteString,
+                    host: hostLabel,
+                    baseURL: target.originLabel!,
                     endpointResults: endpointResults
                 )
             )
@@ -281,6 +311,37 @@ public enum InteropScenarioRunner {
             completedAt: Date(),
             warnings: warnings
         )
+    }
+
+    private static func sanitizedOriginLabel(for url: URL) -> String? {
+        let serialized = url.absoluteString
+        guard !serialized.isEmpty,
+              serialized.utf8.count <= 2_048,
+              serialized.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0)
+              }),
+              let components = URLComponents(
+                  url: url,
+                  resolvingAgainstBaseURL: false
+              ),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              let host = components.host,
+              !host.isEmpty,
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              !components.percentEncodedPath.lowercased().contains("%00"),
+              !components.path.contains("\\") else {
+            return nil
+        }
+
+        var origin = URLComponents()
+        origin.scheme = scheme
+        origin.host = host.lowercased()
+        origin.port = components.port
+        return origin.string
     }
 
     private static func isUnexpectedFailure(_ result: EndpointResult, for faultMode: FaultMode?) -> Bool {
@@ -465,8 +526,8 @@ public enum InteropScenarioRunner {
                         path: "/xrpc/\(descriptor.nsid)",
                         statusCode: 0,
                         requestSummary: sanitizeSummary(["host": targetLabel, "nsid": descriptor.nsid]),
-                        responseSummary: ["error": "invalid base URL"],
-                        expectedError: "invalid base URL"
+                        responseSummary: ["error": "InvalidResponse"],
+                        expectedError: "InvalidResponse"
                     )
                 )
                 continue
@@ -480,8 +541,8 @@ public enum InteropScenarioRunner {
                         path: "/xrpc/\(descriptor.nsid)",
                         statusCode: 0,
                         requestSummary: sanitizeSummary(["host": targetLabel, "nsid": descriptor.nsid]),
-                        responseSummary: ["error": "invalid endpoint"],
-                        expectedError: "invalid endpoint"
+                        responseSummary: ["error": "InvalidResponse"],
+                        expectedError: "InvalidResponse"
                     )
                 )
                 continue
@@ -537,6 +598,7 @@ public enum InteropScenarioRunner {
         for tuple in requestsToProbe {
             let firstAttempt = await probe(
                 request: tuple.request,
+                path: tuple.path,
                 mode: modeLabel,
                 session: session,
                 targetLabel: targetLabel,
@@ -548,6 +610,7 @@ public enum InteropScenarioRunner {
                 endpointResults.append(
                     await probe(
                         request: tuple.request,
+                        path: tuple.path,
                         mode: modeLabel,
                         session: session,
                         targetLabel: targetLabel,
@@ -559,6 +622,7 @@ public enum InteropScenarioRunner {
                 endpointResults.append(
                     await probe(
                         request: defaultCorrupt,
+                        path: tuple.path,
                         mode: modeLabel,
                         session: session,
                         targetLabel: targetLabel,
@@ -573,6 +637,7 @@ public enum InteropScenarioRunner {
 
     private static func probe(
         request: URLRequest,
+        path: String,
         mode: String,
         session: URLSession,
         targetLabel: String,
@@ -590,10 +655,16 @@ public enum InteropScenarioRunner {
                 return EndpointResult(
                     mode: mode,
                     method: request.httpMethod ?? "UNKNOWN",
-                    path: request.url?.path ?? "/",
+                    path: path,
                     statusCode: 0,
-                    requestSummary: sanitizeSummary(requestSummary(for: request, label: targetLabel)),
-                    responseSummary: sanitizeSummary(["error": "non-http response"])
+                    requestSummary: sanitizeSummary(
+                        requestSummary(
+                            for: request,
+                            path: path,
+                            label: targetLabel
+                        )
+                    ),
+                    responseSummary: sanitizeSummary(["error": "InvalidResponse"])
                 )
             }
             var summary = responseSummary(for: data, response: response)
@@ -601,19 +672,31 @@ public enum InteropScenarioRunner {
             return EndpointResult(
                 mode: mode,
                 method: request.httpMethod ?? "UNKNOWN",
-                path: request.url?.path ?? "/",
+                path: path,
                 statusCode: response.statusCode,
-                requestSummary: sanitizeSummary(requestSummary(for: request, label: targetLabel)),
+                requestSummary: sanitizeSummary(
+                    requestSummary(
+                        for: request,
+                        path: path,
+                        label: targetLabel
+                    )
+                ),
                 responseSummary: sanitizeSummary(summary)
             )
         } catch {
             return EndpointResult(
                 mode: mode,
                 method: request.httpMethod ?? "UNKNOWN",
-                path: request.url?.path ?? "/",
+                path: path,
                 statusCode: 0,
-                requestSummary: sanitizeSummary(requestSummary(for: request, label: targetLabel)),
-                responseSummary: sanitizeSummary(["error": String(error.localizedDescription.prefix(120))]),
+                requestSummary: sanitizeSummary(
+                    requestSummary(
+                        for: request,
+                        path: path,
+                        label: targetLabel
+                    )
+                ),
+                responseSummary: sanitizeSummary(["error": "TransportFailure"]),
                 expectedError: nil,
                 transportError: "network"
             )
@@ -632,17 +715,27 @@ public enum InteropScenarioRunner {
             method: request.httpMethod ?? "UNKNOWN",
             path: pathOverride,
             statusCode: 0,
-            requestSummary: sanitizeSummary(requestSummary(for: request, label: targetLabel)),
+            requestSummary: sanitizeSummary(
+                requestSummary(
+                    for: request,
+                    path: pathOverride,
+                    label: targetLabel
+                )
+            ),
             responseSummary: sanitizeSummary(["error": transportError]),
             expectedError: nil,
             transportError: "network"
         )
     }
 
-    private static func requestSummary(for request: URLRequest, label: String) -> [String: String] {
+    private static func requestSummary(
+        for request: URLRequest,
+        path: String,
+        label: String
+    ) -> [String: String] {
         var output: [String: String] = [
             "host": label,
-            "path": request.url?.path ?? "?",
+            "path": path,
             "method": request.httpMethod ?? "UNKNOWN",
         ]
         if let url = request.url,
@@ -683,7 +776,7 @@ public enum InteropScenarioRunner {
             if let error = payload["error"] as? String,
                error.count <= 64,
                error.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || $0 == "." }) {
-                output["error"] = error
+                output["error"] = sanitizedScenarioErrorCode(error)
             }
             for (index, key) in keys.prefix(3).enumerated() {
                 output["json-key-\(index)"] = forbiddenSummaryKey(key) ? "<redacted-key>" : key
@@ -696,6 +789,20 @@ public enum InteropScenarioRunner {
 
     private static func sanitizeSummary(_ summary: [String: String]) -> [String: String] {
         return FixtureSanitizer.sanitize(summary)
+    }
+
+    private static func sanitizedScenarioErrorCode(_ rawValue: String) -> String {
+        let sanitized = FixtureSanitizer.errorCode(rawValue)
+        if sanitized != "<redacted>" {
+            return sanitized
+        }
+        switch rawValue {
+        case "permissioned_data_pending",
+             "permissioned_endpoint_unavailable":
+            return rawValue
+        default:
+            return "<redacted>"
+        }
     }
 
     private static func forbiddenSummaryKey(_ key: String) -> Bool {

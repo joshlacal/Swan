@@ -64,8 +64,8 @@ public struct ProtocolProfileVerificationReport: Sendable, Equatable {
 /// an upstream checkout: profile drift must be visible before network-backed
 /// regeneration happens in CI.
 public enum OfflineProtocolProfileVerifier {
-    public static let stableProfileID = "permissioned-data-0016-2026-07-03"
-    public static let publicProfileID = "public-data-testing-2026-07-27"
+    public static let stableProfileID = "permissioned-data-0016-2026-07-30"
+    public static let publicProfileID = "public-data-testing-2026-07-30"
 
     private struct ProfileIdentity: Decodable {
         let id: String
@@ -82,6 +82,8 @@ public enum OfflineProtocolProfileVerifier {
         let permissionedDataIsEncrypted: Bool
         let oplogRetention: Int
         let referenceArchiveSHA256: String?
+        let petrelManifest: String?
+        let petrelManifestSHA256: String?
         let lexiconManifest: String?
         let lexiconManifestSHA256: String?
         let generatedWireManifest: String?
@@ -108,11 +110,15 @@ public enum OfflineProtocolProfileVerifier {
         let petrelGeneratorCommit: String
         let petrelCommit: String
         let referenceArchiveSHA256: String?
+        let petrelManifest: String?
+        let petrelManifestSHA256: String?
         let lexiconManifest: String?
         let lexiconManifestSHA256: String?
         let generatedWireManifest: String?
         let generatedWireManifestSHA256: String?
+        let inventorySemantics: String
         let intentionalDivergences: [Divergence]
+        let lexicons: [String]
         let endpoints: [String]
     }
 
@@ -126,13 +132,19 @@ public enum OfflineProtocolProfileVerifier {
     // well-formed commit or manifest digest and still report success.
     private static let expectedProposalCommit = "1caad93dbb1f445396f6abf3b97eb4040345e78e"
     private static let expectedReferenceImplementationCommit = "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354"
-    private static let expectedPetrelGeneratorCommit = "d011ccf0029457434e659ec48c8024baa7b5c4e4"
+    private static let expectedPetrelGeneratorCommit = "c2a1cdbee8c621c7682416114700f032cc7e2b37"
     private static let expectedPetrelCommit = "db84b2c9788aa38000ee3f134e21feffa8f351cd"
     private static let expectedReferenceArchiveSHA256 = "1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea"
+    private static let expectedProfileSHA256 = "937ed10ef7a40717746f752204eba1e30d7bfe12e4deda006ce9236b6e10f001"
+    private static let expectedPetrelManifestSHA256 = "ac3c8b006e0e771f6e3cb0b5cbe6e93a78101dc49ce95ea9b3e1ed734a97636f"
     private static let expectedLexiconManifestSHA256 = "9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f"
-    private static let expectedGeneratedWireManifestSHA256 = "c1d5697f351a4209c7f8a9faaf460d423f9f44f37845ae2c92e150e78c552609"
-    private static let expectedPublicLexiconManifestSHA256 = "bd94660a2c2c05fc23185059329194ff6c29635f74ce2efcf97351c1be98fe97"
-    private static let expectedPublicGeneratedWireManifestSHA256 = "c68177a315f6a3d6f01419f48be5e0beedf76d1e4ae21ebe5de52ac49ad80d3b"
+    private static let expectedGeneratedWireManifestSHA256 = "80f9f7b93127826d95d516a4a9d18b7ca245d82fc74f8fa484bbf3423d1f51db"
+    private static let expectedPublicProfileSHA256 = "7d1a3046825aec4cd83a03fd43c48f305738172fd9c462822e0833977f9c7cf8"
+    private static let expectedPublicPetrelManifestSHA256 = "cb39d0c4264d02540b67adbe668a1224753b507e35e11f19ba97879931804068"
+    private static let expectedPublicLexiconManifestSHA256 = "fa89a31b4ac6421ebcacdd6a66de77ff191497f19361d41141f538477638bd75"
+    private static let expectedPublicGeneratedWireManifestSHA256 = "4703b4096dbf5dbc83e19d30c15539f426b73ebaca57c26bf82b5774440f2898"
+    private static let expectedPublicInventorySemantics =
+        "lexicons is the exact ordered 20-file source set, including the repo and sync defs files; endpoints is the exact ordered 18-method XRPC contract set and excludes defs."
     private static let expectedEndpoints = [
         "com.atproto.space.applyWrites",
         "com.atproto.space.createRecord",
@@ -160,20 +172,31 @@ public enum OfflineProtocolProfileVerifier {
         "com.atproto.simplespace.removeMember",
         "com.atproto.simplespace.updateSpace",
     ]
-    private static let expectedPublicEndpoints = [
+    private static let expectedPublicLexicons = [
         "com.atproto.repo.applyWrites",
         "com.atproto.repo.createRecord",
+        "com.atproto.repo.defs",
         "com.atproto.repo.deleteRecord",
         "com.atproto.repo.describeRepo",
         "com.atproto.repo.getRecord",
         "com.atproto.repo.listRecords",
         "com.atproto.repo.putRecord",
         "com.atproto.repo.uploadBlob",
+        "com.atproto.server.confirmEmail",
+        "com.atproto.server.requestEmailConfirmation",
+        "com.atproto.server.requestEmailUpdate",
+        "com.atproto.server.requestPasswordReset",
+        "com.atproto.server.resetPassword",
+        "com.atproto.server.updateEmail",
+        "com.atproto.sync.defs",
         "com.atproto.sync.getBlob",
         "com.atproto.sync.getLatestCommit",
         "com.atproto.sync.getRepo",
         "com.atproto.sync.getRepoStatus",
     ]
+    private static let expectedPublicEndpoints = expectedPublicLexicons.filter {
+        !$0.hasSuffix(".defs")
+    }
 
     public static func verify(
         profileURL: URL,
@@ -216,7 +239,8 @@ public enum OfflineProtocolProfileVerifier {
     ) throws {
         let data = try Data(contentsOf: profileURL)
         let pins = try JSONDecoder().decode(PublicArtifactPins.self, from: data)
-        guard hasExpectedPublicPins(pins),
+        guard Hex.encode(SHA256.hash(data: data)) == expectedPublicProfileSHA256,
+              hasExpectedPublicPins(pins),
               let manifestName = pins.lexiconManifest,
               let manifestChecksum = pins.lexiconManifestSHA256 else {
             throw ProtocolProfileVerificationDiagnostic(.immutableProfilePinMismatch, artifact: "profile")
@@ -233,7 +257,10 @@ public enum OfflineProtocolProfileVerifier {
                   kind: .lexicon,
                   expectedSourcePrefix: "com/atproto/"
               ),
-              entries.count == 14 else {
+              entries.count == 20,
+              entries.map(\.path) == expectedPublicLexicons.map({
+                  $0.replacingOccurrences(of: ".", with: "/") + ".json"
+              }) else {
             throw ProtocolProfileVerificationDiagnostic(.malformedLexiconManifest, artifact: "lexicon manifest")
         }
         for entry in entries {
@@ -262,6 +289,7 @@ public enum OfflineProtocolProfileVerifier {
             "id", "proposalCommit", "referenceImplementationCommit", "petrelGeneratorCommit",
             "petrelCommit", "migrationCompatibility", "crypto",
             "permissionedDataIsEncrypted", "oplogRetention", "referenceArchiveSHA256",
+            "petrelManifest", "petrelManifestSHA256",
             "lexiconManifest", "lexiconManifestSHA256", "generatedWireManifest",
             "generatedWireManifestSHA256", "intentionalDivergences",
             "compatibilityExceptions", "endpoints",
@@ -290,13 +318,31 @@ public enum OfflineProtocolProfileVerifier {
         if pins.endpoints.isEmpty || Set(pins.endpoints).count != pins.endpoints.count {
             diagnostics.append(.init(.malformedProfile, artifact: "profile"))
         }
-        if !hasExpectedImmutablePins(pins) {
+        let profileBytesMatch =
+            Hex.encode(SHA256.hash(data: profileData)) == expectedProfileSHA256
+        if !profileBytesMatch || !hasExpectedImmutablePins(pins) {
             diagnostics.append(.init(.immutableProfilePinMismatch, artifact: "profile"))
         }
         do {
             _ = try ProtocolProfile(data: profileData)
         } catch {
             diagnostics.append(.init(.malformedProfile, artifact: "profile"))
+        }
+
+        let permissionedSourceRoot = sourceRoot ??
+            profileURL.deletingLastPathComponent().deletingLastPathComponent()
+        if let name = pins.petrelManifest,
+           let checksum = pins.petrelManifestSHA256,
+           name == "PetrelManifest.json",
+           isLowercaseHex(checksum, count: 64) {
+            let manifestURL = permissionedSourceRoot.appending(path: name)
+            if isSymbolicLink(manifestURL) ||
+                (try? Data(contentsOf: manifestURL, options: [.mappedIfSafe]))
+                    .map({ Hex.encode(SHA256.hash(data: $0)) }) != checksum {
+                diagnostics.append(.init(.immutableProfilePinMismatch, artifact: "Petrel manifest"))
+            }
+        } else {
+            diagnostics.append(.init(.immutableProfilePinMismatch, artifact: "Petrel manifest"))
         }
 
         let expectedLexiconManifest = "\(stableProfileID).lexicons.sha256"
@@ -318,9 +364,7 @@ public enum OfflineProtocolProfileVerifier {
             checksum: pins.generatedWireManifestSHA256,
             expectedName: expectedWireManifest,
             profileDirectory: profileURL.deletingLastPathComponent(),
-            sourceRoot: sourceRoot ?? profileURL
-                .deletingLastPathComponent()
-                .deletingLastPathComponent(),
+            sourceRoot: permissionedSourceRoot,
             kind: .generatedWire,
             expectedSourcePrefix: "Sources/SwanSpacesWire/",
             generatedTargetRoot: "Sources/SwanSpacesWire",
@@ -344,15 +388,18 @@ public enum OfflineProtocolProfileVerifier {
         }
         let expectedKeys: Set<String> = [
             "id", "referenceImplementationCommit", "petrelGeneratorCommit", "petrelCommit",
-            "referenceArchiveSHA256", "lexiconManifest", "lexiconManifestSHA256",
+            "referenceArchiveSHA256", "petrelManifest", "petrelManifestSHA256",
+            "lexiconManifest", "lexiconManifestSHA256",
             "generatedWireManifest", "generatedWireManifestSHA256",
-            "intentionalDivergences", "endpoints",
+            "inventorySemantics", "intentionalDivergences", "lexicons", "endpoints",
         ]
         let actualKeys = ((try? JSONSerialization.jsonObject(with: profileData)) as? [String: Any])
             .map { Set($0.keys) }
         if actualKeys != expectedKeys {
             diagnostics.append(.init(.malformedProfile, artifact: "profile"))
         }
+        let profileBytesMatch =
+            Hex.encode(SHA256.hash(data: profileData)) == expectedPublicProfileSHA256
         if ![
             pins.referenceImplementationCommit,
             pins.petrelGeneratorCommit,
@@ -363,8 +410,30 @@ public enum OfflineProtocolProfileVerifier {
         if pins.referenceArchiveSHA256.map({ !isLowercaseHex($0, count: 64) }) ?? true {
             diagnostics.append(.init(.invalidChecksumPin, artifact: "reference archive"))
         }
-        if !hasExpectedPublicPins(pins) {
+        if pins.lexicons.count != 20 ||
+            Set(pins.lexicons).count != 20 ||
+            pins.endpoints.count != 18 ||
+            Set(pins.endpoints).count != 18 ||
+            pins.endpoints.contains(where: { $0.hasSuffix(".defs") }) {
+            diagnostics.append(.init(.malformedProfile, artifact: "profile"))
+        }
+        if !profileBytesMatch || !hasExpectedPublicPins(pins) {
             diagnostics.append(.init(.immutableProfilePinMismatch, artifact: "profile"))
+        }
+        let publicSourceRoot = sourceRoot ??
+            profileURL.deletingLastPathComponent().deletingLastPathComponent()
+        if let name = pins.petrelManifest,
+           let checksum = pins.petrelManifestSHA256,
+           name == "PublicPetrelManifest.json",
+           isLowercaseHex(checksum, count: 64) {
+            let manifestURL = publicSourceRoot.appending(path: name)
+            if isSymbolicLink(manifestURL) ||
+                (try? Data(contentsOf: manifestURL, options: [.mappedIfSafe]))
+                    .map({ Hex.encode(SHA256.hash(data: $0)) }) != checksum {
+                diagnostics.append(.init(.immutableProfilePinMismatch, artifact: "Petrel manifest"))
+            }
+        } else {
+            diagnostics.append(.init(.immutableProfilePinMismatch, artifact: "Petrel manifest"))
         }
         verifyManifest(
             name: pins.lexiconManifest,
@@ -382,7 +451,7 @@ public enum OfflineProtocolProfileVerifier {
             checksum: pins.generatedWireManifestSHA256,
             expectedName: "\(publicProfileID).generated-wire.sha256",
             profileDirectory: profileURL.deletingLastPathComponent(),
-            sourceRoot: sourceRoot ?? profileURL.deletingLastPathComponent().deletingLastPathComponent(),
+            sourceRoot: publicSourceRoot,
             kind: .generatedWire,
             expectedSourcePrefix: "Sources/SwanPublicWire/",
             generatedTargetRoot: "Sources/SwanPublicWire",
@@ -597,6 +666,8 @@ public enum OfflineProtocolProfileVerifier {
             pins.permissionedDataIsEncrypted == false &&
             pins.oplogRetention == 10_000 &&
             pins.referenceArchiveSHA256 == expectedReferenceArchiveSHA256 &&
+            pins.petrelManifest == "PetrelManifest.json" &&
+            pins.petrelManifestSHA256 == expectedPetrelManifestSHA256 &&
             pins.lexiconManifest == "\(stableProfileID).lexicons.sha256" &&
             pins.lexiconManifestSHA256 == expectedLexiconManifestSHA256 &&
             pins.generatedWireManifest == "\(stableProfileID).generated-wire.sha256" &&
@@ -610,10 +681,14 @@ public enum OfflineProtocolProfileVerifier {
             pins.petrelGeneratorCommit == expectedPetrelGeneratorCommit &&
             pins.petrelCommit == expectedPetrelCommit &&
             pins.referenceArchiveSHA256 == expectedReferenceArchiveSHA256 &&
+            pins.petrelManifest == "PublicPetrelManifest.json" &&
+            pins.petrelManifestSHA256 == expectedPublicPetrelManifestSHA256 &&
             pins.lexiconManifest == "\(publicProfileID).lexicons.sha256" &&
             pins.lexiconManifestSHA256 == expectedPublicLexiconManifestSHA256 &&
             pins.generatedWireManifest == "\(publicProfileID).generated-wire.sha256" &&
             pins.generatedWireManifestSHA256 == expectedPublicGeneratedWireManifestSHA256 &&
+            pins.inventorySemantics == expectedPublicInventorySemantics &&
+            pins.lexicons == expectedPublicLexicons &&
             pins.endpoints == expectedPublicEndpoints &&
             pins.intentionalDivergences.count == 1 &&
             pins.intentionalDivergences.first?.endpoint == "com.atproto.sync.getRepo" &&
@@ -751,6 +826,51 @@ public struct SanitizedFixture: Codable, Sendable, Equatable {
     public let responseSummary: [String: String]
     public let commitmentHex: String?
     public let expectedError: String?
+
+    public init(
+        scenario: String,
+        requestSummary: [String: String],
+        responseSummary: [String: String],
+        commitmentHex: String?,
+        expectedError: String?
+    ) {
+        self.scenario = FixtureSanitizer.safeIdentifier(scenario)
+        self.requestSummary = FixtureSanitizer.sanitize(requestSummary)
+        self.responseSummary = FixtureSanitizer.sanitize(responseSummary)
+        self.commitmentHex = FixtureSanitizer.canonicalSHA256Hex(commitmentHex)
+        self.expectedError = expectedError.map(FixtureSanitizer.errorCode)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case scenario
+        case requestSummary
+        case responseSummary
+        case commitmentHex
+        case expectedError
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            scenario: try container.decode(String.self, forKey: .scenario),
+            requestSummary: try container.decode(
+                [String: String].self,
+                forKey: .requestSummary
+            ),
+            responseSummary: try container.decode(
+                [String: String].self,
+                forKey: .responseSummary
+            ),
+            commitmentHex: try container.decodeIfPresent(
+                String.self,
+                forKey: .commitmentHex
+            ),
+            expectedError: try container.decodeIfPresent(
+                String.self,
+                forKey: .expectedError
+            )
+        )
+    }
 }
 
 public enum FixtureSanitizer {
@@ -763,10 +883,65 @@ public enum FixtureSanitizer {
         "ikm", "bearer", "token", "atproto-token", "secret", "proof", "jti",
     ]
 
+    private static let permittedErrorCodes: Set<String> = [
+        "AuthMissing",
+        "CommitMissing",
+        "CommitmentMismatch",
+        "ContentBindingMismatch",
+        "ContextSignatureMismatch",
+        "FileFailure",
+        "InteropFailure",
+        "InvalidBlobResponse",
+        "InvalidCommit",
+        "InvalidOperation",
+        "InvalidRequest",
+        "InvalidResponse",
+        "MissingCommitKey",
+        "MissingCredential",
+        "MissingJwt",
+        "OperationMismatch",
+        "RepoDeactivated",
+        "RepoSuspended",
+        "RepoTakendown",
+        "ResponseTooLarge",
+        "SpaceNotFound",
+        "TransportFailure",
+        "Unauthorized",
+        "UnexpectedContentType",
+        "UnexpectedRedirect",
+        "ValueCIDMismatch",
+        "ValueMissing",
+        "temporarily_unavailable",
+        "use_dpop_nonce",
+    ]
+
     public static func sanitize(_ fields: [String: String]) -> [String: String] {
         var output: [String: String] = [:]
         for (key, value) in fields {
             let normalizedKey = key.lowercased()
+
+            // A response's object-member names and raw header values are
+            // peer-controlled. Persist the already-recorded JSON member count
+            // and bounded categories, never their opaque spellings.
+            if normalizedKey.hasPrefix("json-key-") {
+                continue
+            }
+            if normalizedKey == "content-type"
+                || normalizedKey == "request-content-type" {
+                output[key] = contentTypeCategory(value)
+                continue
+            }
+            if normalizedKey == "cache-control" {
+                output[key] = cacheControlCategory(value)
+                continue
+            }
+            if normalizedKey == "scenario"
+                || normalizedKey == "host"
+                || normalizedKey == "assertion" {
+                output[key] = safeIdentifier(value)
+                continue
+            }
+
             let isKeySensitive = forbiddenKeys.contains(normalizedKey)
                 || forbiddenFragments.contains(where: { normalizedKey.contains($0) })
                 || shouldRedactValue(value)
@@ -785,9 +960,123 @@ public enum FixtureSanitizer {
         return output
     }
 
+    /// Accepts only the representation emitted by Swan's SHA-256 encoder.
+    /// Uppercase, truncated, overlong, or non-hex peer values do not become
+    /// fixture evidence.
+    public static func canonicalSHA256Hex(_ value: String?) -> String? {
+        guard let value,
+              value.utf8.count == 64,
+              value.utf8.allSatisfy({
+                  (0x30 ... 0x39).contains($0) || (0x61 ... 0x66).contains($0)
+              }) else {
+            return nil
+        }
+        return value
+    }
+
+    /// Operator-selected labels are identifiers, not free-form fixture text.
+    /// The fixed grammar also prevents paths, URLs, or line-oriented data from
+    /// being smuggled into an artifact through a label field.
+    public static func safeIdentifier(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (1 ... 64).contains(trimmed.utf8.count),
+              trimmed.unicodeScalars.allSatisfy({
+                  $0.value <= 0x7f
+                      && (CharacterSet.alphanumerics.contains($0)
+                          || CharacterSet(charactersIn: "._-").contains($0))
+              }),
+              !shouldRedactValue(trimmed),
+              !containsBearerLikeOrJWT(trimmed) else {
+            return "<redacted>"
+        }
+        return trimmed
+    }
+
+    public static func artifactStatus(_ value: String) -> String {
+        switch value {
+        case "passed", "failed", "planned-not-executed":
+            return value
+        default:
+            return "failed"
+        }
+    }
+
+    public static func httpMethod(_ value: String) -> String {
+        switch value.uppercased() {
+        case "GET", "POST", "PUT", "DELETE", "PATCH":
+            return value.uppercased()
+        default:
+            return "<redacted>"
+        }
+    }
+
+    /// Remote error bodies are not evidence-bearing free text. Preserve only
+    /// protocol codes that Swan understands, so an upstream host cannot
+    /// reflect an opaque bearer value into a persisted fixture.
+    public static func errorCode(_ value: String) -> String {
+        if permittedErrorCodes.contains(value) {
+            return value
+        }
+        if value.count == 7,
+           value.hasPrefix("HTTP"),
+           let status = Int(value.dropFirst(4)),
+           (400 ... 599).contains(status) {
+            return value
+        }
+        return "<redacted>"
+    }
+
+    private static func contentTypeCategory(_ value: String) -> String {
+        let mediaType = value
+            .split(separator: ";", maxSplits: 1)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        switch mediaType {
+        case "application/json":
+            return "json"
+        case "application/vnd.ipld.car":
+            return "car"
+        case "application/octet-stream":
+            return "binary"
+        case "application/x-www-form-urlencoded":
+            return "form"
+        case "text/html":
+            return "html"
+        default:
+            return mediaType.hasSuffix("+json") ? "json" : "other"
+        }
+    }
+
+    private static func cacheControlCategory(_ value: String) -> String {
+        let directives = value.lowercased().split(separator: ",").map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if directives.contains(where: { $0 == "no-store" }) {
+            return "no-store"
+        }
+        if directives.contains(where: { $0 == "no-cache" }) {
+            return "no-cache"
+        }
+        if directives.contains(where: {
+            $0.range(of: #"^(s-maxage|max-age)=[0-9]+$"#, options: .regularExpression) != nil
+        }) {
+            return "cacheable"
+        }
+        return "other"
+    }
+
     private static func shouldRedactValue(_ value: String) -> Bool {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
+        let normalized = trimmed.lowercased()
+        // Fixture values may originate from host labels or response error
+        // strings.  Those fields are not semantic evidence, so redact them
+        // when they contain credential-shaped or owner-only material rather
+        // than relying on the caller to have chosen a safe field name.
+        if forbiddenFragments.contains(where: { normalized.contains($0) }) {
+            return true
+        }
         // Hide values that look like hex digest identifiers when they are long.
         if trimmed.count >= 48,
            trimmed.count <= 80,

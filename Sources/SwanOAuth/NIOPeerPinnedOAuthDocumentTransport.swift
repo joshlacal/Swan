@@ -12,7 +12,7 @@ import SwanCore
 /// SNI, so literal pinning cannot bypass certificate name verification.
 public struct NIOPeerPinnedOAuthDocumentTransport: OAuthRemoteTransport {
     private let maximumTransportTimeout: TimeInterval
-    private let additionalTrustRootsPEM: Data?
+    private let resources: OAuthPeerPinnedNIOClientResources
 
     public init(
         maximumTransportTimeout: TimeInterval = 5,
@@ -24,7 +24,9 @@ public struct NIOPeerPinnedOAuthDocumentTransport: OAuthRemoteTransport {
             throw SwanError.malformed("peer-pinned OAuth document transport configuration is invalid")
         }
         self.maximumTransportTimeout = maximumTransportTimeout
-        self.additionalTrustRootsPEM = additionalTrustRootsPEM
+        resources = try OAuthPeerPinnedNIOClientResources(
+            additionalTrustRootsPEM: additionalTrustRootsPEM
+        )
     }
 
     public func get(
@@ -51,28 +53,22 @@ public struct NIOPeerPinnedOAuthDocumentTransport: OAuthRemoteTransport {
             throw SwanError.malformed("OAuth document URL port is invalid")
         }
 
-        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        do {
-            let response = try await makeRequest(
-                group: group,
-                url: url,
-                hostname: hostname,
-                peer: peer,
-                port: port,
-                scheme: scheme,
-                timeout: timeout,
-                maximumBodyBytes: maximumBodyBytes
-            )
-            try await group.shutdownGracefully()
-            return response
-        } catch {
-            try? await group.shutdownGracefully()
-            throw error
-        }
+        return try await makeRequest(
+            group: resources.eventLoopGroup,
+            tlsContext: resources.tlsContext,
+            url: url,
+            hostname: hostname,
+            peer: peer,
+            port: port,
+            scheme: scheme,
+            timeout: timeout,
+            maximumBodyBytes: maximumBodyBytes
+        )
     }
 
     private func makeRequest(
         group: MultiThreadedEventLoopGroup,
+        tlsContext: NIOSSLContext,
         url: URL,
         hostname: String,
         peer: OAuthIPAddress,
@@ -88,13 +84,8 @@ public struct NIOPeerPinnedOAuthDocumentTransport: OAuthRemoteTransport {
             .channelInitializer { channel in
                 do {
                     if scheme == "https" {
-                        var tls = TLSConfiguration.makeClientConfiguration()
-                        if let pem = additionalTrustRootsPEM {
-                            tls.trustRoots = .certificates(try NIOSSLCertificate.fromPEMBytes([UInt8](pem)))
-                        }
-                        let context = try NIOSSLContext(configuration: tls)
                         try channel.pipeline.syncOperations.addHandler(
-                            try NIOSSLClientHandler(context: context, serverHostname: hostname)
+                            try NIOSSLClientHandler(context: tlsContext, serverHostname: hostname)
                         )
                     }
                     try channel.pipeline.syncOperations.addHTTPClientHandlers()
@@ -140,7 +131,31 @@ public struct NIOPeerPinnedOAuthDocumentTransport: OAuthRemoteTransport {
     }
 }
 
-private final class OAuthDocumentResponseHandler: ChannelInboundHandler {
+/// Long-lived resources owned by a peer-pinned transport configuration. NIO's
+/// event-loop group and SSL context are both safe to reuse across requests;
+/// constructing either per request creates attacker-controlled thread and
+/// blocking certificate-loading churn.
+final class OAuthPeerPinnedNIOClientResources: @unchecked Sendable {
+    let eventLoopGroup: MultiThreadedEventLoopGroup
+    let tlsContext: NIOSSLContext
+
+    init(additionalTrustRootsPEM: Data?) throws {
+        var tls = TLSConfiguration.makeClientConfiguration()
+        if let pem = additionalTrustRootsPEM {
+            tls.trustRoots = .certificates(
+                try NIOSSLCertificate.fromPEMBytes([UInt8](pem))
+            )
+        }
+        tlsContext = try NIOSSLContext(configuration: tls)
+        eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    }
+
+    deinit {
+        eventLoopGroup.shutdownGracefully { _ in }
+    }
+}
+
+private final class OAuthDocumentResponseHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = HTTPClientResponsePart
 
     private let responsePromise: EventLoopPromise<OAuthRemoteHTTPResponse>
@@ -168,13 +183,15 @@ private final class OAuthDocumentResponseHandler: ChannelInboundHandler {
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
-        let promise = responsePromise
-        timeoutTask = context.eventLoop.scheduleTask(in: .milliseconds(Int64(timeout * 1_000))) {
-            promise.fail(SwanError.unavailable("OAuth document request timed out"))
+        timeoutTask = context.eventLoop.scheduleTask(
+            in: .milliseconds(Int64(timeout * 1_000))
+        ) { [weak self] in
+            self?.timeout(context: context)
         }
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        guard !completed else { return }
         switch unwrapInboundIn(data) {
         case let .head(head):
             guard self.head == nil else {
@@ -202,15 +219,13 @@ private final class OAuthDocumentResponseHandler: ChannelInboundHandler {
                 fail(context: context, error: SwanError.unauthorized("OAuth document connected peer did not match its pin"))
                 return
             }
-            timeoutTask?.cancel()
-            completed = true
             let bytes = body.flatMap { buffer in
                 buffer.getBytes(at: buffer.readerIndex, length: buffer.readableBytes)
             } ?? []
             let headers = head.headers.reduce(into: [String: [String]]()) { output, header in
                 output[header.name.lowercased(), default: []].append(header.value)
             }
-            responsePromise.succeed(.init(
+            succeed(.init(
                 status: Int(head.status.code), headers: headers, body: Data(bytes),
                 responseURL: requestURL, redirectCount: 0, connectedPeerAddress: peer
             ))
@@ -231,8 +246,25 @@ private final class OAuthDocumentResponseHandler: ChannelInboundHandler {
         guard !completed else { return }
         completed = true
         timeoutTask?.cancel()
+        timeoutTask = nil
         responsePromise.fail(error)
         context.close(promise: nil)
+    }
+
+    private func timeout(context: ChannelHandlerContext) {
+        guard !completed else { return }
+        completed = true
+        timeoutTask = nil
+        responsePromise.fail(SwanError.unavailable("OAuth document request timed out"))
+        context.close(promise: nil)
+    }
+
+    private func succeed(_ response: OAuthRemoteHTTPResponse) {
+        guard !completed else { return }
+        completed = true
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        responsePromise.succeed(response)
     }
 }
 

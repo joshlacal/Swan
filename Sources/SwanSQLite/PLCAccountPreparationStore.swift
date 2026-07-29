@@ -143,7 +143,19 @@ extension SQLiteAccountDatabase:
         return try await withConnectionGate {
             try await transaction {
                 if let existing = try await loadJournalLocked() {
-                    guard existing == journal else {
+                    // A concurrent preparation request may arrive after the
+                    // winner has already advanced this journal beyond
+                    // `keysStored`.  The immutable identity and key bindings
+                    // must match, but lifecycle stage and the eventual
+                    // public-genesis CID are deliberately monotonic state and
+                    // therefore are not part of the create-only replay check.
+                    guard existing.requestID == journal.requestID,
+                          existing.canonicalHandle == journal.canonicalHandle,
+                          existing.pdsOrigin == journal.pdsOrigin,
+                          existing.repositoryRevision == journal.repositoryRevision,
+                          existing.operation == journal.operation,
+                          existing.signingKey == journal.signingKey,
+                          existing.rotationKey == journal.rotationKey else {
                         throw PLCAccountPreparationStoreError.conflict
                     }
                     return existing
@@ -308,6 +320,11 @@ public actor SQLitePLCAccountPreparationStoreOpener:
 {
     private let dataDirectory: URL
     private var databases: [String: SQLiteAccountDatabase] = [:]
+    /// Databases transferred to the live directory remain addressable for an
+    /// exact activation retry. The live directory is the owner after the
+    /// transfer; keeping this reference here only preserves the idempotent
+    /// admission token and never closes the database from this opener.
+    private var transferredDatabases: [String: SQLiteAccountDatabase] = [:]
     private var closed = false
 
     public init(dataDirectory: URL) {
@@ -338,10 +355,27 @@ public actor SQLitePLCAccountPreparationStoreOpener:
     public func takeActivatedAccountAdmission(
         did: String
     ) throws -> SQLiteActivatedAccountAdmission {
-        guard !closed, let database = databases.removeValue(forKey: did) else {
+        guard !closed else {
             throw PLCAccountPreparationStoreError.unavailable
         }
+        if let database = transferredDatabases[did] {
+            return SQLiteActivatedAccountAdmission(did: did, database: database)
+        }
+        guard let database = databases.removeValue(forKey: did) else {
+            throw PLCAccountPreparationStoreError.unavailable
+        }
+        transferredDatabases[did] = database
         return SQLiteActivatedAccountAdmission(did: did, database: database)
+    }
+
+    /// Releases a transfer whose receiving directory rejected admission. The
+    /// directory closes a rejected database before returning its error, so the
+    /// closed actor must not remain in `transferredDatabases`; an exact retry
+    /// needs to reopen the durable account database instead of receiving the
+    /// stale closed actor. A successful admission never calls this method: the
+    /// live directory owns that database after publication.
+    public func discardActivatedAccountAdmission(did: String) {
+        transferredDatabases.removeValue(forKey: did)
     }
 
     public func close() async throws {

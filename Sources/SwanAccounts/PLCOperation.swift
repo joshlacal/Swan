@@ -778,15 +778,21 @@ enum StrictJSON {
     }
 
     private struct Parser {
+        static let maximumNestingDepth = 64
+
         let bytes: [UInt8]
         var index = 0
 
-        mutating func parseValue() throws {
+        mutating func parseValue(nestingDepth: Int = 0) throws {
             skipWhitespace()
             guard index < bytes.count else { throw malformed() }
             switch bytes[index] {
-            case UInt8(ascii: "{"): try parseObject()
-            case UInt8(ascii: "["): try parseArray()
+            case UInt8(ascii: "{"):
+                let nestedDepth = try nextNestingDepth(after: nestingDepth)
+                try parseObject(nestingDepth: nestedDepth)
+            case UInt8(ascii: "["):
+                let nestedDepth = try nextNestingDepth(after: nestingDepth)
+                try parseArray(nestingDepth: nestedDepth)
             case UInt8(ascii: "\""): _ = try parseString()
             case UInt8(ascii: "t"): try consume("true")
             case UInt8(ascii: "f"): try consume("false")
@@ -796,7 +802,7 @@ enum StrictJSON {
             }
         }
 
-        mutating func parseObject() throws {
+        mutating func parseObject(nestingDepth: Int) throws {
             index += 1
             skipWhitespace()
             if consumeIf(UInt8(ascii: "}")) { return }
@@ -809,23 +815,30 @@ enum StrictJSON {
                 }
                 skipWhitespace()
                 guard consumeIf(UInt8(ascii: ":")) else { throw malformed() }
-                try parseValue()
+                try parseValue(nestingDepth: nestingDepth)
                 skipWhitespace()
                 if consumeIf(UInt8(ascii: "}")) { return }
                 guard consumeIf(UInt8(ascii: ",")) else { throw malformed() }
             }
         }
 
-        mutating func parseArray() throws {
+        mutating func parseArray(nestingDepth: Int) throws {
             index += 1
             skipWhitespace()
             if consumeIf(UInt8(ascii: "]")) { return }
             while true {
-                try parseValue()
+                try parseValue(nestingDepth: nestingDepth)
                 skipWhitespace()
                 if consumeIf(UInt8(ascii: "]")) { return }
                 guard consumeIf(UInt8(ascii: ",")) else { throw malformed() }
             }
+        }
+
+        func nextNestingDepth(after currentDepth: Int) throws -> Int {
+            guard currentDepth < Self.maximumNestingDepth else {
+                throw SwanError.malformed("PLC JSON exceeds maximum nesting depth")
+            }
+            return currentDepth + 1
         }
 
         mutating func parseString() throws -> String {

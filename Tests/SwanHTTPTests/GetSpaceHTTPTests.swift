@@ -378,7 +378,8 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
             try await installEmptyAccountDatabase(root: root, did: Self.otherAuthority)
             let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
                 dataDirectory: root,
-                controlStore: control
+                controlStore: control,
+                publicIdentityVerifier: nil
             )
             let runtime = try SwanOAuthRuntime(
                 controlStore: control,

@@ -58,7 +58,9 @@ services:
         condition: service_completed_successfully
       reference-plc:
         condition: service_healthy
-    networks: [swan]
+    networks:
+      swan:
+        ipv4_address: 172.30.0.6
     restart: "no"
 
   swan:
@@ -66,6 +68,9 @@ services:
       context: ..
       dockerfile: Swan/Dockerfile
     user: swan
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
     command:
       - serve
       - --host
@@ -75,7 +80,7 @@ services:
       - --public-url
       - "https://swan.test"
       - --profile
-      - /usr/local/share/swan/Profiles/permissioned-data-0016-2026-07-03.json
+      - /usr/local/share/swan/Profiles/permissioned-data-0016-2026-07-30.json
       - --data-directory
       - /var/lib/swan/data
       - --enable-local-space-interop
@@ -92,15 +97,35 @@ services:
       - /run/secrets/swan-runtime/oauth-server-key
       - --enable-oauth-authorization-server
       - --oauth-allow-localhost-development-client
+      - --login-trusted-proxy-peer
+      - "172.30.0.2"
+      # This checked-in file contains only disposable lab routing and public
+      # verification configuration. Secrets remain in the prepared volumes.
+      - --notification-config
+      - /etc/swan/interop/notification-config.json
+      - --enable-notification-delivery
       - --managing-service-audience
       - did:web:interop-swan-managing-service
+      - --enable-email-recovery
+      - --email-proof-key-file
+      - /run/secrets/swan-runtime/email-proof-key
+      - --email-sender
+      - no-reply@swan.local
+      - --email-smtp-host
+      - mailpit
+      - --email-smtp-port
+      - "1025"
     volumes:
       - swan-data:/var/lib/swan
       - swan-runtime-secrets:/run/secrets/swan-runtime:ro
-    networks: [swan]
+    networks:
+      swan:
+        ipv4_address: 172.30.0.5
     depends_on:
       swan-bootstrap:
         condition: service_completed_successfully
+      mailpit:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent --show-error --max-time 2 http://127.0.0.1:3000/health >/dev/null"]
       interval: 5s
@@ -124,7 +149,9 @@ services:
     volumes:
       - reference-pds-data:/pds
       - reference-pds-secrets:/run/secrets/reference-pds:ro
-    networks: [swan]
+    networks:
+      swan:
+        ipv4_address: 172.30.0.4
     depends_on:
       swan-secrets-init:
         condition: service_completed_successfully
@@ -145,7 +172,9 @@ services:
     environment:
       PORT: "2582"
       LOG_ENABLED: "false"
-    networks: [swan]
+    networks:
+      swan:
+        ipv4_address: 172.30.0.3
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:2582/_health').then(response => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))\""]
       interval: 5s
@@ -153,15 +182,17 @@ services:
       retries: 24
 
   caddy:
-    image: caddy:2.10.2-alpine
+    build:
+      context: ..
+      dockerfile: Swan/interop/Dockerfile.caddy
     ports:
       - "127.0.0.1:443:443"
     volumes:
-      - ./interop/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
     networks:
       swan:
+        ipv4_address: 172.30.0.2
         aliases:
           - swan.test
           - pds.test
@@ -192,15 +223,28 @@ services:
     restart: "no"
 
   mailpit:
-    image: axllent/mailpit:v1.27.1
-    networks: [swan]
+    image: axllent/mailpit:v1.27.1@sha256:986b14ff7b253e62883ea19fd3112806f116e5e2f221e03f12fb81c7312ff532
+    networks:
+      swan:
+        ipv4_address: 172.30.0.7
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider --quiet http://127.0.0.1:8025/api/v1/info"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
 
   toxiproxy:
-    image: ghcr.io/shopify/toxiproxy:2.12.0
-    networks: [swan]
+    image: ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e
+    # Reserve a non-Caddy address. Without an explicit address Docker may
+    # allocate Caddy's fixed 172.30.0.2 while Caddy is still waiting on the
+    # healthy dependency graph, making the later Caddy start fail with an
+    # address-in-use error.
+    networks:
+      swan:
+        ipv4_address: 172.30.0.8
 
   toxiproxy-setup:
-    image: curlimages/curl:8.13.0
+    image: curlimages/curl:8.13.0@sha256:d43bdb28bae0be0998f3be83199bfb2b81e0a30b034b6d7586ce7e05de34c3fd
     command:
       - /bin/sh
       - -ec
@@ -210,7 +254,9 @@ services:
           -H 'Content-Type: application/json' \
           --data '{"name":"reference-pds","listen":"0.0.0.0:8666","upstream":"reference-pds:3000","enabled":true}' \
           || curl --fail --silent http://toxiproxy:8474/proxies/reference-pds >/dev/null
-    networks: [swan]
+    networks:
+      swan:
+        ipv4_address: 172.30.0.9
     depends_on:
       toxiproxy:
         condition: service_started
@@ -253,3 +299,6 @@ volumes:
 
 networks:
   swan:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

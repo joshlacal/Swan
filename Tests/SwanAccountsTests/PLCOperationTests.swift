@@ -365,6 +365,26 @@ final class PLCOperationTests: XCTestCase {
         ))
     }
 
+    func testStrictJSONRejectsHostilePLCJSONNestingBeforeRecursiveDescent() throws {
+        let hostileDepth = 10_000
+        let deeplyNestedPLCJSON =
+            #"{"type":"plc_operation","nested":"#
+            + String(repeating: "[", count: hostileDepth)
+            + "null"
+            + String(repeating: "]", count: hostileDepth)
+            + "}"
+        let data = Data(deeplyNestedPLCJSON.utf8)
+        XCTAssertLessThan(data.count, 32 * 1_024)
+        XCTAssertThrowsError(
+            try PLCOperationCodec.decodeSignedJSON(data)
+        ) { error in
+            XCTAssertEqual(
+                error as? SwanError,
+                .malformed("PLC JSON exceeds maximum nesting depth")
+            )
+        }
+    }
+
     private func profileUnsigned() throws -> PLCUnsignedRegularOperation {
         try PLCATProfile.regularOperation(
             handle: "alice.example.com",

@@ -23,6 +23,20 @@ public struct MaterializedRepositoryMST: Sendable, Equatable {
     public let newBlocks: PublicRepositoryBlockMap
 }
 
+/// One bounded, repository-native page. `visitedNodeCount` is intentionally
+/// exposed so storage and adversarial tests can prove that pagination work is
+/// a function of the requested page size and MST depth rather than repository
+/// cardinality.
+public struct RepositoryMSTPage: Sendable, Equatable {
+    public let leaves: [RepositoryMSTLeaf]
+    public let visitedNodeCount: Int
+
+    public init(leaves: [RepositoryMSTLeaf], visitedNodeCount: Int) {
+        self.leaves = leaves
+        self.visitedNodeCount = visitedNodeCount
+    }
+}
+
 /// An immutable repository MST. Loaded nodes retain only their CID and block
 /// source until an operation reaches them; mutations replace just the nodes on
 /// the affected search path.
@@ -130,6 +144,78 @@ public struct RepositoryMST: Sendable {
         var result: [RepositoryMSTLeaf] = []
         try await appendLeaves(to: &result)
         return result
+    }
+
+    /// Returns at most `limit` leaves from one collection without materializing
+    /// the repository or consulting a secondary SQL index.
+    ///
+    /// The pinned TypeScript actor-store contract is descending by default
+    /// (`key < cursor`) and ascending when `reverse` is true (`key > cursor`).
+    /// Child subtrees are pruned using the adjacent MST leaf bounds, so a
+    /// missing collection or a small page cannot degenerate into a full scan.
+    public func page(
+        collection: String,
+        limit: Int,
+        cursor: String?,
+        reverse: Bool
+    ) async throws -> RepositoryMSTPage {
+        guard (1...100).contains(limit) else {
+            throw RepositoryMSTMutationError.entryLimitExceeded
+        }
+        _ = try PublicRepositoryPath(
+            collection: collection,
+            recordKey: cursor ?? "validation"
+        )
+
+        let collectionPrefix = Data("\(collection)/".utf8)
+        var collectionUpperBound = collectionPrefix
+        guard let separator = collectionUpperBound.popLast(),
+              separator == UInt8(ascii: "/") else {
+            throw RepositoryMSTMutationError.invalidNode
+        }
+        collectionUpperBound.append(separator + 1)
+
+        let lowerBound: Data
+        let upperBound: Data
+        if let cursor {
+            let cursorKey = Data("\(collection)/\(cursor)".utf8)
+            if reverse {
+                lowerBound = cursorKey
+                upperBound = collectionUpperBound
+            } else {
+                lowerBound = collectionPrefix
+                upperBound = cursorKey
+            }
+        } else {
+            lowerBound = collectionPrefix
+            upperBound = collectionUpperBound
+        }
+
+        // An MST has at most 129 layers (0...128). A range page can reach one
+        // search path per emitted leaf plus the two boundary paths. This
+        // ceiling is deliberately independent of total repository size.
+        let maximumVisitedNodes = min(
+            limits.maximumMSTNodes,
+            (limit + 2) * 129
+        )
+        let budget = RepositoryMSTPageTraversalBudget(
+            maximumVisitedNodes: maximumVisitedNodes
+        )
+        var leaves: [RepositoryMSTLeaf] = []
+        try await appendPageLeaves(
+            lowerBound: lowerBound,
+            upperBound: upperBound,
+            reverse: reverse,
+            inheritedLowerBound: nil,
+            inheritedUpperBound: nil,
+            limit: limit,
+            budget: budget,
+            to: &leaves
+        )
+        return RepositoryMSTPage(
+            leaves: leaves,
+            visitedNodeCount: budget.visitedNodeCount
+        )
     }
 
     public func materialized() async throws -> MaterializedRepositoryMST {
@@ -472,6 +558,76 @@ public struct RepositoryMST: Sendable {
         }
     }
 
+    private func appendPageLeaves(
+        lowerBound: Data,
+        upperBound: Data,
+        reverse: Bool,
+        inheritedLowerBound: Data?,
+        inheritedUpperBound: Data?,
+        limit: Int,
+        budget: RepositoryMSTPageTraversalBudget,
+        to result: inout [RepositoryMSTLeaf]
+    ) async throws {
+        guard result.count < limit else { return }
+        try Task.checkCancellation()
+        if let pointer {
+            try budget.visit(pointer)
+        }
+        let entries = try await entries()
+
+        var lowerByIndex = Array<Data?>(repeating: nil, count: entries.count)
+        var previous = inheritedLowerBound
+        for index in entries.indices {
+            lowerByIndex[index] = previous
+            if case let .leaf(leaf) = entries[index] {
+                previous = Data(leaf.path.mstKey.utf8)
+            }
+        }
+        var upperByIndex = Array<Data?>(repeating: nil, count: entries.count)
+        var next = inheritedUpperBound
+        for index in entries.indices.reversed() {
+            upperByIndex[index] = next
+            if case let .leaf(leaf) = entries[index] {
+                next = Data(leaf.path.mstKey.utf8)
+            }
+        }
+
+        let orderedIndices = reverse
+            ? Array(entries.indices)
+            : Array(entries.indices.reversed())
+        for index in orderedIndices {
+            guard result.count < limit else { return }
+            switch entries[index] {
+            case let .leaf(leaf):
+                let key = Data(leaf.path.mstKey.utf8)
+                if key.lexicographicallyPrecedes(upperBound),
+                   lowerBound.lexicographicallyPrecedes(key) {
+                    result.append(leaf)
+                }
+            case let .tree(child):
+                let subtreeLower = lowerByIndex[index]
+                let subtreeUpper = upperByIndex[index]
+                let isBeforeUpper = subtreeLower.map {
+                    $0.lexicographicallyPrecedes(upperBound)
+                } ?? true
+                let isAfterLower = subtreeUpper.map {
+                    lowerBound.lexicographicallyPrecedes($0)
+                } ?? true
+                guard isBeforeUpper, isAfterLower else { continue }
+                try await child.appendPageLeaves(
+                    lowerBound: lowerBound,
+                    upperBound: upperBound,
+                    reverse: reverse,
+                    inheritedLowerBound: subtreeLower,
+                    inheritedUpperBound: subtreeUpper,
+                    limit: limit,
+                    budget: budget,
+                    to: &result
+                )
+            }
+        }
+    }
+
     private func newTree(_ entries: [Entry], layer: Int? = nil) throws -> Self {
         try Self(
             blocks: blocks,
@@ -526,6 +682,26 @@ public struct RepositoryMST: Sendable {
             try PublicRepositoryCID.validate(cid)
         } catch {
             throw RepositoryMSTMutationError.blockCIDMismatch
+        }
+    }
+}
+
+private final class RepositoryMSTPageTraversalBudget: @unchecked Sendable {
+    private let maximumVisitedNodes: Int
+    private var visited = Set<CID>()
+
+    init(maximumVisitedNodes: Int) {
+        self.maximumVisitedNodes = maximumVisitedNodes
+    }
+
+    var visitedNodeCount: Int { visited.count }
+
+    func visit(_ cid: CID) throws {
+        guard visited.insert(cid).inserted else {
+            throw RepositoryMSTMutationError.invalidNode
+        }
+        guard visited.count <= maximumVisitedNodes else {
+            throw RepositoryMSTMutationError.nodeLimitExceeded
         }
     }
 }

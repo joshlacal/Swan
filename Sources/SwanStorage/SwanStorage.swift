@@ -287,6 +287,21 @@ public struct OAuthCachedClientMetadata: Sendable, Equatable {
     }
 }
 
+/// A durable, per-client ordering token issued before remote metadata or JWKS
+/// retrieval begins. The generation is monotonically increasing in the
+/// control database and deliberately survives cache-entry eviction, so a
+/// delayed older fetch cannot republish stale key material after a newer
+/// revalidation has completed.
+public struct OAuthClientMetadataFetchTicket: Sendable, Equatable {
+    public let clientID: String
+    public let generation: Int64
+
+    public init(clientID: String, generation: Int64) {
+        self.clientID = clientID
+        self.generation = generation
+    }
+}
+
 /// Swan supports only RFC 7636's SHA-256 proof-key transform. The method is
 /// durable alongside the challenge so a future endpoint cannot silently fall
 /// back to `plain` PKCE when interpreting an old PAR or code.
@@ -432,6 +447,20 @@ public enum OAuthOpaqueTokenKind: Sendable, Equatable {
 public protocol OAuthControlStore: Sendable {
     func cacheClientMetadata(_ metadata: OAuthCachedClientMetadata, now: Date) async throws
     func cachedClientMetadata(clientID: String, now: Date) async throws -> OAuthCachedClientMetadata?
+    /// Advances the durable freshness watermark for `clientID`. Fetchers must
+    /// obtain this ticket before performing any remote I/O.
+    func beginClientMetadataFetch(
+        clientID: String,
+        now: Date
+    ) async throws -> OAuthClientMetadataFetchTicket
+    /// Publishes only if `ticket` is still the latest generation issued for
+    /// its client. A `false` result means a newer fetch won the race; the
+    /// caller must not use or return its stale response for authorization.
+    func publishClientMetadata(
+        _ metadata: OAuthCachedClientMetadata,
+        using ticket: OAuthClientMetadataFetchTicket,
+        now: Date
+    ) async throws -> Bool
 
     func storePushedAuthorizationRequest(_ request: OAuthPushedAuthorizationRequest, now: Date) async throws
     /// Returns an unexpired, unconsumed PAR selected by the keyed digest of
@@ -448,6 +477,15 @@ public protocol OAuthControlStore: Sendable {
     ) async throws -> OAuthPushedAuthorizationRequest
 
     func storeAuthorizationCode(_ code: OAuthAuthorizationCode, now: Date) async throws
+    /// Atomically stores the code and its token family only while the subject
+    /// remains active at the exact account revision authenticated into the
+    /// browser cookie. This is the consent/password-recovery linearization
+    /// point; the revision is SQLite's microsecond `accounts.updated_at`.
+    func storeAuthorizationCode(
+        _ code: OAuthAuthorizationCode,
+        requiringActiveSubjectRevisionMicroseconds revision: Int64,
+        now: Date
+    ) async throws
     /// Returns a code's immutable PKCE/binding facts. A consumed code is
     /// returned as a replay sentinel; only the redemption transaction decides
     /// whether it can issue tokens.
@@ -465,7 +503,11 @@ public protocol OAuthControlStore: Sendable {
         tokens: OAuthIssuedTokenDigests,
         now: Date
     ) async throws
-    func validatedAccessToken(accessTokenDigest: Data, now: Date) async throws -> OAuthTokenFamily
+    func validatedAccessToken(
+        accessTokenDigest: Data,
+        requireActiveSubject: Bool,
+        now: Date
+    ) async throws -> OAuthTokenFamily
     func refreshTokenFamily(refreshTokenDigest: Data, now: Date) async throws -> OAuthTokenFamily
     /// Returns an active, unrevoked family selected by one typed opaque-token
     /// digest. This is used only to validate sender constraints immediately

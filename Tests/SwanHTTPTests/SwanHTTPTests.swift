@@ -16,7 +16,11 @@ import XCTest
 
 final class SwanHTTPTests: XCTestCase {
     func testProfileAndGeneratedWireHaveTheSamePermissionedCoverage() throws {
-        let profile = try loadPinnedProfile()
+        let profile = try ProtocolProfile.load(
+            from: packageRoot().appending(
+                path: "Profiles/permissioned-data-0016-2026-07-30.json"
+            )
+        )
         let generated = PermissionedData0016.methods
 
         XCTAssertEqual(profile.id, PermissionedData0016.profileID)
@@ -341,16 +345,16 @@ final class SwanHTTPTests: XCTestCase {
                     headers: Self.jsonBearerHeaders("operator-secret"),
                     body: ByteBuffer(string: #"{"did":"did:plc:abcdefghijklmnopqrstuvwx","tombstoneReason":"operator-request","exportReference":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#)
                 ) { response in
-                    XCTAssertEqual(response.status, .ok)
-                    XCTAssertEqual(try Self.status(from: response.body), "deleted")
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    XCTAssertEqual(response.headers[.cacheControl], "no-store")
                 }
                 try await client.execute(
-                    uri: "/v1/accounts/reactivate",
-                    method: .post,
-                    headers: Self.jsonBearerHeaders("operator-secret"),
-                    body: ByteBuffer(string: #"{"did":"did:plc:abcdefghijklmnopqrstuvwx"}"#)
+                    uri: "/v1/accounts?did=\(Self.aliceDID)",
+                    method: .get,
+                    headers: Self.bearerHeaders("operator-secret")
                 ) { response in
-                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(try Self.status(from: response.body), "active")
                 }
                 let oversized = ByteBuffer(string: #"{"did":""# + String(repeating: "a", count: SwanManagementHTTPServer.maximumJSONBytes) + #""}"#)
                 try await client.execute(
@@ -362,6 +366,40 @@ final class SwanHTTPTests: XCTestCase {
                     XCTAssertEqual(response.status, .contentTooLarge)
                 }
             }
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
+    func testManagementDeleteUsesInjectedPermanentDeletionCoordinator() async throws {
+        let coordinator = TestPermanentDeletionCoordinator()
+        let fixture = try await makeManagementServer(
+            permanentDeletionCoordinator: coordinator
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let app = fixture.server.buildApplication(
+                logger: Logger(label: "SwanManagementDeletionHTTPTests")
+            )
+            try await app.test(.live) { client in
+                try await client.execute(
+                    uri: "/v1/accounts/delete",
+                    method: .post,
+                    headers: Self.jsonBearerHeaders("operator-secret"),
+                    body: ByteBuffer(
+                        string:
+                            #"{"did":"did:plc:abcdefghijklmnopqrstuvwx","tombstoneReason":"operator-request","exportReference":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(try Self.status(from: response.body), "deleted")
+                    XCTAssertEqual(response.headers[.cacheControl], "no-store")
+                }
+            }
+            let calls = await coordinator.recordedDIDs()
+            XCTAssertEqual(calls, [Self.aliceDID])
             try await fixture.control.close()
         } catch {
             try? await fixture.control.close()
@@ -598,7 +636,9 @@ final class SwanHTTPTests: XCTestCase {
     }
 
     private func makeManagementServer(
-        plcProvisioning: (any SwanManagementPLCProvisioning)? = nil
+        plcProvisioning: (any SwanManagementPLCProvisioning)? = nil,
+        permanentDeletionCoordinator:
+            (any AccountPermanentDeletionCoordinating)? = nil
     ) async throws -> (server: SwanManagementHTTPServer, control: SQLiteControlDatabase, root: URL) {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "SwanManagementHTTPTests-\(UUID().uuidString)")
@@ -623,7 +663,9 @@ final class SwanHTTPTests: XCTestCase {
                 configuration: configuration,
                 controlStore: control,
                 operatorSecretVerifier: verifier,
-                plcProvisioning: plcProvisioning
+                plcProvisioning: plcProvisioning,
+                permanentDeletionCoordinator:
+                    permanentDeletionCoordinator
             ), control, root)
         } catch {
             try? await control.close()
@@ -681,6 +723,32 @@ final class SwanHTTPTests: XCTestCase {
 
     private static let aliceDID = "did:plc:abcdefghijklmnopqrstuvwx"
     private static let testVerifier = "$argon2id$v=19$m=65536,t=3,p=1$bcdefghijklmnopqrstuvw$BCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq"
+}
+
+private actor TestPermanentDeletionCoordinator:
+    AccountPermanentDeletionCoordinating
+{
+    private var dids: [String] = []
+
+    func beginAndResume(
+        did: String,
+        declaration: AccountLifecycleDeclaration,
+        now: Date
+    ) async throws -> AccountDeletionTombstone {
+        dids.append(did)
+        guard let tombstone = declaration.tombstone else {
+            throw AccountDeletionStoreError.invalidInput
+        }
+        return try AccountDeletionTombstone(
+            did: did,
+            finalizedAt: now,
+            revision: 1,
+            tombstone: tombstone,
+            export: declaration.export
+        )
+    }
+
+    func recordedDIDs() -> [String] { dids }
 }
 
 private actor TestManagementPLCProvisioning: SwanManagementPLCProvisioning {

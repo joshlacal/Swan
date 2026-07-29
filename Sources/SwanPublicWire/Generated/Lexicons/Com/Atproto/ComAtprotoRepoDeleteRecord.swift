@@ -32,8 +32,34 @@ public struct Input: ATProtocolCodable {
             self.repo = try container.decode(ATIdentifier.self, forKey: .repo)
             self.collection = try container.decode(NSID.self, forKey: .collection)
             self.rkey = try container.decode(RecordKey.self, forKey: .rkey)
-            self.swapRecord = try container.decodeIfPresent(CID.self, forKey: .swapRecord)
-            self.swapCommit = try container.decodeIfPresent(CID.self, forKey: .swapCommit)
+            if container.contains(.swapRecord) {
+                guard try !container.decodeNil(forKey: .swapRecord) else {
+                    throw DecodingError.valueNotFound(
+                        CID.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'swapRecord' must not be null"
+                        )
+                    )
+                }
+                self.swapRecord = try container.decode(CID.self, forKey: .swapRecord)
+            } else {
+                self.swapRecord = nil
+            }
+            if container.contains(.swapCommit) {
+                guard try !container.decodeNil(forKey: .swapCommit) else {
+                    throw DecodingError.valueNotFound(
+                        CID.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'swapCommit' must not be null"
+                        )
+                    )
+                }
+                self.swapCommit = try container.decode(CID.self, forKey: .swapCommit)
+            } else {
+                self.swapCommit = nil
+            }
         }
 
         public func encode(to encoder: Encoder) throws {

@@ -430,7 +430,10 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
 
     func testConcurrentSameRequestConvergesOnOneVisibleIdentity() async throws {
         let fixture = try await PreparationFixture()
-        defer { fixture.removeFiles() }
+        addTeardownBlock { [fixture] in
+            try? await fixture.close()
+            fixture.removeFiles()
+        }
         let serviceA = fixture.service()
         let serviceB = fixture.service()
         async let a = serviceA.prepare(
@@ -455,7 +458,6 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
         let submissionCount = await fixture.plc.submitCount()
         XCTAssertNil(activeAccount)
         XCTAssertLessThanOrEqual(submissionCount, 2)
-        try await fixture.close()
     }
 
     func testEveryRemoteIdentityMismatchAndInactiveTerminalFailClosedWithoutRegistration() async throws {
@@ -540,6 +542,31 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
         let activeAccount = try await fixture.control.account(did: intent.did)
         XCTAssertNil(activeAccount)
         try await fixture.close()
+    }
+
+    func testRejectedActivationTransferDoesNotReplayClosedDatabaseOnRetry() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanPLCTransfer-(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let opener = SQLitePLCAccountPreparationStoreOpener(dataDirectory: root)
+        let did = "did:plc:zyxwvutsrqponmlkjihgfedc"
+        let store = try await opener.openPLCAccountPreparationStore(did: did)
+        let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
+        let admission = try await opener.takeActivatedAccountAdmission(did: did)
+        try await admission.database.close()
+
+        await opener.discardActivatedAccountAdmission(did: did)
+        let retried = try await opener.openPLCAccountPreparationStore(did: did)
+        let retriedDatabase = try XCTUnwrap(retried as? SQLiteAccountDatabase)
+        XCTAssertNotEqual(ObjectIdentifier(database), ObjectIdentifier(retriedDatabase))
+        _ = try await retriedDatabase.plcAccountPreparationJournal()
+        try await opener.close()
     }
 }
 

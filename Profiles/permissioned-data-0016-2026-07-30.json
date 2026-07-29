@@ -1,0 +1,76 @@
+{
+  "id": "permissioned-data-0016-2026-07-30",
+  "proposalCommit": "1caad93dbb1f445396f6abf3b97eb4040345e78e",
+  "referenceImplementationCommit": "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
+  "petrelGeneratorCommit": "c2a1cdbee8c621c7682416114700f032cc7e2b37",
+  "petrelCommit": "db84b2c9788aa38000ee3f134e21feffa8f351cd",
+  "migrationCompatibility": "destructiveBeforeAlpha",
+  "crypto": {
+    "lthashBytes": 2048,
+    "lthashHash": "BLAKE3-XOF",
+    "commitmentHash": "SHA-256",
+    "contentBinding": "HKDF-Expand/HMAC-SHA-256"
+  },
+  "permissionedDataIsEncrypted": false,
+  "oplogRetention": 10000,
+  "referenceArchiveSHA256": "1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea",
+  "petrelManifest": "PetrelManifest.json",
+  "petrelManifestSHA256": "ac3c8b006e0e771f6e3cb0b5cbe6e93a78101dc49ce95ea9b3e1ed734a97636f",
+  "lexiconManifest": "permissioned-data-0016-2026-07-30.lexicons.sha256",
+  "lexiconManifestSHA256": "9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f",
+  "generatedWireManifest": "permissioned-data-0016-2026-07-30.generated-wire.sha256",
+  "generatedWireManifestSHA256": "80f9f7b93127826d95d516a4a9d18b7ca245d82fc74f8fa484bbf3423d1f51db",
+  "intentionalDivergences": [
+    {
+      "endpoint": "com.atproto.space.getRepo",
+      "referenceBehavior": "Pinned TypeScript handler throws MethodNotImplementedError and its generated Swift contract exposes a whole Data output.",
+      "swanBehavior": "Streams proposal-0016 two-root full-recovery CARs from a private bounded-memory spool; the generated handler is retained for typed parameter/context semantics but its Data-returning method is never used by the transport."
+    },
+    {
+      "endpoint": "com.atproto.space.notifyWrite",
+      "referenceBehavior": "Pinned notifyWrite rejects a request unless auth.credentials.iss equals body.repo, but its authority fanout signs iss as ownerDid while retaining a member writer in body.repo; the resulting cross-host fanout shape is not accepted by that same pinned receiver when owner and writer differ.",
+      "swanBehavior": "Emits and accepts only direct writer-to-authority notifications with iss equal to repo and an exact configured authority service identity as aud. It intentionally does not emit or accept authority-signed cross-host write fanout; registrations remain discovery state and notifySpaceDeleted remains the separate authority-signed tombstone control plane."
+    }
+  ],
+  "compatibilityExceptions": [
+    {
+      "id": "did-plc-server-0.0.1-submit-status",
+      "pinnedComponent": "@did-plc/server@0.0.1 from reference implementation 3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
+      "referenceBehavior": "POST /:did ends in Express res.sendStatus(200), producing status 200, Content-Type text/plain; charset=utf-8, and the two ASCII bytes OK.",
+      "swanBehavior": "Only explicit laboratory policy did-plc-server-0.0.1 accepts that exact no-redirect response at the requested URL; production and all PLC JSON reads retain strict validation."
+    },
+    {
+      "id": "typescript-space-list-repo-ops-values-ambiguous-space",
+      "pinnedComponent": "packages/pds/src/actor-store/space/reader.ts from reference implementation 3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
+      "referenceBehavior": "com.atproto.space.listRepoOps returns InternalServerError when values are included because the joined SQLite query leaves the space selector ambiguous; excludeValues=true remains callable.",
+      "swanBehavior": "Qualifies the joined space selector and serves value-bearing operations. The interop runner exposes an explicit excludeValues mode for the pinned branch and never mutates the reference cache."
+    }
+  ],
+  "endpoints": [
+    "com.atproto.space.applyWrites",
+    "com.atproto.space.createRecord",
+    "com.atproto.space.deleteRecord",
+    "com.atproto.space.getBlob",
+    "com.atproto.space.getDelegationToken",
+    "com.atproto.space.getLatestCommit",
+    "com.atproto.space.getRecord",
+    "com.atproto.space.getRepo",
+    "com.atproto.space.getSpace",
+    "com.atproto.space.getSpaceCredential",
+    "com.atproto.space.listRecords",
+    "com.atproto.space.listRepoOps",
+    "com.atproto.space.listRepos",
+    "com.atproto.space.listSpaces",
+    "com.atproto.space.notifySpaceDeleted",
+    "com.atproto.space.notifyWrite",
+    "com.atproto.space.putRecord",
+    "com.atproto.space.registerNotify",
+    "com.atproto.simplespace.addMember",
+    "com.atproto.simplespace.checkUserAccess",
+    "com.atproto.simplespace.createSpace",
+    "com.atproto.simplespace.deleteSpace",
+    "com.atproto.simplespace.listMembers",
+    "com.atproto.simplespace.removeMember",
+    "com.atproto.simplespace.updateSpace"
+  ]
+}

@@ -12,7 +12,7 @@ import XCTest
 final class SwanOperatorBackupTests: XCTestCase {
     func testValidBackupContainsVerifiedPortableArchiveAndOnlyEncryptedSecrets() async throws {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
 
         let output = fixture.root.appending(path: "backup")
         let result = try await fixture.backup(to: output)
@@ -51,7 +51,7 @@ final class SwanOperatorBackupTests: XCTestCase {
 
     func testWrongKeyCiphertextAndAADBoundDigestRejectSafely() async throws {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
         let output = fixture.root.appending(path: "backup")
         _ = try await fixture.backup(to: output)
 
@@ -77,7 +77,7 @@ final class SwanOperatorBackupTests: XCTestCase {
 
     func testNoncanonicalManifestExtraAndSymlinkEntriesReject() async throws {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
 
         let noncanonical = fixture.root.appending(path: "noncanonical")
         _ = try await fixture.backup(to: noncanonical)
@@ -117,7 +117,7 @@ final class SwanOperatorBackupTests: XCTestCase {
 
     func testChangedPortableCARBlobAndDigestRejectAtOuterBoundary() async throws {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
         let blobSource = try await fixture.completedBackup(named: "blob-source")
         let blobPath = try XCTUnwrap(
             regularFiles(under: blobSource).first {
@@ -170,7 +170,7 @@ final class SwanOperatorBackupTests: XCTestCase {
 
     func testSwappedSecretIdentityScalarAndNoncanonicalPlaintextReject() async throws {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
 
         for (name, mutate) in [
             ("did", { (object: inout [String: Any]) in
@@ -233,7 +233,7 @@ final class SwanOperatorBackupTests: XCTestCase {
 
     func testOutputCollisionAndPostRenameFailureLeaveNoTaskArtifacts() async throws {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
         let collision = fixture.root.appending(path: "collision")
         try FileManager.default.createDirectory(
             at: collision,
@@ -251,6 +251,9 @@ final class SwanOperatorBackupTests: XCTestCase {
             database: fixture.database,
             keyReader: fixture.keyStore,
             now: { Date(timeIntervalSince1970: 1_700_000_000) },
+            continuityInventory: {
+                try PLCCredentialKeyContinuityInventory(checkpoints: [])
+            },
             afterRenameBeforeParentSync: {
                 throw SwanOperatorAccountBackupError.failed
             }
@@ -299,7 +302,7 @@ final class SwanOperatorBackupTests: XCTestCase {
 final class SwanOperatorAccountRestoreTests: XCTestCase {
     func testVerifiedBackupRestoresOneActiveAccountAndReopensEveryDurableBoundary() async throws {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
         let backup = try await fixture.completedBackup(named: "restore-source")
         let sourceBefore = try treeSnapshot(backup)
         let sourceEnvelopePlaintext = try decryptedEnvelope(
@@ -462,26 +465,17 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
         try await database.close()
 
         let bootstrapControl = try await SQLiteControlDatabase(dataDirectory: target)
-        let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+        addTeardownBlock { try? await bootstrapControl.close() }
+        let restoredDirectory = try await SQLitePreMigratedAccountDirectory.bootstrap(
             dataDirectory: target,
-            controlStore: bootstrapControl
+            controlStore: bootstrapControl,
+            publicIdentityVerifier: SwanPublicPLCGenesisVerifier()
         )
-        let restoredURI = try SpaceRecordURI(
-            space: fixture.space,
-            author: fixture.account.did,
-            collection: "app.example.note",
-            rkey: "one"
+        let restoredDescription = try await restoredDirectory.describePublicRepository(
+            selector: fixture.account.did
         )
-        await XCTAssertThrowsErrorAsync {
-            _ = try await directory.record(
-                restoredURI,
-                authorization: .accountOAuth(
-                    subject: fixture.account.did,
-                    scopes: ["atproto"]
-                )
-            )
-        }
-        try await directory.close()
+        XCTAssertNotNil(restoredDescription)
+        try await restoredDirectory.close()
         try await bootstrapControl.close()
 
         let targetBytes = try allRegularFileBytes(under: target)
@@ -494,7 +488,7 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
 
     func testSourceFailureAndDestinationCollisionNeverCreateOrMergeTarget() async throws {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
         XCTAssertThrowsError(
             try SwanOperatorAccountKEK(rawBytes: Data(repeating: 0xD4, count: 31))
         )
@@ -556,7 +550,7 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
 
     func testPrepublicationParentReplacementAndPostRenameFailureCleanlyRetry() async throws {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
         let backup = try await fixture.completedBackup(named: "atomic-source")
         let accountKEK = try SwanOperatorAccountKEK(
             rawBytes: Data(repeating: 0xD4, count: 32)
@@ -628,7 +622,7 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
         async throws
     {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
         let backup = try await fixture.completedBackup(named: "replacement-source")
         let accountKEK = try SwanOperatorAccountKEK(
             rawBytes: Data(repeating: 0xD4, count: 32)
@@ -700,7 +694,7 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
 
     func testSwapAfterPathValidationCannotRedirectKeyOrSQLiteWrites() async throws {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
         let backup = try await fixture.completedBackup(named: "post-check-source")
         let accountKEK = try SwanOperatorAccountKEK(
             rawBytes: Data(repeating: 0xD4, count: 32)
@@ -772,7 +766,7 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
 
     func testCleanupEntrySwapNeverDeletesReplacementOrLeavesSecretState() async throws {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
         let backup = try await fixture.completedBackup(named: "cleanup-swap-source")
         let accountKEK = try SwanOperatorAccountKEK(
             rawBytes: Data(repeating: 0xD4, count: 32)
@@ -850,7 +844,7 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
 
     func testDestinationInsideSourceIsRejectedWithoutMutatingSource() async throws {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
         let backup = try await fixture.completedBackup(named: "overlap-source")
         let sourceBefore = try treeSnapshot(backup)
         let target = backup.appending(path: "restored-data")
@@ -878,7 +872,7 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
         async throws
     {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
         let accountKEK = try SwanOperatorAccountKEK(
             rawBytes: Data(repeating: 0xD4, count: 32)
         )
@@ -992,7 +986,7 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
         async throws
     {
         let fixture = try await OperatorBackupFixture()
-        defer { fixture.remove() }
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
         let backup = try await fixture.completedBackup(named: "nested-failure-source")
         let accountKEK = try SwanOperatorAccountKEK(
             rawBytes: Data(repeating: 0xD4, count: 32)
@@ -1053,7 +1047,7 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
     }
 }
 
-private struct OperatorBackupFixture {
+struct OperatorBackupFixture {
     let root: URL
     let database: SQLiteAccountDatabase
     let keyStore: FileAccountKeyStore
@@ -1225,10 +1219,24 @@ private struct OperatorBackupFixture {
     }
 
     func backup(to output: URL) async throws -> SwanOperatorAccountBackupResult {
+        try await backup(
+            to: output,
+            continuityInventory:
+                try PLCCredentialKeyContinuityInventory(checkpoints: [])
+        )
+    }
+
+    func backup(
+        to output: URL,
+        continuityInventory: PLCCredentialKeyContinuityInventory
+    ) async throws -> SwanOperatorAccountBackupResult {
         try await SwanOperatorAccountBackupExporter(
             database: database,
             keyReader: keyStore,
-            now: { Date(timeIntervalSince1970: 1_700_000_000) }
+            now: { Date(timeIntervalSince1970: 1_700_000_000) },
+            continuityInventory: {
+                continuityInventory
+            }
         ).backup(
             account: account,
             credential: credential,
@@ -1244,7 +1252,6 @@ private struct OperatorBackupFixture {
     }
 
     func remove() {
-        Task { try? await database.close() }
         try? FileManager.default.removeItem(at: root)
     }
 }
@@ -1267,12 +1274,13 @@ private func rewriteEnvelope(
         JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any]
     )
     let portableDigest = try XCTUnwrap(object["portableManifestSHA256"] as? String)
+    let profileID = try XCTUnwrap(object["profileID"] as? String)
     let envelopeURL = root.appending(path: "operator/secrets.aesgcm")
     let envelope = try Data(contentsOf: envelopeURL)
     let aad = Data(
         [
             "swan-operator-account-backup-v1",
-            "permissioned-data-0016-2026-07-03",
+            profileID,
             portableDigest,
         ].joined(separator: "\u{0}").utf8
     )
@@ -1305,6 +1313,7 @@ private func decryptedEnvelope(
     let portableDigest = try XCTUnwrap(
         object["portableManifestSHA256"] as? String
     )
+    let profileID = try XCTUnwrap(object["profileID"] as? String)
     return try AES.GCM.open(
         AES.GCM.SealedBox(
             combined: Data(
@@ -1315,7 +1324,7 @@ private func decryptedEnvelope(
         authenticating: Data(
             [
                 "swan-operator-account-backup-v1",
-                "permissioned-data-0016-2026-07-03",
+                profileID,
                 portableDigest,
             ].joined(separator: "\u{0}").utf8
         )

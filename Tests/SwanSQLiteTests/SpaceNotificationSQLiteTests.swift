@@ -185,13 +185,20 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             rkey: "local"
         )
         let revision = try fixture.tid(1)
+        let initialValue = Data([0xA1, 0x61, 0x61, 0x01])
         _ = try await writerDatabase.apply(
             space: fixture.space,
             author: fixture.writer,
             expectedRevision: 0,
             requestID: UUID(),
             wireRevision: revision,
-            writes: [.put(uri: uri, value: Data([0xA1, 0x61, 0x61, 0x01]), cid: "cid:local")]
+            writes: [
+                .put(
+                    uri: uri,
+                    value: initialValue,
+                    cid: CID.fromDAGCBOR(initialValue).string
+                ),
+            ]
         )
         let initialOutbox = try await writerDatabase.pendingOutbox()
         XCTAssertEqual(initialOutbox.count, 1)
@@ -223,13 +230,20 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             XCTFail("recipient tombstone must close repository state reads")
         } catch {}
         do {
+            let postDeletionValue = Data([0xA1, 0x61, 0x61, 0x02])
             _ = try await writerDatabase.apply(
                 space: fixture.space,
                 author: fixture.writer,
                 expectedRevision: 1,
                 requestID: UUID(),
                 wireRevision: try fixture.tid(2),
-                writes: [.put(uri: uri, value: Data([0xA1, 0x61, 0x61, 0x02]), cid: "cid:after-delete")]
+                writes: [
+                    .put(
+                        uri: uri,
+                        value: postDeletionValue,
+                        cid: CID.fromDAGCBOR(postDeletionValue).string
+                    ),
+                ]
             )
             XCTFail("recipient tombstone must close repository writes")
         } catch {}

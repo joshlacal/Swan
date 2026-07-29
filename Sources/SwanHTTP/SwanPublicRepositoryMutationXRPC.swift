@@ -390,48 +390,111 @@ func registerPublicRepositoryMutationEndpoints(
         }
     }
     let blobPath: RouterPath = "/xrpc/com.atproto.sync.getBlob"
-        router.get(blobPath) { request, _ async -> Response in
-            guard let cid = publicQueryValue("cid", request: request) else {
-                return publicMutationError(.notFound, "BlobNotFound")
-            }
-            let blob: PublicBlob?
-        do { blob = try await capability.directory.publicBlob(cid: cid) }
-            catch let error as SwanError {
-                return publicMutationResponse(error)
-            } catch {
-                return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
-            }
-            guard let blob else {
-                return publicMutationError(.notFound, "BlobNotFound")
-            }
-            var headers: HTTPFields = [
-                .contentType: safePublicBlobMIMEType(blob.mimeType),
-                .cacheControl: "no-store",
-            ]
-            headers[.contentLength] = String(blob.body.contentLength)
-            headers[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"
-            return Response(status: .ok, headers: headers, body: .init { writer in
-                try await blob.body.streamBody(maximumChunkBytes: 64 * 1_024) { chunk in
-                    try await writer.write(ByteBuffer(data: chunk))
-                }
-                try await writer.finish(nil)
-            })
+    router.get(blobPath) { request, _ async -> Response in
+        guard await publicBlobRequestHasNoBody(request) else {
+            return publicMutationError(.badRequest, "InvalidRequest")
         }
-    
+        let parameters: PublicBlobParameters
+        do {
+            parameters = try publicBlobParameters(request)
+        } catch {
+            return publicMutationError(.badRequest, "InvalidRequest")
+        }
+        let target: PublicRepositoryMutationTarget
+        do {
+            guard let resolved = try await capability.directory
+                .publicRepositoryMutationTarget(selector: parameters.did),
+                resolved.did == parameters.did else {
+                return publicMutationError(.badRequest, "RepoNotFound")
+            }
+            target = resolved
+        } catch {
+            return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
+        }
+        guard target.status == .active else {
+            return publicBlobLifecycleError(target.status)
+        }
+        guard let blobStore = target.store as? any StreamingBlobStore else {
+            return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
+        }
+        let blob: PublicBlob?
+        do {
+            blob = try await blobStore.publicBlob(cid: parameters.cid)
+        } catch {
+            return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
+        }
+        guard let blob else {
+            return publicMutationError(.notFound, "BlobNotFound")
+        }
+        var headers: HTTPFields = [
+            .contentType: safePublicBlobMIMEType(blob.mimeType),
+            .cacheControl: "no-store",
+        ]
+        headers[.contentLength] = String(blob.body.contentLength)
+        headers[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"
+        return Response(status: .ok, headers: headers, body: .init { writer in
+            try await blob.body.streamBody(maximumChunkBytes: 64 * 1_024) { chunk in
+                try await writer.write(ByteBuffer(data: chunk))
+            }
+            try await writer.finish(nil)
+        })
+    }
+    for method: HTTPRequest.Method in [
+        .head, .post, .put, .patch, .delete, .options, .connect, .trace,
+    ] {
+        router.on(blobPath, method: method) { _, _ -> Response in
+            publicMutationError(.notFound, "public_endpoint_unavailable")
+        }
+    }
 }
 
-private func publicQueryValue(_ name: String, request: Request) -> String? {
-    guard let query = request.uri.query else { return nil }
-    var value: String?
-    for pair in query.split(separator: "&", omittingEmptySubsequences: false) {
-        let pieces = pair.split(separator: "=", maxSplits: 1)
-        guard pieces.first == Substring(name) else { continue }
-        guard pieces.count == 2,
-              let decoded = String(pieces[1]).removingPercentEncoding,
-              value == nil else { return nil }
-        value = decoded
+private struct PublicBlobParameters {
+    let did: String
+    let cid: String
+}
+
+private func publicBlobParameters(_ request: Request) throws -> PublicBlobParameters {
+    let query = try strictAuthenticatedRecordQuery(
+        request,
+        required: ["did", "cid"],
+        optional: []
+    )
+    guard let rawDID = query["did"],
+          rawDID.utf8.count <= 2_048,
+          let did = try? DID(didString: rawDID),
+          did.didString() == rawDID,
+          let rawCID = query["cid"],
+          rawCID.utf8.count <= 256,
+          let cid = try? CID.parse(rawCID),
+          cid.string == rawCID,
+          cid.codec == .raw,
+          cid.multihash.algorithm == Multihash.sha256Code,
+          cid.multihash.length == Multihash.sha256Length,
+          cid.multihash.digest.count == Int(Multihash.sha256Length) else {
+        throw PublicMutationFailure.invalidRequest
     }
-    return value
+    return PublicBlobParameters(did: rawDID, cid: rawCID)
+}
+
+private func publicBlobRequestHasNoBody(_ request: Request) async -> Bool {
+    do {
+        let body = try await request.body.collect(upTo: 1)
+        return body.readableBytes == 0
+    } catch {
+        return false
+    }
+}
+
+private func publicBlobLifecycleError(_ status: AccountControlStatus) -> Response {
+    let code = switch status {
+    case .deactivated: "RepoDeactivated"
+    case .suspended: "RepoSuspended"
+    case .takendown: "RepoTakendown"
+    case .active: "InvalidRequest"
+    case .deleting, .deleted, .desynchronized, .throttled, .unknown:
+        "RepoNotFound"
+    }
+    return publicMutationError(.badRequest, code)
 }
 
 private func publicMutationInput<Value: Decodable>(

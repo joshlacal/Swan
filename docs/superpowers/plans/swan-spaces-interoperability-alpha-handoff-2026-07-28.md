@@ -567,7 +567,7 @@ and the live Compose proof passes. The alpha remains open for value-bearing
 incremental updates, compaction-gap/full-CAR recovery, reverse authority, and
 the complete cross-implementation OAuth/security/lifecycle/export matrix.
 
-## Current resume point: 2026-07-29
+## Historical checkpoint: 2026-07-29
 
 The current Swan jj working copy is clean. The latest committed slice is
 `17fe2ed5439a2b335d82f292f0a65a770de82836`
@@ -594,7 +594,7 @@ The latest verified evidence is:
   blocks, verified commit, and `promotedBlobCount: 1` in the ignored sanitized
   artifact `artifacts/reference-public-import-live.json`.
 
-Continue from this clean commit by closing or explicitly documenting the
+At that checkpoint, the next work was to close or explicitly document the
 remaining cross-implementation gates: a complete Swan/TypeScript semantic
 matrix for records, credentials, blobs, incremental sync, compaction-gap CAR
 recovery, corrupted traffic, and reverse authority where the pinned branch
@@ -603,7 +603,7 @@ matrix. The pinned TypeScript values-including `listRepoOps` SQLite ambiguity
 is an upstream divergence already recorded in the profile and must not be
 silently represented as a passing values test.
 
-## Current resume point: 2026-07-29 DID-bound promotion and reverse-authority probe
+## Historical checkpoint: 2026-07-29 DID-bound promotion and reverse-authority probe
 
 The public blob promotion seam now binds the request selector to the managed
 SQLite account before it performs any network I/O. `SQLiteAccountDatabase`
@@ -656,3 +656,56 @@ Next continuation should therefore:
 The disposable reverse-authority credentials used for this probe remain only
 in the owner-only external lab secret directory; no token, password, selector,
 or body was checked into Swan.
+
+The Linux clean-cache Compose image also now carries the checked-in notification
+configuration and Caddyfile in small pinned image layers. This avoids Docker
+Desktop/native-Linux file-bind inference (which can turn a file target into a
+directory during OCI setup) while retaining the same read-only runtime paths.
+
+## Current status: 2026-07-29 continuation checkpoint
+
+The focused Swift gates remain green when run serially with one unique SwiftPM
+scratch path: `PublicRepositoryReadHTTPTests` is 8/8; the stateful evaluator is
+3/3; the PLC-backed remote credential resolver is 4/4; the hash-only Mailpit
+email-token storage test is 1/1; and the recursive artifact-sanitization test
+passes. The rebuilt `swan` image also starts successfully and is healthy in the
+existing Compose lab after the remote PLC resolver was wired into the
+notification configuration.
+
+The clean-cache macOS runner completed from
+`/private/tmp/swan-clean-cache-status-20260729`: all Swift test targets passed
+with zero failures. The default suite reported only its documented opt-in
+256 MiB skips; no SwiftPM dependency-resolution hang remained when the run was
+serialized with one process and `--jobs 1`.
+
+The previously hanging public-read command was dependency/build contention, not
+a test deadlock. Use one process at a time, `--jobs 1`, and an isolated
+`--scratch-path`; terminate stale `swift`, `swift-frontend`, and Jest processes
+before retrying.
+
+The disposable TypeScript recovery overlay now applies and passes its
+integrity checks without mutating `.interop-cache`; it is deliberately not
+installed into the default Compose image because the exact pinned reference
+branch has its own unsupported `getRepo`/value-bearing sync behavior. The
+overlay is a qualification aid, not evidence of exact-pin convergence.
+
+The alpha is still open. The strict live matrix is currently an endpoint-probe
+artifact rather than a semantic convergence proof. Remaining blockers are:
+
+- a real value-bearing incremental-sync path and compaction-gap/full-CAR
+  recovery across implementations;
+- corrupted-operation/CAR rejection with durable last-good-state evidence;
+- a reproducible dynamic reverse-authority key test (the controlled static-pin
+  proof passes, but the ordinary config has no authority pin);
+- the cross-implementation OAuth/browser-provider adapter and full lifecycle,
+  export/restore, and SSRF/DPoP negative matrix;
+- Mailpit HTTP/CLI wiring and SMTP response validation (durable token storage
+  exists, but the service is not yet an exposed account-control flow);
+- clean-cache Linux acceptance from the current working copy; macOS now passes
+  the full clean-cache Swift suite with zero failures, while its three 256 MiB
+  stress gates remain opt-in and were skipped in the default run.
+
+Do not mark the alpha complete or describe the endpoint-probe artifact as full
+convergence until those gates have current, sanitized evidence. The working
+copy contains the uncommitted implementation slices; review them with `jj
+diff`, rerun the serialized gates, then commit with jj before handing off.

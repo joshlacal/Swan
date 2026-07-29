@@ -715,6 +715,101 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testApplyWritesCreateRejectsMalformedPresentRKeyWithoutMutationAndAcceptsOmission() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let inspectionDatabase = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root,
+            did: Self.alice
+        )
+        do {
+            let loadedInitialSnapshot =
+                try await inspectionDatabase.repositorySnapshot(
+                    space: fixture.space,
+                    author: Self.alice
+                )
+            let initialSnapshot = try XCTUnwrap(
+                loadedInitialSnapshot
+            )
+            let malformedRKeys = [
+                ("invalid-string", #""bad/key""#),
+                ("wrong-type", "7"),
+                ("null", "null"),
+            ]
+            let app = try makeServer(fixture).buildApplication(
+                logger: Logger(label: "PermissionedRecordReadHTTPTests.strict-rkey")
+            )
+
+            try await app.test(.router) { client in
+                for (name, rkey) in malformedRKeys {
+                    let body = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","writes":[{"$type":"com.atproto.space.applyWrites#create","collection":"\#(Self.collection)","rkey":\#(rkey),"value":{"$type":"app.bsky.feed.post","text":"must-not-appear"}}]}"#
+                    let response = try await client.execute(
+                        uri: Self.applyPath,
+                        method: .post,
+                        headers: try self.writeHeaders(
+                            fixture,
+                            path: Self.applyPath,
+                            jti: "apply-malformed-\(name)"
+                        ),
+                        body: ByteBuffer(string: body)
+                    )
+
+                    XCTAssertEqual(response.status, .badRequest, name)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest", name)
+                    self.assertNoStore(response)
+                    let snapshotAfterRejectedRequest =
+                        try await inspectionDatabase.repositorySnapshot(
+                            space: fixture.space,
+                            author: Self.alice
+                        )
+                    XCTAssertEqual(
+                        snapshotAfterRejectedRequest,
+                        initialSnapshot,
+                        name
+                    )
+                }
+
+                let omitted = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","writes":[{"$type":"com.atproto.space.applyWrites#create","collection":"\#(Self.collection)","value":{"$type":"app.bsky.feed.post","text":"generated-rkey"}}]}"#
+                let response = try await client.execute(
+                    uri: Self.applyPath,
+                    method: .post,
+                    headers: try self.writeHeaders(
+                        fixture,
+                        path: Self.applyPath,
+                        jti: "apply-omitted-rkey-strict-decoder"
+                    ),
+                    body: ByteBuffer(string: omitted)
+                )
+
+                XCTAssertEqual(
+                    response.status,
+                    .ok,
+                    String(decoding: response.body.readableBytesView, as: UTF8.self)
+                )
+                let results = try XCTUnwrap(
+                    (try self.jsonObject(response.body))["results"] as? [[String: Any]]
+                )
+                XCTAssertEqual(results.count, 1)
+                XCTAssertTrue(
+                    try XCTUnwrap(results.first?["uri"] as? String)
+                        .hasPrefix("\(fixture.space.rawValue)/\(Self.alice)/\(Self.collection)/")
+                )
+                let snapshotAfterOmittedRKey =
+                    try await inspectionDatabase.repositorySnapshot(
+                        space: fixture.space,
+                        author: Self.alice
+                    )
+                XCTAssertNotEqual(snapshotAfterOmittedRKey, initialSnapshot)
+            }
+            try await inspectionDatabase.close()
+            try await close(fixture)
+        } catch {
+            try? await inspectionDatabase.close()
+            try? await close(fixture)
+            throw error
+        }
+    }
+
     func testWriteBoundaryScopesReplayAndPrivateIsolation() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -908,7 +1003,11 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
             _ = try await control.createAccount(registration(did: Self.bob, handle: "bob.example.com"))
             let records = try await installRecords(root: root, space: space, foreignSpace: foreignSpace)
             try await installEmptyAccountDatabase(root: root, did: Self.bob)
-            let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(dataDirectory: root, controlStore: control)
+            let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+                dataDirectory: root,
+                controlStore: control,
+                publicIdentityVerifier: nil
+            )
             let runtime = try SwanOAuthRuntime(controlStore: control, serverKey: Data(repeating: 0xB7, count: 32))
             let alice = try await issueToken(runtime, subject: Self.alice, scopes: ["atproto"])
             let bob = try await issueToken(runtime, subject: Self.bob, scopes: ["atproto"])
@@ -996,7 +1095,7 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
 
     private func makeServer(_ fixture: Fixture) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
-            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-30.json")
         )
         return SwanHTTPServer(
             profile: profile,

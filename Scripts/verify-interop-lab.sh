@@ -4,9 +4,54 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
+override_names=(
+  SWAN_INTEROP_COMPOSE_FILE
+  SWAN_INTEROP_NOTIFICATION_CONFIG_FILE
+  SWAN_INTEROP_NOTIFICATION_RESTART_SCENARIO
+  SWAN_INTEROP_REFERENCE_PDS_DOCKERFILE
+  SWAN_INTEROP_REFERENCE_PLC_DOCKERFILE
+  SWAN_INTEROP_CADDYFILE
+  SWAN_INTEROP_SWAN_DOCKERIGNORE
+  SWAN_INTEROP_REFERENCE_PDS_DOCKERIGNORE
+  SWAN_INTEROP_REFERENCE_PLC_DOCKERIGNORE
+)
+for override_name in "${override_names[@]}"; do
+  if [[ -n "${!override_name:-}" ]] \
+    && [[ "${SWAN_INTEROP_VERIFIER_TEST_MODE:-0}" != "1" ]]
+  then
+    echo "verifier input overrides require mutation-test mode" >&2
+    exit 64
+  fi
+done
+
 compose_file="${SWAN_INTEROP_COMPOSE_FILE:-docker-compose.yml}"
-if [[ ! -f "$compose_file" ]]; then
-  echo "interop Compose file is missing" >&2
+notification_config_file="${SWAN_INTEROP_NOTIFICATION_CONFIG_FILE:-interop/notification-config.json}"
+notification_restart_scenario="${SWAN_INTEROP_NOTIFICATION_RESTART_SCENARIO:-Scripts/run-notification-restart-acceptance.sh}"
+reference_pds_dockerfile="${SWAN_INTEROP_REFERENCE_PDS_DOCKERFILE:-interop/Dockerfile.reference-pds}"
+reference_plc_dockerfile="${SWAN_INTEROP_REFERENCE_PLC_DOCKERFILE:-interop/Dockerfile.reference-plc}"
+caddyfile="${SWAN_INTEROP_CADDYFILE:-interop/Caddyfile}"
+swan_dockerignore="${SWAN_INTEROP_SWAN_DOCKERIGNORE:-Dockerfile.dockerignore}"
+reference_pds_dockerignore="${SWAN_INTEROP_REFERENCE_PDS_DOCKERIGNORE:-interop/Dockerfile.reference-pds.dockerignore}"
+reference_plc_dockerignore="${SWAN_INTEROP_REFERENCE_PLC_DOCKERIGNORE:-interop/Dockerfile.reference-plc.dockerignore}"
+
+for required_file in \
+  "$compose_file" \
+  "$notification_config_file" \
+  "$notification_restart_scenario" \
+  "$reference_pds_dockerfile" \
+  "$reference_plc_dockerfile" \
+  "$caddyfile" \
+  "$swan_dockerignore" \
+  "$reference_pds_dockerignore" \
+  "$reference_plc_dockerignore"
+do
+  if [[ ! -f "$required_file" ]]; then
+    echo "interop verifier input is missing: ${required_file}" >&2
+    exit 1
+  fi
+done
+if [[ ! -x "$notification_restart_scenario" ]]; then
+  echo "notification restart scenario must be executable" >&2
   exit 1
 fi
 
@@ -75,6 +120,7 @@ runner_block="$(service_block scenario-runner)"
 # Compose may interpolate the external directory path, never secret values.
 interpolations="$(rg -o '\$\{[^}]+\}' "$compose_file" || true)"
 interpolation_count="$(printf '%s\n' "$interpolations" | awk 'NF { count += 1 } END { print count + 0 }')"
+# shellcheck disable=SC2016 # Compare the literal Compose interpolation form.
 if [[ "$interpolation_count" -ne 1 ]] \
   || [[ "$interpolations" != '${SWAN_INTEROP_SECRETS_DIR:?set the owner-only lab interop secret directory path}' ]]; then
   echo "Compose interpolation is limited to the external secret directory path" >&2
@@ -110,11 +156,14 @@ require_contains "$bootstrap_block" $'swan-secrets-init:\n        condition: ser
 require_contains "$bootstrap_block" $'swan-data-init:\n        condition: service_completed_successfully' "bootstrap must wait for prepared data"
 reject_contains "$bootstrap_block" 'user: root' "bootstrap must not run as root"
 reject_contains "$bootstrap_block" 'privileged:' "bootstrap must not be privileged"
+# shellcheck disable=SC2016 # Reject the literal interpolation prefix.
 reject_contains "$bootstrap_block" '${SWAN_INTEROP_SECRETS_DIR' "bootstrap must not mount host secrets directly"
 
 # The long-running runtime is explicitly unprivileged and receives only the
 # two-file runtime volume, never bootstrap passwords/operator material.
 require_contains "$swan_block" 'user: swan' "Swan runtime must explicitly run as swan"
+require_contains "$swan_block" 'read_only: true' "Swan runtime root filesystem must be read-only"
+require_contains "$swan_block" '/tmp:size=16m,mode=1777' "Swan runtime must have only a bounded writable temporary filesystem"
 reject_contains "$swan_block" 'user: root' "Swan runtime must not run as root"
 reject_contains "$swan_block" 'privileged:' "Swan runtime must not be privileged"
 reject_contains "$swan_block" 'cap_add:' "Swan runtime must not add capabilities"
@@ -123,11 +172,23 @@ require_contains "$swan_block" 'swan-runtime-secrets:/run/secrets/swan-runtime:r
 reject_contains "$swan_block" 'swan-bootstrap-secrets' "runtime must not receive bootstrap-only secrets"
 reject_contains "$swan_block" 'operator-secret' "runtime must not receive the operator secret"
 reject_contains "$swan_block" '.password' "runtime must not receive account passwords"
+# shellcheck disable=SC2016 # Reject the literal interpolation prefix.
 reject_contains "$swan_block" '${SWAN_INTEROP_SECRETS_DIR' "runtime must not mount host secrets directly"
 require_contains "$swan_block" '--oauth-server-key-file' "file-backed OAuth server key flag is missing"
 require_contains "$swan_block" '/run/secrets/swan-runtime/oauth-server-key' "OAuth server key path is wrong"
 require_contains "$swan_block" '--enable-oauth-authorization-server' "Compose must enable the complete OAuth authorization server"
 require_contains "$swan_block" '--oauth-allow-localhost-development-client' "Compose must declare its localhost client metadata exception"
+require_contains "$swan_block" '--login-trusted-proxy-peer' "Compose must declare its exact login trusted proxy"
+require_contains "$swan_block" '"172.30.0.2"' "Compose login trusted proxy must match Caddy's fixed peer"
+require_contains "$swan_block" '--notification-config' "Compose must load the checked-in lab notification configuration"
+require_contains "$swan_block" '/etc/swan/interop/notification-config.json' "Compose notification configuration path is wrong"
+require_contains "$swan_block" '--enable-notification-delivery' "Compose must enable durable notification delivery and restart recovery"
+require_contains "$swan_block" '--enable-email-recovery' "Compose must enable durable account-email recovery"
+require_contains "$swan_block" '--email-proof-key-file' "Compose email proof key flag is missing"
+require_contains "$swan_block" '/run/secrets/swan-runtime/email-proof-key' "Compose email proof key path is wrong"
+require_contains "$swan_block" '--email-smtp-host' "Compose email SMTP host flag is missing"
+require_contains "$swan_block" 'mailpit' "Compose email delivery must target the isolated Mailpit service"
+reject_contains "$swan_block" './interop/notification-config.json:' "Compose must not use a host file bind for notification configuration"
 require_contains "$swan_block" '--managing-service-audience' "Compose must enable checkUserAccess service verification"
 reject_contains "$swan_block" '--enable-localhost-oauth' "Compose must not use the narrower localhost-only OAuth bridge"
 require_contains "$swan_block" '--enable-local-space-interop' "local-space interop flag is missing"
@@ -143,6 +204,7 @@ require_contains "$swan_block" $'swan-bootstrap:\n        condition: service_com
 require_contains "$reference_block" 'reference-pds-secrets:/run/secrets/reference-pds:ro' "PDS secrets must use the read-only prepared volume"
 require_contains "$reference_block" 'REFERENCE_PDS_SECRETS_DIR: /run/secrets/reference-pds' "PDS file-secret directory is missing"
 require_contains "$reference_block" $'swan-secrets-init:\n        condition: service_completed_successfully' "PDS must wait for prepared secrets"
+# shellcheck disable=SC2016 # Reject any literal Compose interpolation.
 reject_contains "$reference_block" '${' "PDS must not interpolate environment values"
 reject_contains "$reference_block" 'PDS_DPOP_SECRET:' "PDS DPoP secret must not be in Compose environment"
 reject_contains "$reference_block" 'PDS_JWT_SECRET:' "PDS JWT secret must not be in Compose environment"
@@ -163,10 +225,21 @@ require_contains "$caddy_block" $'swan:\n        condition: service_healthy' "Ca
 require_contains "$caddy_block" '"127.0.0.1:443:443"' "Caddy must be the loopback-only host ingress"
 require_contains "$caddy_block" 'test -s /data/caddy/pki/authorities/local/root.crt' "Caddy CA healthcheck is missing"
 require_contains "$caddy_block" 'aliases:' "Caddy TLS aliases are missing"
+require_contains "$caddy_block" 'ipv4_address: 172.30.0.2' "Caddy must have the fixed login-proxy peer address"
+require_contains "$toxiproxy_block" 'ipv4_address: 172.30.0.8' "Toxiproxy must reserve an address distinct from Caddy"
+require_contains "$caddy_block" 'dockerfile: Swan/interop/Dockerfile.caddy' "Caddy must use the pinned checked-in config image"
+reject_contains "$caddy_block" './interop/Caddyfile:' "Caddy must not use a host file bind"
 require_contains "$caddy_block" 'swan.test' "Caddy must own the swan.test network alias"
 require_contains "$caddy_block" 'pds.test' "Caddy must own the pds.test network alias"
 reject_contains "$mailpit_block" 'ports:' "Mailpit must not publish a host port"
+require_contains "$mailpit_block" 'healthcheck:' "Mailpit must expose a readiness healthcheck"
+require_contains "$mailpit_block" '8025/api/v1/info' "Mailpit healthcheck must use its local HTTP API"
+require_contains "$swan_block" $'mailpit:\n        condition: service_healthy' "Swan must wait for Mailpit readiness"
 reject_contains "$toxiproxy_block" 'ports:' "Toxiproxy must not publish a host port"
+if ! rg -q '^[[:space:]]+- subnet: 172\.30\.0\.0/24$' "$compose_file"; then
+  echo "interop network must use the fixed login-proxy subnet" >&2
+  exit 1
+fi
 published_port_count="$(rg -c '^[[:space:]]+ports:' "$compose_file" || true)"
 if [[ "$published_port_count" -ne 1 ]]; then
   echo "Caddy must be the only service with a published host port" >&2
@@ -199,25 +272,42 @@ reject_contains "$runner_block" 'https://' "planned runner must not name a live 
 reject_contains "$runner_block" 'toxiproxy' "planned runner must not mutate Toxiproxy"
 reject_contains "$runner_block" 'privileged:' "scenario runner must not be privileged"
 
-rg -q 'permissioned-data-0016-2026-07-03' Sources/SwanInterop/SwanInterop.swift
+rg -q 'permissioned-data-0016-2026-07-30' Sources/SwanInterop/SwanInterop.swift
 rg -q '1caad93dbb1f445396f6abf3b97eb4040345e78e' Sources/SwanInterop/SwanInterop.swift
-rg -q '3f6c96d5d2d25438bd40fa89d6ecc37865f8e354' interop/Dockerfile.reference-pds
-rg -q '1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea' interop/Dockerfile.reference-pds
-rg -q 'tls internal' interop/Caddyfile
-rg -q 'reverse_proxy toxiproxy:8666' interop/Caddyfile
+rg -q '3f6c96d5d2d25438bd40fa89d6ecc37865f8e354' "$reference_pds_dockerfile"
+rg -q '1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea' "$reference_pds_dockerfile"
+rg -q 'tls internal' "$caddyfile"
+rg -q 'reverse_proxy toxiproxy:8666' "$caddyfile"
+delete_client_header_count="$(
+  rg -c '^[[:space:]]*header_up -X-Swan-Client-IP$' "$caddyfile" || true
+)"
+if [[ "${delete_client_header_count:-0}" -ne 1 ]]; then
+  echo "Caddy must delete the inbound login client identity header exactly once" >&2
+  exit 1
+fi
+set_client_header_count="$(
+  rg -c '^[[:space:]]*header_up X-Swan-Client-IP \{http\.request\.remote\.host\}$' \
+    "$caddyfile" || true
+)"
+if [[ "${set_client_header_count:-0}" -ne 1 ]]; then
+  echo "Caddy must set the login client identity from its direct peer exactly once" >&2
+  exit 1
+fi
+rg -q '^FROM caddy:2\.10\.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d$' interop/Dockerfile.caddy
+rg -q '^COPY Swan/interop/Caddyfile /etc/caddy/Caddyfile$' interop/Dockerfile.caddy
 
-rg -qx 'FROM swift:6\.1-jammy AS build' Dockerfile
+rg -qx 'FROM swift:6\.1-jammy@sha256:12be34a341945adb64914405ed7b568fcb2d35edbd63a3755007e47dce59456e AS build' Dockerfile
 rg -q 'libsodium-dev pkg-config' Dockerfile
 # The runtime keeps the Swift 6.1 standard-library surface alongside the
 # release executable. A minimal Ubuntu runtime would omit those libraries and
 # fail only after the container passes image build.
-rg -qx 'FROM swift:6\.1-jammy' Dockerfile
+rg -qx 'FROM swift:6\.1-jammy@sha256:12be34a341945adb64914405ed7b568fcb2d35edbd63a3755007e47dce59456e' Dockerfile
 rg -q 'libsodium23' Dockerfile
 rg -q 'COPY Swan/interop/bootstrap-local-space\.sh /usr/local/bin/swan-interop-bootstrap' Dockerfile
 rg -q 'COPY Swan/interop/prepare-interop-secrets\.sh /usr/local/bin/swan-interop-prepare-secrets' Dockerfile
 rg -q 'COPY Swan/interop/prepare-caddy-trust\.sh /usr/local/bin/swan-interop-caddy-trust' Dockerfile
-rg -q 'COPY Swan/interop/run-reference-pds\.sh /usr/local/bin/reference-pds-with-file-secrets' interop/Dockerfile.reference-pds
-rg -q '^CMD \["/usr/local/bin/reference-pds-with-file-secrets",' interop/Dockerfile.reference-pds
+rg -q 'COPY Swan/interop/run-reference-pds\.sh /usr/local/bin/reference-pds-with-file-secrets' "$reference_pds_dockerfile"
+rg -q '^CMD \["/usr/local/bin/reference-pds-with-file-secrets",' "$reference_pds_dockerfile"
 rg -q 'find "\$source" -perm /077' interop/prepare-interop-secrets.sh
 rg -q 'install -o "\$owner" -g "\$group" -m 0400' interop/prepare-interop-secrets.sh
 rg -q 'prepare_directory "\$runtime_directory" swan swan' interop/prepare-interop-secrets.sh
@@ -226,14 +316,304 @@ rg -q 'source_certificate="/caddy-data/caddy/pki/authorities/local/root\.crt"' i
 rg -q 'install -o swan -g swan -m 0444' interop/prepare-caddy-trust.sh
 rg -q 'verify-secret-source\.sh "\$root" "\$SWAN_INTEROP_SECRETS_DIR"' interop/compose.sh
 
-for reference_dockerfile in interop/Dockerfile.reference-pds interop/Dockerfile.reference-plc; do
-  ! rg -q '^ARG[[:space:]]+REFERENCE_ARCHIVE_SHA256' "$reference_dockerfile"
+# The checked-in notification configuration is intentionally lab-only public
+# material. It must not be a hidden private-key or secret input channel.
+python3 - "$notification_config_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+
+
+class DuplicateField(ValueError):
+    pass
+
+
+def reject_duplicate_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateField(key)
+        result[key] = value
+    return result
+
+
+try:
+    configuration = json.loads(
+        path.read_text(encoding="utf-8"),
+        object_pairs_hook=reject_duplicate_pairs,
+    )
+except DuplicateField as error:
+    raise SystemExit(
+        "checked-in notification configuration has a duplicate field: "
+        f"{error}"
+    ) from error
+
+secret_field_tokens = ("private", "secret", "password", "token")
+
+
+def reject_secret_fields(value, location="$"):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise SystemExit(
+                    f"checked-in notification configuration has a non-string field at {location}"
+                )
+            child_location = f"{location}.{key}"
+            if any(token in key.lower() for token in secret_field_tokens):
+                raise SystemExit(
+                    "checked-in notification configuration contains a "
+                    f"secret-like field: {child_location}"
+                )
+            reject_secret_fields(child, child_location)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            reject_secret_fields(child, f"{location}[{index}]")
+
+
+def require_object(value, location, allowed, required):
+    if not isinstance(value, dict):
+        raise SystemExit(
+            f"checked-in notification configuration expected an object at {location}"
+        )
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise SystemExit(
+            "checked-in notification configuration has unknown fields "
+            f"at {location}: {', '.join(unknown)}"
+        )
+    missing = sorted(required - set(value))
+    if missing:
+        raise SystemExit(
+            "checked-in notification configuration is missing fields "
+            f"at {location}: {', '.join(missing)}"
+        )
+
+
+def require_array(value, location):
+    if not isinstance(value, list):
+        raise SystemExit(
+            f"checked-in notification configuration expected an array at {location}"
+        )
+    if len(value) > 128:
+        raise SystemExit(
+            f"checked-in notification configuration has too many entries at {location}"
+        )
+
+
+def require_string(value, location):
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 2_048:
+        raise SystemExit(
+            f"checked-in notification configuration expected a bounded string at {location}"
+        )
+
+
+reject_secret_fields(configuration)
+required_root = {
+    "credentialPublicKeys",
+    "servicePublicKeys",
+    "authorityDestinations",
+    "registrationDestinations",
+    "recipientServiceBindings",
+    "managingServiceAudience",
+    "credentialKeyPLC",
+}
+allowed_root = required_root | {"delegationPublicKeys"}
+require_object(configuration, "$", allowed_root, required_root)
+
+credential_fields = {
+    "issuer",
+    "keyID",
+    "generation",
+    "algorithm",
+    "publicKey",
+    "p256X963",
+    "secp256k1",
+}
+service_fields = credential_fields - {"keyID"}
+string_key_fields = {
+    "issuer",
+    "keyID",
+    "algorithm",
+    "publicKey",
+    "p256X963",
+    "secp256k1",
+}
+
+for collection_name in ("credentialPublicKeys", "delegationPublicKeys"):
+    entries = configuration.get(collection_name, [])
+    require_array(entries, f"$.{collection_name}")
+    for index, entry in enumerate(entries):
+        location = f"$.{collection_name}[{index}]"
+        require_object(entry, location, credential_fields, {"issuer", "generation"})
+        for field in string_key_fields & set(entry):
+            require_string(entry[field], f"{location}.{field}")
+        generation = entry["generation"]
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise SystemExit(
+                f"checked-in notification configuration has an invalid generation at {location}"
+            )
+        if not any(entry.get(field) for field in ("publicKey", "p256X963", "secp256k1")):
+            raise SystemExit(
+                f"checked-in notification configuration has no public key at {location}"
+            )
+
+service_entries = configuration["servicePublicKeys"]
+require_array(service_entries, "$.servicePublicKeys")
+for index, entry in enumerate(service_entries):
+    location = f"$.servicePublicKeys[{index}]"
+    require_object(entry, location, service_fields, {"issuer", "generation"})
+    for field in string_key_fields & set(entry):
+        require_string(entry[field], f"{location}.{field}")
+    generation = entry["generation"]
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise SystemExit(
+            f"checked-in notification configuration has an invalid generation at {location}"
+        )
+    if not any(entry.get(field) for field in ("publicKey", "p256X963", "secp256k1")):
+        raise SystemExit(
+            f"checked-in notification configuration has no public key at {location}"
+        )
+
+destination_fields = {"key", "endpoint", "audience", "finalPeer"}
+for collection_name in ("authorityDestinations", "registrationDestinations"):
+    destinations = configuration[collection_name]
+    require_array(destinations, f"$.{collection_name}")
+    for index, destination in enumerate(destinations):
+        location = f"$.{collection_name}[{index}]"
+        require_object(
+            destination,
+            location,
+            destination_fields,
+            destination_fields,
+        )
+        for field in destination_fields:
+            require_string(destination[field], f"{location}.{field}")
+        if (
+            destination["endpoint"] != "http://localhost:3001"
+            or destination["finalPeer"] != "127.0.0.1"
+        ):
+            raise SystemExit(
+                "checked-in notification destination is not loopback-lab-only"
+            )
+
+expected_authority = "did:plc:abcdefghijklmnopqrstuvwx"
+if configuration["authorityDestinations"] != [
+    {
+        "key": expected_authority,
+        "endpoint": "http://localhost:3001",
+        "audience": expected_authority,
+        "finalPeer": "127.0.0.1",
+    }
+]:
+    raise SystemExit(
+        "checked-in notification authority route is not the fixed restart laboratory"
+    )
+if configuration["registrationDestinations"]:
+    raise SystemExit(
+        "checked-in notification configuration must not contain registration routes"
+    )
+
+bindings = configuration["recipientServiceBindings"]
+require_array(bindings, "$.recipientServiceBindings")
+binding_fields = {"serviceIdentity", "recipientAccount"}
+for index, binding in enumerate(bindings):
+    location = f"$.recipientServiceBindings[{index}]"
+    require_object(binding, location, binding_fields, binding_fields)
+    for field in binding_fields:
+        require_string(binding[field], f"{location}.{field}")
+if bindings:
+    raise SystemExit(
+        "checked-in notification configuration must not contain recipient bindings"
+    )
+if (
+    configuration["credentialPublicKeys"]
+    or configuration.get("delegationPublicKeys", [])
+    or configuration["servicePublicKeys"]
+):
+    raise SystemExit(
+        "checked-in notification configuration must not contain static key material"
+    )
+
+require_string(configuration["managingServiceAudience"], "$.managingServiceAudience")
+if configuration["managingServiceAudience"] != "did:web:interop-swan-managing-service":
+    raise SystemExit("checked-in notification configuration is not lab-scoped")
+plc = configuration["credentialKeyPLC"]
+plc_fields = {"origin", "laboratory", "allowlistedHost"}
+require_object(plc, "$.credentialKeyPLC", plc_fields, plc_fields)
+if plc != {
+    "origin": "http://reference-plc:2582",
+    "laboratory": True,
+    "allowlistedHost": "reference-plc",
+}:
+    raise SystemExit("checked-in notification PLC resolver is not the pinned lab origin")
+PY
+
+# The live closure is opt-in, but its proof contract is checked offline. It
+# must crash the delivery-disabled seed, make the proxy ready before recovery,
+# force a lost acknowledgement, start normal Compose after convergence, and
+# correlate one durable receipt without reading a record table or retaining the
+# generated permissioned value.
+bash -n "$notification_restart_scenario"
+for required_contract in \
+  'docker kill --signal KILL' \
+  'permissioned_space_outbox' \
+  'permissioned_space_notification_receipts' \
+  'WHERE issuer = ? AND event_id = ? AND space_uri = ?' \
+  'readonly: true' \
+  'successfulForwards' \
+  'uniqueRequestDigests' \
+  'droppedAcknowledgements' \
+  'returnedAcknowledgements' \
+  'NOTIFICATION RESTART OUTBOX CONVERGENCE OK: successful_forwards=2 receiver_effects=1'
+do
+  if ! rg -Fq "$required_contract" "$notification_restart_scenario"; then
+    echo "notification restart scenario is missing its durable convergence contract" >&2
+    exit 1
+  fi
+done
+python3 - "$notification_restart_scenario" <<'PY'
+import sys
+from pathlib import Path
+
+scenario = Path(sys.argv[1]).read_text(encoding="utf-8")
+anchors = (
+    'proxy_id="$(',
+    'until [[ -f "$temporary_directory/ready" ]]',
+    'recovery_id="$(',
+    'wait_for_swan_http "$recovery_container" "recovery-enabled Swan"',
+)
+positions = [scenario.find(anchor) for anchor in anchors]
+if any(position < 0 for position in positions) or positions != sorted(positions):
+    raise SystemExit(
+        "notification restart scenario must make the loopback proxy ready "
+        "before recovery starts"
+    )
+PY
+if rg -n \
+  'set[[:space:]]+-x|docker[[:space:]]+logs|cat[[:space:]].*permissioned-record|tee[[:space:]].*permissioned-record' \
+  "$notification_restart_scenario"
+then
+  echo "notification restart scenario contains a value-bearing log path" >&2
+  exit 1
+fi
+
+for reference_dockerfile in "$reference_pds_dockerfile" "$reference_plc_dockerfile"; do
+  if rg -q '^ARG[[:space:]]+REFERENCE_ARCHIVE_SHA256' "$reference_dockerfile"; then
+    echo "reference image Dockerfiles must not accept an archive checksum build argument" >&2
+    exit 1
+  fi
   rg -q '^RUN echo "1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea  /tmp/reference\.tar\.gz" \| sha256sum -c -' "$reference_dockerfile"
 done
 
 # Every build context is an allowlist and excludes secret/state paths. The
 # pinned reference builds expose only the verified archive exception.
-for ignore_file in Dockerfile.dockerignore interop/Dockerfile.reference-pds.dockerignore interop/Dockerfile.reference-plc.dockerignore; do
+for ignore_file in \
+  "$swan_dockerignore" \
+  "$reference_pds_dockerignore" \
+  "$reference_plc_dockerignore"
+do
   rg -qx '\*\*' "$ignore_file"
   rg -qx '!Swan/' "$ignore_file"
   rg -qx '!Petrel/' "$ignore_file"
@@ -245,16 +625,259 @@ for ignore_file in Dockerfile.dockerignore interop/Dockerfile.reference-pds.dock
   rg -qx '\*\*/\.swan-interop-secrets/' "$ignore_file"
   rg -qx '\*\*/\.swan-interop-secrets/\*\*' "$ignore_file"
 done
-rg -qx 'Swan/\.interop-cache/\*\*' Dockerfile.dockerignore
-! rg -q '^!Swan/\.interop-cache/atproto-' Dockerfile.dockerignore
-for ignore_file in interop/Dockerfile.reference-pds.dockerignore interop/Dockerfile.reference-plc.dockerignore; do
+rg -qx 'Swan/\.interop-cache/\*\*' "$swan_dockerignore"
+if rg -q '^!Swan/\.interop-cache/atproto-' "$swan_dockerignore"; then
+  echo "the Swan image build context must not expose a reference-source cache exception" >&2
+  exit 1
+fi
+for ignore_file in "$reference_pds_dockerignore" "$reference_plc_dockerignore"; do
   rg -qx 'Swan/\.interop-cache/\*\*' "$ignore_file"
   rg -qx '!Swan/\.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354\.tar\.gz' "$ignore_file"
 done
 
-if rg -n '^[[:space:]]*RUN .*\b(curl|git clone|git fetch)\b' interop/Dockerfile.reference-pds interop/Dockerfile.reference-plc; then
+if rg -n '^[[:space:]]*RUN .*\b(curl|git clone|git fetch)\b' \
+  "$reference_pds_dockerfile" "$reference_plc_dockerfile"
+then
   echo "reference image Dockerfiles must not fetch source from the network" >&2
   exit 1
+fi
+
+verify_effective_compose() {
+  local effective_secret_source="/var/empty/swan-interop-verifier-secrets"
+  local effective_json=""
+  effective_json="$(mktemp "${TMPDIR:-/tmp}/swan-effective-compose.XXXXXX")"
+
+  if ! SWAN_INTEROP_SECRETS_DIR="$effective_secret_source" \
+    docker compose \
+      --profile planned-not-executed \
+      -f "$compose_file" \
+      config --format json >"$effective_json"
+  then
+    rm -f "$effective_json"
+    echo "effective Compose configuration could not be rendered" >&2
+    exit 1
+  fi
+
+  if python3 - "$effective_json" "$effective_secret_source" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+configuration = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+effective_secret_source = sys.argv[2]
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+services = configuration.get("services")
+if not isinstance(services, dict):
+    fail("effective Compose configuration has no service map")
+
+required_services = {
+    "swan-secrets-init",
+    "swan-data-init",
+    "swan-bootstrap",
+    "swan",
+    "reference-pds",
+    "reference-plc",
+    "caddy",
+    "caddy-ca-ready",
+    "mailpit",
+    "toxiproxy",
+    "toxiproxy-setup",
+    "scenario-runner",
+}
+if set(services) != required_services:
+    fail("effective Compose service set does not match the laboratory profile")
+
+swan = services["swan"]
+if swan.get("user") != "swan":
+    fail("effective Compose Swan runtime must run as swan")
+if swan.get("read_only") is not True:
+    fail("effective Compose Swan runtime root filesystem must be read-only")
+if swan.get("privileged") not in (None, False):
+    fail("effective Compose Swan runtime must not be privileged")
+if swan.get("cap_add"):
+    fail("effective Compose Swan runtime must not add capabilities")
+if swan.get("depends_on", {}).get("swan-bootstrap", {}).get("condition") != (
+    "service_completed_successfully"
+):
+    fail("effective Compose Swan runtime must wait for successful bootstrap")
+command = swan.get("command", [])
+if (
+    not isinstance(command, list)
+    or command.count("--enable-notification-delivery") != 1
+    or command.count("--notification-config") != 1
+    or command.count("/etc/swan/interop/notification-config.json") != 1
+):
+    fail("effective Compose Swan runtime must enable pinned notification recovery")
+if (
+    command.count("--enable-email-recovery") != 1
+    or command.count("--email-proof-key-file") != 1
+    or command.count("/run/secrets/swan-runtime/email-proof-key") != 1
+    or command.count("--email-smtp-host") != 1
+    or command.count("mailpit") != 1
+):
+    fail("effective Compose Swan runtime must enable Mailpit account-email recovery")
+if swan.get("depends_on", {}).get("mailpit", {}).get("condition") != "service_healthy":
+    fail("effective Compose Swan runtime must wait for healthy Mailpit")
+mailpit = services["mailpit"]
+if "healthcheck" not in mailpit or "8025/api/v1/info" not in str(mailpit["healthcheck"]):
+    fail("effective Compose Mailpit readiness healthcheck is missing")
+if (
+    command.count("--login-trusted-proxy-peer") != 1
+    or command.count("172.30.0.2") != 1
+):
+    fail("effective Compose Swan runtime must trust only the fixed Caddy login peer")
+
+runtime_secret_mounts = [
+    volume
+    for volume in swan.get("volumes", [])
+    if volume.get("target") == "/run/secrets/swan-runtime"
+]
+if (
+    len(runtime_secret_mounts) != 1
+    or runtime_secret_mounts[0].get("type") != "volume"
+    or runtime_secret_mounts[0].get("source") != "swan-runtime-secrets"
+    or runtime_secret_mounts[0].get("read_only") is not True
+):
+    fail("effective Compose Swan runtime secret mount is not least privilege")
+
+secret_init = services["swan-secrets-init"]
+if secret_init.get("user") != "root" or secret_init.get("network_mode") != "none":
+    fail("effective Compose secret preparation boundary is invalid")
+external_mounts = [
+    volume
+    for volume in secret_init.get("volumes", [])
+    if volume.get("target") == "/external-secrets"
+]
+if (
+    len(external_mounts) != 1
+    or external_mounts[0].get("type") != "bind"
+    or external_mounts[0].get("source") != effective_secret_source
+    or external_mounts[0].get("read_only") is not True
+):
+    fail("effective Compose external secret mount is not read-only and isolated")
+
+safe_secret_directory_variables = {
+    "EXTERNAL_SECRETS_DIR",
+    "REFERENCE_PDS_SECRETS_DIR",
+    "SWAN_BOOTSTRAP_SECRETS_DIR",
+    "SWAN_INTEROP_SECRETS_DIR",
+    "SWAN_RUNTIME_SECRETS_DIR",
+}
+for service_name, service in services.items():
+    if service.get("privileged") not in (None, False):
+        fail(f"effective Compose service is privileged: {service_name}")
+    if service.get("cap_add"):
+        fail(f"effective Compose service adds capabilities: {service_name}")
+    for environment_key in service.get("environment", {}):
+        lowered_key = environment_key.lower()
+        if (
+            any(
+                token in lowered_key
+                for token in ("private", "secret", "password", "token")
+            )
+            and environment_key not in safe_secret_directory_variables
+        ):
+            fail(
+                "effective Compose contains a secret-like environment key: "
+                f"{service_name}.{environment_key}"
+            )
+    for volume in service.get("volumes", []):
+        if volume.get("type") != "bind":
+            continue
+        if (
+            service_name != "swan-secrets-init"
+            or volume.get("target") != "/external-secrets"
+        ):
+            fail("effective Compose exposes an unexpected host bind mount")
+
+published = []
+for service_name, service in services.items():
+    for port in service.get("ports", []):
+        published.append((service_name, port))
+if len(published) != 1:
+    fail("effective Compose Caddy ingress is not the sole loopback publication")
+published_service, published_port = published[0]
+if (
+    published_service != "caddy"
+    or published_port.get("host_ip") != "127.0.0.1"
+    or published_port.get("target") != 443
+    or str(published_port.get("published")) != "443"
+    or published_port.get("protocol") != "tcp"
+):
+    fail("effective Compose Caddy ingress is not the sole loopback publication")
+
+caddy = services["caddy"]
+if caddy.get("depends_on", {}).get("swan", {}).get("condition") != "service_healthy":
+    fail("effective Compose Caddy must wait for a healthy Swan listener")
+caddy_network = caddy.get("networks", {}).get("swan", {})
+if caddy_network.get("ipv4_address") != "172.30.0.2":
+    fail("effective Compose Caddy must use the fixed login-proxy peer address")
+aliases = caddy_network.get("aliases", [])
+if set(aliases) != {"swan.test", "pds.test"}:
+    fail("effective Compose Caddy aliases do not match the laboratory hosts")
+network = configuration.get("networks", {}).get("swan", {})
+ipam_config = network.get("ipam", {}).get("config", [])
+if (
+    not isinstance(ipam_config, list)
+    or len(ipam_config) != 1
+    or ipam_config[0].get("subnet") != "172.30.0.0/24"
+):
+    fail("effective Compose interop network must use the fixed login-proxy subnet")
+
+reference = services["reference-pds"]
+if reference.get("depends_on", {}).get("reference-plc", {}).get("condition") != (
+    "service_healthy"
+):
+    fail("effective Compose reference PDS must wait for a healthy PLC")
+for forbidden in (
+    "PDS_DPOP_SECRET",
+    "PDS_JWT_SECRET",
+    "PDS_ADMIN_PASSWORD",
+    "PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX",
+    "PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX",
+):
+    if forbidden in reference.get("environment", {}):
+        fail("effective Compose reference PDS contains a secret environment key")
+
+runner = services["scenario-runner"]
+if runner.get("profiles") != ["planned-not-executed"]:
+    fail("effective Compose scenario runner profile is not inert")
+if runner.get("user") != "swan" or runner.get("network_mode") != "none":
+    fail("effective Compose scenario runner privilege boundary is invalid")
+if runner.get("depends_on", {}).get("caddy-ca-ready", {}).get("condition") != (
+    "service_completed_successfully"
+):
+    fail("effective Compose scenario runner must wait for prepared CA trust")
+runner_trust = [
+    volume
+    for volume in runner.get("volumes", [])
+    if volume.get("target") == "/etc/ssl/certs"
+]
+if len(runner_trust) != 1 or runner_trust[0].get("read_only") is not True:
+    fail("effective Compose scenario runner trust mount must be read-only")
+PY
+  then
+    :
+  else
+    rm -f "$effective_json"
+    exit 1
+  fi
+  rm -f "$effective_json"
+  echo "INTEROP LAB EFFECTIVE COMPOSE INVARIANTS OK"
+}
+
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  verify_effective_compose
+elif [[ "${SWAN_INTEROP_REQUIRE_EFFECTIVE_COMPOSE:-0}" == "1" ]]; then
+  echo "Docker Compose is required for effective interop verification" >&2
+  exit 1
+else
+  echo "INTEROP LAB EFFECTIVE COMPOSE INVARIANTS SKIPPED: Docker Compose unavailable" >&2
 fi
 
 echo "INTEROP LAB STATIC INVARIANTS OK"

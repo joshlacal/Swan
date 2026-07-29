@@ -11,7 +11,6 @@ import SwanStorage
 public protocol PublicRepositoryMutationDirectory: Sendable {
     func publicRepositoryMutationTarget(selector: String) async throws
         -> PublicRepositoryMutationTarget?
-    func publicBlob(cid: String) async throws -> PublicBlob?
 }
 
 public struct PublicRepositoryMutationTarget: Sendable {

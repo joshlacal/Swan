@@ -27,26 +27,22 @@ public struct Create: ATProtocolCodable, ATProtocolValue {
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            do {
-                self.collection = try container.decode(NSID.self, forKey: .collection)
-            } catch {
-                LogManager.logError("Decoding error for required property 'collection': \(error)")
-                throw error
-            }
-            do {
-                self.rkey = try container.decodeIfPresent(RecordKey.self, forKey: .rkey)
-            } catch {
-                // Forward compatibility: a malformed or unknown-shaped optional field
-                // must not fail the whole response.
-                LogManager.logWarning("Decoding error for optional property 'rkey' — degrading to nil: \(error)")
+            self.collection = try container.decode(NSID.self, forKey: .collection)
+            if container.contains(.rkey) {
+                guard try !container.decodeNil(forKey: .rkey) else {
+                    throw DecodingError.valueNotFound(
+                        RecordKey.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'rkey' must not be null"
+                        )
+                    )
+                }
+                self.rkey = try container.decode(RecordKey.self, forKey: .rkey)
+            } else {
                 self.rkey = nil
             }
-            do {
-                self.value = try container.decode(ATProtocolValueContainer.self, forKey: .value)
-            } catch {
-                LogManager.logError("Decoding error for required property 'value': \(error)")
-                throw error
-            }
+            self.value = try container.decode(ATProtocolValueContainer.self, forKey: .value)
         }
 
         public func encode(to encoder: Encoder) throws {
@@ -123,24 +119,9 @@ public struct Update: ATProtocolCodable, ATProtocolValue {
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            do {
-                self.collection = try container.decode(NSID.self, forKey: .collection)
-            } catch {
-                LogManager.logError("Decoding error for required property 'collection': \(error)")
-                throw error
-            }
-            do {
-                self.rkey = try container.decode(RecordKey.self, forKey: .rkey)
-            } catch {
-                LogManager.logError("Decoding error for required property 'rkey': \(error)")
-                throw error
-            }
-            do {
-                self.value = try container.decode(ATProtocolValueContainer.self, forKey: .value)
-            } catch {
-                LogManager.logError("Decoding error for required property 'value': \(error)")
-                throw error
-            }
+            self.collection = try container.decode(NSID.self, forKey: .collection)
+            self.rkey = try container.decode(RecordKey.self, forKey: .rkey)
+            self.value = try container.decode(ATProtocolValueContainer.self, forKey: .value)
         }
 
         public func encode(to encoder: Encoder) throws {
@@ -209,18 +190,8 @@ public struct Delete: ATProtocolCodable, ATProtocolValue {
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            do {
-                self.collection = try container.decode(NSID.self, forKey: .collection)
-            } catch {
-                LogManager.logError("Decoding error for required property 'collection': \(error)")
-                throw error
-            }
-            do {
-                self.rkey = try container.decode(RecordKey.self, forKey: .rkey)
-            } catch {
-                LogManager.logError("Decoding error for required property 'rkey': \(error)")
-                throw error
-            }
+            self.collection = try container.decode(NSID.self, forKey: .collection)
+            self.rkey = try container.decode(RecordKey.self, forKey: .rkey)
         }
 
         public func encode(to encoder: Encoder) throws {
@@ -518,7 +489,20 @@ public struct Input: ATProtocolCodable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.space = try container.decode(ATProtocolURI.self, forKey: .space)
             self.repo = try container.decode(DID.self, forKey: .repo)
-            self.validate = try container.decodeIfPresent(Bool.self, forKey: .validate)
+            if container.contains(.validate) {
+                guard try !container.decodeNil(forKey: .validate) else {
+                    throw DecodingError.valueNotFound(
+                        Bool.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'validate' must not be null"
+                        )
+                    )
+                }
+                self.validate = try container.decode(Bool.self, forKey: .validate)
+            } else {
+                self.validate = nil
+            }
             self.writes = try container.decode([InputWritesUnion].self, forKey: .writes)
         }
 

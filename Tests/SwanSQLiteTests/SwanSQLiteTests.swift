@@ -9,6 +9,312 @@ import SwanStorage
 import XCTest
 
 final class SwanSQLiteTests: XCTestCase {
+    func testEmailProofIsHashOnlySingleUseAndExpires() async throws {
+        let root = try controlRoot(); defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        _ = try await database.createAccount(controlRegistration(did: did, handle: "email.example.com"))
+        let email = try AccountEmailAddress("person@example.com")
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        try await database.associateEmail(did: did, email: email, now: now)
+        let token = Data(repeating: 0x42, count: 32)
+        try await database.issueEmailToken(
+            did: did,
+            email: email,
+            purpose: .verifyEmail,
+            digest: token,
+            expiresAt: now.addingTimeInterval(60),
+            now: now
+        )
+        let persisted = try await database.connection.query(
+            "SELECT digest, email, purpose FROM account_email_tokens"
+        )
+        XCTAssertEqual(persisted.count, 1)
+        XCTAssertEqual(
+            Data(sqliteData: try XCTUnwrap(persisted[0].column("digest"))),
+            token
+        )
+        XCTAssertEqual(persisted[0].column("email")?.string, email.value)
+        XCTAssertEqual(
+            persisted[0].column("purpose")?.string,
+            AccountEmailTokenPurpose.verifyEmail.rawValue
+        )
+        // A wrong-purpose attempt is indistinguishable from an unknown proof
+        // and must not burn the correctly scoped token.
+        let wrongPurpose = try await database.consumeEmailToken(
+            digest: token,
+            purpose: .passwordRecovery,
+            now: now
+        )
+        XCTAssertNil(wrongPurpose)
+        let consumed = try await database.consumeEmailToken(digest: token, purpose: .verifyEmail, now: now)
+        XCTAssertEqual(consumed, did)
+        let verifiedEmail = try await database.verifiedEmail(did: did)
+        XCTAssertEqual(verifiedEmail, email)
+        let replay = try await database.consumeEmailToken(digest: token, purpose: .verifyEmail, now: now)
+        XCTAssertNil(replay)
+        let expired = Data(repeating: 0x43, count: 32)
+        try await database.issueEmailToken(
+            did: did,
+            email: email,
+            purpose: .passwordRecovery,
+            digest: expired,
+            expiresAt: now.addingTimeInterval(1),
+            now: now
+        )
+        let expiredResult = try await database.consumeEmailToken(digest: expired, purpose: .passwordRecovery, now: now.addingTimeInterval(2))
+        XCTAssertNil(expiredResult)
+        try await database.close()
+    }
+
+    func testEmailProofIsBoundToAddressGeneration() async throws {
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        _ = try await database.createAccount(
+            controlRegistration(did: did, handle: "email-generation.example.com")
+        )
+        let firstEmail = try AccountEmailAddress("first@example.com")
+        let secondEmail = try AccountEmailAddress("second@example.com")
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let firstToken = Data(repeating: 0x51, count: 32)
+        try await database.associateEmail(did: did, email: firstEmail, now: now)
+        try await database.issueEmailToken(
+            did: did,
+            email: firstEmail,
+            purpose: .verifyEmail,
+            digest: firstToken,
+            expiresAt: now.addingTimeInterval(600),
+            now: now
+        )
+
+        try await database.associateEmail(
+            did: did,
+            email: secondEmail,
+            now: now.addingTimeInterval(1)
+        )
+        let oldAddressResult = try await database.consumeEmailToken(
+            digest: firstToken,
+            purpose: .verifyEmail,
+            now: now.addingTimeInterval(2)
+        )
+        XCTAssertNil(oldAddressResult)
+        let verifiedAfterReassociation = try await database.verifiedEmail(did: did)
+        XCTAssertNil(verifiedAfterReassociation)
+
+        // A caller which selected the old destination before reassociation
+        // cannot create a usable proof for that stale delivery address.
+        await XCTAssertThrowsErrorAsync(
+            try await database.issueEmailToken(
+                did: did,
+                email: firstEmail,
+                purpose: .verifyEmail,
+                digest: Data(repeating: 0x52, count: 32),
+                expiresAt: now.addingTimeInterval(600),
+                now: now.addingTimeInterval(2)
+            )
+        ) { error in
+            XCTAssertEqual(error as? AccountControlStoreError, .notFound)
+        }
+
+        // Returning to the same textual address is still a new generation;
+        // the proof issued for its earlier generation remains revoked.
+        try await database.associateEmail(
+            did: did,
+            email: firstEmail,
+            now: now.addingTimeInterval(3)
+        )
+        let earlierGenerationResult = try await database.consumeEmailToken(
+            digest: firstToken,
+            purpose: .verifyEmail,
+            now: now.addingTimeInterval(4)
+        )
+        XCTAssertNil(earlierGenerationResult)
+        try await database.close()
+    }
+
+    func testEmailProofAndCredentialReplacementFailForInactiveAccount() async throws {
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        _ = try await database.createAccount(
+            controlRegistration(did: did, handle: "inactive-recovery.example.com")
+        )
+        let email = try AccountEmailAddress("person@example.com")
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let token = Data(repeating: 0x61, count: 32)
+        try await database.associateEmail(did: did, email: email, now: now)
+        try await database.issueEmailToken(
+            did: did,
+            email: email,
+            purpose: .passwordRecovery,
+            digest: token,
+            expiresAt: now.addingTimeInterval(600),
+            now: now
+        )
+        let loadedCredential = try await database.credential(did: did)
+        let credential = try XCTUnwrap(loadedCredential)
+        _ = try await database.transitionStatus(
+            did: did,
+            to: .deactivated,
+            declaration: AccountLifecycleDeclaration(),
+            now: now.addingTimeInterval(1)
+        )
+
+        let deactivatedResult = try await database.consumeEmailToken(
+            digest: token,
+            purpose: .passwordRecovery,
+            now: now.addingTimeInterval(2)
+        )
+        XCTAssertNil(deactivatedResult)
+        let replacement = try await database.replaceCredential(
+            did: did,
+            expectedVerifier: credential.verifier,
+            replacementVerifier: credential.verifier,
+            now: now.addingTimeInterval(2)
+        )
+        XCTAssertEqual(replacement, .unchanged)
+        await XCTAssertThrowsErrorAsync(
+            try await database.issueEmailToken(
+                did: did,
+                email: email,
+                purpose: .passwordRecovery,
+                digest: Data(repeating: 0x62, count: 32),
+                expiresAt: now.addingTimeInterval(600),
+                now: now.addingTimeInterval(2)
+            )
+        ) { error in
+            XCTAssertEqual(error as? AccountControlStoreError, .notFound)
+        }
+
+        // Reactivation does not resurrect proofs revoked at the lifecycle
+        // boundary.
+        _ = try await database.transitionStatus(
+            did: did,
+            to: .active,
+            declaration: AccountLifecycleDeclaration(),
+            now: now.addingTimeInterval(3)
+        )
+        let reactivatedResult = try await database.consumeEmailToken(
+            digest: token,
+            purpose: .passwordRecovery,
+            now: now.addingTimeInterval(4)
+        )
+        XCTAssertNil(reactivatedResult)
+        _ = try await database.beginDeletion(
+            did: did,
+            declaration: AccountLifecycleDeclaration(
+                tombstone: try AccountTombstoneMetadata(
+                    declaredAt: now.addingTimeInterval(5),
+                    reason: "email-lifecycle-test"
+                )
+            ),
+            now: now.addingTimeInterval(5)
+        )
+        let deletedEmail = try await database.associatedEmail(did: did)
+        XCTAssertNil(deletedEmail)
+        try await database.close()
+    }
+
+    func testEmailProofConcurrentConsumptionAcrossConnectionsHasOneWinner() async throws {
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = try await SQLiteControlDatabase(dataDirectory: root)
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        _ = try await first.createAccount(
+            controlRegistration(did: did, handle: "email-race.example.com")
+        )
+        let email = try AccountEmailAddress("person@example.com")
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let token = Data(repeating: 0x71, count: 32)
+        try await first.associateEmail(did: did, email: email, now: now)
+        try await first.issueEmailToken(
+            did: did,
+            email: email,
+            purpose: .verifyEmail,
+            digest: token,
+            expiresAt: now.addingTimeInterval(600),
+            now: now
+        )
+        let second = try await SQLiteControlDatabase(dataDirectory: root)
+
+        async let firstClaim = first.consumeEmailToken(
+            digest: token,
+            purpose: .verifyEmail,
+            now: now.addingTimeInterval(1)
+        )
+        async let secondClaim = second.consumeEmailToken(
+            digest: token,
+            purpose: .verifyEmail,
+            now: now.addingTimeInterval(1)
+        )
+        let claims = try await (firstClaim, secondClaim)
+        XCTAssertEqual([claims.0, claims.1].compactMap { $0 }, [did])
+
+        try await first.close()
+        try await second.close()
+    }
+
+    func testEmailProofMigrationInvalidatesUnboundLegacyTokens() async throws {
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        _ = try await database.createAccount(
+            controlRegistration(did: did, handle: "email-migration.example.com")
+        )
+        try await database.associateEmail(
+            did: did,
+            email: try AccountEmailAddress("person@example.com"),
+            now: now
+        )
+        try await database.close()
+
+        let path = SQLiteLayout.controlDatabase(in: root).path
+        let legacy = try await SQLiteConnection.open(storage: .file(path: path))
+        _ = try await legacy.query("DROP TABLE account_email_tokens")
+        _ = try await legacy.query(
+            """
+            CREATE TABLE account_email_tokens (
+                digest BLOB PRIMARY KEY CHECK(length(digest) = 32),
+                did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+                purpose TEXT NOT NULL CHECK(purpose IN ('verify-email', 'password-recovery')),
+                expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+                consumed_at INTEGER CHECK(consumed_at >= 0)
+            )
+            """
+        )
+        _ = try await legacy.query(
+            """
+            INSERT INTO account_email_tokens(
+                digest, did, purpose, expires_at, consumed_at
+            ) VALUES (?, ?, 'verify-email', ?, NULL)
+            """,
+            [
+                Data(repeating: 0x81, count: 32).sqliteData!,
+                .text(did),
+                .integer(1_750_000_600_000_000),
+            ]
+        )
+        try await legacy.close()
+
+        let migrated = try await SQLiteControlDatabase(dataDirectory: root)
+        let rows = try await migrated.connection.query(
+            "SELECT digest FROM account_email_tokens"
+        )
+        XCTAssertTrue(rows.isEmpty)
+        let columns = try await migrated.connection.query(
+            "PRAGMA table_info(account_email_tokens)"
+        )
+        XCTAssertTrue(columns.contains {
+            $0.column("name")?.string == "email"
+        })
+        try await migrated.close()
+    }
+
     func testOperatorRestoreRejectsClientAttestationReplayState() async throws {
         let root = try controlRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -74,7 +380,7 @@ final class SwanSQLiteTests: XCTestCase {
             expectedRevision: 0,
             requestID: UUID(uuidString: "10000000-0000-0000-0000-000000000001")!,
             wireRevision: try fixture.tid(0),
-            writes: [.put(uri: fixture.first, value: fixture.firstValue, cid: "cid:first")],
+            writes: [.put(uri: fixture.first, value: fixture.firstValue, cid: fixture.firstCID)],
             eventID: UUID(uuidString: "20000000-0000-0000-0000-000000000001")!
         )
         XCTAssertEqual(result.state.revision, 1)
@@ -98,7 +404,7 @@ final class SwanSQLiteTests: XCTestCase {
             XCTAssertEqual(snapshot.state.commit, result.state.commit)
             XCTAssertNotEqual(snapshot.state.commit, Data([0x00, 0xff, 0x42]))
             XCTAssertEqual(snapshot.records.map(\.value), [fixture.firstValue])
-            XCTAssertEqual(snapshot.records.map(\.cid), ["cid:first"])
+            XCTAssertEqual(snapshot.records.map(\.cid), [fixture.firstCID])
 
             let oplog = try await reopened.spaceOplog(
                 space: fixture.space,
@@ -114,6 +420,90 @@ final class SwanSQLiteTests: XCTestCase {
             let pending = try await reopened.pendingOutbox()
             XCTAssertEqual(pending, [result.outbox])
         }
+    }
+
+    func testPermissionedStorageRejectsNonCanonicalOrMismatchedRecordBeforeMutation()
+        async throws
+    {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+
+        let nonCanonical = Data([0xa1, 0x61, 0x7a, 0x18, 0x01])
+        let nonCanonicalCID =
+            String(fixture.firstCID.prefix(1))
+            + fixture.firstCID.dropFirst().uppercased()
+        XCTAssertNotEqual(nonCanonicalCID, fixture.firstCID)
+        XCTAssertEqual(
+            try CID.parse(nonCanonicalCID),
+            try CID.parse(fixture.firstCID)
+        )
+        for (value, cid) in [
+            (nonCanonical, CID.fromDAGCBOR(nonCanonical).string),
+            (fixture.firstValue, fixture.secondCID),
+            (fixture.firstValue, nonCanonicalCID),
+        ] {
+            await XCTAssertThrowsErrorAsync(
+                try await database.apply(
+                    space: fixture.space,
+                    author: fixture.author,
+                    expectedRevision: 0,
+                    requestID: UUID(),
+                    wireRevision: try fixture.tid(0),
+                    writes: [
+                        .put(uri: fixture.first, value: value, cid: cid),
+                    ]
+                )
+            ) { error in
+                guard case .malformed = error as? SwanError else {
+                    return XCTFail(
+                        "invalid record must fail as malformed input"
+                    )
+                }
+            }
+            let snapshot = try await database.repositorySnapshot(
+                space: fixture.space,
+                author: fixture.author
+            )
+            let pending = try await database.pendingOutbox()
+            XCTAssertNil(snapshot)
+            XCTAssertTrue(pending.isEmpty)
+        }
+
+        var poisonedLtHash = LtHash()
+        poisonedLtHash.add(
+            element:
+                "\(fixture.first.collection)/\(fixture.first.rkey)/\(nonCanonicalCID)"
+        )
+        let poisonedRecovery = VerifiedSpaceCARRecovery(
+            wireRevision: try fixture.tid(0),
+            records: [
+                SpaceRecord(
+                    uri: fixture.first,
+                    value: fixture.firstValue,
+                    cid: nonCanonicalCID,
+                    revision: 1
+                ),
+            ],
+            ltHash: poisonedLtHash.serialized,
+            commitment: poisonedLtHash.commitment
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await database.restorePortableRepositories([
+                SQLitePortableRestoreRepository(
+                    space: fixture.space,
+                    author: fixture.author,
+                    recovery: poisonedRecovery
+                ),
+            ])
+        )
+        let snapshot = try await database.repositorySnapshot(
+            space: fixture.space,
+            author: fixture.author
+        )
+        let pending = try await database.pendingOutbox()
+        XCTAssertNil(snapshot)
+        XCTAssertTrue(pending.isEmpty)
     }
 
     func testOutboxWorkerDeliversOnceWithOpaquePayloadOutsideSQLiteTransaction() async throws {
@@ -141,7 +531,7 @@ final class SwanSQLiteTests: XCTestCase {
             XCTAssertEqual(delivered.first?.id, committed.outbox.id)
             XCTAssertEqual(delivered.first?.payload, Data(committed.outbox.id.uuidString.lowercased().utf8))
             XCTAssertNil(delivered.first?.payload.range(of: fixture.firstValue))
-            XCTAssertNil(delivered.first?.payload.range(of: Data("cid:first".utf8)))
+            XCTAssertNil(delivered.first?.payload.range(of: Data(fixture.firstCID.utf8)))
             let transactionStates = await transport.observedWriteTransactions()
             XCTAssertEqual(transactionStates, [false])
         }
@@ -451,7 +841,7 @@ final class SwanSQLiteTests: XCTestCase {
         ) { error in
             XCTAssertEqual(
                 error as? SQLiteRepositoryError,
-                .corruptDatabase("permissioned CAR record CID does not match value")
+                .corruptDatabase("permissioned CAR snapshot does not match repository state")
             )
         }
         try await cidCorrupt.close()
@@ -701,7 +1091,7 @@ final class SwanSQLiteTests: XCTestCase {
                 .put(
                     uri: sharedRecord,
                     value: fixture.firstValue,
-                    cid: "cid:shared-first"
+                    cid: fixture.firstCID
                 ),
             ]
         )
@@ -761,7 +1151,7 @@ final class SwanSQLiteTests: XCTestCase {
                 .put(
                     uri: sharedRecord,
                     value: fixture.secondValue,
-                    cid: "cid:shared-second"
+                    cid: fixture.secondCID
                 ),
             ]
         )
@@ -889,7 +1279,7 @@ final class SwanSQLiteTests: XCTestCase {
                 expectedRevision: 0,
                 requestID: UUID(),
                 wireRevision: try fixture.tid(1),
-                writes: [.put(uri: fixture.second, value: fixture.secondValue, cid: "cid:wrong-cas")],
+                writes: [.put(uri: fixture.second, value: fixture.secondValue, cid: fixture.secondCID)],
             )
         ) { error in
             XCTAssertEqual(error as? SwanError, .conflict(expected: 0, actual: 1))
@@ -903,7 +1293,7 @@ final class SwanSQLiteTests: XCTestCase {
                 requestID: UUID(),
                 wireRevision: try fixture.tid(1),
                 writes: [
-                    .put(uri: fixture.second, value: fixture.secondValue, cid: "cid:second"),
+                    .put(uri: fixture.second, value: fixture.secondValue, cid: fixture.secondCID),
                     .delete(uri: fixture.missing),
                 ],
             )
@@ -943,7 +1333,7 @@ final class SwanSQLiteTests: XCTestCase {
             expectedRevision: 0,
             requestID: requestID,
             wireRevision: try fixture.tid(0),
-            writes: [.put(uri: fixture.first, value: fixture.firstValue, cid: "cid:first")],
+            writes: [.put(uri: fixture.first, value: fixture.firstValue, cid: fixture.firstCID)],
         )
 
         await XCTAssertThrowsErrorAsync(
@@ -953,7 +1343,7 @@ final class SwanSQLiteTests: XCTestCase {
                 expectedRevision: 1,
                 requestID: requestID,
                 wireRevision: try fixture.tid(1),
-                writes: [.put(uri: fixture.second, value: fixture.secondValue, cid: "cid:second")],
+                writes: [.put(uri: fixture.second, value: fixture.secondValue, cid: fixture.secondCID)],
             )
         ) { error in
             XCTAssertEqual(error as? SQLiteRepositoryError, .duplicateRequest(requestID))
@@ -998,7 +1388,7 @@ final class SwanSQLiteTests: XCTestCase {
                                 .put(
                                     uri: fixture.first,
                                     value: fixture.firstValue,
-                                    cid: "cid:first"
+                                    cid: fixture.firstCID
                                 )
                             ],
                         )
@@ -1020,7 +1410,7 @@ final class SwanSQLiteTests: XCTestCase {
                                 .put(
                                     uri: fixture.second,
                                     value: fixture.secondValue,
-                                    cid: "cid:second"
+                                    cid: fixture.secondCID
                                 )
                             ],
                         )
@@ -1072,7 +1462,7 @@ final class SwanSQLiteTests: XCTestCase {
                 requestID: UUID(),
                 wireRevision: try fixture.tid(0),
                 writes: [
-                    .put(uri: fixture.first, value: fixture.firstValue, cid: "cid:first")
+                    .put(uri: fixture.first, value: fixture.firstValue, cid: fixture.firstCID)
                 ],
             )
         }
@@ -1094,7 +1484,7 @@ final class SwanSQLiteTests: XCTestCase {
                 requestID: UUID(),
                 wireRevision: try fixture.tid(1),
                 writes: [
-                    .put(uri: fixture.second, value: fixture.secondValue, cid: "cid:second")
+                    .put(uri: fixture.second, value: fixture.secondValue, cid: fixture.secondCID)
                 ],
             )
         }
@@ -1146,7 +1536,7 @@ final class SwanSQLiteTests: XCTestCase {
             requestID: UUID(),
             wireRevision: try fixture.tid(1),
             writes: [
-                .put(uri: fixture.second, value: fixture.secondValue, cid: "cid:second")
+                .put(uri: fixture.second, value: fixture.secondValue, cid: fixture.secondCID)
             ],
         )
         await barrier.release()
@@ -1210,9 +1600,35 @@ final class SwanSQLiteTests: XCTestCase {
 
         let preparedResult = try await snapshotTask.value
         let prepared = try XCTUnwrap(preparedResult)
-        XCTAssertEqual(prepared.state.wireRevision, try fixture.tid(0).toString())
+        let preparedWireRevision = try XCTUnwrap(prepared.state.wireRevision)
+        XCTAssertEqual(preparedWireRevision, try fixture.tid(0).toString())
         XCTAssertEqual(prepared.state.commitment.count, 32)
-        prepared.spool.cleanup()
+        let key = P256.Signing.PrivateKey()
+        let envelope = try SpaceCommitCodec.sign(
+            context: try SpaceCommitContext(
+                space: fixture.space,
+                author: fixture.author,
+                rev: preparedWireRevision,
+                ikm: Data(repeating: 0x43, count: 32)
+            ),
+            commitment: prepared.state.commitment,
+            key: key
+        )
+        var car = try SpaceCARCodec.recoveryPrefix(
+            commit: envelope,
+            indexCID: prepared.spool.indexCID
+        )
+        try await prepared.spool.streamBody { car.append($0) }
+        let recovery = try SpaceCARCodec.verifyRecovery(
+            car,
+            space: fixture.space,
+            author: fixture.author,
+            publicKey: key.publicKey
+        )
+        XCTAssertEqual(recovery.wireRevision.toString(), try fixture.tid(0).toString())
+        XCTAssertEqual(recovery.records.map { $0.uri }, [fixture.first])
+        XCTAssertEqual(recovery.records.map { $0.cid }, [firstCID])
+        XCTAssertEqual(recovery.commitment, prepared.state.commitment)
         XCTAssertTrue(prepared.spool.isCleanedUp)
     }
 
@@ -1230,7 +1646,7 @@ final class SwanSQLiteTests: XCTestCase {
             requestID: UUID(),
             wireRevision: createRevision,
             writes: [
-                .put(uri: fixture.first, value: fixture.firstValue, cid: "cid:first")
+                .put(uri: fixture.first, value: fixture.firstValue, cid: fixture.firstCID)
             ],
         )
         _ = try await database!.apply(
@@ -1240,7 +1656,7 @@ final class SwanSQLiteTests: XCTestCase {
             requestID: UUID(),
             wireRevision: updateRevision,
             writes: [
-                .put(uri: fixture.first, value: fixture.secondValue, cid: "cid:updated")
+                .put(uri: fixture.first, value: fixture.secondValue, cid: fixture.secondCID)
             ],
         )
         _ = try await database!.apply(
@@ -1268,8 +1684,8 @@ final class SwanSQLiteTests: XCTestCase {
             createRevision, updateRevision, deleteRevision,
         ])
         XCTAssertEqual(entries.map(\.action), [.create, .update, .delete])
-        XCTAssertEqual(entries.map(\.previousCID), [nil, "cid:first", "cid:updated"])
-        XCTAssertEqual(entries.map(\.cid), ["cid:first", "cid:updated", nil])
+        XCTAssertEqual(entries.map(\.previousCID), [nil, fixture.firstCID, fixture.secondCID])
+        XCTAssertEqual(entries.map(\.cid), [fixture.firstCID, fixture.secondCID, nil])
         let snapshot = try await reopened.repositorySnapshot(
             space: fixture.space,
             author: fixture.author
@@ -1296,7 +1712,7 @@ final class SwanSQLiteTests: XCTestCase {
                 expectedRevision: 0,
                 requestID: UUID(),
                 wireRevision: try fixture.tid(0),
-                writes: [.put(uri: otherRecord, value: fixture.firstValue, cid: "cid:other")],
+                writes: [.put(uri: otherRecord, value: fixture.firstValue, cid: fixture.firstCID)],
             )
         ) { error in
             guard case .unauthorized = error as? SwanError else {
@@ -1311,7 +1727,7 @@ final class SwanSQLiteTests: XCTestCase {
             try await database.putPublicRecord(
                 uri: otherPublic,
                 value: fixture.firstValue,
-                cid: "cid:other",
+                cid: fixture.firstCID,
                 revision: 1
             )
         ) { error in
@@ -1489,6 +1905,19 @@ final class SwanSQLiteTests: XCTestCase {
         let fixture = try Fixture()
         let database = try await fixture.open()
         defer { Task { try? await database.close() } }
+
+        _ = try await database.apply(
+            space: fixture.space,
+            author: fixture.author,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(0),
+            writes: [.put(
+                uri: fixture.first,
+                value: fixture.firstValue,
+                cid: fixture.firstCID
+            )]
+        )
 
         func casPath(_ cid: String) throws -> URL {
             let parsed = try CID.parse(cid)
@@ -2027,6 +2456,11 @@ final class SwanSQLiteTests: XCTestCase {
         let fixture = try Fixture()
         let database = try await fixture.open()
         defer { Task { try? await database.close() } }
+        // Permissioned blob reads are intentionally reachable only through a
+        // live repository state. Seed the smallest valid repository before
+        // measuring the 256 MiB stream; otherwise this harness exercises the
+        // authorization guard rather than the bounded body path.
+        _ = try await fixture.commitFirst(on: database)
         let payload = Data(repeating: 0x5a, count: 256 * 1_024 * 1_024)
         let reference = try await database.putBlob(
             payload,
@@ -2058,8 +2492,8 @@ final class SwanSQLiteTests: XCTestCase {
             requestID: UUID(),
             wireRevision: try fixture.tid(0),
             writes: [
-                .put(uri: fixture.first, value: fixture.firstValue, cid: "cid:first"),
-                .put(uri: fixture.second, value: fixture.secondValue, cid: "cid:second"),
+                .put(uri: fixture.first, value: fixture.firstValue, cid: fixture.firstCID),
+                .put(uri: fixture.second, value: fixture.secondValue, cid: fixture.secondCID),
             ],
         )
 
@@ -2102,7 +2536,7 @@ final class SwanSQLiteTests: XCTestCase {
             expectedRevision: 1,
             requestID: UUID(),
             wireRevision: try fixture.tid(1),
-            writes: [.put(uri: fixture.second, value: fixture.secondValue, cid: "cid:second")],
+            writes: [.put(uri: fixture.second, value: fixture.secondValue, cid: fixture.secondCID)],
         )
         _ = try await database.apply(
             space: fixture.space,
@@ -2110,7 +2544,7 @@ final class SwanSQLiteTests: XCTestCase {
             expectedRevision: 2,
             requestID: UUID(),
             wireRevision: try fixture.tid(2),
-            writes: [.put(uri: fixture.third, value: fixture.thirdValue, cid: "cid:third")],
+            writes: [.put(uri: fixture.third, value: fixture.thirdValue, cid: fixture.thirdCID)],
         )
 
         guard case let .fullRecoveryRequired(snapshot) = try await database.spaceOplog(
@@ -2367,6 +2801,7 @@ final class SwanSQLiteTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(
             try await reopened.validatedAccessToken(
                 accessTokenDigest: tokens.accessTokenDigest,
+                requireActiveSubject: false,
                 now: now
             )
         ) { error in
@@ -3251,6 +3686,9 @@ private struct Fixture {
     let firstValue = Data([0xa1, 0x61, 0x61, 0x01])
     let secondValue = Data([0xa1, 0x61, 0x62, 0x02])
     let thirdValue = Data([0xa1, 0x61, 0x63, 0x03])
+    var firstCID: String { CID.fromDAGCBOR(firstValue).string }
+    var secondCID: String { CID.fromDAGCBOR(secondValue).string }
+    var thirdCID: String { CID.fromDAGCBOR(thirdValue).string }
 
     init() throws {
         root = FileManager.default.temporaryDirectory
@@ -3301,7 +3739,7 @@ private struct Fixture {
             expectedRevision: 0,
             requestID: UUID(),
             wireRevision: try tid(0),
-            writes: [.put(uri: first, value: firstValue, cid: "cid:first")],
+            writes: [.put(uri: first, value: firstValue, cid: firstCID)],
         )
     }
 
@@ -3509,6 +3947,7 @@ private actor BlockingOutboxTransport: PermissionedSpaceOutboxTransport {
 
 private actor OutboxDeliveryBarrier {
     private var didStart = false
+    private var released = false
     private var startWaiters: [CheckedContinuation<Void, Never>] = []
     private var releaseContinuation: CheckedContinuation<Void, Never>?
 
@@ -3524,10 +3963,12 @@ private actor OutboxDeliveryBarrier {
     }
 
     func waitForRelease() async {
+        guard !released else { return }
         await withCheckedContinuation { releaseContinuation = $0 }
     }
 
     func release() {
+        released = true
         releaseContinuation?.resume()
         releaseContinuation = nil
     }

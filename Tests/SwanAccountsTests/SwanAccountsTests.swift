@@ -33,6 +33,10 @@ final class SwanAccountsTests: XCTestCase {
             memoryLimitBytes: Argon2idPolicy.minimumMemoryLimitBytes
         ))
         XCTAssertTrue(try stronger.needsRehash(encodedHash))
+        XCTAssertThrowsError(
+            try stronger.verify("rehash me", encodedHash: encodedHash),
+            "a restored verifier with a different work factor must fail before Argon2id"
+        )
 
         let argon2i = encodedHash.replacingOccurrences(of: "$argon2id$", with: "$argon2i$")
         let oldVersion = encodedHash.replacingOccurrences(of: "$v=19$", with: "$v=16$")
@@ -749,7 +753,7 @@ final class SwanAccountsTests: XCTestCase {
         }
     }
 
-    func testDurableDirectoryAuthenticatesOnlyActiveAccountsRehashesAndKeepsVerifierPrivate() async throws {
+    func testDurableDirectoryAuthenticatesOnlyActiveAccountsAndKeepsVerifierPrivate() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let database = try await SQLiteControlDatabase(dataDirectory: root)
@@ -779,7 +783,7 @@ final class SwanAccountsTests: XCTestCase {
             AccountControlRegistration(
                 did: Self.aliceDID,
                 canonicalHandle: "alice.example.com",
-                passwordVerifier: DirectoryTestHasher.legacyVerifier,
+                passwordVerifier: DirectoryTestHasher.currentVerifier,
                 signingKey: try AccountControlKeyReference(purpose: .signing, generation: 1),
                 rotationKey: try AccountControlKeyReference(purpose: .rotation, generation: 1),
                 createdAt: Date(timeIntervalSince1970: 1_750_000_000)
@@ -789,16 +793,16 @@ final class SwanAccountsTests: XCTestCase {
         let normalLookupResult = try await directory.resolve(handle: "Alice.Example.COM")
         let normalLookup = try XCTUnwrap(normalLookupResult)
         XCTAssertEqual(normalLookup.credentialState, .configured)
-        XCTAssertFalse(String(describing: normalLookup).contains(DirectoryTestHasher.legacyVerifier))
+        XCTAssertFalse(String(describing: normalLookup).contains(DirectoryTestHasher.currentVerifier))
         let authenticationResult = await directory.authenticate(
             handle: "alice.example.com",
             password: "correct horse"
         )
         let success = try XCTUnwrap(authenticationResult)
-        XCTAssertTrue(success.credentialWasRehashed)
+        XCTAssertFalse(success.credentialWasRehashed)
         XCTAssertEqual(success.account.did, Self.aliceDID)
-        let rehashedCredential = try await database.credential(did: Self.aliceDID)?.verifier
-        XCTAssertEqual(rehashedCredential, DirectoryTestHasher.currentVerifier)
+        let currentCredential = try await database.credential(did: Self.aliceDID)?.verifier
+        XCTAssertEqual(currentCredential, DirectoryTestHasher.currentVerifier)
         let wrongPassword = await directory.authenticate(handle: "alice.example.com", password: "wrong")
         let unknownAccount = await directory.authenticate(handle: "missing.example.com", password: "correct horse")
         let malformedHandle = await directory.authenticate(handle: "invalid handle", password: "correct horse")
@@ -834,25 +838,25 @@ final class SwanAccountsTests: XCTestCase {
             XCTAssertNil(authentication, "\(status.rawValue) must fail closed")
         }
         _ = try await directory.transitionStatus(did: Self.aliceDID, to: .active)
-        let deleted = try await directory.transitionStatus(
-            did: Self.aliceDID,
-            to: .deleted,
-            declaration: AccountLifecycleDeclaration(
-                tombstone: try AccountTombstoneMetadata(reason: "user-request")
-            )
-        )
-        XCTAssertEqual(deleted.status, .deleted)
-        XCTAssertEqual(deleted.tombstone?.reason, "user-request")
-        let deletedAuthentication = await directory.authenticate(
-            handle: "alice.example.com",
-            password: "correct horse"
-        )
-        XCTAssertNil(deletedAuthentication)
         await XCTAssertThrowsErrorAsync(
-            try await directory.transitionStatus(did: Self.aliceDID, to: .active)
+            try await directory.transitionStatus(
+                did: Self.aliceDID,
+                to: .deleted,
+                declaration: AccountLifecycleDeclaration(
+                    tombstone: try AccountTombstoneMetadata(
+                        reason: "user-request"
+                    )
+                )
+            )
         ) { error in
             XCTAssertEqual(error as? AccountControlStoreError, .invalidTransition)
         }
+        let authenticationAfterRejectedGenericDeletion =
+            await directory.authenticate(
+                handle: "alice.example.com",
+                password: "correct horse"
+            )
+        XCTAssertNotNil(authenticationAfterRejectedGenericDeletion)
 
         let keyReferencesResult = try await directory.keyReferences(did: Self.aliceDID)
         let references = try XCTUnwrap(keyReferencesResult)

@@ -16,6 +16,13 @@ import SwanStorage
 /// deliberately indistinguishable to callers.
 public enum SwanOperatorAccountBackupError: Error, Sendable, Equatable {
     case failed
+    /// The outer container authenticated successfully, but its encrypted
+    /// plaintext predates mandatory PLC continuity preservation.
+    case unsupportedVersion
+}
+
+enum SwanOperatorAccountBackupCompatibilityError: Error, Sendable, Equatable {
+    case unsupportedEncryptedPayloadVersion
 }
 
 /// An opaque exact 256-bit key used only for operator backup encryption.
@@ -191,6 +198,8 @@ struct SwanOperatorVerifiedBackupPayload: Sendable {
 public struct SwanOperatorAccountBackupExporter: Sendable {
     private let database: SQLiteAccountDatabase
     private let keyReader: any AccountKeyMaterialReader
+    private let continuityInventory:
+        @Sendable () async throws -> PLCCredentialKeyContinuityInventory
     private let now: @Sendable () -> Date
     private let afterRenameBeforeParentSync: (@Sendable () throws -> Void)?
 
@@ -201,6 +210,10 @@ public struct SwanOperatorAccountBackupExporter: Sendable {
     ) {
         self.database = database
         self.keyReader = keyReader
+        continuityInventory = {
+            try await database
+                .operatorBackupPLCCredentialKeyContinuityInventory()
+        }
         self.now = now
         afterRenameBeforeParentSync = nil
     }
@@ -209,12 +222,31 @@ public struct SwanOperatorAccountBackupExporter: Sendable {
         database: SQLiteAccountDatabase,
         keyReader: any AccountKeyMaterialReader,
         now: @escaping @Sendable () -> Date = Date.init,
+        continuityInventory: @escaping @Sendable () async throws
+            -> PLCCredentialKeyContinuityInventory,
         afterRenameBeforeParentSync: @escaping @Sendable () throws -> Void
     ) {
         self.database = database
         self.keyReader = keyReader
+        self.continuityInventory = continuityInventory
         self.now = now
         self.afterRenameBeforeParentSync = afterRenameBeforeParentSync
+    }
+
+    /// Explicit synthetic-fixture hook. Production construction always reads
+    /// the companion control database and fails closed when it is unavailable.
+    init(
+        database: SQLiteAccountDatabase,
+        keyReader: any AccountKeyMaterialReader,
+        now: @escaping @Sendable () -> Date = Date.init,
+        continuityInventory: @escaping @Sendable () async throws
+            -> PLCCredentialKeyContinuityInventory
+    ) {
+        self.database = database
+        self.keyReader = keyReader
+        self.continuityInventory = continuityInventory
+        self.now = now
+        afterRenameBeforeParentSync = nil
     }
 
     public func backup(
@@ -287,6 +319,7 @@ public struct SwanOperatorAccountBackupExporter: Sendable {
         )
         let signingScalar = try await keyReader.key(for: signingReference)
         let rotationScalar = try await keyReader.key(for: rotationReference)
+        let continuityInventory = try await self.continuityInventory()
         let secrets = try SwanOperatorAccountSecrets(
             profileID: PermissionedData0016.profileID,
             portableManifestSHA256: "",
@@ -298,6 +331,7 @@ public struct SwanOperatorAccountBackupExporter: Sendable {
             rotationKeyReference: rotationControlReference,
             signingPrivateScalar: signingScalar,
             rotationPrivateScalar: rotationScalar,
+            plcCredentialKeyContinuity: continuityInventory,
             allowDeferredDigest: true
         )
 
@@ -419,6 +453,8 @@ public enum SwanOperatorAccountBackupVerifier {
             let descriptor = try SwanPortableExportFilesystem.openArchiveRoot(root)
             defer { _ = close(descriptor) }
             return try verify(directoryDescriptor: descriptor, using: backupKey)
+        } catch is SwanOperatorAccountBackupCompatibilityError {
+            throw SwanOperatorAccountBackupError.unsupportedVersion
         } catch {
             throw SwanOperatorAccountBackupError.failed
         }
@@ -462,7 +498,8 @@ public enum SwanOperatorAccountBackupVerifier {
             let envelope = try SwanPortableExportFilesystem.read(
                 path: manifest.envelopePath,
                 root: root,
-                maximumBytes: 64 * 1_024
+                maximumBytes:
+                    SwanOperatorAccountSecretsCodec.maximumEncodedBytes + 64
             )
             guard SwanPortableExportDigest.hex(envelope) == manifest.envelopeSHA256 else {
                 throw SwanOperatorAccountBackupError.failed
@@ -518,6 +555,8 @@ public enum SwanOperatorAccountBackupVerifier {
                 portable: portable,
                 secrets: secrets
             )
+        } catch let error as SwanOperatorAccountBackupCompatibilityError {
+            throw error
         } catch {
             throw SwanOperatorAccountBackupError.failed
         }
@@ -582,6 +621,7 @@ struct SwanOperatorAccountSecrets: Sendable {
     let rotationKeyReference: AccountControlKeyReference
     let signingPrivateScalar: Data
     let rotationPrivateScalar: Data
+    let plcCredentialKeyContinuity: PLCCredentialKeyContinuityInventory
 
     init(
         profileID: String,
@@ -594,6 +634,7 @@ struct SwanOperatorAccountSecrets: Sendable {
         rotationKeyReference: AccountControlKeyReference,
         signingPrivateScalar: Data,
         rotationPrivateScalar: Data,
+        plcCredentialKeyContinuity: PLCCredentialKeyContinuityInventory,
         allowDeferredDigest: Bool = false
     ) throws {
         guard profileID == PermissionedData0016.profileID,
@@ -628,6 +669,7 @@ struct SwanOperatorAccountSecrets: Sendable {
         self.rotationKeyReference = rotationKeyReference
         self.signingPrivateScalar = signingPrivateScalar
         self.rotationPrivateScalar = rotationPrivateScalar
+        self.plcCredentialKeyContinuity = plcCredentialKeyContinuity
     }
 
     func binding(portableManifestSHA256: String) throws -> Self {
@@ -641,20 +683,27 @@ struct SwanOperatorAccountSecrets: Sendable {
             signingKeyReference: signingKeyReference,
             rotationKeyReference: rotationKeyReference,
             signingPrivateScalar: signingPrivateScalar,
-            rotationPrivateScalar: rotationPrivateScalar
+            rotationPrivateScalar: rotationPrivateScalar,
+            plcCredentialKeyContinuity: plcCredentialKeyContinuity
         )
     }
 }
 
 private enum SwanOperatorAccountSecretsCodec {
-    private static let formatValue = "swan-operator-account-secrets-v1"
+    static let formatValue = "swan-operator-account-secrets-v2"
+    static let legacyFormatValue = "swan-operator-account-secrets-v1"
+    static let maximumEncodedBytes =
+        PLCCredentialKeyContinuityInventory.maximumCheckpointBytes
+            + 16 * 1_024
     private static let rootKeys = Set([
         "canonicalHandle", "did", "format", "passwordVerifier",
+        "plcCredentialKeyContinuity",
         "portableManifestSHA256", "profileID", "publicGenesisCommitCID",
         "rotationKeyReference", "rotationPrivateScalar",
         "signingKeyReference", "signingPrivateScalar",
     ])
     private static let referenceKeys = Set(["generation", "purpose", "reference"])
+    private static let continuityKeys = Set(["issuer", "terminalCID"])
 
     static func encode(_ secrets: SwanOperatorAccountSecrets) throws -> Data {
         let object: [String: Any] = [
@@ -662,6 +711,8 @@ private enum SwanOperatorAccountSecretsCodec {
             "did": secrets.did,
             "format": formatValue,
             "passwordVerifier": secrets.passwordVerifier,
+            "plcCredentialKeyContinuity":
+                try continuityObject(secrets.plcCredentialKeyContinuity),
             "portableManifestSHA256": secrets.portableManifestSHA256,
             "profileID": secrets.profileID,
             "publicGenesisCommitCID": secrets.publicGenesisCommitCID,
@@ -675,23 +726,39 @@ private enum SwanOperatorAccountSecretsCodec {
             ),
         ]
         do {
-            return try JSONSerialization.data(
+            let data = try JSONSerialization.data(
                 withJSONObject: object,
                 options: [.sortedKeys, .withoutEscapingSlashes]
             )
+            guard data.count <= maximumEncodedBytes else {
+                throw SwanOperatorAccountBackupError.failed
+            }
+            return data
         } catch {
             throw SwanOperatorAccountBackupError.failed
         }
     }
 
     static func decode(_ data: Data) throws -> SwanOperatorAccountSecrets {
-        guard !data.isEmpty, data.count <= 16 * 1_024,
-              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard !data.isEmpty, data.count <= maximumEncodedBytes,
+              let object =
+                  try JSONSerialization.jsonObject(with: data)
+                    as? [String: Any],
+              let encodedFormat = object["format"] as? String else {
+            throw SwanOperatorAccountBackupError.failed
+        }
+        if encodedFormat == legacyFormatValue {
+            throw SwanOperatorAccountBackupCompatibilityError
+                .unsupportedEncryptedPayloadVersion
+        }
+        guard
               Set(object.keys) == rootKeys,
-              object["format"] as? String == formatValue,
+              encodedFormat == formatValue,
               let canonicalHandle = object["canonicalHandle"] as? String,
               let did = object["did"] as? String,
               let passwordVerifier = object["passwordVerifier"] as? String,
+              let continuityRows =
+                  object["plcCredentialKeyContinuity"] as? [[String: Any]],
               let portableManifestSHA256 = object["portableManifestSHA256"] as? String,
               let profileID = object["profileID"] as? String,
               let publicGenesisCommitCID = object["publicGenesisCommitCID"] as? String,
@@ -717,6 +784,7 @@ private enum SwanOperatorAccountSecretsCodec {
         }
         let signingReference = try decodeReference(signingReferenceObject)
         let rotationReference = try decodeReference(rotationReferenceObject)
+        let continuity = try decodeContinuity(continuityRows)
         let secrets = try SwanOperatorAccountSecrets(
             profileID: profileID,
             portableManifestSHA256: portableManifestSHA256,
@@ -727,12 +795,74 @@ private enum SwanOperatorAccountSecretsCodec {
             signingKeyReference: signingReference,
             rotationKeyReference: rotationReference,
             signingPrivateScalar: signing,
-            rotationPrivateScalar: rotation
+            rotationPrivateScalar: rotation,
+            plcCredentialKeyContinuity: continuity
         )
         guard try encode(secrets) == data else {
             throw SwanOperatorAccountBackupError.failed
         }
         return secrets
+    }
+
+    private static func continuityObject(
+        _ inventory: PLCCredentialKeyContinuityInventory
+    ) throws -> [[String: String]] {
+        let object = inventory.checkpoints.map {
+            ["issuer": $0.issuer, "terminalCID": $0.terminalCID]
+        }
+        let data = try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        guard
+            data.count
+                <= PLCCredentialKeyContinuityInventory
+                    .maximumCheckpointBytes
+        else {
+            throw SwanOperatorAccountBackupError.failed
+        }
+        return object
+    }
+
+    private static func decodeContinuity(
+        _ rows: [[String: Any]]
+    ) throws -> PLCCredentialKeyContinuityInventory {
+        guard
+            rows.count
+                <= PLCCredentialKeyContinuityInventory
+                    .maximumCheckpointCount
+        else {
+            throw SwanOperatorAccountBackupError.failed
+        }
+        let encoded = try JSONSerialization.data(
+            withJSONObject: rows,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        guard
+            encoded.count
+                <= PLCCredentialKeyContinuityInventory
+                    .maximumCheckpointBytes
+        else {
+            throw SwanOperatorAccountBackupError.failed
+        }
+        let checkpoints = try rows.map { row in
+            guard Set(row.keys) == continuityKeys,
+                  let issuer = row["issuer"] as? String,
+                  let terminalCID = row["terminalCID"] as? String else {
+                throw SwanOperatorAccountBackupError.failed
+            }
+            return try PLCCredentialKeyContinuityCheckpoint(
+                issuer: issuer,
+                terminalCID: terminalCID
+            )
+        }
+        let inventory = try PLCCredentialKeyContinuityInventory(
+            checkpoints: checkpoints
+        )
+        guard inventory.checkpoints == checkpoints else {
+            throw SwanOperatorAccountBackupError.failed
+        }
+        return inventory
     }
 
     private static func referenceObject(

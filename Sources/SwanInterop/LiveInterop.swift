@@ -7,6 +7,7 @@ import NIOHTTP1
 import Petrel
 import SwanCore
 import SwanOAuth
+import SwanSQLite
 import SwanSpaces
 import SwanSpacesWire
 
@@ -241,7 +242,9 @@ public final class InteropHTTPClient: @unchecked Sendable {
                 guard count <= maximumResponseBytes - received else {
                     throw InteropHTTPError.responseTooLarge
                 }
-                try handle.write(contentsOf: Data(buffer: buffer))
+                _ = try InteropStreamingBodyChunker.drain(buffer) {
+                    try handle.write(contentsOf: $0)
+                }
                 received += count
             }
             try handle.close()
@@ -293,6 +296,30 @@ public final class InteropHTTPClient: @unchecked Sendable {
         case .delete: .DELETE
         case .patch: .PATCH
         }
+    }
+}
+
+enum InteropStreamingBodyChunker {
+    static let maximumChunkBytes = 64 * 1_024
+
+    /// AsyncHTTPClient does not promise a maximum size for each yielded
+    /// ByteBuffer. Slice it before bridging to Foundation so one unusually
+    /// large network buffer cannot become an equally large transient Data.
+    static func drain(
+        _ receivedBuffer: ByteBuffer,
+        consume: (Data) throws -> Void
+    ) throws -> Int {
+        var buffer = receivedBuffer
+        let originalCount = buffer.readableBytes
+        while buffer.readableBytes > 0 {
+            let count = min(maximumChunkBytes, buffer.readableBytes)
+            guard let chunk = buffer.readData(length: count),
+                  chunk.count == count else {
+                throw InteropHTTPError.fileFailure
+            }
+            try consume(chunk)
+        }
+        return originalCount
     }
 }
 
@@ -505,14 +532,46 @@ public struct InteropFixtureEvent: Codable, Sendable, Equatable {
         responseSHA256: String,
         responseError: String? = nil
     ) {
-        self.host = FixtureSanitizer.sanitize(host)
-        self.method = FixtureSanitizer.sanitize(method)
-        self.path = FixtureSanitizer.sanitize(path)
+        self.host = FixtureSanitizer.safeIdentifier(host)
+        self.method = FixtureSanitizer.httpMethod(method)
+        self.path = FixtureSanitizer.path(path)
         self.status = status
         self.requestBytes = requestBytes
         self.responseBytes = responseBytes
-        self.responseSHA256 = responseSHA256
-        self.responseError = responseError.map(FixtureSanitizer.sanitize)
+        self.responseSHA256 =
+            FixtureSanitizer.canonicalSHA256Hex(responseSHA256) ?? "<redacted>"
+        self.responseError = responseError.map(FixtureSanitizer.errorCode)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case host
+        case method
+        case path
+        case status
+        case requestBytes
+        case responseBytes
+        case responseSHA256
+        case responseError
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            host: try container.decode(String.self, forKey: .host),
+            method: try container.decode(String.self, forKey: .method),
+            path: try container.decode(String.self, forKey: .path),
+            status: try container.decode(Int.self, forKey: .status),
+            requestBytes: try container.decode(Int.self, forKey: .requestBytes),
+            responseBytes: try container.decode(Int.self, forKey: .responseBytes),
+            responseSHA256: try container.decode(
+                String.self,
+                forKey: .responseSHA256
+            ),
+            responseError: try container.decodeIfPresent(
+                String.self,
+                forKey: .responseError
+            )
+        )
     }
 }
 
@@ -535,7 +594,7 @@ public actor InteropFixtureRecorder {
             InteropFixtureEvent(
                 host: host,
                 method: method,
-                path: FixtureSanitizer.path(path),
+                path: path,
                 status: response.status,
                 requestBytes: requestBody?.count ?? 0,
                 responseBytes: response.body.count,
@@ -626,26 +685,90 @@ public struct LiveInteropPublicRoundTripArtifact: Codable, Sendable, Equatable {
         errorCode: String?,
         events: [InteropFixtureEvent]
     ) {
-        self.scenario = FixtureSanitizer.sanitize(["scenario": scenario])["scenario"] ?? "<redacted>"
+        self.scenario = FixtureSanitizer.safeIdentifier(scenario)
         self.profileID = OfflineProtocolProfileVerifier.stableProfileID
-        self.producer = FixtureSanitizer.sanitize(["host": producer])["host"] ?? "<redacted>"
-        self.consumer = FixtureSanitizer.sanitize(["host": consumer])["host"] ?? "<redacted>"
+        self.producer = FixtureSanitizer.safeIdentifier(producer)
+        self.consumer = FixtureSanitizer.safeIdentifier(consumer)
         self.putStatus = putStatus
         self.readStatus = readStatus
-        self.putCID = putCID
-        self.readCID = readCID
-        self.putResponseSHA256 = putResponseSHA256
-        self.readResponseSHA256 = readResponseSHA256
+        self.putCID = canonicalInteropCID(putCID, codec: .dagCBOR)
+        self.readCID = canonicalInteropCID(readCID, codec: .dagCBOR)
+        self.putResponseSHA256 =
+            FixtureSanitizer.canonicalSHA256Hex(putResponseSHA256)
+        self.readResponseSHA256 =
+            FixtureSanitizer.canonicalSHA256Hex(readResponseSHA256)
         self.blobUploadStatus = blobUploadStatus
         self.blobDownloadStatus = blobDownloadStatus
-        self.blobCID = blobCID
+        self.blobCID = canonicalInteropCID(blobCID, codec: .raw)
         self.blobBytes = blobBytes
         self.blobVerified = blobVerified
         self.converged = converged
-        self.status = status
-        self.errorCode = errorCode.map { FixtureSanitizer.sanitize(["error": $0])["error"] ?? "<redacted>" }
+        self.status = FixtureSanitizer.artifactStatus(status)
+        self.errorCode = errorCode.map(FixtureSanitizer.errorCode)
         self.fixturePolicy = "semantic-summary-only; no request bodies, record values, credentials, tokens, DPoP proofs, or personal selectors"
         self.events = events
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case scenario
+        case profileID
+        case producer
+        case consumer
+        case putStatus
+        case readStatus
+        case putCID
+        case readCID
+        case putResponseSHA256
+        case readResponseSHA256
+        case blobUploadStatus
+        case blobDownloadStatus
+        case blobCID
+        case blobBytes
+        case blobVerified
+        case converged
+        case status
+        case errorCode
+        case fixturePolicy
+        case events
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            scenario: try container.decode(String.self, forKey: .scenario),
+            producer: try container.decode(String.self, forKey: .producer),
+            consumer: try container.decode(String.self, forKey: .consumer),
+            putStatus: try container.decodeIfPresent(Int.self, forKey: .putStatus),
+            readStatus: try container.decodeIfPresent(Int.self, forKey: .readStatus),
+            putCID: try container.decodeIfPresent(String.self, forKey: .putCID),
+            readCID: try container.decodeIfPresent(String.self, forKey: .readCID),
+            putResponseSHA256: try container.decodeIfPresent(
+                String.self,
+                forKey: .putResponseSHA256
+            ),
+            readResponseSHA256: try container.decodeIfPresent(
+                String.self,
+                forKey: .readResponseSHA256
+            ),
+            blobUploadStatus: try container.decodeIfPresent(
+                Int.self,
+                forKey: .blobUploadStatus
+            ),
+            blobDownloadStatus: try container.decodeIfPresent(
+                Int.self,
+                forKey: .blobDownloadStatus
+            ),
+            blobCID: try container.decodeIfPresent(String.self, forKey: .blobCID),
+            blobBytes: try container.decodeIfPresent(Int.self, forKey: .blobBytes),
+            blobVerified: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .blobVerified
+            ),
+            converged: try container.decode(Bool.self, forKey: .converged),
+            status: try container.decode(String.self, forKey: .status),
+            errorCode: try container.decodeIfPresent(String.self, forKey: .errorCode),
+            events: try container.decode([InteropFixtureEvent].self, forKey: .events)
+        )
     }
 }
 
@@ -664,6 +787,14 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
     public let syncStatus: Int?
     public let syncOpsCount: Int?
     public let syncOperationCID: String?
+    /// Revision of the operation that matched the write CID. This makes the
+    /// incremental page an explicit state-transition witness, rather than an
+    /// endpoint-success probe.
+    public let syncOperationRevision: String?
+    /// Hex-encoded LtHash commitment reconstructed from the terminal page.
+    public let syncCommitment: String?
+    /// Revision bound into the verified signed terminal commitment.
+    public let syncCommitRevision: String?
     public let syncCommitVerified: Bool?
     /// Whether the incremental-sync response included record values.  The
     /// pinned TypeScript branch currently has an ambiguous SQLite query when
@@ -674,6 +805,14 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
     public let fullCARStatus: Int?
     public let fullCARRecordCount: Int?
     public let fullCARCommitment: String?
+    /// Canonical TID from the signed full-CAR commit context. This is retained
+    /// so a commitment that recurs at a later state cannot make an older CAR
+    /// look current.
+    public let fullCARWireRevision: String?
+    /// True only when the fully verified CAR index contains the exact
+    /// collection/rkey -> CID produced and read by this round trip. The path
+    /// itself is intentionally not persisted in the artifact.
+    public let fullCARExpectedRecordVerified: Bool?
     public let fullCARVerified: Bool?
     public let converged: Bool
     public let status: String
@@ -695,42 +834,179 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
         syncStatus: Int? = nil,
         syncOpsCount: Int? = nil,
         syncOperationCID: String? = nil,
+        syncOperationRevision: String? = nil,
+        syncCommitment: String? = nil,
+        syncCommitRevision: String? = nil,
         syncCommitVerified: Bool? = nil,
         syncValuesIncluded: Bool? = nil,
         fullCARStatus: Int? = nil,
         fullCARRecordCount: Int? = nil,
         fullCARCommitment: String? = nil,
+        fullCARWireRevision: String? = nil,
+        fullCARExpectedRecordVerified: Bool? = nil,
         fullCARVerified: Bool? = nil,
         converged: Bool,
         status: String,
         errorCode: String?,
         events: [InteropFixtureEvent]
     ) {
-        self.scenario = FixtureSanitizer.sanitize(["scenario": scenario])["scenario"] ?? "<redacted>"
+        self.scenario = FixtureSanitizer.safeIdentifier(scenario)
         self.profileID = OfflineProtocolProfileVerifier.stableProfileID
-        self.member = FixtureSanitizer.sanitize(["host": member])["host"] ?? "<redacted>"
-        self.authority = FixtureSanitizer.sanitize(["host": authority])["host"] ?? "<redacted>"
+        self.member = FixtureSanitizer.safeIdentifier(member)
+        self.authority = FixtureSanitizer.safeIdentifier(authority)
         self.credentialIssued = credentialIssued
         self.writeStatus = writeStatus
         self.readStatus = readStatus
-        self.writeCID = writeCID
-        self.readCID = readCID
-        self.writeResponseSHA256 = writeResponseSHA256
-        self.readResponseSHA256 = readResponseSHA256
+        self.writeCID = canonicalInteropCID(writeCID, codec: .dagCBOR)
+        self.readCID = canonicalInteropCID(readCID, codec: .dagCBOR)
+        self.writeResponseSHA256 =
+            FixtureSanitizer.canonicalSHA256Hex(writeResponseSHA256)
+        self.readResponseSHA256 =
+            FixtureSanitizer.canonicalSHA256Hex(readResponseSHA256)
         self.syncStatus = syncStatus
         self.syncOpsCount = syncOpsCount
-        self.syncOperationCID = syncOperationCID
+        self.syncOperationCID = canonicalInteropCID(
+            syncOperationCID,
+            codec: .dagCBOR
+        )
+        self.syncOperationRevision = canonicalInteropTID(
+            syncOperationRevision
+        )
+        self.syncCommitment =
+            FixtureSanitizer.canonicalSHA256Hex(syncCommitment)
+        self.syncCommitRevision = canonicalInteropTID(syncCommitRevision)
         self.syncCommitVerified = syncCommitVerified
         self.syncValuesIncluded = syncValuesIncluded
         self.fullCARStatus = fullCARStatus
         self.fullCARRecordCount = fullCARRecordCount
-        self.fullCARCommitment = fullCARCommitment
+        self.fullCARCommitment =
+            FixtureSanitizer.canonicalSHA256Hex(fullCARCommitment)
+        self.fullCARWireRevision = canonicalInteropTID(fullCARWireRevision)
+        self.fullCARExpectedRecordVerified = fullCARExpectedRecordVerified
         self.fullCARVerified = fullCARVerified
         self.converged = converged
-        self.status = status
-        self.errorCode = errorCode.map { FixtureSanitizer.sanitize(["error": $0])["error"] ?? "<redacted>" }
+        self.status = FixtureSanitizer.artifactStatus(status)
+        self.errorCode = errorCode.map(FixtureSanitizer.errorCode)
         self.fixturePolicy = "semantic-summary-only; no credentials, tokens, DPoP proofs, request bodies, record values, or personal selectors"
         self.events = events
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case scenario
+        case profileID
+        case member
+        case authority
+        case credentialIssued
+        case writeStatus
+        case readStatus
+        case writeCID
+        case readCID
+        case writeResponseSHA256
+        case readResponseSHA256
+        case syncStatus
+        case syncOpsCount
+        case syncOperationCID
+        case syncOperationRevision
+        case syncCommitment
+        case syncCommitRevision
+        case syncCommitVerified
+        case syncValuesIncluded
+        case fullCARStatus
+        case fullCARRecordCount
+        case fullCARCommitment
+        case fullCARWireRevision
+        case fullCARExpectedRecordVerified
+        case fullCARVerified
+        case converged
+        case status
+        case errorCode
+        case fixturePolicy
+        case events
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            scenario: try container.decode(String.self, forKey: .scenario),
+            member: try container.decode(String.self, forKey: .member),
+            authority: try container.decode(String.self, forKey: .authority),
+            credentialIssued: try container.decode(
+                Bool.self,
+                forKey: .credentialIssued
+            ),
+            writeStatus: try container.decodeIfPresent(
+                Int.self,
+                forKey: .writeStatus
+            ),
+            readStatus: try container.decodeIfPresent(Int.self, forKey: .readStatus),
+            writeCID: try container.decodeIfPresent(String.self, forKey: .writeCID),
+            readCID: try container.decodeIfPresent(String.self, forKey: .readCID),
+            writeResponseSHA256: try container.decodeIfPresent(
+                String.self,
+                forKey: .writeResponseSHA256
+            ),
+            readResponseSHA256: try container.decodeIfPresent(
+                String.self,
+                forKey: .readResponseSHA256
+            ),
+            syncStatus: try container.decodeIfPresent(Int.self, forKey: .syncStatus),
+            syncOpsCount: try container.decodeIfPresent(
+                Int.self,
+                forKey: .syncOpsCount
+            ),
+            syncOperationCID: try container.decodeIfPresent(
+                String.self,
+                forKey: .syncOperationCID
+            ),
+            syncOperationRevision: try container.decodeIfPresent(
+                String.self,
+                forKey: .syncOperationRevision
+            ),
+            syncCommitment: try container.decodeIfPresent(
+                String.self,
+                forKey: .syncCommitment
+            ),
+            syncCommitRevision: try container.decodeIfPresent(
+                String.self,
+                forKey: .syncCommitRevision
+            ),
+            syncCommitVerified: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .syncCommitVerified
+            ),
+            syncValuesIncluded: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .syncValuesIncluded
+            ),
+            fullCARStatus: try container.decodeIfPresent(
+                Int.self,
+                forKey: .fullCARStatus
+            ),
+            fullCARRecordCount: try container.decodeIfPresent(
+                Int.self,
+                forKey: .fullCARRecordCount
+            ),
+            fullCARCommitment: try container.decodeIfPresent(
+                String.self,
+                forKey: .fullCARCommitment
+            ),
+            fullCARWireRevision: try container.decodeIfPresent(
+                String.self,
+                forKey: .fullCARWireRevision
+            ),
+            fullCARExpectedRecordVerified: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .fullCARExpectedRecordVerified
+            ),
+            fullCARVerified: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .fullCARVerified
+            ),
+            converged: try container.decode(Bool.self, forKey: .converged),
+            status: try container.decode(String.self, forKey: .status),
+            errorCode: try container.decodeIfPresent(String.self, forKey: .errorCode),
+            events: try container.decode([InteropFixtureEvent].self, forKey: .events)
+        )
     }
 }
 
@@ -743,16 +1019,62 @@ public enum LiveInteropRunner {
         let cid: String?
     }
 
+    private struct BlobResponse: Decodable {
+        struct BlobValue: Decodable {
+            struct Link: Decodable {
+                let link: String
+
+                private enum CodingKeys: String, CodingKey {
+                    case link = "$link"
+                }
+            }
+
+            let ref: Link?
+            let cid: String?
+        }
+
+        let blob: BlobValue
+    }
+
+    static func canonicalRecordCID(from body: Data) -> String? {
+        guard let response = try? StrictJSON.decode(
+            RecordResponse.self,
+            from: body
+        ) else {
+            return nil
+        }
+        return canonicalInteropCID(response.cid, codec: .dagCBOR)
+    }
+
+    static func canonicalBlobCID(from body: Data) -> String? {
+        guard let response = try? StrictJSON.decode(
+            BlobResponse.self,
+            from: body
+        ) else {
+            return nil
+        }
+        let candidates = [response.blob.ref?.link, response.blob.cid]
+            .compactMap { $0 }
+        guard candidates.count == 1 else {
+            return nil
+        }
+        return canonicalInteropCID(candidates[0], codec: .raw)
+    }
+
     private struct PermissionedSyncResult: Sendable {
         let status: Int?
         let opsCount: Int?
         let operationCID: String?
+        let operationRevision: String?
+        let commitment: String?
+        let commitRevision: String?
         let commitVerified: Bool?
         let valuesIncluded: Bool?
         let errorCode: String?
 
         static let notRequested = Self(
             status: nil, opsCount: nil, operationCID: nil,
+            operationRevision: nil, commitment: nil, commitRevision: nil,
             commitVerified: nil, valuesIncluded: nil, errorCode: nil
         )
     }
@@ -761,11 +1083,14 @@ public enum LiveInteropRunner {
         let status: Int?
         let recordCount: Int?
         let commitment: String?
+        let wireRevision: String?
+        let expectedRecordVerified: Bool?
         let verified: Bool?
         let errorCode: String?
 
         static let notRequested = Self(
             status: nil, recordCount: nil, commitment: nil,
+            wireRevision: nil, expectedRecordVerified: nil,
             verified: nil, errorCode: nil
         )
     }
@@ -887,7 +1212,7 @@ public enum LiveInteropRunner {
                     errorCode: errorCode, recorder: recorder
                 )
             }
-            putCID = try StrictJSON.decode(RecordResponse.self, from: response.body).cid
+            putCID = canonicalRecordCID(from: response.body)
             guard putCID != nil else {
                 errorCode = "InvalidResponse"
                 return await artifact(
@@ -942,7 +1267,10 @@ public enum LiveInteropRunner {
                     errorCode: errorCode, recorder: recorder
                 )
             }
-            readCID = try StrictJSON.decode(RecordResponse.self, from: response.body).cid
+            readCID = canonicalRecordCID(from: response.body)
+            if readCID == nil {
+                errorCode = "InvalidResponse"
+            }
         } catch {
             errorCode = liveErrorCode(error)
         }
@@ -1001,7 +1329,7 @@ public enum LiveInteropRunner {
                     errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
                 )
             }
-            guard let cid = blobCID(from: response.body) else {
+            guard let cid = canonicalBlobCID(from: response.body) else {
                 return PublicBlobResult(
                     uploadStatus: response.status, downloadStatus: nil,
                     cid: nil, byteCount: body.count, verified: false,
@@ -1085,34 +1413,6 @@ public enum LiveInteropRunner {
                 byteCount: nil, verified: false, errorCode: liveErrorCode(error)
             )
         }
-    }
-
-    private static func blobCID(from body: Data) -> String? {
-        guard let object = try? JSONSerialization.jsonObject(with: body) else {
-            return nil
-        }
-        func find(_ value: Any) -> String? {
-            if let string = value as? String, (try? CID.parse(string)) != nil {
-                return string
-            }
-            if let object = value as? [String: Any] {
-                for key in ["$link", "cid"] {
-                    if let candidate = object[key] as? String,
-                       (try? CID.parse(candidate)) != nil {
-                        return candidate
-                    }
-                }
-                for nested in object.values {
-                    if let found = find(nested) { return found }
-                }
-            } else if let values = value as? [Any] {
-                for nested in values {
-                    if let found = find(nested) { return found }
-                }
-            }
-            return nil
-        }
-        return find(object)
     }
 
     private static func fileDigest(_ url: URL) throws -> (bytes: Int, digest: String) {
@@ -1220,7 +1520,7 @@ public enum LiveInteropRunner {
                     converged: false, errorCode: errorCode, recorder: recorder
                 )
             }
-            writeCID = try StrictJSON.decode(RecordResponse.self, from: write.body).cid
+            writeCID = canonicalRecordCID(from: write.body)
             guard writeCID != nil else {
                 errorCode = "InvalidResponse"
                 return await permissionedArtifact(
@@ -1263,7 +1563,7 @@ public enum LiveInteropRunner {
                     converged: false, errorCode: errorCode, recorder: recorder
                 )
             }
-            readCID = try StrictJSON.decode(RecordResponse.self, from: read.body).cid
+            readCID = canonicalRecordCID(from: read.body)
             guard readCID != nil else {
                 errorCode = "InvalidResponse"
                 return await permissionedArtifact(
@@ -1290,13 +1590,24 @@ public enum LiveInteropRunner {
                     repositoryHost: repositoryHost,
                     space: space,
                     author: readQuery["repo"] ?? "",
+                    collection: readQuery["collection"],
+                    rkey: readQuery["rkey"],
+                    expectedCID: writeCID == readCID ? writeCID : nil,
                     authorization: credentialAuthorization,
                     recorder: recorder
                 )
             }
-            let converged = writeCID == readCID
-                && syncResult.errorCode == nil
-                && fullCARResult.errorCode == nil
+            let converged = permissionedEvidenceConverged(
+                writeCID: writeCID,
+                readCID: readCID,
+                verifyIncrementalSync: verifyIncrementalSync,
+                syncResult: syncResult,
+                verifyFullCAR: verifyFullCAR,
+                fullCARResult: fullCARResult
+            )
+            let evidenceError = syncResult.errorCode
+                ?? fullCARResult.errorCode
+                ?? (converged ? nil : "EvidenceMismatch")
             return await permissionedArtifact(
                 scenario: scenario, member: member, authority: authority,
                 credentialIssued: credentialIssued, writeStatus: writeStatus,
@@ -1305,7 +1616,7 @@ public enum LiveInteropRunner {
                 syncResult: syncResult,
                 fullCARResult: fullCARResult,
                 converged: converged,
-                errorCode: syncResult.errorCode ?? fullCARResult.errorCode,
+                errorCode: evidenceError,
                 recorder: recorder
             )
         } catch {
@@ -1334,6 +1645,7 @@ public enum LiveInteropRunner {
         guard let expectedCID else {
             return PermissionedSyncResult(
                 status: nil, opsCount: nil, operationCID: nil,
+                operationRevision: nil, commitment: nil, commitRevision: nil,
                 commitVerified: false, valuesIncluded: includeValues,
                 errorCode: "InvalidResponse"
             )
@@ -1364,6 +1676,7 @@ public enum LiveInteropRunner {
             guard (200 ... 299).contains(response.status) else {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: nil, operationCID: nil,
+                    operationRevision: nil, commitment: nil, commitRevision: nil,
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
                 )
@@ -1372,11 +1685,28 @@ public enum LiveInteropRunner {
                 ComAtprotoSpaceListRepoOps.Output.self,
                 from: response.body
             )
+            guard output.cursor == nil,
+                  !output.ops.isEmpty,
+                  let operationRevisions = try? output.ops.map({ try TID(tidString: $0.rev) }),
+                  zip(operationRevisions, operationRevisions.dropFirst()).allSatisfy({
+                      $0.0 <= $0.1
+                  }) else {
+                return PermissionedSyncResult(
+                    status: response.status, opsCount: output.ops.count,
+                    operationCID: output.ops.first?.cid?.string,
+                    operationRevision: output.ops.first?.rev,
+                    commitment: nil, commitRevision: output.commit?.rev,
+                    commitVerified: false, valuesIncluded: includeValues,
+                    errorCode: "InvalidOperation"
+                )
+            }
             let operation = output.ops.first(where: { $0.cid?.string == expectedCID })
             guard let operation else {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: output.ops.first?.cid?.string,
+                    operationRevision: output.ops.first?.rev,
+                    commitment: nil, commitRevision: nil,
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "OperationMismatch"
                 )
@@ -1385,11 +1715,15 @@ public enum LiveInteropRunner {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
+                    operationRevision: operation.rev,
+                    commitment: nil, commitRevision: nil,
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "CommitMissing"
                 )
             }
             guard commit.ver == 1,
+                  commit.rev == output.ops.last?.rev,
+                  (try? TID(tidString: commit.rev)) != nil,
                   commit.hash.data.count == 32,
                   commit.ikm.data.count == 32,
                   commit.sig.data.count == 64,
@@ -1397,17 +1731,54 @@ public enum LiveInteropRunner {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
+                    operationRevision: operation.rev,
+                    commitment: nil, commitRevision: commit.rev,
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "InvalidCommit"
                 )
             }
             var lthash = LtHash()
             for entry in output.ops {
+                if let value = entry.value {
+                    guard let cid = entry.cid,
+                          let canonicalValue = try? canonicalInteropRecordValue(value),
+                          CID.fromDAGCBOR(canonicalValue) == cid else {
+                        return PermissionedSyncResult(
+                            status: response.status, opsCount: output.ops.count,
+                            operationCID: operation.cid?.string,
+                            operationRevision: operation.rev,
+                            commitment: nil, commitRevision: commit.rev,
+                            commitVerified: false, valuesIncluded: includeValues,
+                            errorCode: "ValueCIDMismatch"
+                        )
+                    }
+                } else if includeValues, entry.cid != nil {
+                    return PermissionedSyncResult(
+                        status: response.status, opsCount: output.ops.count,
+                        operationCID: operation.cid?.string,
+                        operationRevision: operation.rev,
+                        commitment: nil, commitRevision: commit.rev,
+                        commitVerified: false, valuesIncluded: includeValues,
+                        errorCode: "ValueMissing"
+                    )
+                }
                 guard let cid = entry.cid?.string else {
+                    guard entry.value == nil else {
+                        return PermissionedSyncResult(
+                            status: response.status, opsCount: output.ops.count,
+                            operationCID: operation.cid?.string,
+                            operationRevision: operation.rev,
+                            commitment: nil, commitRevision: commit.rev,
+                            commitVerified: false, valuesIncluded: includeValues,
+                            errorCode: "InvalidOperation"
+                        )
+                    }
                     guard let previous = entry.prev?.string else {
                         return PermissionedSyncResult(
                             status: response.status, opsCount: output.ops.count,
                             operationCID: operation.cid?.string,
+                            operationRevision: operation.rev,
+                            commitment: nil, commitRevision: commit.rev,
                             commitVerified: false, valuesIncluded: includeValues,
                             errorCode: "InvalidOperation"
                         )
@@ -1424,6 +1795,8 @@ public enum LiveInteropRunner {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
+                    operationRevision: operation.rev,
+                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev,
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "CommitmentMismatch"
                 )
@@ -1445,6 +1818,8 @@ public enum LiveInteropRunner {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
+                    operationRevision: operation.rev,
+                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev,
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "ContentBindingMismatch"
                 )
@@ -1453,6 +1828,8 @@ public enum LiveInteropRunner {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
+                    operationRevision: operation.rev,
+                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev,
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "MissingCommitKey"
                 )
@@ -1469,6 +1846,8 @@ public enum LiveInteropRunner {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
+                    operationRevision: operation.rev,
+                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev,
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "ContextSignatureMismatch"
                 )
@@ -1476,11 +1855,14 @@ public enum LiveInteropRunner {
             return PermissionedSyncResult(
                 status: response.status, opsCount: output.ops.count,
                 operationCID: operation.cid?.string,
+                operationRevision: operation.rev,
+                commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev,
                 commitVerified: true, valuesIncluded: includeValues, errorCode: nil
             )
         } catch {
             return PermissionedSyncResult(
                 status: nil, opsCount: nil, operationCID: nil,
+                operationRevision: nil, commitment: nil, commitRevision: nil,
                 commitVerified: false, valuesIncluded: includeValues,
                 errorCode: liveErrorCode(error)
             )
@@ -1491,19 +1873,38 @@ public enum LiveInteropRunner {
         repositoryHost: LiveInteropHost,
         space: SpaceURI,
         author: String,
+        collection: String?,
+        rkey: String?,
+        expectedCID: String?,
         authorization: InteropAuthorization,
         recorder: InteropFixtureRecorder
     ) async -> PermissionedCARResult {
+        guard let collection,
+              let rkey,
+              let expectedCID,
+              let parsedCID = try? CID.parse(expectedCID),
+              let recordURI = try? SpaceRecordURI(
+                  space: space,
+                  author: author,
+                  collection: collection,
+                  rkey: rkey
+              )
+        else {
+            return PermissionedCARResult(
+                status: nil, recordCount: nil, commitment: nil,
+                wireRevision: nil, expectedRecordVerified: false,
+                verified: false, errorCode: "InvalidExpectedRecord"
+            )
+        }
+        let expectedEntry = SpaceCARRecoveryIndexEntry(
+            path: "\(recordURI.collection)/\(recordURI.rkey)",
+            cid: parsedCID
+        )
         guard let key = repositoryHost.permissionedCommitVerificationKey else {
             return PermissionedCARResult(
                 status: nil, recordCount: nil, commitment: nil,
+                wireRevision: nil, expectedRecordVerified: false,
                 verified: false, errorCode: "MissingCommitKey"
-            )
-        }
-        guard case let .p256(publicKey) = key else {
-            return PermissionedCARResult(
-                status: nil, recordCount: nil, commitment: nil,
-                verified: false, errorCode: "UnsupportedCommitKey"
             )
         }
         let spoolURL = FileManager.default.temporaryDirectory
@@ -1526,6 +1927,7 @@ public enum LiveInteropRunner {
             guard (200 ... 299).contains(response.status) else {
                 return PermissionedCARResult(
                     status: response.status, recordCount: nil, commitment: nil,
+                    wireRevision: nil, expectedRecordVerified: false,
                     verified: false, errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
                 )
             }
@@ -1533,25 +1935,31 @@ public enum LiveInteropRunner {
                 .contains("application/vnd.ipld.car") == true else {
                 return PermissionedCARResult(
                     status: response.status, recordCount: nil, commitment: nil,
+                    wireRevision: nil, expectedRecordVerified: false,
                     verified: false, errorCode: "UnexpectedContentType"
                 )
             }
-            let recovery = try SwanCARConsumer().verify(
+            let recovery = try await SwanCARConsumer().verifyStreaming(
                 fileURL: spoolURL,
                 space: space,
                 author: author,
-                publicKey: publicKey
+                verificationKey: key,
+                expectedEntries: [expectedEntry]
             )
             return PermissionedCARResult(
                 status: response.status,
-                recordCount: recovery.records.count,
+                recordCount: recovery.recordCount,
                 commitment: Hex.encode(recovery.commitment),
+                wireRevision: recovery.wireRevision.toString(),
+                expectedRecordVerified:
+                    recovery.verifiedExpectedWitnessCount == 1,
                 verified: true,
                 errorCode: nil
             )
         } catch {
             return PermissionedCARResult(
                 status: nil, recordCount: nil, commitment: nil,
+                wireRevision: nil, expectedRecordVerified: false,
                 verified: false, errorCode: liveErrorCode(error)
             )
         }
@@ -1625,17 +2033,75 @@ public enum LiveInteropRunner {
             syncStatus: syncResult.status,
             syncOpsCount: syncResult.opsCount,
             syncOperationCID: syncResult.operationCID,
+            syncOperationRevision: syncResult.operationRevision,
+            syncCommitment: syncResult.commitment,
+            syncCommitRevision: syncResult.commitRevision,
             syncCommitVerified: syncResult.commitVerified,
             syncValuesIncluded: syncResult.valuesIncluded,
             fullCARStatus: fullCARResult.status,
             fullCARRecordCount: fullCARResult.recordCount,
             fullCARCommitment: fullCARResult.commitment,
+            fullCARWireRevision: fullCARResult.wireRevision,
+            fullCARExpectedRecordVerified:
+                fullCARResult.expectedRecordVerified,
             fullCARVerified: fullCARResult.verified,
             converged: converged,
             status: converged ? "passed" : "failed",
             errorCode: errorCode,
             events: await recorder.snapshot()
         )
+    }
+
+    /// Computes the permissioned result from semantic evidence, not endpoint
+    /// reachability. A recurrent LtHash commitment is insufficient when both
+    /// synchronization forms are requested: their signed terminal TIDs must
+    /// identify the exact same repository state.
+    private static func permissionedEvidenceConverged(
+        writeCID: String?,
+        readCID: String?,
+        verifyIncrementalSync: Bool,
+        syncResult: PermissionedSyncResult,
+        verifyFullCAR: Bool,
+        fullCARResult: PermissionedCARResult
+    ) -> Bool {
+        guard let writeCID, writeCID == readCID else { return false }
+
+        if verifyIncrementalSync {
+            guard syncResult.status.map({ (200 ... 299).contains($0) }) == true,
+                  (syncResult.opsCount ?? 0) > 0,
+                  syncResult.operationCID == writeCID,
+                  canonicalInteropTID(syncResult.commitRevision) != nil,
+                  !(syncResult.commitment?.isEmpty ?? true),
+                  syncResult.commitVerified == true,
+                  syncResult.errorCode == nil
+            else {
+                return false
+            }
+        }
+
+        if verifyFullCAR {
+            guard fullCARResult.status.map({ (200 ... 299).contains($0) }) == true,
+                  (fullCARResult.recordCount ?? 0) > 0,
+                  !(fullCARResult.commitment?.isEmpty ?? true),
+                  canonicalInteropTID(fullCARResult.wireRevision) != nil,
+                  fullCARResult.expectedRecordVerified == true,
+                  fullCARResult.verified == true,
+                  fullCARResult.errorCode == nil
+            else {
+                return false
+            }
+        }
+
+        if verifyIncrementalSync, verifyFullCAR {
+            guard syncResult.commitment == fullCARResult.commitment,
+                  canonicalInteropTID(syncResult.commitRevision)
+                    == canonicalInteropTID(fullCARResult.wireRevision)
+            else {
+                return false
+            }
+        }
+
+        return true
     }
 
     private static func authorization(
@@ -1668,11 +2134,49 @@ private func responseDigest(_ response: InteropHTTPResponse) -> String {
     Hex.encode(Data(SHA256.hash(data: response.body)))
 }
 
+private func canonicalInteropRecordValue(_ record: ATProtocolValueContainer) throws -> Data {
+    let cborValue = try record.toCBORValue()
+    guard cborValue is OrderedCBORMap || cborValue is [String: Any] else {
+        throw SwanError.malformed("incremental record value is not a map")
+    }
+    let bytes = try DAGCBOR.encodeValue(cborValue)
+    _ = try CARRepository.decodeRecordCBOR(bytes)
+    return bytes
+}
+
 private func responseErrorCode(_ response: InteropHTTPResponse) -> String? {
     guard let object = try? JSONSerialization.jsonObject(with: response.body) as? [String: Any] else {
         return nil
     }
-    return (object["error"] as? String).map { FixtureSanitizer.sanitize(["error": $0])["error"] ?? "<redacted>" }
+    return (object["error"] as? String).map(FixtureSanitizer.errorCode)
+}
+
+/// Returns only the canonical lowercase base32 spelling for the expected
+/// content class. `CID.parse` intentionally accepts uppercase base32 input;
+/// fixture and request boundaries must not.
+private func canonicalInteropCID(
+    _ rawValue: String?,
+    codec: CIDCodec
+) -> String? {
+    guard let rawValue,
+          rawValue.utf8.count <= 100,
+          let cid = try? CID.parse(rawValue),
+          cid.codec == codec,
+          cid.string == rawValue else {
+        return nil
+    }
+    return cid.string
+}
+
+/// Returns only the canonical fixed-alphabet TID spelling. Artifacts never
+/// retain arbitrary peer-provided revision text.
+private func canonicalInteropTID(_ rawValue: String?) -> String? {
+    guard let rawValue,
+          let tid = try? TID(tidString: rawValue)
+    else {
+        return nil
+    }
+    return tid.toString()
 }
 
 private func liveErrorCode(_ error: Error) -> String {
@@ -1697,7 +2201,7 @@ private extension InteropHTTPResponse {
         guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             return nil
         }
-        return (object["error"] as? String).map(FixtureSanitizer.sanitize)
+        return (object["error"] as? String).map(FixtureSanitizer.errorCode)
     }
 }
 
@@ -1721,6 +2225,8 @@ public actor SpaceReplica {
         case missingDelete
         case commitmentMismatch
         case emptyOperation
+        case invalidWireRevision
+        case terminalRevisionMismatch
     }
 
     private let space: SpaceURI
@@ -1728,6 +2234,12 @@ public actor SpaceReplica {
     private var records: [SpaceRecordURI: SpaceRecord] = [:]
     private var revision: UInt64 = 0
     private var ltHash = LtHash()
+
+    private struct PreparedState {
+        let records: [SpaceRecordURI: SpaceRecord]
+        let revision: UInt64
+        let ltHash: LtHash
+    }
 
     public init(space: SpaceURI, author: String) throws {
         guard (try? DID(didString: author)) != nil else {
@@ -1747,12 +2259,46 @@ public actor SpaceReplica {
     }
 
     public func apply(_ entries: [InteropRepositoryOperation]) throws -> State {
+        let prepared = try prepare(entries)
+        install(prepared)
+        return state()
+    }
+
+    /// Applies a page only after its reader-specific terminal envelope has
+    /// verified against the candidate state. Keeping preparation and install
+    /// in one actor turn prevents a bad terminal commit from advancing the
+    /// last-good replica before verification fails.
+    public func applyAndVerify(
+        _ entries: [InteropRepositoryOperation],
+        terminalCommit: SpaceCommitEnvelope,
+        publicKey: P256.Signing.PublicKey
+    ) throws -> State {
+        let prepared = try prepare(entries)
+        guard let first = entries.first, let last = entries.last,
+              terminalCommit.context.space == first.uri.space,
+              terminalCommit.context.author == first.uri.author,
+              terminalCommit.context.rev == last.wireRevision else {
+            throw Error.terminalRevisionMismatch
+        }
+        guard try SpaceCommitCodec.verifyContextSignature(terminalCommit, publicKey: publicKey),
+              SpaceCommitCodec.verifyContentBinding(terminalCommit),
+              terminalCommit.commitment == prepared.ltHash.commitment else {
+            throw Error.commitmentMismatch
+        }
+        install(prepared)
+        return state()
+    }
+
+    private func prepare(_ entries: [InteropRepositoryOperation]) throws -> PreparedState {
         guard !entries.isEmpty else { throw Error.emptyOperation }
         var nextRecords = records
         var nextRevision = revision
         var nextHash = ltHash
         for entry in entries {
             guard entry.uri.space == space, entry.uri.author == author else { throw Error.wrongRepository }
+            guard (try? TID(tidString: entry.wireRevision)) != nil else {
+                throw Error.invalidWireRevision
+            }
             guard entry.revision == nextRevision + 1 else {
                 throw entry.revision <= nextRevision ? Error.staleRevision : Error.revisionGap
             }
@@ -1779,10 +2325,13 @@ public actor SpaceReplica {
             guard nextHash.commitment == entry.commitment else { throw Error.commitmentMismatch }
             nextRevision = entry.revision
         }
-        records = nextRecords
-        revision = nextRevision
-        ltHash = nextHash
-        return state()
+        return PreparedState(records: nextRecords, revision: nextRevision, ltHash: nextHash)
+    }
+
+    private func install(_ prepared: PreparedState) {
+        records = prepared.records
+        revision = prepared.revision
+        ltHash = prepared.ltHash
     }
 
     public func replace(
@@ -1815,6 +2364,7 @@ public actor SpaceReplica {
 
 public struct InteropRepositoryOperation: Sendable, Equatable {
     public let revision: UInt64
+    public let wireRevision: String
     public let uri: SpaceRecordURI
     public let cid: String
     public let value: Data?
@@ -1822,12 +2372,14 @@ public struct InteropRepositoryOperation: Sendable, Equatable {
 
     public init(
         revision: UInt64,
+        wireRevision: String,
         uri: SpaceRecordURI,
         cid: String,
         value: Data?,
         commitment: Data
     ) {
         self.revision = revision
+        self.wireRevision = wireRevision
         self.uri = uri
         self.cid = cid
         self.value = value
@@ -1850,30 +2402,39 @@ public struct IncrementalSynchronizer: Sendable {
         terminalCommit: SpaceCommitEnvelope,
         publicKey: P256.Signing.PublicKey
     ) async throws -> SpaceReplica.State {
-        let state = try await replica.apply(entries)
-        guard terminalCommit.context.space == entries[0].uri.space,
-              terminalCommit.context.author == entries[0].uri.author,
-              try SpaceCommitCodec.verifyContextSignature(terminalCommit, publicKey: publicKey),
-              SpaceCommitCodec.verifyContentBinding(terminalCommit),
-              terminalCommit.commitment == state.commitment else {
-            throw SpaceReplica.Error.commitmentMismatch
-        }
-        return state
+        try await replica.applyAndVerify(
+            entries,
+            terminalCommit: terminalCommit,
+            publicKey: publicKey
+        )
     }
 }
 
-/// Consumes a streamed Swan two-root CAR through a bounded temporary spool.
-/// Verification is delegated to the same proposal-0016 decoder used by the
-/// server; the returned recovery is safe to install only after all roots,
-/// record CIDs, context signature, content binding, and LtHash checks pass.
+/// Consumes a Swan two-root CAR. Live interop uses the asynchronous streaming
+/// methods, which retain at most one one-MiB record value and a 64-KiB source
+/// chunk while the DRISL map lives in an owner-only disposable SQLite index.
+/// The synchronous methods remain for small/offline fixtures that need record
+/// values and are explicitly bounded by `maximumBytes`.
 public struct SwanCARConsumer: Sendable {
     public let maximumBytes: Int
+    public let maximumRecordBytes: Int
+    private let stagingDirectory: URL
 
-    public init(maximumBytes: Int = 256 * 1024 * 1024) throws {
-        guard (1 ... 256 * 1024 * 1024).contains(maximumBytes) else {
+    public init(
+        maximumBytes: Int = 256 * 1024 * 1024,
+        maximumRecordBytes: Int = 1 * 1_024 * 1_024,
+        stagingDirectory: URL = FileManager.default.temporaryDirectory
+    ) throws {
+        guard (1 ... SpaceCARRecoveryLimits.absoluteMaximumCARBytes)
+            .contains(maximumBytes),
+            (1 ... SpaceCARRecoveryLimits.absoluteMaximumRecordBytes)
+                .contains(maximumRecordBytes)
+        else {
             throw SwanError.malformed("CAR consumer bound is invalid")
         }
         self.maximumBytes = maximumBytes
+        self.maximumRecordBytes = maximumRecordBytes
+        self.stagingDirectory = stagingDirectory
     }
 
     public func verify(
@@ -1891,6 +2452,80 @@ public struct SwanCARConsumer: Sendable {
         )
     }
 
+    public func verify(
+        fileURL: URL,
+        space: SpaceURI,
+        author: String,
+        verificationKey: PermissionedDataJWTVerificationKey
+    ) throws -> VerifiedSpaceCARRecovery {
+        let data = try boundedFileData(fileURL)
+        let algorithm: String = switch verificationKey {
+        case .p256: "ES256"
+        case .secp256k1PublicKey: "ES256K"
+        }
+        return try SpaceCARCodec.verifyRecovery(
+            data,
+            space: space,
+            author: author,
+            contextSignatureVerifier: { envelope in
+                try verificationKey.verify(
+                    signature: envelope.contextSignature,
+                    signingInput: try SpaceCommitCodec.contextSigningBytes(envelope.context),
+                    algorithm: algorithm
+                )
+            }
+        )
+    }
+
+    public func verifyStreaming(
+        fileURL: URL,
+        space: SpaceURI,
+        author: String,
+        publicKey: P256.Signing.PublicKey,
+        expectedEntries: [SpaceCARRecoveryIndexEntry] = []
+    ) async throws -> VerifiedStreamingSpaceCARRecovery {
+        try await verifyStreaming(
+            fileURL: fileURL,
+            space: space,
+            author: author,
+            expectedEntries: expectedEntries,
+            contextSignatureVerifier: {
+                try SpaceCommitCodec.verifyContextSignature(
+                    $0,
+                    publicKey: publicKey
+                )
+            }
+        )
+    }
+
+    public func verifyStreaming(
+        fileURL: URL,
+        space: SpaceURI,
+        author: String,
+        verificationKey: PermissionedDataJWTVerificationKey,
+        expectedEntries: [SpaceCARRecoveryIndexEntry] = []
+    ) async throws -> VerifiedStreamingSpaceCARRecovery {
+        let algorithm: String = switch verificationKey {
+        case .p256: "ES256"
+        case .secp256k1PublicKey: "ES256K"
+        }
+        return try await verifyStreaming(
+            fileURL: fileURL,
+            space: space,
+            author: author,
+            expectedEntries: expectedEntries,
+            contextSignatureVerifier: { envelope in
+                try verificationKey.verify(
+                    signature: envelope.contextSignature,
+                    signingInput: try SpaceCommitCodec.contextSigningBytes(
+                        envelope.context
+                    ),
+                    algorithm: algorithm
+                )
+            }
+        )
+    }
+
     public func streamAndVerify(
         client: InteropXRPCClient,
         query: [String: String],
@@ -1898,8 +2533,10 @@ public struct SwanCARConsumer: Sendable {
         space: SpaceURI,
         author: String,
         publicKey: P256.Signing.PublicKey,
-        spoolURL: URL
-    ) async throws -> VerifiedSpaceCARRecovery {
+        spoolURL: URL,
+        expectedEntries: [SpaceCARRecoveryIndexEntry] = []
+    ) async throws -> VerifiedStreamingSpaceCARRecovery {
+        defer { try? FileManager.default.removeItem(at: spoolURL) }
         _ = try await client.stream(
             "com.atproto.space.getRepo",
             query: query,
@@ -1907,7 +2544,60 @@ public struct SwanCARConsumer: Sendable {
             to: spoolURL,
             maximumResponseBytes: maximumBytes
         )
-        return try verify(fileURL: spoolURL, space: space, author: author, publicKey: publicKey)
+        return try await verifyStreaming(
+            fileURL: spoolURL,
+            space: space,
+            author: author,
+            publicKey: publicKey,
+            expectedEntries: expectedEntries
+        )
+    }
+
+    private func verifyStreaming(
+        fileURL: URL,
+        space: SpaceURI,
+        author: String,
+        expectedEntries: [SpaceCARRecoveryIndexEntry],
+        contextSignatureVerifier: @escaping @Sendable (
+            SpaceCommitEnvelope
+        ) throws -> Bool
+    ) async throws -> VerifiedStreamingSpaceCARRecovery {
+        let source: FileSpaceCARRecoverySource
+        do {
+            source = try FileSpaceCARRecoverySource(fileURL: fileURL)
+        } catch {
+            throw InteropHTTPError.fileFailure
+        }
+        let index: SQLiteSpaceCARRecoveryIndex
+        do {
+            index = try await SQLiteSpaceCARRecoveryIndex.create(
+                temporaryParentURL: stagingDirectory
+            )
+        } catch {
+            await source.close()
+            throw error
+        }
+        do {
+            let result = try await SpaceCARCodec.verifyStreamingRecovery(
+                from: source,
+                space: space,
+                author: author,
+                contextSignatureVerifier: contextSignatureVerifier,
+                index: index,
+                expectedEntries: expectedEntries,
+                limits: try SpaceCARRecoveryLimits(
+                    maximumCARBytes: maximumBytes,
+                    maximumRecordBytes: maximumRecordBytes
+                )
+            )
+            await source.close()
+            await index.cleanup()
+            return result
+        } catch {
+            await source.close()
+            await index.cleanup()
+            throw error
+        }
     }
 
     private func boundedFileData(_ url: URL) throws -> Data {
@@ -1916,11 +2606,51 @@ public struct SwanCARConsumer: Sendable {
               size.intValue <= maximumBytes else {
             throw InteropHTTPError.responseTooLarge
         }
+        let handle: FileHandle
         do {
-            return try Data(contentsOf: url, options: [.mappedIfSafe])
+            handle = try FileHandle(forReadingFrom: url)
         } catch {
             throw InteropHTTPError.fileFailure
         }
+        defer { try? handle.close() }
+        var output = Data()
+        output.reserveCapacity(size.intValue)
+        do {
+            while let chunk = try handle.read(
+                upToCount: SpaceCARRecoveryLimits.maximumChunkBytes
+            ), !chunk.isEmpty {
+                guard chunk.count <= maximumBytes - output.count else {
+                    throw InteropHTTPError.responseTooLarge
+                }
+                output.append(chunk)
+            }
+        } catch let error as InteropHTTPError {
+            throw error
+        } catch {
+            throw InteropHTTPError.fileFailure
+        }
+        return output
+    }
+}
+
+private actor FileSpaceCARRecoverySource: SpaceCARRecoveryByteSource {
+    private var handle: FileHandle?
+
+    init(fileURL: URL) throws {
+        handle = try FileHandle(forReadingFrom: fileURL)
+    }
+
+    func read(maximumBytes: Int) throws -> Data? {
+        guard let handle else {
+            throw InteropHTTPError.fileFailure
+        }
+        return try handle.read(upToCount: maximumBytes)
+    }
+
+    func close() {
+        guard let handle else { return }
+        self.handle = nil
+        try? handle.close()
     }
 }
 
@@ -2047,9 +2777,28 @@ private extension FixtureSanitizer {
         }
         // XRPC query values can contain DIDs, handles, record keys, and
         // selectors. Keep only the endpoint path and sorted parameter names.
-        let names = Set(components.queryItems?.map(\.name) ?? []).sorted()
+        let queryItems = components.queryItems ?? []
+        let names = Set(queryItems.map(\.name)).sorted()
         components.query = nil
         let path = components.path
+        // Fixture events are XRPC probe summaries, never a record of a local
+        // resource.  Reject arbitrary paths so an owner-only file path cannot
+        // become an artifact merely because a caller supplied it as `path`.
+        guard path.hasPrefix("/xrpc/"),
+              path.dropFirst("/xrpc/".count).allSatisfy({
+                  $0.isLetter || $0.isNumber || $0 == "." || $0 == "-"
+              }) else {
+            return "<invalid-path>"
+        }
+        if queryItems.count == 1,
+           queryItems[0].name == "keys",
+           let summarizedKeys = queryItems[0].value,
+           (1 ... 256).contains(summarizedKeys.utf8.count),
+           summarizedKeys.allSatisfy({
+               $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" || $0 == ","
+           }) {
+            return path + "?keys=" + summarizedKeys
+        }
         guard !names.isEmpty else { return path }
         return path + "?keys=" + names.joined(separator: ",")
     }

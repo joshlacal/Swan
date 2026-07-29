@@ -51,7 +51,7 @@ assert_unchanged
 # this preflight directly with a throwaway profile while retaining the same
 # generated-output inventory assertion.
 bad_profile="${temporary_root}/profile.json"
-python3 - "Profiles/permissioned-data-0016-2026-07-03.json" "${bad_profile}" <<'PY'
+python3 - "Profiles/permissioned-data-0016-2026-07-30.json" "${bad_profile}" <<'PY'
 import json
 import sys
 with open(sys.argv[1], encoding="utf-8") as source:

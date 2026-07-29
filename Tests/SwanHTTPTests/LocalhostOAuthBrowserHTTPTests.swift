@@ -11,6 +11,7 @@ import SwanAccounts
 @testable import SwanHTTP
 @testable import SwanOAuth
 import SwanSQLite
+import SwanStorage
 
 final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
     private let issuer = URL(string: "https://swan.example")!
@@ -19,6 +20,121 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
     private let did = "did:plc:abcdefghijklmnopqrstuvwx"
     private let handle = "alice.swan.test"
     private let password = "correct horse battery staple"
+
+    func testBrowserPagesAndAuthorizationErrorsSendStrictSecurityHeaders() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let session = try makeSession(
+            proofID: "localhost-browser-security-headers",
+            keyThumbprint: String(repeating: "h", count: 43)
+        )
+        let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
+            session: session,
+            state: "localhost-browser-security-headers",
+            codeChallengeS256: String(repeating: "a", count: 43)
+        )
+        let authorize =
+            "/oauth/authorize?client_id=\(formEncode(clientID.absoluteString))&request_uri=\(formEncode(requestURI))"
+        do {
+            let app = fixture.server.buildApplication(
+                logger: Logger(label: "LocalhostOAuthBrowserHTTPTests.browser-headers")
+            )
+            try await app.test(.router) { client in
+                try await client.execute(uri: authorize, method: .get) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    self.assertStrictBrowserSecurityHeaders(
+                        response.headers,
+                        contentType: "text/html; charset=utf-8"
+                    )
+                }
+                try await client.execute(uri: "/oauth/authorize", method: .get) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    self.assertStrictBrowserSecurityHeaders(
+                        response.headers,
+                        contentType: "text/plain; charset=utf-8"
+                    )
+                }
+            }
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
+    func testTrustedProxyRequiresClientIPBeforeLoginAdmission() async throws {
+        let admission = CountingLoginAdmissionStore()
+        let policy = try SwanLoginClientIdentityPolicy(
+            // Hummingbird's live test listener may accept the loopback client
+            // over either family. Both are trusted test peers; the forwarded
+            // header is still required for either one.
+            trustedProxyPeerLiterals: ["127.0.0.1", "::1"]
+        )
+        let fixture = try await makeFixture(
+            loginClientIdentityPolicy: policy,
+            loginAdmissionStore: admission
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let session = try makeSession(
+            proofID: "trusted-proxy-missing-client-ip",
+            keyThumbprint: String(repeating: "p", count: 43)
+        )
+        let requestURI = try await fixture.runtime.tokenService
+            .createPushedAuthorizationRequest(
+                session: session,
+                state: "trusted-proxy-missing-client-ip",
+                codeChallengeS256: String(repeating: "a", count: 43)
+            )
+        let authorizeQuery =
+            "/oauth/authorize?client_id=\(formEncode(clientID.absoluteString))"
+            + "&request_uri=\(formEncode(requestURI))"
+
+        do {
+            let app = fixture.server.buildApplication(
+                logger: Logger(
+                    label: "LocalhostOAuthBrowserHTTPTests.trusted-proxy"
+                )
+            )
+            try await app.test(.live) { client in
+                var loginCookie: String?
+                var loginCSRF: String?
+                try await client.execute(
+                    uri: authorizeQuery,
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    loginCookie = self.cookieValue(
+                        try XCTUnwrap(response.headers[setCookieHeader])
+                    )
+                    loginCSRF = try fixture.runtime.browserSessionService
+                        .verify(try XCTUnwrap(loginCookie)).csrfToken
+                }
+                let form = [
+                    ("csrf", try XCTUnwrap(loginCSRF)),
+                    ("handle", handle),
+                    ("password", password),
+                ].map {
+                    "\(formEncode($0.0))=\(formEncode($0.1))"
+                }.joined(separator: "&")
+                try await client.execute(
+                    uri: "/oauth/authorize",
+                    method: .post,
+                    headers: browserFormHeaders(
+                        cookie: try XCTUnwrap(loginCookie)
+                    ),
+                    body: ByteBuffer(string: form)
+                ) { response in
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                }
+            }
+            let admissionInvocations = await admission.invocationCount()
+            XCTAssertEqual(admissionInvocations, 0)
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.control.close()
+            throw error
+        }
+    }
 
     func testLocalBrowserFlowConsumesPARAndMintsOnePKCEBoundCode() async throws {
         let fixture = try await makeFixture()
@@ -40,7 +156,7 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
 
         do {
             let app = fixture.server.buildApplication(logger: Logger(label: "LocalhostOAuthBrowserHTTPTests"))
-            try await app.test(.router) { client in
+            try await app.test(.live) { client in
                 var loginCookie: String?
                 var loginCSRF: String?
                 try await client.execute(uri: authorizeQuery, method: .get) { response in
@@ -70,10 +186,27 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
                     XCTAssertEqual(response.headers[.cacheControl], "no-store")
+                    let consentHTML = String(
+                        decoding: Data(buffer: response.body),
+                        as: UTF8.self
+                    )
+                    XCTAssertTrue(
+                        consentHTML.contains(
+                            self.clientID.absoluteString
+                                .replacingOccurrences(
+                                    of: "&",
+                                    with: "&amp;"
+                                )
+                        )
+                    )
+                    XCTAssertTrue(
+                        consentHTML.contains("<code>atproto</code>")
+                    )
                     let cookie = try XCTUnwrap(response.headers[setCookieHeader])
                     consentCookie = self.cookieValue(cookie)
                     let session = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(consentCookie))
                     XCTAssertEqual(session.subject, self.did)
+                    XCTAssertNotNil(session.subjectRevisionMicroseconds)
                     consentCSRF = session.csrfToken
                 }
 
@@ -195,7 +328,7 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
 
         do {
             let app = fixture.server.buildApplication(logger: Logger(label: "LocalhostOAuthBrowserHTTPTests.negative"))
-            try await app.test(.router) { client in
+            try await app.test(.live) { client in
                 var cookie: String?
                 try await client.execute(uri: query, method: .get) { response in
                     cookie = self.cookieValue(try XCTUnwrap(response.headers[setCookieHeader]))
@@ -236,7 +369,7 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
         ].map { "\(formEncode($0.0))=\(formEncode($0.1))" }.joined(separator: "&")
         do {
             let app = fixture.server.buildApplication(logger: Logger(label: "LocalhostOAuthBrowserHTTPTests.qualifiedHTTP"))
-            try await app.test(.router) { client in
+            try await app.test(.live) { client in
                 var parNonce: String?
                 try await client.execute(uri: "/oauth/par", method: .post, headers: tokenHeaders(), body: ByteBuffer(string: parForm)) { response in
                     XCTAssertEqual(response.status, .badRequest)
@@ -262,6 +395,15 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
                 var consentCSRF: String?
                 try await client.execute(uri: "/oauth/authorize", method: .post, headers: browserFormHeaders(cookie: try XCTUnwrap(loginCookie)), body: ByteBuffer(string: login)) { response in
                     XCTAssertEqual(response.status, .ok)
+                    let consentHTML = String(
+                        decoding: Data(buffer: response.body),
+                        as: UTF8.self
+                    )
+                    XCTAssertTrue(
+                        consentHTML.contains(
+                            "<code>\(scope.replacingOccurrences(of: "&", with: "&amp;"))</code>"
+                        )
+                    )
                     consentCookie = self.cookieValue(try XCTUnwrap(response.headers[setCookieHeader]))
                     consentCSRF = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(consentCookie)).csrfToken
                 }
@@ -361,7 +503,10 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
                 }
             }
             await XCTAssertThrowsAsync(
-                try await fixture.runtime.tokenService.validateAccess(tokens.accessToken, proof: session.dpopProof)
+                try await fixture.runtime.tokenService.validateAccess(
+                    tokens.accessToken,
+                    proof: session.dpopProof
+                )
             )
             try await fixture.control.close()
         } catch {
@@ -402,21 +547,44 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
         let refreshed = try await fixture.runtime.tokenService.redeemLocalhostPublicRefresh(
             refresh, clientID: qualifiedClientID, dpopProof: session.dpopProof, requestedScopes: [scope]
         )
-        let grant = try await fixture.runtime.tokenService.validateAccess(refreshed.accessToken, proof: session.dpopProof)
+        let grant = try await fixture.runtime.tokenService.validateAccess(
+            refreshed.accessToken,
+            proof: session.dpopProof
+        )
         XCTAssertEqual(grant.scopes, [scope])
         try await fixture.control.close()
     }
 
-    private func makeFixture() async throws -> (server: SwanHTTPServer, runtime: SwanOAuthRuntime, control: SQLiteControlDatabase, root: URL) {
+    private func makeFixture(
+        loginClientIdentityPolicy: SwanLoginClientIdentityPolicy? = nil,
+        loginAdmissionStore: (any AccountLoginAdmissionStore)? = nil
+    ) async throws -> (
+        server: SwanHTTPServer,
+        runtime: SwanOAuthRuntime,
+        control: SQLiteControlDatabase,
+        root: URL
+    ) {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "LocalhostOAuthBrowserHTTPTests-\(UUID().uuidString)")
         let control = try await SQLiteControlDatabase(dataDirectory: root)
         do {
             let hasher = try LibsodiumArgon2idHasher(policy: .interactive)
+            let admissionStore: any AccountLoginAdmissionStore
+            if let loginAdmissionStore {
+                admissionStore = loginAdmissionStore
+            } else {
+                admissionStore = control
+            }
             let directory = DurableAccountDirectory(
                 store: control,
                 passwordHasher: hasher,
-                verificationExecutor: try Argon2idVerificationExecutor(hasher: hasher)
+                verificationExecutor: try Argon2idVerificationExecutor(hasher: hasher),
+                loginAdmissionService: AccountLoginAdmissionService(
+                    store: admissionStore,
+                    key: try AccountLoginAdmissionKey(
+                        Data(repeating: 0xD5, count: 32)
+                    )
+                )
             )
             _ = try await directory.registerProvisionedAccount(
                 did: did,
@@ -434,7 +602,9 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
                 profile: profile,
                 configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: issuer),
                 oauthRuntime: runtime,
-                localhostOAuthConfiguration: oauthConfiguration
+                localhostOAuthConfiguration: oauthConfiguration,
+                loginClientIdentityPolicy:
+                    loginClientIdentityPolicy ?? SwanLoginClientIdentityPolicy.direct
             )
             return (
                 server,
@@ -472,6 +642,25 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
         var headers: HTTPFields = [.contentType: "application/x-www-form-urlencoded"]
         headers[.cookie] = "__Host-swan-oauth=\(cookie)"
         return headers
+    }
+
+    private func assertStrictBrowserSecurityHeaders(
+        _ headers: HTTPFields,
+        contentType: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(headers[.contentType], contentType, file: file, line: line)
+        XCTAssertEqual(headers[.cacheControl], "no-store", file: file, line: line)
+        XCTAssertEqual(
+            headers[contentSecurityPolicyHeader],
+            "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(headers[xFrameOptionsHeader], "DENY", file: file, line: line)
+        XCTAssertEqual(headers[referrerPolicyHeader], "no-referrer", file: file, line: line)
+        XCTAssertEqual(headers[xContentTypeOptionsHeader], "nosniff", file: file, line: line)
     }
 
     private func tokenHeaders(dpop: String? = nil) -> HTTPFields {
@@ -543,9 +732,29 @@ final class LocalhostOAuthBrowserHTTPTests: XCTestCase, @unchecked Sendable {
     }
 }
 
+private actor CountingLoginAdmissionStore: AccountLoginAdmissionStore {
+    private var invocations = 0
+
+    func consumeLoginRateLimit(
+        _: AccountLoginRateLimitRequest,
+        now _: Date
+    ) async throws -> AccountLoginRateLimitDecision {
+        invocations += 1
+        return .allowed
+    }
+
+    func invocationCount() -> Int {
+        invocations
+    }
+}
+
 private let setCookieHeader = HTTPField.Name("Set-Cookie")!
 private let dpopHeader = HTTPField.Name("DPoP")!
 private let dpopNonceHeader = HTTPField.Name("DPoP-Nonce")!
+private let contentSecurityPolicyHeader = HTTPField.Name("Content-Security-Policy")!
+private let xFrameOptionsHeader = HTTPField.Name("X-Frame-Options")!
+private let referrerPolicyHeader = HTTPField.Name("Referrer-Policy")!
+private let xContentTypeOptionsHeader = HTTPField.Name("X-Content-Type-Options")!
 
 private func formEncode(_ value: String) -> String {
     value.utf8.map { byte in

@@ -7,6 +7,7 @@ import Glibc
 import Foundation
 import SwanCore
 import SwanPublicRepository
+import SwanStorage
 
 public enum AccountKeyPurpose: String, Codable, Sendable, CaseIterable {
     case signing = "account-signing"
@@ -132,6 +133,56 @@ public protocol AccountKeyStore: AccountKeyMaterialReader {
     func createBatch(_ materials: [AccountKeyMaterial]) async throws
 }
 
+/// Reuses the control-store's exact authenticated PLC staging locator instead
+/// of allowing the key layer and deletion journal to drift into two subtly
+/// different wire shapes.
+public typealias AccountKeyDeletionStagingBinding =
+    AccountDeletionStagingKeyBinding
+
+public struct AccountKeyDestructionRequest: Sendable, Equatable {
+    public static let maximumStagingBindings =
+        AccountDeletionJob.maximumStagingKeyBindings
+
+    public let accountDID: String
+    public let stagingBindings: [AccountKeyDeletionStagingBinding]
+
+    public init(
+        accountDID: String,
+        stagingBindings: [AccountKeyDeletionStagingBinding]
+    ) throws {
+        guard stagingBindings.count <= Self.maximumStagingBindings,
+              Set(stagingBindings).count == stagingBindings.count,
+              stagingBindings.allSatisfy(\.isCanonicalValue) else {
+            throw SwanError.malformed(
+                "invalid account key destruction request"
+            )
+        }
+        self.accountDID = try AccountIdentifiers.validateDID(accountDID)
+        self.stagingBindings = stagingBindings
+    }
+}
+
+public struct AccountKeyDestructionReport: Sendable, Equatable {
+    public let destroyedEnvelopeCount: Int
+    public let destroyedStagingCount: Int
+
+    public init(
+        destroyedEnvelopeCount: Int,
+        destroyedStagingCount: Int
+    ) {
+        self.destroyedEnvelopeCount = destroyedEnvelopeCount
+        self.destroyedStagingCount = destroyedStagingCount
+    }
+}
+
+/// Purpose-built destructive capability. Ordinary key readers and writers do
+/// not receive account-wide erasure authority.
+public protocol AccountKeyDestructionStore: Sendable {
+    func destroyAccountKeyMaterial(
+        _ request: AccountKeyDestructionRequest
+    ) async throws -> AccountKeyDestructionReport
+}
+
 /// The only pre-DID private-material persistence surface. It is purpose-bound
 /// to PLC genesis preparation and cannot store arbitrary values.
 public protocol PLCAccountIdentityStagingKeyStore: AccountKeyStore {
@@ -187,6 +238,7 @@ public protocol AccountKeyPublicKeyStore: Sendable {
 /// descriptor. KEKs are deployment configuration and are never serialized.
 public actor FileAccountKeyStore:
     AccountKeyStore,
+    AccountKeyDestructionStore,
     AccountKeyPublicKeyStore,
     PLCAccountIdentityStagingKeyStore
 {
@@ -373,6 +425,77 @@ public actor FileAccountKeyStore:
         try withExclusiveLock {
             try requireActiveWriterKey()
             try createBatchUnlocked(materials)
+        }
+    }
+
+    /// Authenticates every matching envelope and explicitly supplied PLC
+    /// staging binding before removing the first file. Removal itself is
+    /// restart-safe: each unlink is durably synchronized and an interrupted
+    /// retry simply inventories the remaining exact DID-bound files.
+    public func destroyAccountKeyMaterial(
+        _ request: AccountKeyDestructionRequest
+    ) throws -> AccountKeyDestructionReport {
+        try withExclusiveLock {
+            let loaded = try loadAllEnvelopes()
+            let accountEnvelopes = loaded.filter {
+                $0.reference.accountDID == request.accountDID
+            }
+            // Loading proves the filename and plaintext envelope reference;
+            // decryption proves the KEK/AAD binding before deletion begins.
+            for item in accountEnvelopes {
+                _ = try decrypt(
+                    item.envelope,
+                    reference: item.reference
+                )
+            }
+
+            var stagingFilenames: [String] = []
+            stagingFilenames.reserveCapacity(
+                request.stagingBindings.count
+            )
+            for binding in request.stagingBindings {
+                let filename = try Self.plcStagingFilename(
+                    requestID: binding.requestID
+                )
+                guard try Self.entryExists(
+                    named: filename,
+                    directoryDescriptor: directoryDescriptor
+                ) else {
+                    continue
+                }
+                guard let origin = URL(string: binding.pdsOrigin),
+                      let staged = try loadStagedPLCAccountIdentity(
+                          requestID: binding.requestID,
+                          canonicalHandle: binding.canonicalHandle,
+                          pdsOrigin: origin,
+                          repositoryRevision:
+                              binding.repositoryRevision
+                      ),
+                      staged.did == request.accountDID else {
+                    throw SwanError.unauthorized(
+                        "PLC account staging deletion binding is invalid"
+                    )
+                }
+                stagingFilenames.append(filename)
+            }
+
+            let envelopeFilenames = accountEnvelopes.map(\.filename)
+            let targets = envelopeFilenames + stagingFilenames
+            guard Set(targets).count == targets.count else {
+                throw SwanError.malformed(
+                    "duplicate account key destruction target"
+                )
+            }
+            for filename in targets.sorted() {
+                try Self.remove(
+                    named: filename,
+                    directoryDescriptor: directoryDescriptor
+                )
+            }
+            return AccountKeyDestructionReport(
+                destroyedEnvelopeCount: envelopeFilenames.count,
+                destroyedStagingCount: stagingFilenames.count
+            )
         }
     }
 

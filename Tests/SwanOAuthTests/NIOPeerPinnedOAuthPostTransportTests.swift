@@ -68,9 +68,90 @@ final class NIOPeerPinnedOAuthPostTransportTests: XCTestCase {
         XCTAssertEqual(received, 1)
     }
 
+    func testPinnedTransportRejectsConfiguredPeerMissingFromPreflightBeforeConnectOrBody() async throws {
+        let server = try await LocalTLSPeer.start()
+        defer { Task { await server.close() } }
+
+        let differentApprovedPeer = try XCTUnwrap(OAuthIPAddress(literal: "8.8.8.8"))
+        let poster = try makePoster(
+            endpoint: server.endpoint,
+            resolver: PeerTestResolver(answers: [[differentApprovedPeer]])
+        )
+
+        do {
+            try await poster.postJSON(
+                to: server.endpoint,
+                headers: ["content-type": "application/json"],
+                body: Data("{\"must_not_be_delivered\":true}".utf8)
+            )
+            XCTFail("a configured pin absent from the approved DNS set must fail before connecting")
+        } catch let error as SwanError {
+            guard case .unauthorized = error else {
+                return XCTFail("expected a preflight peer-pin rejection, got \(error)")
+            }
+        }
+
+        XCTAssertEqual(server.connectionCount(), 0)
+        XCTAssertEqual(server.receivedBodyByteCount(), 0)
+        XCTAssertEqual(server.completedRequestCount(), 0)
+    }
+
+    func testDocumentTransportTimeoutCompletesAndClosesUnresponsivePeer() async throws {
+        let server = try await LocalTLSPeer.start(responseDelay: .seconds(1))
+        defer { Task { await server.close() } }
+        let connector = try NIOPeerPinnedOAuthDocumentTransport(
+            maximumTransportTimeout: 1,
+            additionalTrustRootsPEM: Data(LocalTLSCertificate.authority.utf8)
+        )
+        let startedAt = Date()
+
+        do {
+            _ = try await connector.get(
+                url: server.endpoint,
+                approvedPeers: [server.peer],
+                timeout: 0.03,
+                maximumBodyBytes: 1_024
+            )
+            XCTFail("the document transport must time out")
+        } catch let error as SwanError {
+            guard case .unavailable = error else {
+                return XCTFail("expected timeout unavailability, got \(error)")
+            }
+        }
+
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.5)
+    }
+
+    func testPostTransportTimeoutCompletesAndClosesUnresponsivePeer() async throws {
+        let server = try await LocalTLSPeer.start(responseDelay: .seconds(1))
+        defer { Task { await server.close() } }
+        let poster = try makePoster(
+            endpoint: server.endpoint,
+            resolver: PeerTestResolver(answers: [[server.peer]]),
+            timeout: 0.03
+        )
+        let startedAt = Date()
+
+        do {
+            try await poster.postJSON(
+                to: server.endpoint,
+                headers: ["content-type": "application/json"],
+                body: Data("{}".utf8)
+            )
+            XCTFail("the POST transport must time out")
+        } catch let error as SwanError {
+            guard case .unavailable = error else {
+                return XCTFail("expected timeout unavailability, got \(error)")
+            }
+        }
+
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.5)
+    }
+
     private func makePoster(
         endpoint: URL,
-        resolver: any OAuthHostnameResolving
+        resolver: any OAuthHostnameResolving,
+        timeout: TimeInterval = 2
     ) throws -> OAuthBoundedJSONPoster {
         let peer = try XCTUnwrap(OAuthIPAddress(literal: "127.0.0.1"))
         let connector = NIOPeerPinnedOAuthPostTransport(configuration: try .init(
@@ -80,7 +161,7 @@ final class NIOPeerPinnedOAuthPostTransportTests: XCTestCase {
         return OAuthBoundedJSONPoster(
             policy: try OAuthRemoteFetchPolicy(
                 networkAllowlist: .init(addresses: [peer]),
-                timeout: 2
+                timeout: timeout
             ),
             resolver: resolver,
             transport: connector
@@ -110,31 +191,40 @@ private final class LocalTLSPeer: @unchecked Sendable {
     let endpoint: URL
     private let group: MultiThreadedEventLoopGroup
     private let channel: Channel
-    private let receipt: EventLoopPromise<Void>
+    private let receipt: LocalTLSReceipt
+    private let observation: LocalTLSPeerObservation
 
     private init(
         peer: OAuthIPAddress,
         endpoint: URL,
         group: MultiThreadedEventLoopGroup,
         channel: Channel,
-        receipt: EventLoopPromise<Void>
+        receipt: LocalTLSReceipt,
+        observation: LocalTLSPeerObservation
     ) {
         self.peer = peer
         self.endpoint = endpoint
         self.group = group
         self.channel = channel
         self.receipt = receipt
+        self.observation = observation
     }
 
-    static func start() async throws -> LocalTLSPeer {
+    static func start(
+        responseDelay: TimeAmount = .zero
+    ) async throws -> LocalTLSPeer {
         let peer = try XCTUnwrap(OAuthIPAddress(literal: "127.0.0.1"))
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         do {
             let tlsContext = try NIOSSLContext(configuration: LocalTLSCertificate.serverConfiguration())
-            let receipt = group.next().makePromise(of: Void.self)
+            let receipt = LocalTLSReceipt(
+                promise: group.next().makePromise(of: Void.self)
+            )
+            let observation = LocalTLSPeerObservation()
             let bootstrap = ServerBootstrap(group: group)
                 .childChannelInitializer { channel in
                     do {
+                        observation.recordConnection()
                         let tls = NIOSSLServerHandler(context: tlsContext)
                         // NIO assigns this closure and its handlers to one
                         // event loop. Use the synchronous pipeline view rather
@@ -143,7 +233,13 @@ private final class LocalTLSPeer: @unchecked Sendable {
                         try channel.pipeline.syncOperations.addHandler(tls)
                         try channel.pipeline.syncOperations.addHandler(ByteToMessageHandler(HTTPRequestDecoder()))
                         try channel.pipeline.syncOperations.addHandler(HTTPResponseEncoder())
-                        try channel.pipeline.syncOperations.addHandler(LocalTLSResponder(receipt: receipt))
+                        try channel.pipeline.syncOperations.addHandler(
+                            LocalTLSResponder(
+                                receipt: receipt,
+                                observation: observation,
+                                responseDelay: responseDelay
+                            )
+                        )
                         return channel.eventLoop.makeSucceededFuture(())
                     } catch {
                         return channel.eventLoop.makeFailedFuture(error)
@@ -152,7 +248,14 @@ private final class LocalTLSPeer: @unchecked Sendable {
             let channel = try await bootstrap.bind(host: peer.description, port: 0).get()
             let port = try XCTUnwrap(channel.localAddress?.port)
             let endpoint = try XCTUnwrap(URL(string: "https://hummingbird.codes:\(port)/xrpc/com.atproto.space.notifyWrite"))
-            return LocalTLSPeer(peer: peer, endpoint: endpoint, group: group, channel: channel, receipt: receipt)
+            return LocalTLSPeer(
+                peer: peer,
+                endpoint: endpoint,
+                group: group,
+                channel: channel,
+                receipt: receipt,
+                observation: observation
+            )
         } catch {
             try? await group.shutdownGracefully()
             throw error
@@ -160,31 +263,82 @@ private final class LocalTLSPeer: @unchecked Sendable {
     }
 
     func receivedRequest() async throws -> Int {
-        try await receipt.futureResult.get()
+        try await receipt.value()
         return 1
     }
 
+    func connectionCount() -> Int {
+        observation.snapshot().connections
+    }
+
+    func receivedBodyByteCount() -> Int {
+        observation.snapshot().bodyBytes
+    }
+
+    func completedRequestCount() -> Int {
+        observation.snapshot().completedRequests
+    }
+
     func close() async {
+        receipt.failIfPending()
         try? await channel.close().get()
         try? await group.shutdownGracefully()
     }
 }
 
-private final class LocalTLSResponder: ChannelInboundHandler {
+private final class LocalTLSResponder: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
-    private let receipt: EventLoopPromise<Void>
+    private let receipt: LocalTLSReceipt
+    private let observation: LocalTLSPeerObservation
+    private let responseDelay: TimeAmount
     private var responded = false
+    private weak var handlerContext: ChannelHandlerContext?
+    private var responseTask: Scheduled<Void>?
 
-    init(receipt: EventLoopPromise<Void>) {
+    init(
+        receipt: LocalTLSReceipt,
+        observation: LocalTLSPeerObservation,
+        responseDelay: TimeAmount
+    ) {
         self.receipt = receipt
+        self.observation = observation
+        self.responseDelay = responseDelay
+    }
+
+    func handlerAdded(context: ChannelHandlerContext) {
+        handlerContext = context
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        guard case .end = unwrapInboundIn(data), !responded else { return }
+        let part = unwrapInboundIn(data)
+        if case let .body(buffer) = part {
+            observation.recordBodyBytes(buffer.readableBytes)
+        }
+        guard case .end = part, !responded else { return }
         responded = true
-        receipt.succeed(())
+        observation.recordCompletedRequest()
+        receipt.succeed()
+        if responseDelay.nanoseconds == 0 {
+            respond()
+        } else {
+            responseTask = context.eventLoop.scheduleTask(
+                in: responseDelay
+            ) { [weak self] in
+                self?.respond()
+            }
+        }
+    }
+
+    func channelInactive(context _: ChannelHandlerContext) {
+        responseTask?.cancel()
+        responseTask = nil
+        handlerContext = nil
+    }
+
+    private func respond() {
+        guard let context = handlerContext else { return }
         var headers = HTTPHeaders()
         headers.add(name: "content-length", value: "0")
         headers.add(name: "connection", value: "close")
@@ -194,8 +348,75 @@ private final class LocalTLSResponder: ChannelInboundHandler {
     }
 
     func errorCaught(context: ChannelHandlerContext, error _: Error) {
-        receipt.fail(SwanError.unavailable("local TLS peer failed"))
+        receipt.failIfPending()
         context.close(promise: nil)
+    }
+}
+
+private final class LocalTLSReceipt: @unchecked Sendable {
+    private let lock = NSLock()
+    private let promise: EventLoopPromise<Void>
+    private var completed = false
+
+    init(promise: EventLoopPromise<Void>) {
+        self.promise = promise
+    }
+
+    func succeed() {
+        lock.lock()
+        guard !completed else {
+            lock.unlock()
+            return
+        }
+        completed = true
+        lock.unlock()
+        promise.succeed(())
+    }
+
+    func failIfPending() {
+        lock.lock()
+        guard !completed else {
+            lock.unlock()
+            return
+        }
+        completed = true
+        lock.unlock()
+        promise.fail(CancellationError())
+    }
+
+    func value() async throws {
+        try await promise.futureResult.get()
+    }
+}
+
+private final class LocalTLSPeerObservation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var connections = 0
+    private var bodyBytes = 0
+    private var completedRequests = 0
+
+    func recordConnection() {
+        lock.lock()
+        connections += 1
+        lock.unlock()
+    }
+
+    func recordBodyBytes(_ count: Int) {
+        lock.lock()
+        bodyBytes += count
+        lock.unlock()
+    }
+
+    func recordCompletedRequest() {
+        lock.lock()
+        completedRequests += 1
+        lock.unlock()
+    }
+
+    func snapshot() -> (connections: Int, bodyBytes: Int, completedRequests: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (connections, bodyBytes, completedRequests)
     }
 }
 

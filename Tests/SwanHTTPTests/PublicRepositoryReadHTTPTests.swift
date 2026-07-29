@@ -126,6 +126,44 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
         try await serviceFixture.control.close()
     }
 
+    // Production mutation caught: `describeRepo` hard-codes the P-256
+    // verification-method type even when admission authenticated the pinned
+    // TypeScript PDS's canonical secp256k1 did:key.
+    func testDescribeRepoReportsSecp256k1VerificationMethodType() async throws {
+        let signingDIDKey =
+            "did:key:zQ3shqwJEJyMBsBXCWyCBpUBMqxcon9oHB7mCvx4sSpMdLJwc"
+        let fixture = try await makeFixture(
+            identitySigningDIDKey: signingDIDKey
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let app = fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryReadHTTPTests.secp256k1")
+        )
+
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/xrpc/com.atproto.repo.describeRepo?repo=\(did)",
+                method: .get
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                let body = try self.object(response.body)
+                let didDoc = try XCTUnwrap(body["didDoc"] as? [String: Any])
+                let methods = try XCTUnwrap(
+                    didDoc["verificationMethod"] as? [[String: Any]]
+                )
+                XCTAssertEqual(
+                    methods.first?["type"] as? String,
+                    "EcdsaSecp256k1VerificationKey2019"
+                )
+                XCTAssertEqual(
+                    methods.first?["publicKeyMultibase"] as? String,
+                    String(signingDIDKey.dropFirst("did:key:".count))
+                )
+            }
+        }
+        try await fixture.control.close()
+    }
+
     func testGetRecordExactCIDListPaginationAndMalformedInput() async throws {
         let fixture = try await makeFixture(nonEmpty: true)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -347,11 +385,188 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
         try await fixture.control.close()
     }
 
+    // Production mutation caught: anonymous JSON reads enter the database and
+    // decode record bodies without first reserving a process-wide response
+    // budget, so concurrent list/get requests can multiply the maximum page
+    // allocation without bound.
+    func testAnonymousListAndGetShareBoundedProcessAdmission() async throws {
+        let barrier = PublicJSONReadBarrier()
+        let fixture = try await makeFixture(
+            nonEmpty: true,
+            jsonReadBarrier: barrier
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let directory = fixture.server.publicRepositoryReadDirectory
+            as! TestPublicRepositoryReadDirectory
+        let admission = try PublicRepositoryJSONReadAdmission(
+            maximumConcurrentReads: 1,
+            maximumReservedResponseBytes:
+                PublicRepositoryJSONReadLimits.maximumListRecordsResponseBytes
+        )
+        let router = Router(context: SwanHTTPRequestContext.self)
+        registerPublicRepositoryReadEndpoints(
+            on: router,
+            directory: directory,
+            publicURL: URL(string: "https://swan.example")!,
+            jsonReadAdmission: admission
+        )
+        let app = Application(
+            router: router,
+            logger: Logger(label: "PublicRepositoryReadHTTPTests.json-admission")
+        )
+        let record = try XCTUnwrap(fixture.records.first)
+        let listURI =
+            "/xrpc/com.atproto.repo.listRecords?repo=\(did)&collection=app.bsky.feed.post&limit=2"
+        let getURI =
+            "/xrpc/com.atproto.repo.getRecord?repo=\(did)&collection=\(record.path.collection)&rkey=\(record.path.recordKey)"
+
+        try await app.test(.router) { client in
+            try await withThrowingTaskGroup(of: Int.self) { group in
+                group.addTask {
+                    try await client.execute(
+                        uri: listURI,
+                        method: .get
+                    ) { Int($0.status.code) }
+                }
+                await barrier.waitUntilEntered()
+
+                do {
+                    try await client.execute(uri: getURI, method: .get) {
+                        response in
+                        XCTAssertEqual(response.status, .serviceUnavailable)
+                        XCTAssertEqual(
+                            try self.object(response.body)["error"] as? String,
+                            "temporarily_unavailable"
+                        )
+                    }
+                } catch {
+                    await barrier.release()
+                    throw error
+                }
+                let outcomeRequestCount =
+                    await directory.jsonOutcomeRequestCount
+                XCTAssertEqual(outcomeRequestCount, 1)
+                XCTAssertEqual(admission.snapshot.activeLeases, 1)
+
+                await barrier.release()
+                let completedStatus = try await group.next()
+                XCTAssertEqual(try XCTUnwrap(completedStatus), 200)
+            }
+        }
+        XCTAssertEqual(admission.snapshot.activeLeases, 0)
+        XCTAssertEqual(admission.snapshot.reservedResponseBytes, 0)
+        try await fixture.control.close()
+    }
+
+    // Production mutation caught: the route releases admission with a handler
+    // scope `defer`, before Hummingbird drains the returned response body.
+    func testJSONAdmissionLeaseIsHeldUntilResponseBodyDrain() async throws {
+        let admission = try PublicRepositoryJSONReadAdmission(
+            maximumConcurrentReads: 1,
+            maximumReservedResponseBytes:
+                PublicRepositoryJSONReadLimits.maximumListRecordsResponseBytes
+        )
+        let lease = try XCTUnwrap(admission.reserve(
+            maximumResponseBytes:
+                PublicRepositoryJSONReadLimits.maximumGetRecordResponseBytes
+        ))
+        let response = publicReadJSON(
+            .ok,
+            ["ok": true],
+            maximumBytes:
+                PublicRepositoryJSONReadLimits.maximumGetRecordResponseBytes,
+            lease: lease
+        )
+
+        XCTAssertEqual(admission.snapshot.activeLeases, 1)
+        XCTAssertNil(admission.reserve(
+            maximumResponseBytes:
+                PublicRepositoryJSONReadLimits.maximumGetRecordResponseBytes
+        ))
+
+        try await response.body.write(DiscardingPublicResponseBodyWriter())
+
+        XCTAssertEqual(admission.snapshot.activeLeases, 0)
+        XCTAssertEqual(admission.snapshot.reservedResponseBytes, 0)
+
+        let failingLease = try XCTUnwrap(admission.reserve(
+            maximumResponseBytes:
+                PublicRepositoryJSONReadLimits.maximumGetRecordResponseBytes
+        ))
+        let failingResponse = publicReadJSON(
+            .ok,
+            ["ok": true],
+            maximumBytes:
+                PublicRepositoryJSONReadLimits.maximumGetRecordResponseBytes,
+            lease: failingLease
+        )
+        do {
+            try await failingResponse.body.write(
+                FailingPublicResponseBodyWriter()
+            )
+            XCTFail("expected the response writer to fail")
+        } catch PublicResponseBodyWriterFailure.expected {
+            // Expected: the body closure's defer must still release admission.
+        }
+        XCTAssertEqual(admission.snapshot.activeLeases, 0)
+        XCTAssertEqual(admission.snapshot.reservedResponseBytes, 0)
+    }
+
+    // Production mutation caught: a forged/non-SQLite directory can return a
+    // syntactically valid page whose aggregate canonical bodies exceed the
+    // anonymous JSON budget.
+    func testPublicReadPageRejectsAggregateCanonicalBodyBudgetOverflow() throws {
+        let collection = "app.bsky.feed.post"
+        let sourcePath = try PublicRepositoryPath(
+            collection: collection,
+            recordKey: "source"
+        )
+        let prepared = try PublicRepositoryRecordCodec.prepare(
+            [
+                "$type": .string(collection),
+                "text": .string(
+                    String(
+                        repeating: "x",
+                        count: PublicRepositoryLimits.standard
+                            .maximumRecordBlockBytes - 1_024
+                    )
+                ),
+            ],
+            for: sourcePath
+        )
+        XCTAssertLessThanOrEqual(
+            prepared.bytes.count,
+            PublicRepositoryLimits.standard.maximumRecordBlockBytes
+        )
+        let recordCount =
+            PublicRepositoryJSONReadLimits.maximumAggregateRecordBlockBytes
+                / prepared.bytes.count + 1
+        let records = try (0..<recordCount).map { index in
+            try PublicRepositoryReadRecord(
+                path: PublicRepositoryPath(
+                    collection: collection,
+                    recordKey: "record-\(index)"
+                ),
+                cid: prepared.cid,
+                canonicalBytes: prepared.bytes
+            )
+        }
+
+        XCTAssertThrowsError(
+            try PublicRepositoryReadPage(records: records, cursor: nil)
+        ) {
+            XCTAssertEqual($0 as? PublicRepositoryReadError, .unavailable)
+        }
+    }
+
     private func makeFixture(
         nonEmpty: Bool = false,
         identityHandle: String? = nil,
         identityOrigin: String = "https://swan.example",
-        handleIsCorrect: Bool = true
+        identitySigningDIDKey: String =
+            "did:key:zDnaejgmAHMLkBPMBWnkBxyGxpXx8LgE4WJAYDhwZzyoRAddF",
+        handleIsCorrect: Bool = true,
+        jsonReadBarrier: PublicJSONReadBarrier? = nil
     ) async throws -> (
         server: SwanHTTPServer,
         control: SQLiteControlDatabase,
@@ -393,13 +608,14 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
                 identity: try .init(
                     canonicalHandle: identityHandle ?? handle,
                     pdsOrigin: identityOrigin,
-                    signingDIDKey: "did:key:zDnaejgmAHMLkBPMBWnkBxyGxpXx8LgE4WJAYDhwZzyoRAddF",
+                    signingDIDKey: identitySigningDIDKey,
                     handleIsCorrect: handleIsCorrect,
                     preparationRequestID: "public-read-http",
                     genesisOperationCID: state.commitCID.string
                 )
             ),
-            records: records
+            records: records,
+            jsonReadBarrier: jsonReadBarrier
         )
         let runtime = try SwanOAuthRuntime(
             controlStore: control,
@@ -433,10 +649,17 @@ private actor TestPublicRepositoryReadDirectory: PublicRepositoryReadDirectory {
     private(set) var carRequestCount = 0
     private var forgeOutOfOrderPage = false
     private var carBytes: Data?
+    private let jsonReadBarrier: PublicJSONReadBarrier?
+    private(set) var jsonOutcomeRequestCount = 0
 
-    init(description: PublicRepositoryReadDescription, records: [PublicRepositoryReadRecord]) {
+    init(
+        description: PublicRepositoryReadDescription,
+        records: [PublicRepositoryReadRecord],
+        jsonReadBarrier: PublicJSONReadBarrier? = nil
+    ) {
         self.description = description
         self.records = records
+        self.jsonReadBarrier = jsonReadBarrier
         lifecycleStatus = description.status
     }
 
@@ -502,6 +725,7 @@ private actor TestPublicRepositoryReadDirectory: PublicRepositoryReadDirectory {
 
     func publicRepositoryCAR(selector: String) async throws -> PublicRepositoryReadCAR? {
         carRequestCount += 1
+        guard recognizes(selector) else { return nil }
         guard let carBytes else { return nil }
         let url = FileManager.default.temporaryDirectory
             .appending(path: "swan-public-read-test-\(UUID().uuidString).car")
@@ -526,6 +750,153 @@ private actor TestPublicRepositoryReadDirectory: PublicRepositoryReadDirectory {
             spool: PublicRepositoryCARSpool(fileHandle: handle, lease: lease)
         )
     }
+
+    func publicRepositoryDescriptionOutcome(
+        selector: String
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadDescription>
+    {
+        guard recognizes(selector) else { return .notFound }
+        let status = try currentStatus()
+        guard status.status == .active else { return .lifecycle(status) }
+        return .active(description)
+    }
+
+    func publicRepositoryRecordOutcome(
+        selector: String,
+        path: PublicRepositoryPath,
+        expectedCID: CID?
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadRecordResult>
+    {
+        guard recognizes(selector) else { return .notFound }
+        let status = try currentStatus()
+        guard status.status == .active else { return .lifecycle(status) }
+        jsonOutcomeRequestCount += 1
+        let record = records.first {
+            $0.path == path && (expectedCID == nil || expectedCID == $0.cid)
+        }
+        return .active(try PublicRepositoryReadRecordResult(
+            did: description.did,
+            state: description.state,
+            record: record
+        ))
+    }
+
+    func publicRepositoryRecordsOutcome(
+        selector: String,
+        collection: String,
+        limit: Int,
+        cursor: String?,
+        reverse: Bool
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadPageResult>
+    {
+        guard recognizes(selector) else { return .notFound }
+        let status = try currentStatus()
+        guard status.status == .active else { return .lifecycle(status) }
+        jsonOutcomeRequestCount += 1
+        if let jsonReadBarrier {
+            await jsonReadBarrier.arriveAndWait()
+        }
+        return .active(try PublicRepositoryReadPageResult(
+            did: description.did,
+            state: description.state,
+            page: try makePage(
+                collection: collection,
+                limit: limit,
+                cursor: cursor,
+                reverse: reverse
+            )
+        ))
+    }
+
+    func publicRepositoryCAROutcome(
+        selector: String
+    ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadCAR> {
+        guard recognizes(selector) else { return .notFound }
+        let status = try currentStatus()
+        guard status.status == .active else { return .lifecycle(status) }
+        guard let car = try await publicRepositoryCAR(selector: selector) else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        return .active(car)
+    }
+
+    private func recognizes(_ selector: String) -> Bool {
+        [description.did, description.canonicalHandle].contains(selector)
+    }
+
+    private func currentStatus() throws -> PublicRepositoryReadStatus {
+        try .init(
+            did: description.did,
+            status: lifecycleStatus,
+            revision: lifecycleStatus == .active
+                ? description.state.revision
+                : nil
+        )
+    }
+
+    private func makePage(
+        collection: String,
+        limit: Int,
+        cursor: String?,
+        reverse: Bool
+    ) throws -> PublicRepositoryReadPage {
+        if forgeOutOfOrderPage {
+            return try .init(
+                records: Array(records.prefix(limit)),
+                cursor: records.first?.path.recordKey
+            )
+        }
+        let ordered = reverse ? records : records.reversed()
+        let afterCursor = ordered.filter { record in
+            guard let cursor else { return true }
+            return reverse
+                ? record.path.recordKey > cursor
+                : record.path.recordKey < cursor
+        }
+        let emitted = Array(afterCursor.prefix(limit))
+        return try .init(
+            records: emitted,
+            cursor: emitted.last?.path.recordKey
+        )
+    }
+}
+
+private actor PublicJSONReadBarrier {
+    private var entered = false
+    private var released = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func arriveAndWait() async {
+        guard !released else { return }
+        entered = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { continuation in
+            if released {
+                continuation.resume()
+            } else {
+                releaseWaiters.append(continuation)
+            }
+        }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func release() {
+        guard !released else { return }
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
 }
 
 private actor HTTPPublicCARSource: PublicRepositoryCARByteSource {
@@ -542,4 +913,21 @@ private actor HTTPPublicCARSource: PublicRepositoryCARByteSource {
         defer { offset = end }
         return Data(data[offset..<end])
     }
+}
+
+private struct DiscardingPublicResponseBodyWriter: ResponseBodyWriter {
+    func write(_: ByteBuffer) async throws {}
+    func finish(_: HTTPFields?) async throws {}
+}
+
+private enum PublicResponseBodyWriterFailure: Error {
+    case expected
+}
+
+private struct FailingPublicResponseBodyWriter: ResponseBodyWriter {
+    func write(_: ByteBuffer) async throws {
+        throw PublicResponseBodyWriterFailure.expected
+    }
+
+    func finish(_: HTTPFields?) async throws {}
 }

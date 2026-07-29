@@ -29,8 +29,34 @@ public struct Input: ATProtocolCodable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.did = try container.decode(DID.self, forKey: .did)
             self.type = try container.decode(NSID.self, forKey: .type)
-            self.skey = try container.decodeIfPresent(String.self, forKey: .skey)
-            self.config = try container.decodeIfPresent(ComAtprotoSimplespaceDefs.SpaceConfig.self, forKey: .config)
+            if container.contains(.skey) {
+                guard try !container.decodeNil(forKey: .skey) else {
+                    throw DecodingError.valueNotFound(
+                        String.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'skey' must not be null"
+                        )
+                    )
+                }
+                self.skey = try container.decode(String.self, forKey: .skey)
+            } else {
+                self.skey = nil
+            }
+            if container.contains(.config) {
+                guard try !container.decodeNil(forKey: .config) else {
+                    throw DecodingError.valueNotFound(
+                        ComAtprotoSimplespaceDefs.SpaceConfig.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'config' must not be null"
+                        )
+                    )
+                }
+                self.config = try container.decode(ComAtprotoSimplespaceDefs.SpaceConfig.self, forKey: .config)
+            } else {
+                self.config = nil
+            }
         }
 
         public func encode(to encoder: Encoder) throws {

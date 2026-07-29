@@ -25,6 +25,7 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
         /// Optional PEM trust roots are only for a local interop lab. Normal
         /// construction leaves NIOSSL's platform/default trust policy intact.
         public let additionalTrustRootsPEM: Data?
+        fileprivate let resources: OAuthPeerPinnedNIOClientResources
 
         public init(
             endpointPeers: [String: OAuthIPAddress],
@@ -48,6 +49,9 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
             }
             self.endpointPeers = endpointPeers
             self.additionalTrustRootsPEM = additionalTrustRootsPEM
+            resources = try OAuthPeerPinnedNIOClientResources(
+                additionalTrustRootsPEM: additionalTrustRootsPEM
+            )
         }
     }
 
@@ -59,13 +63,14 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
 
     public func post(
         url: URL,
+        approvedPeers: Set<OAuthIPAddress>,
         headers: [String: String],
         body: Data,
         timeout: TimeInterval,
         maximumResponseBodyBytes: Int
     ) async throws -> OAuthRemoteHTTPResponse {
         guard body.count <= 64 * 1_024,
-              maximumResponseBodyBytes >= 0,
+              (0 ... 1_048_576).contains(maximumResponseBodyBytes),
               timeout > 0,
               timeout <= 30,
               timeout.isFinite,
@@ -75,7 +80,10 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
               components.user == nil,
               components.password == nil,
               components.fragment == nil,
-              let peer = configuration.endpointPeers[url.absoluteString] else {
+              !approvedPeers.isEmpty,
+              approvedPeers.count <= 32,
+              let peer = configuredPeer(for: url),
+              approvedPeers.contains(peer) else {
             throw SwanError.unauthorized("notification endpoint is not peer-pinned")
         }
         guard scheme == "https" || (scheme == "http" && hostname == "localhost") else {
@@ -86,30 +94,43 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
             throw SwanError.malformed("notification endpoint port is invalid")
         }
 
-        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        do {
-            let response = try await makeRequest(
-                group: group,
-                url: url,
-                hostname: hostname,
-                peer: peer,
-                port: port,
-                scheme: scheme,
-                headers: headers,
-                body: body,
-                timeout: timeout,
-                maximumResponseBodyBytes: maximumResponseBodyBytes
-            )
-            try await group.shutdownGracefully()
-            return response
-        } catch {
-            try? await group.shutdownGracefully()
-            throw error
+        return try await makeRequest(
+            group: configuration.resources.eventLoopGroup,
+            tlsContext: configuration.resources.tlsContext,
+            url: url,
+            hostname: hostname,
+            peer: peer,
+            port: port,
+            scheme: scheme,
+            headers: headers,
+            body: body,
+            timeout: timeout,
+            maximumResponseBodyBytes: maximumResponseBodyBytes
+        )
+    }
+
+    private func configuredPeer(for url: URL) -> OAuthIPAddress? {
+        if let exact = configuration.endpointPeers[url.absoluteString] {
+            return exact
         }
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        // Notification destinations are configured as service origins, while
+        // the XRPC transport adds an absolute method path.  Preserve exact
+        // path pins when present, then fall back only to that same origin
+        // spelling; scheme, host, port, userinfo, and fragments remain bound
+        // by the configuration key and cannot be selected by the request.
+        components.path = ""
+        components.query = nil
+        components.fragment = nil
+        guard let origin = components.url?.absoluteString else { return nil }
+        return configuration.endpointPeers[origin]
     }
 
     private func makeRequest(
         group: MultiThreadedEventLoopGroup,
+        tlsContext: NIOSSLContext,
         url: URL,
         hostname: String,
         peer: OAuthIPAddress,
@@ -127,12 +148,10 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
             .channelInitializer { channel in
                 do {
                     if scheme == "https" {
-                        var tls = TLSConfiguration.makeClientConfiguration()
-                        if let pem = configuration.additionalTrustRootsPEM {
-                            tls.trustRoots = .certificates(try NIOSSLCertificate.fromPEMBytes([UInt8](pem)))
-                        }
-                        let context = try NIOSSLContext(configuration: tls)
-                        let handler = try NIOSSLClientHandler(context: context, serverHostname: hostname)
+                        let handler = try NIOSSLClientHandler(
+                            context: tlsContext,
+                            serverHostname: hostname
+                        )
                         // `channelInitializer` is already isolated to this
                         // event loop, so use NIO's synchronous pipeline view.
                         // This avoids claiming the legacy NIOSSL handler is
@@ -192,7 +211,7 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
     }
 }
 
-private final class PeerPinnedHTTPResponseHandler: ChannelInboundHandler {
+private final class PeerPinnedHTTPResponseHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = HTTPClientResponsePart
 
     private let responsePromise: EventLoopPromise<OAuthRemoteHTTPResponse>
@@ -220,13 +239,15 @@ private final class PeerPinnedHTTPResponseHandler: ChannelInboundHandler {
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
-        let promise = responsePromise
-        timeoutTask = context.eventLoop.scheduleTask(in: .milliseconds(Int64(timeout * 1_000))) {
-            promise.fail(SwanError.unavailable("notification request timed out"))
+        timeoutTask = context.eventLoop.scheduleTask(
+            in: .milliseconds(Int64(timeout * 1_000))
+        ) { [weak self] in
+            self?.timeout(context: context)
         }
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        guard !completed else { return }
         switch unwrapInboundIn(data) {
         case let .head(head):
             guard self.head == nil else {
@@ -254,15 +275,13 @@ private final class PeerPinnedHTTPResponseHandler: ChannelInboundHandler {
                 fail(context: context, error: SwanError.unauthorized("notification connected peer did not match its pin"))
                 return
             }
-            timeoutTask?.cancel()
-            completed = true
             let bytes = body.flatMap { buffer in
                 buffer.getBytes(at: buffer.readerIndex, length: buffer.readableBytes)
             } ?? []
             let headers = head.headers.reduce(into: [String: [String]]()) { output, header in
                 output[header.name.lowercased(), default: []].append(header.value)
             }
-            responsePromise.succeed(.init(
+            succeed(.init(
                 status: Int(head.status.code),
                 headers: headers,
                 body: Data(bytes),
@@ -287,8 +306,25 @@ private final class PeerPinnedHTTPResponseHandler: ChannelInboundHandler {
         guard !completed else { return }
         completed = true
         timeoutTask?.cancel()
+        timeoutTask = nil
         responsePromise.fail(error)
         context.close(promise: nil)
+    }
+
+    private func timeout(context: ChannelHandlerContext) {
+        guard !completed else { return }
+        completed = true
+        timeoutTask = nil
+        responsePromise.fail(SwanError.unavailable("notification request timed out"))
+        context.close(promise: nil)
+    }
+
+    private func succeed(_ response: OAuthRemoteHTTPResponse) {
+        guard !completed else { return }
+        completed = true
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        responsePromise.succeed(response)
     }
 }
 

@@ -18,6 +18,9 @@ import Glibc
 enum SQLiteProtectedPaths {
     private static let ownerOnlyDirectoryMode: mode_t = 0o700
     private static let ownerOnlyFileMode: mode_t = 0o600
+    private static let accountLifecycleLockFilenamePrefix =
+        ".swan-account-lifecycle-"
+    private static let accountDeletionInventoryBatchLimit = 256
 
     static func openRoot(_ url: URL) throws -> Int32 {
         let path = url.standardizedFileURL.path
@@ -221,54 +224,6 @@ enum SQLiteProtectedPaths {
         }
     }
 
-    /// Allocates a single owner-only regular file below a dedicated private
-    /// directory for permissioned CAR recovery spools. The generated name is
-    /// not derived from a DID, space, record, or CID, and `O_EXCL|O_NOFOLLOW`
-    /// prevents accidental reuse or symlink traversal. The caller owns
-    /// deletion once the response completes or fails.
-    static func makePrivateCARSpoolURL(in dataDirectory: URL) throws -> URL {
-        let root = try openRoot(dataDirectory)
-        defer { _ = close(root) }
-        let spoolDirectory = try openOrCreateDirectory(
-            parent: root,
-            name: "permissioned-car-spool"
-        )
-        defer { _ = close(spoolDirectory) }
-
-        for _ in 0 ..< 16 {
-            let name = "car-\(UUID().uuidString.lowercased()).spool"
-            let descriptor = name.withCString { path in
-                openat(
-                    spoolDirectory,
-                    path,
-                    O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-                    ownerOnlyFileMode
-                )
-            }
-            if descriptor < 0 {
-                guard errno == EEXIST else {
-                    throw SwanError.unavailable("permissioned CAR spool is unavailable")
-                }
-                continue
-            }
-            do {
-                try requireOwnerOnlyRegularFile(descriptor)
-                guard fchmod(descriptor, ownerOnlyFileMode) == 0 else {
-                    throw SwanError.unavailable("permissioned CAR spool is unavailable")
-                }
-                _ = close(descriptor)
-                return dataDirectory.standardizedFileURL
-                    .appending(path: "permissioned-car-spool")
-                    .appending(path: name)
-            } catch {
-                _ = close(descriptor)
-                _ = name.withCString { unlinkat(spoolDirectory, $0, 0) }
-                throw error
-            }
-        }
-        throw SwanError.unavailable("permissioned CAR spool is unavailable")
-    }
-
     /// Creates an owner-only anonymous regular file for public repository CAR
     /// streaming. The directory entry is removed before the descriptor leaves
     /// this function, so later path replacement or symlink attacks cannot
@@ -319,6 +274,65 @@ enum SQLiteProtectedPaths {
             }
         }
         throw SwanError.unavailable("public CAR spool is unavailable")
+    }
+
+    /// Creates an owner-only anonymous regular file for a permissioned
+    /// recovery CAR. Keeping only the open descriptor prevents path
+    /// replacement and makes process crashes reclaim in-flight private data
+    /// automatically.
+    static func makeUnlinkedPermissionedCARSpool(
+        in dataDirectory: URL
+    ) throws -> FileHandle {
+        let root = try openRoot(dataDirectory)
+        defer { _ = close(root) }
+        let spoolDirectory = try openOrCreateDirectory(
+            parent: root,
+            name: "permissioned-car-spool"
+        )
+        defer { _ = close(spoolDirectory) }
+
+        for _ in 0..<16 {
+            let name = "car-\(UUID().uuidString.lowercased()).spool"
+            let descriptor = name.withCString { path in
+                openat(
+                    spoolDirectory,
+                    path,
+                    O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                    ownerOnlyFileMode
+                )
+            }
+            if descriptor < 0 {
+                guard errno == EEXIST else {
+                    throw SwanError.unavailable(
+                        "permissioned CAR spool is unavailable"
+                    )
+                }
+                continue
+            }
+            do {
+                try requireOwnerOnlyRegularFile(descriptor)
+                guard fchmod(descriptor, ownerOnlyFileMode) == 0,
+                      name.withCString({
+                          unlinkat(spoolDirectory, $0, 0)
+                      }) == 0
+                else {
+                    throw SwanError.unavailable(
+                        "permissioned CAR spool is unavailable"
+                    )
+                }
+                return FileHandle(
+                    fileDescriptor: descriptor,
+                    closeOnDealloc: true
+                )
+            } catch {
+                _ = close(descriptor)
+                _ = name.withCString { unlinkat(spoolDirectory, $0, 0) }
+                throw error
+            }
+        }
+        throw SwanError.unavailable(
+            "permissioned CAR spool is unavailable"
+        )
     }
 
     /// Creates an owner-only anonymous staging file for a public blob upload.
@@ -627,6 +641,149 @@ enum SQLiteProtectedPaths {
         _ = close(descriptor)
     }
 
+    /// Every managed account database holds a shared lease for its entire
+    /// lifetime. Permanent deletion must first remove the database from live
+    /// routing, close it, and then acquire the exclusive form. A second Swan
+    /// process therefore makes deletion fail closed rather than unlinking a
+    /// database it can still serve.
+    static func openAccountLifecycleLock(
+        accountDirectoryDescriptor: Int32,
+        did: String,
+        exclusive: Bool
+    ) throws -> Int32 {
+        let accountDigest = Hex.encode(
+            SHA256.hash(data: Data(did.utf8))
+        )
+        guard validBlobDigest(accountDigest) else {
+            throw SwanError.unavailable(
+                "account lifecycle lease is unavailable"
+            )
+        }
+        let lockFilename =
+            "\(accountLifecycleLockFilenamePrefix)\(accountDigest).lock"
+        let descriptor = lockFilename.withCString { path in
+            openat(
+                accountDirectoryDescriptor,
+                path,
+                O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
+                ownerOnlyFileMode
+            )
+        }
+        guard descriptor >= 0 else {
+            throw SwanError.unavailable(
+                "account lifecycle lease is unavailable"
+            )
+        }
+        do {
+            var metadata = stat()
+            guard fchmod(descriptor, ownerOnlyFileMode) == 0,
+                  fstat(descriptor, &metadata) == 0,
+                  (metadata.st_mode & S_IFMT) == S_IFREG,
+                  metadata.st_uid == geteuid(),
+                  metadata.st_nlink == 1,
+                  (metadata.st_mode & 0o777) == ownerOnlyFileMode,
+                  fsync(descriptor) == 0 else {
+                throw SwanError.unavailable(
+                    "account lifecycle lease is unavailable"
+                )
+            }
+            let operation = (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB
+            while flock(descriptor, operation) != 0 {
+                guard errno == EINTR else {
+                    throw SwanError.unavailable(
+                        "account lifecycle lease is unavailable"
+                    )
+                }
+            }
+            return descriptor
+        } catch {
+            _ = close(descriptor)
+            throw error
+        }
+    }
+
+    static func closeAccountLifecycleLock(_ descriptor: Int32) {
+        guard descriptor >= 0 else { return }
+        while flock(descriptor, LOCK_UN) != 0, errno == EINTR {}
+        _ = close(descriptor)
+    }
+
+    /// Removes only the exact DID-derived database family and private/public
+    /// CAS namespace below a held, descriptor-validated account shard. The
+    /// lifecycle lock entry is deliberately retained so its inode can never
+    /// be replaced while another process still holds an older lease.
+    static func destroyAccountData(
+        accountDirectoryDescriptor: Int32,
+        did: String
+    ) throws {
+        let accountDigest = Hex.encode(
+            SHA256.hash(data: Data(did.utf8))
+        )
+        guard validBlobDigest(accountDigest) else {
+            throw SwanError.unavailable(
+                "account data deletion target is unavailable"
+            )
+        }
+
+        // CAS comes first. An unexpected symlink or object type therefore
+        // leaves the authoritative SQLite database intact and the durable
+        // deletion stage retryable.
+        try destroyAccountCASNamespace(
+            accountDirectoryDescriptor: accountDirectoryDescriptor,
+            accountDigest: accountDigest
+        )
+
+        let databaseName = "\(accountDigest).sqlite"
+        for name in [
+            databaseName,
+            "\(databaseName)-wal",
+            "\(databaseName)-shm",
+        ] {
+            let descriptor = name.withCString {
+                openat(
+                    accountDirectoryDescriptor,
+                    $0,
+                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+                )
+            }
+            if descriptor < 0 {
+                guard errno == ENOENT else {
+                    throw SwanError.unavailable(
+                        "account data deletion target is unavailable"
+                    )
+                }
+                continue
+            }
+            defer { _ = close(descriptor) }
+            do {
+                var metadata = stat()
+                guard fstat(descriptor, &metadata) == 0,
+                      (metadata.st_mode & S_IFMT) == S_IFREG,
+                      metadata.st_uid == geteuid(),
+                      metadata.st_nlink == 1,
+                      (metadata.st_mode & 0o777) == ownerOnlyFileMode else {
+                    throw SwanError.unavailable(
+                        "account data deletion target is unavailable"
+                    )
+                }
+                guard name.withCString({
+                    unlinkat(accountDirectoryDescriptor, $0, 0)
+                }) == 0 else {
+                    throw SwanError.unavailable(
+                        "account data deletion target is unavailable"
+                    )
+                }
+            } catch {
+                throw error
+            }
+        }
+        guard fsync(accountDirectoryDescriptor) == 0 else {
+            throw SwanError.unavailable(
+                "account data deletion could not be synchronized"
+            )
+        }
+    }
+
     static func closeDirectory(_ descriptor: Int32) {
         guard descriptor >= 0 else { return }
         _ = close(descriptor)
@@ -707,6 +864,230 @@ enum SQLiteProtectedPaths {
               (metadata.st_mode & 0o777) == ownerOnlyFileMode else {
             throw SwanError.unavailable("SQLite database path is unavailable")
         }
+    }
+
+    private static func destroyAccountCASNamespace(
+        accountDirectoryDescriptor: Int32,
+        accountDigest: String
+    ) throws {
+        let casRootName = "permissioned-blob-cas"
+        let casRoot = casRootName.withCString {
+            openat(
+                accountDirectoryDescriptor,
+                $0,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+            )
+        }
+        if casRoot < 0 {
+            guard errno == ENOENT else {
+                throw SwanError.unavailable(
+                    "account CAS deletion target is unavailable"
+                )
+            }
+            return
+        }
+        defer { _ = close(casRoot) }
+        try requireOwnerOnlyDirectory(casRoot)
+
+        let account = accountDigest.withCString {
+            openat(
+                casRoot,
+                $0,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+            )
+        }
+        if account < 0 {
+            guard errno == ENOENT else {
+                throw SwanError.unavailable(
+                    "account CAS deletion target is unavailable"
+                )
+            }
+            return
+        }
+        defer { _ = close(account) }
+        try requireOwnerOnlyDirectory(account)
+
+        while true {
+            let shardBatch = try directoryEntryNameBatch(
+                account,
+                limit: accountDeletionInventoryBatchLimit
+            )
+            guard !shardBatch.isEmpty else { break }
+            for shardName in shardBatch {
+                guard shardName.utf8.count == 2,
+                      shardName.utf8.allSatisfy(isLowercaseHex) else {
+                    throw SwanError.unavailable(
+                        "account CAS deletion target is unavailable"
+                    )
+                }
+                let shard = shardName.withCString {
+                    openat(
+                        account,
+                        $0,
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+                    )
+                }
+                guard shard >= 0 else {
+                    throw SwanError.unavailable(
+                        "account CAS deletion target is unavailable"
+                    )
+                }
+                do {
+                    defer { _ = close(shard) }
+                    try requireOwnerOnlyDirectory(shard)
+                    while true {
+                        let filenameBatch = try directoryEntryNameBatch(
+                            shard,
+                            limit: accountDeletionInventoryBatchLimit
+                        )
+                        guard !filenameBatch.isEmpty else { break }
+                        for filename in filenameBatch {
+                            guard validCASFilename(filename) else {
+                                throw SwanError.unavailable(
+                                    "account CAS deletion target is unavailable"
+                                )
+                            }
+                            let descriptor = filename.withCString {
+                                openat(
+                                    shard,
+                                    $0,
+                                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+                                )
+                            }
+                            guard descriptor >= 0 else {
+                                throw SwanError.unavailable(
+                                    "account CAS deletion target is unavailable"
+                                )
+                            }
+                            var metadata = stat()
+                            guard fstat(descriptor, &metadata) == 0,
+                                  (metadata.st_mode & S_IFMT) == S_IFREG,
+                                  metadata.st_uid == geteuid(),
+                                  metadata.st_nlink == 1,
+                                  (metadata.st_mode & 0o777)
+                                    == ownerOnlyFileMode else {
+                                _ = close(descriptor)
+                                throw SwanError.unavailable(
+                                    "account CAS deletion target is unavailable"
+                                )
+                            }
+                            _ = close(descriptor)
+                            guard filename.withCString({
+                                unlinkat(shard, $0, 0)
+                            }) == 0 else {
+                                throw SwanError.unavailable(
+                                    "account CAS deletion target is unavailable"
+                                )
+                            }
+                        }
+                    }
+                    guard fsync(shard) == 0 else {
+                        throw SwanError.unavailable(
+                            "account CAS deletion could not be synchronized"
+                        )
+                    }
+                    guard shardName.withCString({
+                        unlinkat(account, $0, AT_REMOVEDIR)
+                    }) == 0 else {
+                        throw SwanError.unavailable(
+                            "account CAS deletion target is unavailable"
+                        )
+                    }
+                } catch {
+                    throw error
+                }
+            }
+        }
+        guard fsync(account) == 0,
+              accountDigest.withCString({
+                  unlinkat(casRoot, $0, AT_REMOVEDIR)
+              }) == 0,
+              fsync(casRoot) == 0 else {
+            throw SwanError.unavailable(
+                "account CAS deletion could not be synchronized"
+            )
+        }
+    }
+
+    /// Inventories at most one bounded page. Deletion restarts the descriptor
+    /// iterator after unlinking that page, so memory is independent of the
+    /// total number of blobs and partial progress remains crash-retryable.
+    private static func directoryEntryNameBatch(
+        _ descriptor: Int32,
+        limit: Int
+    ) throws -> [String] {
+        guard limit > 0 else {
+            throw SwanError.unavailable(
+                "account deletion inventory is unavailable"
+            )
+        }
+        let inventoryDescriptor = openat(
+            descriptor,
+            ".",
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+        )
+        guard inventoryDescriptor >= 0,
+              let directory = fdopendir(inventoryDescriptor) else {
+            if inventoryDescriptor >= 0 {
+                _ = close(inventoryDescriptor)
+            }
+            throw SwanError.unavailable(
+                "account deletion inventory is unavailable"
+            )
+        }
+        defer { _ = closedir(directory) }
+        var names: [String] = []
+        names.reserveCapacity(limit)
+        while names.count < limit {
+            errno = 0
+            guard let entry = readdir(directory) else {
+                guard errno == 0 else {
+                    throw SwanError.unavailable(
+                        "account deletion inventory is unavailable"
+                    )
+                }
+                break
+            }
+            var storage = entry.pointee.d_name
+            let capacity = MemoryLayout.size(ofValue: storage)
+            let name = withUnsafePointer(to: &storage) {
+                $0.withMemoryRebound(
+                    to: CChar.self,
+                    capacity: capacity
+                ) {
+                    String(cString: $0)
+                }
+            }
+            if name != ".", name != ".." {
+                guard validDirectoryComponent(name),
+                      name.utf8.count <= 255 else {
+                    throw SwanError.unavailable(
+                        "account deletion inventory is unavailable"
+                    )
+                }
+                names.append(name)
+            }
+        }
+        return names
+    }
+
+    private static func validCASFilename(_ value: String) -> Bool {
+        let digest: Substring
+        if value.hasSuffix(".blob.lock") {
+            digest = value.dropLast(".blob.lock".count)
+        } else if value.hasSuffix(".blob") {
+            digest = value.dropLast(".blob".count)
+        } else {
+            return false
+        }
+        return digest.utf8.count == 64
+            && digest.utf8.allSatisfy(isLowercaseHex)
+    }
+
+    private static func isLowercaseHex(_ byte: UInt8) -> Bool {
+        (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+            || (byte >= UInt8(ascii: "a")
+                && byte <= UInt8(ascii: "f"))
     }
 
     private static func privateBlobLocation(

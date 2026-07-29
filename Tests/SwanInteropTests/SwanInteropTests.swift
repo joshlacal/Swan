@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 import Crypto
+import NIOCore
 import Petrel
 @testable import SwanInterop
 import SwanCore
@@ -9,6 +10,11 @@ import SwanSQLite
 import SwanSpaces
 
 final class SwanInteropTests: XCTestCase {
+    private static let artifactRecordCID =
+        "bafyreidqz2dr7cr5h62etpb4hlhgkr6o6aw7y5h74sgzcjjsu4sl7w7fxe"
+    private static let artifactReadCID =
+        "bafyreibtcy2i3ow7w6yry7boui2zjfaz4i7z7keyvuwbtd4zsylzckuzeu"
+
     func testCheckedInProfileAndArtifactsVerifyOffline() throws {
         let fixture = try ProfileFixture()
         defer { fixture.remove() }
@@ -20,6 +26,48 @@ final class SwanInteropTests: XCTestCase {
 
         XCTAssertTrue(report.isValid, "\(report.diagnostics)")
         XCTAssertEqual(report.profileID, OfflineProtocolProfileVerifier.stableProfileID)
+    }
+
+    func testLegacyPermissionedProfileArtifactsRemainByteExact() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let expected = [
+            (
+                "Profiles/permissioned-data-0016-2026-07-03.json",
+                "30a696e78f62b11f22dd669f6ebb9f7e08d6c1d3346ebd71ad5cf0cd49b3f4d0"
+            ),
+            (
+                "Profiles/permissioned-data-0016-2026-07-03.lexicons.sha256",
+                "9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f"
+            ),
+            (
+                "Profiles/permissioned-data-0016-2026-07-03.generated-wire.sha256",
+                "c1d5697f351a4209c7f8a9faaf460d423f9f44f37845ae2c92e150e78c552609"
+            ),
+        ]
+
+        for (path, checksum) in expected {
+            let data = try Data(contentsOf: packageRoot.appending(path: path))
+            XCTAssertEqual(
+                SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(),
+                checksum,
+                path
+            )
+        }
+
+        let report = OfflineProtocolProfileVerifier.verify(
+            profileURL: packageRoot.appending(
+                path: "Profiles/permissioned-data-0016-2026-07-03.json"
+            ),
+            sourceRoot: packageRoot
+        )
+        XCTAssertEqual(report.profileID, "permissioned-data-0016-2026-07-03")
+        XCTAssertEqual(
+            report.diagnostics,
+            [.init(.unsupportedProfileID, artifact: "profile")]
+        )
     }
 
     func testInvalidRevisionPinFailsWithTypedDiagnostic() throws {
@@ -220,8 +268,8 @@ final class SwanInteropTests: XCTestCase {
             credentialIssued: true,
             writeStatus: 200,
             readStatus: 200,
-            writeCID: "bafywrite",
-            readCID: "bafywrite",
+            writeCID: Self.artifactRecordCID,
+            readCID: Self.artifactRecordCID,
             writeResponseSHA256: String(repeating: "a", count: 64),
             readResponseSHA256: String(repeating: "b", count: 64),
             converged: true,
@@ -232,8 +280,8 @@ final class SwanInteropTests: XCTestCase {
         let object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: JSONEncoder().encode(artifact)) as? [String: Any]
         )
-        XCTAssertEqual(object["writeCID"] as? String, "bafywrite")
-        XCTAssertEqual(object["readCID"] as? String, "bafywrite")
+        XCTAssertEqual(object["writeCID"] as? String, Self.artifactRecordCID)
+        XCTAssertEqual(object["readCID"] as? String, Self.artifactRecordCID)
         XCTAssertEqual(object["status"] as? String, "passed")
         let keys = Set(Self.sanitizedKeys(in: object).map { $0.lowercased() })
         for forbidden in ["access_token", "refresh_token", "dpop", "private_key", "record_value"] {
@@ -337,6 +385,21 @@ final class SwanInteropTests: XCTestCase {
         XCTAssertEqual(http.maximumStreamingResponseBytes, 512 * 1_024 * 1_024)
     }
 
+    func testStreamingResponseBufferIsDrainedThroughAtMost64KiBChunks() throws {
+        let byteCount = 3 * 64 * 1_024 + 17
+        var buffer = ByteBufferAllocator().buffer(capacity: byteCount)
+        buffer.writeRepeatingByte(0x42, count: byteCount)
+        var chunkCounts: [Int] = []
+
+        let drained = try InteropStreamingBodyChunker.drain(buffer) { chunk in
+            chunkCounts.append(chunk.count)
+        }
+
+        XCTAssertEqual(drained, byteCount)
+        XCTAssertEqual(chunkCounts.reduce(0, +), byteCount)
+        XCTAssertEqual(chunkCounts, [64 * 1_024, 64 * 1_024, 64 * 1_024, 17])
+    }
+
     func testLiveReplicaRejectsReorderingAndVerifiesReaderCommitBeforePublication() async throws {
         let space = try SpaceURI(
             authority: "did:plc:alice",
@@ -368,6 +431,7 @@ final class SwanInteropTests: XCTestCase {
         let synchronizer = IncrementalSynchronizer(replica: replica)
         let entry = InteropRepositoryOperation(
             revision: 1,
+            wireRevision: "222222222222a",
             uri: uri,
             cid: cid,
             value: value,
@@ -389,6 +453,113 @@ final class SwanInteropTests: XCTestCase {
         }
         let afterDuplicate = await replica.state()
         XCTAssertEqual(afterDuplicate, state)
+    }
+
+    func testLiveReplicaDoesNotAdvanceWhenTerminalCommitVerificationFails() async throws {
+        let space = try SpaceURI(
+            authority: "did:plc:alice",
+            spaceType: "app.swan.interop",
+            skey: "atomic-terminal"
+        )
+        let uri = try SpaceRecordURI(
+            space: space,
+            author: "did:plc:alice",
+            collection: "app.bsky.feed.post",
+            rkey: "r1"
+        )
+        let value = Data([0xa1, 0x61, 0x78, 0x01])
+        let cid = CID.fromDAGCBOR(value).string
+        var hash = LtHash()
+        hash.add(element: "app.bsky.feed.post/r1/\(cid)")
+        let key = P256.Signing.PrivateKey()
+        let forgedCommit = try SpaceCommitCodec.sign(
+            context: try SpaceCommitContext(
+                space: space,
+                author: "did:plc:alice",
+                rev: "222222222222a",
+                ikm: Data(repeating: 0x41, count: 32)
+            ),
+            commitment: Data(repeating: 0x99, count: 32),
+            key: key
+        )
+        let replica = try SpaceReplica(space: space, author: "did:plc:alice")
+        let synchronizer = IncrementalSynchronizer(replica: replica)
+        let entry = InteropRepositoryOperation(
+            revision: 1,
+            wireRevision: "222222222222a",
+            uri: uri,
+            cid: cid,
+            value: value,
+            commitment: hash.commitment
+        )
+
+        do {
+            _ = try await synchronizer.apply(
+                [entry],
+                terminalCommit: forgedCommit,
+                publicKey: key.publicKey
+            )
+            XCTFail("a mismatched terminal commit must be rejected")
+        } catch let error as SpaceReplica.Error {
+            XCTAssertEqual(error, .commitmentMismatch)
+        }
+        let afterFailure = await replica.state()
+        XCTAssertEqual(afterFailure.revision, 0)
+        XCTAssertTrue(afterFailure.records.isEmpty)
+        XCTAssertEqual(afterFailure.commitment, LtHash().commitment)
+    }
+
+    func testLiveReplicaRejectsSignedTerminalRevisionMismatchWithoutAdvancing() async throws {
+        let space = try SpaceURI(
+            authority: "did:plc:alice",
+            spaceType: "app.swan.interop",
+            skey: "terminal-revision"
+        )
+        let uri = try SpaceRecordURI(
+            space: space,
+            author: "did:plc:alice",
+            collection: "app.bsky.feed.post",
+            rkey: "r1"
+        )
+        let value = Data([0xa1, 0x61, 0x78, 0x01])
+        let cid = CID.fromDAGCBOR(value).string
+        var hash = LtHash()
+        hash.add(element: "app.bsky.feed.post/r1/\(cid)")
+        let key = P256.Signing.PrivateKey()
+        let wrongRevisionCommit = try SpaceCommitCodec.sign(
+            context: try SpaceCommitContext(
+                space: space,
+                author: "did:plc:alice",
+                rev: "222222222222b",
+                ikm: Data(repeating: 0x42, count: 32)
+            ),
+            commitment: hash.commitment,
+            key: key
+        )
+        let replica = try SpaceReplica(space: space, author: "did:plc:alice")
+        let entry = InteropRepositoryOperation(
+            revision: 1,
+            wireRevision: "222222222222a",
+            uri: uri,
+            cid: cid,
+            value: value,
+            commitment: hash.commitment
+        )
+
+        do {
+            _ = try await IncrementalSynchronizer(replica: replica).apply(
+                [entry],
+                terminalCommit: wrongRevisionCommit,
+                publicKey: key.publicKey
+            )
+            XCTFail("a terminal commit for a different wire revision must be rejected")
+        } catch let error as SpaceReplica.Error {
+            XCTAssertEqual(error, .terminalRevisionMismatch)
+        }
+        let afterFailure = await replica.state()
+        XCTAssertEqual(afterFailure.revision, 0)
+        XCTAssertTrue(afterFailure.records.isEmpty)
+        XCTAssertEqual(afterFailure.commitment, LtHash().commitment)
     }
 
     func testCARConsumerVerifiesTwoRootRecoveryFromAFileSpool() throws {
@@ -434,6 +605,102 @@ final class SwanInteropTests: XCTestCase {
         )
         XCTAssertEqual(recovery.records.count, 1)
         XCTAssertEqual(recovery.commitment, hash.commitment)
+        let algorithmBoundRecovery = try SwanCARConsumer(maximumBytes: car.data.count + 1).verify(
+            fileURL: root,
+            space: space,
+            author: "did:plc:alice",
+            verificationKey: .p256(key.publicKey)
+        )
+        XCTAssertEqual(algorithmBoundRecovery.records, recovery.records)
+        XCTAssertEqual(algorithmBoundRecovery.commitment, recovery.commitment)
+    }
+
+    func testStreamingCARConsumerReturnsSummaryAndCleansSQLiteStagingOnSuccessAndError() async throws {
+        let space = try SpaceURI(
+            authority: "did:plc:alice",
+            spaceType: "app.swan.interop",
+            skey: "streaming-car"
+        )
+        let repeatedValue = Data([0xa1, 0x61, 0x78, 0x01])
+        let middleValue = Data([0xa1, 0x61, 0x78, 0x02])
+        let values = [repeatedValue, middleValue, repeatedValue]
+        let records = try zip(["r1", "r2", "r3"], values).map { pair in
+            let (rkey, value) = pair
+            let uri = try SpaceRecordURI(
+                space: space,
+                author: "did:plc:alice",
+                collection: "app.bsky.feed.post",
+                rkey: rkey
+            )
+            return SpaceRecord(
+                uri: uri,
+                value: value,
+                cid: CID.fromDAGCBOR(value).string,
+                revision: 1
+            )
+        }
+        var hash = LtHash()
+        for record in records {
+            hash.add(
+                element: "\(record.uri.collection)/\(record.uri.rkey)/\(record.cid)"
+            )
+        }
+        let key = P256.Signing.PrivateKey()
+        let commit = try SpaceCommitCodec.sign(
+            context: try SpaceCommitContext(
+                space: space,
+                author: "did:plc:alice",
+                rev: "222222222222a",
+                ikm: Data(repeating: 0x42, count: 32)
+            ),
+            commitment: hash.commitment,
+            key: key
+        )
+        let car = try SpaceCARCodec.encode(
+            commit: commit,
+            records: records
+        )
+        let root = FileManager.default.temporaryDirectory.appending(
+            path: "swan-streaming-car-consumer-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let carURL = root.appending(path: "recovery.car")
+        try car.data.write(to: carURL)
+
+        let consumer = try SwanCARConsumer(
+            maximumBytes: car.data.count,
+            stagingDirectory: root
+        )
+        let summary = try await consumer.verifyStreaming(
+            fileURL: carURL,
+            space: space,
+            author: "did:plc:alice",
+            publicKey: key.publicKey
+        )
+        XCTAssertEqual(summary.recordCount, 3)
+        XCTAssertEqual(summary.commitment, hash.commitment)
+        XCTAssertTrue(try recoveryStagingDirectories(in: root).isEmpty)
+
+        var corrupt = car.data
+        corrupt[corrupt.index(before: corrupt.endIndex)] ^= 0x01
+        try corrupt.write(to: carURL)
+        do {
+            _ = try await consumer.verifyStreaming(
+                fileURL: carURL,
+                space: space,
+                author: "did:plc:alice",
+                publicKey: key.publicKey
+            )
+            XCTFail("corrupt streamed recovery was accepted")
+        } catch let error as SpaceCARStreamingError {
+            XCTAssertEqual(error, .blockCIDMismatch)
+        }
+        XCTAssertTrue(try recoveryStagingDirectories(in: root).isEmpty)
     }
 
     func testDPoPClientProofIsStrictlySignedAndFresh() throws {
@@ -493,6 +760,111 @@ final class SwanInteropTests: XCTestCase {
         XCTAssertFalse(events[0].path.contains("alice"))
         XCTAssertFalse(events[0].path.contains("secret"))
         XCTAssertFalse(events[0].responseSHA256.isEmpty)
+    }
+
+    func testSerializedPermissionedSyncCARAndErrorArtifactsContainNoSensitiveSentinels() async throws {
+        let recorder = InteropFixtureRecorder()
+        let recordValue = "permissioned-record-value-sentinel"
+        let accessToken = "access-token-sentinel"
+        let jwt = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJtZW1iZXIifQ.signaturevalue"
+        let dpopProof = "dpop-proof-sentinel"
+        let selector = "did:plc:owner-only-selector-sentinel"
+        let cursor = "owner-only-cursor-sentinel"
+        let ownerOnlyPath = "file:///var/db/swan/owner-only-secret-path-sentinel.car"
+        let responseError = "QWxwaGEyMzQ1Njc4OUFCQ0RFRkdISg"
+
+        await recorder.record(
+            host: "member-host",
+            method: "GET",
+            path: "/xrpc/com.atproto.sync.getOps?repo=\(selector)&cursor=\(cursor)",
+            response: InteropHTTPResponse(
+                status: 200,
+                headers: ["content-type": "application/json"],
+                body: Data("{\"ops\":[{\"record\":\"\(recordValue)\",\"access_token\":\"\(accessToken)\",\"dpop\":\"\(dpopProof)\",\"jwt\":\"\(jwt)\"}]}".utf8),
+                finalURL: URL(string: "https://member.example")!,
+                redirectCount: 0
+            )
+        )
+        await recorder.record(
+            host: "authority-host",
+            method: "GET",
+            path: "/xrpc/com.atproto.sync.getRepo?did=\(selector)",
+            response: InteropHTTPResponse(
+                status: 200,
+                headers: ["content-type": "application/vnd.ipld.car"],
+                body: Data("CAR:\(recordValue):\(jwt)".utf8),
+                finalURL: URL(string: "https://authority.example")!,
+                redirectCount: 0
+            )
+        )
+        await recorder.record(
+            host: "owner-only-secret-host-sentinel",
+            method: "GET",
+            path: ownerOnlyPath,
+            response: InteropHTTPResponse(
+                status: 403,
+                headers: ["content-type": "application/json"],
+                body: Data("{\"error\":\"\(responseError)\",\"message\":\"\(recordValue)\"}".utf8),
+                finalURL: nil,
+                redirectCount: 0
+            )
+        )
+        let events = await recorder.snapshot()
+
+        let successful = LiveInteropPermissionedRoundTripArtifact(
+            scenario: "permissioned-sync-car",
+            member: "member-host",
+            authority: "authority-host",
+            credentialIssued: true,
+            writeStatus: 200,
+            readStatus: 200,
+            writeCID: Self.artifactRecordCID,
+            readCID: Self.artifactReadCID,
+            writeResponseSHA256: String(repeating: "a", count: 64),
+            readResponseSHA256: String(repeating: "b", count: 64),
+            syncStatus: 200,
+            syncOpsCount: 1,
+            syncOperationCID: Self.artifactRecordCID,
+            syncCommitVerified: true,
+            syncValuesIncluded: false,
+            fullCARStatus: 200,
+            fullCARRecordCount: 1,
+            fullCARCommitment: String(repeating: "c", count: 64),
+            fullCARVerified: true,
+            converged: true,
+            status: "passed",
+            errorCode: nil,
+            events: Array(events.prefix(2))
+        )
+        let failed = LiveInteropPermissionedRoundTripArtifact(
+            scenario: "permissioned-response-error",
+            member: "member-host",
+            authority: "authority-host",
+            credentialIssued: true,
+            writeStatus: 200,
+            readStatus: 403,
+            writeCID: Self.artifactRecordCID,
+            readCID: nil,
+            writeResponseSHA256: String(repeating: "a", count: 64),
+            readResponseSHA256: String(repeating: "d", count: 64),
+            converged: false,
+            status: "failed",
+            errorCode: "\(responseError)-\(jwt)",
+            events: [events[2]]
+        )
+
+        let serialized = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode([successful, failed])
+        )
+        let serializedStrings = Self.serializedStrings(in: serialized)
+        for sentinel in [recordValue, accessToken, jwt, dpopProof, selector, cursor, ownerOnlyPath, responseError] {
+            XCTAssertFalse(
+                serializedStrings.contains(where: { $0.contains(sentinel) }),
+                "serialized artifact leaked sentinel: \(sentinel)"
+            )
+        }
+        XCTAssertTrue(serializedStrings.contains("<redacted>"))
+        XCTAssertTrue(serializedStrings.contains("<invalid-path>"))
     }
 
     func testDuplicatedFaultModeProbesEachEndpointTwice() async throws {
@@ -863,6 +1235,28 @@ final class SwanInteropTests: XCTestCase {
             return []
         }
     }
+
+    private static func serializedStrings(in value: Any) -> [String] {
+        switch value {
+        case let value as String:
+            return [value]
+        case let object as [String: Any]:
+            return object.values.flatMap(serializedStrings(in:))
+        case let array as [Any]:
+            return array.flatMap(serializedStrings(in:))
+        default:
+            return []
+        }
+    }
+}
+
+private func recoveryStagingDirectories(in root: URL) throws -> [URL] {
+    try FileManager.default.contentsOfDirectory(
+        at: root,
+        includingPropertiesForKeys: nil
+    ).filter {
+        $0.lastPathComponent.hasPrefix("swan-space-recovery-")
+    }
 }
 
 private final class ProfileFixture {
@@ -884,11 +1278,11 @@ private final class ProfileFixture {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let profileName = "permissioned-data-0016-2026-07-03.json"
-        let lexiconName = "permissioned-data-0016-2026-07-03.lexicons.sha256"
+        let profileName = "permissioned-data-0016-2026-07-30.json"
+        let lexiconName = "permissioned-data-0016-2026-07-30.lexicons.sha256"
         profileURL = profiles.appending(path: profileName)
         lexiconManifestURL = profiles.appending(path: lexiconName)
-        generatedWireManifestURL = profiles.appending(path: "permissioned-data-0016-2026-07-03.generated-wire.sha256")
+        generatedWireManifestURL = profiles.appending(path: "permissioned-data-0016-2026-07-30.generated-wire.sha256")
         generatedWireSourceURL = sources.appending(path: "SwanSpacesWire/SwanSpacesWire.swift")
 
         try FileManager.default.copyItem(
@@ -900,8 +1294,12 @@ private final class ProfileFixture {
             to: lexiconManifestURL
         )
         try FileManager.default.copyItem(
-            at: packageRoot.appending(path: "Profiles/permissioned-data-0016-2026-07-03.generated-wire.sha256"),
+            at: packageRoot.appending(path: "Profiles/permissioned-data-0016-2026-07-30.generated-wire.sha256"),
             to: generatedWireManifestURL
+        )
+        try FileManager.default.copyItem(
+            at: packageRoot.appending(path: "PetrelManifest.json"),
+            to: root.appending(path: "PetrelManifest.json")
         )
         try FileManager.default.copyItem(
             at: packageRoot.appending(path: "Sources/SwanSpacesWire"),
@@ -926,7 +1324,7 @@ private final class ProfileFixture {
         try data.write(to: generatedWireManifestURL)
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         try replaceInProfile(
-            "c1d5697f351a4209c7f8a9faaf460d423f9f44f37845ae2c92e150e78c552609",
+            "80f9f7b93127826d95d516a4a9d18b7ca245d82fc74f8fa484bbf3423d1f51db",
             with: digest
         )
     }

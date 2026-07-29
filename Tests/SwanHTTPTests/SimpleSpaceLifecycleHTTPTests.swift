@@ -296,7 +296,11 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 let database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
                 try await database.close()
             }
-            let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(dataDirectory: root, controlStore: control)
+            let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+                dataDirectory: root,
+                controlStore: control,
+                publicIdentityVerifier: nil
+            )
             let runtime = try SwanOAuthRuntime(controlStore: control, serverKey: Data(repeating: 0x5A, count: 32))
             let alice = try await issueToken(runtime, subject: Self.alice, scopes: ["atproto"])
             let bob = try await issueToken(runtime, subject: Self.bob, scopes: ["atproto"])

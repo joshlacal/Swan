@@ -40,7 +40,8 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
 
         let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
             dataDirectory: root,
-            controlStore: control
+            controlStore: control,
+            publicIdentityVerifier: nil
         )
         let loaded = try await directory.space(
             space,
@@ -74,7 +75,8 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         await XCTAssertSwanUnavailableAsync(
             try await SQLitePreMigratedAccountDirectory.bootstrap(
                 dataDirectory: root,
-                controlStore: control
+                controlStore: control,
+                publicIdentityVerifier: nil
             )
         )
         assertNoAccountDatabase(root: root, did: alice)
@@ -92,7 +94,8 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         await XCTAssertSwanUnavailableAsync(
             try await SQLitePreMigratedAccountDirectory.bootstrap(
                 dataDirectory: root,
-                controlStore: control
+                controlStore: control,
+                publicIdentityVerifier: nil
             )
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: accountURL.path))
@@ -121,7 +124,8 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         )
         let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
             dataDirectory: root,
-            controlStore: control
+            controlStore: control,
+            publicIdentityVerifier: nil
         )
 
         let unknownResult = try await directory.space(
@@ -164,7 +168,8 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         _ = try await control.createAccount(registration(did: alice, handle: "alice.example.com"))
         let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
             dataDirectory: root,
-            controlStore: control
+            controlStore: control,
+            publicIdentityVerifier: nil
         )
         let authorization: AuthorizationContext = .accountOAuth(
             subject: alice,
@@ -191,14 +196,23 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         let reactivatedResult = try await directory.space(space, authorization: authorization)
         XCTAssertNotNil(reactivatedResult)
 
-        _ = try await control.transitionStatus(
+        _ = try await control.beginDeletion(
             did: alice,
-            to: .deleted,
-            declaration: .init(),
+            declaration: AccountLifecycleDeclaration(
+                tombstone: try AccountTombstoneMetadata(
+                    declaredAt: Date(
+                        timeIntervalSince1970: 1_750_000_003
+                    ),
+                    reason: "directory-lifecycle-test"
+                )
+            ),
             now: Date(timeIntervalSince1970: 1_750_000_003)
         )
-        let deletedResult = try await directory.space(space, authorization: authorization)
-        XCTAssertNil(deletedResult)
+        let deletingResult = try await directory.space(
+            space,
+            authorization: authorization
+        )
+        XCTAssertNil(deletingResult)
 
         try await directory.close()
         await XCTAssertSwanUnavailableAsync(
@@ -216,7 +230,8 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         _ = try await control.createAccount(registration(did: alice, handle: "alice.example.com"))
         let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
             dataDirectory: root,
-            controlStore: control
+            controlStore: control,
+            publicIdentityVerifier: nil
         )
         let databaseURL = SQLiteLayout.accountDatabase(in: root, did: alice)
         try FileManager.default.removeItem(at: databaseURL)
@@ -244,7 +259,8 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         _ = try await control.createAccount(registration(did: alice, handle: "alice.example.com"))
         let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
             dataDirectory: root,
-            controlStore: control
+            controlStore: control,
+            publicIdentityVerifier: nil
         )
 
         await XCTAssertSwanUnauthorizedAsync(
@@ -275,7 +291,8 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
 
         let reopened = try await SQLitePreMigratedAccountDirectory.bootstrap(
             dataDirectory: root,
-            controlStore: control
+            controlStore: control,
+            publicIdentityVerifier: nil
         )
         await XCTAssertSwanUnavailableAsync(
             try await reopened.space(
@@ -285,6 +302,64 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         )
         try await reopened.close()
         try await control.close()
+    }
+
+    func testPermanentDeletionDrainFailureCanBeRetried() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let space = try makeSpace(authority: alice)
+        try await installAccountDatabase(root: root, did: alice, space: space)
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        _ = try await control.createAccount(
+            registration(did: alice, handle: "alice.example.com")
+        )
+        let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+            dataDirectory: root,
+            controlStore: control,
+            publicIdentityVerifier: nil
+        )
+        let failure = FailOncePermanentDeletionClose()
+        try await directory.installPermanentDeletionTestingHooks(
+            SQLiteTestingHooks(
+                beforePermanentDeletionClose: {
+                    try await failure.failOnce()
+                }
+            ),
+            did: alice
+        )
+
+        await XCTAssertSwanUnavailableAsync(
+            try await directory.revokeAndDrainAccount(did: alice)
+        )
+        await XCTAssertSwanUnavailableAsync(
+            try await directory.space(
+                space,
+                authorization: .accountOAuth(
+                    subject: alice,
+                    scopes: ["atproto"]
+                )
+            )
+        )
+
+        try await directory.revokeAndDrainAccount(did: alice)
+        let deletion = try SQLiteAccountDataDeletionStore(
+            dataDirectory: root
+        )
+        let lease = try deletion.acquireExclusiveLease(did: alice)
+        lease.release()
+
+        try await directory.close()
+        try await control.close()
+    }
+}
+
+private actor FailOncePermanentDeletionClose {
+    private var shouldFail = true
+
+    func failOnce() throws {
+        guard shouldFail else { return }
+        shouldFail = false
+        throw SwanError.unavailable("injected permanent-deletion close failure")
     }
 }
 

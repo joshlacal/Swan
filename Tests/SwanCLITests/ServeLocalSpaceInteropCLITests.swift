@@ -1,6 +1,7 @@
 import Crypto
 import Foundation
 import SwanAccounts
+import SwanPublicRepository
 import SwanSQLite
 import SwanStorage
 import XCTest
@@ -91,24 +92,133 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
             root: data.appending(path: "keys"),
             configuration: try .init(activeKeyID: "mixed", activeKey: kek)
         )
-        let provisioned = try await AccountKeyProvisioner(keyStore: keyStore)
-            .provisionInitial(accountDID: did)
+        let signing = P256.Signing.PrivateKey()
+        let rotation = P256.Signing.PrivateKey()
+        let pdsOrigin = URL(string: "https://swan.example")!
+        let unsignedOperation = try PLCATProfile.regularOperation(
+            handle: "mixed.example.com",
+            signingPublicKey: signing.publicKey,
+            rotationPublicKeys: [rotation.publicKey],
+            pdsOrigin: pdsOrigin,
+            prev: nil
+        )
+        let operation = try PLCOperationCodec.sign(
+            .regular(unsignedOperation),
+            using: rotation
+        )
+        let localDID = try PLCOperationCodec.genesisDID(for: operation)
+        let signingReference = try AccountKeyReference(
+            accountDID: localDID,
+            purpose: .signing,
+            generation: 1
+        )
+        let rotationReference = try AccountKeyReference(
+            accountDID: localDID,
+            purpose: .rotation,
+            generation: 1
+        )
+        try await keyStore.createBatch([
+            try AccountKeyMaterial(reference: signingReference, key: signing.rawRepresentation),
+            try AccountKeyMaterial(reference: rotationReference, key: rotation.rawRepresentation),
+        ])
         let control = try await SQLiteControlDatabase(dataDirectory: data)
+        let revision = "3jzfcijpj2z2a"
+        let publicGenesis = try PublicRepositoryGenesisCodec.create(
+            did: localDID,
+            revision: revision,
+            signingKey: signing
+        )
+        let operationCID = try operation.cid.string
+        let requestID = "serve-local-interop"
+        let operationFacts = try PLCAccountPreparationOperationFacts(
+            signingDIDKey: try XCTUnwrap(
+                operation.regular?.verificationMethods["atproto"]
+            ),
+            rotationDIDKey: try XCTUnwrap(operation.regular?.rotationKeys.first),
+            signature: try XCTUnwrap(operation.regular?.signature)
+        )
+        let journal = try PLCAccountPreparationJournal(
+            requestID: requestID,
+            canonicalHandle: "mixed.example.com",
+            pdsOrigin: pdsOrigin.absoluteString,
+            repositoryRevision: revision,
+            operation: operationFacts,
+            signingKey: try AccountControlKeyReference(
+                purpose: .signing,
+                generation: 1
+            ),
+            rotationKey: try AccountControlKeyReference(
+                purpose: .rotation,
+                generation: 1
+            ),
+            publicGenesisCommitCID: nil,
+            stage: .keysStored
+        )
+        let intent = try PLCAccountPreparationIntent(
+            requestID: requestID,
+            did: localDID,
+            canonicalHandle: "mixed.example.com",
+            pdsOrigin: pdsOrigin.absoluteString,
+            repositoryRevision: revision,
+            operationCID: operationCID,
+            stage: .keysStored
+        )
+        _ = try await control.reservePLCAccountPreparationIntent(intent)
+        _ = try await control.advancePLCAccountPreparationIntent(
+            requestID: requestID,
+            expectedStage: .keysStored,
+            to: .repositoryInstalled
+        )
+        _ = try await control.advancePLCAccountPreparationIntent(
+            requestID: requestID,
+            expectedStage: .repositoryInstalled,
+            to: .submissionPending
+        )
+        _ = try await control.advancePLCAccountPreparationIntent(
+            requestID: requestID,
+            expectedStage: .submissionPending,
+            to: .submitted
+        )
         _ = try await control.createAccount(try .init(
-            did: did,
+            did: localDID,
             canonicalHandle: "mixed.example.com",
             passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
             signingKey: .init(
                 purpose: .signing,
-                generation: provisioned.signingReference.generation
+                generation: 1
             ),
             rotationKey: .init(
                 purpose: .rotation,
-                generation: provisioned.rotationReference.generation
+                generation: 1
             ),
+            publicGenesisCommitCID: publicGenesis.commitCID.string,
             createdAt: Date(timeIntervalSince1970: 1_750_000_000)
         ))
-        let database = try await SQLiteAccountDatabase(dataDirectory: data, did: did)
+        let database = try await SQLiteAccountDatabase(dataDirectory: data, did: localDID)
+        _ = try await database.installPublicRepositoryGenesis(
+            publicGenesis,
+            signingPublicKey: signing.publicKey,
+            installedAt: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+        _ = try await database.installPLCAccountPreparationJournal(journal)
+        _ = try await database.advancePLCAccountPreparationJournal(
+            requestID: requestID,
+            expectedStage: .keysStored,
+            to: .repositoryInstalled,
+            publicGenesisCommitCID: publicGenesis.commitCID.string
+        )
+        _ = try await database.advancePLCAccountPreparationJournal(
+            requestID: requestID,
+            expectedStage: .repositoryInstalled,
+            to: .submissionPending,
+            publicGenesisCommitCID: nil
+        )
+        _ = try await database.advancePLCAccountPreparationJournal(
+            requestID: requestID,
+            expectedStage: .submissionPending,
+            to: .submitted,
+            publicGenesisCommitCID: nil
+        )
         try await database.close()
         try await control.close()
 
@@ -121,7 +231,7 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
             "delegationPublicKeys": [],
             "servicePublicKeys": [],
             "authorityDestinations": [[
-                "key": did,
+                "key": localDID,
                 "endpoint": "http://localhost:3000",
                 "audience": "did:web:configured-managing.example",
                 "finalPeer": "127.0.0.1",
@@ -129,7 +239,7 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
             "registrationDestinations": [],
             "recipientServiceBindings": [[
                 "serviceIdentity": "did:web:configured-recipient.example",
-                "recipientAccount": did,
+                "recipientAccount": localDID,
             ]],
             "managingServiceAudience": "did:web:configured-managing.example",
         ]
@@ -202,6 +312,39 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
         )
         for result in [inapplicableIP, nonliteralIP, inapplicableLocalhost] {
             XCTAssertFalse(result.error.contains(root.path))
+        }
+    }
+
+    func testLoginTrustedProxyPeersRequireStrictLiteralIPsBeforeCreatingData() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        for (index, literal) in [
+            "caddy",
+            "172.30.0.2:3000",
+            "[2001:db8::2]",
+            "172.30.0.2,172.30.0.3",
+            "2001:db8::2%en0",
+        ].enumerated() {
+            let data = root.appending(path: "invalid-\(index)")
+            let result = try runServe(
+                data: data,
+                arguments: [
+                    "--login-trusted-proxy-peer",
+                    literal,
+                ]
+            )
+
+            XCTAssertNotEqual(result.status, 0, literal)
+            XCTAssertTrue(result.output.isEmpty, literal)
+            XCTAssertTrue(
+                result.error.contains(
+                    "--login-trusted-proxy-peer must be a literal IPv4 or IPv6 address"
+                ),
+                "\(literal): \(result.error)"
+            )
+            XCTAssertFalse(result.error.contains(root.path), literal)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: data.path), literal)
         }
     }
 
@@ -453,6 +596,14 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
     }
 
     private func executableURL() -> URL? {
+        if let override = ProcessInfo.processInfo.environment[
+            "SWAN_TEST_EXECUTABLE"
+        ], !override.isEmpty {
+            let url = URL(filePath: override)
+            if FileManager.default.isExecutableFile(atPath: url.path) {
+                return url
+            }
+        }
         let packageRoot = URL(filePath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let executable = packageRoot.appending(path: ".build/debug/swan")

@@ -29,6 +29,7 @@ struct ServeNotificationRuntime {
     let delegationPins: [PinnedSpaceDelegationPublicKey]
     let servicePins: [PinnedSpaceServicePublicKey]
     let credentialPublicKeys: PinnedSpaceCredentialPublicKeyResolver
+    let remoteCredentialPublicKeys: (any SpaceCredentialPublicKeyResolver)?
     let delegationPublicKeys: PinnedSpaceDelegationPublicKeyResolver
     let servicePublicKeys: PinnedSpaceServicePublicKeyResolver
     let recipientBindings: SwanSpaceNotificationRecipientBindings
@@ -44,6 +45,13 @@ struct ServeNotificationRuntime {
         let registrationDestinations: [Destination]
         let recipientServiceBindings: [RecipientServiceBinding]?
         let managingServiceAudience: String?
+        let credentialKeyPLC: CredentialKeyPLC?
+    }
+
+    private struct CredentialKeyPLC: Decodable {
+        let origin: String
+        let laboratory: Bool
+        let allowlistedHost: String?
     }
 
     private struct CredentialKey: Decodable {
@@ -81,7 +89,14 @@ struct ServeNotificationRuntime {
         let recipientAccount: String
     }
 
-    static func load(from url: URL) throws -> ServeNotificationRuntime {
+    private enum ConfigurationShapeError: Error {
+        case invalid
+    }
+
+    static func load(
+        from url: URL,
+        continuityStore: any PLCCredentialKeyContinuityStore
+    ) throws -> ServeNotificationRuntime {
         let data: Data
         do {
             data = try Data(contentsOf: url, options: [.mappedIfSafe])
@@ -93,6 +108,7 @@ struct ServeNotificationRuntime {
         }
         let configuration: Configuration
         do {
+            try validateConfigurationShape(data)
             configuration = try JSONDecoder().decode(Configuration.self, from: data)
         } catch {
             throw ValidationError("--notification-config is invalid JSON")
@@ -106,6 +122,35 @@ struct ServeNotificationRuntime {
             }
             let servicePins = try configuration.servicePublicKeys.map { pin in
                 try servicePin(pin)
+            }
+            let remoteCredentialPublicKeys: (any SpaceCredentialPublicKeyResolver)?
+            if let plc = configuration.credentialKeyPLC {
+                let allowedIssuers = Set(configuration.authorityDestinations.map(\.key))
+                guard !allowedIssuers.isEmpty else {
+                    throw SwanError.malformed("notification PLC requires an authority allowlist")
+                }
+                guard let origin = URL(string: plc.origin) else {
+                    throw SwanError.malformed("notification PLC origin is invalid")
+                }
+                let plcConfiguration: PLCClientConfiguration
+                if plc.laboratory {
+                    plcConfiguration = try PLCClientConfiguration.laboratory(
+                        origin: origin,
+                        allowlistedHost: plc.allowlistedHost
+                    )
+                } else {
+                    guard plc.allowlistedHost == nil else {
+                        throw SwanError.malformed("production notification PLC cannot use a host allowlist")
+                    }
+                    plcConfiguration = try PLCClientConfiguration.production(origin: origin)
+                }
+                remoteCredentialPublicKeys = try PLCSpaceCredentialPublicKeyResolver(
+                    configuration: plcConfiguration,
+                    continuityStore: continuityStore,
+                    allowedIssuers: allowedIssuers
+                )
+            } else {
+                remoteCredentialPublicKeys = nil
             }
             var authorities: [String: SwanSpaceNotificationDestination] = [:]
             var registrations: [String: SwanSpaceNotificationDestination] = [:]
@@ -146,6 +191,7 @@ struct ServeNotificationRuntime {
                 credentialPublicKeys: try PinnedSpaceCredentialPublicKeyResolver(
                     pins: credentialPins
                 ),
+                remoteCredentialPublicKeys: remoteCredentialPublicKeys,
                 delegationPublicKeys: try PinnedSpaceDelegationPublicKeyResolver(
                     pins: delegationPins
                 ),
@@ -162,6 +208,107 @@ struct ServeNotificationRuntime {
             )
         } catch {
             throw ValidationError("--notification-config contains invalid pinned notification material")
+        }
+    }
+
+    private static func validateConfigurationShape(_ data: Data) throws {
+        let value = try JSONSerialization.jsonObject(with: data)
+        guard let configuration = value as? [String: Any] else {
+            throw ConfigurationShapeError.invalid
+        }
+        try rejectUnknownKeys(
+            in: configuration,
+            allowed: [
+                "credentialPublicKeys",
+                "delegationPublicKeys",
+                "servicePublicKeys",
+                "authorityDestinations",
+                "registrationDestinations",
+                "recipientServiceBindings",
+                "managingServiceAudience",
+                "credentialKeyPLC",
+            ]
+        )
+        try validateObjectArray(
+            configuration["credentialPublicKeys"],
+            allowed: [
+                "issuer",
+                "keyID",
+                "generation",
+                "algorithm",
+                "publicKey",
+                "p256X963",
+                "secp256k1",
+            ]
+        )
+        try validateObjectArray(
+            configuration["delegationPublicKeys"],
+            allowed: [
+                "issuer",
+                "keyID",
+                "generation",
+                "algorithm",
+                "publicKey",
+                "p256X963",
+                "secp256k1",
+            ]
+        )
+        try validateObjectArray(
+            configuration["servicePublicKeys"],
+            allowed: [
+                "issuer",
+                "generation",
+                "algorithm",
+                "publicKey",
+                "p256X963",
+                "secp256k1",
+            ]
+        )
+        try validateObjectArray(
+            configuration["authorityDestinations"],
+            allowed: ["key", "endpoint", "audience", "finalPeer"]
+        )
+        try validateObjectArray(
+            configuration["registrationDestinations"],
+            allowed: ["key", "endpoint", "audience", "finalPeer"]
+        )
+        try validateObjectArray(
+            configuration["recipientServiceBindings"],
+            allowed: ["serviceIdentity", "recipientAccount"]
+        )
+        if let plc = configuration["credentialKeyPLC"] {
+            guard let plc = plc as? [String: Any] else {
+                throw ConfigurationShapeError.invalid
+            }
+            try rejectUnknownKeys(
+                in: plc,
+                allowed: ["origin", "laboratory", "allowlistedHost"]
+            )
+        }
+    }
+
+    private static func validateObjectArray(
+        _ value: Any?,
+        allowed: Set<String>
+    ) throws {
+        guard let value else { return }
+        guard let values = value as? [Any] else {
+            throw ConfigurationShapeError.invalid
+        }
+        for value in values {
+            guard let object = value as? [String: Any] else {
+                throw ConfigurationShapeError.invalid
+            }
+            try rejectUnknownKeys(in: object, allowed: allowed)
+        }
+    }
+
+    private static func rejectUnknownKeys(
+        in object: [String: Any],
+        allowed: Set<String>
+    ) throws {
+        guard Set(object.keys).isSubset(of: allowed) else {
+            throw ConfigurationShapeError.invalid
         }
     }
 
@@ -349,19 +496,11 @@ private struct ServePublicMutationDirectory: PublicRepositoryMutationDirectory {
         }
         guard let account else { return nil }
         // The store is keyed by the resolved DID, not by the caller's handle.
-        guard let resolvedStore = await directory.preopenedPublicMutationStore(did: account.did) else {
+        guard let resolvedStore = await directory
+            .generationRefreshingPublicMutationStore(did: account.did) else {
             return nil
         }
         return try PublicRepositoryMutationTarget(did: account.did, status: account.status, store: resolvedStore)
-    }
-
-    func publicBlob(cid: String) async throws -> PublicBlob? {
-        for did in try await controls.activeAccountDIDs() {
-            guard let store = await directory.preopenedPublicMutationStore(did: did),
-                  let blobs = store as? any StreamingBlobStore else { continue }
-            if let blob = try await blobs.publicBlob(cid: cid) { return blob }
-        }
-        return nil
     }
 }
 
@@ -569,6 +708,7 @@ struct ServePermissionedRuntime {
         case let (.some(local), .some(notification)):
             credentialPublicKeys = try await CompositeSpaceCredentialPublicKeyResolver(
                 local: local.credentialPublicKeys,
+                remote: notification.remoteCredentialPublicKeys,
                 pinned: notification.credentialPins
             )
             delegationPublicKeys = try await CompositeSpaceDelegationPublicKeyResolver(
@@ -584,7 +724,11 @@ struct ServePermissionedRuntime {
             delegationPublicKeys = local.delegationPublicKeys
             servicePublicKeys = local.servicePublicKeys
         case let (nil, .some(notification)):
-            credentialPublicKeys = notification.credentialPublicKeys
+            credentialPublicKeys = try await CompositeSpaceCredentialPublicKeyResolver(
+                local: UnavailableSpaceCredentialPublicKeyResolver(),
+                remote: notification.remoteCredentialPublicKeys,
+                pinned: notification.credentialPins
+            )
             delegationPublicKeys = notification.delegationPublicKeys
             servicePublicKeys = notification.servicePublicKeys
         case (nil, nil):
@@ -675,7 +819,9 @@ struct ServePermissionedRuntime {
         publicMutationRuntime: ServePublicMutationRuntime? = nil,
         localhostPARConfiguration: SwanLocalhostPARConfiguration? = nil,
         localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration? = nil,
-        authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration? = nil
+        authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration? = nil,
+        accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
+        loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct
     ) -> SwanHTTPServer {
         SwanHTTPServer(
             profile: profile,
@@ -697,7 +843,9 @@ struct ServePermissionedRuntime {
             publicRepositoryMutationDirectory: publicMutationRuntime.map { _ in
                 ServePublicMutationDirectory(directory: directory, controls: accountControlStore)
             },
-            publicRepositoryMutationSignerProvider: publicMutationRuntime?.signerProvider
+            publicRepositoryMutationSignerProvider: publicMutationRuntime?.signerProvider,
+            accountEmailXRPC: accountEmailXRPC,
+            loginClientIdentityPolicy: loginClientIdentityPolicy
         )
     }
 }
@@ -1129,7 +1277,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Run Swan's Hummingbird server")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-07-03.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-07-30.json"
 
         @Option(name: .long)
         var host: String = "127.0.0.1"
@@ -1161,6 +1309,12 @@ extension SwanCommand {
         @Option(name: .customLong("oauth-allow-metadata-ip"), help: "Explicit literal IP allowlist for laboratory OAuth client metadata/JWKS retrieval; repeat for each address")
         var oauthMetadataAllowedIPs: [String] = []
 
+        @Option(
+            name: .customLong("login-trusted-proxy-peer"),
+            help: "Exact literal IPv4/IPv6 socket peer trusted to replace X-Swan-Client-IP; repeat for each proxy"
+        )
+        var loginTrustedProxyPeers: [String] = []
+
         @Option(name: .long, help: "Reserved root for control/account databases and blobs")
         var dataDirectory: String = ".swan-data"
 
@@ -1176,13 +1330,28 @@ extension SwanCommand {
         @Flag(name: .customLong("enable-management-plc-provisioning"), help: "Enable authenticated PLC prepare/activate routes on the separate management listener")
         var enableManagementPLCProvisioning = false
 
-        @Option(name: .customLong("management-account-kek-file"), help: "Owner-only mounted account-KEK file for management PLC provisioning; SWAN_ACCOUNT_KEK is the alternative")
+        @Flag(name: .customLong("enable-management-permanent-deletion"), help: "Enable resumable PLC-tombstoning permanent deletion on the separate management listener")
+        var enableManagementPermanentDeletion = false
+
+        @Option(name: .customLong("management-deletion-plc-origin"), help: "PLC directory origin used only for permanent deletion")
+        var managementDeletionPLCOrigin: String?
+
+        @Flag(name: .customLong("management-deletion-plc-laboratory"), help: "Select explicit PLC laboratory policy for permanent deletion")
+        var managementDeletionPLCLaboratory = false
+
+        @Option(name: .customLong("management-deletion-plc-laboratory-allowlisted-host"), help: "Explicit Docker/service DNS host allowed for the permanent-deletion PLC laboratory origin")
+        var managementDeletionPLCLaboratoryAllowlistedHost: String?
+
+        @Option(name: .customLong("management-deletion-plc-reference-compatibility"), help: "Pinned permanent-deletion PLC submit compatibility; only did-plc-server-0.0.1 is supported")
+        var managementDeletionPLCReferenceCompatibility: String?
+
+        @Option(name: .customLong("management-account-kek-file"), help: "Owner-only mounted account-KEK file for management PLC provisioning/deletion; SWAN_ACCOUNT_KEK is the alternative")
         var managementAccountKEKFile: String?
 
-        @Option(name: .customLong("management-account-kek-id"), help: "Active account-KEK identifier for management PLC provisioning")
+        @Option(name: .customLong("management-account-kek-id"), help: "Active account-KEK identifier for management PLC provisioning/deletion")
         var managementAccountKEKID: String?
 
-        @Option(name: .customLong("management-account-key-directory"), help: "Protected account key-envelope directory for management PLC provisioning; defaults to <data-directory>/keys")
+        @Option(name: .customLong("management-account-key-directory"), help: "Protected account key-envelope directory for management PLC provisioning/deletion; defaults to <data-directory>/keys")
         var managementAccountKeyDirectory: String?
 
         @Option(name: .customLong("notification-config"), help: "Owner-supplied JSON with ES256/ES256K public pins, peer-pinned destinations, and receiver service-identity bindings")
@@ -1199,6 +1368,24 @@ extension SwanCommand {
 
         @Option(name: .customLong("notification-account-key-directory"), help: "Protected account key-envelope directory for notification signing; defaults to <data-directory>/keys")
         var notificationAccountKeyDirectory: String?
+
+        @Flag(name: .customLong("enable-email-recovery"), help: "Enable durable account confirmation and password-recovery XRPC with the isolated Mailpit SMTP worker")
+        var enableEmailRecovery = false
+
+        @Option(name: .customLong("email-proof-key-file"), help: "Owner-only mounted base64url 32-byte HMAC key required by --enable-email-recovery")
+        var emailProofKeyFile: String?
+
+        @Option(name: .customLong("email-sender"), help: "Canonical sender mailbox for the Mailpit account-email worker")
+        var emailSender: String?
+
+        @Option(name: .customLong("email-smtp-host"), help: "Mailpit SMTP host (default: mailpit)")
+        var emailSMTPHost: String?
+
+        @Option(name: .customLong("email-smtp-port"), help: "Mailpit SMTP port (default: 1025)")
+        var emailSMTPPort: Int?
+
+        @Option(name: .customLong("email-worker-id"), help: "Stable durable lease owner for the account-email worker")
+        var emailWorkerID: String?
 
         @Option(
             name: .customLong("managing-service-audience"),
@@ -1255,6 +1442,16 @@ extension SwanCommand {
         var spaceAccountKeyDirectory: String?
 
         func run() async throws {
+            let loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
+            do {
+                loginClientIdentityPolicy = try SwanLoginClientIdentityPolicy(
+                    trustedProxyPeerLiterals: loginTrustedProxyPeers
+                )
+            } catch {
+                throw ValidationError(
+                    "--login-trusted-proxy-peer must be a literal IPv4 or IPv6 address"
+                )
+            }
             if !enableLocalSpaceInterop {
                 guard spaceAccountKEKFile == nil,
                       spaceAccountKEKID == nil,
@@ -1320,15 +1517,50 @@ extension SwanCommand {
                     throw ValidationError("notification account key-store options are invalid")
                 }
             }
+            if !enableEmailRecovery {
+                guard emailProofKeyFile == nil,
+                      emailSender == nil,
+                      emailSMTPHost == nil,
+                      emailSMTPPort == nil,
+                      emailWorkerID == nil else {
+                    throw ValidationError(
+                        "email recovery options require --enable-email-recovery"
+                    )
+                }
+            } else {
+                guard let emailProofKeyFile,
+                      !emailProofKeyFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      let emailSender,
+                      !emailSender.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      emailSMTPHost.map({
+                          !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      }) ?? true,
+                      emailWorkerID.map({
+                          !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                      }) ?? true,
+                      emailSMTPPort.map({ (1 ... 65_535).contains($0) }) ?? true else {
+                    throw ValidationError(
+                        "--enable-email-recovery requires an owner-only --email-proof-key-file and canonical --email-sender"
+                    )
+                }
+            }
             guard !enableManagementPLCProvisioning || managementPort != nil else {
                 throw ValidationError("--enable-management-plc-provisioning requires --management-port")
             }
-            if !enableManagementPLCProvisioning {
+            guard !enableManagementPermanentDeletion || managementPort != nil else {
+                throw ValidationError("--enable-management-permanent-deletion requires --management-port")
+            }
+            let managementNeedsAccountKeyStore =
+                enableManagementPLCProvisioning
+                    || enableManagementPermanentDeletion
+            if !managementNeedsAccountKeyStore {
                 guard managementAccountKEKFile == nil,
                       managementAccountKeyDirectory == nil,
                       managementAccountKEKID == nil
                 else {
-                    throw ValidationError("management account KEK options require --enable-management-plc-provisioning")
+                    throw ValidationError(
+                        "management account key options require --enable-management-plc-provisioning or --enable-management-permanent-deletion"
+                    )
                 }
             } else {
                 guard managementAccountKEKID.map({
@@ -1340,6 +1572,31 @@ extension SwanCommand {
                 else {
                     throw ValidationError("management account key-store options are invalid")
                 }
+            }
+            if !enableManagementPermanentDeletion {
+                guard managementDeletionPLCOrigin == nil,
+                      !managementDeletionPLCLaboratory,
+                      managementDeletionPLCLaboratoryAllowlistedHost == nil,
+                      managementDeletionPLCReferenceCompatibility == nil else {
+                    throw ValidationError(
+                        "management deletion PLC options require --enable-management-permanent-deletion"
+                    )
+                }
+            }
+            let managementDeletionPLCConfiguration:
+                PLCClientConfiguration?
+            if enableManagementPermanentDeletion {
+                managementDeletionPLCConfiguration =
+                    try makePermanentDeletionPLCConfiguration(
+                        origin: managementDeletionPLCOrigin,
+                        laboratory: managementDeletionPLCLaboratory,
+                        laboratoryAllowlistedHost:
+                            managementDeletionPLCLaboratoryAllowlistedHost,
+                        referenceCompatibility:
+                            managementDeletionPLCReferenceCompatibility
+                    )
+            } else {
+                managementDeletionPLCConfiguration = nil
             }
             let loadedProfile = try ProtocolProfile.load(from: URL(fileURLWithPath: profile))
             let baseURL = try publicURL.map { value in
@@ -1358,6 +1615,15 @@ extension SwanCommand {
             var preopenedAccountDirectory: SQLitePreMigratedAccountDirectory?
             var preopenedManagementProvisioning: SwanManagementPLCProvisioningRuntime?
             do {
+                if !enableManagementPermanentDeletion {
+                    let pending = try await controlDatabase
+                        .pendingDeletionJobs(afterDID: nil, limit: 1)
+                    guard pending.isEmpty else {
+                        throw ValidationError(
+                            "pending permanent deletion requires --enable-management-permanent-deletion"
+                        )
+                    }
+                }
                 // Permissioned lookup never creates or migrates an account
                 // database during a request. Build the complete active set
                 // before the public listener exists; failures keep the
@@ -1439,7 +1705,11 @@ extension SwanCommand {
                         let accounts = DurableAccountDirectory(
                             store: controlDatabase,
                             passwordHasher: passwordHasher,
-                            verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher)
+                            verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher),
+                            loginAdmissionService: AccountLoginAdmissionService(
+                                store: controlDatabase,
+                                key: try AccountLoginAdmissionKey(serverKey)
+                            )
                         )
                         localhostOAuthConfiguration = try SwanLocalhostOAuthConfiguration(
                             issuer: baseURL,
@@ -1514,7 +1784,11 @@ extension SwanCommand {
                         let accounts = DurableAccountDirectory(
                             store: controlDatabase,
                             passwordHasher: passwordHasher,
-                            verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher)
+                            verificationExecutor: try Argon2idVerificationExecutor(hasher: passwordHasher),
+                            loginAdmissionService: AccountLoginAdmissionService(
+                                store: controlDatabase,
+                                key: try AccountLoginAdmissionKey(serverKey)
+                            )
                         )
                         authorizationServerConfiguration = try SwanOAuthAuthorizationServerConfiguration(
                             issuer: baseURL,
@@ -1555,7 +1829,8 @@ extension SwanCommand {
                 let notificationRuntime: ServeNotificationRuntime?
                 if let notificationConfig {
                     notificationRuntime = try ServeNotificationRuntime.load(
-                        from: URL(fileURLWithPath: notificationConfig)
+                        from: URL(fileURLWithPath: notificationConfig),
+                        continuityStore: controlDatabase
                     )
                 } else {
                     notificationRuntime = nil
@@ -1652,8 +1927,70 @@ extension SwanCommand {
                 } else {
                     notificationRecoveryService = nil
                 }
-                let managementPLCProvisioning: SwanManagementPLCProvisioningRuntime?
-                if enableManagementPLCProvisioning {
+                let accountEmailXRPC: SwanAccountEmailXRPCServer?
+                let emailRecoveryService: SwanAccountEmailRecoveryService?
+                if enableEmailRecovery {
+                    do {
+                        let proofKey = try AccountEmailProofKey(
+                            AccountProvisioningSecrets.requiredMounted32ByteSecret(
+                                secretFile: URL(fileURLWithPath: emailProofKeyFile!)
+                            )
+                        )
+                        let sender: AccountEmailAddress
+                        do {
+                            sender = try AccountEmailAddress(emailSender!)
+                        } catch {
+                            throw ValidationError("--email-sender must be a canonical mailbox")
+                        }
+                        let delivery = try MailpitSMTPDelivery(
+                            host: emailSMTPHost ?? "mailpit",
+                            port: emailSMTPPort ?? 1025,
+                            sender: sender
+                        )
+                        let passwordHasher = try LibsodiumArgon2idHasher()
+                        let recovery = try AccountEmailRecoveryService(
+                            store: controlDatabase,
+                            delivery: delivery,
+                            proofCodec: AccountEmailProofCodec(key: proofKey),
+                            hashExecutor: try Argon2idHashExecutor(
+                                hasher: passwordHasher
+                            )
+                        )
+                        let authorizer = try SwanOAuthResourceAuthorizer(
+                            publicURL: baseURL,
+                            runtime: oauthRuntime,
+                            accountControlStore: controlDatabase
+                        )
+                        accountEmailXRPC = SwanAccountEmailXRPCServer(
+                            authorizer: authorizer,
+                            recovery: SwanAccountEmailRecoveryXRPCAdapter(
+                                service: recovery,
+                                store: controlDatabase
+                            ),
+                            rateLimiter: SwanDurableAccountEmailXRPCRateLimiter(
+                                store: controlDatabase,
+                                proofCodec: AccountEmailProofCodec(key: proofKey)
+                            ),
+                            loginClientIdentityPolicy: loginClientIdentityPolicy
+                        )
+                        emailRecoveryService = try SwanAccountEmailRecoveryService(
+                            recovery: recovery,
+                            delivery: delivery,
+                            workerID: emailWorkerID ?? "swan-email-worker"
+                        )
+                    } catch let error as ValidationError {
+                        throw error
+                    } catch {
+                        throw ValidationError(
+                            "account email recovery runtime is unavailable"
+                        )
+                    }
+                } else {
+                    accountEmailXRPC = nil
+                    emailRecoveryService = nil
+                }
+                let managementKeyStore: FileAccountKeyStore?
+                if managementNeedsAccountKeyStore {
                     do {
                         let keyConfiguration = try AccountProvisioningSecrets.accountKeyConfiguration(
                             activeKeyID: managementAccountKEKID ?? "primary",
@@ -1662,14 +1999,31 @@ extension SwanCommand {
                         let keyDirectory = managementAccountKeyDirectory.map {
                             URL(fileURLWithPath: $0)
                         } ?? dataURL.appending(path: "keys")
-                        let keyStore = try FileAccountKeyStore(
+                        managementKeyStore = try FileAccountKeyStore(
                             root: keyDirectory,
                             configuration: keyConfiguration
                         )
+                    } catch {
+                        throw ValidationError(
+                            "management account key store is unavailable"
+                        )
+                    }
+                } else {
+                    managementKeyStore = nil
+                }
+                let managementPLCProvisioning:
+                    SwanManagementPLCProvisioningRuntime?
+                if enableManagementPLCProvisioning {
+                    do {
+                        guard let managementKeyStore else {
+                            throw SwanError.unavailable(
+                                "management account key store is unavailable"
+                            )
+                        }
                         managementPLCProvisioning = try .init(
                             controlDatabase: controlDatabase,
                             dataDirectory: dataURL,
-                            keyStore: keyStore,
+                            keyStore: managementKeyStore,
                             liveAccountDirectory: directory
                         )
                         preopenedManagementProvisioning = managementPLCProvisioning
@@ -1678,6 +2032,42 @@ extension SwanCommand {
                     }
                 } else {
                     managementPLCProvisioning = nil
+                }
+                let permanentDeletionRuntime:
+                    ServeAccountPermanentDeletionRuntime?
+                if enableManagementPermanentDeletion {
+                    do {
+                        guard let managementKeyStore,
+                              let managementDeletionPLCConfiguration else {
+                            throw SwanError.unavailable(
+                                "management permanent deletion runtime is unavailable"
+                            )
+                        }
+                        let runtime = try ServeAccountPermanentDeletionRuntime(
+                            controlStore: controlDatabase,
+                            dataDirectory: dataURL,
+                            keyStore: managementKeyStore,
+                            plcConfiguration:
+                                managementDeletionPLCConfiguration,
+                            liveDirectory: directory
+                        )
+                        // This is deliberately completed before either
+                        // application is built. A pending external side effect
+                        // can therefore fail startup, but can never coexist
+                        // with a newly accepting public listener.
+                        try await runtime.resumePendingJobs(
+                            controlStore: controlDatabase
+                        )
+                        permanentDeletionRuntime = runtime
+                    } catch let error as ValidationError {
+                        throw error
+                    } catch {
+                        throw ValidationError(
+                            "management permanent deletion runtime is unavailable"
+                        )
+                    }
+                } else {
+                    permanentDeletionRuntime = nil
                 }
                 let server = permissionedRuntime.makeServer(
                     profile: loadedProfile,
@@ -1689,7 +2079,9 @@ extension SwanCommand {
                     publicMutationRuntime: publicMutationRuntime,
                     localhostPARConfiguration: localhostPARConfiguration,
                     localhostOAuthConfiguration: localhostOAuthConfiguration,
-                    authorizationServerConfiguration: authorizationServerConfiguration
+                    authorizationServerConfiguration: authorizationServerConfiguration,
+                    accountEmailXRPC: accountEmailXRPC,
+                    loginClientIdentityPolicy: loginClientIdentityPolicy
                 )
                 guard server.authenticatedGetSpace != nil else {
                     throw ValidationError(
@@ -1727,7 +2119,9 @@ extension SwanCommand {
                         configuration: managementConfiguration,
                         controlStore: controlDatabase,
                         operatorSecretVerifier: verifier,
-                        plcProvisioning: managementPLCProvisioning
+                        plcProvisioning: managementPLCProvisioning,
+                        permanentDeletionCoordinator:
+                            permanentDeletionRuntime?.coordinator
                     )
                     managementApplication = managementServer.buildApplication(
                         logger: Logger(label: "swan.management")
@@ -1746,6 +2140,10 @@ extension SwanCommand {
                 if let notificationRecoveryService {
                     services.append(notificationRecoveryService)
                     logger.info("space notification recovery delivery enabled with peer-pinned NIO transport")
+                }
+                if let emailRecoveryService {
+                    services.append(emailRecoveryService)
+                    logger.info("account email recovery delivery enabled with Mailpit SMTP")
                 }
                 if let managementApplication {
                     services.append(managementApplication)
@@ -1802,7 +2200,7 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(abstract: "Verify a pinned Swan artifact")
 
         @Option(name: .long, help: "Pinned protocol profile JSON")
-        var profile: String = "Profiles/permissioned-data-0016-2026-07-03.json"
+        var profile: String = "Profiles/permissioned-data-0016-2026-07-30.json"
 
         @Option(name: .long, help: "Swan package root containing generated wire sources")
         var sourceRoot: String?
@@ -2583,21 +2981,117 @@ extension SwanCommand {
             @Option(name: .long, help: "Optional sha256:<64 lowercase hex> portable-export manifest reference")
             var exportReference: String?
 
+            @Option(name: .long, help: "PLC directory origin")
+            var plcOrigin: String?
+
+            @Flag(name: .long, help: "Select explicit literal-loopback HTTP PLC laboratory policy")
+            var plcLaboratory = false
+
+            @Option(
+                name: .customLong("plc-laboratory-allowlisted-host"),
+                help: "Explicit Docker/service DNS host allowed for the PLC laboratory origin"
+            )
+            var plcLaboratoryAllowlistedHost: String?
+
+            @Option(name: .long, help: "Pinned PLC submit compatibility; only did-plc-server-0.0.1 is supported")
+            var plcReferenceCompatibility: String?
+
+            @Option(name: .long, help: "Owner-only mounted account-KEK file (URL-safe base64); SWAN_ACCOUNT_KEK is the alternative")
+            var accountKEKFile: String?
+
+            @Option(name: .customLong("account-kek-id"), help: "Active account-KEK identifier used by encrypted envelopes")
+            var accountKEKID: String = "primary"
+
+            @Option(name: .long, help: "Protected key-envelope directory; defaults to <data-directory>/keys")
+            var accountKeyDirectory: String?
+
             func run() async throws {
+                guard !dataDirectory.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ).isEmpty else {
+                    throw ValidationError("--data-directory must not be empty")
+                }
+                guard !accountKEKID.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ).isEmpty,
+                      accountKeyDirectory.map({
+                          !$0.trimmingCharacters(
+                              in: .whitespacesAndNewlines
+                          ).isEmpty
+                      }) ?? true else {
+                    throw ValidationError(
+                        "account deletion key-store options are invalid"
+                    )
+                }
+                let plcConfiguration =
+                    try makePermanentDeletionPLCConfiguration(
+                        origin: plcOrigin,
+                        laboratory: plcLaboratory,
+                        laboratoryAllowlistedHost:
+                            plcLaboratoryAllowlistedHost,
+                        referenceCompatibility:
+                            plcReferenceCompatibility
+                    )
+                // Operator authorization precedes every mounted-secret read,
+                // encrypted-key-store construction, and writable database
+                // open.
                 let authorization = try AccountCommandSupport.authorization(
                     secretFilePath: operatorSecretFile
                 )
-                let view = try await AccountCommandSupport.withService(
-                    dataDirectory: dataDirectory
-                ) { service in
-                    try await service.delete(
+                let keyConfiguration: AccountKeyEncryptionConfiguration
+                do {
+                    keyConfiguration = try AccountProvisioningSecrets
+                        .accountKeyConfiguration(
+                            activeKeyID: accountKEKID,
+                            secretFile: accountKEKFile.map {
+                                URL(fileURLWithPath: $0)
+                            }
+                        )
+                } catch {
+                    throw AccountCommandSupport.validationError(for: error)
+                }
+                let dataURL = URL(fileURLWithPath: dataDirectory)
+                let keyURL = accountKeyDirectory.map {
+                    URL(fileURLWithPath: $0)
+                } ?? dataURL.appending(path: "keys")
+                let control: SQLiteControlDatabase
+                do {
+                    control = try await SQLiteControlDatabase(
+                        dataDirectory: dataURL
+                    )
+                } catch {
+                    throw ValidationError(
+                        "unable to open Swan control database"
+                    )
+                }
+                do {
+                    let keyStore = try FileAccountKeyStore(
+                        root: keyURL,
+                        configuration: keyConfiguration
+                    )
+                    let runtime = try ServeAccountPermanentDeletionRuntime(
+                        controlStore: control,
+                        dataDirectory: dataURL,
+                        keyStore: keyStore,
+                        plcConfiguration: plcConfiguration,
+                        liveDirectory: nil
+                    )
+                    let service = AccountOperatorService(
+                        store: control,
+                        permanentDeletionCoordinator: runtime.coordinator
+                    )
+                    let view = try await service.delete(
                         did: did,
                         tombstoneReason: tombstoneReason,
                         exportReference: exportReference,
                         authorization: authorization
                     )
+                    try await control.close()
+                    try AccountCommandSupport.write(view)
+                } catch {
+                    try? await control.close()
+                    throw AccountCommandSupport.validationError(for: error)
                 }
-                try AccountCommandSupport.write(view)
             }
         }
     }
@@ -3117,9 +3611,15 @@ extension SwanCommand {
             )
             var permissionedGetRepo = false
 
+            @Flag(
+                name: .customLong("permissioned-stateful-matrix"),
+                help: "Require create/read CID convergence plus verified listRepoOps revision/commitment and full-CAR recovery evidence"
+            )
+            var permissionedStatefulMatrix = false
+
             @Option(
                 name: .customLong("permissioned-commit-key-env"),
-                help: "Environment variable containing the repository author's base64url secp256k1 public key"
+                help: "Environment variable containing ES256:<base64url-x963> or ES256K:<base64url> repository-author public key (untagged is legacy ES256K)"
             )
             var permissionedCommitKeyEnvironment = "SWAN_LAB_PERMISSIONED_COMMIT_KEY"
 
@@ -3161,7 +3661,7 @@ extension SwanCommand {
                     environment: "SWAN_LAB_CONSUMER_URL",
                     fallback: "https://pds.test"
                 )
-                let permissionedCommitKey = try (permissionedListOps || permissionedGetRepo)
+                let permissionedCommitKey = try (permissionedListOps || permissionedGetRepo || permissionedStatefulMatrix)
                     ? LabLiveSupport.permissionedCommitVerificationKey(environment: permissionedCommitKeyEnvironment)
                     : nil
                 let producer = try await LabLiveSupport.host(
@@ -3187,7 +3687,8 @@ extension SwanCommand {
                     clientID: consumerClientID,
                     redirectURI: consumerRedirectURI,
                     scopes: scope,
-                    timeout: requestTimeoutSeconds
+                    timeout: requestTimeoutSeconds,
+                    permissionedCommitVerificationKey: permissionedCommitKey
                 )
                 let body = try LabLiveSupport.body(at: URL(fileURLWithPath: bodyFile))
                 let blobBody = try blobFile.map {
@@ -3245,21 +3746,37 @@ extension SwanCommand {
                     default:
                         throw ValidationError("--permissioned-read-host must be authority or member")
                     }
-                    let result = await LiveInteropRunner.permissionedCreateAndRead(
-                        scenario: normalizedScenario,
-                        member: producer,
-                        authority: consumer,
-                        broker: broker,
-                        space: parsedSpace,
-                        createBody: body,
-                        readQuery: query,
-                        readHost: readHost,
-                        verifyIncrementalSync: permissionedListOps,
-                        includeIncrementalValues: !permissionedListOpsExcludeValues,
-                        verifyFullCAR: permissionedGetRepo
-                    )
-                    artifact = result
-                    status = result.status
+                    if permissionedStatefulMatrix {
+                        let result = await StatefulInteropMatrixRunner.execute(
+                            scenario: normalizedScenario,
+                            member: producer,
+                            authority: consumer,
+                            broker: broker,
+                            space: parsedSpace,
+                            createBody: body,
+                            readQuery: query,
+                            readHost: readHost,
+                            includeIncrementalValues: !permissionedListOpsExcludeValues
+                        )
+                        artifact = result
+                        status = result.status
+                    } else {
+                        let result = await LiveInteropRunner.permissionedCreateAndRead(
+                            scenario: normalizedScenario,
+                            member: producer,
+                            authority: consumer,
+                            broker: broker,
+                            space: parsedSpace,
+                            createBody: body,
+                            readQuery: query,
+                            readHost: readHost,
+                            verifyIncrementalSync: permissionedListOps,
+                            includeIncrementalValues: !permissionedListOpsExcludeValues,
+                            verifyFullCAR: permissionedGetRepo
+                        )
+                        artifact = result
+                        status = result.status
+                    }
                 }
                 let outputURL = URL(fileURLWithPath: output)
                 try FileManager.default.createDirectory(
@@ -3523,11 +4040,29 @@ private enum LabLiveSupport {
     static func permissionedCommitVerificationKey(
         environment: String
     ) throws -> PermissionedDataJWTVerificationKey {
-        let encoded = try environmentValue(environment, label: "permissioned commit public key")
-        guard let data = Data(base64URLEncoded: encoded) else {
+        let configured = try environmentValue(environment, label: "permissioned commit public key")
+        let pieces = configured.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+        let algorithm: String
+        let encoded: String
+        switch pieces.count {
+        case 1:
+            algorithm = "ES256K"
+            encoded = String(pieces[0])
+        case 2:
+            algorithm = String(pieces[0]).uppercased()
+            encoded = String(pieces[1])
+        default:
+            throw ValidationError("permissioned commit public key is invalid")
+        }
+        guard algorithm == "ES256" || algorithm == "ES256K",
+              let data = Data(base64URLEncoded: encoded),
+              data.base64URLEncodedString() == encoded else {
             throw ValidationError("permissioned commit public key is not canonical base64url")
         }
         do {
+            if algorithm == "ES256" {
+                return .p256(try P256.Signing.PublicKey(x963Representation: data))
+            }
             return try PermissionedDataJWTVerificationKey(secp256k1PublicKey: data)
         } catch {
             throw ValidationError("permissioned commit public key is invalid")
@@ -3606,7 +4141,10 @@ private enum LabLiveSupport {
         )
         guard (200 ... 299).contains(create.status) ||
             responseError(create) == "SpaceAlreadyExists" else {
-            throw ValidationError("permissioned space creation failed")
+            let error = responseError(create) ?? "unknown"
+            throw ValidationError(
+                "permissioned space creation failed (status=\(create.status), error=\(error))"
+            )
         }
 
         let addBody = try JSONSerialization.data(
@@ -3619,7 +4157,10 @@ private enum LabLiveSupport {
             body: addBody
         )
         guard (200 ... 299).contains(add.status) else {
-            throw ValidationError("permissioned space membership failed")
+            let error = responseError(add) ?? "unknown"
+            throw ValidationError(
+                "permissioned space membership failed (status=\(add.status), error=\(error))"
+            )
         }
     }
 
@@ -3737,6 +4278,56 @@ private struct RotatedPLCAccountView: Encodable {
         generation = result.generation
         operationCID = try result.operation.cid.string
         previousOperationCID = result.operation.prev
+    }
+}
+
+private func makePermanentDeletionPLCConfiguration(
+    origin: String?,
+    laboratory: Bool,
+    laboratoryAllowlistedHost: String?,
+    referenceCompatibility: String?
+) throws -> PLCClientConfiguration {
+    let rawOrigin =
+        origin ?? PLCClientConfiguration.defaultProductionOrigin.absoluteString
+    guard let directoryOrigin = URL(string: rawOrigin) else {
+        throw ValidationError("permanent-deletion PLC origin must be a URL")
+    }
+    let responsePolicy: PLCSubmitSuccessResponsePolicy
+    switch referenceCompatibility {
+    case nil:
+        responsePolicy = .strict
+    case PLCSubmitSuccessResponsePolicy.didPLCServer001.rawValue:
+        guard laboratory else {
+            throw ValidationError(
+                "permanent-deletion PLC reference compatibility requires laboratory mode"
+            )
+        }
+        responsePolicy = .didPLCServer001
+    case .some:
+        throw ValidationError(
+            "permanent-deletion PLC reference compatibility is unsupported"
+        )
+    }
+    do {
+        if laboratory {
+            return try .laboratory(
+                origin: directoryOrigin,
+                submitSuccessResponsePolicy: responsePolicy,
+                allowlistedHost: laboratoryAllowlistedHost
+            )
+        }
+        guard laboratoryAllowlistedHost == nil else {
+            throw ValidationError(
+                "permanent-deletion PLC laboratory allowlist requires laboratory mode"
+            )
+        }
+        return try .production(origin: directoryOrigin)
+    } catch let error as ValidationError {
+        throw error
+    } catch {
+        throw ValidationError(
+            "permanent-deletion PLC configuration is invalid"
+        )
     }
 }
 

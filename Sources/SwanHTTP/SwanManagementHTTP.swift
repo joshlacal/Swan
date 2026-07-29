@@ -85,10 +85,16 @@ public struct SwanManagementHTTPServer: Sendable {
         configuration: SwanManagementHTTPConfiguration,
         controlStore: any AccountControlStore,
         operatorSecretVerifier: OperatorSecretVerifier,
-        plcProvisioning: (any SwanManagementPLCProvisioning)? = nil
+        plcProvisioning: (any SwanManagementPLCProvisioning)? = nil,
+        permanentDeletionCoordinator:
+            (any AccountPermanentDeletionCoordinating)? = nil
     ) {
         self.configuration = configuration
-        accounts = AccountOperatorService(store: controlStore)
+        accounts = AccountOperatorService(
+            store: controlStore,
+            permanentDeletionCoordinator:
+                permanentDeletionCoordinator
+        )
         self.operatorSecretVerifier = operatorSecretVerifier
         self.plcProvisioning = plcProvisioning
     }
@@ -177,15 +183,15 @@ public struct SwanManagementHTTPServer: Sendable {
                 guard authorize(request: request, context: context, verifier: verifier) != nil else {
                     return managementError(.unauthorized)
                 }
-                do {
-                    let requestBody: ManagementPLCActivateRequest =
-                        try await decodeManagementJSON(from: request)
-                    let input = try requestBody.validatedInput()
-                    let result = try await plcProvisioning.activate(input)
-                    return managementJSON(.ok, result)
-                } catch {
-                    return managementError(status(for: error))
-                }
+                    do {
+                        let requestBody: ManagementPLCActivateRequest =
+                            try await decodeManagementJSON(from: request)
+                        let input = try requestBody.validatedInput()
+                        let result = try await plcProvisioning.activate(input)
+                        return managementJSON(.ok, result)
+                    } catch {
+                        return managementError(status(for: error))
+                    }
             }
         } else {
             // Keep disabled provisioning indistinguishable from any other
@@ -309,19 +315,24 @@ private struct ManagementPLCActivateRequest: Decodable {
     let password: String
     let plcOrigin: String?
     let plcLaboratory: Bool
+    let plcReferenceCompatibility: String?
     let handleLaboratoryOrigin: String?
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: ManagementCodingKey.self)
         try validateKeys(container, allowed: [
             "requestId", "password", "plcOrigin", "plcLaboratory",
-            "handleLaboratoryOrigin",
+            "plcReferenceCompatibility", "handleLaboratoryOrigin",
         ])
         requestID = try container.decode(String.self, forKey: .init("requestId"))
         password = try container.decode(String.self, forKey: .init("password"))
         plcOrigin = try container.decodeIfPresent(String.self, forKey: .init("plcOrigin"))
         plcLaboratory = try container.decodeIfPresent(Bool.self, forKey: .init("plcLaboratory"))
             ?? false
+        plcReferenceCompatibility = try container.decodeIfPresent(
+            String.self,
+            forKey: .init("plcReferenceCompatibility")
+        )
         handleLaboratoryOrigin = try container.decodeIfPresent(
             String.self,
             forKey: .init("handleLaboratoryOrigin")
@@ -337,8 +348,8 @@ private struct ManagementPLCActivateRequest: Decodable {
         let plcConfiguration = try validatedPLCConfiguration(
             origin: plcOrigin,
             laboratory: plcLaboratory,
-            compatibility: nil,
-            allowsCompatibility: false
+            compatibility: plcReferenceCompatibility,
+            allowsCompatibility: true
         )
         let handlePolicy: ATHandleResolutionPolicy
         if plcLaboratory {
@@ -600,6 +611,9 @@ private func status(for error: any Error) -> HTTPResponse.Status {
         return .badRequest
     case let error as AccountOperatorError where error == .unknownAccount:
         return .notFound
+    case let error as AccountOperatorError
+        where error == .permanentDeletionUnavailable:
+        return .serviceUnavailable
     case let error as PLCAccountPreparationError:
         return error == .unavailable ? .serviceUnavailable : .badRequest
     case let error as PLCAccountActivationError:

@@ -166,9 +166,13 @@ final class ManagementPLCProvisioningRuntimeHTTPTests: XCTestCase {
                         headers: fixture.authorizationHeaders,
                         body: ByteBuffer(data: fixture.activateBody)
                     ) { response in
-                        XCTAssertEqual(response.status, .ok)
-                        XCTAssertEqual(response.headers[.cacheControl], "no-store")
                         let body = Data(buffer: response.body)
+                        XCTAssertEqual(
+                            response.status,
+                            .ok,
+                            String(data: body, encoding: .utf8) ?? "<non-UTF8 body>"
+                        )
+                        XCTAssertEqual(response.headers[.cacheControl], "no-store")
                         let object = try JSONDecoder().decode(
                             ManagementActivatedResponse.self,
                             from: body
@@ -435,7 +439,8 @@ private final class ConcreteManagementFixture: @unchecked Sendable {
         control = try await SQLiteControlDatabase(dataDirectory: data)
         liveDirectory = try await SQLitePreMigratedAccountDirectory.bootstrap(
             dataDirectory: data,
-            controlStore: control
+            controlStore: control,
+            publicIdentityVerifier: SwanPublicPLCGenesisVerifier()
         )
         let keyStore = try FileAccountKeyStore(
             root: keyRoot,
@@ -471,6 +476,7 @@ private final class ConcreteManagementFixture: @unchecked Sendable {
             "password": password,
             "plcOrigin": "http://127.0.0.1:\(plc.port)",
             "plcLaboratory": true,
+            "plcReferenceCompatibility": "did-plc-server-0.0.1",
             "handleLaboratoryOrigin": "http://127.0.0.1:\(plc.port)",
         ], options: [.sortedKeys])
     }

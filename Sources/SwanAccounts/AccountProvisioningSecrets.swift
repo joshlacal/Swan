@@ -39,6 +39,15 @@ public enum AccountProvisioningSecrets {
         activeKeyID: String = "primary",
         secretFile: URL
     ) throws -> AccountKeyEncryptionConfiguration {
+        let key = try requiredMounted32ByteSecret(secretFile: secretFile)
+        return try AccountKeyEncryptionConfiguration(activeKeyID: activeKeyID, activeKey: key)
+    }
+
+    /// Reads a canonical, unpadded base64url-encoded 32-byte secret from an
+    /// owner-only mounted file.  This is shared by other process secrets that
+    /// use the same deployment-safe file format (for example the account
+    /// recovery proof key) without exposing the descriptor-reading primitive.
+    public static func requiredMounted32ByteSecret(secretFile: URL) throws -> Data {
         let encoded = try readOwnerOnlyRegularFile(
             secretFile,
             maximumPayloadBytes: maximumEncodedKEKBytes
@@ -55,9 +64,9 @@ public enum AccountProvisioningSecrets {
               let key = decodeBase64URL(text),
               key.count == 32,
               encodeBase64URL(key) == text else {
-            throw SwanError.malformed("account KEK is invalid")
+            throw SwanError.malformed("mounted 32-byte secret is invalid")
         }
-        return try AccountKeyEncryptionConfiguration(activeKeyID: activeKeyID, activeKey: key)
+        return key
     }
 
     /// Reads one account password. A terminal LF or CRLF is accepted for

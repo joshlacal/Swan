@@ -477,7 +477,8 @@ private struct PreopenedRecoveryFixture {
                 control: control,
                 directory: try await .bootstrap(
                     dataDirectory: root,
-                    controlStore: control
+                    controlStore: control,
+                    publicIdentityVerifier: nil
                 )
             )
         } catch {

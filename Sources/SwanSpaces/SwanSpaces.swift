@@ -4,6 +4,12 @@ import Foundation
 import Petrel
 import SwanCore
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 public enum Blake3 {
     /// Produces a BLAKE3 XOF output of an explicit size using only the vendored
     /// portable reference implementation.
@@ -580,30 +586,222 @@ public struct VerifiedSpaceCARRecovery: Sendable, Equatable {
     }
 }
 
+/// Immutable producer-side admission for a proposal-0016 full recovery.
+/// Swan reserves the consumer's entire 64 KiB signed-commit allowance even
+/// though ordinary P-256 commits are much smaller, so storage can reject an
+/// oversized suffix before a reader-specific envelope exists.
+public enum SpaceCARProductionLimits {
+    public static let maximumRecordCount =
+        SpaceCARRecoveryLimits.absoluteMaximumIndexEntries
+    public static let maximumRecordBytes =
+        SpaceCARRecoveryLimits.absoluteMaximumRecordBytes
+    public static let maximumLogicalMetadataBytes = 64 * 1_024 * 1_024
+    /// Conservative process admission includes the final CAR allowance plus
+    /// two metadata allowances: one for the encoded index during handoff and
+    /// one for the connection-local SQLite projection/B-tree overhead that
+    /// remains live while the body spool is assembled.
+    public static let maximumWorkingSpoolBytes =
+        SpaceCARRecoveryLimits.absoluteMaximumCARBytes
+            + 2 * maximumLogicalMetadataBytes
+
+    /// One-byte length + canonical 99-byte CAR header + a three-byte frame
+    /// length + 36-byte CID + the consumer's 64 KiB commit-body allowance.
+    public static let maximumRecoveryPrefixBytes =
+        1 + 99 + 3 + 36
+            + SpaceCARRecoveryLimits.absoluteMaximumCommitBytes
+    public static let maximumBodyBytes =
+        SpaceCARRecoveryLimits.absoluteMaximumCARBytes
+            - maximumRecoveryPrefixBytes
+
+    public static func limitExceeded() -> SwanError {
+        SwanError.unavailable("permissioned CAR exceeds production limits")
+    }
+}
+
+/// Process-wide and per-account reservation for private full-recovery spools.
+/// Each request reserves the complete consumer CAR allowance plus its bounded
+/// producer metadata working set before a path is created, bounding both disk
+/// amplification and slow-reader concurrency.
+public final class SpaceCARSpoolAdmission: @unchecked Sendable {
+    public struct Snapshot: Sendable, Equatable {
+        public let reservedBytes: Int
+        public let activeLeases: Int
+
+        public init(reservedBytes: Int, activeLeases: Int) {
+            self.reservedBytes = reservedBytes
+            self.activeLeases = activeLeases
+        }
+    }
+
+    private let maximumGlobalBytes: Int
+    private let maximumPerAccountBytes: Int
+    private let lock = NSLock()
+    private var leases: [UUID: (account: String, bytes: Int)] = [:]
+    private var reservedByAccount: [String: Int] = [:]
+
+    public init(
+        maximumGlobalBytes: Int = 1_024 * 1_024 * 1_024,
+        maximumPerAccountBytes: Int = 512 * 1_024 * 1_024
+    ) throws {
+        guard maximumGlobalBytes > 0,
+              maximumPerAccountBytes > 0,
+              maximumPerAccountBytes <= maximumGlobalBytes
+        else {
+            throw SpaceCARProductionLimits.limitExceeded()
+        }
+        self.maximumGlobalBytes = maximumGlobalBytes
+        self.maximumPerAccountBytes = maximumPerAccountBytes
+    }
+
+    public func reserve(
+        accountDID: String,
+        maximumBytes: Int
+    ) -> SpaceCARSpoolLease? {
+        guard SpaceURI.isValidDID(accountDID), maximumBytes > 0 else {
+            return nil
+        }
+        return lock.withLock {
+            let global = leases.values.reduce(0) { partial, lease in
+                let (next, overflow) = partial.addingReportingOverflow(
+                    lease.bytes
+                )
+                return overflow ? Int.max : next
+            }
+            let account = reservedByAccount[accountDID, default: 0]
+            guard global <= maximumGlobalBytes,
+                  account <= maximumPerAccountBytes,
+                  maximumBytes <= maximumGlobalBytes - global,
+                  maximumBytes <= maximumPerAccountBytes - account
+            else {
+                return nil
+            }
+            let id = UUID()
+            leases[id] = (accountDID, maximumBytes)
+            reservedByAccount[accountDID] = account + maximumBytes
+            return SpaceCARSpoolLease(admission: self, id: id)
+        }
+    }
+
+    public var snapshot: Snapshot {
+        lock.withLock {
+            Snapshot(
+                reservedBytes: leases.values.reduce(0) { partial, lease in
+                    partial + lease.bytes
+                },
+                activeLeases: leases.count
+            )
+        }
+    }
+
+    fileprivate func release(_ id: UUID) {
+        lock.withLock {
+            guard let lease = leases.removeValue(forKey: id) else { return }
+            let remaining =
+                reservedByAccount[lease.account, default: 0] - lease.bytes
+            if remaining == 0 {
+                reservedByAccount.removeValue(forKey: lease.account)
+            } else {
+                reservedByAccount[lease.account] = remaining
+            }
+        }
+    }
+}
+
+public final class SpaceCARSpoolLease: @unchecked Sendable {
+    private weak var admission: SpaceCARSpoolAdmission?
+    private let id: UUID
+    private let lock = NSLock()
+    private var released = false
+
+    fileprivate init(admission: SpaceCARSpoolAdmission, id: UUID) {
+        self.admission = admission
+        self.id = id
+    }
+
+    deinit { release() }
+
+    public func release() {
+        let target = lock.withLock {
+            guard !released else {
+                return nil as SpaceCARSpoolAdmission?
+            }
+            released = true
+            return admission
+        }
+        target?.release(id)
+    }
+}
+
 /// An owner-only, private spool containing the index and record-block suffix
 /// of a full-recovery CAR.  It deliberately never contains the request's
 /// reader-specific commit envelope: fresh IKM, the context signature, and the
 /// deniable binding stay in the small HTTP response prefix until the response
 /// is written.
 ///
-/// `SwanSQLite` is the sole producer. It creates the file below a
-/// descriptor-validated owner-only data directory after validating an
-/// immutable SQLite snapshot. Consumers cannot obtain the path; they can only
-/// drain bounded chunks, which also removes the file on normal completion,
-/// write failure, or task cancellation.
+/// `SwanSQLite` is the sole production source. It adopts an owner-only file
+/// descriptor after unlinking its directory entry, so consumers cannot obtain
+/// or replace a path and a crash cannot orphan private bytes. The descriptor is
+/// single-use and drains only through bounded chunks on success, write failure,
+/// or task cancellation.
 public final class SpaceCARBodySpool: @unchecked Sendable {
     /// A deliberately small maximum for a single Hummingbird body write. It
     /// bounds response-side buffering independently of the CAR size.
     public static let maximumChunkBytes = 64 * 1_024
 
     public let indexCID: CID
-    private let bodyURL: URL
+    /// Exact index-plus-record suffix bytes. HTTP can combine this with its
+    /// freshly created prefix before constructing response headers.
+    public let bodyByteCount: Int
+    private let adoptedHandle: FileHandle?
+    private let bodyURL: URL?
+    private let lease: SpaceCARSpoolLease?
     private let cleanupLock = NSLock()
-    private var cleanedUp = false
+    private enum State {
+        case available
+        case streaming
+        case cleaned
+    }
+    private var state: State = .available
 
-    public init(indexCID: CID, bodyURL: URL) {
+    /// Compatibility initializer for small local tests. Production SQLite
+    /// adopts an already-open, unlinked descriptor through the initializer
+    /// below so no permissioned bytes remain reachable by pathname.
+    package init(
+        indexCID: CID,
+        bodyURL: URL,
+        bodyByteCount: Int? = nil,
+        lease: SpaceCARSpoolLease? = nil
+    ) throws {
         self.indexCID = indexCID
+        adoptedHandle = nil
         self.bodyURL = bodyURL
+        self.lease = lease
+        let discovered = try? bodyURL.resourceValues(
+            forKeys: [.fileSizeKey]
+        ).fileSize
+        let resolvedByteCount = bodyByteCount ?? discovered ?? 0
+        guard resolvedByteCount >= 0 else {
+            throw SpaceCARProductionLimits.limitExceeded()
+        }
+        self.bodyByteCount = resolvedByteCount
+    }
+
+    /// Adopts an owner-only descriptor whose pathname has already been
+    /// unlinked. The spool is single-use and owns both close and lease release.
+    package init(
+        indexCID: CID,
+        fileHandle: FileHandle,
+        bodyByteCount: Int,
+        lease: SpaceCARSpoolLease? = nil
+    ) throws {
+        guard bodyByteCount >= 0 else {
+            throw SpaceCARProductionLimits.limitExceeded()
+        }
+        self.indexCID = indexCID
+        adoptedHandle = fileHandle
+        bodyURL = nil
+        self.lease = lease
+        self.bodyByteCount = bodyByteCount
     }
 
     deinit {
@@ -613,9 +811,7 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
     /// An observable cleanup state is intentionally useful for deterministic
     /// storage/transport tests. It reveals no repository path or data.
     public var isCleanedUp: Bool {
-        cleanupLock.lock()
-        defer { cleanupLock.unlock() }
-        return cleanedUp
+        cleanupLock.withLock { state == .cleaned }
     }
 
     /// Drains the private CAR suffix through fixed-size chunks. The caller is
@@ -626,42 +822,161 @@ public final class SpaceCARBodySpool: @unchecked Sendable {
         maximumChunkBytes: Int = SpaceCARBodySpool.maximumChunkBytes,
         consume: (Data) async throws -> Void
     ) async throws {
+        let admitted = cleanupLock.withLock {
+            guard state == .available else { return false }
+            state = .streaming
+            return true
+        }
+        guard admitted else {
+            throw SwanError.unavailable(
+                "permissioned CAR spool is unavailable"
+            )
+        }
         guard (1 ... Self.maximumChunkBytes).contains(maximumChunkBytes) else {
             cleanup()
             throw SwanError.malformed("permissioned CAR chunk size is invalid")
         }
         let handle: FileHandle
-        do {
-            handle = try FileHandle(forReadingFrom: bodyURL)
-        } catch {
-            cleanup()
-            throw SwanError.unavailable("permissioned CAR spool is unavailable")
+        if let adoptedHandle {
+            handle = adoptedHandle
+        } else {
+            guard let bodyURL else {
+                cleanup()
+                throw SwanError.unavailable(
+                    "permissioned CAR spool is unavailable"
+                )
+            }
+            do {
+                handle = try FileHandle(forReadingFrom: bodyURL)
+            } catch {
+                cleanup()
+                throw SwanError.unavailable(
+                    "permissioned CAR spool is unavailable"
+                )
+            }
         }
         defer {
             try? handle.close()
             cleanup()
         }
 
-        while true {
+        var streamedByteCount = 0
+        var reusableChunk = Data(count: maximumChunkBytes)
+        while streamedByteCount < bodyByteCount {
             try Task.checkCancellation()
-            guard let chunk = try handle.read(upToCount: maximumChunkBytes),
-                  !chunk.isEmpty
-            else { return }
-            try await consume(chunk)
+            let requestedByteCount = min(
+                maximumChunkBytes,
+                bodyByteCount - streamedByteCount
+            )
+            let chunkByteCount = try readPOSIXBytes(
+                fileDescriptor: handle.fileDescriptor,
+                offset: streamedByteCount,
+                maximumBytes: requestedByteCount,
+                into: &reusableChunk
+            )
+            guard chunkByteCount > 0 else {
+                throw SwanError.unavailable(
+                    "permissioned CAR spool is unavailable"
+                )
+            }
+            let (nextByteCount, overflow) =
+                streamedByteCount.addingReportingOverflow(chunkByteCount)
+            guard !overflow, nextByteCount <= bodyByteCount else {
+                throw SwanError.unavailable(
+                    "permissioned CAR spool is unavailable"
+                )
+            }
+            streamedByteCount = nextByteCount
+            if chunkByteCount == reusableChunk.count {
+                try await consume(reusableChunk)
+            } else {
+                // Regular-file pread fills all nonterminal requests. Keep the
+                // reusable allocation at maximum size and copy only the one
+                // terminal short chunk (or an anomalous short read).
+                try await consume(Data(reusableChunk.prefix(chunkByteCount)))
+            }
+        }
+        // The byte count is part of the authenticated producer handoff. Check
+        // that the descriptor has neither truncated nor grown behind it.
+        var endProbe = Data(count: 1)
+        guard try readPOSIXBytes(
+            fileDescriptor: handle.fileDescriptor,
+            offset: streamedByteCount,
+            maximumBytes: 1,
+            into: &endProbe
+        ) == 0 else {
+            throw SwanError.unavailable(
+                "permissioned CAR spool is unavailable"
+            )
+        }
+    }
+
+    /// Foundation's `FileHandle.read(upToCount:)` can retain one autoreleased
+    /// NSData per iteration until an async task yields back to its outer pool.
+    /// A near-256 MiB response then appears bounded by chunk size while RSS
+    /// still grows by the complete CAR. `pread(2)` fills native Swift `Data`
+    /// directly and lets ARC/malloc reuse each completed 64 KiB region.
+    private func readPOSIXBytes(
+        fileDescriptor: Int32,
+        offset: Int,
+        maximumBytes: Int,
+        into buffer: inout Data
+    ) throws -> Int {
+        guard fileDescriptor >= 0,
+              offset >= 0,
+              maximumBytes > 0,
+              maximumBytes <= buffer.count
+        else {
+            throw SwanError.unavailable(
+                "permissioned CAR spool is unavailable"
+            )
+        }
+        return try buffer.withUnsafeMutableBytes { bytes in
+            guard let baseAddress = bytes.baseAddress else { return 0 }
+            while true {
+                #if canImport(Darwin)
+                let result = Darwin.pread(
+                    fileDescriptor,
+                    baseAddress,
+                    maximumBytes,
+                    off_t(offset)
+                )
+                #elseif canImport(Glibc)
+                let result = Glibc.pread(
+                    fileDescriptor,
+                    baseAddress,
+                    maximumBytes,
+                    off_t(offset)
+                )
+                #else
+                let result = -1
+                #endif
+                if result >= 0 { return result }
+                guard errno == EINTR else {
+                    throw SwanError.unavailable(
+                        "permissioned CAR spool is unavailable"
+                    )
+                }
+            }
         }
     }
 
     /// Removes the private spool idempotently. It is safe to call before a
     /// response begins, after a failed write, or more than once.
     public func cleanup() {
-        cleanupLock.lock()
-        guard !cleanedUp else {
-            cleanupLock.unlock()
-            return
+        let shouldClean = cleanupLock.withLock {
+            guard state != .cleaned else { return false }
+            state = .cleaned
+            return true
         }
-        cleanedUp = true
-        cleanupLock.unlock()
-        try? FileManager.default.removeItem(at: bodyURL)
+        guard shouldClean else { return }
+        try? adoptedHandle?.close()
+        if let bodyURL,
+           FileManager.default.fileExists(atPath: bodyURL.path)
+        {
+            try? FileManager.default.removeItem(at: bodyURL)
+        }
+        lease?.release()
     }
 }
 
@@ -695,8 +1010,15 @@ public enum SpaceCARCodec {
         output.append(headerBlock)
         appendBlock(cid: commitCID, data: commitBlock, to: &output)
         appendBlock(cid: indexCID, data: indexBlock, to: &output)
+        var emittedCIDs = Set<String>()
         for record in orderedRecords {
-            appendBlock(cid: CID.fromDAGCBOR(record.value), data: record.value, to: &output)
+            let cid = CID.fromDAGCBOR(record.value)
+            // DRISL retains every path, while CAR block storage is
+            // content-addressed. Proposal 0016 and the pinned TypeScript PDS
+            // therefore emit one block per unique CID, ordered by the first
+            // lexical path that references it.
+            guard emittedCIDs.insert(cid.string).inserted else { continue }
+            appendBlock(cid: cid, data: record.value, to: &output)
         }
         return SpaceCAR(data: output, commitCID: commitCID, indexCID: indexCID)
     }
@@ -710,6 +1032,11 @@ public enum SpaceCARCodec {
         indexCID: CID
     ) throws -> Data {
         let commitBlock = try encodeCommit(commit)
+        guard commitBlock.count
+            <= SpaceCARRecoveryLimits.absoluteMaximumCommitBytes
+        else {
+            throw SpaceCARProductionLimits.limitExceeded()
+        }
         let commitCID = CID.fromDAGCBOR(commitBlock)
         let header = OrderedCBORMap(entries: [
             (key: "roots", value: [ATProtoLink(cid: commitCID), ATProtoLink(cid: indexCID)]),
@@ -720,6 +1047,10 @@ public enum SpaceCARCodec {
         appendVarint(headerBlock.count, to: &output)
         output.append(headerBlock)
         appendBlock(cid: commitCID, data: commitBlock, to: &output)
+        guard output.count <= SpaceCARProductionLimits.maximumRecoveryPrefixBytes
+        else {
+            throw SpaceCARProductionLimits.limitExceeded()
+        }
         return output
     }
 
@@ -780,7 +1111,9 @@ public enum SpaceCARCodec {
             car,
             space: space,
             author: author,
-            publicKey: publicKey
+            contextSignatureVerifier: {
+                try SpaceCommitCodec.verifyContextSignature($0, publicKey: publicKey)
+            }
         )
         return Dictionary(
             uniqueKeysWithValues: recovery.records.map {
@@ -798,11 +1131,30 @@ public enum SpaceCARCodec {
         author: String,
         publicKey: P256.Signing.PublicKey
     ) throws -> VerifiedSpaceCARRecovery {
+        try verifyRecovery(
+            car,
+            space: space,
+            author: author,
+            contextSignatureVerifier: {
+                try SpaceCommitCodec.verifyContextSignature($0, publicKey: publicKey)
+            }
+        )
+    }
+
+    /// Verifies a recovery CAR with an algorithm-bound context verifier.
+    /// This keeps CAR framing and content checks independent of the concrete
+    /// signing curve while requiring callers to supply a trusted key policy.
+    public static func verifyRecovery(
+        _ car: Data,
+        space: SpaceURI,
+        author: String,
+        contextSignatureVerifier: @Sendable (SpaceCommitEnvelope) throws -> Bool
+    ) throws -> VerifiedSpaceCARRecovery {
         let decoded = try decodeRecovery(
             car,
             space: space,
             author: author,
-            publicKey: publicKey
+            contextSignatureVerifier: contextSignatureVerifier
         )
         return VerifiedSpaceCARRecovery(
             wireRevision: try TID(tidString: decoded.revision),
@@ -823,35 +1175,109 @@ public enum SpaceCARCodec {
         _ car: Data,
         space: SpaceURI,
         author: String,
-        publicKey: P256.Signing.PublicKey
+        contextSignatureVerifier: @Sendable (SpaceCommitEnvelope) throws -> Bool
     ) throws -> DecodedSpaceCARRecovery {
         let reader = try CARReader(data: car)
         guard reader.roots.count == 2 else { throw SwanError.malformed("permissioned CAR must have two roots") }
         let commitCID = reader.roots[0]
         let indexCID = reader.roots[1]
-        let commitBlock = try reader.rawBlockData(for: CARReader.cidHex(from: commitCID))
-        let indexBlock = try reader.rawBlockData(for: CARReader.cidHex(from: indexCID))
-        guard CID.fromDAGCBOR(commitBlock) == commitCID, CID.fromDAGCBOR(indexBlock) == indexCID else {
-            throw SwanError.malformed("CAR root CID does not match block")
-        }
+        let frames = try strictRecoveryFrames(
+            car,
+            commitCID: commitCID,
+            indexCID: indexCID
+        )
+        let commitBlock = frames[0].body
+        let indexBlock = frames[1].body
 
         let envelope = try decodeCommit(commitBlock, space: space, author: author)
-        guard try SpaceCommitCodec.verifyContextSignature(envelope, publicKey: publicKey),
+        guard try encodeCommit(envelope) == commitBlock else {
+            throw SwanError.malformed("permissioned CAR commit is not canonical DAG-CBOR")
+        }
+        guard try contextSignatureVerifier(envelope),
               SpaceCommitCodec.verifyContentBinding(envelope) else {
             throw SwanError.unauthorized("permissioned CAR commit did not verify")
         }
-        guard let rawIndex = try reader.decodeBlock(for: CARReader.cidHex(from: indexCID)) as? [String: Any] else {
+        guard let rawIndex = try decodeDAGCBORMap(indexBlock) else {
             throw SwanError.malformed("permissioned CAR index is not a map")
+        }
+
+        var validatedIndex: [(path: String, cid: CID)] = []
+        validatedIndex.reserveCapacity(rawIndex.count)
+        for (path, value) in rawIndex {
+            guard isRecordPath(path),
+                  let cid = value as? CID,
+                  isProfileDAGCBORCID(cid)
+            else {
+                throw SwanError.malformed(
+                    "permissioned CAR index entry is invalid"
+                )
+            }
+            validatedIndex.append((path, cid))
+        }
+        let canonicalIndex = validatedIndex.sorted {
+            let left = Data($0.path.utf8)
+            let right = Data($1.path.utf8)
+            return left.count < right.count
+                || (
+                    left.count == right.count
+                        && left.lexicographicallyPrecedes(right)
+                )
+        }
+        let canonicalIndexBlock = try DAGCBOR.encodeValue(
+            OrderedCBORMap(entries: canonicalIndex.map {
+                (key: $0.path, value: ATProtoLink(cid: $0.cid))
+            })
+        )
+        guard canonicalIndexBlock == indexBlock else {
+            throw SwanError.malformed(
+                "permissioned CAR index is not canonical DAG-CBOR"
+            )
+        }
+
+        let lexicalIndex = validatedIndex.sorted {
+            $0.path.utf8.lexicographicallyPrecedes($1.path.utf8)
+        }
+        var orderedUniqueCIDs: [CID] = []
+        var seenRecordCIDs = Set<String>()
+        for entry in lexicalIndex
+        where seenRecordCIDs.insert(entry.cid.string).inserted {
+            orderedUniqueCIDs.append(entry.cid)
+        }
+        guard frames.count == orderedUniqueCIDs.count + 2 else {
+            throw SwanError.malformed("permissioned CAR has unindexed blocks")
+        }
+        var recordBlocks: [String: Data] = [:]
+        recordBlocks.reserveCapacity(orderedUniqueCIDs.count)
+        for (offset, expectedCID) in orderedUniqueCIDs.enumerated() {
+            let frame = frames[offset + 2]
+            guard frame.cid == expectedCID,
+                  recordBlocks.updateValue(
+                      frame.body,
+                      forKey: frame.cid.string
+                  ) == nil
+            else {
+                throw SwanError.malformed(
+                    "permissioned CAR record block order is invalid"
+                )
+            }
         }
 
         var setHash = LtHash()
         var records: [SpaceRecord] = []
-        for path in rawIndex.keys.sorted(by: { $0.utf8.lexicographicallyPrecedes($1.utf8) }) {
-            guard isRecordPath(path), let cid = rawIndex[path] as? CID else {
-                throw SwanError.malformed("permissioned CAR index entry is invalid")
+        records.reserveCapacity(lexicalIndex.count)
+        for entry in lexicalIndex {
+            let path = entry.path
+            let cid = entry.cid
+            guard let value = recordBlocks[cid.string] else {
+                throw SwanError.malformed(
+                    "permissioned CAR record block is missing"
+                )
             }
-            let value = try reader.rawBlockData(for: CARReader.cidHex(from: cid))
-            guard CID.fromDAGCBOR(value) == cid else { throw SwanError.malformed("record CID does not match block") }
+            do {
+                try CanonicalSpaceRecordValidator.validate(value)
+            } catch {
+                throw SwanError.malformed("permissioned CAR record is not canonical DAG-CBOR")
+            }
             setHash.add(element: "\(path)/\(cid.string)")
             let components = path.split(separator: "/", omittingEmptySubsequences: false)
             let uri = try SpaceRecordURI(
@@ -867,9 +1293,6 @@ public enum SpaceCARCodec {
         guard constantTimeEqual(setHash.commitment, envelope.commitment) else {
             throw SwanError.malformed("permissioned CAR index does not match commit")
         }
-        guard reader.blockIndex.count == records.count + 2 else {
-            throw SwanError.malformed("permissioned CAR has unindexed blocks")
-        }
         return DecodedSpaceCARRecovery(
             revision: envelope.context.rev,
             records: records,
@@ -878,7 +1301,155 @@ public enum SpaceCARCodec {
         )
     }
 
-    private static func encodeCommit(_ commit: SpaceCommitEnvelope) throws -> Data {
+    private struct StrictRecoveryFrame {
+        let cid: CID
+        let body: Data
+    }
+
+    private static let profileCIDByteCount = 36
+
+    /// Petrel's general-purpose reader indexes blocks by CID. A duplicate CID
+    /// therefore replaces the earlier dictionary entry, and malformed trailing
+    /// bytes can terminate its permissive indexing loop. Recovery needs a
+    /// stricter contract: every byte belongs to one canonical frame, roots
+    /// occupy the first two frames, and each frame's body hashes to its CID.
+    private static func strictRecoveryFrames(
+        _ car: Data,
+        commitCID: CID,
+        indexCID: CID
+    ) throws -> [StrictRecoveryFrame] {
+        guard isProfileDAGCBORCID(commitCID),
+              isProfileDAGCBORCID(indexCID),
+              commitCID != indexCID
+        else {
+            throw SwanError.malformed("permissioned CAR roots are invalid")
+        }
+        var offset = 0
+        let headerLength = try readCanonicalRecoveryVarint(
+            car,
+            offset: &offset
+        )
+        guard headerLength <= car.count - offset else {
+            throw SwanError.malformed("permissioned CAR header is truncated")
+        }
+        let header = Data(car[offset ..< offset + headerLength])
+        offset += headerLength
+        let canonicalHeader = try DAGCBOR.encodeValue(
+            OrderedCBORMap(entries: [
+                (key: "roots", value: [
+                    ATProtoLink(cid: commitCID),
+                    ATProtoLink(cid: indexCID),
+                ]),
+                (key: "version", value: 1),
+            ])
+        )
+        guard header == canonicalHeader else {
+            throw SwanError.malformed(
+                "permissioned CAR header is not canonical"
+            )
+        }
+
+        var frames: [StrictRecoveryFrame] = []
+        while offset < car.count {
+            let frameLength = try readCanonicalRecoveryVarint(
+                car,
+                offset: &offset
+            )
+            guard frameLength > profileCIDByteCount,
+                  frameLength <= car.count - offset
+            else {
+                throw SwanError.malformed(
+                    "permissioned CAR frame is truncated"
+                )
+            }
+            let cidBytes = Data(
+                car[
+                    offset
+                        ..< offset + profileCIDByteCount
+                ]
+            )
+            let cid: CID
+            do {
+                cid = try CID(bytes: cidBytes)
+            } catch {
+                throw SwanError.malformed(
+                    "permissioned CAR block CID is invalid"
+                )
+            }
+            guard cid.bytes == cidBytes, isProfileDAGCBORCID(cid) else {
+                throw SwanError.malformed(
+                    "permissioned CAR block CID is invalid"
+                )
+            }
+            offset += profileCIDByteCount
+            let bodyLength =
+                frameLength - profileCIDByteCount
+            let body = Data(car[offset ..< offset + bodyLength])
+            offset += bodyLength
+            guard CID.fromDAGCBOR(body) == cid else {
+                throw SwanError.malformed(
+                    "permissioned CAR block CID does not match body"
+                )
+            }
+            frames.append(StrictRecoveryFrame(cid: cid, body: body))
+        }
+        guard frames.count >= 2,
+              frames[0].cid == commitCID,
+              frames[1].cid == indexCID
+        else {
+            throw SwanError.malformed(
+                "permissioned CAR root block order is invalid"
+            )
+        }
+        return frames
+    }
+
+    private static func readCanonicalRecoveryVarint(
+        _ data: Data,
+        offset: inout Int
+    ) throws -> Int {
+        let start = offset
+        var value: UInt64 = 0
+        var shift: UInt64 = 0
+        while offset < data.count, offset - start < 10 {
+            let byte = data[offset]
+            offset += 1
+            let portion = UInt64(byte & 0x7f)
+            guard shift < 63 || portion <= 1 else {
+                throw SwanError.malformed(
+                    "permissioned CAR varint is invalid"
+                )
+            }
+            value |= portion << shift
+            if byte & 0x80 == 0 {
+                guard value <= UInt64(Int.max) else {
+                    throw SwanError.malformed(
+                        "permissioned CAR varint is invalid"
+                    )
+                }
+                var canonical = Data()
+                appendVarint(Int(value), to: &canonical)
+                guard canonical == Data(data[start ..< offset]) else {
+                    throw SwanError.malformed(
+                        "permissioned CAR varint is not canonical"
+                    )
+                }
+                return Int(value)
+            }
+            shift += 7
+        }
+        throw SwanError.malformed("permissioned CAR varint is invalid")
+    }
+
+    private static func isProfileDAGCBORCID(_ cid: CID) -> Bool {
+        cid.bytes.count == profileCIDByteCount
+            && cid.codec == .dagCBOR
+            && cid.multihash.algorithm == Multihash.sha256Code
+            && cid.multihash.length == Multihash.sha256Length
+            && cid.multihash.digest.count == Int(Multihash.sha256Length)
+    }
+
+    static func encodeCommit(_ commit: SpaceCommitEnvelope) throws -> Data {
         guard commit.ver == 1 else { throw SwanError.malformed("unsupported commit version") }
         let block = OrderedCBORMap(entries: [
             (key: "ver", value: commit.ver),
@@ -891,9 +1462,10 @@ public enum SpaceCARCodec {
         return try DAGCBOR.encodeValue(block)
     }
 
-    private static func decodeCommit(_ data: Data, space: SpaceURI, author: String) throws -> SpaceCommitEnvelope {
+    static func decodeCommit(_ data: Data, space: SpaceURI, author: String) throws -> SpaceCommitEnvelope {
         guard let map = try decodeDAGCBORMap(data),
               let ver = map["ver"] as? UInt64,
+              ver == 1,
               let hash = map["hash"] as? Data,
               let mac = map["mac"] as? Data,
               let ikm = map["ikm"] as? Data,
@@ -970,7 +1542,7 @@ public enum SpaceCARCodec {
         "\(record.uri.collection)/\(record.uri.rkey)"
     }
 
-    private static func isRecordPath(_ path: String) -> Bool {
+    static func isRecordPath(_ path: String) -> Bool {
         let fields = path.split(separator: "/", omittingEmptySubsequences: false)
         return fields.count == 2 && SpaceURI.isValidNSID(String(fields[0])) && SpaceURI.isValidRecordKey(String(fields[1]))
     }

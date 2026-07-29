@@ -26,7 +26,20 @@ public struct Input: ATProtocolCodable {
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.space = try container.decode(ATProtocolURI.self, forKey: .space)
-            self.repo = try container.decodeIfPresent(DID.self, forKey: .repo)
+            if container.contains(.repo) {
+                guard try !container.decodeNil(forKey: .repo) else {
+                    throw DecodingError.valueNotFound(
+                        DID.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'repo' must not be null"
+                        )
+                    )
+                }
+                self.repo = try container.decode(DID.self, forKey: .repo)
+            } else {
+                self.repo = nil
+            }
             self.endpoint = try container.decode(URI.self, forKey: .endpoint)
         }
 

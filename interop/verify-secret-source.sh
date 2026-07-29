@@ -70,6 +70,7 @@ fi
 for name in \
   oauth-server-key \
   account-kek \
+  email-proof-key \
   operator-secret \
   authority.did \
   authority.handle \

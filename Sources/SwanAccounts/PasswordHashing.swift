@@ -69,9 +69,18 @@ public struct LibsodiumArgon2idHasher: PasswordHasher {
 
     public func verify(_ password: String, encodedHash: String) throws -> Bool {
         let metadata = try Self.parsePHCString(encodedHash)
-        guard metadata.algorithm == "argon2id", metadata.version == 19,
+        guard metadata.algorithm == "argon2id",
+              metadata.version == 19,
+              metadata.operationsLimit == policy.operationsLimit,
+              metadata.memoryLimitBytes == policy.memoryLimitBytes,
               metadata.parallelism == 1 else {
-            throw SwanError.malformed("unsupported password PHC algorithm or version")
+            // Accepting a restored verifier with a different work factor
+            // would make known-account failures measurably different from the
+            // boot-generated unknown-account dummy. Such credentials require
+            // password recovery or an explicit operator migration.
+            throw SwanError.malformed(
+                "password PHC does not match the configured Argon2id policy"
+            )
         }
         return encodedHash.withCString { hashBytes in
             Self.withPasswordBytes(password) { passwordBytes, passwordLength in

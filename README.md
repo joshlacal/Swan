@@ -5,7 +5,7 @@ It intentionally starts with protocol fidelity, durable local semantics, and
 cross-implementation fixtures rather than attempting to be a public production
 PDS on day one.
 
-The active profile is `permissioned-data-0016-2026-07-03`. Its upstream pins
+The active profile is `permissioned-data-0016-2026-07-30`. Its upstream pins
 and security boundary live in `Profiles/`.
 
 ## Development
@@ -57,6 +57,16 @@ when `listRepoOps` includes values because its joined SQLite query leaves
 `--permissioned-list-ops-exclude-values`; the artifact records
 `syncValuesIncluded: false` so this limitation is visible rather than hidden.
 Swan's own endpoint remains value-capable and is covered by its HTTP tests.
+
+For the stateful permissioned alpha result, add
+`--permissioned-stateful-matrix` to `lab live --mode permissioned`. It runs
+the existing create/read flow and requires explicit write/read CID convergence,
+the matching `listRepoOps` operation CID and revision, a verified signed
+LtHash commitment that matches the verified full-CAR recovery commitment,
+and recovered CAR records before the artifact passes.
+It automatically enables both terminal verifiers; use
+`--permissioned-list-ops-exclude-values` for the pinned TypeScript branch's
+metadata-only incremental page.
 
 Add `--permissioned-get-repo` to stream and verify the full two-root recovery
 CAR from the selected permissioned repository host. It uses the same explicit
@@ -184,15 +194,93 @@ The same one-shot path runs the sanitized six-fault endpoint matrix.
 `Scripts/verify-interop-lab.sh` statically enforces this topology, and
 `Scripts/test-verify-interop-lab.sh` pressure-tests the verifier with unsafe
 privilege, dependency, interpolation, mount, runner, and readiness mutations.
-The Linux Compose gate has been exercised with a clean cache: health checks,
-PLC-backed account bootstrap, stateful public and permissioned Swan-to-Swan
-round trips, public/private isolation, and the offline/disconnected/delayed/
-duplicated/reordered/corrupted endpoint matrix all pass. The pinned TypeScript
-host also passed a disposable public record smoke and a cross-host permissioned
-round trip: it wrote on the reference member PDS, received a Swan-issued space
-credential, and read the same CID back from that member host. The sanitized
-transport artifact is not a claim of full Swan-to-TypeScript semantic
-convergence.
+Normal Compose also loads the checked-in
+`interop/notification-config.json` from the pinned Swan image. Keeping it in
+the image avoids non-portable host file binds while preserving a read-only
+runtime path. The Swan container root filesystem is read-only; only its bounded
+`/tmp` tmpfs and named data volume are writable. Normal Compose explicitly
+enables durable notification delivery, so startup installs the outbox recovery
+service instead of merely loading receiver verification material.
+
+The checked-in notification file is strictly disposable lab routing plus public
+verification configuration. It has no secret, private-key, password, token,
+recipient binding, or static key fields. Its sole authority route binds the
+fixed restart-scenario DID and service-JWT audience to
+`http://localhost:3001`, with the final peer pinned to `127.0.0.1`; there is no
+wildcard or request-controlled destination. Its credential-key resolver uses
+the pinned laboratory PLC origin (`reference-plc`) with an explicit host
+allowlist. Production or cross-host notification pins remain an
+operator-supplied configuration outside this repository.
+
+### Notification crash/restart acceptance
+
+Run the durable outbox closure against a disposable Compose project:
+
+```sh
+export SWAN_INTEROP_SECRETS_DIR=/absolute/path/outside/this/repository
+Scripts/run-notification-restart-acceptance.sh
+```
+
+The scenario installs two disposable local accounts while Swan is stopped,
+commits one real permissioned write through OAuth under a delivery-disabled
+seed process, verifies one opaque pending outbox row, and kills that process.
+It starts and waits for a loopback proxy before launching a recovery-enabled
+Swan process with the normal Compose image, volumes, config, and delivery flag.
+The proxy forwards `notifyWrite`, discards the first successful
+acknowledgement, and returns the second. It must observe exactly two successful,
+byte-identical forwards; this is not a claim that the deleted sender row
+retains an exact attempt count. Read-only SQLite assertions require the sender
+outbox to converge to empty while the authority retains exactly one receipt
+and one writer-state effect. A final start of the normal Compose Swan service
+must preserve that state without the proxy.
+
+The private record value and OAuth artifact exist only in container tmpfs. The
+proxy retains only counts and SHA-256 request digests, and the script prints no
+credentials, service-auth headers, event IDs, request bodies, or permissioned
+values. It tears down its uniquely named project and volumes on exit. Static
+verification proves the configuration and scenario contract; this acceptance
+is live Compose evidence only after the command itself completes successfully.
+
+### Clean-cache acceptance
+
+Run the reproducibility gate from a clean SwiftPM scratch path on macOS:
+
+```sh
+Scripts/run-clean-cache-acceptance.sh --mode macos
+```
+
+On Linux, provide the same external owner-only secret directory used for the
+lab. The runner copies the source into a disposable scratch directory, fetches
+the pinned reference archive into that copy, runs the static and Swift suites
+there, then rebuilds the Compose images with `--no-cache` and waits for all
+required services. Its generated Compose project is torn down with volumes at
+the end; the scratch directory is retained for inspection.
+
+```sh
+export SWAN_INTEROP_SECRETS_DIR=/absolute/path/outside/this/repository
+Scripts/run-clean-cache-acceptance.sh --mode linux --wait-timeout 240
+```
+
+To retain the exact scratch location in CI, supply a path that does not yet
+exist:
+
+```sh
+Scripts/run-clean-cache-acceptance.sh --mode macos \
+  --scratch-path /tmp/swan-clean-cache-macos
+```
+
+Prior Linux Compose artifacts cover health checks, PLC-backed account bootstrap,
+Swan-to-Swan transport, public/private isolation, and endpoint-probe fault
+scenarios. They are not a clean-cache run of the current working copy and are
+not evidence of full Swan-to-TypeScript semantic convergence. The pinned
+TypeScript host also has disposable public-record and cross-host permissioned
+transport probes; those sanitized artifacts do not close the value-bearing sync,
+compaction-gap, reverse-authority, or cross-implementation OAuth gates.
+
+The current macOS clean-cache run completed the full Swift suite with zero
+failures. Its opt-in 256 MiB stress tests remain explicitly skipped unless
+`SWAN_CAR_256M_STRESS=1`, `SWAN_RUN_256MIB_CAR_STAGING=1`, and
+`SWAN_RUN_256MIB_PUBLIC_GET_REPO=1` are supplied.
 
 ### Pinned wire generation
 
@@ -206,7 +294,7 @@ exists), then select the reviewed Petrel generator workspace explicitly:
 PETREL_GENERATOR_ROOT=/Users/joshlacalamito/Developer/Catbird+Petrel/Petrel-swan-generator \
   ./Scripts/verify-wire-generation.sh
 
-# This is the intentional mutating form. It validates the profile, d011ccf0
+# This is the intentional mutating form. It validates the profile, c2a1cdbe
 # generator parent, server-contract capability, and entrypoint before writing.
 PETREL_GENERATOR_ROOT=/Users/joshlacalamito/Developer/Catbird+Petrel/Petrel-swan-generator \
   ./Scripts/regenerate-wire.sh

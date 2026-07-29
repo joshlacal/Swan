@@ -25,6 +25,10 @@ public actor SQLitePreMigratedAccountDirectory:
     private let publicCARSpoolAdmission: PublicRepositorySpoolAdmission
     private let dataDirectory: URL
     private var databases: [String: SQLiteAccountDatabase]
+    private var publicReadGenerations:
+        [String: SQLiteVerifiedPublicRepositoryGeneration]
+    private var permanentlyRevokedDIDs: Set<String> = []
+    private var drainingDatabases: [String: SQLiteAccountDatabase] = [:]
     private var isClosed = false
 
     /// Returns only a startup-preopened public mutation store. HTTP adapters
@@ -35,10 +39,26 @@ public actor SQLitePreMigratedAccountDirectory:
         return databases[did]
     }
 
+    /// Runtime mutation surface. A successful commit is not returned to HTTP
+    /// until the new state has been fully re-admitted and atomically published
+    /// as the directory's next public-read generation.
+    public func generationRefreshingPublicMutationStore(
+        did: String
+    ) async -> (any PublicRepositoryMutationStore)? {
+        guard !isClosed, let database = databases[did] else { return nil }
+        return SQLiteGenerationRefreshingPublicMutationStore(
+            did: did,
+            database: database,
+            directory: self
+        )
+    }
+
     private init(
         dataDirectory: URL,
         controlStore: any AccountControlStore,
         databases: [String: SQLiteAccountDatabase],
+        publicReadGenerations:
+            [String: SQLiteVerifiedPublicRepositoryGeneration],
         publicIdentityVerifier: (any PublicPLCGenesisVerifying)?,
         publicCARSpoolAdmission: PublicRepositorySpoolAdmission
     ) {
@@ -47,16 +67,22 @@ public actor SQLitePreMigratedAccountDirectory:
         self.publicIdentityVerifier = publicIdentityVerifier
         self.publicCARSpoolAdmission = publicCARSpoolAdmission
         self.databases = databases
+        self.publicReadGenerations = publicReadGenerations
     }
 
     /// Opens and migrates every currently active account database. A missing,
     /// non-regular, symlinked, corrupt, or unopenable account database makes
     /// startup unavailable; it is never created as a recovery side effect.
+    ///
+    /// `publicIdentityVerifier: nil` is an explicit internal/test mode that
+    /// disables public repository admission. Production passes a verifier and
+    /// therefore requires every active account to carry both authenticated PLC
+    /// genesis facts and a valid empty or non-empty public repository.
     public static func bootstrap(
         dataDirectory: URL,
         controlStore: any AccountControlStore,
         oplogRetention: Int = 10_000,
-        publicIdentityVerifier: (any PublicPLCGenesisVerifying)? = nil,
+        publicIdentityVerifier: (any PublicPLCGenesisVerifying)?,
         publicCARSpoolAdmission: PublicRepositorySpoolAdmission? = nil
     ) async throws -> SQLitePreMigratedAccountDirectory {
         guard oplogRetention > 0 else {
@@ -64,17 +90,48 @@ public actor SQLitePreMigratedAccountDirectory:
         }
 
         var opened: [String: SQLiteAccountDatabase] = [:]
+        var admittedPublicReads:
+            [String: SQLiteVerifiedPublicRepositoryGeneration] = [:]
         do {
             let dids = try await controlStore.activeAccountDIDs()
             try validateStartupDIDs(dids)
             for did in dids {
                 let databaseURL = SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
                 try requireExistingRegularDatabase(databaseURL)
-                opened[did] = try await SQLiteAccountDatabase(
+                let database = try await SQLiteAccountDatabase(
                     dataDirectory: dataDirectory,
                     did: did,
                     oplogRetention: oplogRetention
                 )
+                do {
+                    guard let account = try await controlStore.account(did: did),
+                          account.did == did,
+                          account.status.authorizesAccount else {
+                        throw SwanError.unavailable(
+                            "authenticated space directory is unavailable"
+                        )
+                    }
+                    let publicGeneration =
+                        try await validatePublicRepositoryAdmission(
+                        database: database,
+                        account: account,
+                        identityVerifier: publicIdentityVerifier,
+                        controlStore: controlStore
+                    )
+                    guard let current = try await controlStore.account(did: did),
+                          current == account,
+                          current.status.authorizesAccount else {
+                        throw SwanError.unavailable(
+                            "authenticated space directory is unavailable"
+                        )
+                    }
+                    try requireExistingRegularDatabase(databaseURL)
+                    opened[did] = database
+                    admittedPublicReads[did] = publicGeneration
+                } catch {
+                    try? await database.close()
+                    throw error
+                }
             }
             let admission = try publicCARSpoolAdmission
                 ?? PublicRepositorySpoolAdmission()
@@ -82,6 +139,7 @@ public actor SQLitePreMigratedAccountDirectory:
                 dataDirectory: dataDirectory,
                 controlStore: controlStore,
                 databases: opened,
+                publicReadGenerations: admittedPublicReads,
                 publicIdentityVerifier: publicIdentityVerifier,
                 publicCARSpoolAdmission: admission
             )
@@ -190,18 +248,41 @@ public actor SQLitePreMigratedAccountDirectory:
         let did = admission.did
         let database = admission.database
         guard !isClosed,
-              AccountControlIdentifiers.isDID(did) else {
+              !permanentlyRevokedDIDs.contains(did),
+              AccountControlIdentifiers.isDID(did),
+              database.accountDID == did,
+              database.dataDirectory.standardizedFileURL
+                == dataDirectory.standardizedFileURL else {
             try? await database.close()
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
-        let isActive: Bool
+        if let installed = databases[did] {
+            // The activation transfer is intentionally opaque and single-use,
+            // but a retry can still replay the same value after a lost
+            // response. Never close the actor already owned by this directory.
+            if installed === database {
+                return
+            }
+            try? await database.close()
+            throw SwanError.unavailable(
+                "authenticated space directory is unavailable"
+            )
+        }
+        let account: AccountControlAccount
         do {
-            isActive = try await isActiveAccount(did)
+            guard let current = try await controlStore.account(did: did),
+                  current.did == did,
+                  current.status.authorizesAccount else {
+                throw SwanError.unavailable(
+                    "authenticated space directory is unavailable"
+                )
+            }
+            account = current
         } catch {
             try? await database.close()
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
-        guard isActive, !isClosed else {
+        guard !isClosed else {
             try? await database.close()
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
@@ -217,15 +298,71 @@ public actor SQLitePreMigratedAccountDirectory:
             try? await database.close()
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
-        if databases[did] != nil {
-            do {
-                try await database.close()
-            } catch {
-                throw SwanError.unavailable("authenticated space directory is unavailable")
+        let publicGeneration: SQLiteVerifiedPublicRepositoryGeneration?
+        do {
+            publicGeneration =
+                try await Self.validatePublicRepositoryAdmission(
+                database: database,
+                account: account,
+                identityVerifier: publicIdentityVerifier,
+                controlStore: controlStore
+                )
+        } catch {
+            try? await database.close()
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        let current: AccountControlAccount
+        do {
+            guard let rechecked = try await controlStore.account(did: did),
+                  rechecked == account,
+                  rechecked.status.authorizesAccount else {
+                throw SwanError.unavailable(
+                    "authenticated space directory is unavailable"
+                )
             }
-            return
+            current = rechecked
+        } catch {
+            try? await database.close()
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard current.status.authorizesAccount, !isClosed else {
+            try? await database.close()
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        do {
+            try Self.requireExistingRegularDatabase(
+                SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
+            )
+        } catch {
+            try? await database.close()
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        guard !isClosed else {
+            try? await database.close()
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        // Every validation above suspends this actor. Permanent deletion or a
+        // competing activation may therefore have won while this admission was
+        // awaiting durable state. Recheck terminal revocation and occupancy in
+        // one non-suspending actor turn before publishing the transferred
+        // database and its read generation.
+        guard !permanentlyRevokedDIDs.contains(did) else {
+            try? await database.close()
+            throw SwanError.unavailable(
+                "authenticated space directory is unavailable"
+            )
+        }
+        if let installed = databases[did] {
+            if installed === database {
+                return
+            }
+            try? await database.close()
+            throw SwanError.unavailable(
+                "authenticated space directory is unavailable"
+            )
         }
         databases[did] = database
+        publicReadGenerations[did] = publicGeneration
     }
 
     // MARK: Authenticated simple-space lifecycle
@@ -791,14 +928,50 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
+    /// Removes one DID from every live selection path before awaiting its
+    /// database and escaped-blob-body drain. Revocation is terminal for this
+    /// directory instance, so a concurrent activation cannot reinsert the
+    /// actor after deletion begins.
+    public func revokeAndDrainAccount(did: String) async throws {
+        guard !isClosed,
+              AccountControlIdentifiers.isDID(did) else {
+            throw SwanError.unavailable(
+                "account deletion quiescence is unavailable"
+            )
+        }
+        permanentlyRevokedDIDs.insert(did)
+        publicReadGenerations.removeValue(forKey: did)
+        let database: SQLiteAccountDatabase
+        if let draining = drainingDatabases[did] {
+            database = draining
+        } else if let installed = databases.removeValue(forKey: did) {
+            drainingDatabases[did] = installed
+            database = installed
+        } else {
+            return
+        }
+        do {
+            try await database.closeForPermanentDeletion()
+        } catch {
+            throw SwanError.unavailable(
+                "account deletion quiescence is unavailable"
+            )
+        }
+        if drainingDatabases[did] === database {
+            drainingDatabases.removeValue(forKey: did)
+        }
+    }
+
     /// Explicitly releases every startup-opened connection. The method is
     /// idempotent, and lookup after closing is unavailable rather than able to
     /// reopen a database on demand.
     public func close() async throws {
         guard !isClosed else { return }
         isClosed = true
-        let opened = Array(databases.values)
+        let opened = Array(databases.values) + Array(drainingDatabases.values)
         databases.removeAll()
+        drainingDatabases.removeAll()
+        publicReadGenerations.removeAll()
 
         var failed = false
         for database in opened {
@@ -811,6 +984,21 @@ public actor SQLitePreMigratedAccountDirectory:
         if failed {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
+    }
+
+    /// Internal failure injection for the permanent-deletion drain retry
+    /// regression. It exposes no connection or account data.
+    func installPermanentDeletionTestingHooks(
+        _ hooks: SQLiteTestingHooks,
+        did: String
+    ) async throws {
+        guard !isClosed,
+              let database = databases[did] ?? drainingDatabases[did] else {
+            throw SwanError.unavailable(
+                "account deletion quiescence is unavailable"
+            )
+        }
+        await database.installTestingHooks(hooks)
     }
 
     // MARK: Public repository reads
@@ -828,53 +1016,73 @@ public actor SQLitePreMigratedAccountDirectory:
                 did: account.did, status: account.status, revision: nil
             )
         }
-        let database = try preopenedPublicRepositoryDatabase(account.did)
-        guard let publicIdentityVerifier else {
-            throw PublicRepositoryReadError.unavailable
-        }
-        let description: PublicRepositoryReadDescription
+        let (database, generation) = try activePublicReadContext(account)
         do {
-            description = try await database.readPublicRepositoryDescription(
-                account: account,
-                identityVerifier: publicIdentityVerifier
+            _ = try await database.readPublicRepositoryDescription(
+                generation: generation
             )
-            try await verifyPublicIdentityIntent(description)
         } catch {
             throw PublicRepositoryReadError.unavailable
         }
-        try await recheckPublicAccount(account)
+        try await recheckPublicAccount(account, generation: generation)
         return try PublicRepositoryReadStatus(
             did: account.did,
             status: account.status,
-            revision: description.state.revision
+            revision: generation.description.state.revision
         )
     }
 
     public func describePublicRepository(
         selector: String
     ) async throws -> PublicRepositoryReadDescription? {
-        guard let account = try await resolvePublicAccount(selector),
-              account.status == .active else { return nil }
-        let database = try preopenedPublicRepositoryDatabase(account.did)
-        guard let publicIdentityVerifier else {
-            throw PublicRepositoryReadError.unavailable
+        switch try await publicRepositoryDescriptionOutcome(
+            selector: selector
+        ) {
+        case .notFound, .lifecycle:
+            return nil
+        case let .active(description):
+            return description
         }
-        let result: PublicRepositoryReadDescription
+    }
+
+    public func publicRepositoryDescriptionOutcome(
+        selector: String
+    ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadDescription> {
+        guard let account = try await resolvePublicAccount(selector) else {
+            return .notFound
+        }
+        guard account.status == .active else {
+            return .lifecycle(try PublicRepositoryReadStatus(
+                did: account.did,
+                status: account.status,
+                revision: nil
+            ))
+        }
+        let (database, generation) = try activePublicReadContext(account)
+        let description: PublicRepositoryReadDescription
         do {
-            result = try await database.readPublicRepositoryDescription(
-                account: account,
-                identityVerifier: publicIdentityVerifier
+            description = try await database.readPublicRepositoryDescription(
+                generation: generation
             )
-            try await verifyPublicIdentityIntent(result)
         } catch {
             throw PublicRepositoryReadError.unavailable
         }
-        try await recheckPublicAccount(account)
-        return result
+        try await recheckPublicAccount(account, generation: generation)
+        return .active(description)
     }
 
     private func verifyPublicIdentityIntent(
         _ description: PublicRepositoryReadDescription
+    ) async throws {
+        try await Self.verifyPublicIdentityIntent(
+            description,
+            controlStore: controlStore
+        )
+    }
+
+    private static func verifyPublicIdentityIntent(
+        _ description: PublicRepositoryReadDescription,
+        controlStore: any AccountControlStore
     ) async throws {
         guard let intentStore = controlStore
                 as? any PLCAccountPreparationIntentStore,
@@ -895,14 +1103,50 @@ public actor SQLitePreMigratedAccountDirectory:
         path: PublicRepositoryPath,
         expectedCID: CID?
     ) async throws -> PublicRepositoryReadRecord? {
-        guard let account = try await resolvePublicAccount(selector),
-              account.status == .active else { return nil }
-        let database = try preopenedPublicRepositoryDatabase(account.did)
-        let result = try await database.readPublicRepositoryRecord(
-            path: path, expectedCID: expectedCID
-        )
-        try await recheckPublicAccount(account)
-        return result
+        switch try await publicRepositoryRecordOutcome(
+            selector: selector,
+            path: path,
+            expectedCID: expectedCID
+        ) {
+        case .notFound, .lifecycle:
+            return nil
+        case let .active(result):
+            return result.record
+        }
+    }
+
+    public func publicRepositoryRecordOutcome(
+        selector: String,
+        path: PublicRepositoryPath,
+        expectedCID: CID?
+    ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadRecordResult> {
+        guard let account = try await resolvePublicAccount(selector) else {
+            return .notFound
+        }
+        guard account.status == .active else {
+            return .lifecycle(try PublicRepositoryReadStatus(
+                did: account.did,
+                status: account.status,
+                revision: nil
+            ))
+        }
+        let (database, generation) = try activePublicReadContext(account)
+        let read: SQLitePublicRepositoryRecordRead
+        do {
+            read = try await database.readPublicRepositoryRecord(
+                path: path,
+                expectedCID: expectedCID,
+                generation: generation
+            )
+        } catch {
+            throw PublicRepositoryReadError.unavailable
+        }
+        try await recheckPublicAccount(account, generation: generation)
+        return .active(try PublicRepositoryReadRecordResult(
+            did: account.did,
+            state: read.state,
+            record: read.record
+        ))
     }
 
     public func listPublicRepositoryRecords(
@@ -912,47 +1156,142 @@ public actor SQLitePreMigratedAccountDirectory:
         cursor: String?,
         reverse: Bool
     ) async throws -> PublicRepositoryReadPage {
-        guard let account = try await resolvePublicAccount(selector),
-              account.status == .active else {
-            throw PublicRepositoryReadError.invalidSelector
-        }
-        let database = try preopenedPublicRepositoryDatabase(account.did)
-        let result = try await database.readPublicRepositoryRecords(
+        switch try await publicRepositoryRecordsOutcome(
+            selector: selector,
             collection: collection,
             limit: limit,
             cursor: cursor,
             reverse: reverse
-        )
-        try await recheckPublicAccount(account)
-        return result
+        ) {
+        case .notFound, .lifecycle:
+            throw PublicRepositoryReadError.invalidSelector
+        case let .active(result):
+            return result.page
+        }
+    }
+
+    public func publicRepositoryRecordsOutcome(
+        selector: String,
+        collection: String,
+        limit: Int,
+        cursor: String?,
+        reverse: Bool
+    ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadPageResult> {
+        guard let account = try await resolvePublicAccount(selector) else {
+            return .notFound
+        }
+        guard account.status == .active else {
+            return .lifecycle(try PublicRepositoryReadStatus(
+                did: account.did,
+                status: account.status,
+                revision: nil
+            ))
+        }
+        let (database, generation) = try activePublicReadContext(account)
+        let read: SQLitePublicRepositoryPageRead
+        do {
+            read = try await database.readPublicRepositoryRecords(
+                collection: collection,
+                limit: limit,
+                cursor: cursor,
+                reverse: reverse,
+                generation: generation
+            )
+        } catch let error as PublicRepositoryReadError {
+            throw error
+        } catch {
+            throw PublicRepositoryReadError.unavailable
+        }
+        try await recheckPublicAccount(account, generation: generation)
+        return .active(try PublicRepositoryReadPageResult(
+            did: account.did,
+            state: read.state,
+            page: read.page
+        ))
     }
 
     public func publicRepositoryCAR(
         selector: String
     ) async throws -> PublicRepositoryReadCAR? {
-        guard let account = try await resolvePublicAccount(selector),
-              account.status == .active else { return nil }
+        switch try await publicRepositoryCAROutcome(selector: selector) {
+        case .notFound, .lifecycle:
+            return nil
+        case let .active(car):
+            return car
+        }
+    }
+
+    public func publicRepositoryCAROutcome(
+        selector: String
+    ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadCAR> {
+        guard let account = try await resolvePublicAccount(selector) else {
+            return .notFound
+        }
+        guard account.status == .active else {
+            return .lifecycle(try PublicRepositoryReadStatus(
+                did: account.did,
+                status: account.status,
+                revision: nil
+            ))
+        }
+        let (database, generation) = try activePublicReadContext(account)
         guard let lease = publicCARSpoolAdmission.reserve(
             accountDID: account.did,
             maximumBytes: PublicRepositoryLimits.standard.maximumCARBytes
         ) else {
             throw PublicRepositoryReadError.unavailable
         }
-        let database = try preopenedPublicRepositoryDatabase(account.did)
         let result: PublicRepositoryReadCAR
         do {
-            result = try await database.preparePublicRepositoryCAR(lease: lease)
+            result = try await database.preparePublicRepositoryCAR(
+                lease: lease,
+                generation: generation
+            )
         } catch {
             lease.release()
             throw PublicRepositoryReadError.unavailable
         }
         do {
-            try await recheckPublicAccount(account)
-            return result
+            try await recheckPublicAccount(account, generation: generation)
+            return .active(result)
         } catch {
             result.spool.cleanup()
             throw error
         }
+    }
+
+    fileprivate func refreshPublicReadGenerationAfterMutation(
+        did: String,
+        database: SQLiteAccountDatabase
+    ) async throws {
+        guard !isClosed,
+              databases[did] === database,
+              let identityVerifier = publicIdentityVerifier,
+              let account = try await controlStore.account(did: did),
+              account.status == .active else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        let generation: SQLiteVerifiedPublicRepositoryGeneration
+        do {
+            generation = try await database.admitPublicRepositoryGeneration(
+                account: account,
+                identityVerifier: identityVerifier
+            )
+            try await Self.verifyPublicIdentityIntent(
+                generation.description,
+                controlStore: controlStore
+            )
+        } catch {
+            throw PublicRepositoryReadError.unavailable
+        }
+        guard !isClosed,
+              databases[did] === database,
+              let current = try await controlStore.account(did: did),
+              current == account,
+              current.status == .active else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        publicReadGenerations[did] = generation
     }
 
     private func resolvePublicAccount(
@@ -1000,10 +1339,30 @@ public actor SQLitePreMigratedAccountDirectory:
         return database
     }
 
+    private func activePublicReadContext(
+        _ account: AccountControlAccount
+    ) throws -> (
+        database: SQLiteAccountDatabase,
+        generation: SQLiteVerifiedPublicRepositoryGeneration
+    ) {
+        guard account.status == .active,
+              let generation = publicReadGenerations[account.did],
+              generation.controlAccount == account else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        return (
+            try preopenedPublicRepositoryDatabase(account.did),
+            generation
+        )
+    }
+
     private func recheckPublicAccount(
-        _ expected: AccountControlAccount
+        _ expected: AccountControlAccount,
+        generation: SQLiteVerifiedPublicRepositoryGeneration
     ) async throws {
-        guard !isClosed, databases[expected.did] != nil else {
+        guard !isClosed,
+              databases[expected.did] != nil,
+              publicReadGenerations[expected.did]?.id == generation.id else {
             throw PublicRepositoryReadError.unavailable
         }
         let current: AccountControlAccount?
@@ -1012,13 +1371,12 @@ public actor SQLitePreMigratedAccountDirectory:
         } catch {
             throw PublicRepositoryReadError.unavailable
         }
-        guard let current,
-              current.did == expected.did,
-              current.canonicalHandle == expected.canonicalHandle,
-              current.status == .active else {
+        guard let current, current == expected, current.status == .active else {
             throw PublicRepositoryReadError.unavailable
         }
-        guard !isClosed, databases[expected.did] != nil else {
+        guard !isClosed,
+              databases[expected.did] != nil,
+              publicReadGenerations[expected.did]?.id == generation.id else {
             throw PublicRepositoryReadError.unavailable
         }
         do {
@@ -1318,6 +1676,35 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
+    private static func validatePublicRepositoryAdmission(
+        database: SQLiteAccountDatabase,
+        account: AccountControlAccount,
+        identityVerifier: (any PublicPLCGenesisVerifying)?,
+        controlStore: any AccountControlStore
+    ) async throws -> SQLiteVerifiedPublicRepositoryGeneration? {
+        let state = try await database.loadPublicRepositoryState()
+        guard let identityVerifier else {
+            // Explicit public-read-disabled mode must not normalize partially
+            // provisioned public truth into an inaccessible nil generation.
+            guard state == nil, account.publicGenesisCommitCID == nil else {
+                throw PublicRepositoryReadError.unavailable
+            }
+            return nil
+        }
+        guard state != nil, account.publicGenesisCommitCID != nil else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        let generation = try await database.admitPublicRepositoryGeneration(
+            account: account,
+            identityVerifier: identityVerifier
+        )
+        try await verifyPublicIdentityIntent(
+            generation.description,
+            controlStore: controlStore
+        )
+        return generation
+    }
+
     private static func requireExistingRegularDatabase(_ url: URL) throws {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         guard let type = attributes[.type] as? FileAttributeType,
@@ -1338,5 +1725,72 @@ public actor SQLitePreMigratedAccountDirectory:
         for database in databases {
             try? await database.close()
         }
+    }
+}
+
+private actor SQLiteGenerationRefreshingPublicMutationStore:
+    PublicRepositoryMutationStore
+{
+    let did: String
+    let database: SQLiteAccountDatabase
+    let directory: SQLitePreMigratedAccountDirectory
+
+    init(
+        did: String,
+        database: SQLiteAccountDatabase,
+        directory: SQLitePreMigratedAccountDirectory
+    ) {
+        self.did = did
+        self.database = database
+        self.directory = directory
+    }
+
+    func loadPublicRepositoryState() async throws -> PublicRepositoryState? {
+        try await database.loadPublicRepositoryState()
+    }
+
+    func verifyPublicRepositoryProjection() async throws {
+        try await database.verifyPublicRepositoryProjection()
+    }
+
+    func block(for cid: CID) async throws -> Data? {
+        try await database.block(for: cid)
+    }
+
+    func publicRepositoryRecordCID(
+        for path: PublicRepositoryPath
+    ) async throws -> CID? {
+        try await database.publicRepositoryRecordCID(for: path)
+    }
+
+    func reservePublicRepositoryRevision(
+        _ request: PublicRepositoryMutationRequest,
+        wallClockMicroseconds: UInt64
+    ) async throws -> PublicRepositoryMutationReservationOutcome {
+        try await database.reservePublicRepositoryRevision(
+            request,
+            wallClockMicroseconds: wallClockMicroseconds
+        )
+    }
+
+    func applyPublicRepositoryMutation(
+        reservation: PublicRepositoryMutationReservation,
+        prepared: PreparedPublicRepositoryMutation
+    ) async throws -> CommittedPublicRepositoryMutation {
+        let committed = try await database.applyPublicRepositoryMutation(
+            reservation: reservation,
+            prepared: prepared
+        )
+        try await directory.refreshPublicReadGenerationAfterMutation(
+            did: did,
+            database: database
+        )
+        return committed
+    }
+
+    func abandonPublicRepositoryReservation(
+        _ reservation: PublicRepositoryMutationReservation
+    ) async throws {
+        try await database.abandonPublicRepositoryReservation(reservation)
     }
 }

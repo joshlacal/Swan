@@ -97,7 +97,8 @@ private struct UntrustedLocalDPoPNonce: Decodable {
 func registerLocalhostOAuthEndpoints(
     on router: Router<BasicRequestContext>,
     configuration: SwanLocalhostOAuthConfiguration,
-    runtime: SwanOAuthRuntime
+    runtime: SwanOAuthRuntime,
+    loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
 ) {
     router.get("/oauth/authorize") { request, _ async -> Response in
         await beginLocalhostAuthorization(
@@ -106,11 +107,13 @@ func registerLocalhostOAuthEndpoints(
             runtime: runtime
         )
     }
-    router.post("/oauth/authorize") { request, _ async -> Response in
+    router.post("/oauth/authorize") { request, context async -> Response in
         await loginLocalhostAuthorization(
             request: request,
+            context: context,
             configuration: configuration,
-            runtime: runtime
+            runtime: runtime,
+            loginClientIdentityPolicy: loginClientIdentityPolicy
         )
     }
     router.post("/oauth/authorize/consent") { request, _ async -> Response in
@@ -170,8 +173,10 @@ private func beginLocalhostAuthorization(
 
 private func loginLocalhostAuthorization(
     request: Request,
+    context: SwanHTTPRequestContext,
     configuration: SwanLocalhostOAuthConfiguration,
-    runtime: SwanOAuthRuntime
+    runtime: SwanOAuthRuntime,
+    loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
 ) async -> Response {
     do {
         let form = try await parseLoginForm(request)
@@ -182,22 +187,51 @@ private func loginLocalhostAuthorization(
               pushed.binding.issuer == configuration.issuer.absoluteString else {
             return localhostAuthorizationError(.badRequest)
         }
-        guard let authenticated = await configuration.accounts.authenticate(
+        let clientIPAddress = try loginClientIdentityPolicy.clientIPAddress(
+            directPeer: context.remoteAddress?.ipAddress,
+            headers: request.headers
+        )
+        switch try await configuration.accounts.admitLogin(
+            handle: form.handle,
+            directPeer: clientIPAddress
+        ) {
+        case .rateLimited:
+            return localhostAuthorizationError(.tooManyRequests)
+        case .allowed:
+            break
+        }
+        let authenticated: AccountAuthenticationSuccess
+        switch try await configuration.accounts.authenticateForLogin(
             handle: form.handle,
             password: form.password
-        ) else {
+        ) {
+        case .rejected:
             return localhostAuthorizationError(.unauthorized)
+        case let .authenticated(success):
+            authenticated = success
         }
         let issued = try runtime.browserSessionService.issue(
             requestURI: session.requestURI,
             subject: authenticated.account.did,
+            subjectUpdatedAt: authenticated.account.updatedAt,
             lifetime: session.expiresAt.timeIntervalSinceNow
         )
         return localhostHTML(
             .ok,
-            consentPage(csrf: issued.session.csrfToken, subject: authenticated.account.did),
+            consentPage(
+                csrf: issued.session.csrfToken,
+                subject: authenticated.account.did,
+                clientID: pushed.binding.clientID,
+                scopes: pushed.binding.scopes
+            ),
             setCookie: browserCookie(issued.value)
         )
+    } catch is AccountLoginAdmissionError {
+        return localhostAuthorizationError(.serviceUnavailable)
+    } catch is AccountLoginAuthenticationError {
+        return localhostAuthorizationError(.serviceUnavailable)
+    } catch is SwanLoginClientIdentityError {
+        return localhostAuthorizationError(.serviceUnavailable)
     } catch {
         return localhostAuthorizationError(.badRequest)
     }
@@ -213,9 +247,13 @@ private func consentLocalhostAuthorization(
         let form = try await parseConsentForm(request)
         let session = try browserSession(from: request, runtime: runtime)
         guard let subject = session.subject,
+              let subjectRevision = session.subjectRevisionMicroseconds,
               form.csrf == session.csrfToken,
               let account = try await configuration.accounts.account(did: subject),
               account.status.authorizesAccount,
+              OAuthBrowserSessionService.subjectRevisionMicroseconds(
+                  for: account.updatedAt
+              ) == subjectRevision,
               let pushed = try await runtime.tokenService.activePushedAuthorizationRequest(session.requestURI),
               pushed.binding.issuer == configuration.issuer.absoluteString else {
             return fallback
@@ -235,7 +273,8 @@ private func consentLocalhostAuthorization(
             let code = try await runtime.tokenService.issueAuthorizationCode(
                 subject: account.did,
                 binding: consumed.binding,
-                codeChallengeS256: consumed.codeChallengeS256
+                codeChallengeS256: consumed.codeChallengeS256,
+                activeSubjectRevisionMicroseconds: subjectRevision
             )
             destination = try authorizationRedirect(
                 base: consumed.binding.redirectURI,
@@ -325,7 +364,10 @@ private func exchangeLocalhostToken(
                 dpopProof: dpopProof,
                 requestedScopes: form.scopes
             )
-            let grant = try await runtime.tokenService.validateAccess(pair.accessToken, proof: dpopProof)
+            let grant = try await runtime.tokenService.validateAccess(
+                pair.accessToken,
+                proof: dpopProof
+            )
             issued = OAuthTokenGrantResult(
                 accessToken: pair.accessToken,
                 accessExpiresAt: pair.accessExpiresAt,
@@ -721,9 +763,17 @@ private func loginPage(csrf: String) -> String {
     """
 }
 
-private func consentPage(csrf: String, subject: String) -> String {
-    """
-    <!doctype html><html><head><meta charset="utf-8"><title>Authorize Swan client</title></head><body><main><h1>Authorize local development client</h1><p>Signed in as \(htmlEscape(subject)).</p><form method="post" action="/oauth/authorize/consent"><input type="hidden" name="csrf" value="\(csrf)"><button name="decision" value="approve" type="submit">Approve</button><button name="decision" value="deny" type="submit">Deny</button></form></main></body></html>
+private func consentPage(
+    csrf: String,
+    subject: String,
+    clientID: String,
+    scopes: Set<String>
+) -> String {
+    let scopeItems = scopes.sorted().map {
+        "<li><code>\(htmlEscape($0))</code></li>"
+    }.joined()
+    return """
+    <!doctype html><html><head><meta charset="utf-8"><title>Authorize Swan client</title></head><body><main><h1>Authorize local development client</h1><p>Signed in as \(htmlEscape(subject)).</p><p>Client: <code>\(htmlEscape(clientID))</code></p><p>Requested access:</p><ul>\(scopeItems)</ul><form method="post" action="/oauth/authorize/consent"><input type="hidden" name="csrf" value="\(htmlEscape(csrf))"><button name="decision" value="approve" type="submit">Approve</button><button name="decision" value="deny" type="submit">Deny</button></form></main></body></html>
     """
 }
 
@@ -736,21 +786,33 @@ private func htmlEscape(_ value: String) -> String {
 }
 
 private func localhostHTML(_ status: HTTPResponse.Status, _ html: String, setCookie: String? = nil) -> Response {
-    var headers: HTTPFields = [.contentType: "text/html; charset=utf-8", .cacheControl: "no-store"]
+    var headers = localhostBrowserHeaders(contentType: "text/html; charset=utf-8")
     if let setCookie { headers[HTTPField.Name("Set-Cookie")!] = setCookie }
     return Response(status: status, headers: headers, body: .init(byteBuffer: ByteBuffer(string: html)))
 }
 
 private func localhostRedirect(_ destination: URL, clearCookie: Bool) -> Response {
-    var headers: HTTPFields = [.location: destination.absoluteString, .cacheControl: "no-store"]
+    var headers = localhostBrowserHeaders()
+    headers[.location] = destination.absoluteString
     if clearCookie { headers[HTTPField.Name("Set-Cookie")!] = expiredBrowserCookie() }
     return Response(status: .found, headers: headers)
 }
 
 private func localhostAuthorizationError(_ status: HTTPResponse.Status, clearCookie: Bool = false) -> Response {
-    var headers: HTTPFields = [.contentType: "text/plain; charset=utf-8", .cacheControl: "no-store"]
+    var headers = localhostBrowserHeaders(contentType: "text/plain; charset=utf-8")
     if clearCookie { headers[HTTPField.Name("Set-Cookie")!] = expiredBrowserCookie() }
     return Response(status: status, headers: headers, body: .init(byteBuffer: ByteBuffer(string: "authorization request rejected")))
+}
+
+private func localhostBrowserHeaders(contentType: String? = nil) -> HTTPFields {
+    var headers: HTTPFields = [.cacheControl: "no-store"]
+    if let contentType { headers[.contentType] = contentType }
+    headers[HTTPField.Name("Content-Security-Policy")!] =
+        "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+    headers[HTTPField.Name("X-Frame-Options")!] = "DENY"
+    headers[HTTPField.Name("Referrer-Policy")!] = "no-referrer"
+    headers[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"
+    return headers
 }
 
 private func localhostTokenNonceChallenge(runtime: SwanOAuthRuntime) -> Response {

@@ -15,6 +15,15 @@ public struct AccountAuthenticationSuccess: Sendable, Equatable {
     }
 }
 
+public enum AccountLoginAuthenticationOutcome: Sendable, Equatable {
+    case authenticated(AccountAuthenticationSuccess)
+    case rejected
+}
+
+public enum AccountLoginAuthenticationError: Error, Sendable, Equatable {
+    case unavailable
+}
+
 /// Durable registry, lifecycle, and local-password service. It never stores a
 /// raw password and never returns a verifier through directory lookup APIs.
 /// DID lifecycle/PLC operations remain outside this local control-plane slice.
@@ -23,17 +32,38 @@ public actor DurableAccountDirectory {
     private let passwordHasher: any PasswordHasher
     private let verificationExecutor: Argon2idVerificationExecutor
     private let keyProvisioner: AccountKeyProvisioner?
+    private let loginAdmissionService: AccountLoginAdmissionService?
+    private let dummyPasswordVerifier: String?
 
     public init(
         store: any AccountControlStore,
         passwordHasher: any PasswordHasher,
         verificationExecutor: Argon2idVerificationExecutor,
-        keyProvisioner: AccountKeyProvisioner? = nil
+        keyProvisioner: AccountKeyProvisioner? = nil,
+        loginAdmissionService: AccountLoginAdmissionService? = nil
     ) {
         self.store = store
         self.passwordHasher = passwordHasher
         self.verificationExecutor = verificationExecutor
         self.keyProvisioner = keyProvisioner
+        self.loginAdmissionService = loginAdmissionService
+        var generator = SystemRandomNumberGenerator()
+        let dummyPassword = Data(
+            (0 ..< 32).map { _ in
+                UInt8.random(in: 0 ... 255, using: &generator)
+            }
+        ).base64EncodedString()
+        if let verifier = try? passwordHasher.hash(dummyPassword),
+           (try? passwordHasher.needsRehash(verifier)) == false,
+           verifier.hasPrefix("$argon2id$v=19$"),
+           verifier.utf8.count <= 1_024,
+           verifier.utf8.allSatisfy({ $0 >= 0x20 && $0 <= 0x7e }) {
+            dummyPasswordVerifier = verifier
+        } else {
+            // A deployment whose boot-time dummy hash cannot be generated may
+            // still use non-login account APIs, but login fails unavailable.
+            dummyPasswordVerifier = nil
+        }
     }
 
     /// Creates key material in the configured external key store and records
@@ -62,8 +92,9 @@ public actor DurableAccountDirectory {
 
     /// Registers an account whose external key material was provisioned by an
     /// operator or a previous durable workflow. This accepts raw password only
-    /// at registration time; later credential changes are rehash upgrades
-    /// performed immediately after a successful password verification.
+    /// at registration time. A non-current restored verifier is not upgraded
+    /// through login because doing so would expose its different work factor;
+    /// password recovery or an operator migration must replace it.
     public func registerProvisionedAccount(
         did: String,
         canonicalHandle: String,
@@ -83,6 +114,11 @@ public actor DurableAccountDirectory {
             throw SwanError.malformed("account key references do not match the account generation")
         }
         let verifier = try passwordHasher.hash(password)
+        guard (try? passwordHasher.needsRehash(verifier)) == false else {
+            throw SwanError.unavailable(
+                "password hasher did not produce its configured Argon2id policy"
+            )
+        }
         let registration = try AccountControlRegistration(
             did: did,
             canonicalHandle: handle,
@@ -137,41 +173,149 @@ public actor DurableAccountDirectory {
         )
     }
 
-    /// Fails closed with `nil` for malformed handles, unknown accounts, missing
-    /// verifiers, wrong passwords, verifier parse errors, and every non-active
-    /// status. No public result differentiates those conditions.
+    /// Compatibility wrapper for non-HTTP callers. OAuth login must use
+    /// ``authenticateForLogin(handle:password:now:)`` so capacity and storage
+    /// unavailability cannot collapse into a bad-credentials response.
     public func authenticate(
         handle: String,
         password: String,
         now: Date = Date()
     ) async -> AccountAuthenticationSuccess? {
-        guard let handle = try? AccountIdentifiers.canonicalHandle(handle),
-              let initialAccount = try? await store.account(canonicalHandle: handle),
-              initialAccount.status.authorizesAccount,
-              let credential = try? await store.credential(did: initialAccount.did) else {
-            return nil
-        }
-
-        guard (try? await verificationExecutor.verify(password, encodedHash: credential.verifier)) == true else {
-            return nil
-        }
-
-        let replacement: String?
-        if (try? passwordHasher.needsRehash(credential.verifier)) == true,
-           let upgraded = try? passwordHasher.hash(password) {
-            replacement = upgraded
-        } else {
-            replacement = nil
-        }
-        guard let finalized = try? await store.finalizeAuthentication(
-            did: initialAccount.did,
-            expectedVerifier: credential.verifier,
-            replacementVerifier: replacement,
+        guard let outcome = try? await authenticateForLogin(
+            handle: handle,
+            password: password,
             now: now
-        ) else { return nil }
-        return AccountAuthenticationSuccess(
-            account: finalized.account,
-            credentialWasRehashed: finalized.credentialWasReplaced
+        ), case let .authenticated(success) = outcome else {
+            return nil
+        }
+        return success
+    }
+
+    /// Enumeration-resistant password verification for browser login.
+    ///
+    /// Every bounded input performs exactly one Argon2id verification.
+    /// Unknown, inactive, missing-credential, malformed-credential, and
+    /// malformed-handle paths use a boot-generated dummy verifier. A real
+    /// active credential uses its own verifier only when its PHC work factor
+    /// exactly matches that dummy. Infrastructure or executor saturation is
+    /// typed separately from the common rejected result.
+    public func authenticateForLogin(
+        handle: String,
+        password: String,
+        now: Date = Date()
+    ) async throws -> AccountLoginAuthenticationOutcome {
+        guard let dummyPasswordVerifier else {
+            throw AccountLoginAuthenticationError.unavailable
+        }
+
+        var candidate:
+            (account: AccountControlAccount, credential: AccountControlCredential)?
+        var storageUnavailable = false
+        if let canonicalHandle = try? AccountIdentifiers.canonicalHandle(handle) {
+            do {
+                if let account = try await store.account(
+                    canonicalHandle: canonicalHandle
+                ), account.status.authorizesAccount,
+                   account.credentialState == .configured {
+                    do {
+                        if let credential = try await store.credential(
+                            did: account.did
+                        ) {
+                            candidate = (account, credential)
+                        }
+                    } catch let error as AccountControlStoreError {
+                        if error == .unavailable {
+                            storageUnavailable = true
+                        }
+                        // Malformed/missing credential material deliberately
+                        // falls through to the dummy verification path.
+                    } catch {
+                        storageUnavailable = true
+                    }
+                }
+            } catch let error as AccountControlStoreError {
+                if error == .unavailable {
+                    storageUnavailable = true
+                }
+                // Identifier/account-record failures do not become an
+                // existence oracle; they still consume the dummy verifier.
+            } catch {
+                storageUnavailable = true
+            }
+        }
+
+        // A restored or legacy PHC string with a different work factor would
+        // make known-account failures measurably faster or slower than the
+        // unknown-account dummy path. Parse exactly one candidate (the dummy
+        // when none exists) and admit a real verifier only when it matches the
+        // configured hasher policy exactly. Non-current hashes
+        // fail closed through the same boot-generated dummy verification and
+        // require password recovery or an operator migration.
+        let proposedVerifier = candidate?.credential.verifier
+            ?? dummyPasswordVerifier
+        let matchesConfiguredPolicy =
+            (try? passwordHasher.needsRehash(proposedVerifier)) == false
+        if !matchesConfiguredPolicy {
+            candidate = nil
+        }
+        let selectedVerifier = candidate?.credential.verifier
+            ?? dummyPasswordVerifier
+        let verified: Bool
+        do {
+            verified = try await verificationExecutor.verify(
+                password,
+                encodedHash: selectedVerifier
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw AccountLoginAuthenticationError.unavailable
+        }
+        guard !storageUnavailable else {
+            throw AccountLoginAuthenticationError.unavailable
+        }
+        guard verified, let candidate else {
+            return .rejected
+        }
+
+        do {
+            guard let finalized = try await store.finalizeAuthentication(
+                did: candidate.account.did,
+                expectedVerifier: candidate.credential.verifier,
+                replacementVerifier: nil,
+                now: now
+            ) else {
+                return .rejected
+            }
+            return .authenticated(AccountAuthenticationSuccess(
+                account: finalized.account,
+                credentialWasRehashed: finalized.credentialWasReplaced
+            ))
+        } catch let error as AccountControlStoreError {
+            if error == .unavailable {
+                throw AccountLoginAuthenticationError.unavailable
+            }
+            return .rejected
+        } catch {
+            throw AccountLoginAuthenticationError.unavailable
+        }
+    }
+
+    /// Applies the mandatory login abuse boundary using the actual accepted
+    /// socket peer. A directory not composed with durable admission fails
+    /// unavailable rather than silently enabling unthrottled OAuth login.
+    public func admitLogin(
+        handle: String,
+        directPeer: String,
+        now: Date = Date()
+    ) async throws -> AccountLoginAdmissionDecision {
+        guard let loginAdmissionService else {
+            throw AccountLoginAdmissionError.unavailable
+        }
+        return try await loginAdmissionService.admit(
+            handle: handle,
+            directPeer: directPeer,
+            now: now
         )
     }
 

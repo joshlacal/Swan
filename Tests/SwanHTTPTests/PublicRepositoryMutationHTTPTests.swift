@@ -21,6 +21,7 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
     private static let publicURL = URL(string: "https://swan.example")!
     private static let collection = "app.bsky.feed.post"
     private static let mutationPath = "/xrpc/com.atproto.repo.createRecord"
+    private static let applyPath = "/xrpc/com.atproto.repo.applyWrites"
 
     func testExplicitRKeyPutDeleteNoOpAndSwapSemantics() async throws {
         let fixture = try await makeFixture()
@@ -118,6 +119,88 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testApplyWritesCreateRejectsMalformedPresentRKeyWithoutMutationAndAcceptsOmission() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let loadedInitialState =
+            try await fixture.database.loadPublicRepositoryState()
+        let initialState = try XCTUnwrap(loadedInitialState)
+        let malformedRKeys = [
+            ("invalid-string", #""bad/key""#),
+            ("wrong-type", "7"),
+            ("null", "null"),
+        ]
+        let app = fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.strict-rkey")
+        )
+
+        try await app.test(.router) { client in
+            for (name, rkey) in malformedRKeys {
+                let body = #"{"repo":"\#(Self.did)","writes":[{"$type":"com.atproto.repo.applyWrites#create","collection":"\#(Self.collection)","rkey":\#(rkey),"value":{"$type":"app.bsky.feed.post","text":"must-not-appear","createdAt":"2026-07-30T00:00:00.000Z"}}]}"#
+                let response = try await client.execute(
+                    uri: Self.applyPath,
+                    method: .post,
+                    headers: try fixture.headers(
+                        jti: "apply-malformed-\(name)",
+                        method: "POST",
+                        path: Self.applyPath
+                    ),
+                    body: ByteBuffer(string: body)
+                )
+
+                XCTAssertEqual(response.status, .badRequest, name)
+                XCTAssertEqual(
+                    try self.jsonObject(response.body)["error"] as? String,
+                    "InvalidRequest",
+                    name
+                )
+                XCTAssertEqual(response.headers[.cacheControl], "no-store", name)
+                let stateAfterRejectedRequest =
+                    try await fixture.database.loadPublicRepositoryState()
+                XCTAssertEqual(
+                    stateAfterRejectedRequest,
+                    initialState,
+                    name
+                )
+            }
+
+            let omitted = #"{"repo":"\#(Self.did)","writes":[{"$type":"com.atproto.repo.applyWrites#create","collection":"\#(Self.collection)","value":{"$type":"app.bsky.feed.post","text":"generated-rkey","createdAt":"2026-07-30T00:00:00.000Z"}}]}"#
+            let response = try await client.execute(
+                uri: Self.applyPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "apply-omitted-rkey",
+                    method: "POST",
+                    path: Self.applyPath
+                ),
+                body: ByteBuffer(string: omitted)
+            )
+
+            XCTAssertEqual(
+                response.status,
+                .ok,
+                String(decoding: response.body.readableBytesView, as: UTF8.self)
+            )
+            let results = try XCTUnwrap(
+                (try self.jsonObject(response.body))["results"] as? [[String: Any]]
+            )
+            XCTAssertEqual(results.count, 1)
+            XCTAssertTrue(
+                try XCTUnwrap(results.first?["uri"] as? String)
+                    .hasPrefix("at://\(Self.did)/\(Self.collection)/")
+            )
+            let stateAfterOmittedRKey =
+                try await fixture.database.loadPublicRepositoryState()
+            XCTAssertNotEqual(stateAfterOmittedRKey, initialState)
+        }
+    }
+
     func testPublicRecordLinksRequirePublicBlobReachability() async throws {
         let fixture = try await makeFixture()
         defer { Task { try? await fixture.database.close(); try? await fixture.control.close(); try? FileManager.default.removeItem(at: fixture.root) } }
@@ -196,7 +279,8 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
             }
 
             try await client.execute(
-                uri: "/xrpc/com.atproto.sync.getBlob?cid=" + publicReference.cid,
+                uri: "/xrpc/com.atproto.sync.getBlob?did=" + Self.did
+                    + "&cid=" + publicReference.cid,
                 method: .get
             ) { response in
                 XCTAssertEqual(response.status, .ok)
@@ -204,7 +288,8 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
                 XCTAssertEqual(response.headers[.contentLength], "12")
             }
             try await client.execute(
-                uri: "/xrpc/com.atproto.sync.getBlob?cid=" + privateReference.cid,
+                uri: "/xrpc/com.atproto.sync.getBlob?did=" + Self.did
+                    + "&cid=" + privateReference.cid,
                 method: .get
             ) { response in
                 XCTAssertEqual(response.status, .notFound)
@@ -274,7 +359,7 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         signer: any PublicRepositoryCommitSigner
     ) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
-            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")
+            from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-30.json")
         )
         return SwanHTTPServer(
             profile: profile,
@@ -450,10 +535,6 @@ private actor TestMutationDirectory: PublicRepositoryMutationDirectory {
             status: .active,
             store: database
         )
-    }
-
-    func publicBlob(cid: String) async throws -> PublicBlob? {
-        try await database.publicBlob(cid: cid)
     }
 }
 

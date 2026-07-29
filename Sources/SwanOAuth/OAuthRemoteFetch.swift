@@ -140,9 +140,12 @@ public struct OAuthRemoteFetchPolicy: Sendable, Equatable {
               components.user == nil, components.password == nil, components.fragment == nil else {
             throw SwanError.unauthorized("OAuth remote URL is malformed")
         }
-        let exactLocalhost = scheme == "http" && host == "localhost" &&
-            components.port == nil && (components.path.isEmpty || components.path == "/")
-        guard scheme == "https" || (allowLocalhostDevelopment && exactLocalhost) else {
+        // The localhost exception is an explicit development-only escape
+        // hatch.  Local XRPC services commonly use a non-default port and a
+        // method path; keeping the host literal still prevents it from
+        // becoming a general private-network allowance.
+        let localhostDevelopment = scheme == "http" && host == "localhost"
+        guard scheme == "https" || (allowLocalhostDevelopment && localhostDevelopment) else {
             throw SwanError.unauthorized("OAuth remote URL must use HTTPS")
         }
         if let literal = OAuthIPAddress(literal: host) {
@@ -179,6 +182,71 @@ public enum OAuthRemoteURLPolicy {
 
 public protocol OAuthHostnameResolving: Sendable {
     func resolve(host: String) async throws -> [OAuthIPAddress]
+}
+
+/// Bounds blocking `getaddrinfo` work independently of async request
+/// cancellation. A timed-out caller cannot cancel the libc call, so its lease
+/// is released only when that blocking operation actually returns. This
+/// prevents repeated DNS timeouts from accumulating an unbounded dispatch
+/// backlog after the higher-level remote-fetch permit has been released.
+final class OAuthBlockingDNSAdmission: @unchecked Sendable {
+    static let shared = OAuthBlockingDNSAdmission(maximumOutstanding: 4)
+
+    private let lock = NSLock()
+    private let maximumOutstanding: Int
+    private var outstanding = 0
+
+    init(maximumOutstanding: Int) {
+        precondition(maximumOutstanding > 0)
+        self.maximumOutstanding = maximumOutstanding
+    }
+
+    func acquire() throws -> OAuthBlockingDNSLease {
+        lock.lock()
+        guard outstanding < maximumOutstanding else {
+            lock.unlock()
+            throw SwanError.unavailable(
+                "OAuth DNS resolver capacity is exhausted"
+            )
+        }
+        outstanding += 1
+        lock.unlock()
+        return OAuthBlockingDNSLease(admission: self)
+    }
+
+    fileprivate func release() {
+        lock.lock()
+        precondition(outstanding > 0)
+        outstanding -= 1
+        lock.unlock()
+    }
+
+    var outstandingCountForTesting: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return outstanding
+    }
+}
+
+final class OAuthBlockingDNSLease: @unchecked Sendable {
+    private let lock = NSLock()
+    private var admission: OAuthBlockingDNSAdmission?
+
+    fileprivate init(admission: OAuthBlockingDNSAdmission) {
+        self.admission = admission
+    }
+
+    func release() {
+        lock.lock()
+        let held = admission
+        admission = nil
+        lock.unlock()
+        held?.release()
+    }
+
+    deinit {
+        release()
+    }
 }
 
 /// Races DNS resolution against the same deadline used by the transport.
@@ -282,8 +350,10 @@ public struct SystemOAuthHostnameResolver: OAuthHostnameResolving {
 
     public func resolve(host: String) async throws -> [OAuthIPAddress] {
         if let literal = OAuthIPAddress(literal: host) { return [literal] }
+        let admission = try OAuthBlockingDNSAdmission.shared.acquire()
         return try await withCheckedThrowingContinuation { continuation in
             Self.queue.async {
+                defer { admission.release() }
                 var hints = addrinfo()
                 hints.ai_flags = AI_ADDRCONFIG
                 hints.ai_family = AF_UNSPEC
@@ -397,6 +467,76 @@ public final class AsyncHTTPClientOAuthTransport: OAuthRemoteTransport {
     }
 }
 
+/// One process-wide budget covers every outbound OAuth document, including
+/// metadata and a metadata document's remote JWKS. Admission is deliberately
+/// non-queueing: an attacker controlling many distinct URLs cannot turn the
+/// server into an unbounded waiter or connection factory.
+private final class OAuthRemoteFetchAdmission: @unchecked Sendable {
+    static let shared = OAuthRemoteFetchAdmission(limit: 8)
+
+    private let lock = NSLock()
+    private let limit: Int
+    private var active = 0
+
+    private init(limit: Int) {
+        precondition(limit > 0)
+        self.limit = limit
+    }
+
+    func acquire() throws -> OAuthRemoteFetchAdmissionLease {
+        lock.lock()
+        guard active < limit else {
+            lock.unlock()
+            throw SwanError.unavailable(
+                "OAuth remote fetch admission capacity is exhausted"
+            )
+        }
+        active += 1
+        lock.unlock()
+        return OAuthRemoteFetchAdmissionLease(admission: self)
+    }
+
+    fileprivate func release() {
+        lock.lock()
+        precondition(active > 0)
+        active -= 1
+        lock.unlock()
+    }
+}
+
+private final class OAuthRemoteFetchAdmissionLease: @unchecked Sendable {
+    private let lock = NSLock()
+    private var admission: OAuthRemoteFetchAdmission?
+
+    fileprivate init(admission: OAuthRemoteFetchAdmission) {
+        self.admission = admission
+    }
+
+    func release() {
+        lock.lock()
+        let heldAdmission = admission
+        admission = nil
+        lock.unlock()
+        heldAdmission?.release()
+    }
+
+    deinit {
+        release()
+    }
+}
+
+/// Capability handed only to code already holding the process-wide admission
+/// lease. A metadata loader keeps one lease across the metadata document and
+/// its optional remote JWKS, so the second fetch cannot bypass or deadlock
+/// against the same budget.
+struct OAuthAdmittedRemoteDocumentFetcher: Sendable {
+    fileprivate let fetcher: OAuthRemoteDocumentFetcher
+
+    func fetchJSON(from url: URL) async throws -> Data {
+        try await fetcher.fetchJSONWithoutAdmission(from: url)
+    }
+}
+
 /// Applies the complete local policy around a single GET. It intentionally has
 /// no cache: only a domain loader can know that a fetched JSON body was fully
 /// validated before retaining it.
@@ -416,6 +556,28 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
     }
 
     public func fetchJSON(from url: URL) async throws -> Data {
+        _ = try policy.validateURL(url)
+        return try await withAdmission { admittedFetcher in
+            try await admittedFetcher.fetchJSON(from: url)
+        }
+    }
+
+    func withAdmission<T: Sendable>(
+        _ operation: @escaping @Sendable (
+            OAuthAdmittedRemoteDocumentFetcher
+        ) async throws -> T
+    ) async throws -> T {
+        try Task.checkCancellation()
+        let admission = try OAuthRemoteFetchAdmission.shared.acquire()
+        defer { admission.release() }
+        return try await operation(
+            OAuthAdmittedRemoteDocumentFetcher(fetcher: self)
+        )
+    }
+
+    fileprivate func fetchJSONWithoutAdmission(from url: URL) async throws
+        -> Data
+    {
         let host = try policy.validateURL(url)
         let preflightPeers = Set(try await resolveOAuthHostname(
             resolver, host: host, timeout: policy.timeout
@@ -490,8 +652,13 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
 /// This is separate from `OAuthRemoteTransport` so existing metadata fetch
 /// fakes cannot accidentally gain a request-body capability.
 public protocol OAuthRemotePostTransport: Sendable {
+    /// `approvedPeers` is the exact, policy-checked DNS answer set observed
+    /// immediately before this request. A concrete transport must reject its
+    /// configured literal pin unless it is a member of this set, before
+    /// opening a connection or writing any request bytes.
     func post(
         url: URL,
+        approvedPeers: Set<OAuthIPAddress>,
         headers: [String: String],
         body: Data,
         timeout: TimeInterval,
@@ -533,6 +700,7 @@ public final class AsyncHTTPClientOAuthPostTransport: OAuthRemotePostTransport {
 
     public func post(
         url: URL,
+        approvedPeers _: Set<OAuthIPAddress>,
         headers: [String: String],
         body: Data,
         timeout: TimeInterval,
@@ -577,14 +745,15 @@ public struct OAuthBoundedJSONPoster: Sendable {
             throw SwanError.malformed("outbound JSON body is out of bounds")
         }
         let host = try policy.validateURL(url)
-        let initialAddresses = try await resolveOAuthHostname(
+        let initialAddresses = Set(try await resolveOAuthHostname(
             resolver, host: host, timeout: policy.timeout
-        )
-        try policy.validateResolved(initialAddresses, host: host)
+        ))
+        try policy.validateResolved(Array(initialAddresses), host: host)
         let response: OAuthRemoteHTTPResponse
         do {
             response = try await transport.post(
                 url: url,
+                approvedPeers: initialAddresses,
                 headers: headers,
                 body: body,
                 timeout: policy.timeout,
@@ -598,10 +767,10 @@ public struct OAuthBoundedJSONPoster: Sendable {
         // Re-resolve after the request and require the transport to prove the
         // actual peer belongs to *both* approved answer sets. A nil peer is
         // never a permissive fallback for service-to-service delivery.
-        let finalAddresses = try await resolveOAuthHostname(
+        let finalAddresses = Set(try await resolveOAuthHostname(
             resolver, host: host, timeout: policy.timeout
-        )
-        try policy.validateResolved(finalAddresses, host: host)
+        ))
+        try policy.validateResolved(Array(finalAddresses), host: host)
         guard response.redirectCount == 0,
               response.responseURL.absoluteString == url.absoluteString,
               (200 ... 299).contains(response.status),

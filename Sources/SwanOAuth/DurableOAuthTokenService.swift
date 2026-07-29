@@ -238,6 +238,7 @@ public actor DurableOAuthTokenService {
         subject: String,
         session: OAuthValidatedSession,
         codeChallengeS256: String,
+        activeSubjectRevisionMicroseconds: Int64? = nil,
         codeLifetime: TimeInterval = 60,
         refreshLifetime: TimeInterval = 14 * 24 * 60 * 60,
         familyID: UUID = UUID(),
@@ -247,6 +248,7 @@ public actor DurableOAuthTokenService {
             subject: subject,
             binding: session.durableBinding,
             codeChallengeS256: codeChallengeS256,
+            activeSubjectRevisionMicroseconds: activeSubjectRevisionMicroseconds,
             codeLifetime: codeLifetime,
             refreshLifetime: refreshLifetime,
             familyID: familyID,
@@ -262,6 +264,7 @@ public actor DurableOAuthTokenService {
         subject: String,
         binding: OAuthClientBinding,
         codeChallengeS256: String,
+        activeSubjectRevisionMicroseconds: Int64? = nil,
         codeLifetime: TimeInterval = 60,
         refreshLifetime: TimeInterval = 14 * 24 * 60 * 60,
         familyID: UUID = UUID(),
@@ -283,7 +286,16 @@ public actor DurableOAuthTokenService {
             familyExpiresAt: now.addingTimeInterval(refreshLifetime)
         )
         do {
-            try await controlStore.storeAuthorizationCode(record, now: now)
+            if let activeSubjectRevisionMicroseconds {
+                try await controlStore.storeAuthorizationCode(
+                    record,
+                    requiringActiveSubjectRevisionMicroseconds:
+                        activeSubjectRevisionMicroseconds,
+                    now: now
+                )
+            } else {
+                try await controlStore.storeAuthorizationCode(record, now: now)
+            }
         } catch {
             throw secureControlError(error)
         }
@@ -298,7 +310,7 @@ public actor DurableOAuthTokenService {
         verifier: String,
         session: OAuthValidatedSession,
         accessLifetime: TimeInterval = 300,
-        requireActiveSubject: Bool = false,
+        requireActiveSubject: Bool,
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
         let binding = session.durableBinding
@@ -436,9 +448,40 @@ public actor DurableOAuthTokenService {
         proof: OAuthValidatedDPoPProof,
         now: Date = Date()
     ) async throws -> AccessGrant {
+        try await validateAccess(
+            token,
+            proof: proof,
+            requireActiveSubject: true,
+            now: now
+        )
+    }
+
+    /// Test-only seam for durable token mechanics that intentionally construct
+    /// token families without provisioning an account row. Runtime call sites
+    /// cannot opt out of the active-subject check.
+    func validateAccessWithoutActiveSubjectCheck(
+        _ token: String,
+        proof: OAuthValidatedDPoPProof,
+        now: Date = Date()
+    ) async throws -> AccessGrant {
+        try await validateAccess(
+            token,
+            proof: proof,
+            requireActiveSubject: false,
+            now: now
+        )
+    }
+
+    private func validateAccess(
+        _ token: String,
+        proof: OAuthValidatedDPoPProof,
+        requireActiveSubject: Bool,
+        now: Date
+    ) async throws -> AccessGrant {
         do {
             let family = try await controlStore.validatedAccessToken(
                 accessTokenDigest: digest(token, purpose: .accessToken),
+                requireActiveSubject: requireActiveSubject,
                 now: now
             )
             try requirePresentedBindings(
@@ -462,7 +505,7 @@ public actor DurableOAuthTokenService {
         clientAssertion: OAuthValidatedClientAssertion?,
         metadataLoader: OAuthClientMetadataLoader,
         accessLifetime: TimeInterval = 300,
-        requireActiveSubject: Bool = false,
+        requireActiveSubject: Bool,
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
         let refreshDigest = digest(refreshToken, purpose: .refreshToken)

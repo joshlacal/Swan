@@ -649,7 +649,8 @@ private struct Fixture: Sendable {
         try await accountDatabase.close()
         preopenedDirectory = try await SQLitePreMigratedAccountDirectory.bootstrap(
             dataDirectory: root,
-            controlStore: control
+            controlStore: control,
+            publicIdentityVerifier: nil
         )
     }
 

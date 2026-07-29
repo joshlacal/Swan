@@ -73,7 +73,7 @@ final class AccountOperatorServiceTests: XCTestCase {
         }
     }
 
-    func testOperatorServiceTransitionsLifecycleAndProjectsOnlySanitizedJSON() async throws {
+    func testOperatorServiceTransitionsReversibleLifecycle() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let control = try await SQLiteControlDatabase(dataDirectory: root)
@@ -103,35 +103,139 @@ final class AccountOperatorServiceTests: XCTestCase {
                 now: Date(timeIntervalSince1970: 1_750_000_020)
             )
             XCTAssertEqual(reactivated.status, "active")
+            try await control.close()
+        } catch {
+            try? await control.close()
+            throw error
+        }
+    }
+
+    func testDeleteInvokesPermanentCoordinatorAndReturnsMinimalSanitizedTerminalView() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        do {
+            try await createAlice(in: control)
+            let now = Date(timeIntervalSince1970: 1_750_000_030)
+            let manifest =
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            let terminal = try AccountDeletionTombstone(
+                did: Self.aliceDID,
+                finalizedAt: Date(timeIntervalSince1970: 1_750_000_031),
+                revision: 9,
+                tombstone: AccountTombstoneMetadata(
+                    declaredAt: now,
+                    reason: "operator-request"
+                ),
+                export: AccountExportMetadata(
+                    declaredAt: now,
+                    reference: manifest
+                )
+            )
+            let deletion = RecordingPermanentDeletionCoordinator(result: terminal)
+            let service = AccountOperatorService(
+                store: control,
+                permanentDeletionCoordinator: deletion
+            )
+            let authorization = try OperatorSecretResolver.authorize(
+                environment: ["SWAN_OPERATOR_SECRET": "operator-secret"],
+                secretFile: nil
+            )
+
             let deleted = try await service.delete(
                 did: Self.aliceDID,
                 tombstoneReason: "operator-request",
-                exportReference: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                exportReference: manifest,
                 authorization: authorization,
-                now: Date(timeIntervalSince1970: 1_750_000_030)
+                now: now
             )
-            XCTAssertEqual(deleted.status, "deleted")
-            XCTAssertEqual(deleted.tombstone?.reason, "operator-request")
+
+            let requests = await deletion.recordedRequests()
             XCTAssertEqual(
-                deleted.export?.reference,
-                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                requests,
+                [
+                    .init(
+                        did: Self.aliceDID,
+                        declaration: AccountLifecycleDeclaration(
+                            tombstone: try AccountTombstoneMetadata(
+                                declaredAt: now,
+                                reason: "operator-request"
+                            ),
+                            export: try AccountExportMetadata(
+                                declaredAt: now,
+                                reference: manifest
+                            )
+                        ),
+                        now: now
+                    ),
+                ]
             )
+            XCTAssertEqual(deleted.did, Self.aliceDID)
+            XCTAssertEqual(deleted.status, "deleted")
+            XCTAssertNil(deleted.canonicalHandle)
+            XCTAssertNil(deleted.createdAt)
+            XCTAssertNil(deleted.updatedAt)
+            XCTAssertEqual(deleted.finalizedAt, terminal.finalizedAt)
+            XCTAssertEqual(deleted.tombstone, terminal.tombstone)
+            XCTAssertEqual(deleted.export, terminal.export)
 
             let rendered = try AccountOperatorJSON.render(deleted)
             let object = try XCTUnwrap(
                 JSONSerialization.jsonObject(with: rendered) as? [String: Any]
             )
+            XCTAssertEqual(
+                Set(object.keys),
+                Set(["did", "status", "finalizedAt", "tombstone", "export"])
+            )
             XCTAssertEqual(object["did"] as? String, Self.aliceDID)
-            XCTAssertEqual(object["canonicalHandle"] as? String, "alice.example.com")
             XCTAssertEqual(object["status"] as? String, "deleted")
-            XCTAssertNotNil(object["tombstone"])
-            XCTAssertNotNil(object["export"])
             let text = String(decoding: rendered, as: UTF8.self)
+            XCTAssertFalse(text.contains("alice.example.com"))
             XCTAssertFalse(text.contains("$argon2id$"))
             XCTAssertFalse(text.contains("signingKey"))
             XCTAssertFalse(text.contains("rotationKey"))
             XCTAssertFalse(text.contains("passwordVerifier"))
             XCTAssertFalse(text.contains("operator-secret"))
+
+            // The coordinator owns all lifecycle mutation. The operator
+            // service must never append a generic `.deleted` transition.
+            let accountAfterDelegatedDeletion = try await control.account(
+                did: Self.aliceDID
+            )
+            XCTAssertEqual(accountAfterDelegatedDeletion?.status, .active)
+            try await control.close()
+        } catch {
+            try? await control.close()
+            throw error
+        }
+    }
+
+    func testDeleteFailsClosedWithoutPermanentDeletionCapabilityAndLeavesAccountActive() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        do {
+            try await createAlice(in: control)
+            let service = AccountOperatorService(store: control)
+            let authorization = try OperatorSecretResolver.authorize(
+                environment: ["SWAN_OPERATOR_SECRET": "operator-secret"],
+                secretFile: nil
+            )
+
+            do {
+                _ = try await service.delete(
+                    did: Self.aliceDID,
+                    authorization: authorization,
+                    now: Date(timeIntervalSince1970: 1_750_000_030)
+                )
+                XCTFail("deletion ran without the permanent-deletion capability")
+            } catch let error as AccountOperatorError {
+                XCTAssertEqual(error, .permanentDeletionUnavailable)
+            }
+            let accountAfterRejectedDeletion = try await control.account(
+                did: Self.aliceDID
+            )
+            XCTAssertEqual(accountAfterRejectedDeletion?.status, .active)
             try await control.close()
         } catch {
             try? await control.close()
@@ -234,3 +338,39 @@ final class AccountOperatorServiceTests: XCTestCase {
 }
 
 private let testVerifier = "$argon2id$v=19$m=65536,t=3,p=1$bcdefghijklmnopqrstuvw$BCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq"
+
+private struct PermanentDeletionRequest: Sendable, Equatable {
+    let did: String
+    let declaration: AccountLifecycleDeclaration
+    let now: Date
+}
+
+private actor RecordingPermanentDeletionCoordinator:
+    AccountPermanentDeletionCoordinating
+{
+    private let result: AccountDeletionTombstone
+    private var requests: [PermanentDeletionRequest] = []
+
+    init(result: AccountDeletionTombstone) {
+        self.result = result
+    }
+
+    func beginAndResume(
+        did: String,
+        declaration: AccountLifecycleDeclaration,
+        now: Date
+    ) async throws -> AccountDeletionTombstone {
+        requests.append(
+            PermanentDeletionRequest(
+                did: did,
+                declaration: declaration,
+                now: now
+            )
+        )
+        return result
+    }
+
+    func recordedRequests() -> [PermanentDeletionRequest] {
+        requests
+    }
+}

@@ -1,5 +1,9 @@
+import Crypto
 import Foundation
+import Petrel
+import secp256k1
 import SwanCore
+import SwanPublicRepository
 import SwanStorage
 
 public struct SwanPublicPLCGenesisVerifier: PublicPLCGenesisVerifying {
@@ -122,5 +126,75 @@ extension SwanPublicPLCGenesisVerifier: PublicPLCIdentityVerifying {
             rotationDIDKey: rotationDIDKey,
             keyGeneration: generation
         )
+    }
+}
+
+extension SwanPublicPLCGenesisVerifier: PublicPLCRepositoryAuthenticating {
+    public func authenticateRepositoryCommit(
+        signedCommitBytes: Data,
+        expectedCommitCID: CID,
+        expectedDID: String,
+        signingDIDKey: String
+    ) async throws -> PublicRepositoryCommitAuthentication {
+        let verifier: any PublicRepositoryCommitVerifier
+        switch try PLCDIDKeyCodec.decode(signingDIDKey) {
+        case let .p256(publicKey):
+            verifier = P256PublicRepositoryCommitVerifier(
+                publicKey: publicKey
+            )
+        case let .secp256k1(compressedPublicKey):
+            verifier = try PLCSecp256k1RepositoryCommitVerifier(
+                compressedPublicKey: compressedPublicKey
+            )
+        }
+        let verified = try await PublicRepositoryCommitCodec.verify(
+            signedCommitBytes: signedCommitBytes,
+            expectedCommitCID: expectedCommitCID,
+            verifier: verifier
+        )
+        guard verified.descriptor.did == expectedDID else {
+            throw SwanError.unauthorized(
+                "public repository commit DID does not match PLC identity"
+            )
+        }
+        return try PublicRepositoryCommitAuthentication(
+            descriptor: verified.descriptor,
+            commitCID: verified.commitCID,
+            verificationIdentity: verifier.verificationIdentity
+        )
+    }
+}
+
+private struct PLCSecp256k1RepositoryCommitVerifier:
+    PublicRepositoryCommitVerifier,
+    @unchecked Sendable
+{
+    let signingAlgorithm: PublicRepositorySigningAlgorithm = .secp256k1
+    let verificationIdentity: String
+    private let publicKey: secp256k1.Signing.PublicKey
+
+    init(compressedPublicKey: Data) throws {
+        publicKey = try secp256k1.Signing.PublicKey(
+            dataRepresentation: compressedPublicKey,
+            format: .compressed
+        )
+        verificationIdentity =
+            "secp256k1-sha256:\(Hex.encode(SHA256.hash(data: compressedPublicKey)))"
+    }
+
+    func verify(
+        signature: Data,
+        unsignedCommitBytes: Data,
+        did _: String
+    ) async throws {
+        let decoded = try secp256k1.Signing.ECDSASignature(
+            compactRepresentation: signature
+        )
+        guard publicKey.isValidSignature(
+            decoded,
+            for: unsignedCommitBytes
+        ) else {
+            throw PublicRepositoryCommitError.invalidSignature
+        }
     }
 }

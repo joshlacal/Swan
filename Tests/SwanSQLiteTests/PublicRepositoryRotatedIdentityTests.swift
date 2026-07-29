@@ -47,15 +47,14 @@ final class PublicRepositoryRotatedIdentityTests: XCTestCase {
         let rotated = try PLCOperationCodec.sign(.regular(nextUnsigned), using: rotationKey)
 
         let accountDatabase = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
-        let repositoryKey = P256.Signing.PrivateKey()
         let repositoryGenesis = try PublicRepositoryGenesisCodec.create(
             did: did,
             revision: "3jzfcijpj2z2a",
-            signingKey: repositoryKey
+            signingKey: nextSigningKey
         )
         _ = try await accountDatabase.installPublicRepositoryGenesis(
             repositoryGenesis,
-            signingPublicKey: repositoryKey.publicKey,
+            signingPublicKey: nextSigningKey.publicKey,
             installedAt: Date(timeIntervalSince1970: 1_750_000_000)
         )
         let journal = try PLCAccountPreparationJournal(

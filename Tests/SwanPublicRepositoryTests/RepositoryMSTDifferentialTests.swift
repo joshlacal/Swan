@@ -75,6 +75,128 @@ final class RepositoryMSTDifferentialTests: XCTestCase {
         }
     }
 
+    // Production mutations caught: range traversal reverses one comparator,
+    // treats the cursor as inclusive, leaks records from an adjacent
+    // collection, or returns insertion order instead of the pinned
+    // TypeScript ordering.
+    func testSeededBoundedPagesMatchIndependentFullScanOracle() async throws {
+        let recordCID = try CID.parse(
+            "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454"
+        )
+        let collections = [
+            "app.bsky.feed.like",
+            "app.bsky.feed.post",
+            "com.example.record",
+        ]
+        var expected: [PublicRepositoryPath: CID] = [:]
+        for index in 0..<384 {
+            let path = try PublicRepositoryPath(
+                collection: collections[index % collections.count],
+                recordKey: String(format: "record-%04d", index * 2)
+            )
+            expected[path] = recordCID
+        }
+        let oracle = try SlowMSTRebuild.build(expected)
+        XCTAssertGreaterThan(oracle.blocks.count, 1)
+
+        var random = SeededGenerator(seed: 0x5A17_2026_0730)
+        let selectedCollections = collections + ["app.bsky.feed.message"]
+        for sample in 0..<96 {
+            let collection = selectedCollections[
+                Int(random.next() % UInt64(selectedCollections.count))
+            ]
+            let reverse = random.next().isMultiple(of: 2)
+            let limit = Int(random.next() % 20) + 1
+            let cursor: String? = random.next().isMultiple(of: 4)
+                ? nil
+                : String(
+                    format: "record-%04d",
+                    Int(random.next() % 768)
+                )
+            let source = PageCountingBlockSource(oracle.blocks)
+            let tree = try RepositoryMST.load(
+                rootCID: oracle.rootCID,
+                blocks: source
+            )
+
+            let page = try await tree.page(
+                collection: collection,
+                limit: limit,
+                cursor: cursor,
+                reverse: reverse
+            )
+            let expectedPage = slowPage(
+                records: expected,
+                collection: collection,
+                limit: limit,
+                cursor: cursor,
+                reverse: reverse
+            )
+            XCTAssertEqual(
+                page.leaves,
+                expectedPage,
+                "seeded page sample \(sample)"
+            )
+            XCTAssertGreaterThan(page.visitedNodeCount, 0)
+            XCTAssertLessThanOrEqual(
+                page.visitedNodeCount,
+                (limit + 2) * 129
+            )
+            let sourceReadCount = await source.readCount
+            XCTAssertEqual(
+                sourceReadCount,
+                page.visitedNodeCount,
+                "every visited node must correspond to exactly one block read"
+            )
+        }
+    }
+
+    // Production mutation caught: child-range pruning is removed or uses only
+    // the requested collection prefix, turning a missing collection with a
+    // one-record limit into a full repository walk.
+    func testMissingCollectionPageVisitsFewerNodesThanLargeRepositoryContains()
+        async throws
+    {
+        let recordCID = try CID.parse(
+            "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454"
+        )
+        var expected: [PublicRepositoryPath: CID] = [:]
+        for index in 0..<4_096 {
+            let collection = index.isMultiple(of: 2)
+                ? "app.bsky.feed.like"
+                : "app.bsky.feed.post"
+            expected[try PublicRepositoryPath(
+                collection: collection,
+                recordKey: String(format: "record-%05d", index)
+            )] = recordCID
+        }
+        let oracle = try SlowMSTRebuild.build(expected)
+        XCTAssertGreaterThan(
+            oracle.blocks.count,
+            3 * 129,
+            "fixture must be larger than the page's cardinality-independent budget"
+        )
+        let source = PageCountingBlockSource(oracle.blocks)
+        let tree = try RepositoryMST.load(
+            rootCID: oracle.rootCID,
+            blocks: source
+        )
+
+        let page = try await tree.page(
+            collection: "app.bsky.feed.message",
+            limit: 1,
+            cursor: nil,
+            reverse: false
+        )
+
+        XCTAssertEqual(page.leaves, [])
+        XCTAssertGreaterThan(page.visitedNodeCount, 0)
+        XCTAssertLessThanOrEqual(page.visitedNodeCount, 3 * 129)
+        XCTAssertLessThan(page.visitedNodeCount, oracle.blocks.count)
+        let sourceReadCount = await source.readCount
+        XCTAssertEqual(sourceReadCount, page.visitedNodeCount)
+    }
+
     private func assertEquivalent(
         incremental: RepositoryMST,
         expected: [PublicRepositoryPath: CID],
@@ -125,6 +247,30 @@ final class RepositoryMSTDifferentialTests: XCTestCase {
             ]),
             for: path
         )
+    }
+
+    private func slowPage(
+        records: [PublicRepositoryPath: CID],
+        collection: String,
+        limit: Int,
+        cursor: String?,
+        reverse: Bool
+    ) -> [RepositoryMSTLeaf] {
+        let inCollection = records.map {
+            RepositoryMSTLeaf(path: $0.key, recordCID: $0.value)
+        }.filter { leaf in
+            guard leaf.path.collection == collection else { return false }
+            guard let cursor else { return true }
+            return reverse
+                ? leaf.path.recordKey > cursor
+                : leaf.path.recordKey < cursor
+        }
+        let ordered = inCollection.sorted {
+            reverse
+                ? $0.path.recordKey < $1.path.recordKey
+                : $0.path.recordKey > $1.path.recordKey
+        }
+        return Array(ordered.prefix(limit))
     }
 }
 
@@ -203,6 +349,20 @@ private struct DictionaryBlockSource: PublicRepositoryBlockSource {
 
     func block(for cid: CID) async throws -> Data? {
         storage[cid]
+    }
+}
+
+private actor PageCountingBlockSource: PublicRepositoryBlockSource {
+    private let storage: [CID: Data]
+    private(set) var readCount = 0
+
+    init(_ storage: [CID: Data]) {
+        self.storage = storage
+    }
+
+    func block(for cid: CID) async throws -> Data? {
+        readCount += 1
+        return storage[cid]
     }
 }
 

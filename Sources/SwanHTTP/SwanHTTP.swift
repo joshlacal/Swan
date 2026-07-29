@@ -2,6 +2,7 @@ import Foundation
 import Hummingbird
 import HTTPTypes
 import Logging
+import NIOCore
 import ServiceLifecycle
 import SwanAccounts
 import SwanCore
@@ -10,6 +11,25 @@ import SwanPublicWire
 import SwanSpaces
 import SwanSpacesWire
 import SwanStorage
+
+/// Public-listener context retaining the accepted channel's direct socket
+/// peer. Forwarded headers are deliberately not decoded into this type.
+public struct SwanHTTPRequestContext:
+    RequestContext,
+    RemoteAddressRequestContext
+{
+    public var coreContext: CoreRequestContextStorage
+    public let remoteAddress: SocketAddress?
+
+    public init(source: ApplicationRequestContextSource) {
+        coreContext = .init(source: source)
+        remoteAddress = source.channel.remoteAddress
+    }
+}
+
+// Keep the existing internal route-registration signatures compact while
+// migrating the complete public router to the peer-retaining context.
+typealias BasicRequestContext = SwanHTTPRequestContext
 
 /// An explicit publication boundary for OAuth discovery. The only public
 /// construction is `.unavailable`; a future complete HTTP assembly inside
@@ -241,6 +261,10 @@ public struct SwanHTTPServer: Sendable {
     /// cannot coexist with the narrower localhost bridge because both own the
     /// same PAR, browser, token, and revocation paths.
     public let authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration?
+    /// Resolves the password-login admission identity from the accepted socket
+    /// peer and, only for explicitly trusted peers, Swan's single internal
+    /// proxy header. The default ignores every forwarding header.
+    public let loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
     /// The one authenticated authority `getSpace` query. It is unavailable by
     /// default and only constructed from this server's runtime and canonical
     /// public URL after account databases have been preopened at startup.
@@ -287,6 +311,10 @@ public struct SwanHTTPServer: Sendable {
     /// this capability, and it is only formed alongside the server-bound
     /// OAuth resource authorizer.
     public let publicRepositoryMutations: SwanPublicRepositoryMutationCapability?
+    /// Durable account-email confirmation and password-recovery routes. This
+    /// capability is nil unless the caller has assembled the proof codec,
+    /// control-store adapter, rate limiter, and SMTP worker at startup.
+    public let accountEmailXRPC: SwanAccountEmailXRPCServer?
 
     public init(
         profile: ProtocolProfile,
@@ -308,13 +336,17 @@ public struct SwanHTTPServer: Sendable {
         simpleSpaceCheckUserAccessConfiguration: SwanSimpleSpaceCheckUserAccessHTTPConfiguration? = nil,
         publicRepositoryReadDirectory: (any PublicRepositoryReadDirectory)? = nil,
         publicRepositoryMutationDirectory: (any PublicRepositoryMutationDirectory)? = nil,
-        publicRepositoryMutationSignerProvider: (any PublicRepositoryMutationSignerProvider)? = nil
+        publicRepositoryMutationSignerProvider: (any PublicRepositoryMutationSignerProvider)? = nil,
+        accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
+        loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct
     ) {
         self.profile = profile
         self.configuration = configuration
         self.repositories = repositories
         self.oauthRuntime = oauthRuntime
+        self.loginClientIdentityPolicy = loginClientIdentityPolicy
         self.publicRepositoryReadDirectory = publicRepositoryReadDirectory
+        self.accountEmailXRPC = accountEmailXRPC
         if let simpleSpaceCheckUserAccessConfiguration {
             simpleSpaceCheckUserAccess = SwanSimpleSpaceCheckUserAccessCapability(
                 serviceAuthentication: simpleSpaceCheckUserAccessConfiguration.serviceAuthentication,
@@ -551,8 +583,8 @@ public struct SwanHTTPServer: Sendable {
     /// All routes are registered before Application construction. Hummingbird
     /// ignores routes appended after app initialization, so this is the only
     /// supported server assembly boundary.
-    public func buildRouter() -> Router<BasicRequestContext> {
-        let router = Router(context: BasicRequestContext.self)
+    public func buildRouter() -> Router<SwanHTTPRequestContext> {
+        let router = Router(context: SwanHTTPRequestContext.self)
         router.get("/health") { _, _ in "OK" }
 
         let publicURL = configuration.publicURL
@@ -587,7 +619,8 @@ public struct SwanHTTPServer: Sendable {
             registerOAuthAuthorizationServerEndpoints(
                 on: router,
                 configuration: authorizationServerConfiguration,
-                runtime: oauthRuntime
+                runtime: oauthRuntime,
+                loginClientIdentityPolicy: loginClientIdentityPolicy
             )
             registerOAuthAuthorizationServerPAREndpoint(
                 on: router,
@@ -598,7 +631,8 @@ public struct SwanHTTPServer: Sendable {
             registerLocalhostOAuthEndpoints(
                 on: router,
                 configuration: localhostOAuthConfiguration,
-                runtime: oauthRuntime
+                runtime: oauthRuntime,
+                loginClientIdentityPolicy: loginClientIdentityPolicy
             )
         } else {
             router.get("/oauth/authorize") { _, _ -> Response in
@@ -771,6 +805,10 @@ public struct SwanHTTPServer: Sendable {
             )
         }
         for descriptor in PublicDataTesting20260727.methods {
+            if accountEmailXRPC != nil,
+               Self.isInstalledAccountEmailMethod(descriptor.nsid) {
+                continue
+            }
             if publicRepositoryReadDirectory != nil,
                isInstalledPublicReadMethod(descriptor.nsid) {
                 continue
@@ -785,6 +823,7 @@ public struct SwanHTTPServer: Sendable {
             }
             registerUnavailablePublicEndpoint(descriptor, on: router)
         }
+        accountEmailXRPC?.register(on: router)
         registerUnknownPublicEndpointGuards(on: router)
 
         return router
@@ -810,6 +849,20 @@ public struct SwanHTTPServer: Sendable {
             nsid == SwanPublicWire.ComAtprotoRepoPutRecord.typeIdentifier ||
             nsid == SwanPublicWire.ComAtprotoRepoUploadBlob.typeIdentifier ||
             nsid == SwanPublicWire.ComAtprotoRepoDeleteRecord.typeIdentifier
+    }
+
+    private static func isInstalledAccountEmailMethod(_ nsid: String) -> Bool {
+        switch nsid {
+        case SwanPublicWire.ComAtprotoServerRequestEmailConfirmation.typeIdentifier,
+             SwanPublicWire.ComAtprotoServerConfirmEmail.typeIdentifier,
+             SwanPublicWire.ComAtprotoServerRequestEmailUpdate.typeIdentifier,
+             SwanPublicWire.ComAtprotoServerUpdateEmail.typeIdentifier,
+             SwanPublicWire.ComAtprotoServerRequestPasswordReset.typeIdentifier,
+             SwanPublicWire.ComAtprotoServerResetPassword.typeIdentifier:
+            true
+        default:
+            false
+        }
     }
 
     public func buildApplication(logger: Logger) -> some ApplicationProtocol {

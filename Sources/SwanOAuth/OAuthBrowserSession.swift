@@ -8,6 +8,9 @@ import SwanCore
 public struct OAuthBrowserApprovalSession: Sendable, Equatable {
     public let requestURI: String
     public let subject: String?
+    /// Exact `accounts.updated_at` revision, expressed as microseconds since
+    /// the Unix epoch. It is present exactly when `subject` is present.
+    public let subjectRevisionMicroseconds: Int64?
     public let csrfToken: String
     public let issuedAt: Date
     public let expiresAt: Date
@@ -18,7 +21,7 @@ public struct OAuthBrowserApprovalSession: Sendable, Equatable {
 /// browser's login and consent forms to the opaque PAR capability and, after
 /// successful password verification, to the selected active account.
 public struct OAuthBrowserSessionService: Sendable {
-    private static let signingDomain = Data("swan.oauth.browser-session.v1\0".utf8)
+    private static let signingDomain = Data("swan.oauth.browser-session.v2\0".utf8)
     private static let maximumLifetime: TimeInterval = 10 * 60
     private static let requestURIPrefix = "urn:ietf:params:oauth:request_uri:"
 
@@ -26,6 +29,7 @@ public struct OAuthBrowserSessionService: Sendable {
         let format: String
         let requestURI: String
         let subject: String?
+        let subjectRevisionMicroseconds: Int64?
         let csrfToken: String
         let issuedAt: Int64
         let expiresAt: Int64
@@ -45,19 +49,24 @@ public struct OAuthBrowserSessionService: Sendable {
     public func issue(
         requestURI: String,
         subject: String? = nil,
+        subjectUpdatedAt: Date? = nil,
         lifetime: TimeInterval = 10 * 60,
         now: Date = Date()
     ) throws -> (value: String, session: OAuthBrowserApprovalSession) {
+        let subjectRevision = Self.subjectRevisionMicroseconds(for: subjectUpdatedAt)
         guard lifetime > 0, lifetime <= Self.maximumLifetime, lifetime.isFinite,
-              validRequestURI(requestURI), validSubject(subject) else {
+              validRequestURI(requestURI), validSubject(subject),
+              (subject == nil) == (subjectUpdatedAt == nil),
+              (subject == nil) == (subjectRevision == nil) else {
             throw SwanError.malformed("OAuth browser session is invalid")
         }
         let expiresAt = now.addingTimeInterval(lifetime)
         let csrfToken = Self.randomOpaqueValue()
         let payload = Payload(
-            format: "swan-oauth-browser-session-v1",
+            format: "swan-oauth-browser-session-v2",
             requestURI: requestURI,
             subject: subject,
+            subjectRevisionMicroseconds: subjectRevision,
             csrfToken: csrfToken,
             issuedAt: Int64(now.timeIntervalSince1970),
             expiresAt: Int64(expiresAt.timeIntervalSince1970)
@@ -72,6 +81,7 @@ public struct OAuthBrowserSessionService: Sendable {
             OAuthBrowserApprovalSession(
                 requestURI: requestURI,
                 subject: subject,
+                subjectRevisionMicroseconds: subjectRevision,
                 csrfToken: csrfToken,
                 issuedAt: now,
                 expiresAt: expiresAt
@@ -107,9 +117,11 @@ public struct OAuthBrowserSessionService: Sendable {
         }
         let issuedAt = Date(timeIntervalSince1970: TimeInterval(payload.issuedAt))
         let expiresAt = Date(timeIntervalSince1970: TimeInterval(payload.expiresAt))
-        guard payload.format == "swan-oauth-browser-session-v1",
+        guard payload.format == "swan-oauth-browser-session-v2",
               validRequestURI(payload.requestURI),
               validSubject(payload.subject),
+              (payload.subject == nil) == (payload.subjectRevisionMicroseconds == nil),
+              payload.subjectRevisionMicroseconds.map({ $0 >= 0 }) ?? true,
               validOpaqueValue(payload.csrfToken),
               expiresAt > now,
               issuedAt <= now.addingTimeInterval(60),
@@ -120,6 +132,7 @@ public struct OAuthBrowserSessionService: Sendable {
         return OAuthBrowserApprovalSession(
             requestURI: payload.requestURI,
             subject: payload.subject,
+            subjectRevisionMicroseconds: payload.subjectRevisionMicroseconds,
             csrfToken: payload.csrfToken,
             issuedAt: issuedAt,
             expiresAt: expiresAt
@@ -143,6 +156,18 @@ public struct OAuthBrowserSessionService: Sendable {
         return value.hasPrefix("did:")
             && value.utf8.count <= 4_096
             && !value.utf8.contains(0)
+    }
+
+    /// Converts an account timestamp read from SQLite back to its exact
+    /// microsecond revision. SQLite decoding may introduce a sub-microsecond
+    /// floating-point remainder, so nearest-microsecond rounding is required.
+    public static func subjectRevisionMicroseconds(for updatedAt: Date?) -> Int64? {
+        guard let updatedAt else { return nil }
+        let value = updatedAt.timeIntervalSince1970 * 1_000_000
+        guard value.isFinite, value >= 0, value <= Double(Int64.max) else {
+            return nil
+        }
+        return Int64(value.rounded())
     }
 
     private func validOpaqueValue(_ value: String) -> Bool {

@@ -4,6 +4,39 @@ import SQLiteNIO
 import SwanPublicRepository
 import SwanStorage
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+struct SQLitePublicRepositoryFileIdentity: Sendable, Equatable {
+    let device: UInt64
+    let inode: UInt64
+}
+
+/// Process-local authority to serve one exact public repository generation.
+/// It is minted only after the full projection, PLC identity, control intent,
+/// and signed head have all been authenticated.
+struct SQLiteVerifiedPublicRepositoryGeneration: Sendable {
+    let id: UUID
+    let description: PublicRepositoryReadDescription
+    let controlAccount: AccountControlAccount
+    let repositoryVerificationIdentity: String
+    let dataVersion: Int64
+    let fileIdentity: SQLitePublicRepositoryFileIdentity
+}
+
+struct SQLitePublicRepositoryRecordRead: Sendable {
+    let state: PublicRepositoryState
+    let record: PublicRepositoryReadRecord?
+}
+
+struct SQLitePublicRepositoryPageRead: Sendable {
+    let state: PublicRepositoryState
+    let page: PublicRepositoryReadPage
+}
+
 extension SQLiteAccountDatabase {
     /// Returns the DID bound to this managed account database. Replication
     /// callers use this before any network fetch so a valid-but-different DID
@@ -20,7 +53,7 @@ extension SQLiteAccountDatabase {
     /// codec projection.
     public func publicRepositoryBlobCIDs() async throws -> [CID] {
         try await withConnectionGate {
-            try await transaction {
+            try await readTransaction {
                 let rows = try await connection.query(
                     """
                     SELECT collection, rkey, record_cid
@@ -54,12 +87,14 @@ extension SQLiteAccountDatabase {
         }
     }
 
-    func readPublicRepositoryDescription(
+    func admitPublicRepositoryGeneration(
         account: AccountControlAccount,
         identityVerifier: any PublicPLCGenesisVerifying
-    ) async throws -> PublicRepositoryReadDescription {
+    ) async throws -> SQLiteVerifiedPublicRepositoryGeneration {
         try await withConnectionGate {
-            try await transaction {
+            try await readTransaction {
+                let fileIdentity = try publicRepositoryFileIdentityWithoutGate()
+                let dataVersion = try await publicRepositoryDataVersionWithoutGate()
                 guard let state = try await loadPublicRepositoryStateWithoutGate() else {
                     throw PublicRepositoryReadError.unavailable
                 }
@@ -173,7 +208,28 @@ extension SQLiteAccountDatabase {
                         terminalOperationCID: terminal.terminalOperationCID
                     )
                 }
-                return try PublicRepositoryReadDescription(
+                guard let repositoryAuthenticator = identityVerifier
+                    as? any PublicPLCRepositoryAuthenticating else {
+                    throw PublicRepositoryReadError.unavailable
+                }
+                let commitBytes = try await blockBytesWithoutGate(
+                    state.commitCID
+                )
+                let authentication = try await repositoryAuthenticator
+                    .authenticateRepositoryCommit(
+                        signedCommitBytes: commitBytes,
+                        expectedCommitCID: state.commitCID,
+                        expectedDID: accountDID,
+                        signingDIDKey: identity.signingDIDKey
+                    )
+                guard authentication.commitCID == state.commitCID,
+                      authentication.descriptor.did == state.did,
+                      authentication.descriptor.revision.value
+                        == state.revision,
+                      authentication.descriptor.dataCID == state.dataCID else {
+                    throw PublicRepositoryReadError.unavailable
+                }
+                let description = try PublicRepositoryReadDescription(
                     did: accountDID,
                     canonicalHandle: account.canonicalHandle,
                     status: account.status,
@@ -181,39 +237,98 @@ extension SQLiteAccountDatabase {
                     collections: collections,
                     identity: identity
                 )
+                guard try await publicRepositoryDataVersionWithoutGate()
+                        == dataVersion,
+                      try publicRepositoryFileIdentityWithoutGate()
+                        == fileIdentity else {
+                    throw PublicRepositoryReadError.unavailable
+                }
+                return SQLiteVerifiedPublicRepositoryGeneration(
+                    id: UUID(),
+                    description: description,
+                    controlAccount: account,
+                    repositoryVerificationIdentity:
+                        authentication.verificationIdentity,
+                    dataVersion: dataVersion,
+                    fileIdentity: fileIdentity
+                )
+            }
+        }
+    }
+
+    /// Compatibility entry point for storage-level callers. Production
+    /// request routing uses the admitted generation methods below and never
+    /// repeats the full projection walk.
+    func readPublicRepositoryDescription(
+        account: AccountControlAccount,
+        identityVerifier: any PublicPLCGenesisVerifying
+    ) async throws -> PublicRepositoryReadDescription {
+        let generation = try await admitPublicRepositoryGeneration(
+            account: account,
+            identityVerifier: identityVerifier
+        )
+        return generation.description
+    }
+
+    func readPublicRepositoryDescription(
+        generation: SQLiteVerifiedPublicRepositoryGeneration
+    ) async throws -> PublicRepositoryReadDescription {
+        try await withConnectionGate {
+            try await readTransaction {
+                _ = try await requirePublicRepositoryGenerationWithoutGate(
+                    generation
+                )
+                return generation.description
             }
         }
     }
 
     func readPublicRepositoryRecord(
         path: PublicRepositoryPath,
-        expectedCID: CID?
-    ) async throws -> PublicRepositoryReadRecord? {
+        expectedCID: CID?,
+        generation: SQLiteVerifiedPublicRepositoryGeneration
+    ) async throws -> SQLitePublicRepositoryRecordRead {
         try await withConnectionGate {
-            try await transaction { () async throws -> PublicRepositoryReadRecord? in
-                guard let state = try await loadPublicRepositoryStateWithoutGate() else {
+            try await readTransaction {
+                let state = try await requirePublicRepositoryGenerationWithoutGate(
+                    generation
+                )
+                let tree = try RepositoryMST.load(
+                    rootCID: state.dataCID,
+                    blocks: SQLitePublicRepositoryBlockSource(
+                        connection: connection
+                    )
+                )
+                let cid: CID?
+                do {
+                    cid = try await tree.get(path)
+                } catch {
                     throw PublicRepositoryReadError.unavailable
                 }
-                try await verifyProjectionWithoutGate(state: state)
-                let rows = try await connection.query(
-                    """
-                    SELECT record_cid
-                    FROM public_repository_record_index
-                    WHERE collection = ? AND rkey = ?
-                    """,
-                    [.text(path.collection), .text(path.recordKey)]
-                )
-                guard rows.count <= 1 else {
-                    throw PublicRepositoryReadError.unavailable
+                guard let cid,
+                      expectedCID == nil || expectedCID == cid else {
+                    try await recheckPublicRepositoryGenerationWithoutGate(
+                        generation,
+                        expectedState: state
+                    )
+                    return SQLitePublicRepositoryRecordRead(
+                        state: state,
+                        record: nil
+                    )
                 }
-                guard let row = rows.first else { return nil }
-                let cid = try publicReadCID(
-                    try publicReadRequiredText(row, "record_cid")
-                )
-                guard expectedCID == nil || expectedCID == cid else { return nil }
                 let bytes = try await blockBytesWithoutGate(cid)
-                return try PublicRepositoryReadRecord(
-                    path: path, cid: cid, canonicalBytes: bytes
+                let record = try PublicRepositoryReadRecord(
+                    path: path,
+                    cid: cid,
+                    canonicalBytes: bytes
+                )
+                try await recheckPublicRepositoryGenerationWithoutGate(
+                    generation,
+                    expectedState: state
+                )
+                return SQLitePublicRepositoryRecordRead(
+                    state: state,
+                    record: record
                 )
             }
         }
@@ -223,8 +338,9 @@ extension SQLiteAccountDatabase {
         collection: String,
         limit: Int,
         cursor: String?,
-        reverse: Bool
-    ) async throws -> PublicRepositoryReadPage {
+        reverse: Bool,
+        generation: SQLiteVerifiedPublicRepositoryGeneration
+    ) async throws -> SQLitePublicRepositoryPageRead {
         guard (1...100).contains(limit) else {
             throw PublicRepositoryReadError.invalidLimit
         }
@@ -234,62 +350,156 @@ extension SQLiteAccountDatabase {
             )
         }
         return try await withConnectionGate {
-            try await transaction {
-                guard let state = try await loadPublicRepositoryStateWithoutGate() else {
+            try await readTransaction {
+                let state = try await requirePublicRepositoryGenerationWithoutGate(
+                    generation
+                )
+                let tree = try RepositoryMST.load(
+                    rootCID: state.dataCID,
+                    blocks: SQLitePublicRepositoryBlockSource(
+                        connection: connection
+                    )
+                )
+                let mstPage: RepositoryMSTPage
+                do {
+                    mstPage = try await tree.page(
+                        collection: collection,
+                        limit: limit,
+                        cursor: cursor,
+                        reverse: reverse
+                    )
+                } catch {
                     throw PublicRepositoryReadError.unavailable
                 }
-                try await verifyProjectionWithoutGate(state: state)
-                // Pinned actor-store semantics paginate "before" by default
-                // and "after" when reverse=true.
-                let comparator = reverse ? ">" : "<"
-                let ordering = reverse ? "ASC" : "DESC"
-                let rows: [SQLiteRow]
-                if let cursor {
-                    rows = try await connection.query(
-                        """
-                        SELECT rkey, record_cid
-                        FROM public_repository_record_index
-                        WHERE collection = ? AND rkey \(comparator) ?
-                        ORDER BY rkey \(ordering)
-                        LIMIT ?
-                        """,
-                        [.text(collection), .text(cursor), .integer(limit)]
-                    )
-                } else {
-                    rows = try await connection.query(
-                        """
-                        SELECT rkey, record_cid
-                        FROM public_repository_record_index
-                        WHERE collection = ?
-                        ORDER BY rkey \(ordering)
-                        LIMIT ?
-                        """,
-                        [.text(collection), .integer(limit)]
-                    )
-                }
                 var records: [PublicRepositoryReadRecord] = []
-                for row in rows.prefix(limit) {
-                    let path = try PublicRepositoryPath(
-                        collection: collection,
-                        recordKey: try publicReadRequiredText(row, "rkey")
+                records.reserveCapacity(mstPage.leaves.count)
+                var aggregateRecordBytes = 0
+                for leaf in mstPage.leaves {
+                    // Ask SQLite for the scalar length before materializing a
+                    // record body. This keeps canonical record Data at or
+                    // below the aggregate anonymous-read budget even when the
+                    // next indexed block is itself near the per-record limit.
+                    let byteCount =
+                        try await publicRepositoryRecordBlockByteCountWithoutGate(
+                            leaf.recordCID
+                        )
+                    let (nextAggregate, overflow) =
+                        aggregateRecordBytes.addingReportingOverflow(
+                            byteCount
+                        )
+                    // A short page is valid AT Protocol pagination. Stop before
+                    // fetching the first body that would exceed the anonymous
+                    // JSON allocation budget and return the last emitted key as
+                    // the continuation cursor.
+                    guard !overflow,
+                          nextAggregate <= PublicRepositoryJSONReadLimits
+                            .maximumAggregateRecordBlockBytes else {
+                        break
+                    }
+                    let bytes = try await blockBytesWithoutGate(
+                        leaf.recordCID
                     )
-                    let cid = try publicReadCID(
-                        try publicReadRequiredText(row, "record_cid")
-                    )
+                    guard bytes.count == byteCount else {
+                        throw PublicRepositoryReadError.unavailable
+                    }
                     records.append(try PublicRepositoryReadRecord(
-                        path: path,
-                        cid: cid,
-                        canonicalBytes: try await blockBytesWithoutGate(cid)
+                        path: leaf.path,
+                        cid: leaf.recordCID,
+                        canonicalBytes: bytes
                     ))
+                    aggregateRecordBytes = nextAggregate
                 }
-                return try PublicRepositoryReadPage(
+                let page = try PublicRepositoryReadPage(
                     records: records,
                     cursor: records.last?.path.recordKey
+                )
+                try await recheckPublicRepositoryGenerationWithoutGate(
+                    generation,
+                    expectedState: state
+                )
+                return SQLitePublicRepositoryPageRead(
+                    state: state,
+                    page: page
                 )
             }
         }
     }
 
+    /// Returns only SQLite's scalar body length. Callers use this before
+    /// selecting the BLOB so an over-budget page never transiently
+    /// materializes the first excluded record.
+    private func publicRepositoryRecordBlockByteCountWithoutGate(
+        _ cid: CID
+    ) async throws -> Int {
+        let rows = try await connection.query(
+            """
+            SELECT length(bytes) AS byte_count
+            FROM public_repository_blocks
+            WHERE cid = ?
+            """,
+            [.text(cid.string)]
+        )
+        guard rows.count == 1,
+              let byteCount = rows[0].column("byte_count")?.integer,
+              (1...PublicRepositoryLimits.standard.maximumRecordBlockBytes)
+                .contains(byteCount) else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        return byteCount
+    }
+
+    func preparePublicRepositoryCAR(
+        lease: PublicRepositorySpoolLease,
+        generation: SQLiteVerifiedPublicRepositoryGeneration
+    ) async throws -> PublicRepositoryReadCAR {
+        let handle = try SQLiteProtectedPaths.makeUnlinkedPublicCARSpool(
+            in: dataDirectory
+        )
+        do {
+            let state = try await withConnectionGate {
+                try await readTransaction {
+                    let state = try await
+                        requirePublicRepositoryGenerationWithoutGate(generation)
+                    let commitBytes = try await blockBytesWithoutGate(
+                        state.commitCID
+                    )
+                    let commit = try structurallyValidatedCommit(
+                        signedCommitBytes: commitBytes,
+                        expectedCommitCID: state.commitCID
+                    )
+                    guard commit.descriptor.did == state.did,
+                          commit.descriptor.revision.value == state.revision,
+                          commit.descriptor.dataCID == state.dataCID else {
+                        throw PublicRepositoryReadError.unavailable
+                    }
+                    let sink = PublicRepositoryFileSink(handle: handle)
+                    try await writeBoundedPublicRepositoryCAR(
+                        state: state,
+                        commit: commit,
+                        to: sink
+                    )
+                    try handle.synchronize()
+                    try handle.seek(toOffset: 0)
+                    try await recheckPublicRepositoryGenerationWithoutGate(
+                        generation,
+                        expectedState: state
+                    )
+                    return state
+                }
+            }
+            return PublicRepositoryReadCAR(
+                state: state,
+                spool: PublicRepositoryCARSpool(fileHandle: handle, lease: lease)
+            )
+        } catch {
+            try? handle.close()
+            lease.release()
+            throw error
+        }
+    }
+
+    /// Storage-test compatibility for exercising the spool in isolation.
+    /// Runtime HTTP code must use the generation-bound overload above.
     func preparePublicRepositoryCAR(
         lease: PublicRepositorySpoolLease
     ) async throws -> PublicRepositoryReadCAR {
@@ -298,8 +508,10 @@ extension SQLiteAccountDatabase {
         )
         do {
             let state = try await withConnectionGate {
-                try await transaction {
-                    guard let state = try await loadPublicRepositoryStateWithoutGate() else {
+                try await readTransaction {
+                    guard let state =
+                            try await loadPublicRepositoryStateWithoutGate()
+                    else {
                         throw PublicRepositoryReadError.unavailable
                     }
                     let commitBytes = try await blockBytesWithoutGate(
@@ -327,13 +539,92 @@ extension SQLiteAccountDatabase {
             }
             return PublicRepositoryReadCAR(
                 state: state,
-                spool: PublicRepositoryCARSpool(fileHandle: handle, lease: lease)
+                spool: PublicRepositoryCARSpool(
+                    fileHandle: handle,
+                    lease: lease
+                )
             )
         } catch {
             try? handle.close()
             lease.release()
             throw error
         }
+    }
+
+    private func requirePublicRepositoryGenerationWithoutGate(
+        _ generation: SQLiteVerifiedPublicRepositoryGeneration
+    ) async throws -> PublicRepositoryState {
+        guard generation.controlAccount.did == accountDID,
+              generation.description.did == accountDID,
+              generation.description.status == .active,
+              !generation.repositoryVerificationIdentity.isEmpty,
+              try publicRepositoryFileIdentityWithoutGate()
+                == generation.fileIdentity,
+              try await publicRepositoryDataVersionWithoutGate()
+                == generation.dataVersion,
+              let state = try await loadPublicRepositoryStateWithoutGate(),
+              state == generation.description.state else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        return state
+    }
+
+    private func recheckPublicRepositoryGenerationWithoutGate(
+        _ generation: SQLiteVerifiedPublicRepositoryGeneration,
+        expectedState: PublicRepositoryState
+    ) async throws {
+        guard try publicRepositoryFileIdentityWithoutGate()
+                == generation.fileIdentity,
+              try await publicRepositoryDataVersionWithoutGate()
+                == generation.dataVersion,
+              let state = try await loadPublicRepositoryStateWithoutGate(),
+              state == expectedState,
+              state == generation.description.state else {
+            throw PublicRepositoryReadError.unavailable
+        }
+    }
+
+    private func publicRepositoryDataVersionWithoutGate() async throws -> Int64 {
+        let rows = try await connection.query("PRAGMA data_version")
+        guard rows.count == 1,
+              let value = rows[0].column("data_version")?.integer,
+              let dataVersion = Int64(exactly: value) else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        return dataVersion
+    }
+
+    private func publicRepositoryFileIdentityWithoutGate() throws
+        -> SQLitePublicRepositoryFileIdentity
+    {
+        let descriptorIdentity = try publicRepositoryDatabaseDescriptorIdentity()
+        let path = SQLiteLayout.accountDatabase(
+            in: dataDirectory,
+            did: accountDID
+        ).path
+        var metadata = stat()
+        let result = path.withCString { pointer in
+            #if canImport(Darwin)
+            Darwin.lstat(pointer, &metadata)
+            #else
+            Glibc.lstat(pointer, &metadata)
+            #endif
+        }
+        guard result == 0,
+              (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_uid == geteuid(),
+              (metadata.st_mode & 0o777) == 0o600,
+              metadata.st_nlink == 1 else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        let pathIdentity = SQLitePublicRepositoryFileIdentity(
+            device: UInt64(metadata.st_dev),
+            inode: UInt64(metadata.st_ino)
+        )
+        guard pathIdentity == descriptorIdentity else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        return descriptorIdentity
     }
 }
 

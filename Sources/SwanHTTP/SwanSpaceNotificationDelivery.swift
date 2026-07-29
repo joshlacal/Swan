@@ -154,6 +154,10 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
             wireRevision: announcement.wireRevision,
             commitment: announcement.commitment
         )
+        let endpoint = try notificationEndpoint(
+            destination.endpoint,
+            method: ComAtprotoSpaceNotifyWrite.typeIdentifier
+        )
         let token = try await serviceAuthentication.issue(
             issuer: notification.author,
             audience: destination.audience,
@@ -162,7 +166,7 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
             now: Date()
         )
         try await poster.postJSON(
-            to: destination.endpoint,
+            to: endpoint,
             headers: notificationHeaders(token),
             body: body
         )
@@ -222,6 +226,7 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
             throw SwanError.unavailable("registered notification destination is unavailable")
         }
         let method = ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier
+        let endpoint = try notificationEndpoint(destination.endpoint, method: method)
         let body = try deletionJSON(space: notification.space)
         let token = try await serviceAuthentication.issue(
             issuer: notification.space.authority,
@@ -231,11 +236,44 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
             now: Date()
         )
         try await poster.postJSON(
-            to: destination.endpoint,
+            to: endpoint,
             headers: notificationHeaders(token),
             body: body
         )
     }
+}
+
+/// The TypeScript XRPC client treats a DID-document PDS/service endpoint as
+/// an origin and constructs an absolute `/xrpc/<nsid>` request path.  Keep
+/// that behavior at the transport boundary so an operator pin cannot turn
+/// the notification worker into a request to an arbitrary configured path.
+/// Query and fragment components are intentionally discarded, matching the
+/// absolute-path construction used by the reference client.
+private func notificationEndpoint(_ endpoint: URL, method: String) throws -> URL {
+    guard let components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
+          components.scheme != nil,
+          components.host != nil,
+          components.user == nil,
+          components.password == nil,
+          components.fragment == nil,
+          method.utf8.count <= 256,
+          !method.isEmpty,
+          method.utf8.allSatisfy({ byte in
+              (byte >= 0x41 && byte <= 0x5A)
+                  || (byte >= 0x61 && byte <= 0x7A)
+                  || (byte >= 0x30 && byte <= 0x39)
+                  || byte == 0x2E
+        }) else {
+        throw SwanError.malformed("notification endpoint is invalid")
+    }
+    var request = components
+    request.path = "/xrpc/\(method)"
+    request.query = nil
+    request.fragment = nil
+    guard let url = request.url else {
+        throw SwanError.malformed("notification endpoint is invalid")
+    }
+    return url
 }
 
 private func notificationJSON(

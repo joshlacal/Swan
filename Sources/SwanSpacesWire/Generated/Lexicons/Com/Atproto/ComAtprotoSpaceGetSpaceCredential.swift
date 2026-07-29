@@ -24,7 +24,20 @@ public struct Input: ATProtocolCodable {
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.space = try container.decode(ATProtocolURI.self, forKey: .space)
-            self.clientAttestation = try container.decodeIfPresent(String.self, forKey: .clientAttestation)
+            if container.contains(.clientAttestation) {
+                guard try !container.decodeNil(forKey: .clientAttestation) else {
+                    throw DecodingError.valueNotFound(
+                        String.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'clientAttestation' must not be null"
+                        )
+                    )
+                }
+                self.clientAttestation = try container.decode(String.self, forKey: .clientAttestation)
+            } else {
+                self.clientAttestation = nil
+            }
         }
 
         public func encode(to encoder: Encoder) throws {

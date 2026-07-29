@@ -1,0 +1,684 @@
+diff --git a/packages/pds/src/actor-store/space/reader.ts b/packages/pds/src/actor-store/space/reader.ts
+index f68d0d4..a39ea4b 100644
+--- a/packages/pds/src/actor-store/space/reader.ts
++++ b/packages/pds/src/actor-store/space/reader.ts
+@@ -189,0 +190,79 @@ export class SpaceReader {
++  async countRepoRecords(space: string): Promise<number> {
++    const row = await this.db.db
++      .selectFrom('space_record')
++      .select((eb) => eb.fn.countAll<number>().as('count'))
++      .where('space', '=', space)
++      .executeTakeFirstOrThrow()
++    return Number(row.count)
++  }
++
++  // DAG-CBOR map keys use the RFC 7049 canonical order: encoded length first,
++  // then bytewise. For text strings, ordering by UTF-8 byte length and SQLite's
++  // binary text order is equivalent and allows keyset iteration without
++  // materializing the index.
++  async getRepoRecordAfterCanonical(
++    space: string,
++    cursor?: { dataKey: string; keyByteLength: number },
++  ): Promise<{
++    collection: string
++    rkey: string
++    cid: string
++    dataKey: string
++    keyByteLength: number
++  } | null> {
++    const dataKey = sql<string>`collection || '/' || rkey`
++    const keyByteLength = sql<number>`length(CAST(${dataKey} AS BLOB))`
++    let builder = this.db.db
++      .selectFrom('space_record')
++      .select([
++        'collection',
++        'rkey',
++        'cid',
++        dataKey.as('dataKey'),
++        keyByteLength.as('keyByteLength'),
++      ])
++      .where('space', '=', space)
++      .orderBy(keyByteLength, 'asc')
++      .orderBy(dataKey, 'asc')
++      .limit(1)
++    if (cursor) {
++      builder = builder.where(
++        sql<SqlBool>`(
++          ${keyByteLength} > ${cursor.keyByteLength}
++          OR (
++            ${keyByteLength} = ${cursor.keyByteLength}
++            AND ${dataKey} > ${cursor.dataKey} COLLATE BINARY
++          )
++        )`,
++      )
++    }
++    return (await builder.executeTakeFirst()) ?? null
++  }
++
++  // Record blocks are serialized in lexical (collection, rkey) order. The
++  // caller deliberately requests one row at a time so record values remain
++  // bounded by the maximum single-record size.
++  async getRepoRecordAfterLexical(
++    space: string,
++    cursor?: { collection: string; rkey: string },
++  ): Promise<{
++    collection: string
++    rkey: string
++    cid: string
++    value: Uint8Array
++  } | null> {
++    let builder = this.db.db
++      .selectFrom('space_record')
++      .select(['collection', 'rkey', 'cid', 'value'])
++      .where('space', '=', space)
++      .orderBy('collection', 'asc')
++      .orderBy('rkey', 'asc')
++      .limit(1)
++    if (cursor) {
++      builder = builder.where(
++        sql<SqlBool>`("collection", "rkey") > (${cursor.collection}, ${cursor.rkey})`,
++      )
++    }
++    return (await builder.executeTakeFirst()) ?? null
++  }
++
+@@ -286 +365 @@ export class SpaceReader {
+-      .where('space', '=', space)
++      .where('space_record_oplog.space', '=', space)
+diff --git a/packages/repo/src/car.ts b/packages/repo/src/car.ts
+index 8916ebf..1fe0c0c 100644
+--- a/packages/repo/src/car.ts
++++ b/packages/repo/src/car.ts
+@@ -8 +8 @@ import { CarBlock, schema } from './types.js'
+-import { concatBytesAsync } from './util.js'
++import { concatBytes, concatBytesAsync } from './util.js'
+@@ -13,0 +14,22 @@ export async function* writeCarStream(
++  yield* writeCarStreamWithRoots(root ? [root] : [], blocks)
++}
++
++/**
++ * Write a CARv1 stream with an ordered root set. Most AT Protocol repos use a
++ * single root; permissioned space recovery deliberately binds a signed commit
++ * and a DRISL index as two roots.
++ */
++export async function* writeCarStreamWithRoots(
++  roots: Cid[],
++  blocks: AsyncIterable<CarBlock>,
++): AsyncIterable<Uint8Array> {
++  yield writeCarHeader(roots)
++  for await (const block of blocks) {
++    yield writeCarBlockHeader(block.cid, block.bytes.byteLength)
++    yield block.bytes
++  }
++}
++
++// These framing helpers let callers stream a single large CAR block (or a
++// pre-framed sequence of blocks) without first joining it into one Uint8Array.
++export function writeCarHeader(roots: Cid[]): Uint8Array {
+@@ -17 +39 @@ export async function* writeCarStream(
+-      roots: root ? [root] : [],
++      roots,
+@@ -20,9 +42,8 @@ export async function* writeCarStream(
+-  yield new Uint8Array(varint.encode(header.byteLength))
+-  yield header
+-  for await (const block of blocks) {
+-    yield new Uint8Array(
+-      varint.encode(block.cid.bytes.byteLength + block.bytes.byteLength),
+-    )
+-    yield block.cid.bytes
+-    yield block.bytes
+-  }
++  return concatBytes([new Uint8Array(varint.encode(header.byteLength)), header])
++}
++
++export function writeCarBlockHeader(cid: Cid, byteLength: number): Uint8Array {
++  return concatBytes([
++    new Uint8Array(varint.encode(cid.bytes.byteLength + byteLength)),
++    cid.bytes,
++  ])
+diff --git a/packages/pds/src/api/com/atproto/space/getRepo.ts b/packages/pds/src/api/com/atproto/space/getRepo.ts
+index a637932..004ca35 100644
+--- a/packages/pds/src/api/com/atproto/space/getRepo.ts
++++ b/packages/pds/src/api/com/atproto/space/getRepo.ts
+@@ -1 +1,20 @@
+-import { MethodNotImplementedError, Server } from '@atproto/xrpc-server'
++import { createHash } from 'node:crypto'
++import { createReadStream } from 'node:fs'
++import { mkdtemp, open, rm } from 'node:fs/promises'
++import type { FileHandle } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import path from 'node:path'
++import SqliteDB from 'better-sqlite3'
++import { byteIterableToStream } from '@atproto/common'
++import { encode } from '@atproto/lex-cbor'
++import {
++  CBOR_DATA_CODEC,
++  SHA256_HASH_CODE,
++  cidForCbor,
++  createCid,
++  isCborCid,
++  parseCid,
++} from '@atproto/lex-data'
++import type { Cid } from '@atproto/lex-data'
++import { writeCarBlockHeader, writeCarHeader } from '@atproto/repo'
++import { InvalidRequestError, Server } from '@atproto/xrpc-server'
+@@ -3,0 +23,75 @@ import { com } from '../../../../lexicons/index.js'
++import { assertSpaceScope, buildSignedCommit } from './util.js'
++
++type SpooledRepo = {
++  directory: string
++  indexPath: string
++  recordsPath: string
++  commitBytes: Uint8Array
++  commitCid: Cid
++  indexCid: Cid
++  indexByteLength: number
++}
++
++const writeAll = async (
++  handle: FileHandle,
++  bytes: Uint8Array,
++): Promise<void> => {
++  let offset = 0
++  while (offset < bytes.byteLength) {
++    const { bytesWritten } = await handle.write(
++      bytes,
++      offset,
++      bytes.byteLength - offset,
++      null,
++    )
++    if (bytesWritten === 0) {
++      throw new Error('Could not make progress writing permissioned repo spool')
++    }
++    offset += bytesWritten
++  }
++}
++
++// Encode only the definite-length CBOR map prefix. Each key and CID value is
++// appended separately in canonical order so the DRISL never exists as a
++// process-sized object or Uint8Array.
++const encodeMapHeader = (size: number): Uint8Array => {
++  if (!Number.isSafeInteger(size) || size < 0) {
++    throw new Error('Invalid permissioned repo record count')
++  }
++  if (size < 24) return new Uint8Array([0xa0 | size])
++  if (size <= 0xff) return new Uint8Array([0xb8, size])
++  if (size <= 0xffff) {
++    return new Uint8Array([0xb9, size >>> 8, size & 0xff])
++  }
++  if (size <= 0xffff_ffff) {
++    const result = new Uint8Array(5)
++    result[0] = 0xba
++    new DataView(result.buffer).setUint32(1, size)
++    return result
++  }
++  const result = new Uint8Array(9)
++  result[0] = 0xbb
++  new DataView(result.buffer).setBigUint64(1, BigInt(size))
++  return result
++}
++
++const streamSpooledRepo = async function* (
++  repo: SpooledRepo,
++): AsyncGenerator<Uint8Array, void, unknown> {
++  try {
++    yield writeCarHeader([repo.commitCid, repo.indexCid])
++    yield writeCarBlockHeader(repo.commitCid, repo.commitBytes.byteLength)
++    yield repo.commitBytes
++    yield writeCarBlockHeader(repo.indexCid, repo.indexByteLength)
++    for await (const chunk of createReadStream(repo.indexPath)) {
++      yield chunk
++    }
++    // The records spool already contains CAR block framing followed by each
++    // canonical DAG-CBOR value in lexical record order.
++    for await (const chunk of createReadStream(repo.recordsPath)) {
++      yield chunk
++    }
++  } finally {
++    await rm(repo.directory, { recursive: true, force: true })
++  }
++}
+@@ -12,6 +106,179 @@ export default function (server: Server, ctx: AppContext) {
+-    // @TODO Implement full-state CAR export. The CAR declares two roots in
+-    // order — the signedCommit, then a DRISL (DAG-CBOR) index mapping
+-    // "{collection}/{rkey}" -> record CID (lexicographic) — followed by the
+-    // record blocks in the same order. See proposal 0016 "Repo serialization".
+-    handler: async () => {
+-      throw new MethodNotImplementedError('getRepo is not yet implemented')
++    handler: async ({ params, auth }) => {
++      const { space, repo } = params
++
++      if (auth.credentials.type === 'space_credential') {
++        if (auth.credentials.space !== space) {
++          throw new InvalidRequestError('Credential space mismatch')
++        }
++      } else {
++        assertSpaceScope(auth, space, { action: 'read' })
++      }
++
++      const directory = await mkdtemp(
++        path.join(tmpdir(), 'atproto-space-get-repo-'),
++      )
++      const indexPath = path.join(directory, 'index.cbor')
++      const recordsPath = path.join(directory, 'records.carblocks')
++
++      try {
++        const exportState = await ctx.actorStore.read(repo, async (store) => {
++          const keypair = await store.keypair()
++          return store.transact(async (storeTxn) => {
++            // countRepoRecords is the first statement in this transaction and
++            // establishes the SQLite read snapshot used for every later row.
++            const recordCount = await storeTxn.space.countRepoRecords(space)
++            const state = await storeTxn.space.getRepoState(space)
++            const commit = await buildSignedCommit({
++              spaceUri: space,
++              author: repo,
++              state,
++              keypair,
++            })
++            if (!commit) {
++              throw new InvalidRequestError('Could not find permissioned repo')
++            }
++
++            const commitBytes = encode(commit)
++            const commitCid = await cidForCbor(commitBytes)
++            const indexHash = createHash('sha256')
++            let indexByteLength = 0
++            let indexHandle: FileHandle | undefined
++            let recordsHandle: FileHandle | undefined
++            let seenCidDb: { close(): void } | undefined
++
++            const appendIndex = async (bytes: Uint8Array) => {
++              if (!indexHandle) throw new Error('Index spool is not open')
++              await writeAll(indexHandle, bytes)
++              indexHash.update(bytes)
++              indexByteLength += bytes.byteLength
++            }
++
++            try {
++              indexHandle = await open(indexPath, 'wx', 0o600)
++              recordsHandle = await open(recordsPath, 'wx', 0o600)
++              // Multiple record paths can reference the same CID. Keep the
++              // deduplication set on disk so recovery emits one CAR block per
++              // unique CID without growing process memory with repo size.
++              const cidDb = new SqliteDB(
++                path.join(directory, 'seen-cids.sqlite'),
++              )
++              seenCidDb = cidDb
++              cidDb.pragma('journal_mode = OFF')
++              cidDb.exec(
++                'CREATE TABLE seen_cid (cid TEXT PRIMARY KEY) WITHOUT ROWID',
++              )
++              const claimCid = cidDb.prepare(
++                'INSERT OR IGNORE INTO seen_cid (cid) VALUES (?)',
++              )
++              await appendIndex(encodeMapHeader(recordCount))
++
++              let indexedRecords = 0
++              let canonicalCursor:
++                | { dataKey: string; keyByteLength: number }
++                | undefined
++              while (true) {
++                const record = await storeTxn.space.getRepoRecordAfterCanonical(
++                  space,
++                  canonicalCursor,
++                )
++                if (!record) break
++                const cid = parseCid(record.cid)
++                if (!isCborCid(cid)) {
++                  throw new Error('Permissioned record has a non-DAG-CBOR CID')
++                }
++                await appendIndex(encode(record.dataKey))
++                await appendIndex(encode(cid))
++                canonicalCursor = {
++                  dataKey: record.dataKey,
++                  keyByteLength: record.keyByteLength,
++                }
++                indexedRecords += 1
++                if (indexedRecords > recordCount) {
++                  throw new Error(
++                    'Permissioned repo grew within a stable read snapshot',
++                  )
++                }
++              }
++              if (indexedRecords !== recordCount) {
++                throw new Error(
++                  'Permissioned repo count changed within a stable read snapshot',
++                )
++              }
++
++              let spooledRecords = 0
++              let lexicalCursor:
++                | { collection: string; rkey: string }
++                | undefined
++              while (true) {
++                const record = await storeTxn.space.getRepoRecordAfterLexical(
++                  space,
++                  lexicalCursor,
++                )
++                if (!record) break
++                const cid = parseCid(record.cid)
++                if (!isCborCid(cid)) {
++                  throw new Error('Permissioned record has a non-DAG-CBOR CID')
++                }
++                const actualCid = await cidForCbor(record.value)
++                if (actualCid.toString() !== cid.toString()) {
++                  throw new Error('Permissioned record CID mismatch')
++                }
++                if (claimCid.run(cid.toString()).changes === 1) {
++                  await writeAll(
++                    recordsHandle,
++                    writeCarBlockHeader(cid, record.value.byteLength),
++                  )
++                  await writeAll(recordsHandle, record.value)
++                }
++                lexicalCursor = {
++                  collection: record.collection,
++                  rkey: record.rkey,
++                }
++                spooledRecords += 1
++                if (spooledRecords > recordCount) {
++                  throw new Error(
++                    'Permissioned repo grew within a stable read snapshot',
++                  )
++                }
++              }
++              if (spooledRecords !== recordCount) {
++                throw new Error(
++                  'Permissioned repo count changed within a stable read snapshot',
++                )
++              }
++            } finally {
++              try {
++                seenCidDb?.close()
++              } finally {
++                await Promise.all([
++                  indexHandle?.close(),
++                  recordsHandle?.close(),
++                ])
++              }
++            }
++
++            const indexCid = createCid(
++              CBOR_DATA_CODEC,
++              SHA256_HASH_CODE,
++              indexHash.digest(),
++            )
++            return {
++              directory,
++              indexPath,
++              recordsPath,
++              commitBytes,
++              commitCid,
++              indexCid,
++              indexByteLength,
++            }
++          })
++        })
++
++        return {
++          encoding: 'application/vnd.ipld.car' as const,
++          body: byteIterableToStream(streamSpooledRepo(exportState)),
++        }
++      } catch (err) {
++        await rm(directory, { recursive: true, force: true })
++        throw err
++      }
+diff --git a/packages/pds/tests/spaces.test.ts b/packages/pds/tests/spaces.test.ts
+index d127588..a93bace 100644
+--- a/packages/pds/tests/spaces.test.ts
++++ b/packages/pds/tests/spaces.test.ts
+@@ -2,0 +3,3 @@ import { Client, DidString, xrpc } from '@atproto/lex'
++import { decode as cborDecode } from '@atproto/lex-cbor'
++import type { Cid } from '@atproto/lex-data'
++import { readCar, readCarStream } from '@atproto/repo'
+@@ -5,0 +9,3 @@ import { createServiceAuthHeaders } from '@atproto/xrpc-server'
++// TestPds imports @atproto/pds through its package export, so patch the built
++// reader class it actually instantiates rather than a distinct source module.
++import { SpaceReader } from '../dist/actor-store/space/reader.js'
+@@ -468,0 +475,245 @@ describe('spaces', () => {
++  it('exports a two-root recovery CAR with ordered current records', async () => {
++    const spaceUri = await createSpace('two-root-recovery', [danDid])
++    const otherSpaceUri = await createSpace('two-root-recovery-other', [danDid])
++    const sharedRecord = {
++      $type: 'app.bsky.feed.post',
++      text: 'shared value',
++      createdAt: new Date().toISOString(),
++    }
++    const writes = await Promise.all(
++      [
++        {
++          rkey: 'a-record-with-a-longer-key',
++          record: {
++            $type: 'app.bsky.feed.post',
++            text: 'unique value',
++            createdAt: new Date().toISOString(),
++          },
++        },
++        { rkey: 'z', record: sharedRecord },
++        { rkey: 'z-copy', record: sharedRecord },
++      ].map(({ rkey, record }) =>
++        pds1Client.call(
++          com.atproto.space.createRecord,
++          {
++            space: spaceUri,
++            repo: danDid,
++            collection: 'app.bsky.feed.post',
++            rkey,
++            record,
++          },
++          { headers: danHeaders },
++        ),
++      ),
++    )
++    expect(writes[1].cid).toBe(writes[2].cid)
++
++    const wrongSpaceCredential = await credentialFor(
++      pds1,
++      danHeaders,
++      otherSpaceUri,
++    )
++    await expect(
++      pds1Client.call(
++        com.atproto.space.getRepo,
++        { space: spaceUri, repo: danDid },
++        { headers: wrongSpaceCredential },
++      ),
++    ).rejects.toThrow('Credential space mismatch')
++
++    const carBytes = await pds1Client.call(
++      com.atproto.space.getRepo,
++      { space: spaceUri, repo: danDid },
++      { headers: danHeaders },
++    )
++    const car = await readCar(carBytes)
++    expect(car.roots).toHaveLength(2)
++
++    const signedCommit = cborDecode(car.blocks.get(car.roots[0])!) as {
++      rev: string
++    }
++    expect(signedCommit.rev).toBeDefined()
++
++    const index = cborDecode(car.blocks.get(car.roots[1])!) as Record<
++      string,
++      Cid
++    >
++    const keys = Object.keys(index)
++    // DAG-CBOR canonical map order is encoded-length first, then bytewise.
++    expect(keys).toEqual([
++      'app.bsky.feed.post/z',
++      'app.bsky.feed.post/z-copy',
++      'app.bsky.feed.post/a-record-with-a-longer-key',
++    ])
++    expect(index[keys[0]].toString()).toBe(writes[1].cid)
++    expect(index[keys[1]].toString()).toBe(writes[2].cid)
++    expect(index[keys[2]].toString()).toBe(writes[0].cid)
++    expect(car.blocks.has(index[keys[0]])).toBe(true)
++    expect(car.blocks.has(index[keys[1]])).toBe(true)
++    expect(car.blocks.has(index[keys[2]])).toBe(true)
++    // Record blocks use the proposal's independent lexical path ordering.
++    const streamedCar = await readCarStream([carBytes])
++    const framedCids: string[] = []
++    for await (const block of streamedCar.blocks) {
++      framedCids.push(block.cid.toString())
++    }
++    expect(framedCids).toEqual([
++      car.roots[0].toString(),
++      car.roots[1].toString(),
++      writes[0].cid,
++      writes[1].cid,
++    ])
++    expect(car.blocks.size).toBe(4)
++  })
++
++  it('rejects a full recovery export when a stored record CID is corrupt', async () => {
++    const spaceUri = await createSpace('two-root-recovery-corrupt', [danDid])
++    const first = await pds1Client.call(
++      com.atproto.space.createRecord,
++      {
++        space: spaceUri,
++        repo: danDid,
++        collection: 'app.bsky.feed.post',
++        rkey: 'first',
++        record: {
++          $type: 'app.bsky.feed.post',
++          text: 'first',
++          createdAt: new Date().toISOString(),
++        },
++      },
++      { headers: danHeaders },
++    )
++    const second = await pds1Client.call(
++      com.atproto.space.createRecord,
++      {
++        space: spaceUri,
++        repo: danDid,
++        collection: 'app.bsky.feed.post',
++        rkey: 'second',
++        record: {
++          $type: 'app.bsky.feed.post',
++          text: 'second',
++          createdAt: new Date().toISOString(),
++        },
++      },
++      { headers: danHeaders },
++    )
++    expect(first.cid).not.toBe(second.cid)
++
++    await pds1.ctx.actorStore.transact(danDid, (store) =>
++      store.space.db.db
++        .updateTable('space_record')
++        .set({ cid: second.cid })
++        .where('space', '=', spaceUri)
++        .where('collection', '=', 'app.bsky.feed.post')
++        .where('rkey', '=', 'first')
++        .execute(),
++    )
++
++    await expect(
++      pds1Client.call(
++        com.atproto.space.getRepo,
++        { space: spaceUri, repo: danDid },
++        { headers: danHeaders },
++      ),
++    ).rejects.toMatchObject({
++      name: 'XrpcResponseError',
++      status: 500,
++      error: 'InternalServerError',
++      message: 'Internal Server Error',
++    })
++  })
++
++  it('spools getRepo from one stable snapshot during a concurrent update', async () => {
++    const spaceUri = await createSpace('two-root-recovery-snapshot', [danDid])
++    const created = await pds1Client.call(
++      com.atproto.space.createRecord,
++      {
++        space: spaceUri,
++        repo: danDid,
++        collection: 'app.bsky.feed.post',
++        rkey: 'stable',
++        record: {
++          $type: 'app.bsky.feed.post',
++          text: 'before',
++          createdAt: new Date().toISOString(),
++        },
++      },
++      { headers: danHeaders },
++    )
++
++    const original = SpaceReader.prototype.getRepoRecordAfterLexical
++    let releaseSnapshot = () => {}
++    const releasePromise = new Promise<void>((resolve) => {
++      releaseSnapshot = resolve
++    })
++    let announceSnapshot = () => {}
++    const snapshotReached = new Promise<void>((resolve) => {
++      announceSnapshot = resolve
++    })
++    let intercepted = false
++    SpaceReader.prototype.getRepoRecordAfterLexical = async function (
++      this: SpaceReader,
++      requestedSpace,
++      cursor,
++    ) {
++      const record = await original.call(this, requestedSpace, cursor)
++      if (requestedSpace === spaceUri && !cursor && !intercepted) {
++        intercepted = true
++        announceSnapshot()
++        await releasePromise
++      }
++      return record
++    }
++
++    try {
++      const exportPromise = pds1Client.call(
++        com.atproto.space.getRepo,
++        { space: spaceUri, repo: danDid },
++        { headers: danHeaders },
++      )
++      await Promise.race([
++        snapshotReached,
++        exportPromise.then(() => {
++          throw new Error('getRepo completed before its snapshot barrier')
++        }),
++      ])
++      const updatePromise = pds1Client.call(
++        com.atproto.space.putRecord,
++        {
++          space: spaceUri,
++          repo: danDid,
++          collection: 'app.bsky.feed.post',
++          rkey: 'stable',
++          record: {
++            $type: 'app.bsky.feed.post',
++            text: 'after',
++            createdAt: new Date().toISOString(),
++          },
++        },
++        { headers: danHeaders },
++      )
++      releaseSnapshot()
++      const [carBytes, updated] = await Promise.all([
++        exportPromise,
++        updatePromise,
++      ])
++      expect(updated.cid).not.toBe(created.cid)
++
++      const car = await readCar(carBytes)
++      const index = cborDecode(car.blocks.get(car.roots[1])!) as Record<
++        string,
++        Cid
++      >
++      const exportedCid = index['app.bsky.feed.post/stable'].toString()
++      expect(exportedCid).toBe(created.cid)
++      const exportedRecord = cborDecode(
++        car.blocks.get(index['app.bsky.feed.post/stable'])!,
++      ) as { text: string }
++      expect(exportedRecord.text).toBe('before')
++    } finally {
++      releaseSnapshot()
++      SpaceReader.prototype.getRepoRecordAfterLexical = original
++    }
++  })
++

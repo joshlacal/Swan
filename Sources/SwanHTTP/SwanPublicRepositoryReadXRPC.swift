@@ -3,6 +3,7 @@ import Hummingbird
 import HTTPTypes
 import NIOCore
 import Petrel
+import SwanAccounts
 import SwanPublicRepository
 import SwanPublicWire
 import SwanStorage
@@ -37,19 +38,21 @@ private struct PublicDescribeRepoHandler:
         context: Request
     ) async throws -> SwanPublicWire.ComAtprotoRepoDescribeRepo.Output {
         let selector = parameters.repo.stringValue()
-        guard let status = try await directory.publicRepositoryStatus(
+        let description: PublicRepositoryReadDescription
+        switch try await directory.publicRepositoryDescriptionOutcome(
             selector: selector
-        ) else { throw PublicReadHandlerFailure.repoNotFound }
-        guard status.status == .active else {
+        ) {
+        case .notFound:
+            throw PublicReadHandlerFailure.repoNotFound
+        case let .lifecycle(status):
             throw PublicReadHandlerFailure.lifecycle(status.status)
+        case let .active(resolved):
+            description = resolved
         }
-        guard let description = try await directory.describePublicRepository(
-            selector: selector
-        ) else { throw PublicReadHandlerFailure.unavailable }
         guard publicReadOriginsMatch(
             description.identity.pdsOrigin, publicURL.absoluteString
         ) else { throw PublicReadHandlerFailure.unavailable }
-        let document = PublicDIDDocument(
+        let document = try PublicDIDDocument(
             id: description.did,
             handle: description.identity.canonicalHandle,
             signingDIDKey: description.identity.signingDIDKey,
@@ -85,19 +88,25 @@ private struct PublicGetRecordHandler:
             collection: parameters.collection.nsidString(),
             recordKey: parameters.rkey.value
         )
-        guard let record = try await directory.publicRepositoryRecord(
+        let result: PublicRepositoryReadRecordResult
+        switch try await directory.publicRepositoryRecordOutcome(
             selector: selector,
             path: path,
             expectedCID: parameters.cid
-        ) else { throw PublicReadHandlerFailure.recordNotFound }
-        guard let description = try await directory.describePublicRepository(
-            selector: selector
-        ), description.status == .active else {
-            throw PublicReadHandlerFailure.unavailable
+        ) {
+        case .notFound:
+            throw PublicReadHandlerFailure.repoNotFound
+        case let .lifecycle(status):
+            throw PublicReadHandlerFailure.lifecycle(status.status)
+        case let .active(resolved):
+            result = resolved
+        }
+        guard let record = result.record else {
+            throw PublicReadHandlerFailure.recordNotFound
         }
         return .init(
             uri: try ATProtocolURI(
-                uriString: "at://\(description.did)/\(path.mstKey)"
+                uriString: "at://\(result.did)/\(path.mstKey)"
             ),
             cid: record.cid,
             value: try RepositoryMSTValidation.decodeRecordBlock(
@@ -121,13 +130,22 @@ private struct PublicListRecordsHandler:
     ) async throws -> SwanPublicWire.ComAtprotoRepoListRecords.Output {
         let selector = parameters.repo.stringValue()
         let collection = parameters.collection.nsidString()
-        let page = try await directory.listPublicRepositoryRecords(
+        let result: PublicRepositoryReadPageResult
+        switch try await directory.publicRepositoryRecordsOutcome(
             selector: selector,
             collection: collection,
             limit: parameters.limit ?? 50,
             cursor: parameters.cursor,
             reverse: parameters.reverse ?? false
-        )
+        ) {
+        case .notFound:
+            throw PublicReadHandlerFailure.repoNotFound
+        case let .lifecycle(status):
+            throw PublicReadHandlerFailure.lifecycle(status.status)
+        case let .active(resolved):
+            result = resolved
+        }
+        let page = result.page
         let limit = parameters.limit ?? 50
         let reverse = parameters.reverse ?? false
         let keys = page.records.map(\.path.recordKey)
@@ -145,15 +163,10 @@ private struct PublicListRecordsHandler:
               page.cursor == keys.last else {
             throw PublicReadHandlerFailure.unavailable
         }
-        guard let description = try await directory.describePublicRepository(
-            selector: selector
-        ), description.status == .active else {
-            throw PublicReadHandlerFailure.unavailable
-        }
         let records = try page.records.map {
             SwanPublicWire.ComAtprotoRepoListRecords.Record(
                 uri: try ATProtocolURI(
-                    uriString: "at://\(description.did)/\($0.path.mstKey)"
+                    uriString: "at://\(result.did)/\($0.path.mstKey)"
                 ),
                 cid: $0.cid,
                 value: try RepositoryMSTValidation.decodeRecordBlock(
@@ -178,15 +191,17 @@ private struct PublicLatestCommitHandler:
         context: Request
     ) async throws -> SwanPublicWire.ComAtprotoSyncGetLatestCommit.Output {
         let selector = parameters.did.didString()
-        guard let status = try await directory.publicRepositoryStatus(
+        let description: PublicRepositoryReadDescription
+        switch try await directory.publicRepositoryDescriptionOutcome(
             selector: selector
-        ) else { throw PublicReadHandlerFailure.repoNotFound }
-        guard status.status == .active else {
+        ) {
+        case .notFound:
+            throw PublicReadHandlerFailure.repoNotFound
+        case let .lifecycle(status):
             throw PublicReadHandlerFailure.lifecycle(status.status)
+        case let .active(resolved):
+            description = resolved
         }
-        guard let description = try await directory.describePublicRepository(
-            selector: selector
-        ) else { throw PublicReadHandlerFailure.unavailable }
         return .init(
             cid: description.state.commitCID,
             rev: try TID(tidString: description.state.revision)
@@ -210,7 +225,7 @@ private struct PublicRepoStatusHandler:
         ) else { throw PublicReadHandlerFailure.repoNotFound }
         let publicStatus: String? = switch status.status {
         case .active: nil
-        case .deactivated, .deleted, .takendown, .suspended,
+        case .deactivated, .deleting, .deleted, .takendown, .suspended,
              .desynchronized, .throttled:
             status.status.rawValue
         case .unknown:
@@ -232,7 +247,8 @@ func isInstalledPublicReadMethod(_ nsid: String) -> Bool {
 func registerPublicRepositoryReadEndpoints(
     on router: Router<BasicRequestContext>,
     directory: any PublicRepositoryReadDirectory,
-    publicURL: URL
+    publicURL: URL,
+    jsonReadAdmission: PublicRepositoryJSONReadAdmission = .processShared
 ) {
     let describeHandler = PublicDescribeRepoHandler(
         directory: directory, publicURL: publicURL
@@ -274,19 +290,38 @@ func registerPublicRepositoryReadEndpoints(
                 recordKey: query["rkey"]!
             )
             let expectedCID = try query["cid"].map(publicReadCID)
-            let output = try await getRecordHandler.handle(
-                parameters: try publicReadWireParameters {
-                    .init(
-                        repo: try ATIdentifier(string: query["repo"]!),
-                        collection: try NSID(nsidString: path.collection),
-                        rkey: try RecordKey(keyString: path.recordKey),
-                        cid: expectedCID
-                    )
-                },
-                input: (),
-                context: request
-            )
-            return publicReadJSON(.ok, output)
+            guard let lease = jsonReadAdmission.reserve(
+                maximumResponseBytes: PublicRepositoryJSONReadLimits
+                    .maximumGetRecordResponseBytes
+            ) else {
+                return publicReadError(
+                    .serviceUnavailable, "temporarily_unavailable"
+                )
+            }
+            do {
+                let output = try await getRecordHandler.handle(
+                    parameters: try publicReadWireParameters {
+                        .init(
+                            repo: try ATIdentifier(string: query["repo"]!),
+                            collection: try NSID(nsidString: path.collection),
+                            rkey: try RecordKey(keyString: path.recordKey),
+                            cid: expectedCID
+                        )
+                    },
+                    input: (),
+                    context: request
+                )
+                return publicReadJSON(
+                    .ok,
+                    output,
+                    maximumBytes: PublicRepositoryJSONReadLimits
+                        .maximumGetRecordResponseBytes,
+                    lease: lease
+                )
+            } catch {
+                lease.release()
+                throw error
+            }
         } catch let failure as PublicReadHandlerFailure {
             return publicReadResponse(failure)
         } catch PublicRepositoryReadError.invalidSelector {
@@ -313,20 +348,39 @@ func registerPublicRepositoryReadEndpoints(
             )
             let limit = try query["limit"].map(publicReadLimit) ?? 50
             let reverse = try query["reverse"].map(publicReadBoolean) ?? false
-            let output = try await listRecordsHandler.handle(
-                parameters: try publicReadWireParameters {
-                    .init(
-                        repo: try ATIdentifier(string: query["repo"]!),
-                        collection: try NSID(nsidString: query["collection"]!),
-                        limit: limit,
-                        cursor: query["cursor"],
-                        reverse: reverse
-                    )
-                },
-                input: (),
-                context: request
-            )
-            return publicReadJSON(.ok, output)
+            guard let lease = jsonReadAdmission.reserve(
+                maximumResponseBytes: PublicRepositoryJSONReadLimits
+                    .maximumListRecordsResponseBytes
+            ) else {
+                return publicReadError(
+                    .serviceUnavailable, "temporarily_unavailable"
+                )
+            }
+            do {
+                let output = try await listRecordsHandler.handle(
+                    parameters: try publicReadWireParameters {
+                        .init(
+                            repo: try ATIdentifier(string: query["repo"]!),
+                            collection: try NSID(nsidString: query["collection"]!),
+                            limit: limit,
+                            cursor: query["cursor"],
+                            reverse: reverse
+                        )
+                    },
+                    input: (),
+                    context: request
+                )
+                return publicReadJSON(
+                    .ok,
+                    output,
+                    maximumBytes: PublicRepositoryJSONReadLimits
+                        .maximumListRecordsResponseBytes,
+                    lease: lease
+                )
+            } catch {
+                lease.release()
+                throw error
+            }
         } catch let failure as PublicReadHandlerFailure {
             return publicReadResponse(failure)
         } catch PublicRepositoryReadError.invalidLimit,
@@ -392,18 +446,16 @@ func registerPublicRepositoryReadEndpoints(
             _ = try publicReadWireParameters {
                 try DID(didString: query["did"]!)
             }
-            guard let status = try await directory.publicRepositoryStatus(
+            let car: PublicRepositoryReadCAR
+            switch try await directory.publicRepositoryCAROutcome(
                 selector: query["did"]!
-            ) else {
+            ) {
+            case .notFound:
                 return publicReadError(.badRequest, "RepoNotFound")
-            }
-            guard status.status == .active else {
+            case let .lifecycle(status):
                 return publicLifecycleError(status.status)
-            }
-            guard let car = try await directory.publicRepositoryCAR(
-                selector: query["did"]!
-            ) else {
-                return publicReadError(.badRequest, "RepoNotFound")
+            case let .active(resolved):
+                car = resolved
             }
             return publicRepositoryCARHTTPResponse(car)
         } catch let failure as PublicReadHandlerFailure {
@@ -539,11 +591,33 @@ private func publicReadError(_ status: HTTPResponse.Status, _ code: String) -> R
     jsonResponseWithStatus(status, body: ["error": code])
 }
 
-private func publicReadJSON(_ status: HTTPResponse.Status, _ value: some Encodable) -> Response {
+// Internal so the response-body lease lifetime can be regression-tested
+// without requiring a real socket to stall its outbound writer.
+func publicReadJSON(
+    _ status: HTTPResponse.Status,
+    _ value: some Encodable,
+    maximumBytes: Int = PublicRepositoryJSONReadLimits
+        .maximumListRecordsResponseBytes,
+    lease: PublicRepositoryJSONReadLease? = nil
+) -> Response {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-    guard let data = try? encoder.encode(value) else {
+    guard maximumBytes > 0,
+          let data = try? encoder.encode(value),
+          data.count <= maximumBytes else {
+        lease?.release()
         return publicReadError(.serviceUnavailable, "temporarily_unavailable")
+    }
+    if let lease {
+        return Response(
+            status: status,
+            headers: [.contentType: "application/json", .cacheControl: "no-store"],
+            body: .init(contentLength: data.count) { writer in
+                defer { lease.release() }
+                try await writer.write(ByteBuffer(data: data))
+                try await writer.finish(nil)
+            }
+        )
     }
     return Response(
         status: status,
@@ -567,12 +641,20 @@ private struct PublicDIDDocument: Encodable {
         handle: String,
         signingDIDKey: String,
         serviceEndpoint: String
-    ) {
+    ) throws {
         self.id = id
         alsoKnownAs = ["at://\(handle)"]
+        let verificationType = switch try PLCDIDKeyCodec.decode(
+            signingDIDKey
+        ) {
+        case .p256:
+            "EcdsaSecp256r1VerificationKey2019"
+        case .secp256k1:
+            "EcdsaSecp256k1VerificationKey2019"
+        }
         verificationMethod = [.init(
             id: "#atproto",
-            type: "EcdsaSecp256r1VerificationKey2019",
+            type: verificationType,
             controller: id,
             publicKeyMultibase: String(signingDIDKey.dropFirst("did:key:".count))
         )]

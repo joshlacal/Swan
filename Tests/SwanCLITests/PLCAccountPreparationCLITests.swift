@@ -424,7 +424,7 @@ final class PLCAccountPreparationCLITests: XCTestCase {
         XCTAssertNotEqual(optionWithoutCapability.status, 0)
         XCTAssertTrue(
             optionWithoutCapability.error.contains(
-                "management account KEK options require --enable-management-plc-provisioning"
+                "management account key options require --enable-management-plc-provisioning or --enable-management-permanent-deletion"
             )
         )
 
@@ -437,7 +437,7 @@ final class PLCAccountPreparationCLITests: XCTestCase {
         XCTAssertNotEqual(explicitDefaultWithoutCapability.status, 0)
         XCTAssertTrue(
             explicitDefaultWithoutCapability.error.contains(
-                "management account KEK options require --enable-management-plc-provisioning"
+                "management account key options require --enable-management-plc-provisioning or --enable-management-permanent-deletion"
             )
         )
 
@@ -453,10 +453,57 @@ final class PLCAccountPreparationCLITests: XCTestCase {
         XCTAssertNotEqual(missingRuntimeSecret.status, 0)
         XCTAssertTrue(
             missingRuntimeSecret.error.contains(
-                "management PLC provisioning runtime is unavailable"
+                "management account key store is unavailable"
             )
         )
         XCTAssertFalse(missingRuntimeSecret.error.contains(fixture.encodedKEK))
+    }
+
+    func testServePermanentDeletionOptionsFailClosedBeforeListener() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+
+        let missingPort = try runServe(
+            fixture: fixture,
+            arguments: ["--enable-management-permanent-deletion"]
+        )
+        XCTAssertNotEqual(missingPort.status, 0)
+        XCTAssertTrue(
+            missingPort.error.contains(
+                "--enable-management-permanent-deletion requires --management-port"
+            )
+        )
+
+        let optionWithoutCapability = try runServe(
+            fixture: fixture,
+            arguments: [
+                "--management-deletion-plc-origin",
+                "http://127.0.0.1:2582",
+            ]
+        )
+        XCTAssertNotEqual(optionWithoutCapability.status, 0)
+        XCTAssertTrue(
+            optionWithoutCapability.error.contains(
+                "management deletion PLC options require --enable-management-permanent-deletion"
+            )
+        )
+
+        let missingKey = try runServe(
+            fixture: fixture,
+            arguments: [
+                "--management-port", "40123",
+                "--enable-management-permanent-deletion",
+                "--management-account-kek-file",
+                fixture.secrets.appending(path: "missing-deletion-kek").path,
+            ]
+        )
+        XCTAssertNotEqual(missingKey.status, 0)
+        XCTAssertTrue(
+            missingKey.error.contains(
+                "management account key store is unavailable"
+            )
+        )
+        XCTAssertFalse(missingKey.error.contains(fixture.encodedKEK))
     }
 
     private func runPrepare(

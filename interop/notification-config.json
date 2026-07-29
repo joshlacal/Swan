@@ -4,12 +4,17 @@
   "authorityDestinations": [
     {
       "key": "did:plc:abcdefghijklmnopqrstuvwx",
-      "endpoint": "http://localhost:3000",
-      "audience": "did:web:interop-swan-managing-service",
+      "endpoint": "http://localhost:3001",
+      "audience": "did:plc:abcdefghijklmnopqrstuvwx",
       "finalPeer": "127.0.0.1"
     }
   ],
   "registrationDestinations": [],
   "recipientServiceBindings": [],
-  "managingServiceAudience": "did:web:interop-swan-managing-service"
+  "managingServiceAudience": "did:web:interop-swan-managing-service",
+  "credentialKeyPLC": {
+    "origin": "http://reference-plc:2582",
+    "laboratory": true,
+    "allowlistedHost": "reference-plc"
+  }
 }

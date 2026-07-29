@@ -9,6 +9,7 @@ public_wire_verify_checked_in_manifest
 public_wire_require_pinned_generator
 
 temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/swan-public-regenerate.XXXXXX")"
+trap 'find "${temporary_root}" -depth -delete' EXIT
 staged="${temporary_root}/lexicons"
 manifest="${temporary_root}/PublicPetrelManifest.json"
 public_wire_stage_lexicons "${staged}"
@@ -20,4 +21,5 @@ public_wire_materialize_manifest "${staged}" "${root}/Sources/SwanPublicWire/Gen
 public_wire_normalize_generated_sources "${root}/Sources/SwanPublicWire/Generated"
 public_wire_assert_contracts "${root}/Sources/SwanPublicWire/Generated"
 public_wire_verify_checked_in_manifest
+public_wire_verify_legacy_profile_immutable
 echo "pinned Swan public wire sources regenerated"

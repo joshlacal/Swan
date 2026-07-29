@@ -65,6 +65,25 @@ public enum SQLiteLayout {
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS oauth_control_client_metadata_freshness (
+            client_id TEXT PRIMARY KEY,
+            latest_generation INTEGER NOT NULL
+                CHECK(latest_generation > 0),
+            published_generation INTEGER NOT NULL DEFAULT 0
+                CHECK(published_generation >= 0)
+                CHECK(published_generation <= latest_generation),
+            retain_until INTEGER NOT NULL DEFAULT 0
+                CHECK(retain_until >= 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS oauth_control_client_metadata_generation (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            last_generation INTEGER NOT NULL
+                CHECK(last_generation >= 0)
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS oauth_control_token_families (
             family_id TEXT PRIMARY KEY,
             subject TEXT NOT NULL,
@@ -159,6 +178,14 @@ public enum SQLiteLayout {
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS plc_credential_key_continuity (
+            issuer TEXT PRIMARY KEY
+                CHECK(length(issuer) = 32 AND issuer GLOB 'did:plc:*'),
+            terminal_cid TEXT NOT NULL
+                CHECK(length(terminal_cid) = 59 AND terminal_cid GLOB 'bafyrei*')
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS plc_account_preparation_intents (
             request_id TEXT PRIMARY KEY,
             did TEXT NOT NULL UNIQUE,
@@ -172,6 +199,21 @@ public enum SQLiteLayout {
         "CREATE INDEX IF NOT EXISTS oauth_control_access_token_expiry ON oauth_control_access_tokens(expires_at)",
         "CREATE INDEX IF NOT EXISTS oauth_control_refresh_token_expiry ON oauth_control_refresh_tokens(expires_at)",
         "CREATE INDEX IF NOT EXISTS oauth_control_family_expiry ON oauth_control_token_families(expires_at)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_client_metadata_cleanup ON oauth_control_client_metadata(expires_at, client_id)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_par_request_cleanup ON oauth_control_par_requests(expires_at, request_digest)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_par_state_cleanup ON oauth_control_par_state_replays(expires_at, state_digest)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_authorization_code_expiry_cleanup ON oauth_control_authorization_codes(consumed_at, expires_at, code_digest)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_authorization_code_reuse_cleanup ON oauth_control_authorization_codes(consumed_at, reuse_expires_at, code_digest)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_authorization_code_family ON oauth_control_authorization_codes(family_id)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_access_token_cleanup ON oauth_control_access_tokens(expires_at, token_digest)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_access_token_family ON oauth_control_access_tokens(family_id)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_refresh_token_cleanup ON oauth_control_refresh_tokens(expires_at, token_digest)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_refresh_token_family ON oauth_control_refresh_tokens(family_id)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_dpop_replay_cleanup ON oauth_control_dpop_replays(expires_at, jti_digest)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_client_assertion_replay_cleanup ON oauth_control_client_assertion_replays(expires_at, jti_digest)",
+        "CREATE INDEX IF NOT EXISTS permissioned_space_delegation_replay_cleanup ON permissioned_space_delegation_replays(expires_at, jti_digest)",
+        "CREATE INDEX IF NOT EXISTS permissioned_space_client_attestation_replay_cleanup ON permissioned_space_client_attestation_replays(expires_at, replay_digest)",
+        "CREATE INDEX IF NOT EXISTS oauth_control_family_cleanup ON oauth_control_token_families(expires_at, family_id)",
     ]
 
     public static let accountConnectionPragmas = [
@@ -475,6 +517,274 @@ public enum SQLiteLayout {
         ON public_repository_import_sessions(status, expires_at)
         """,
         """
+        CREATE TABLE IF NOT EXISTS permissioned_remote_replica_state (
+            receiver_did TEXT NOT NULL,
+            space_uri TEXT NOT NULL,
+            repository_did TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK(generation > 0),
+            wire_revision TEXT NOT NULL,
+            history_floor_wire_revision TEXT NOT NULL,
+            lthash BLOB NOT NULL CHECK(length(lthash) = 2048),
+            commitment BLOB NOT NULL CHECK(length(commitment) = 32),
+            state_marker BLOB NOT NULL CHECK(length(state_marker) > 0),
+            installed_at INTEGER NOT NULL CHECK(installed_at >= 0),
+            PRIMARY KEY(space_uri, repository_did)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_remote_replica_blocks (
+            space_uri TEXT NOT NULL,
+            repository_did TEXT NOT NULL,
+            cid TEXT NOT NULL,
+            byte_count INTEGER NOT NULL
+                CHECK(byte_count BETWEEN 1 AND 1048576),
+            chunk_count INTEGER NOT NULL CHECK(chunk_count BETWEEN 1 AND 16),
+            generation INTEGER NOT NULL CHECK(generation > 0),
+            PRIMARY KEY(space_uri, repository_did, generation, cid)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_remote_replica_block_chunks (
+            space_uri TEXT NOT NULL,
+            repository_did TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK(generation > 0),
+            cid TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL CHECK(chunk_index BETWEEN 0 AND 15),
+            bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 65536),
+            PRIMARY KEY(
+                space_uri, repository_did, generation, cid, chunk_index
+            ),
+            FOREIGN KEY(space_uri, repository_did, generation, cid)
+                REFERENCES permissioned_remote_replica_blocks(
+                    space_uri, repository_did, generation, cid
+                ) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_remote_replica_records (
+            space_uri TEXT NOT NULL,
+            repository_did TEXT NOT NULL,
+            collection TEXT NOT NULL,
+            rkey TEXT NOT NULL,
+            cid TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK(generation > 0),
+            PRIMARY KEY(
+                space_uri, repository_did, generation, collection, rkey
+            ),
+            FOREIGN KEY(space_uri, repository_did, generation, cid)
+                REFERENCES permissioned_remote_replica_blocks(
+                    space_uri, repository_did, generation, cid
+                )
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_remote_replica_import_sessions (
+            session_id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL UNIQUE,
+            request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
+            source_origin TEXT NOT NULL,
+            receiver_did TEXT NOT NULL,
+            space_uri TEXT NOT NULL,
+            repository_did TEXT NOT NULL,
+            expected_base_generation INTEGER,
+            expected_base_wire_revision TEXT,
+            expected_base_history_floor TEXT,
+            expected_base_lthash BLOB,
+            expected_base_commitment BLOB,
+            expected_base_marker BLOB,
+            freshness_wire_revision TEXT,
+            freshness_commitment BLOB,
+            verifier_identity TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            maximum_car_bytes INTEGER NOT NULL,
+            maximum_record_bytes INTEGER NOT NULL,
+            maximum_index_entries INTEGER NOT NULL,
+            maximum_unique_blocks INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK(
+                status IN (
+                    'receiving', 'verifying', 'verified',
+                    'preparing', 'poisoned', 'consumed'
+                )
+            ),
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            expires_at INTEGER NOT NULL CHECK(expires_at > created_at),
+            commit_root_cid TEXT,
+            index_root_cid TEXT,
+            verified_commit_body BLOB
+                CHECK(verified_commit_body IS NULL
+                    OR length(verified_commit_body) <= 65536),
+            verified_commit_body_digest BLOB
+                CHECK(verified_commit_body_digest IS NULL
+                    OR length(verified_commit_body_digest) = 32),
+            verified_wire_revision TEXT,
+            verified_lthash BLOB
+                CHECK(verified_lthash IS NULL
+                    OR length(verified_lthash) = 2048),
+            verified_commitment BLOB
+                CHECK(verified_commitment IS NULL
+                    OR length(verified_commitment) = 32),
+            verified_record_count INTEGER,
+            verified_unique_block_count INTEGER,
+            verified_received_byte_count INTEGER,
+            verified_projection_digest BLOB
+                CHECK(verified_projection_digest IS NULL
+                    OR length(verified_projection_digest) = 32),
+            prepared_generation INTEGER CHECK(
+                prepared_generation IS NULL OR prepared_generation > 0
+            ),
+            prepared_projection_digest BLOB CHECK(
+                prepared_projection_digest IS NULL
+                    OR length(prepared_projection_digest) = 32
+            ),
+            CHECK(
+                (expected_base_generation IS NULL
+                    AND expected_base_wire_revision IS NULL
+                    AND expected_base_history_floor IS NULL
+                    AND expected_base_lthash IS NULL
+                    AND expected_base_commitment IS NULL
+                    AND expected_base_marker IS NULL)
+                OR
+                (expected_base_generation IS NOT NULL
+                    AND expected_base_wire_revision IS NOT NULL
+                    AND expected_base_history_floor IS NOT NULL
+                    AND length(expected_base_lthash) = 2048
+                    AND length(expected_base_commitment) = 32
+                    AND expected_base_marker IS NOT NULL)
+            ),
+            CHECK(
+                (freshness_wire_revision IS NULL
+                    AND freshness_commitment IS NULL)
+                OR
+                (freshness_wire_revision IS NOT NULL
+                    AND length(freshness_commitment) = 32)
+            )
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_remote_replica_import_index (
+            session_id TEXT NOT NULL REFERENCES
+                permissioned_remote_replica_import_sessions(session_id)
+                ON DELETE CASCADE,
+            path BLOB NOT NULL,
+            collection TEXT NOT NULL,
+            rkey TEXT NOT NULL,
+            cid TEXT NOT NULL,
+            consumed INTEGER NOT NULL DEFAULT 0 CHECK(consumed IN (0, 1)),
+            PRIMARY KEY(session_id, path),
+            UNIQUE(session_id, collection, rkey)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_remote_replica_import_blocks (
+            session_id TEXT NOT NULL REFERENCES
+                permissioned_remote_replica_import_sessions(session_id)
+                ON DELETE CASCADE,
+            cid TEXT NOT NULL,
+            byte_count INTEGER NOT NULL
+                CHECK(byte_count BETWEEN 1 AND 1048576),
+            chunk_count INTEGER NOT NULL DEFAULT 0
+                CHECK(chunk_count BETWEEN 0 AND 16),
+            complete INTEGER NOT NULL DEFAULT 0 CHECK(complete IN (0, 1)),
+            PRIMARY KEY(session_id, cid)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS
+            permissioned_remote_replica_import_block_chunks (
+            session_id TEXT NOT NULL,
+            cid TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL CHECK(chunk_index BETWEEN 0 AND 15),
+            bytes BLOB NOT NULL CHECK(length(bytes) BETWEEN 1 AND 65536),
+            PRIMARY KEY(session_id, cid, chunk_index),
+            FOREIGN KEY(session_id, cid)
+                REFERENCES permissioned_remote_replica_import_blocks(
+                    session_id, cid
+                ) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS permissioned_remote_replica_import_results (
+            request_id TEXT PRIMARY KEY,
+            request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
+            source_origin TEXT NOT NULL,
+            receiver_did TEXT NOT NULL,
+            space_uri TEXT NOT NULL,
+            repository_did TEXT NOT NULL,
+            base_generation INTEGER,
+            installed_generation INTEGER NOT NULL CHECK(installed_generation > 0),
+            installed_wire_revision TEXT NOT NULL,
+            installed_history_floor TEXT NOT NULL,
+            installed_lthash BLOB NOT NULL CHECK(length(installed_lthash) = 2048),
+            installed_commitment BLOB NOT NULL
+                CHECK(length(installed_commitment) = 32),
+            installed_marker BLOB NOT NULL,
+            commit_root_cid TEXT NOT NULL,
+            index_root_cid TEXT NOT NULL,
+            record_count INTEGER NOT NULL CHECK(record_count >= 0),
+            unique_block_count INTEGER NOT NULL CHECK(unique_block_count >= 0),
+            verifier_identity TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            committed_at INTEGER NOT NULL CHECK(committed_at >= 0),
+            integrity_digest BLOB NOT NULL CHECK(length(integrity_digest) = 32)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS permissioned_remote_replica_import_expiry
+        ON permissioned_remote_replica_import_sessions(status, expires_at)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS
+            permissioned_remote_replica_import_index_canonical_page
+        ON permissioned_remote_replica_import_index(
+            session_id, length(path), path
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS
+            permissioned_remote_replica_import_index_cid
+        ON permissioned_remote_replica_import_index(session_id, cid)
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS permissioned_remote_replica_records_page
+        ON permissioned_remote_replica_records(
+            space_uri, repository_did, generation, collection, rkey
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS permissioned_remote_replica_records_cid
+        ON permissioned_remote_replica_records(
+            space_uri, repository_did, generation, cid
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS
+            permissioned_remote_replica_records_canonical_page
+        ON permissioned_remote_replica_records(
+            space_uri,
+            repository_did,
+            generation,
+            length(CAST(collection || '/' || rkey AS BLOB)),
+            CAST(collection || '/' || rkey AS BLOB)
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS
+            permissioned_remote_replica_one_active_import
+        ON permissioned_remote_replica_import_sessions(
+            receiver_did, space_uri, repository_did
+        )
+        WHERE status IN ('receiving', 'verifying', 'verified', 'preparing')
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS
+            permissioned_remote_replica_one_active_import_v2
+        ON permissioned_remote_replica_import_sessions(
+            receiver_did, space_uri, repository_did
+        )
+        WHERE status IN ('receiving', 'verifying', 'verified', 'preparing')
+           OR (status = 'poisoned' AND prepared_generation IS NOT NULL)
+        """,
+        """
         CREATE TABLE IF NOT EXISTS plc_account_preparation_journal (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             request_id TEXT NOT NULL UNIQUE,
@@ -704,8 +1014,8 @@ public struct PersistedSpaceRecord: Sendable, Equatable {
     public let revision: UInt64
 }
 
-/// SQLite accepts an already-derived CID because canonical DAG-CBOR/CID
-/// construction belongs to SwanSpaces. Identifiers remain typed at this API.
+/// The write carries an already-derived CID, but the SQLite boundary verifies
+/// it against canonical DAG-CBOR before any transaction can persist it.
 public enum SQLiteSpaceWrite: Sendable, Equatable {
     case create(uri: SpaceRecordURI, value: Data, cid: String)
     case put(uri: SpaceRecordURI, value: Data, cid: String)
@@ -1095,6 +1405,8 @@ private actor SQLiteBlobLifecycleCoordinator {
 }
 
 private let sqliteBlobLifecycleCoordinator = SQLiteBlobLifecycleCoordinator()
+private let sqlitePermissionedCARSpoolAdmission =
+    try? SpaceCARSpoolAdmission()
 
 struct SQLiteTestingHooks: Sendable {
     var beforeApplyCommit: (@Sendable () async throws -> Void)?
@@ -1103,6 +1415,8 @@ struct SQLiteTestingHooks: Sendable {
     var beforeLegacyBlobMigrationCommit: (@Sendable () async throws -> Void)?
     var afterBlobReclaimCommit: (@Sendable () async throws -> Void)?
     var afterPublicRepositoryMutatingSQL: (@Sendable (Int) async throws -> Void)?
+    var afterRemoteReplicaMutatingSQL: (@Sendable (Int) async throws -> Void)?
+    var beforePermanentDeletionClose: (@Sendable () async throws -> Void)?
 
     init(
         beforeApplyCommit: (@Sendable () async throws -> Void)? = nil,
@@ -1110,7 +1424,9 @@ struct SQLiteTestingHooks: Sendable {
         beforeBlobReferenceCommit: (@Sendable () async throws -> Void)? = nil,
         beforeLegacyBlobMigrationCommit: (@Sendable () async throws -> Void)? = nil,
         afterBlobReclaimCommit: (@Sendable () async throws -> Void)? = nil,
-        afterPublicRepositoryMutatingSQL: (@Sendable (Int) async throws -> Void)? = nil
+        afterPublicRepositoryMutatingSQL: (@Sendable (Int) async throws -> Void)? = nil,
+        afterRemoteReplicaMutatingSQL: (@Sendable (Int) async throws -> Void)? = nil,
+        beforePermanentDeletionClose: (@Sendable () async throws -> Void)? = nil
     ) {
         self.beforeApplyCommit = beforeApplyCommit
         self.afterSnapshotStateRead = afterSnapshotStateRead
@@ -1118,6 +1434,8 @@ struct SQLiteTestingHooks: Sendable {
         self.beforeLegacyBlobMigrationCommit = beforeLegacyBlobMigrationCommit
         self.afterBlobReclaimCommit = afterBlobReclaimCommit
         self.afterPublicRepositoryMutatingSQL = afterPublicRepositoryMutatingSQL
+        self.afterRemoteReplicaMutatingSQL = afterRemoteReplicaMutatingSQL
+        self.beforePermanentDeletionClose = beforePermanentDeletionClose
     }
 }
 
@@ -1153,8 +1471,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private let descriptorBackedRestore: Bool
     private var accountDirectoryDescriptor: Int32
     private var databaseFileDescriptor: Int32
+    private var accountLifecycleLockDescriptor: Int32
+    private let externalBodyLeases =
+        SQLiteAccountExternalBodyLeaseGate()
     var testingHooks = SQLiteTestingHooks()
     private var activeWriteTransactions = 0
+    private var isClosed = false
 
     public init(
         dataDirectory: URL,
@@ -1207,6 +1529,19 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             SQLiteProtectedPaths.closeDirectory(rootDescriptor)
             throw error
         }
+        let lifecycleLockDescriptor: Int32
+        do {
+            lifecycleLockDescriptor = try SQLiteProtectedPaths
+                .openAccountLifecycleLock(
+                    accountDirectoryDescriptor: accountDescriptor,
+                    did: did,
+                    exclusive: false
+                )
+        } catch {
+            SQLiteProtectedPaths.closeDirectory(accountDescriptor)
+            SQLiteProtectedPaths.closeDirectory(rootDescriptor)
+            throw error
+        }
         let databasePath: String
         var heldDatabaseDescriptor: Int32 = -1
         do {
@@ -1215,17 +1550,24 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 .standardizedFileURL.path
             switch openMode {
             case .managed:
-                databasePath = try SQLiteProtectedPaths.openDatabaseFile(
+                // Keep an exact-file descriptor for the lifetime of the
+                // connection even though SQLite still opens the ordinary
+                // path below (WAL sidecars must live beside that path). Public
+                // repository admission uses this descriptor to prove that
+                // the directory entry still names the inode SQLite opened.
+                heldDatabaseDescriptor = try SQLiteProtectedPaths.openDatabaseFileDescriptor(
                     parentDescriptor: accountDescriptor,
                     name: name,
-                    resolvedPath: path
+                    create: true
                 )
+                databasePath = path
             case .existingPortableExportSource:
-                databasePath = try SQLiteProtectedPaths.openExistingDatabaseFile(
+                heldDatabaseDescriptor = try SQLiteProtectedPaths.openDatabaseFileDescriptor(
                     parentDescriptor: accountDescriptor,
                     name: name,
-                    resolvedPath: path
+                    create: false
                 )
+                databasePath = path
             case .descriptorBackedOperatorRestore:
                 heldDatabaseDescriptor = try SQLiteProtectedPaths.openDatabaseFileDescriptor(
                     parentDescriptor: accountDescriptor,
@@ -1247,6 +1589,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             }
         } catch {
             SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
+            SQLiteProtectedPaths.closeAccountLifecycleLock(
+                lifecycleLockDescriptor
+            )
             SQLiteProtectedPaths.closeDirectory(accountDescriptor)
             SQLiteProtectedPaths.closeDirectory(rootDescriptor)
             throw error
@@ -1285,17 +1630,24 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             )
         } catch {
             SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
+            SQLiteProtectedPaths.closeAccountLifecycleLock(
+                lifecycleLockDescriptor
+            )
             SQLiteProtectedPaths.closeDirectory(accountDescriptor)
             throw error
         }
         connection = openedConnection
         accountDirectoryDescriptor = accountDescriptor
         databaseFileDescriptor = heldDatabaseDescriptor
+        accountLifecycleLockDescriptor = lifecycleLockDescriptor
         if !readOnly {
             do {
                 try await migrateWithoutGate()
                 _ = try await recoverExpiredPublicRepositoryImportSessionsWithoutGate(
                     now: Int(Date().timeIntervalSince1970)
+                )
+                _ = try await recoverExpiredPermissionedRemoteReplicaImportSessionsWithoutGate(
+                    now: Int64(Date().timeIntervalSince1970)
                 )
                 try await recoverPrivateBlobLifecycle()
                 if !descriptorBacked {
@@ -1307,6 +1659,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             } catch {
                 try? await openedConnection.close()
                 SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
+                SQLiteProtectedPaths.closeAccountLifecycleLock(
+                    lifecycleLockDescriptor
+                )
                 SQLiteProtectedPaths.closeDirectory(accountDescriptor)
                 throw error
             }
@@ -1316,6 +1671,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             } catch {
                 try? await openedConnection.close()
                 SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
+                SQLiteProtectedPaths.closeAccountLifecycleLock(
+                    lifecycleLockDescriptor
+                )
                 SQLiteProtectedPaths.closeDirectory(accountDescriptor)
                 throw error
             }
@@ -1325,17 +1683,62 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// Service lifecycle owns shutdown explicitly; deinit cannot safely launch
     /// a task that captures an actor instance under Swift 6 isolation rules.
     public func close() async throws {
+        // Lifecycle transfers, shutdown recovery, and rejected admissions can
+        // all converge on the same actor. Closing twice must be a harmless
+        // replay rather than invoking SQLiteNIO on an already-closed handle.
+        guard !isClosed else { return }
+        isClosed = true
         try await withConnectionGate {
             let descriptor = accountDirectoryDescriptor
             let databaseDescriptor = databaseFileDescriptor
+            let lifecycleDescriptor = accountLifecycleLockDescriptor
             accountDirectoryDescriptor = -1
             databaseFileDescriptor = -1
+            accountLifecycleLockDescriptor = -1
             defer {
                 SQLiteProtectedPaths.closeDirectory(databaseDescriptor)
+                SQLiteProtectedPaths.closeAccountLifecycleLock(
+                    lifecycleDescriptor
+                )
                 SQLiteProtectedPaths.closeDirectory(descriptor)
             }
             try await connection.close()
         }
+    }
+
+    /// Returns the identity of the exact database file descriptor retained
+    /// for this connection. The descriptor is kept even for normal WAL
+    /// databases (SQLite still uses the directory path for sidecars), so
+    /// public-read admission can detect a directory-entry replacement without
+    /// relying on a second, request-time open.
+    func publicRepositoryDatabaseDescriptorIdentity()
+        throws -> SQLitePublicRepositoryFileIdentity
+    {
+        guard databaseFileDescriptor >= 0 else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        var metadata = stat()
+        guard fstat(databaseFileDescriptor, &metadata) == 0,
+              (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_uid == geteuid(),
+              (metadata.st_mode & 0o777) == 0o600,
+              metadata.st_nlink == 1 else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        return SQLitePublicRepositoryFileIdentity(
+            device: UInt64(metadata.st_dev),
+            inode: UInt64(metadata.st_ino)
+        )
+    }
+
+    /// Permanent deletion first closes admission in the escaping-body gate,
+    /// then waits for every previously authorized public/private blob stream
+    /// to release its descriptor before the database lifecycle lease is
+    /// dropped. This is stronger than ordinary service shutdown.
+    public func closeForPermanentDeletion() async throws {
+        await externalBodyLeases.revokeAndWait()
+        try await testingHooks.beforePermanentDeletionClose?()
+        try await close()
     }
 
     public func migrate() async throws {
@@ -1343,6 +1746,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migrateWithoutGate()
             _ = try await recoverExpiredPublicRepositoryImportSessionsWithoutGate(
                 now: Int(Date().timeIntervalSince1970)
+            )
+            _ = try await recoverExpiredPermissionedRemoteReplicaImportSessionsWithoutGate(
+                now: Int64(Date().timeIntervalSince1970)
             )
         }
         try await recoverPrivateBlobLifecycle()
@@ -2331,11 +2737,20 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 throw SwanError.unauthorized("record belongs to another repository")
             }
             switch write {
-            case let .create(_, _, cid) where cid.isEmpty,
-                 let .put(_, _, cid) where cid.isEmpty,
-                 let .update(_, _, cid) where cid.isEmpty:
-                throw SwanError.malformed("record CID is empty")
-            default:
+            case let .create(_, value, cid),
+                 let .put(_, value, cid),
+                 let .update(_, value, cid):
+                do {
+                    try SpaceCARCodec.validateCanonicalRecord(
+                        value,
+                        expectedCID: cid
+                    )
+                } catch {
+                    throw SwanError.malformed(
+                        "record must be canonical DAG-CBOR with its exact CID"
+                    )
+                }
+            case .delete:
                 break
             }
         }
@@ -2906,6 +3321,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let digestHex = try blobDigestHex(cid: expectedCID, allowLegacy: true)
         let byteCount = try blobByteCount(data.count)
         let columns = blobNamespaceColumns(namespace)
+        let restoreRepositorySpace: SpaceURI?
+        switch namespace {
+        case .public:
+            restoreRepositorySpace = nil
+        case let .space(space):
+            restoreRepositorySpace = space
+        }
         return try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
             try await putBlobLocked(
                 .memory(data),
@@ -2915,7 +3337,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 namespace: namespace,
                 namespaceKind: columns.kind,
                 spaceURI: columns.spaceURI,
-                mimeType: nil
+                mimeType: nil,
+                restoreRepositorySpace: restoreRepositorySpace
             )
         }
     }
@@ -2934,81 +3357,129 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         author: String
     ) async throws -> AuthorizedSpaceRepositoryCARSnapshot? {
         try requireAccount(author)
-        let bodyURL = try SQLiteProtectedPaths.makePrivateCARSpoolURL(in: dataDirectory)
-        do {
-            let prepared = try await withConnectionGate {
+        guard let lease = sqlitePermissionedCARSpoolAdmission?.reserve(
+            accountDID: author,
+            maximumBytes: SpaceCARProductionLimits.maximumWorkingSpoolBytes
+        ) else {
+            throw SpaceCARProductionLimits.limitExceeded()
+        }
+        var transferredLease = false
+        defer {
+            if !transferredLease {
+                lease.release()
+            }
+        }
+        let prepared = try await withConnectionGate {
+            try await withRepositoryCARIndexTable {
                 try await readTransaction {
+                    try Task.checkCancellation()
                     try await requireLocalRepositorySpaceOpen(space)
                     return try await prepareRepositoryCARSnapshotWithoutTransaction(
                         space: space,
                         author: author,
-                        bodyURL: bodyURL
+                        lease: lease
                     )
                 }
             }
-            guard let prepared else {
-                try? FileManager.default.removeItem(at: bodyURL)
-                return nil
-            }
-            return prepared
-        } catch {
-            try? FileManager.default.removeItem(at: bodyURL)
-            throw error
         }
+        if prepared != nil {
+            transferredLease = true
+        }
+        return prepared
     }
 
     private func prepareRepositoryCARSnapshotWithoutTransaction(
         space: SpaceURI,
         author: String,
-        bodyURL: URL
+        lease: SpaceCARSpoolLease
     ) async throws -> AuthorizedSpaceRepositoryCARSnapshot? {
         guard let state = try await loadState(space: space, author: author) else {
             return nil
         }
+        try Task.checkCancellation()
+        let recordCount = try await requireRepositoryCARProductionAdmission(
+            space: space,
+            author: author
+        )
+        try Task.checkCancellation()
+        let bodyHandle = try SQLiteProtectedPaths.makeUnlinkedPermissionedCARSpool(
+            in: dataDirectory
+        )
+        var transferredBodyHandle = false
+        defer {
+            if !transferredBodyHandle {
+                try? bodyHandle.close()
+            }
+        }
+        try await populateRepositoryCARIndex(space: space, author: author)
+        try Task.checkCancellation()
+        guard try await repositoryCARIndexRecordCount() == recordCount else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "permissioned CAR record count changed during snapshot"
+            )
+        }
+        try Task.checkCancellation()
         // Shared with the ordinary snapshot test hook so the CAR path proves
         // it remains one stable read transaction even while another WAL
-        // connection commits a newer revision.
+        // connection commits a newer revision. The metadata projection is
+        // already populated so tests can also inspect the connection-local
+        // keyset plan at this stable-snapshot boundary.
         await testingHooks.afterSnapshotStateRead?()
-        let indexURL = try SQLiteProtectedPaths.makePrivateCARSpoolURL(in: dataDirectory)
-        defer { try? FileManager.default.removeItem(at: indexURL) }
-
-        let indexHandle: FileHandle
-        do {
-            indexHandle = try FileHandle(forWritingTo: indexURL)
-        } catch {
-            throw SwanError.unavailable("permissioned CAR spool is unavailable")
-        }
+        try Task.checkCancellation()
+        let indexHandle =
+            try SQLiteProtectedPaths.makeUnlinkedPermissionedCARSpool(
+                in: dataDirectory
+            )
         var indexClosed = false
         defer {
             if !indexClosed { try? indexHandle.close() }
         }
 
-        let recordCount = try await repositoryCARRecordCount(space: space, author: author)
         var indexHash = SHA256()
         let indexPrefix = try SpaceCARCodec.streamingIndexPrefix(recordCount: recordCount)
         try writeCARSpoolData(indexPrefix, to: indexHandle)
         indexHash.update(data: indexPrefix)
+        var indexSize = indexPrefix.count
 
         var calculatedLtHash = LtHash()
-        var canonicalCursor: (length: Int, path: String)?
+        var canonicalCursor: (length: Int, pathBytes: Data)?
         var indexedCount = 0
-        while let record = try await nextRepositoryCARIndexRecord(
-            space: space,
-            author: author,
-            after: canonicalCursor
-        ) {
+        while true {
+            try Task.checkCancellation()
+            guard let record = try await nextRepositoryCARIndexRecord(
+                space: space,
+                author: author,
+                after: canonicalCursor
+            ) else {
+                break
+            }
             let path = "\(record.uri.collection)/\(record.uri.rkey)"
-            let length = path.utf8.count
+            let pathBytes = Data(path.utf8)
+            let length = pathBytes.count
             if let cursor = canonicalCursor,
-               length < cursor.length || (length == cursor.length && !cursor.path.utf8.lexicographicallyPrecedes(path.utf8)) {
+               length < cursor.length
+                || (
+                    length == cursor.length
+                        && !cursor.pathBytes.lexicographicallyPrecedes(pathBytes)
+                )
+            {
                 throw SQLiteRepositoryError.corruptDatabase("permissioned CAR index order is invalid")
             }
-            let cid = try validatedRepositoryCARCID(for: record)
+            let cid = try repositoryCARCID(for: record)
             let entry = try SpaceCARCodec.streamingIndexEntry(path: path, cid: cid)
+            let (nextIndexSize, indexSizeOverflow) =
+                indexSize.addingReportingOverflow(entry.count)
+            guard !indexSizeOverflow,
+                  nextIndexSize
+                    <= SpaceCARProductionLimits.maximumLogicalMetadataBytes
+            else {
+                throw SpaceCARProductionLimits.limitExceeded()
+            }
+            indexSize = nextIndexSize
             try writeCARSpoolData(entry, to: indexHandle)
             indexHash.update(data: entry)
             calculatedLtHash.add(element: "\(path)/\(cid.string)")
-            canonicalCursor = (length, path)
+            canonicalCursor = (length, pathBytes)
             indexedCount += 1
         }
         guard indexedCount == recordCount,
@@ -3017,8 +3488,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             throw SQLiteRepositoryError.corruptDatabase("permissioned CAR snapshot does not match repository state")
         }
 
-        try indexHandle.close()
-        indexClosed = true
         let indexCID = CID(
             codec: .dagCBOR,
             multihash: .init(
@@ -3027,74 +3496,197 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 digest: Data(indexHash.finalize())
             )
         )
-        let indexSize = try repositoryCARFileSize(indexURL)
 
-        let bodyHandle: FileHandle
-        do {
-            bodyHandle = try FileHandle(forWritingTo: bodyURL)
-        } catch {
-            throw SwanError.unavailable("permissioned CAR spool is unavailable")
-        }
-        var bodyClosed = false
-        defer {
-            if !bodyClosed { try? bodyHandle.close() }
-        }
-
-        try writeCARSpoolData(
-            try SpaceCARCodec.streamingBlockPrefix(cid: indexCID, dataLength: indexSize),
-            to: bodyHandle
+        var bodyByteCount = 0
+        let indexBlockPrefix = try SpaceCARCodec.streamingBlockPrefix(
+            cid: indexCID,
+            dataLength: indexSize
         )
-        try copyCARSpoolFile(indexURL, to: bodyHandle)
+        try reserveRepositoryCARBodyBytes(
+            indexBlockPrefix.count,
+            currentByteCount: &bodyByteCount
+        )
+        try reserveRepositoryCARBodyBytes(
+            indexSize,
+            currentByteCount: &bodyByteCount
+        )
+        try writeCARSpoolData(indexBlockPrefix, to: bodyHandle)
+        try copyCARSpoolFile(indexHandle, to: bodyHandle)
+        try indexHandle.close()
+        indexClosed = true
 
         var lexicalCursor: (collection: String, rkey: String)?
-        var emittedCount = 0
-        while let record = try await nextRepositoryCARRecord(
-            space: space,
-            author: author,
-            after: lexicalCursor
-        ) {
+        var visitedCount = 0
+        while true {
+            try Task.checkCancellation()
+            guard let selected = try await nextRepositoryCARRecord(
+                space: space,
+                author: author,
+                after: lexicalCursor
+            ) else {
+                break
+            }
+            let record = selected.record
             if let cursor = lexicalCursor,
                record.uri.collection < cursor.collection ||
                (record.uri.collection == cursor.collection && record.uri.rkey <= cursor.rkey) {
                 throw SQLiteRepositoryError.corruptDatabase("permissioned CAR record order is invalid")
             }
-            let cid = try validatedRepositoryCARCID(for: record)
-            try writeCARSpoolData(
-                try SpaceCARCodec.streamingBlockPrefix(cid: cid, dataLength: record.value.count),
-                to: bodyHandle
-            )
-            try writeCARSpoolData(record.value, to: bodyHandle)
+            let cid = try repositoryCARCID(for: record)
+            if selected.shouldEmit {
+                guard record.valueByteCount
+                    <= SpaceCARProductionLimits.maximumRecordBytes
+                else {
+                    throw SpaceCARProductionLimits.limitExceeded()
+                }
+                let blockPrefix = try SpaceCARCodec.streamingBlockPrefix(
+                    cid: cid,
+                    dataLength: record.valueByteCount
+                )
+                let (blockByteCount, overflow) = blockPrefix.count
+                    .addingReportingOverflow(record.valueByteCount)
+                guard !overflow else {
+                    throw SpaceCARProductionLimits.limitExceeded()
+                }
+                try reserveRepositoryCARBodyBytes(
+                    blockByteCount,
+                    currentByteCount: &bodyByteCount
+                )
+                try writeCARSpoolData(blockPrefix, to: bodyHandle)
+                try await streamAndValidateRepositoryCARValue(
+                    for: record,
+                    expectedCID: cid,
+                    to: bodyHandle
+                )
+                try await markRepositoryCARCIDEmitted(cid.string)
+            } else {
+                // A shared CID still requires validating every persisted value.
+                // Otherwise a corrupt duplicate row could be hidden behind the
+                // one canonical CAR block emitted for an earlier path.
+                try await streamAndValidateRepositoryCARValue(
+                    for: record,
+                    expectedCID: cid,
+                    to: nil
+                )
+            }
             lexicalCursor = (record.uri.collection, record.uri.rkey)
-            emittedCount += 1
+            visitedCount += 1
         }
-        guard emittedCount == recordCount else {
+        guard visitedCount == recordCount else {
             throw SQLiteRepositoryError.corruptDatabase("permissioned CAR record count changed during snapshot")
         }
-        try bodyHandle.close()
-        bodyClosed = true
+        try bodyHandle.synchronize()
+        try Task.checkCancellation()
+        try bodyHandle.seek(toOffset: 0)
 
-        return AuthorizedSpaceRepositoryCARSnapshot(
+        let prepared = AuthorizedSpaceRepositoryCARSnapshot(
             state: AuthorizedSpaceRepositoryCommitState(
                 space: state.space,
                 author: state.author,
                 wireRevision: state.wireRevision.toString(),
                 commitment: state.commitment
             ),
-            spool: SpaceCARBodySpool(indexCID: indexCID, bodyURL: bodyURL)
+            spool: try SpaceCARBodySpool(
+                indexCID: indexCID,
+                fileHandle: bodyHandle,
+                bodyByteCount: bodyByteCount,
+                lease: lease
+            )
         )
+        transferredBodyHandle = true
+        return prepared
     }
 
-    private func repositoryCARRecordCount(
+    /// Rejects adversarial path cardinality, TEMP projection amplification,
+    /// and incompatible record bodies before creating either CAR payload
+    /// spool. This runs inside the same read snapshot as subsequent encoding.
+    private func requireRepositoryCARProductionAdmission(
         space: SpaceURI,
         author: String
     ) async throws -> Int {
-        let rows = try await connection.query(
+        let countRows = try await connection.query(
             """
             SELECT COUNT(*) AS record_count
             FROM permissioned_space_records
             WHERE space_uri = ? AND author_did = ?
             """,
             [.text(space.rawValue), .text(author)]
+        )
+        guard let countRow = countRows.first else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "permissioned CAR count is unavailable"
+            )
+        }
+        let count = try requiredRevision(countRow, "record_count")
+        guard count <= UInt64(SpaceCARProductionLimits.maximumRecordCount) else {
+            throw SpaceCARProductionLimits.limitExceeded()
+        }
+
+        let admissionRows = try await connection.query(
+            """
+            SELECT
+              COALESCE(
+                SUM(
+                  2 * length(CAST(collection || '/' || rkey AS BLOB))
+                  + length(CAST(cid AS BLOB))
+                  + 64
+                ),
+                0
+              ) AS logical_metadata_bytes,
+              COALESCE(MAX(length(value)), 0) AS maximum_record_bytes
+            FROM permissioned_space_records
+            WHERE space_uri = ? AND author_did = ?
+            """,
+            [.text(space.rawValue), .text(author)]
+        )
+        guard let admission = admissionRows.first,
+              let logicalMetadataBytes = admission
+                .column("logical_metadata_bytes")?.integer,
+              let maximumRecordBytes = admission
+                .column("maximum_record_bytes")?.integer,
+              logicalMetadataBytes >= 0,
+              maximumRecordBytes >= 0,
+              logicalMetadataBytes
+                <= SpaceCARProductionLimits.maximumLogicalMetadataBytes,
+              maximumRecordBytes
+                <= SpaceCARProductionLimits.maximumRecordBytes
+        else {
+            throw SpaceCARProductionLimits.limitExceeded()
+        }
+        return Int(count)
+    }
+
+    /// Materializes only canonical path metadata. Record values stay in the
+    /// repository table and are fetched one at a time through its full primary
+    /// key after the metadata keyset selects the next path.
+    private func populateRepositoryCARIndex(
+        space: SpaceURI,
+        author: String
+    ) async throws {
+        _ = try await connection.query(
+            """
+            INSERT INTO temp.swan_repository_car_index(
+                path_length, path_bytes, collection, rkey, cid, emitted
+            )
+            SELECT length(CAST(collection || '/' || rkey AS BLOB)),
+                   CAST(collection || '/' || rkey AS BLOB),
+                   collection,
+                   rkey,
+                   cid,
+                   0
+            FROM permissioned_space_records
+            WHERE space_uri = ? AND author_did = ?
+            """,
+            [.text(space.rawValue), .text(author)]
+        )
+    }
+
+    private func repositoryCARIndexRecordCount() async throws -> Int {
+        let rows = try await connection.query(
+            """
+            SELECT COUNT(*) AS record_count
+            FROM temp.swan_repository_car_index
+            """
         )
         guard let row = rows.first else {
             throw SQLiteRepositoryError.corruptDatabase("permissioned CAR count is unavailable")
@@ -3111,44 +3703,54 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private func nextRepositoryCARIndexRecord(
         space: SpaceURI,
         author: String,
-        after cursor: (length: Int, path: String)?
-    ) async throws -> PersistedSpaceRecord? {
+        after cursor: (length: Int, pathBytes: Data)?
+    ) async throws -> RepositoryCARRecordMetadata? {
         let rows: [SQLiteRow]
         if let cursor {
             rows = try await connection.query(
                 """
-                SELECT collection, rkey, value, cid, revision
-                FROM permissioned_space_records
-                WHERE space_uri = ? AND author_did = ?
-                  AND (
-                    length(CAST(collection || '/' || rkey AS BLOB)) > ?
-                    OR (
-                      length(CAST(collection || '/' || rkey AS BLOB)) = ?
-                      AND collection || '/' || rkey > ?
-                    )
-                  )
-                ORDER BY length(CAST(collection || '/' || rkey AS BLOB)), collection || '/' || rkey
+                SELECT records.collection, records.rkey,
+                       records.cid, records.revision,
+                       length(records.value) AS value_byte_count
+                FROM temp.swan_repository_car_index AS metadata
+                JOIN permissioned_space_records AS records
+                  ON records.space_uri = ?
+                 AND records.author_did = ?
+                 AND records.collection = metadata.collection
+                 AND records.rkey = metadata.rkey
+                WHERE (metadata.path_length, metadata.path_bytes) > (?, ?)
+                ORDER BY metadata.path_length, metadata.path_bytes
                 LIMIT 1
                 """,
                 [
                     .text(space.rawValue), .text(author),
-                    .integer(cursor.length), .integer(cursor.length), .text(cursor.path),
+                    .integer(cursor.length), cursor.pathBytes.sqliteData!,
                 ]
             )
         } else {
             rows = try await connection.query(
                 """
-                SELECT collection, rkey, value, cid, revision
-                FROM permissioned_space_records
-                WHERE space_uri = ? AND author_did = ?
-                ORDER BY length(CAST(collection || '/' || rkey AS BLOB)), collection || '/' || rkey
+                SELECT records.collection, records.rkey,
+                       records.cid, records.revision,
+                       length(records.value) AS value_byte_count
+                FROM temp.swan_repository_car_index AS metadata
+                JOIN permissioned_space_records AS records
+                  ON records.space_uri = ?
+                 AND records.author_did = ?
+                 AND records.collection = metadata.collection
+                 AND records.rkey = metadata.rkey
+                ORDER BY metadata.path_length, metadata.path_bytes
                 LIMIT 1
                 """,
                 [.text(space.rawValue), .text(author)]
             )
         }
         guard let row = rows.first else { return nil }
-        return try decodeRecord(row, space: space, author: author)
+        return try decodeRepositoryCARRecordMetadata(
+            row,
+            space: space,
+            author: author
+        )
     }
 
     /// The proposal requires record blocks to follow lexicographic
@@ -3158,79 +3760,242 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         space: SpaceURI,
         author: String,
         after cursor: (collection: String, rkey: String)?
-    ) async throws -> PersistedSpaceRecord? {
+    ) async throws -> (
+        record: RepositoryCARRecordMetadata,
+        shouldEmit: Bool
+    )? {
         let rows: [SQLiteRow]
         if let cursor {
             rows = try await connection.query(
                 """
-                SELECT collection, rkey, value, cid, revision
-                FROM permissioned_space_records
-                WHERE space_uri = ? AND author_did = ?
-                  AND (collection > ? OR (collection = ? AND rkey > ?))
-                ORDER BY collection, rkey
+                SELECT records.collection, records.rkey,
+                       records.cid, records.revision,
+                       length(records.value) AS value_byte_count,
+                       metadata.emitted AS car_cid_emitted
+                FROM permissioned_space_records AS records
+                JOIN temp.swan_repository_car_index AS metadata
+                  ON metadata.collection = records.collection
+                 AND metadata.rkey = records.rkey
+                 AND metadata.cid = records.cid
+                WHERE records.space_uri = ? AND records.author_did = ?
+                  AND (records.collection, records.rkey) > (?, ?)
+                ORDER BY records.collection, records.rkey
                 LIMIT 1
                 """,
                 [
                     .text(space.rawValue), .text(author),
-                    .text(cursor.collection), .text(cursor.collection), .text(cursor.rkey),
+                    .text(cursor.collection), .text(cursor.rkey),
                 ]
             )
         } else {
             rows = try await connection.query(
                 """
-                SELECT collection, rkey, value, cid, revision
-                FROM permissioned_space_records
-                WHERE space_uri = ? AND author_did = ?
-                ORDER BY collection, rkey
+                SELECT records.collection, records.rkey,
+                       records.cid, records.revision,
+                       length(records.value) AS value_byte_count,
+                       metadata.emitted AS car_cid_emitted
+                FROM permissioned_space_records AS records
+                JOIN temp.swan_repository_car_index AS metadata
+                  ON metadata.collection = records.collection
+                 AND metadata.rkey = records.rkey
+                 AND metadata.cid = records.cid
+                WHERE records.space_uri = ? AND records.author_did = ?
+                ORDER BY records.collection, records.rkey
                 LIMIT 1
                 """,
                 [.text(space.rawValue), .text(author)]
             )
         }
         guard let row = rows.first else { return nil }
-        return try decodeRecord(row, space: space, author: author)
+        guard let emitted = row.column("car_cid_emitted")?.integer,
+              emitted == 0 || emitted == 1
+        else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "permissioned CAR CID projection is invalid"
+            )
+        }
+        return (
+            try decodeRepositoryCARRecordMetadata(
+                row,
+                space: space,
+                author: author
+            ),
+            emitted == 0
+        )
     }
 
-    private func validatedRepositoryCARCID(
-        for record: PersistedSpaceRecord
+    private func markRepositoryCARCIDEmitted(_ cid: String) async throws {
+        _ = try await connection.query(
+            """
+            UPDATE temp.swan_repository_car_index
+            SET emitted = 1
+            WHERE cid = ? AND emitted = 0
+            """,
+            [.text(cid)]
+        )
+        // This runs while the caller owns `connectionGate`, so no other
+        // statement can replace SQLite's connection-local changes count
+        // between the UPDATE and this constant-size scalar query.
+        let rows = try await connection.query(
+            "SELECT changes() AS changed_count"
+        )
+        guard rows.count == 1,
+              let changed = rows[0].column("changed_count")?.integer,
+              changed > 0,
+              changed <= SpaceCARProductionLimits.maximumRecordCount
+        else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "permissioned CAR CID projection is invalid"
+            )
+        }
+    }
+
+    private struct RepositoryCARRecordMetadata {
+        let uri: SpaceRecordURI
+        let cid: String
+        let valueByteCount: Int
+    }
+
+    private func decodeRepositoryCARRecordMetadata(
+        _ row: SQLiteRow,
+        space: SpaceURI,
+        author: String
+    ) throws -> RepositoryCARRecordMetadata {
+        let uri = try SpaceRecordURI(
+            space: space,
+            author: author,
+            collection: requiredText(row, "collection"),
+            rkey: requiredText(row, "rkey")
+        )
+        let valueByteCount = try requiredInteger(row, "value_byte_count")
+        guard valueByteCount >= 0 else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "permissioned CAR record length is invalid"
+            )
+        }
+        // Preserve the existing corruption check even though a CAR frame does
+        // not otherwise need the persisted revision.
+        _ = try requiredRevision(row, "revision")
+        return RepositoryCARRecordMetadata(
+            uri: uri,
+            cid: try requiredText(row, "cid"),
+            valueByteCount: valueByteCount
+        )
+    }
+
+    private func repositoryCARCID(
+        for record: RepositoryCARRecordMetadata
     ) throws -> CID {
-        let stored = try CID.parse(record.cid)
-        guard CID.fromDAGCBOR(record.value) == stored else {
+        try CID.parse(record.cid)
+    }
+
+    /// Hashes every persisted record through bounded SQLite BLOB slices and,
+    /// for the first path referencing a CID, copies those same slices into the
+    /// private CAR spool. Avoiding a full `SQLiteRow` BLOB here is essential:
+    /// Foundation's debug allocator can retain one freed ~1 MiB region per row,
+    /// turning a nominally streaming 256 MiB read into a 256 MiB RSS increase.
+    private func streamAndValidateRepositoryCARValue(
+        for record: RepositoryCARRecordMetadata,
+        expectedCID: CID,
+        to destination: FileHandle?
+    ) async throws {
+        var hasher = SHA256()
+        var offset = 0
+        while offset < record.valueByteCount {
+            try Task.checkCancellation()
+            let chunkByteCount = min(
+                SpaceCARBodySpool.maximumChunkBytes,
+                record.valueByteCount - offset
+            )
+            let rows = try await connection.query(
+                """
+                SELECT substr(value, ?, ?) AS value_chunk,
+                       length(value) AS value_byte_count
+                FROM permissioned_space_records
+                WHERE space_uri = ? AND author_did = ?
+                  AND collection = ? AND rkey = ?
+                """,
+                [
+                    .integer(offset + 1), .integer(chunkByteCount),
+                    .text(record.uri.space.rawValue), .text(record.uri.author),
+                    .text(record.uri.collection), .text(record.uri.rkey),
+                ]
+            )
+            guard rows.count == 1 else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "permissioned CAR record changed during snapshot"
+                )
+            }
+            let row = rows[0]
+            guard try requiredInteger(row, "value_byte_count")
+                    == record.valueByteCount
+            else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "permissioned CAR record changed during snapshot"
+                )
+            }
+            let chunk = try requiredBlob(row, "value_chunk")
+            guard chunk.count == chunkByteCount else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "permissioned CAR record is truncated"
+                )
+            }
+            hasher.update(data: chunk)
+            if let destination {
+                try writeCARSpoolData(chunk, to: destination)
+            }
+            offset += chunk.count
+        }
+        let calculated = CID(
+            codec: .dagCBOR,
+            multihash: .init(
+                algorithm: Multihash.sha256Code,
+                length: Multihash.sha256Length,
+                digest: Data(hasher.finalize())
+            )
+        )
+        guard calculated == expectedCID else {
             throw SQLiteRepositoryError.corruptDatabase("permissioned CAR record CID does not match value")
         }
-        return stored
     }
 
-    private func repositoryCARFileSize(_ url: URL) throws -> Int {
-        let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
-        guard values.isRegularFile == true,
-              let size = values.fileSize,
-              size >= 0
-        else {
-            throw SwanError.unavailable("permissioned CAR spool is unavailable")
+    private func reserveRepositoryCARBodyBytes(
+        _ bytes: Int,
+        currentByteCount: inout Int
+    ) throws {
+        guard bytes >= 0 else {
+            throw SpaceCARProductionLimits.limitExceeded()
         }
-        return size
+        let (next, overflow) = currentByteCount.addingReportingOverflow(bytes)
+        guard !overflow,
+              next <= SpaceCARProductionLimits.maximumBodyBytes
+        else {
+            throw SpaceCARProductionLimits.limitExceeded()
+        }
+        currentByteCount = next
     }
 
     private func writeCARSpoolData(_ data: Data, to handle: FileHandle) throws {
         var offset = 0
         while offset < data.count {
+            try Task.checkCancellation()
             let end = min(offset + SpaceCARBodySpool.maximumChunkBytes, data.count)
             try handle.write(contentsOf: data[offset ..< end])
             offset = end
         }
     }
 
-    private func copyCARSpoolFile(_ source: URL, to destination: FileHandle) throws {
-        let handle: FileHandle
-        do {
-            handle = try FileHandle(forReadingFrom: source)
-        } catch {
-            throw SwanError.unavailable("permissioned CAR spool is unavailable")
-        }
-        defer { try? handle.close() }
-        while let chunk = try handle.read(upToCount: SpaceCARBodySpool.maximumChunkBytes),
+    private func copyCARSpoolFile(
+        _ source: FileHandle,
+        to destination: FileHandle
+    ) throws {
+        try source.synchronize()
+        try source.seek(toOffset: 0)
+        while let chunk = try source.read(
+            upToCount: SpaceCARBodySpool.maximumChunkBytes
+        ),
               !chunk.isEmpty {
+            try Task.checkCancellation()
             try destination.write(contentsOf: chunk)
         }
     }
@@ -4738,17 +5503,18 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         guard author == accountDID else {
             throw SwanError.unauthorized("account database ownership mismatch")
         }
-        try await withConnectionGate {
+        _ = try canonicalRawBlobCID(cid)
+        let stored = try await withConnectionGate {
             try await readTransaction {
-                try await requireLocalRepositorySpaceOpen(space)
+                try await requireReadablePermissionedBlobRepository(space)
+                return try await blobPayloadIfReachableWithoutGate(
+                    cid: cid,
+                    namespaceKind: "space",
+                    spaceURI: space.rawValue
+                )
             }
         }
-        _ = try canonicalRawBlobCID(cid)
-        guard let stored = try await blobPayloadIfReachable(
-            cid: cid,
-            namespaceKind: "space",
-            spaceURI: space.rawValue
-        ) else {
+        guard let stored else {
             return nil
         }
         let body = try await fileBackedBlobBody(stored)
@@ -4800,7 +5566,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             digestHex: digestHex
         )
         await sqliteBlobLifecycleCoordinator.acquire(key)
-        let descriptor: Int32
+        var descriptor: Int32 = -1
         do {
             descriptor = try SQLiteProtectedPaths.openPrivateBlobLifecycleLock(
                 accountDirectoryDescriptor: accountDirectoryDescriptor,
@@ -4831,10 +5597,22 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         namespace: BlobNamespace,
         namespaceKind: String,
         spaceURI: String,
-        mimeType: String?
+        mimeType: String?,
+        restoreRepositorySpace: SpaceURI? = nil
     ) async throws -> BlobReference {
         let preparation: BlobCASPreparation = try await withConnectionGate {
             try await transaction {
+                if let restoreRepositorySpace {
+                    guard namespaceKind == "space",
+                          spaceURI == restoreRepositorySpace.rawValue else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "portable blob restore namespace is invalid"
+                        )
+                    }
+                    try await requirePortableBlobRestoreRepository(
+                        restoreRepositorySpace
+                    )
+                }
                 switch try await blobStorageKindWithoutGate(cid: cid) {
                 case .casV1:
                     try await setBlobLifecycleStateWithoutGate(
@@ -4904,6 +5682,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             }
             try await withConnectionGate {
                 try await transaction {
+                    if let restoreRepositorySpace {
+                        try await requirePortableBlobRestoreRepository(
+                            restoreRepositorySpace
+                        )
+                    }
                     _ = try await connection.query(
                         """
                         INSERT INTO blob_payloads(
@@ -5126,20 +5909,28 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         guard let expectedDigest = legacyBlobDigest("sha256:\(digestHex)") else {
             throw SQLiteRepositoryError.corruptDatabase("invalid CAS blob digest")
         }
-        let descriptor = try SQLiteProtectedPaths.openPrivateBlob(
-            accountDirectoryDescriptor: accountDirectoryDescriptor,
-            accountNamespace: accountBlobNamespace,
-            digestHex: digestHex
-        )
+        guard let lease = externalBodyLeases.acquire() else {
+            throw SwanError.unavailable(
+                "permissioned blob storage is unavailable"
+            )
+        }
+        var descriptor: Int32 = -1
         do {
+            descriptor = try SQLiteProtectedPaths.openPrivateBlob(
+                accountDirectoryDescriptor: accountDirectoryDescriptor,
+                accountNamespace: accountBlobNamespace,
+                digestHex: digestHex
+            )
             let body = try SQLiteVerifiedSpaceBlobBody(
                 descriptor: descriptor,
                 expectedDigest: expectedDigest,
-                expectedLength: expectedLength
+                expectedLength: expectedLength,
+                externalLease: lease
             )
             body.discardUnstreamed()
         } catch {
             SQLiteProtectedPaths.closeDirectory(descriptor)
+            lease.release()
             throw error
         }
     }
@@ -5436,19 +6227,27 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         guard let digest = legacyBlobDigest("sha256:\(digestHex)") else {
             throw SQLiteRepositoryError.corruptDatabase("invalid CAS blob digest")
         }
-        let descriptor = try SQLiteProtectedPaths.openPrivateBlob(
-            accountDirectoryDescriptor: accountDirectoryDescriptor,
-            accountNamespace: accountBlobNamespace,
-            digestHex: digestHex
-        )
+        guard let lease = externalBodyLeases.acquire() else {
+            throw SwanError.unavailable(
+                "permissioned blob storage is unavailable"
+            )
+        }
+        var descriptor: Int32 = -1
         do {
+            descriptor = try SQLiteProtectedPaths.openPrivateBlob(
+                accountDirectoryDescriptor: accountDirectoryDescriptor,
+                accountNamespace: accountBlobNamespace,
+                digestHex: digestHex
+            )
             return try SQLiteVerifiedSpaceBlobBody(
                 descriptor: descriptor,
                 expectedDigest: digest,
-                expectedLength: stored.byteCount
+                expectedLength: stored.byteCount,
+                externalLease: lease
             )
         } catch {
             SQLiteProtectedPaths.closeDirectory(descriptor)
+            lease.release()
             throw error
         }
     }
@@ -5836,7 +6635,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
-    private func readTransaction<T: Sendable>(
+    func readTransaction<T: Sendable>(
         _ body: () async throws -> T
     ) async throws -> T {
         _ = try await connection.query("BEGIN")
@@ -5846,6 +6645,52 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             return result
         } catch {
             _ = try? await connection.query("ROLLBACK")
+            throw error
+        }
+    }
+
+    /// Owns the connection-local canonical-path projection for exactly one CAR
+    /// read. Callers already hold `connectionGate`; cleanup therefore happens
+    /// after the read transaction has committed or rolled back and before any
+    /// other operation can reuse this SQLite connection.
+    private func withRepositoryCARIndexTable<T: Sendable>(
+        _ body: () async throws -> T
+    ) async throws -> T {
+        _ = try await connection.query(
+            "DROP TABLE IF EXISTS temp.swan_repository_car_index"
+        )
+        try Task.checkCancellation()
+        _ = try await connection.query(
+            """
+            CREATE TEMP TABLE swan_repository_car_index (
+                path_length INTEGER NOT NULL,
+                path_bytes BLOB NOT NULL,
+                collection TEXT NOT NULL,
+                rkey TEXT NOT NULL,
+                cid TEXT NOT NULL,
+                emitted INTEGER NOT NULL DEFAULT 0
+                    CHECK(emitted IN (0, 1)),
+                PRIMARY KEY(path_length, path_bytes)
+            ) WITHOUT ROWID
+            """
+        )
+        _ = try await connection.query(
+            """
+            CREATE INDEX temp.swan_repository_car_index_cid
+            ON swan_repository_car_index(cid, emitted)
+            """
+        )
+        do {
+            let result = try await body()
+            _ = try await connection.query(
+                "DROP TABLE temp.swan_repository_car_index"
+            )
+            try Task.checkCancellation()
+            return result
+        } catch {
+            _ = try? await connection.query(
+                "DROP TABLE IF EXISTS temp.swan_repository_car_index"
+            )
             throw error
         }
     }
@@ -6295,9 +7140,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             guard record.uri.space == repository.space,
                   record.uri.author == repository.author,
                   record.revision == 1,
-                  record.value.count <= 512 * 1_024 * 1_024,
+                  record.value.count
+                    <= SpaceCARRecoveryLimits.absoluteMaximumRecordBytes,
                   totalBytes <= 1_024 * 1_024 * 1_024 - record.value.count,
-                  CID.fromDAGCBOR(record.value).string == record.cid else {
+                  (try? SpaceCARCodec.validateCanonicalRecord(
+                    record.value,
+                    expectedCID: record.cid
+                  )) != nil else {
                 throw SQLiteRepositoryError.corruptDatabase(
                     "portable restore record is invalid"
                 )
@@ -6337,6 +7186,82 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
         guard rows.isEmpty, restoredClosures.isEmpty else {
             throw SwanError.unauthorized("permissioned space is closed")
+        }
+    }
+
+    /// Portable restore may stage bytes for a repository that is deliberately
+    /// HTTP-closed by `missing-authority-policy-v1`. It still requires the
+    /// matching account-owned repository state and rejects authority or
+    /// recipient tombstones before creating lifecycle metadata, CAS content,
+    /// or a namespace reference.
+    private func requirePortableBlobRestoreRepository(
+        _ space: SpaceURI
+    ) async throws {
+        let rows = try await connection.query(
+            """
+            SELECT 1
+            FROM permissioned_repository_state AS repository
+            WHERE repository.space_uri = ?
+              AND repository.author_did = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM permissioned_space_recipient_tombstones AS recipient
+                  WHERE recipient.space_uri = repository.space_uri
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM permissioned_simple_space_authorities AS authority
+                  WHERE authority.space_uri = repository.space_uri
+                    AND authority.is_deleted != 0
+              )
+            LIMIT 1
+            """,
+            [.text(space.rawValue), .text(accountDID)]
+        )
+        guard !rows.isEmpty else {
+            throw SwanError.unauthorized(
+                "permissioned repository is unavailable for blob restore"
+            )
+        }
+    }
+
+    /// Request-time reads are stricter than offline restore staging. The
+    /// repository, tombstone/closure checks, and exact blob namespace
+    /// reference are all read from the caller's one SQLite snapshot.
+    private func requireReadablePermissionedBlobRepository(
+        _ space: SpaceURI
+    ) async throws {
+        let rows = try await connection.query(
+            """
+            SELECT 1
+            FROM permissioned_repository_state AS repository
+            WHERE repository.space_uri = ?
+              AND repository.author_did = ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM permissioned_space_recipient_tombstones AS recipient
+                  WHERE recipient.space_uri = repository.space_uri
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM permissioned_restored_repository_closures AS closure
+                  WHERE closure.space_uri = repository.space_uri
+                    AND closure.author_did = repository.author_did
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM permissioned_simple_space_authorities AS authority
+                  WHERE authority.space_uri = repository.space_uri
+                    AND authority.is_deleted != 0
+              )
+            LIMIT 1
+            """,
+            [.text(space.rawValue), .text(accountDID)]
+        )
+        guard !rows.isEmpty else {
+            throw SwanError.unauthorized(
+                "permissioned repository is unavailable for blob read"
+            )
         }
     }
 
@@ -7105,17 +8030,91 @@ private final class SQLiteBlobUploadSpool: @unchecked Sendable {
 /// cannot start successfully and later discover that a swapped/corrupt file
 /// had a different CID.  It intentionally exposes neither a path nor a way
 /// to seek/reopen the payload.
+private final class SQLiteAccountExternalBodyLeaseGate:
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var accepting = true
+    private var activeLeaseCount = 0
+    private var drainWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() -> SQLiteAccountExternalBodyLease? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard accepting else { return nil }
+        activeLeaseCount += 1
+        return SQLiteAccountExternalBodyLease(gate: self)
+    }
+
+    func revokeAndWait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            accepting = false
+            if activeLeaseCount == 0 {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                drainWaiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+
+    fileprivate func release() {
+        let waiters: [CheckedContinuation<Void, Never>]
+        lock.lock()
+        guard activeLeaseCount > 0 else {
+            lock.unlock()
+            return
+        }
+        activeLeaseCount -= 1
+        if !accepting, activeLeaseCount == 0 {
+            waiters = drainWaiters
+            drainWaiters.removeAll()
+        } else {
+            waiters = []
+        }
+        lock.unlock()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+}
+
+private final class SQLiteAccountExternalBodyLease:
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private weak var gate: SQLiteAccountExternalBodyLeaseGate?
+
+    init(gate: SQLiteAccountExternalBodyLeaseGate) {
+        self.gate = gate
+    }
+
+    deinit { release() }
+
+    func release() {
+        lock.lock()
+        let current = gate
+        gate = nil
+        lock.unlock()
+        current?.release()
+    }
+}
+
 private final class SQLiteVerifiedSpaceBlobBody: @unchecked Sendable,
     AuthorizedSpaceBlobBody
 {
     private let lock = NSLock()
     private var descriptor: Int32
+    private var externalLease: SQLiteAccountExternalBodyLease?
     let contentLength: Int
 
     init(
         descriptor: Int32,
         expectedDigest: Data,
-        expectedLength: Int
+        expectedLength: Int,
+        externalLease: SQLiteAccountExternalBodyLease
     ) throws {
         guard expectedLength >= 0, expectedDigest.count == 32 else {
             throw SwanError.unavailable("permissioned blob storage is unavailable")
@@ -7149,10 +8148,14 @@ private final class SQLiteVerifiedSpaceBlobBody: @unchecked Sendable,
         }
 
         self.descriptor = descriptor
+        self.externalLease = externalLease
         contentLength = expectedLength
     }
 
-    deinit { closeDescriptor() }
+    deinit {
+        closeDescriptor()
+        releaseExternalLease()
+    }
 
     func streamBody(
         maximumChunkBytes: Int,
@@ -7160,6 +8163,7 @@ private final class SQLiteVerifiedSpaceBlobBody: @unchecked Sendable,
     ) async throws {
         guard (1 ... 64 * 1_024).contains(maximumChunkBytes) else {
             closeDescriptor()
+            releaseExternalLease()
             throw SwanError.malformed("permissioned blob chunk size is invalid")
         }
         let descriptor = takeDescriptor()
@@ -7167,7 +8171,10 @@ private final class SQLiteVerifiedSpaceBlobBody: @unchecked Sendable,
             throw SwanError.unavailable("permissioned blob storage is unavailable")
         }
         let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-        defer { try? handle.close() }
+        defer {
+            try? handle.close()
+            releaseExternalLease()
+        }
         while true {
             try Task.checkCancellation()
             guard let chunk = try handle.read(upToCount: maximumChunkBytes),
@@ -7183,6 +8190,7 @@ private final class SQLiteVerifiedSpaceBlobBody: @unchecked Sendable,
     /// one-shot just like the HTTP streaming path without buffering a body.
     func discardUnstreamed() {
         closeDescriptor()
+        releaseExternalLease()
     }
 
     private func takeDescriptor() -> Int32 {
@@ -7196,6 +8204,14 @@ private final class SQLiteVerifiedSpaceBlobBody: @unchecked Sendable,
     private func closeDescriptor() {
         let descriptor = takeDescriptor()
         if descriptor >= 0 { _ = close(descriptor) }
+    }
+
+    private func releaseExternalLease() {
+        lock.lock()
+        let lease = externalLease
+        externalLease = nil
+        lock.unlock()
+        lease?.release()
     }
 }
 

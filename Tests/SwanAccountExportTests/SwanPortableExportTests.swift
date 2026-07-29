@@ -6,12 +6,13 @@ import SwanAccounts
 import SwanPublicRepository
 import SwanSQLite
 import SwanSpaces
+import SwanSpacesWire
 import SwanStorage
 import XCTest
 
 final class SwanPortableExportTests: XCTestCase {
     private let handle = "alice.example.com"
-    private let profileID = "permissioned-data-0016-2026-07-03"
+    private let profileID = PermissionedData0016.profileID
 
     func testVerifierAcceptsCanonicalArchiveAndChecksBothCARTypes() throws {
         let fixture = try ArchiveFixture()
@@ -522,6 +523,12 @@ final class SwanPortableExportTests: XCTestCase {
     }
 
     private func swanExecutableURL() -> URL? {
+        if let configured = ProcessInfo.processInfo.environment["SWAN_TEST_EXECUTABLE"] {
+            let candidate = URL(fileURLWithPath: configured)
+            if FileManager.default.isExecutableFile(atPath: candidate.path) {
+                return candidate
+            }
+        }
         let packageRoot = URL(filePath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -673,7 +680,7 @@ final class SwanPortableRestoreTests: XCTestCase {
         XCTAssertEqual(result.fileCount, verification.manifest.files.count)
         XCTAssertFalse(result.includesPrivateKeys)
         XCTAssertEqual(result.manifestSHA256, verification.manifestSHA256)
-        XCTAssertEqual(result.profileID, "permissioned-data-0016-2026-07-03")
+        XCTAssertEqual(result.profileID, PermissionedData0016.profileID)
         let staged = URL(fileURLWithPath: result.stagingDirectory)
         XCTAssertEqual(try treeSnapshot(fixture.root), try treeSnapshot(staged))
         _ = try SwanPortableExportVerifier.verifyArchive(at: staged)
@@ -1338,7 +1345,7 @@ private struct ArchiveFixture {
             ),
         ]
         let manifest = try SwanPortableExportManifest(
-            profileID: "permissioned-data-0016-2026-07-03",
+            profileID: PermissionedData0016.profileID,
             did: did,
             canonicalHandle: "alice.example.com",
             createdAt: "2026-07-27T12:34:56.000Z",

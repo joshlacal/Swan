@@ -28,9 +28,48 @@ public struct Input: ATProtocolCodable {
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.space = try container.decode(ATProtocolURI.self, forKey: .space)
-            self.policy = try container.decodeIfPresent(String.self, forKey: .policy)
-            self.managingApp = try container.decodeIfPresent(String.self, forKey: .managingApp)
-            self.appAccess = try container.decodeIfPresent(InputAppAccessUnion.self, forKey: .appAccess)
+            if container.contains(.policy) {
+                guard try !container.decodeNil(forKey: .policy) else {
+                    throw DecodingError.valueNotFound(
+                        String.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'policy' must not be null"
+                        )
+                    )
+                }
+                self.policy = try container.decode(String.self, forKey: .policy)
+            } else {
+                self.policy = nil
+            }
+            if container.contains(.managingApp) {
+                guard try !container.decodeNil(forKey: .managingApp) else {
+                    throw DecodingError.valueNotFound(
+                        String.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'managingApp' must not be null"
+                        )
+                    )
+                }
+                self.managingApp = try container.decode(String.self, forKey: .managingApp)
+            } else {
+                self.managingApp = nil
+            }
+            if container.contains(.appAccess) {
+                guard try !container.decodeNil(forKey: .appAccess) else {
+                    throw DecodingError.valueNotFound(
+                        InputAppAccessUnion.self,
+                        DecodingError.Context(
+                            codingPath: container.codingPath,
+                            debugDescription: "Property 'appAccess' must not be null"
+                        )
+                    )
+                }
+                self.appAccess = try container.decode(InputAppAccessUnion.self, forKey: .appAccess)
+            } else {
+                self.appAccess = nil
+            }
         }
 
         public func encode(to encoder: Encoder) throws {

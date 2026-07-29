@@ -35,11 +35,23 @@ public protocol SpaceCredentialSigningKeyResolver: Sendable {
     ) async throws -> SpaceCredentialAuthoritySigningKey?
 }
 
+/// Opaque terminal failure for a credential-key authority which was found but
+/// cannot currently authorize verification. The single case deliberately does
+/// not reveal lifecycle, key-generation, or key-store details to callers.
+public enum SpaceCredentialPublicKeyResolutionError:
+    Error, Sendable, Equatable
+{
+    case unavailable
+}
+
 /// Resolves the public material for a credential already inspected for its
-/// exact type and accepted dedicated-or-fallback key ID. Remote implementations are intentionally
-/// separate from SQLite policy evaluation: a future DID/PLC cache may fetch
-/// outside this method's callers' transactions, but this alpha ships only
-/// local and pinned resolvers.
+/// exact type and accepted dedicated-or-fallback key ID. When used as the
+/// authoritative local source in a composite, `nil` has the narrow meaning
+/// "this resolver does not manage the issuer"; a local resolver which does
+/// manage the issuer must throw on every unsupported, inactive, missing, or
+/// corrupt state so composition cannot fall through to another authority.
+/// Remote implementations are intentionally separate from SQLite policy
+/// evaluation.
 public protocol SpaceCredentialPublicKeyResolver: Sendable {
     func publicKey(
         for issuer: String,
@@ -223,19 +235,75 @@ public struct LocalAccountSpaceCredentialPublicKeyResolver:
         for issuer: String,
         keyID: String
     ) async throws -> PermissionedDataJWTVerificationKey? {
-        guard keyID == PermissionedDataJWT.spaceCredentialKeyID
-                || keyID == PermissionedDataJWT.spaceCredentialFallbackKeyID,
-              let account = try await accounts.account(did: issuer),
-              account.status.authorizesAccount,
-              let references = try await accounts.keyReferences(did: issuer),
-              let encoded = try await publicKeyStore.publicKey(for: references.signing) else {
-            return nil
-        }
+        let account: AccountControlAccount
         do {
-            return .p256(try P256.Signing.PublicKey(x963Representation: encoded))
+            guard let managed = try await accounts.account(did: issuer) else {
+                // Only a proven absence from the local account directory may
+                // fall through to an operator pin or remote PLC resolver.
+                return nil
+            }
+            account = managed
         } catch {
-            throw SwanError.unavailable("space credential verification key is unavailable")
+            throw SpaceCredentialPublicKeyResolutionError.unavailable
         }
+
+        guard account.status.authorizesAccount,
+              keyID == PermissionedDataJWT.spaceCredentialKeyID
+                || keyID == PermissionedDataJWT.spaceCredentialFallbackKeyID,
+              let expectedSigning = account.signingKey,
+              let expectedRotation = account.rotationKey,
+              expectedSigning.generation == expectedRotation.generation else {
+            throw SpaceCredentialPublicKeyResolutionError.unavailable
+        }
+
+        let references: (signing: AccountKeyReference, rotation: AccountKeyReference)
+        do {
+            guard let current = try await accounts.keyReferences(did: issuer),
+                  current.signing.generation == expectedSigning.generation,
+                  current.rotation.generation == expectedRotation.generation else {
+                throw SpaceCredentialPublicKeyResolutionError.unavailable
+            }
+            references = current
+        } catch {
+            throw SpaceCredentialPublicKeyResolutionError.unavailable
+        }
+
+        let encoded: Data
+        do {
+            guard let current = try await publicKeyStore.publicKey(
+                for: references.signing
+            ) else {
+                throw SpaceCredentialPublicKeyResolutionError.unavailable
+            }
+            encoded = current
+        } catch {
+            throw SpaceCredentialPublicKeyResolutionError.unavailable
+        }
+
+        let verificationKey: PermissionedDataJWTVerificationKey
+        do {
+            verificationKey = .p256(
+                try P256.Signing.PublicKey(x963Representation: encoded)
+            )
+        } catch {
+            throw SpaceCredentialPublicKeyResolutionError.unavailable
+        }
+
+        // The directory does not currently expose one atomic account/key
+        // projection. Re-read the complete account generation and lifecycle
+        // after the external metadata read, and treat any intervening change
+        // as a terminal local negative. A caller may retry against the new
+        // generation; it must never verify through an old pin or remote key.
+        do {
+            guard let currentAccount = try await accounts.account(did: issuer),
+                  currentAccount == account,
+                  currentAccount.status.authorizesAccount else {
+                throw SpaceCredentialPublicKeyResolutionError.unavailable
+            }
+        } catch {
+            throw SpaceCredentialPublicKeyResolutionError.unavailable
+        }
+        return verificationKey
     }
 }
 
@@ -732,13 +800,27 @@ public struct DurableSpaceCredentialVerifier: SpaceCredentialAuthorizationVerifi
               inspection.claims.sub == expectedSpace.rawValue else {
             throw SwanError.unauthorized("space credential does not match the requested space")
         }
-        guard let publicKey = try await publicKeys.publicKey(
-            for: inspection.claims.iss,
-            keyID: inspection.header.kid ?? ""
-        ) else {
-            // Do not attempt remote resolution from an auth path. The caller
-            // cannot distinguish an absent remote key from a disabled cache.
-            throw SwanError.unavailable("space credential verification key is unavailable")
+        let publicKey: PermissionedDataJWTVerificationKey
+        do {
+            guard let resolved = try await publicKeys.publicKey(
+                for: inspection.claims.iss,
+                keyID: inspection.header.kid ?? ""
+            ) else {
+                // Do not attempt remote resolution from an auth path. The
+                // caller cannot distinguish an absent remote key from a
+                // disabled cache.
+                throw SwanError.unavailable(
+                    "space credential verification key is unavailable"
+                )
+            }
+            publicKey = resolved
+        } catch is SpaceCredentialPublicKeyResolutionError {
+            // Preserve the local resolver's typed terminal signal inside the
+            // composition layer while exposing only the pre-existing opaque
+            // availability error to HTTP and other authorization callers.
+            throw SwanError.unavailable(
+                "space credential verification key is unavailable"
+            )
         }
         let claims = try PermissionedDataJWT.verifySpaceCredential(
             token,

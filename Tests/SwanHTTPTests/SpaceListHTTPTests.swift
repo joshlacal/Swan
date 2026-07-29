@@ -193,7 +193,11 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
                 _ = try await repository.apply(.put(uri: uri, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za2y"), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
             }
             try await database.close()
-            let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(dataDirectory: root, controlStore: control)
+            let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+                dataDirectory: root,
+                controlStore: control,
+                publicIdentityVerifier: nil
+            )
             let runtime = try SwanOAuthRuntime(controlStore: control, serverKey: Data(repeating: 0xD1, count: 32))
             return .init(root: root, owner: owner, remote: remote, control: control, directory: directory, runtime: runtime, token: try await issueToken(runtime, scopes: ["atproto"]))
         } catch { try? await control.close(); try? FileManager.default.removeItem(at: root); throw error }

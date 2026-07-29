@@ -27,16 +27,19 @@ final class SwanOAuthTests: XCTestCase {
 
     func testBrowserApprovalSessionIsBoundAndExpiresWithoutPersistingCredentials() throws {
         let service = try OAuthBrowserSessionService(serverKey: Data(repeating: 0x43, count: 32))
-        let now = Date(timeIntervalSince1970: 1_750_000_000)
+        let now = Date(timeIntervalSince1970: 1_750_000_000.123_456)
+        let subjectRevision = Date(timeIntervalSince1970: 1_749_999_999.654_321)
         let requestURI = "urn:ietf:params:oauth:request_uri:" + String(repeating: "a", count: 43)
         let issued = try service.issue(
             requestURI: requestURI,
             subject: "did:plc:abcdefghijklmnopqrstuvwx",
+            subjectUpdatedAt: subjectRevision,
             now: now
         )
         let verified = try service.verify(issued.value, now: now.addingTimeInterval(1))
         XCTAssertEqual(verified.requestURI, requestURI)
         XCTAssertEqual(verified.subject, "did:plc:abcdefghijklmnopqrstuvwx")
+        XCTAssertEqual(verified.subjectRevisionMicroseconds, 1_749_999_999_654_321)
         XCTAssertEqual(verified.csrfToken, issued.session.csrfToken)
         XCTAssertFalse(issued.value.contains("correct horse battery staple"))
 
@@ -49,6 +52,167 @@ final class SwanOAuthTests: XCTestCase {
         XCTAssertThrowsError(try service.verify(tampered, now: now.addingTimeInterval(1)))
         XCTAssertThrowsError(try service.verify(issued.value, now: now.addingTimeInterval(601)))
         XCTAssertThrowsError(try service.issue(requestURI: "not-a-request-uri", now: now))
+        XCTAssertThrowsError(try service.issue(
+            requestURI: requestURI,
+            subject: "did:plc:abcdefghijklmnopqrstuvwx",
+            now: now
+        ))
+        XCTAssertThrowsError(try service.issue(
+            requestURI: requestURI,
+            subjectUpdatedAt: subjectRevision,
+            now: now
+        ))
+
+        let preLogin = try service.issue(requestURI: requestURI, now: now)
+        let verifiedPreLogin = try service.verify(
+            preLogin.value,
+            now: now.addingTimeInterval(1)
+        )
+        XCTAssertNil(verifiedPreLogin.subject)
+        XCTAssertNil(verifiedPreLogin.subjectRevisionMicroseconds)
+    }
+
+    func testPasswordRecoveryAndBrowserCodeIssuanceAreSafeInBothTransactionOrders() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = try await SQLiteControlDatabase(dataDirectory: root)
+        let second = try await SQLiteControlDatabase(dataDirectory: root)
+        do {
+            let did = "did:plc:abcdefghijklmnopqrstuvwx"
+            let initialVerifier =
+                "$argon2id$v=19$m=65536,t=2,p=1$initialsalt$initial-precomputed-verifier"
+            let replacementVerifier =
+                "$argon2id$v=19$m=65536,t=2,p=1$replacesalt$replacement-precomputed-verifier"
+            let email = try AccountEmailAddress("person@example.com")
+            let now = Date(timeIntervalSince1970: 1_750_000_000.123_456)
+            _ = try await first.createAccount(try AccountControlRegistration(
+                did: did,
+                canonicalHandle: "oauth-recovery-race.example.com",
+                passwordVerifier: initialVerifier,
+                signingKey: try .init(purpose: .signing, generation: 1),
+                rotationKey: try .init(purpose: .rotation, generation: 1),
+                createdAt: now
+            ))
+            try await first.associateEmail(did: did, email: email, now: now)
+            let verificationDigest = Data(repeating: 0x81, count: 32)
+            try await first.issueEmailToken(
+                did: did,
+                email: email,
+                purpose: .verifyEmail,
+                digest: verificationDigest,
+                expiresAt: now.addingTimeInterval(600),
+                now: now
+            )
+            let verifiedDID = try await first.consumeEmailToken(
+                digest: verificationDigest,
+                purpose: .verifyEmail,
+                now: now.addingTimeInterval(1)
+            )
+            XCTAssertEqual(verifiedDID, did)
+            let recoveryDigest = Data(repeating: 0x82, count: 32)
+            try await first.issueEmailToken(
+                did: did,
+                email: email,
+                purpose: .passwordRecovery,
+                digest: recoveryDigest,
+                expiresAt: now.addingTimeInterval(600),
+                now: now.addingTimeInterval(1)
+            )
+            let loadedRecoveryConfirmation =
+                try await first.passwordRecoveryConfirmation(
+                    proofDigest: recoveryDigest,
+                    now: now.addingTimeInterval(2)
+                )
+            let recoveryConfirmation = try XCTUnwrap(
+                loadedRecoveryConfirmation
+            )
+            let recovery = try AccountPasswordRecoveryRequest(
+                confirmation: recoveryConfirmation,
+                expectedVerifier: initialVerifier,
+                replacementVerifier: replacementVerifier
+            )
+            let loadedOriginalAccount = try await first.account(did: did)
+            let originalAccount = try XCTUnwrap(loadedOriginalAccount)
+            let originalRevision = try XCTUnwrap(
+                OAuthBrowserSessionService.subjectRevisionMicroseconds(
+                    for: originalAccount.updatedAt
+                )
+            )
+            let service = try DurableOAuthTokenService(
+                controlStore: first,
+                serverKey: Data(repeating: 0x84, count: 32)
+            )
+            let session = try publicOAuthSession(
+                dpopJKT: testDPoPJKT("R"),
+                now: now
+            )
+            let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+            let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+
+            // SQLite serializes a real race to one of two orders. Exercise
+            // both total orders explicitly so this test is deterministic.
+            let codeFirstFamily = UUID()
+            let codeFirst = try await service.issueAuthorizationCode(
+                subject: did,
+                session: session,
+                codeChallengeS256: challenge,
+                activeSubjectRevisionMicroseconds: originalRevision,
+                familyID: codeFirstFamily,
+                now: now.addingTimeInterval(3)
+            )
+            let recoveryResult = try await second.completePasswordRecovery(
+                recovery,
+                now: now.addingTimeInterval(4)
+            )
+            XCTAssertEqual(recoveryResult, .completed)
+            await XCTAssertThrowsErrorAsync(
+                try await service.redeemAuthorizationCode(
+                    codeFirst,
+                    verifier: verifier,
+                    session: session,
+                    requireActiveSubject: true,
+                    now: now.addingTimeInterval(5)
+                )
+            )
+
+            let recoveryFirstFamily = UUID()
+            await XCTAssertThrowsErrorAsync(
+                try await service.issueAuthorizationCode(
+                    subject: did,
+                    session: session,
+                    codeChallengeS256: challenge,
+                    activeSubjectRevisionMicroseconds: originalRevision,
+                    familyID: recoveryFirstFamily,
+                    now: now.addingTimeInterval(5)
+                )
+            )
+            let loadedRecoveredAccount = try await first.account(did: did)
+            let recoveredAccount = try XCTUnwrap(loadedRecoveredAccount)
+            let recoveredRevision = try XCTUnwrap(
+                OAuthBrowserSessionService.subjectRevisionMicroseconds(
+                    for: recoveredAccount.updatedAt
+                )
+            )
+            XCTAssertNotEqual(recoveredRevision, originalRevision)
+
+            // Reusing the same family ID with the current revision proves the
+            // stale attempt rolled back both the family and code insert.
+            _ = try await service.issueAuthorizationCode(
+                subject: did,
+                session: session,
+                codeChallengeS256: challenge,
+                activeSubjectRevisionMicroseconds: recoveredRevision,
+                familyID: recoveryFirstFamily,
+                now: now.addingTimeInterval(6)
+            )
+
+            try await second.close()
+            try await first.close()
+        } catch {
+            try? await second.close()
+            try? await first.close()
+            throw error
+        }
     }
 
     func testPKCEAndRefreshReuseRevokesFamily() async throws {
@@ -138,6 +302,60 @@ final class SwanOAuthTests: XCTestCase {
         ))
     }
 
+    func testSignedJWTVerifiersRejectExtremeTimeClaimsWithoutOverflowing() throws {
+        let key = P256.Signing.PrivateKey()
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let clientID = "https://client.example/metadata"
+        let audience = "https://auth.example"
+        let assertion = try testCompactJWT(
+            header: TestAssertionHeader(kid: "extreme-time-key"),
+            claims: TestAssertionClaims(
+                iss: clientID,
+                sub: clientID,
+                aud: audience,
+                iat: .min,
+                exp: .max,
+                jti: "extreme-time-assertion"
+            ),
+            key: key
+        )
+        XCTAssertThrowsError(
+            try OAuthCompactJWT.verify(
+                assertion,
+                publicKey: key.publicKey,
+                constraints: .init(
+                    expectedIssuer: clientID,
+                    expectedAudience: audience,
+                    now: now,
+                    clockSkew: 60,
+                    requireIssuedAt: true,
+                    requireExpiration: true,
+                    maxLifetime: 300
+                )
+            )
+        )
+
+        let serviceToken = try testCompactJWT(
+            header: TestSpaceServiceHeader(),
+            claims: SpaceServiceJWT.Claims(
+                iss: "did:plc:abcdefghijklmnopqrstuvwx",
+                aud: "did:plc:zyxwvutsrqponmlkjihgfedc",
+                iat: .min,
+                exp: .max,
+                lxm: "com.atproto.space.notifyOfUpdates",
+                jti: "extreme-time-service"
+            ),
+            key: key
+        )
+        XCTAssertThrowsError(
+            try SpaceServiceJWT.verify(
+                serviceToken,
+                publicKey: .p256(key.publicKey),
+                now: now
+            )
+        )
+    }
+
     func testRemoteMetadataPolicyRejectsAllPrivateLiteralRanges() throws {
         XCTAssertThrowsError(try OAuthRemoteURLPolicy.validate(URL(string: "https://172.31.1.1/metadata")!))
         XCTAssertThrowsError(try OAuthRemoteURLPolicy.validate(URL(string: "https://169.254.169.254/latest/meta-data")!))
@@ -171,6 +389,7 @@ final class SwanOAuthTests: XCTestCase {
             dpopProof: session.dpopProof,
             clientAssertion: nil,
             metadataLoader: try testMetadataLoader(database: database),
+            requireActiveSubject: false,
             now: now
         )
         let authorizationCode = try await service.issueAuthorizationCode(
@@ -203,7 +422,8 @@ final class SwanOAuthTests: XCTestCase {
             now: now.addingTimeInterval(1)
         )
         XCTAssertEqual(cachedMetadata, metadata)
-        let grant = try await reopenedService.validateAccess(
+        let grant = try await reopenedService
+            .validateAccessWithoutActiveSubjectCheck(
             rotated.accessToken,
             proof: session.dpopProof,
             now: now.addingTimeInterval(1)
@@ -260,7 +480,8 @@ final class SwanOAuthTests: XCTestCase {
                         original.refreshToken,
                         dpopProof: session.dpopProof,
                         clientAssertion: nil,
-                        metadataLoader: loader
+                        metadataLoader: loader,
+                        requireActiveSubject: false
                     ))
                 } catch {
                     return .failure(error)
@@ -272,7 +493,8 @@ final class SwanOAuthTests: XCTestCase {
                         original.refreshToken,
                         dpopProof: session.dpopProof,
                         clientAssertion: nil,
-                        metadataLoader: loader
+                        metadataLoader: loader,
+                        requireActiveSubject: false
                     ))
                 } catch {
                     return .failure(error)
@@ -286,7 +508,7 @@ final class SwanOAuthTests: XCTestCase {
         XCTAssertEqual(outcomes.count - issued.count, 1)
         let onlyPair = try XCTUnwrap(issued.first)
         await XCTAssertThrowsErrorAsync(
-            try await first.validateAccess(
+            try await first.validateAccessWithoutActiveSubjectCheck(
                 onlyPair.accessToken,
                 proof: session.dpopProof
             )
@@ -322,7 +544,8 @@ final class SwanOAuthTests: XCTestCase {
                     return .success(try await first.redeemAuthorizationCode(
                         code,
                         verifier: verifier,
-                        session: session
+                        session: session,
+                        requireActiveSubject: false
                     ))
                 } catch {
                     return .failure(error)
@@ -333,7 +556,8 @@ final class SwanOAuthTests: XCTestCase {
                     return .success(try await second.redeemAuthorizationCode(
                         code,
                         verifier: verifier,
-                        session: session
+                        session: session,
+                        requireActiveSubject: false
                     ))
                 } catch {
                     return .failure(error)
@@ -346,7 +570,7 @@ final class SwanOAuthTests: XCTestCase {
         XCTAssertEqual(issued.count, 1)
         let winningPair = try XCTUnwrap(issued.first)
         await XCTAssertThrowsErrorAsync(
-            try await first.validateAccess(
+            try await first.validateAccessWithoutActiveSubjectCheck(
                 winningPair.accessToken,
                 proof: session.dpopProof
             )
@@ -415,7 +639,11 @@ final class SwanOAuthTests: XCTestCase {
             dpopProof: noRefreshSession.dpopProof, clientAssertion: nil, now: now
         )
         XCTAssertNil(noRefreshGrant.refreshToken)
-        _ = try await service.validateAccess(noRefreshGrant.accessToken, proof: noRefreshSession.dpopProof, now: now)
+        _ = try await service.validateAccess(
+            noRefreshGrant.accessToken,
+            proof: noRefreshSession.dpopProof,
+            now: now
+        )
 
         let refreshSession = try publicOAuthSession(dpopJKT: testDPoPJKT("M"), now: now)
         let refreshCode = try await service.issueAuthorizationCode(
@@ -430,6 +658,13 @@ final class SwanOAuthTests: XCTestCase {
         let refreshToken = try XCTUnwrap(refreshGrant.refreshToken)
         _ = try await database.transitionStatus(
             did: did, to: .deactivated, declaration: .init(), now: now)
+        await XCTAssertThrowsErrorAsync(
+            try await service.validateAccess(
+                noRefreshGrant.accessToken,
+                proof: noRefreshSession.dpopProof,
+                now: now
+            )
+        )
         await XCTAssertThrowsErrorAsync(
             try await service.redeemRefreshForClient(
                 refreshToken, client: OAuthResolvedClientMetadata(metadata: refreshMetadata, keySet: nil),
@@ -516,6 +751,7 @@ final class SwanOAuthTests: XCTestCase {
             code,
             verifier: verifier,
             session: session,
+            requireActiveSubject: false,
             now: now
         )
         await XCTAssertThrowsErrorAsync(
@@ -523,11 +759,16 @@ final class SwanOAuthTests: XCTestCase {
                 code,
                 verifier: verifier,
                 session: session,
+                requireActiveSubject: false,
                 now: now.addingTimeInterval(1)
             )
         )
         await XCTAssertThrowsErrorAsync(
-            try await service.validateAccess(tokens.accessToken, proof: session.dpopProof, now: now)
+            try await service.validateAccessWithoutActiveSubjectCheck(
+                tokens.accessToken,
+                proof: session.dpopProof,
+                now: now
+            )
         )
 
         let expiredCode = try await service.issueAuthorizationCode(
@@ -542,6 +783,7 @@ final class SwanOAuthTests: XCTestCase {
                 expiredCode,
                 verifier: verifier,
                 session: session,
+                requireActiveSubject: false,
                 now: now.addingTimeInterval(2)
             )
         )
@@ -669,9 +911,12 @@ final class SwanOAuthTests: XCTestCase {
             keyThumbprint: testDPoPJKT("W"), jwtID: "wrong-proof", issuedAt: Date()
         )
         await XCTAssertThrowsErrorAsync(
-            try await service.validateAccess(pair.accessToken, proof: wrongProof)
+            try await service.validateAccessWithoutActiveSubjectCheck(
+                pair.accessToken,
+                proof: wrongProof
+            )
         )
-        let grant = try await service.validateAccess(
+        let grant = try await service.validateAccessWithoutActiveSubjectCheck(
             pair.accessToken,
             proof: session.dpopProof
         )
@@ -680,7 +925,8 @@ final class SwanOAuthTests: XCTestCase {
             pair.refreshToken,
             dpopProof: session.dpopProof,
             clientAssertion: nil,
-            metadataLoader: try testMetadataLoader(database: database)
+            metadataLoader: try testMetadataLoader(database: database),
+            requireActiveSubject: false
         )
         XCTAssertFalse(rotated.accessToken.isEmpty)
         let metadata = session.client.metadata
@@ -724,10 +970,14 @@ final class SwanOAuthTests: XCTestCase {
             dpopProof: session.dpopProof,
             clientAssertion: session.clientAssertion,
             metadataLoader: rekeyedLoader,
+            requireActiveSubject: false,
             now: now
         ))
-        await XCTAssertThrowsErrorAsync(try await service.validateAccess(
-            rekeyedPair.accessToken, proof: session.dpopProof, now: now
+        await XCTAssertThrowsErrorAsync(
+            try await service.validateAccessWithoutActiveSubjectCheck(
+            rekeyedPair.accessToken,
+            proof: session.dpopProof,
+            now: now
         ))
 
         let removedJWK = try testJWK(P256.Signing.PrivateKey(), keyID: "replacement-key")
@@ -743,10 +993,14 @@ final class SwanOAuthTests: XCTestCase {
             dpopProof: session.dpopProof,
             clientAssertion: session.clientAssertion,
             metadataLoader: removedLoader,
+            requireActiveSubject: false,
             now: now
         ))
-        await XCTAssertThrowsErrorAsync(try await service.validateAccess(
-            removedPair.accessToken, proof: session.dpopProof, now: now
+        await XCTAssertThrowsErrorAsync(
+            try await service.validateAccessWithoutActiveSubjectCheck(
+            removedPair.accessToken,
+            proof: session.dpopProof,
+            now: now
         ))
         try await database.close()
     }
@@ -813,6 +1067,64 @@ final class SwanOAuthTests: XCTestCase {
         XCTAssertThrowsError(try OAuthClientMetadata.localhostDevelopmentMetadata(
             clientID: URL(string: "https://localhost/metadata")!
         ))
+    }
+
+    func testStrictJSONRejectsHostileNestingBeforeRecursiveDescent() throws {
+        let maximumAcceptedDepth = 64
+        let boundaryArray =
+            String(repeating: "[", count: maximumAcceptedDepth)
+            + "null"
+            + String(repeating: "]", count: maximumAcceptedDepth)
+        XCTAssertNoThrow(try StrictJSON.validate(Data(boundaryArray.utf8)))
+
+        let hostileDepth = 10_000
+        let deeplyNestedObject =
+            String(repeating: #"{"nested":"#, count: hostileDepth)
+            + "null"
+            + String(repeating: "}", count: hostileDepth)
+        XCTAssertThrowsError(
+            try StrictJSON.validate(Data(deeplyNestedObject.utf8))
+        ) { error in
+            XCTAssertEqual(
+                error as? SwanError,
+                .malformed("JSON exceeds maximum nesting depth")
+            )
+        }
+
+        let deeplyNestedArray =
+            String(repeating: "[", count: hostileDepth)
+            + "null"
+            + String(repeating: "]", count: hostileDepth)
+        XCTAssertThrowsError(
+            try StrictJSON.validate(Data(deeplyNestedArray.utf8))
+        ) { error in
+            XCTAssertEqual(
+                error as? SwanError,
+                .malformed("JSON exceeds maximum nesting depth")
+            )
+        }
+
+        let jwtDepth = 512
+        let deeplyNestedJWTHeader =
+            #"{"alg":"ES256","nested":"#
+            + String(repeating: "[", count: jwtDepth)
+            + "null"
+            + String(repeating: "]", count: jwtDepth)
+            + "}"
+        let jwtHeaderData = Data(deeplyNestedJWTHeader.utf8)
+        XCTAssertLessThan(jwtHeaderData.count, 4_096)
+        let encodedHeader = jwtHeaderData.base64URLEncodedString()
+        let signature =
+            Data(repeating: 0, count: 64).base64URLEncodedString()
+        let compactJWT = "\(encodedHeader).e30.\(signature)"
+        XCTAssertThrowsError(
+            try OAuthCompactJWT.unverifiedHeader(compactJWT)
+        ) { error in
+            XCTAssertEqual(
+                error as? SwanError,
+                .malformed("JSON exceeds maximum nesting depth")
+            )
+        }
     }
 
     func testHardenedRemoteFetcherRejectsUnsafeDNSAndBadResponses() async throws {
@@ -1396,6 +1708,7 @@ private actor TestPostTransport: OAuthRemotePostTransport {
 
     func post(
         url _: URL,
+        approvedPeers _: Set<OAuthIPAddress>,
         headers _: [String: String],
         body _: Data,
         timeout _: TimeInterval,
@@ -1447,6 +1760,11 @@ private struct TestAssertionClaims: Encodable {
     let iat: Int64
     let exp: Int64
     let jti: String
+}
+
+private struct TestSpaceServiceHeader: Encodable {
+    let alg = "ES256"
+    let typ = "JWT"
 }
 
 private func testDPoPToken(

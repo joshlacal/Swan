@@ -1126,7 +1126,7 @@ final class SwanSpacesTests: XCTestCase {
         try successHandle.write(contentsOf: Data(repeating: 0xa5, count: 19))
         try successHandle.close()
 
-        let spool = SpaceCARBodySpool(
+        let spool = try SpaceCARBodySpool(
             indexCID: CID.fromDAGCBOR(Data([0xa0])),
             bodyURL: successURL
         )
@@ -1144,7 +1144,7 @@ final class SwanSpacesTests: XCTestCase {
         let failureURL = root.appending(path: "failure.spool")
         try Data(repeating: 0x3c, count: SpaceCARBodySpool.maximumChunkBytes + 1)
             .write(to: failureURL, options: .atomic)
-        let failingSpool = SpaceCARBodySpool(
+        let failingSpool = try SpaceCARBodySpool(
             indexCID: CID.fromDAGCBOR(Data([0xa0])),
             bodyURL: failureURL
         )
@@ -1153,6 +1153,24 @@ final class SwanSpacesTests: XCTestCase {
         )
         XCTAssertTrue(failingSpool.isCleanedUp)
         XCTAssertFalse(FileManager.default.fileExists(atPath: failureURL.path))
+
+        let truncatedURL = root.appending(path: "truncated.spool")
+        try Data([0x01, 0x02, 0x03]).write(
+            to: truncatedURL,
+            options: .atomic
+        )
+        let truncatedSpool = try SpaceCARBodySpool(
+            indexCID: CID.fromDAGCBOR(Data([0xa0])),
+            bodyURL: truncatedURL,
+            bodyByteCount: 4
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await truncatedSpool.streamBody { _ in }
+        )
+        XCTAssertTrue(truncatedSpool.isCleanedUp)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: truncatedURL.path)
+        )
     }
 
     func testPrivateCARSpool256MiBStressWhenExplicitlyEnabled() async throws {
@@ -1176,7 +1194,10 @@ final class SwanSpacesTests: XCTestCase {
         }
         try handle.close()
 
-        let spool = SpaceCARBodySpool(indexCID: CID.fromDAGCBOR(Data([0xa0])), bodyURL: url)
+        let spool = try SpaceCARBodySpool(
+            indexCID: CID.fromDAGCBOR(Data([0xa0])),
+            bodyURL: url
+        )
         let collector = CARChunkCollector()
         try await spool.streamBody { bodyChunk in
             await collector.append(bodyChunk.count)
