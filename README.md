@@ -249,6 +249,17 @@ the pinned laboratory PLC origin (`reference-plc`) with an explicit host
 allowlist. Production or cross-host notification pins remain an
 operator-supplied configuration outside this repository.
 
+The reference PLC uses the pinned `@did-plc/server` validator behind a small
+file-backed laboratory adapter. Accepted operation bodies are written to an
+owner-only, atomically replaced `reference-plc-data` volume and replayed
+through the pinned validator before the listener starts. A malformed or
+tampered state file fails closed instead of silently resetting the PLC registry.
+The focused persistence gate is:
+
+```sh
+interop/test-reference-plc-persistence.sh
+```
+
 ### Notification crash/restart acceptance
 
 Run the durable outbox closure against a disposable Compose project:

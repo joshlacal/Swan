@@ -172,6 +172,9 @@ services:
     environment:
       PORT: "2582"
       LOG_ENABLED: "false"
+      PLC_DATA_DIRECTORY: /plc
+    volumes:
+      - reference-plc-data:/plc
     networks:
       swan:
         ipv4_address: 172.30.0.3
@@ -293,6 +296,7 @@ volumes:
   swan-bootstrap-secrets:
   reference-pds-data:
   reference-pds-secrets:
+  reference-plc-data:
   caddy-data:
   caddy-config:
   caddy-trust:

@@ -223,6 +223,22 @@ reject_contains "$reference_block" 'PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX:' 
 require_contains "$swan_block" 'curl --fail --silent --show-error --max-time 2 http://127.0.0.1:3000/health' "Swan healthcheck must probe the live HTTP listener"
 require_contains "$reference_block" "fetch('http://127.0.0.1:3000/xrpc/_health')" "reference PDS healthcheck must probe the live HTTP listener"
 require_contains "$(service_block reference-plc)" "fetch('http://127.0.0.1:2582/_health')" "reference PLC healthcheck must probe the live HTTP listener"
+require_contains "$(service_block reference-plc)" 'PLC_DATA_DIRECTORY: /plc' "reference PLC state directory is missing"
+require_contains "$(service_block reference-plc)" 'reference-plc-data:/plc' "reference PLC state volume is missing"
+rg -q '^COPY Swan/interop/reference-plc-server\.mjs /reference/reference-plc-server\.mjs$' \
+  "$reference_plc_dockerfile" || {
+  echo "reference PLC must use the persistent wrapper" >&2
+  exit 1
+}
+rg -q '^CMD \["node", "/reference/reference-plc-server\.mjs"\]$' \
+  "$reference_plc_dockerfile" || {
+  echo "reference PLC command must use the persistent wrapper" >&2
+  exit 1
+}
+test -x "${root}/interop/test-reference-plc-persistence.sh" || {
+  echo "reference PLC persistence acceptance script is missing or not executable" >&2
+  exit 1
+}
 require_contains "$reference_block" $'reference-plc:\n        condition: service_healthy' "reference PDS must wait for a healthy PLC"
 require_contains "$(service_block toxiproxy-setup)" $'reference-pds:\n        condition: service_healthy' "Toxiproxy setup must wait for a healthy reference PDS"
 require_contains "$caddy_block" $'swan:\n        condition: service_healthy' "Caddy must wait for a healthy Swan listener"

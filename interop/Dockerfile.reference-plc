@@ -14,8 +14,12 @@ RUN npm install --global pnpm@11.5.2 \
 
 FROM node:24.15-alpine3.23
 COPY --from=build /reference /reference
+COPY Swan/interop/reference-plc-server.mjs /reference/reference-plc-server.mjs
 WORKDIR /reference
 EXPOSE 2582
 ENV NODE_ENV=production
+ENV PLC_DATA_DIRECTORY=/plc
+RUN mkdir /plc && chown node /plc && chmod 0700 /plc
+VOLUME /plc
 USER node
-CMD ["node", "/reference/node_modules/.pnpm/@did-plc+server@0.0.1/node_modules/@did-plc/server/dist/bin.js"]
+CMD ["node", "/reference/reference-plc-server.mjs"]

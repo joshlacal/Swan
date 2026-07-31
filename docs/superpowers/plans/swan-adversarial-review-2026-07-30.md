@@ -939,5 +939,41 @@ macOS/Docker laboratory path, including public blob-linked records and the
  semantic/recovery interoperability, reverse-authority OAuth/browser and
  lifecycle coverage, corrupted-operation and compaction-gap traffic, and the
  official security launcher remain release gates. The active immutable profile
- is `permissioned-data-0016-2026-07-30`; the frozen 07-03 plan input remains a
- documented predecessor rather than an interchangeable profile.
+is `permissioned-data-0016-2026-07-30`; the frozen 07-03 plan input remains a
+documented predecessor rather than an interchangeable profile.
+
+## Reference PLC restart-boundary hardening: 2026-07-31
+
+The checked-in PLC service previously selected the pinned server's in-memory
+`Database.mock()` whenever `DATABASE_URL` was absent. Recreating a Compose
+project could therefore erase every PLC DID while Swan's account databases
+survived. The lab now keeps the same pinned PLC HTTP implementation and
+validator behind a narrow file-backed adapter. Accepted operation bodies are
+serialized with an owner-only temporary file, `fsync`, and atomic rename into
+the named `reference-plc-data` volume; startup replays them through the pinned
+validator and rejects malformed or tampered state before binding the listener.
+
+`interop/test-reference-plc-persistence.sh` now proves write, restart/read,
+and tampered-state fail-closed behavior. `verify-interop-lab.sh` requires the
+volume, wrapper command, and executable acceptance script. This closes the
+Compose PLC restart/reprovisioning availability gap; native Linux and the
+cross-implementation semantic/fault gates remain separate release evidence.
+
+## Fresh recovery-qualified stateful run: 2026-07-31
+
+After rebuilding the recovery-qualified Compose project from the working
+copy, the Swan-to-Swan permissioned stateful matrix passed with the persistent
+PLC wrapper active. The sanitized artifact is retained outside the repository
+at `/private/tmp/permissioned-recovery-20260731c.json`. It records credential
+issuance, member write and authority read at HTTP 200, matching write/read
+record CIDs, a value-bearing terminal `listRepoOps` page, a verified signed
+commitment, and a verified two-root full CAR containing the expected record.
+All 26 stateful assertions passed; the artifact contains no credentials,
+passwords, DPoP proofs, request bodies, or record values. This is fresh
+Swan-to-Swan recovery evidence, not proof that the unmodified pinned
+TypeScript PDS implements `getRepo` or value-bearing `listRepoOps`.
+
+The PLC service was then rebuilt with the final adapter, recreated against
+the same named volume, and health-checked before a second permissioned write.
+That post-restart stateful run also passed all 26 assertions; its sanitized
+artifact is `/private/tmp/permissioned-after-plc-restart-20260731c.json`.
