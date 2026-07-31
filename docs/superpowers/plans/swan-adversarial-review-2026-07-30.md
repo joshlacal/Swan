@@ -528,3 +528,43 @@ TypeScript delegation-key pin. The dedicated Codex Security launcher was also
 unavailable in this environment because its bundled Python helper failed to
 start; this document is therefore a bounded manual adversarial review, not an
 official security-scan report.
+
+## Live cross-host adversarial evidence: 2026-07-31
+
+The disposable Compose network was then exercised with a real reference-PDS
+account, not a checked-in fixture. The stock pinned TypeScript image served as
+the member host and Swan served as the authority. Swan rejected the first
+exchange with HTTP 401 when no remote delegation key was configured. Supplying
+the reference account's public PLC `#atproto` key through the existing
+owner-controlled notification pin made the same path pass: delegation minting,
+credential exchange, member write, and credential-authenticated member-host
+read all returned HTTP 200 with matching record CIDs. No private key, token, or
+record value entered the repository.
+
+The checksummed reference-recovery overlay was built separately from the
+immutable cache and used only for qualified recovery evidence. Its stateful
+cross-host run passed every assertion: value-bearing `listRepoOps`, operation
+CID/revision, signed LtHash commitment, two-root `getRepo` CAR, expected-record
+membership, CAR commitment/revision equality, and final convergence. This is
+not evidence that the unmodified pinned TypeScript image supports those two
+recovery endpoints; the stock image still returns the documented 500/501
+responses. The remote delegation key was operator-pinned for this disposable
+run, so dynamic PLC/DID key discovery and reverse-authority placement remain
+open alpha gates.
+
+The email-recovery review candidates were reconciled against the current tree:
+the account-free marker table has a 4,096-row admission ceiling, migration
+trimming, and a 256-row expiry purge batch, so the earlier unbounded-cardinality
+candidate does not reproduce at the reviewed head. A separate pre-existing
+SMTP lease-boundary concern remains a follow-up: a network attempt that outlives
+the five-minute fence needs explicit cancellation/heartbeat semantics before
+production claims. It is outside the current interop alpha acceptance gates.
+
+Reverse authority placement was also exercised with the same disposable
+network. The reference PDS acted as authority, Swan hosted the member
+repository, and the reference authority's public credential key was pinned at
+the Swan member. The stateful run passed credential issuance, member write,
+member-host read, value-bearing incremental sync, signed commitment checks, and
+two-root CAR recovery, with sync/CAR commitment and revision equality. This is
+controlled pinned-key evidence; it does not turn the checked-in configuration
+into an automatic remote-key discovery policy.

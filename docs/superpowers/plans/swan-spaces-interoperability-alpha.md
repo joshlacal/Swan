@@ -328,3 +328,32 @@ client-side CSRF/API contract that the current minimal Swan form driver does
 not implement. Reverse key provisioning and the cross-implementation OAuth
 matrix remain explicit alpha gates rather than being inferred from this one
 controlled proof.
+
+## 2026-07-31 cross-host recovery-qualified checkpoint
+
+The disposable Compose lab now has a fresh real TypeScript member account and
+has exercised the opposite-host permissioned path. With an owner-only pin for
+the member's public `#atproto` key, Swan authority issued a credential for a
+reference-PDS delegation; the member wrote on the TypeScript host and the
+credential-authenticated read was served by that same remote host with a
+matching CID. Removing the pin was also exercised and failed closed with HTTP
+401 before any write or read.
+
+The recovery-qualified reference image (the immutable pinned archive plus the
+checked-in, checksum-verified overlay) then passed the stateful matrix with
+value-bearing `listRepoOps` and two-root `getRepo`: operation and commit
+revisions matched, LtHash commitments matched, the expected record was present
+in the recovered CAR, and the sync/CAR verifier accepted the final state. This
+is qualified overlay evidence only; the stock pinned TypeScript image remains
+the source of truth for normal compatibility and still lacks those recovery
+surfaces. Dynamic remote key discovery, reverse authority placement, full
+cross-implementation OAuth/browser/lifecycle coverage, corrupted-operation and
+compaction-gap fault runs, and a native Linux host run remain open.
+
+Reverse authority placement was subsequently exercised as well: the reference
+PDS acted as authority while Swan hosted the member repository. With the
+reference authority's public credential key pinned at the Swan member, the
+stateful matrix passed credential issuance, member write/read, value-bearing
+incremental sync, signed commitment verification, and two-root CAR recovery.
+The pin is operator-supplied disposable evidence, not automatic remote-key
+discovery.
