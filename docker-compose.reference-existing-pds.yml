@@ -1,0 +1,8 @@
+# Optional disposable lab override: reuse an already-provisioned reference
+# PDS volume when a cross-host scenario needs a real TypeScript account. The
+# volume name must be supplied explicitly by the operator and is never used by
+# the clean/default Compose profile.
+volumes:
+  reference-pds-data:
+    external: true
+    name: ${SWAN_INTEROP_REFERENCE_PDS_DATA_VOLUME:?set the existing reference PDS data volume name}

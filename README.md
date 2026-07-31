@@ -68,6 +68,16 @@ It automatically enables both terminal verifiers; use
 `--permissioned-list-ops-exclude-values` for the pinned TypeScript branch's
 metadata-only incremental page.
 
+The default Compose service intentionally remains the byte-for-byte pinned
+TypeScript image. That image currently has no `getRepo` implementation and
+its value-bearing `listRepoOps` query is not usable, so it cannot by itself
+prove the recovery half of this stateful matrix. For that explicit lab gate,
+populate the pinned cache first and invoke `interop/compose-recovery.sh`; the
+wrapper applies the checksum-pinned recovery overlay to a disposable image
+without changing `.interop-cache` or the reference source checkout. Treat
+results from that overlay as qualified recovery evidence, not as evidence
+that the unmodified upstream image supports those endpoints.
+
 Add `--permissioned-get-repo` to stream and verify the full two-root recovery
 CAR from the selected permissioned repository host. It uses the same explicit
 repository-author key pin and records only the HTTP status, record count, and

@@ -1,0 +1,8 @@
+# Opt-in reference image for the full permissioned recovery laboratory.
+# The base Compose file remains the byte-for-byte pinned TypeScript image;
+# this overlay applies only the checked-in, checksum-pinned recovery
+# qualification to a disposable build.
+services:
+  reference-pds:
+    build:
+      dockerfile: Swan/interop/Dockerfile.reference-pds-recovery

@@ -2180,6 +2180,11 @@ private func canonicalInteropTID(_ rawValue: String?) -> String? {
 }
 
 private func liveErrorCode(_ error: Error) -> String {
+    if let error = error as? SpaceCARStreamingError {
+        // Keep CAR failures actionable in sanitized lab artifacts without
+        // exposing the response body, record values, or peer-selected paths.
+        return spaceCARStreamingErrorCode(error)
+    }
     switch error {
     case let error as InteropHTTPError:
         switch error {
@@ -2193,6 +2198,37 @@ private func liveErrorCode(_ error: Error) -> String {
         }
     default:
         return "InteropFailure"
+    }
+}
+
+private func spaceCARStreamingErrorCode(_ error: SpaceCARStreamingError) -> String {
+    switch error {
+    case .invalidLimits: return "CARInvalidLimits"
+    case .invalidChunk: return "CARInvalidChunk"
+    case .byteLimitExceeded: return "CARByteLimitExceeded"
+    case .malformedVarint: return "CARMalformedVarint"
+    case .nonCanonicalVarint: return "CARNonCanonicalVarint"
+    case .malformedHeader: return "CARMalformedHeader"
+    case .invalidRootCount: return "CARInvalidRootCount"
+    case .unsupportedVersion: return "CARUnsupportedVersion"
+    case .malformedFrame: return "CARMalformedFrame"
+    case .invalidCID: return "CARInvalidCID"
+    case .blockCIDMismatch: return "CARBlockCIDMismatch"
+    case .commitBodyLimitExceeded: return "CARCommitBodyLimitExceeded"
+    case .recordBodyLimitExceeded: return "CARRecordBodyLimitExceeded"
+    case .commitDidNotVerify: return "CARCommitDidNotVerify"
+    case .malformedIndex: return "CARMalformedIndex"
+    case .nonCanonicalIndex: return "CARNonCanonicalIndex"
+    case .duplicateIndexEntry: return "CARDuplicateIndexEntry"
+    case .indexEntryLimitExceeded: return "CARIndexEntryLimitExceeded"
+    case .uniqueBlockLimitExceeded: return "CARUniqueBlockLimitExceeded"
+    case .invalidRecordOrder: return "CARInvalidRecordOrder"
+    case .invalidRecordValue: return "CARInvalidRecordValue"
+    case .unindexedBlocks: return "CARUnindexedBlocks"
+    case .invalidExpectedWitness: return "CARInvalidExpectedWitness"
+    case .expectedWitnessMismatch: return "CARExpectedWitnessMismatch"
+    case .commitmentMismatch: return "CARCommitmentMismatch"
+    case .stagingUnavailable: return "CARStagingUnavailable"
     }
 }
 

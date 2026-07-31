@@ -432,3 +432,47 @@ Swan rejected the credential exchange with HTTP 401 before any write or read.
 The resolver therefore fails closed as intended; the remaining ADV-64 work is
 the reference overlay/full-CAR and fault-matrix proof, not broadening remote
 key discovery.
+
+## Live recovery and clean-cache addendum: 2026-07-31
+
+The explicit checksummed reference-recovery overlay was rebuilt and exercised
+against the disposable existing reference-PDS data volume. The first full-CAR
+attempt exposed a real wire-compatibility defect in Swan: the TypeScript
+`com.atproto.space.defs#signedCommit` block carries its `$type` field, while
+Swan's encoder had omitted it. Swan consequently rejected an otherwise valid
+reference CAR as `CARMalformedFrame`. `SpaceCommitCodec` now emits and requires
+that lexicon type, and the verifier keeps the concrete CAR error code in the
+sanitized interop result.
+
+After the correction, the live stateful path passed with a fresh record key:
+the TypeScript member delegated to the Swan authority, Swan issued the space
+credential, the member write and credential-authenticated read returned 200
+with the same CID, value-bearing `listRepoOps` returned 200 with commit
+verification, and `getRepo` returned a two-root CAR whose record count,
+commitment, and TID revision matched the incremental page. No token, private
+key, CAR, record value, or recoverable personal data was retained in the
+repository; the diagnostic artifacts were removed after classification.
+
+The notification crash/restart acceptance also passed on the composed lab:
+two forwards produced one receiver effect, demonstrating durable outbox
+recovery and idempotent delivery after the forced stop. The run started only
+after reclaiming disposable Docker build/container space; the earlier
+`SQLITE_IOERR_SHMSIZE`/`SQLITE_FULL` result was a 100%-full Docker VM, not a
+protocol failure. Data volumes were preserved.
+
+The clean-cache macOS gate then completed from a new scratch directory with
+profile verification, static/mutation lab checks, a fresh SwiftPM resolution,
+and the full test graph green. The explicit 256 MiB private-CAR stress test
+remains opt-in and was not part of that default run. This is stronger local
+evidence, but it is not Linux-host evidence and does not close the remaining
+reverse-authority, compaction-gap/fault, cross-implementation OAuth/lifecycle,
+or clean-cache Linux gates. The default pinned TypeScript image still does not
+implement `getRepo`; full-CAR/stateful recovery therefore requires the
+checked-in overlay and must remain labeled as such.
+
+As an additional portability check, `Scripts/run-clean-cache-acceptance.sh
+--mode linux` completed from a copied source tree: its isolated Linux
+containers built from the pinned archive, the full Swift test graph passed,
+and Compose reached the expected healthy/exited service topology. The host
+kernel was macOS, so this is Docker-Linux build/health evidence only; a native
+Linux-host run remains required before the platform gate can be called green.

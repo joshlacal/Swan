@@ -1452,6 +1452,7 @@ public enum SpaceCARCodec {
     static func encodeCommit(_ commit: SpaceCommitEnvelope) throws -> Data {
         guard commit.ver == 1 else { throw SwanError.malformed("unsupported commit version") }
         let block = OrderedCBORMap(entries: [
+            (key: "$type", value: "com.atproto.space.defs#signedCommit"),
             (key: "ver", value: commit.ver),
             (key: "hash", value: commit.commitment),
             (key: "mac", value: commit.contentBinding),
@@ -1464,6 +1465,7 @@ public enum SpaceCARCodec {
 
     static func decodeCommit(_ data: Data, space: SpaceURI, author: String) throws -> SpaceCommitEnvelope {
         guard let map = try decodeDAGCBORMap(data),
+              map["$type"] as? String == "com.atproto.space.defs#signedCommit",
               let ver = map["ver"] as? UInt64,
               ver == 1,
               let hash = map["hash"] as? Data,
