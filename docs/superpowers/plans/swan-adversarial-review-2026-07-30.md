@@ -476,3 +476,55 @@ containers built from the pinned archive, the full Swift test graph passed,
 and Compose reached the expected healthy/exited service topology. The host
 kernel was macOS, so this is Docker-Linux build/health evidence only; a native
 Linux-host run remains required before the platform gate can be called green.
+
+## Adversarial rereview: 2026-07-31
+
+The Luna-era changes were rechecked from a fresh serialized SwiftPM scratch
+build and against the current pinned reference cache. No new reportable
+authorization, public/private isolation, CAR-integrity, credential, or
+recovery defect was reproduced.
+
+Evidence from this rereview:
+
+- `PublicRepositoryReadHTTPTests` passed 12/12 after dependency resolution with
+  `SWIFTPM_MAX_CONCURRENT_OPERATIONS=1`, `--jobs 1`, and a unique scratch path.
+  The larger focused boundary selection passed 68/68, covering permissioned
+  reads, repository sync/recovery, credential exchange, lifecycle, public blob
+  binding, login admission, and selected remote OAuth-fetch cases.
+- The fresh-process public CAR spool gate streamed 270,049,433 bytes with a
+  18,726,912-byte peak RSS increase. The permissioned near-256 MiB CAR gate
+  streamed 267,396,722 bytes in 64 KiB chunks with a 21,299,200-byte peak
+  increase, verified integrity, and rejected an over-limit record without
+  creating a spool.
+- `verify-profile.sh`, `verify-interop-lab.sh`, its mutation suite, and the
+  checked-in reference overlay qualification all passed without mutating the
+  pinned cache. The complete Swift test graph also passed when the CLI child
+  process was explicitly pinned to the same scratch-built `swan` executable.
+
+One reproducibility trap was confirmed and closed as a harness issue, not a
+source regression: invoking `swift test` directly with a scratch path but
+without `SWAN_TEST_EXECUTABLE` makes CLI subprocess tests select a stale
+`.build-task21`/`.build` binary. That produced false failures in backup,
+restore, and export success tests. Re-running those tests with the scratch
+binary passed, and `Scripts/run-clean-cache-acceptance.sh` already exports the
+override after building the product.
+
+Two suspected scope/timing concerns were also classified rather than silently
+promoted to findings. `getSpace` intentionally requires an authority
+`atproto` token; qualified space scopes are enforced on record/repository
+operations, matching Swan's documented pinned-TypeScript exception. Recovery
+marker cleanup is bounded by the 4,096-row invariant, but a single request can
+still delete the expired portion of that bounded table; strict constant-work
+behavior under arbitrary SQLite contention remains an ADV-50 follow-up. The
+request-time JSON/index materialization concern remains ADV-26 follow-up work
+even though response-size and process-admission gates are green.
+
+The review is not an alpha-completion sign-off. The remaining closure gates are
+the native-Linux host run, reverse-authority and cross-implementation
+OAuth/browser/lifecycle coverage, the value-bearing TypeScript incremental and
+compaction-gap matrix using the explicit recovery overlay, corrupted
+cross-host operation/CAR recovery, and an operator-supplied disposable
+TypeScript delegation-key pin. The dedicated Codex Security launcher was also
+unavailable in this environment because its bundled Python helper failed to
+start; this document is therefore a bounded manual adversarial review, not an
+official security-scan report.
