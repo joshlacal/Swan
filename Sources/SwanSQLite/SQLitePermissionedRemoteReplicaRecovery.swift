@@ -1571,10 +1571,13 @@ extension SQLiteAccountDatabase: PermissionedRemoteReplicaRecoveryStore {
             uniqueBlockCount: validation.uniqueBlockCount,
             committedAt: committedAt
         )
+        let bindingDigest = permissionedRemoteReplicaBindingDigest(
+            session.binding
+        )
         let inserted = try await connection.query(
             """
             INSERT INTO permissioned_remote_replica_import_results(
-                request_id, request_digest, source_origin,
+                request_id, request_digest, binding_digest, source_origin,
                 receiver_did, space_uri, repository_did,
                 base_generation, installed_generation,
                 installed_wire_revision, installed_history_floor,
@@ -1584,7 +1587,7 @@ extension SQLiteAccountDatabase: PermissionedRemoteReplicaRecoveryStore {
                 verifier_identity, profile_id, committed_at,
                 integrity_digest
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?
             )
             RETURNING request_id
@@ -1592,6 +1595,7 @@ extension SQLiteAccountDatabase: PermissionedRemoteReplicaRecoveryStore {
             [
                 .text(session.binding.requestID),
                 session.binding.requestDigest.sqliteData!,
+                bindingDigest.sqliteData!,
                 .text(session.binding.sourceOrigin),
                 .text(accountDID),
                 .text(head.target.space.rawValue),
@@ -2874,14 +2878,18 @@ extension SQLiteAccountDatabase: PermissionedRemoteReplicaRecoveryStore {
                 row, "maximum_unique_blocks"
             )
         )
+        let source = try PermissionedRemoteReplicaSourceIdentity(
+            persistedOrigin: remoteReplicaText(row, "source_origin"),
+            repositoryDID: target.repositoryDID,
+            verifierIdentity: remoteReplicaText(row, "verifier_identity")
+        )
         let binding = try PermissionedRemoteReplicaImportBinding(
             requestID: remoteReplicaText(row, "request_id"),
             requestDigest: requiredRemoteReplicaData(row, "request_digest"),
-            sourceOrigin: remoteReplicaText(row, "source_origin"),
+            source: source,
             target: target,
             expectedBase: expected,
             freshnessWitness: freshness,
-            verifierIdentity: remoteReplicaText(row, "verifier_identity"),
             profileID: remoteReplicaText(row, "profile_id"),
             limits: limits
         )
@@ -3315,6 +3323,8 @@ extension SQLiteAccountDatabase: PermissionedRemoteReplicaRecoveryStore {
         guard let row = rows.first else { return nil }
         guard remoteReplicaData(row, "request_digest")
                 == expectedBinding.requestDigest,
+              remoteReplicaData(row, "binding_digest")
+                == permissionedRemoteReplicaBindingDigest(expectedBinding),
               remoteReplicaText(row, "source_origin")
                 == expectedBinding.sourceOrigin,
               remoteReplicaText(row, "receiver_did")
@@ -3533,6 +3543,64 @@ extension SQLiteAccountDatabase: PermissionedRemoteReplicaRecoveryStore {
                 hasher.update(data: Data($0))
             }
         }
+        return Data(hasher.finalize())
+    }
+
+    /// The request digest is supplied by the caller and is useful for
+    /// correlating a replay, but it is not a storage-authenticated
+    /// description of the binding. This digest is computed inside the
+    /// SQLite boundary and covers every field that affects recovery
+    /// semantics, including the complete local CAS base, signed freshness
+    /// witness, and resource limits. A durable result can therefore be
+    /// replayed only with the exact same binding, not merely the same request
+    /// ID and base generation.
+    private func permissionedRemoteReplicaBindingDigest(
+        _ binding: PermissionedRemoteReplicaImportBinding
+    ) -> Data {
+        var hasher = SHA256()
+        hasher.update(data: Data(
+            "swan.permissioned.remote-replica.binding.v1".utf8
+        ))
+        func append(_ value: Data) {
+            remoteReplicaDigestAppend(value, to: &hasher)
+        }
+
+        append(Data(binding.requestID.utf8))
+        append(binding.requestDigest)
+        append(Data(binding.sourceOrigin.utf8))
+        append(Data(binding.target.receiverDID.utf8))
+        append(Data(binding.target.space.rawValue.utf8))
+        append(Data(binding.target.repositoryDID.utf8))
+        append(Data(binding.verifierIdentity.utf8))
+        append(Data(binding.profileID.utf8))
+
+        if let expectedBase = binding.expectedBase {
+            append(Data("base-present".utf8))
+            append(Data(expectedBase.target.receiverDID.utf8))
+            append(Data(expectedBase.target.space.rawValue.utf8))
+            append(Data(expectedBase.target.repositoryDID.utf8))
+            append(Data(String(expectedBase.generation).utf8))
+            append(Data(expectedBase.wireRevision.toString().utf8))
+            append(Data(expectedBase.historyFloorWireRevision.toString().utf8))
+            append(expectedBase.ltHash)
+            append(expectedBase.commitment)
+            append(expectedBase.stateMarker)
+        } else {
+            append(Data("base-none".utf8))
+        }
+
+        if let freshnessWitness = binding.freshnessWitness {
+            append(Data("freshness-present".utf8))
+            append(Data(freshnessWitness.wireRevision.toString().utf8))
+            append(freshnessWitness.commitment)
+        } else {
+            append(Data("freshness-none".utf8))
+        }
+
+        append(Data(String(binding.limits.maximumCARBytes).utf8))
+        append(Data(String(binding.limits.maximumRecordBytes).utf8))
+        append(Data(String(binding.limits.maximumIndexEntries).utf8))
+        append(Data(String(binding.limits.maximumUniqueBlocks).utf8))
         return Data(hasher.finalize())
     }
 

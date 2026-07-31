@@ -137,13 +137,18 @@ public actor SwanOAuthLabClient {
         clientID: URL,
         redirectURI: URL,
         timeout: TimeInterval = 15,
-        dpopKey: InteropDPoPKey = .init()
+        dpopKey: InteropDPoPKey = .init(),
+        additionalTrustRootFile: URL? = nil
     ) throws {
         self.issuer = issuer
         self.clientID = clientID
         self.redirectURI = redirectURI
         self.dpopKey = dpopKey
-        http = try InteropHTTPClient(baseURL: issuer, timeout: timeout)
+        http = try InteropHTTPClient(
+            baseURL: issuer,
+            timeout: timeout,
+            additionalTrustRootFile: additionalTrustRootFile
+        )
     }
 
     public func authorizationCode(

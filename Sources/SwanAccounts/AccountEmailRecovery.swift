@@ -6,6 +6,10 @@ import NIOPosix
 import SwanStorage
 
 public protocol AccountEmailDelivery: Sendable {
+    /// Implementations must promptly honor task cancellation. The durable
+    /// account outbox uses a bounded pre-network fence; allowing a cancelled
+    /// delivery to continue past that fence could race lease reclamation or
+    /// permanent account deletion.
     func deliver(to: AccountEmailAddress, subject: String, body: String) async throws
 }
 
@@ -842,6 +846,12 @@ public enum AccountEmailDeliveryRunResult: Sendable, Equatable {
 /// Durable account recovery coordinator. Raw bearer proofs exist only while a
 /// delivery body or exact confirmation/reset request is being processed.
 public actor AccountEmailRecoveryService {
+    /// Keep a margin below the SQLite pre-network fence. Mailpit's maximum
+    /// configured SMTP exchange (connect plus bounded command deadlines) is
+    /// below this value, while a stalled/cancelled delivery cannot remain in
+    /// flight until the durable lease is reclaimable.
+    public static let maximumDeliveryAttemptTimeout: TimeInterval = 240
+
     private let store: any AccountControlStore
     private let delivery: any AccountEmailDelivery
     private let proofCodec: AccountEmailProofCodec
@@ -849,6 +859,7 @@ public actor AccountEmailRecoveryService {
     private let tokenLifetime: TimeInterval
     private let retryPolicy: AccountEmailRetryPolicy
     private let deliveryLeaseDuration: TimeInterval
+    private let deliveryAttemptTimeout: TimeInterval
 
     public init(
         store: any AccountControlStore,
@@ -857,12 +868,16 @@ public actor AccountEmailRecoveryService {
         hashExecutor: Argon2idHashExecutor,
         tokenLifetime: TimeInterval = 900,
         retryPolicy: AccountEmailRetryPolicy = .standard,
-        deliveryLeaseDuration: TimeInterval = 30
+        deliveryLeaseDuration: TimeInterval = 30,
+        deliveryAttemptTimeout: TimeInterval = 240
     ) throws {
         guard tokenLifetime.isFinite,
               (60 ... 86_400).contains(tokenLifetime),
               deliveryLeaseDuration.isFinite,
-              (1 ... 300).contains(deliveryLeaseDuration) else {
+              (1 ... 300).contains(deliveryLeaseDuration),
+              deliveryAttemptTimeout.isFinite,
+              (0.01 ... Self.maximumDeliveryAttemptTimeout)
+                .contains(deliveryAttemptTimeout) else {
             throw AccountControlStoreError.invalidInput
         }
         self.store = store
@@ -872,6 +887,7 @@ public actor AccountEmailRecoveryService {
         self.tokenLifetime = tokenLifetime
         self.retryPolicy = retryPolicy
         self.deliveryLeaseDuration = deliveryLeaseDuration
+        self.deliveryAttemptTimeout = deliveryAttemptTimeout
     }
 
     public func requestEmailConfirmation(
@@ -947,7 +963,7 @@ public actor AccountEmailRecoveryService {
             ) else {
                 throw AccountEmailRecoveryError.deliveryUnavailable
             }
-            try await delivery.deliver(
+            try await deliverWithDeadline(
                 to: lease.email,
                 subject: subject,
                 body: "Swan proof token: \(proof)"
@@ -976,6 +992,34 @@ public actor AccountEmailRecoveryService {
             case .expired:
                 return .expired(lease.deliveryID)
             }
+        }
+    }
+
+    private func deliverWithDeadline(
+        to email: AccountEmailAddress,
+        subject: String,
+        body: String
+    ) async throws {
+        let delivery = self.delivery
+        let timeoutMilliseconds = Int64(
+            (deliveryAttemptTimeout * 1_000).rounded(.up)
+        )
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await delivery.deliver(
+                    to: email,
+                    subject: subject,
+                    body: body
+                )
+            }
+            group.addTask {
+                try await Task.sleep(
+                    for: .milliseconds(timeoutMilliseconds)
+                )
+                throw AccountEmailRecoveryError.deliveryUnavailable
+            }
+            defer { group.cancelAll() }
+            try await group.next()
         }
     }
 

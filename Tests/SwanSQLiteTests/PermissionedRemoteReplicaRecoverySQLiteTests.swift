@@ -463,6 +463,37 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
       }
       XCTAssertEqual(replayed, idempotent.result)
 
+      // A request ID and caller-supplied request digest are not sufficient
+      // replay authority. The durable result must bind the complete expected
+      // base, not only its generation; otherwise a low-level storage caller
+      // could receive a committed replay for a different CAS precondition.
+      var forgedMarker = installed.result.head.stateMarker
+      forgedMarker[forgedMarker.startIndex] ^= 0x01
+      let forgedBase = try PermissionedRemoteReplicaHead(
+        target: fixture.target,
+        generation: installed.result.head.generation,
+        wireRevision: installed.result.head.wireRevision,
+        historyFloorWireRevision:
+          installed.result.head.historyFloorWireRevision,
+        ltHash: installed.result.head.ltHash,
+        commitment: installed.result.head.commitment,
+        stateMarker: forgedMarker
+      )
+      let forgedBinding = try fixture.binding(
+        archive: equivalent,
+        expectedBase: forgedBase,
+        requestID: "same-tid-equivalent",
+        freshnessWitness: fixture.witness(for: equivalent)
+      )
+      await assertRemoteReplicaError(.conflictingRequestReuse) {
+        try await database.createPermissionedRemoteReplicaImportSession(
+          binding: forgedBinding,
+          createdAt: RemoteReplicaSQLiteFixture.createdAt,
+          expiresAt: RemoteReplicaSQLiteFixture.expiresAt,
+          now: RemoteReplicaSQLiteFixture.operationNow
+        )
+      }
+
       let conflicting = try fixture.archive(
         revision: "222222222222a",
         values: ["different value at the same TID"],
@@ -976,14 +1007,18 @@ private struct RemoteReplicaSQLiteFixture {
     requestID: String,
     freshnessWitness: PermissionedRemoteReplicaFreshnessWitness?
   ) throws -> PermissionedRemoteReplicaImportBinding {
-    try PermissionedRemoteReplicaImportBinding(
+    let source = try PermissionedRemoteReplicaSourceIdentity(
+      origin: URL(string: "https://writer.example")!,
+      repositoryDID: target.repositoryDID,
+      verifierIdentity: "key-sha256:" + String(repeating: "a", count: 64)
+    )
+    return try PermissionedRemoteReplicaImportBinding(
       requestID: requestID,
       requestDigest: Data(SHA256.hash(data: Data(requestID.utf8))),
-      sourceOrigin: "https://writer.example",
+      source: source,
       target: target,
       expectedBase: expectedBase,
       freshnessWitness: freshnessWitness,
-      verifierIdentity: "did:key:remote-replica-test-verifier",
       profileID: "permissioned-data-0016-test",
       limits: archive.limits
     )

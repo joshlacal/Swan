@@ -167,6 +167,43 @@ final class AccountEmailOutboxRuntimeTests: XCTestCase {
         XCTAssertEqual(replay, .invalidToken)
     }
 
+    func testDeliveryTimeoutCancelsBeforeDurableFenceExpires() async throws {
+        let fixture = try await RuntimeFixture(testCase: self)
+        addTeardownBlock { try? await fixture.database.close(); fixture.cleanup() }
+        let codec = AccountEmailProofCodec(
+            key: try AccountEmailProofKey(Data(repeating: 0x57, count: 32))
+        )
+        let replacementVerifier = self.replacementVerifier
+        let service = try AccountEmailRecoveryService(
+            store: fixture.database,
+            delivery: SlowCancellableDelivery(),
+            proofCodec: codec,
+            hashExecutor: try Argon2idHashExecutor(
+                maximumConcurrentHashes: 1
+            ) { _ in replacementVerifier },
+            tokenLifetime: 600,
+            retryPolicy: AccountEmailRetryPolicy(
+                maximumAttempts: 2,
+                initialDelay: 1,
+                maximumDelay: 1
+            ),
+            deliveryAttemptTimeout: 0.02
+        )
+
+        try await service.requestEmailConfirmation(
+            did: did,
+            email: email,
+            now: fixture.now
+        )
+        let result = try await service.deliverNext(
+            workerID: "timeout-worker",
+            now: fixture.now
+        )
+        guard case .retryScheduled = result else {
+            return XCTFail("expected a bounded delivery timeout, got \(result)")
+        }
+    }
+
     func testPasswordResetRequestIsOpaqueAndCompletionUsesBoundedHasher() async throws {
         let fixture = try await RuntimeFixture(testCase: self)
         addTeardownBlock { try? await fixture.database.close(); fixture.cleanup() }
@@ -291,6 +328,16 @@ private actor RecordingDelivery: AccountEmailDelivery {
 
     func messages() -> [Message] { recorded }
     func lastMessage() -> Message? { recorded.last }
+}
+
+private actor SlowCancellableDelivery: AccountEmailDelivery {
+    func deliver(
+        to _: AccountEmailAddress,
+        subject _: String,
+        body _: String
+    ) async throws {
+        try await Task.sleep(for: .seconds(1))
+    }
 }
 
 private final class RuntimeFixture: @unchecked Sendable {

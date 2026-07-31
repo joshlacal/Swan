@@ -337,6 +337,7 @@ public struct SwanHTTPServer: Sendable {
         publicRepositoryReadDirectory: (any PublicRepositoryReadDirectory)? = nil,
         publicRepositoryMutationDirectory: (any PublicRepositoryMutationDirectory)? = nil,
         publicRepositoryMutationSignerProvider: (any PublicRepositoryMutationSignerProvider)? = nil,
+        publicBlobSpoolAdmission: PublicRepositorySpoolAdmission? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct
     ) {
@@ -414,7 +415,8 @@ public struct SwanHTTPServer: Sendable {
                 publicRepositoryMutations = SwanPublicRepositoryMutationCapability(
                     authorizer: authorizer,
                     directory: mutationDirectory,
-                    signerProvider: signerProvider
+                    signerProvider: signerProvider,
+                    publicBlobSpoolAdmission: publicBlobSpoolAdmission
                 )
             } else {
                 publicRepositoryMutations = nil

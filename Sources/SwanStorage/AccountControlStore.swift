@@ -1208,7 +1208,10 @@ public protocol AccountControlStore: Sendable {
     /// Claims one due delivery under a bounded lease. Expired leases are
     /// reclaimable after restart; SMTP happens outside this transaction. Once
     /// `beginEmailDeliveryAttempt` succeeds, the storage implementation keeps
-    /// the lease alive through its bounded network-attempt window.
+    /// the lease alive through its bounded network-attempt window. The
+    /// delivery implementation must honor task cancellation before that
+    /// window expires; the account recovery coordinator enforces a shorter
+    /// deadline than the durable fence.
     func claimNextEmailDelivery(
         workerID: String,
         now: Date,

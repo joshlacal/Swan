@@ -18,6 +18,7 @@ public enum PublicRepositoryCARReplicationError: Error, Sendable, Equatable {
     case unexpectedStatus(Int)
     case unexpectedContentType
     case responseTooLarge
+    case spoolUnavailable
 }
 
 /// Errors from the optional receiver-side public-blob promotion step. The
@@ -32,6 +33,7 @@ public enum PublicRepositoryBlobPromotionError: Error, Sendable, Equatable {
     case unexpectedContentType
     case responseTooLarge
     case digestMismatch
+    case spoolUnavailable
 }
 
 /// Stable, secret-free failure labels for the import artifact. The CLI must
@@ -59,6 +61,7 @@ public enum PublicRepositoryCARImportFailureCode {
             case .unexpectedStatus: return "UnexpectedStatus"
             case .unexpectedContentType: return "UnexpectedContentType"
             case .responseTooLarge: return "ResponseTooLarge"
+            case .spoolUnavailable: return "SpoolUnavailable"
             }
         case let error as PublicRepositoryBlobPromotionError:
             switch error {
@@ -69,6 +72,7 @@ public enum PublicRepositoryCARImportFailureCode {
             case .unexpectedContentType: return "BlobUnexpectedContentType"
             case .responseTooLarge: return "BlobResponseTooLarge"
             case .digestMismatch: return "BlobDigestMismatch"
+            case .spoolUnavailable: return "BlobSpoolUnavailable"
             }
         case let error as InteropHTTPError:
             switch error {
@@ -350,13 +354,19 @@ public actor FilePublicRepositoryCARByteSource: PublicRepositoryCARByteSource {
 public struct RemotePublicRepositoryCARImporter: Sendable {
     public let client: InteropXRPCClient
     public let limits: PublicRepositoryLimits
+    /// Shared disk admission for the remote CAR spool. A missing admission
+    /// is fail-closed so this operator-only seam cannot bypass public-read
+    /// resource bounds by creating an uncoordinated temporary file.
+    public let spoolAdmission: PublicRepositorySpoolAdmission?
 
     public init(
         client: InteropXRPCClient,
-        limits: PublicRepositoryLimits = .standard
+        limits: PublicRepositoryLimits = .standard,
+        spoolAdmission: PublicRepositorySpoolAdmission? = nil
     ) {
         self.client = client
         self.limits = limits
+        self.spoolAdmission = spoolAdmission
     }
 
     public func importRepository(
@@ -385,6 +395,14 @@ public struct RemotePublicRepositoryCARImporter: Sendable {
         guard current.did == did else {
             throw PublicRepositoryCARReplicationError.repositoryUnavailable
         }
+        guard let spoolAdmission,
+              let spoolLease = spoolAdmission.reserve(
+                  accountDID: did,
+                  maximumBytes: limits.maximumCARBytes
+              ) else {
+            throw PublicRepositoryCARReplicationError.spoolUnavailable
+        }
+        defer { spoolLease.release() }
 
         let temporaryURL = FileManager.default.temporaryDirectory
             .appending(path: "swan-public-repository-import-\(UUID().uuidString).car")
@@ -467,13 +485,19 @@ public struct RemotePublicRepositoryCARImporter: Sendable {
 public struct RemotePublicRepositoryBlobPromoter: Sendable {
     public let client: InteropXRPCClient
     public let limits: PublicRepositoryLimits
+    /// The HTTP response and the receiver's adoption spool coexist for one
+    /// blob, so the same lease is held until both the source descriptor and
+    /// temporary file are closed.
+    public let spoolAdmission: PublicRepositorySpoolAdmission?
 
     public init(
         client: InteropXRPCClient,
-        limits: PublicRepositoryLimits = .standard
+        limits: PublicRepositoryLimits = .standard,
+        spoolAdmission: PublicRepositorySpoolAdmission? = nil
     ) {
         self.client = client
         self.limits = limits
+        self.spoolAdmission = spoolAdmission
     }
 
     public func promoteReferencedBlobs(
@@ -504,9 +528,22 @@ public struct RemotePublicRepositoryBlobPromoter: Sendable {
             if try await database.publicBlobExists(cid: cid.string) {
                 continue
             }
+            let reservation = limits.maximumCARBytes
+                .multipliedReportingOverflow(by: 2)
+            guard let spoolAdmission,
+                  !reservation.overflow,
+                  let spoolLease = spoolAdmission.reserve(
+                      accountDID: did,
+                      maximumBytes: reservation.partialValue
+                  ) else {
+                throw PublicRepositoryBlobPromotionError.spoolUnavailable
+            }
             let temporaryURL = FileManager.default.temporaryDirectory
                 .appending(path: "swan-public-blob-promotion-\(UUID().uuidString).blob")
-            defer { try? FileManager.default.removeItem(at: temporaryURL) }
+            defer {
+                try? FileManager.default.removeItem(at: temporaryURL)
+                spoolLease.release()
+            }
             let path: String
             do {
                 path = try client.xrpcPath(

@@ -61,6 +61,14 @@ private struct PublicMutationHandlers {
             ?? "application/octet-stream"
         let mimeType = safePublicBlobMIMEType(requestedMIMEType)
         let maximumBytes = 256 * 1024 * 1024
+        guard let admission = capability.publicBlobSpoolAdmission,
+              let lease = admission.reserve(
+                  accountDID: target.did,
+                  maximumBytes: maximumBytes
+              ) else {
+            throw PublicMutationFailure.unavailable
+        }
+        defer { lease.release() }
         let counter = PublicBlobUploadCounter()
         let body = request.body
         let reference = try await blobStore.putStreaming(

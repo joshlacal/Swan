@@ -25,6 +25,14 @@ descriptor-replacement, and cap tests are green, and the serialized macOS
 suite is green. Live Compose SIGKILL/restart, cross-host semantic matrix, and
 Linux-host gate remain open.
 
+The latest rereview additionally added a caller-bound HTTP provider for durable
+permissioned full-CAR recovery, shared spool admission for public blob upload,
+remote public CAR import, and optional blob promotion, plus an IPv6 loopback
+origin regression. A fresh clean-cache macOS build and full serialized test
+graph passed after those changes; the first clean-cache attempt failed only
+because the host data volume was full, then passed after explicitly removing
+the generated scratch caches.
+
 ## Review judgment
 
 The new work contains useful production-shaped controls, but the first version
@@ -78,7 +86,7 @@ overstated several gates. The most important adversarial findings were:
 | ADV-18 | P1 | Active public databases were published at bootstrap and live activation before full projection verification. Public JSON reads then repeated whole-repository verification inside `BEGIN IMMEDIATE`, allowing unauthenticated reads to reserve the SQLite writer. | The admission and writer-reservation cases are remediated and green. Public requests use the admitted generation; the remaining index-projection risk is covered by ADV-26's bounded preflight and explicit ceilings. |
 | ADV-19 | P1 | Concurrent exact-URL OAuth metadata cache misses each performed their own DNS/GET, and canceling one waiter canceled its transport rather than only that waiter. The production transport also creates a new event-loop thread for each GET. | Coalescing, prompt waiter-only cancellation, and the shared eight-flight metadata/JWKS admission are green. Shared transport lifecycle remains open. |
 | ADV-20 | P1 | `AccountOperatorService.delete` still calls the generic `.deleted` transition, which the lifecycle policy explicitly rejects so deletion cannot reach the resumable coordinator. | Remediated and green in the serialized macOS suite: the operator boundary delegates only to the permanent-deletion capability; the CLI/runtime injects concrete PLC/data adapters, resumes pending work before listeners, and fails closed if recovery is required but unavailable. |
-| ADV-21 | P1 | Full-CAR recovery evidence is verified but discarded; no durable atomic installer retains verified record bodies, rejects rollback/equivocation against last-good state, and replaces a remote replica. | Storage installer is remediated and green in the serialized macOS suite with descriptor-backed staging, authenticated freshness witnesses, atomic generation publication, rollback/equivocation rejection, and crash cleanup. Production cross-host orchestration still must bind the authorized origin/DID/key/freshness to this installer. |
+| ADV-21 | P1 | Full-CAR recovery evidence is verified but discarded; no durable atomic installer retains verified record bodies, rejects rollback/equivocation against last-good state, and replaces a remote replica. | Storage installer is remediated and green in the serialized macOS suite with descriptor-backed staging, authenticated freshness witnesses, atomic generation publication, rollback/equivocation rejection, and crash cleanup. A caller-bound HTTP provider and `LiveInterop` recovery helper now bind the authorized origin/DID/key/freshness to this installer; the live cross-host command/Compose matrix still must exercise that API end to end. |
 | ADV-22 | P1 | Checked-in Compose loaded notification configuration but did not enable outbound delivery or the startup recovery service. Duplicate/reorder scenarios exercised endpoint probes, not durable convergence. | Static remediation and adversarial rereview are complete: delivery is enabled, the proxy is ready before recovery, and the claim is correctly scoped to two successful forwards/one receiver effect. The live SIGKILL/lost-ack Compose run is still required. |
 | ADV-23 | P1 | Portable export/restore accepted a permissioned blob whose space had no matching space CAR. With no restored closure or repository-existence check, the published account could stream that orphan through `getBlob`. | Remediated and green: restore requires matching repository state before persistence, request reads check state/closure/tombstones/exact reference in one snapshot, and the legitimate closed operator-restore path remains supported. |
 | ADV-24 | P1 | Password login has no durable per-account/source failure admission, and PAR/replay persistence has no live-row cardinality cap. Argon work and unbounded expiry deletes can monopolize the process-local queue and serialized control database. | Login admission and the OAuth storage ceilings are remediated in source: metadata/PAR/replay plus authorization-code, token-family, access-token, and refresh-token rows now use transactional hard caps. Focused cap tests are green; the serialized suite remains the execution gate. |
@@ -131,6 +139,11 @@ overstated several gates. The most important adversarial findings were:
 | ADV-71 | P3 | `swan serve` force-unwrapped the default URL assembled from operator-supplied `--host`/`--port`, turning malformed configuration into a process crash. | Remediated with `ValidationError` mapping and a child CLI regression using the scratch-built executable. Operator availability only; no remote request path was involved. |
 | ADV-72 | P2 | Anonymous `describeRepo` encoded a potentially large admitted collection list without reserving the process-wide JSON response lease used by `getRecord` and `listRecords`, allowing concurrent callers to multiply response allocations. | Remediated by reserving the same 16 MiB response lease and releasing it on handler, encoding, and body-drain failures. `PublicRepositoryReadHTTPTests` passed 12/12, including a regression that blocks `describeRepo` behind an active list lease. |
 | ADV-73 | P2 | `abandonPublicRepositoryReservation` force-unwrapped the persisted request digest and did not enforce its 32-byte invariant, so a corrupt reservation row could crash the process or be abandoned with an invalid integrity input. | Remediated with checked blob decoding and an exact 32-byte guard; malformed rows now return `corruptRepository`. `PublicRepositoryMutationStoreTests/testAbandonReservationRejectsMalformedPersistedDigest` covers the failure. |
+| ADV-74 | P1 | The new HTTP recovery provider opened a bounded CAR file and held a spool lease before durable-session creation, but the orchestrator returned early on idempotent replay or pre-staging rejection without closing that source. Repeated failed/replayed requests could therefore pin temporary files and exhaust the receiver's recovery admission budget. | Remediated: every pre-staging terminal path closes the source session; the close callback is idempotent and the regression covers expiry rejection. The provider also binds the source origin, repository DID, exact verifier fingerprint, signed current-head witness, and CAR spool to the durable import. Live cross-host recovery remains an acceptance gate. |
+| ADV-75 | P2 | `swan lab import-public` and optional public-blob promotion created temporary CAR/blob files outside the shared public-repository spool admission. A lab operator could therefore bypass the same disk budget enforced by public reads and uploads. | Remediated fail-closed: both helpers require an admission lease, and the CLI uses an explicit two-spool budget for CAR import plus blob adoption. Response-file cleanup runs before lease release. Focused build and the clean-cache macOS graph pass; a large hostile remote import remains a live lab exercise. |
+| ADV-76 | P2 | Canonicalizing a valid `http://[::1]` laboratory origin through `URLComponents` dropped the required IPv6 brackets and rejected the source binding. This made a supported loopback recovery path fail closed and could have encouraged an unsafe workaround. | Remediated by rebuilding the bracketed literal and adding a regression for `http://[::1]:3000/`. Non-loopback HTTP, credentials, paths, queries, and fragments remain rejected. |
+| ADV-77 | P2 | `PermissionedRemoteReplicaSourceSession` allowed callers to omit cleanup, and the orchestrator invoked a caller-supplied cleanup closure from multiple terminal paths without enforcing idempotence. A custom file-backed source could leak a descriptor/spool or double-release an external lease. | Remediated in the working copy: cleanup is now mandatory at session construction and an actor-backed close gate executes it exactly once. Verification-failure and preflight-rejection regressions pass; the HTTP provider remains the owner of the file/lease callback. |
+| ADV-78 | P2 | The durable replay result stores only `base_generation`, while the orchestrator's request digest historically omitted the remaining expected-base fields. A direct caller of the storage protocol could reuse a request ID/digest with a forged same-generation base and receive a committed replay instead of a conflicting-reuse error. The production orchestrator obtains the base from the receiver database, so this is a storage-boundary integrity hardening issue rather than an HTTP bypass. | Remediated in migration 8: the result projection stores a domain-separated digest of the complete expected-base binding and replay requires an exact match; legacy rows without the digest fail closed. |
 
 ### Provenance limitation
 
@@ -796,3 +809,135 @@ The account migration now rebuilds the receipt table with
 space, and preserves existing receipts transactionally. A regression creates
 two spaces under one authority and proves the same writer JTI advances both
 writer sets. `SpaceNotificationSQLiteTests` passed 6/6 after the migration.
+
+## Caller-bound recovery and public spool rereview: 2026-07-31
+
+The durable recovery boundary was rechecked for resource ownership, not only
+cryptographic correctness. The HTTP provider now obtains and verifies a signed
+current-head witness before opening `getRepo`, derives the persisted source
+identity from the exact selected public key, and holds one admission lease for
+the bounded CAR spool. The orchestrator closes that source on successful
+publication, verification failure, idempotent replay, and every pre-staging
+rejection. A focused regression verifies closure when expiry rejects the
+request before SQLite staging begins.
+
+The public replication helpers received the same disk-boundary treatment.
+Remote CAR import now fails closed without a shared admission lease, and blob
+promotion reserves a deliberate two-spool budget for the response file plus
+SQLite adoption stream. The `swan lab import-public` command supplies the
+larger explicit budget required by that two-spool case; leases and owner-only
+temporary files are cleaned up in the reverse order. IPv6 loopback origin
+canonicalization is covered by a regression.
+
+Evidence for this pass:
+
+- `PermissionedRemoteReplicaRecoveryOrchestratorTests` passed 4/4 after the
+  source-closure change.
+- The public import fail-closed regression, the concurrent spool-admission
+  reservation test, and the four recovery-orchestrator tests passed together
+  as a 6-test focused selection; the existing mutation HTTP selection remained
+  green at 5/5.
+- The clean-cache macOS script passed its fresh SwiftPM build and full test
+  graph with zero failures (the opt-in 256 MiB stress test remained skipped).
+- `git diff --check`, profile verification, Compose invariant verification,
+  verifier mutation tests, and reference-overlay qualification passed.
+
+These changes close bounded local availability defects, but they do not close
+the native-Linux, cross-implementation browser/OAuth/lifecycle, corrupted
+operation/compaction-gap, or stock-TypeScript full-CAR evidence gates.
+
+## Independent source-boundary rereview: 2026-07-31
+
+The current working copy was reread independently of the historical Luna-era
+ledger. No new P1 authorization, public/private-isolation, credential, CAR
+integrity, or recovery bypass was reproduced. Two lower-priority boundaries
+were separated from that conclusion:
+
+- **ADV-77 was remediated in code.** Source sessions now require an explicit
+  cleanup action, and the private close gate makes repeated orchestrator
+  cleanup calls harmless and exactly-once. The focused recovery selection now
+  passes 5/5, including a malformed-CAR path that reaches both the staging and
+  outer error handlers while observing one close callback.
+- **ADV-78 is closed.** The result migration persists and compares a
+  domain-separated digest over the receiver's complete expected-base state;
+  direct storage callers now receive the same fail-closed replay guarantee as
+  orchestrated callers.
+
+The current focused command completed 17 selected tests with zero failures:
+five recovery-orchestrator tests and twelve public-read HTTP tests. This is
+macOS evidence only. The profile successor boundary (07-30 versus the frozen
+07-03 plan input), stock TypeScript recovery endpoint gap, semantic fault and
+compaction-gap matrix, dynamic TypeScript key discovery, reverse OAuth/browser
+lifecycle coverage, native Linux execution, and the unavailable official
+security launcher remain release blockers.
+
+## Replay, delivery, origin, and live-public follow-up: 2026-07-31
+
+The next adversarial pass closed four remaining local boundaries:
+
+- **ADV-78 persistence hardening is now versioned.** Migration 8 adds a
+  domain-separated digest of the complete expected-base binding to durable
+  remote-replica results. Replay now requires the request ID, canonical body
+  digest, source/target/profile/verifier identity, expected generation, commit
+  CID, revision, LtHash commitment, and witness fields to match; legacy rows
+  without the binding digest fail closed. A forged same-generation replay
+  regression passes.
+- **Remote origins are checked before network work.** The HTTP provider now
+  rejects an unsafe or malformed source origin in its initializer, before
+  creating a request or opening a response file. The orchestrator test covers
+  this preflight boundary.
+- **Email delivery has a bounded cancellation window.** The runtime delivery
+  wrapper uses a 240-second maximum attempt deadline and cancels the SMTP task
+  before entering the durable deletion fence. The timeout regression proves a
+  stalled delivery cannot cross that fence after cancellation.
+- **Live public mutation targets retain streaming blob capability.** The
+  startup generation-refreshing wrapper now delegates the narrow streaming
+  blob methods instead of allowing `uploadBlob`/`getBlob` to fail with a false
+  404 while direct unit fixtures pass. The live runner also accepts an explicit
+  lab CA trust root for the Caddy certificate while retaining normal trust
+  roots.
+
+Focused Swift evidence after these changes:
+
+- `AccountEmailOutboxSQLiteTests` 12/12, `PermissionedRemoteReplicaRecoverySQLiteTests`
+  7/7, `PermissionedRemoteReplicaRecoveryOrchestratorTests` 5/5, and
+  `AccountEmailOutboxRuntimeTests` 6/6 (30 selected tests, zero failures).
+- `SwanInteropTests` 82/82 and `PublicRepositoryMutationHTTPTests` 6/6.
+- The serialized scratch-executable macOS graph passed 889 XCTest cases with
+  8 explicit skips and zero failures, plus the four Swift Testing profile
+  cases. The command must export `SWAN_TEST_EXECUTABLE` from the same scratch
+  tree; invoking CLI tests with a stale normal `.build/debug/swan` produces a
+  deterministic profile-mismatch `invalidManifest`, not a source failure.
+- `verify-profile.sh`, `verify-interop-lab.sh`, reference-overlay qualification,
+  and `git diff --check` passed.
+
+A fresh isolated Compose Swan-to-Swan run now proves the public path over
+trusted local TLS: OAuth/DPoP, public blob upload (200), `putRecord` (200),
+ `getRecord` (200), `getBlob` (200), CID equality, and blob-byte verification
+ all pass. The checked-in `public-live-blob-placeholder.json` fixture passed;
+ the sanitized artifact contains no request body, token, password, or record
+ value. The earlier live 400 was a harness selector error caused by reading the
+ bootstrap marker `generate` from an owner-only `authority.did` file; the
+ runner correctly rejected that non-DID selector. The actual PLC DID run is
+ green.
+
+The same fresh Compose project previously passed the strict Swan-to-Swan
+ permissioned stateful matrix: credential issuance, member write/read,
+ value-bearing incremental sync, signed commitment verification, two-root
+ full-CAR recovery, expected-record verification, and convergence. This is
+ configured-Swan evidence only. The pinned TypeScript branch still lacks the
+ required `getRepo` implementation and has the known value-bearing
+ `listRepoOps` SQLite ambiguity, so cross-implementation recovery and the
+ fault/compaction matrix remain open.
+
+## Current release boundary after this pass
+
+Swan is ready for repeatable local public and permissioned data testing on the
+macOS/Docker laboratory path, including public blob-linked records and the
+ configured Swan-to-Swan permissioned recovery path. It is not yet an alpha
+ completion claim. Native Linux execution, unmodified pinned TypeScript
+ semantic/recovery interoperability, reverse-authority OAuth/browser and
+ lifecycle coverage, corrupted-operation and compaction-gap traffic, and the
+ official security launcher remain release gates. The active immutable profile
+ is `permissioned-data-0016-2026-07-30`; the frozen 07-03 plan input remains a
+ documented predecessor rather than an interchangeable profile.

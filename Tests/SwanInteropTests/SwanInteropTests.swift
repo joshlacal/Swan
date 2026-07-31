@@ -6,6 +6,7 @@ import Petrel
 @testable import SwanInterop
 import SwanCore
 import SwanOAuth
+import SwanPublicRepository
 import SwanSQLite
 import SwanSpaces
 
@@ -1244,6 +1245,50 @@ final class SwanInteropTests: XCTestCase {
             XCTAssertEqual(error, .invalidRepositoryDID)
         }
         try await database.close()
+    }
+
+    func testPublicRepositoryImportFailsClosedWithoutSpoolAdmissionBeforeNetwork() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(
+                path: "swan-public-import-admission-" + UUID().uuidString,
+                directoryHint: .isDirectory
+            )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        let signingKey = P256.Signing.PrivateKey()
+        let genesis = try PublicRepositoryGenesisCodec.create(
+            did: did,
+            revision: "3jzfcijpj2z2a",
+            signingKey: signingKey
+        )
+        let database = try await SQLiteAccountDatabase(
+            dataDirectory: root,
+            did: did
+        )
+        defer { Task { try? await database.close() } }
+        _ = try await database.installPublicRepositoryGenesis(
+            genesis,
+            signingPublicKey: signingKey.publicKey,
+            installedAt: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+
+        let importer = try RemotePublicRepositoryCARImporter(
+            client: InteropXRPCClient(baseURL: URL(string: "https://pds.test")!)
+        )
+        do {
+            _ = try await importer.importRepository(
+                did: did,
+                database: database,
+                verifier: PermissionedDataPublicRepositoryCommitVerifier(
+                    key: .p256(signingKey.publicKey)
+                ),
+                requestID: "no-spool-admission"
+            )
+            XCTFail("public CAR import must require shared spool admission")
+        } catch let error as PublicRepositoryCARReplicationError {
+            XCTAssertEqual(error, .spoolUnavailable)
+        }
     }
 
     private static func sanitizedKeys(in value: Any) -> [String] {

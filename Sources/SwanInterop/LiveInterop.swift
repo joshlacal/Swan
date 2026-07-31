@@ -4,11 +4,13 @@ import Foundation
 import NIOCore
 import NIOFoundationCompat
 import NIOHTTP1
+import NIOSSL
 import Petrel
 import SwanCore
 import SwanOAuth
 import SwanSQLite
 import SwanSpaces
+import SwanStorage
 import SwanSpacesWire
 
 /// A bounded, redirect-free HTTP response used by the stateful interop
@@ -97,7 +99,8 @@ public final class InteropHTTPClient: @unchecked Sendable {
         baseURL: URL,
         timeout: TimeInterval = 15,
         maximumResponseBytes: Int = 2 * 1024 * 1024,
-        maximumStreamingResponseBytes: Int = 512 * 1024 * 1024
+        maximumStreamingResponseBytes: Int = 512 * 1024 * 1024,
+        additionalTrustRootFile: URL? = nil
     ) throws {
         guard Self.validBaseURL(baseURL),
               timeout > 0, timeout <= 120, timeout.isFinite,
@@ -109,14 +112,26 @@ public final class InteropHTTPClient: @unchecked Sendable {
         self.timeout = timeout
         self.maximumResponseBytes = maximumResponseBytes
         self.maximumStreamingResponseBytes = maximumStreamingResponseBytes
-        client = HTTPClient(configuration: .init(
+        var configuration = HTTPClient.Configuration(
             redirectConfiguration: .disallow,
             timeout: .init(
                 connect: .milliseconds(Int64(timeout * 1_000)),
                 read: .milliseconds(Int64(timeout * 1_000))
             ),
             decompression: .disabled
-        ))
+        )
+        if let additionalTrustRootFile {
+            let path = additionalTrustRootFile.standardizedFileURL.path
+            guard FileManager.default.fileExists(atPath: path),
+                  let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+                  (attributes[.type] as? FileAttributeType) == .typeRegular else {
+                throw SwanError.malformed("interop TLS trust root is unavailable")
+            }
+            var tls = TLSConfiguration.makeClientConfiguration()
+            tls.additionalTrustRoots = [.file(path)]
+            configuration.tlsConfiguration = tls
+        }
+        client = HTTPClient(configuration: configuration)
     }
 
     deinit {
@@ -334,8 +349,16 @@ public struct InteropXRPCClient: Sendable {
         self.http = http
     }
 
-    public init(baseURL: URL, timeout: TimeInterval = 15) throws {
-        self.init(http: try InteropHTTPClient(baseURL: baseURL, timeout: timeout))
+    public init(
+        baseURL: URL,
+        timeout: TimeInterval = 15,
+        additionalTrustRootFile: URL? = nil
+    ) throws {
+        self.init(http: try InteropHTTPClient(
+            baseURL: baseURL,
+            timeout: timeout,
+            additionalTrustRootFile: additionalTrustRootFile
+        ))
     }
 
     public func query(
@@ -1631,6 +1654,47 @@ public enum LiveInteropRunner {
                 converged: false, errorCode: errorCode, recorder: recorder
             )
         }
+    }
+
+    /// Performs a live, caller-bound full-CAR recovery into a receiver's
+    /// durable per-account database. The source provider obtains the signed
+    /// current-head witness and CAR from the configured host; the SQLite
+    /// orchestrator verifies and publishes only an authenticated replacement.
+    /// This is kept separate from the summary-only round-trip artifact so a
+    /// caller must deliberately provide the receiver database and request
+    /// identity rather than silently turning a read probe into an install.
+    public static func recoverPermissionedRepository(
+        target: PermissionedRemoteReplicaTarget,
+        requestID: String,
+        sourceHost: LiveInteropHost,
+        receiverDatabase: SQLiteAccountDatabase,
+        profileID: String = OfflineProtocolProfileVerifier.stableProfileID,
+        expiresAt: Int64,
+        temporaryDirectory: URL = FileManager.default.temporaryDirectory,
+        spoolAdmission: PublicRepositorySpoolAdmission,
+        limits: SpaceCARRecoveryLimits = .standard,
+        now: @escaping @Sendable () -> Int64 = {
+            Int64(Date().timeIntervalSince1970)
+        }
+    ) async throws -> CommittedPermissionedRemoteReplicaRecovery {
+        let provider = try PermissionedRemoteReplicaHTTPSourceProvider(
+            host: sourceHost,
+            temporaryDirectory: temporaryDirectory,
+            spoolAdmission: spoolAdmission,
+            limits: limits
+        )
+        let orchestrator = PermissionedRemoteReplicaRecoveryOrchestrator(
+            database: receiverDatabase,
+            now: now
+        )
+        return try await orchestrator.recover(
+            target: target,
+            requestID: requestID,
+            provider: provider,
+            profileID: profileID,
+            expiresAt: expiresAt,
+            limits: limits
+        )
     }
 
     private static func verifyPermissionedListRepoOps(

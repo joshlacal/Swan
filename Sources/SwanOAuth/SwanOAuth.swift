@@ -45,6 +45,14 @@ public enum PermissionedDataJWTVerificationKey: Sendable {
         }
     }
 
+    /// Stable, non-secret identity used when a remote recovery installer binds
+    /// durable evidence to the exact public key that verified the CAR.  The
+    /// key bytes never leave this value; only their SHA-256 fingerprint is
+    /// exposed to the storage binding.
+    public var recoveryVerifierIdentity: String {
+        "key-sha256:" + Hex.encode(SHA256.hash(data: deterministicIdentity))
+    }
+
     /// Internal shared verifier for the bounded proposal JWT and service-JWT
     /// parsers. The key enum itself still exposes no signing material and the
     /// caller must select it from a local/pinned resolver before this method

@@ -921,6 +921,9 @@ struct ServePermissionedRuntime {
                 ServePublicMutationDirectory(directory: directory, controls: accountControlStore)
             },
             publicRepositoryMutationSignerProvider: publicMutationRuntime?.signerProvider,
+            publicBlobSpoolAdmission: publicMutationRuntime.map { _ in
+                directory.publicRepositorySpoolAdmission
+            },
             accountEmailXRPC: accountEmailXRPC,
             loginClientIdentityPolicy: loginClientIdentityPolicy
         )
@@ -3503,10 +3506,22 @@ extension SwanCommand {
                 let id = requestID.isEmpty
                     ? "sync-\(current.commitCID.string)"
                     : requestID
-                let importer = RemotePublicRepositoryCARImporter(
-                    client: try InteropXRPCClient(baseURL: baseURL, timeout: requestTimeoutSeconds)
+                // A public CAR import keeps its network spool while SQLite
+                // adopts blocks; blob promotion keeps that response while a
+                // second bounded adoption spool is active. Reserve enough
+                // process/account budget for that deliberate two-spool case.
+                let importSpoolAdmission = try PublicRepositorySpoolAdmission(
+                    maximumGlobalBytes: 2 * 1_024 * 1_024 * 1_024,
+                    maximumPerAccountBytes: 1 * 1_024 * 1_024 * 1_024
                 )
-                let blobPromoter = RemotePublicRepositoryBlobPromoter(client: importer.client)
+                let importer = RemotePublicRepositoryCARImporter(
+                    client: try InteropXRPCClient(baseURL: baseURL, timeout: requestTimeoutSeconds),
+                    spoolAdmission: importSpoolAdmission
+                )
+                let blobPromoter = RemotePublicRepositoryBlobPromoter(
+                    client: importer.client,
+                    spoolAdmission: importSpoolAdmission
+                )
                 let result: PublicRepositoryCARImportArtifact
                 do {
                     let imported: CommittedPublicRepositoryImport
@@ -4068,7 +4083,14 @@ private enum LabLiveSupport {
         guard timeout > 0, timeout <= 120, timeout.isFinite else {
             throw ValidationError("--request-timeout-seconds is invalid")
         }
-        let client = try InteropXRPCClient(baseURL: url, timeout: timeout)
+        let additionalTrustRootFile = ProcessInfo.processInfo.environment[
+            "SWAN_LAB_CA_CERT_FILE"
+        ].map { URL(fileURLWithPath: $0) }
+        let client = try InteropXRPCClient(
+            baseURL: url,
+            timeout: timeout,
+            additionalTrustRootFile: additionalTrustRootFile
+        )
         switch auth.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "none":
             return LiveInteropHost(
@@ -4106,7 +4128,8 @@ private enum LabLiveSupport {
                 issuer: url,
                 clientID: clientIDURL,
                 redirectURI: redirectURL,
-                timeout: timeout
+                timeout: timeout,
+                additionalTrustRootFile: additionalTrustRootFile
             )
             let token = try await oauth.authorizationCode(
                 handle: handle,

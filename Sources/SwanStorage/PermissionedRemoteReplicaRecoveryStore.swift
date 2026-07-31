@@ -80,6 +80,91 @@ public struct PermissionedRemoteReplicaFreshnessWitness:
     }
 }
 
+/// The authenticated source identity used for a remote permissioned-replica
+/// install.  A recovery caller must obtain this value from its authenticated
+/// source session; the durable binding no longer accepts free-form origin or
+/// verifier strings.  The verifier identity is a stable fingerprint of the
+/// exact public key selected for commit-context verification.
+public struct PermissionedRemoteReplicaSourceIdentity:
+    Sendable, Equatable, Hashable
+{
+    public let origin: String
+    public let repositoryDID: String
+    public let verifierIdentity: String
+
+    public init(
+        origin: URL,
+        repositoryDID: String,
+        verifierIdentity: String
+    ) throws {
+        guard let canonicalOrigin = Self.canonicalOrigin(origin),
+              (try? DID(didString: repositoryDID)) != nil,
+              Self.isCanonicalVerifierIdentity(verifierIdentity) else {
+            throw PermissionedRemoteReplicaRecoveryError.invalidBinding
+        }
+        self.origin = canonicalOrigin
+        self.repositoryDID = repositoryDID
+        self.verifierIdentity = verifierIdentity
+    }
+
+    /// Reconstructs the same validated identity from the durable projection.
+    /// Invalid legacy rows fail closed instead of being upgraded into an
+    /// apparently authenticated source.
+    public init(
+        persistedOrigin: String,
+        repositoryDID: String,
+        verifierIdentity: String
+    ) throws {
+        guard let origin = URL(string: persistedOrigin) else {
+            throw PermissionedRemoteReplicaRecoveryError.invalidBinding
+        }
+        try self.init(
+            origin: origin,
+            repositoryDID: repositoryDID,
+            verifierIdentity: verifierIdentity
+        )
+    }
+
+    /// Returns the exact origin form accepted by remote-replica recovery.
+    /// Callers that are about to perform network I/O should run this check
+    /// before opening a request; constructing the full identity later is not
+    /// an adequate preflight because it would validate too late.
+    public static func canonicalOrigin(_ url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased(),
+              !host.isEmpty,
+              url.user == nil,
+              url.password == nil,
+              url.query == nil,
+              url.fragment == nil,
+              url.path.isEmpty || url.path == "/" else {
+            return nil
+        }
+        let loopback = host == "localhost"
+            || host == "127.0.0.1"
+            || host == "::1"
+        guard scheme == "https" || (scheme == "http" && loopback) else {
+            return nil
+        }
+        var components = URLComponents()
+        components.scheme = scheme
+        // URLComponents requires bracketed IPv6 literals when rebuilding an
+        // origin, while URL.host exposes the same value without brackets.
+        components.host = host == "::1" ? "[::1]" : host
+        components.port = url.port
+        return components.url?.absoluteString
+    }
+
+    private static func isCanonicalVerifierIdentity(_ value: String) -> Bool {
+        let prefix = "key-sha256:"
+        guard value.hasPrefix(prefix) else { return false }
+        let digest = value.dropFirst(prefix.count)
+        return digest.count == 64 && digest.allSatisfy { character in
+            character.isHexDigit && character.isASCII
+        }
+    }
+}
+
 public struct PermissionedRemoteReplicaImportBinding:
     Sendable, Equatable
 {
@@ -96,22 +181,17 @@ public struct PermissionedRemoteReplicaImportBinding:
     public init(
         requestID: String,
         requestDigest: Data,
-        sourceOrigin: String,
+        source: PermissionedRemoteReplicaSourceIdentity,
         target: PermissionedRemoteReplicaTarget,
         expectedBase: PermissionedRemoteReplicaHead?,
         freshnessWitness: PermissionedRemoteReplicaFreshnessWitness?,
-        verifierIdentity: String,
         profileID: String,
         limits: SpaceCARRecoveryLimits = .standard
     ) throws {
         guard !requestID.isEmpty, requestID.utf8.count <= 512,
               !requestID.contains("\0"),
               requestDigest.count == 32,
-              !sourceOrigin.isEmpty, sourceOrigin.utf8.count <= 2_048,
-              !sourceOrigin.contains("\0"),
-              !verifierIdentity.isEmpty,
-              verifierIdentity.utf8.count <= 512,
-              !verifierIdentity.contains("\0"),
+              source.repositoryDID == target.repositoryDID,
               !profileID.isEmpty, profileID.utf8.count <= 256,
               !profileID.contains("\0"),
               // Every remote full-CAR install, including first bootstrap, must
@@ -124,11 +204,11 @@ public struct PermissionedRemoteReplicaImportBinding:
         }
         self.requestID = requestID
         self.requestDigest = requestDigest
-        self.sourceOrigin = sourceOrigin
+        self.sourceOrigin = source.origin
         self.target = target
         self.expectedBase = expectedBase
         self.freshnessWitness = freshnessWitness
-        self.verifierIdentity = verifierIdentity
+        self.verifierIdentity = source.verifierIdentity
         self.profileID = profileID
         self.limits = limits
     }

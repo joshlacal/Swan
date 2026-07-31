@@ -52,16 +52,22 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
     let signerProvider: any PublicRepositoryMutationSignerProvider
     let tidAllocator = SwanPermissionedTIDAllocator()
     let blobStore: (any BlobStore)?
+    /// Shared with public CAR reads. Uploads reserve their worst-case spool
+    /// size before `putStreaming` creates an anonymous descriptor, so a
+    /// mutation capability cannot bypass the directory's disk budget.
+    let publicBlobSpoolAdmission: PublicRepositorySpoolAdmission?
 
     public init(
         authorizer: SwanOAuthResourceAuthorizer,
         directory: any PublicRepositoryMutationDirectory,
         signerProvider: any PublicRepositoryMutationSignerProvider,
-        blobStore: (any BlobStore)? = nil
+        blobStore: (any BlobStore)? = nil,
+        publicBlobSpoolAdmission: PublicRepositorySpoolAdmission? = nil
     ) {
         self.authorizer = authorizer
         self.directory = directory
         self.signerProvider = signerProvider
         self.blobStore = blobStore
+        self.publicBlobSpoolAdmission = publicBlobSpoolAdmission
     }
 }

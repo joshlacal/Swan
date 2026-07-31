@@ -706,6 +706,14 @@ public enum SQLiteLayout {
         CREATE TABLE IF NOT EXISTS permissioned_remote_replica_import_results (
             request_id TEXT PRIMARY KEY,
             request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
+            -- This is computed by the storage boundary from the complete
+            -- import binding.  It is intentionally separate from the
+            -- caller-supplied request digest: a low-level caller must not be
+            -- able to replay a request while changing the expected base,
+            -- freshness witness, or resource limits.
+            binding_digest BLOB CHECK(
+                binding_digest IS NULL OR length(binding_digest) = 32
+            ),
             source_origin TEXT NOT NULL,
             receiver_did TEXT NOT NULL,
             space_uri TEXT NOT NULL,
@@ -1462,6 +1470,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let fileBackedBlobLifecycleMigrationVersion = 5
     private static let physicalBlobCASLifecycleMigrationVersion = 6
     private static let spaceNotificationReceiptMigrationVersion = 7
+    private static let permissionedRemoteReplicaResultBindingMigrationVersion = 8
 
     /// A read credential may register notification recipients, but it must
     /// not be able to turn the later deletion fanout into an unbounded
@@ -1795,6 +1804,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migratePhysicalBlobCASLifecycleIfNeeded()
             try await migratePublicRepositoryRequestIntegrityIfNeeded()
             try await migratePublicRepositoryImportProjectionBindingIfNeeded()
+            try await migratePermissionedRemoteReplicaResultBindingIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -1959,6 +1969,39 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 "DELETE FROM public_repository_import_sessions"
             )
         }
+    }
+
+    /// Durable replay results written before the storage boundary owned the
+    /// complete import binding cannot be upgraded safely: the old row did not
+    /// retain the expected-base tuple, freshness witness, or limits. Keep the
+    /// row for audit/export purposes, but leave its binding digest NULL so a
+    /// replay fails closed with `conflictingRequestReuse` instead of being
+    /// treated as an idempotent success.
+    private func migratePermissionedRemoteReplicaResultBindingIfNeeded()
+        async throws
+    {
+        let version = Self.permissionedRemoteReplicaResultBindingMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        try await addAccountColumnIfMissing(
+            table: "permissioned_remote_replica_import_results",
+            column: "binding_digest",
+            definition: "BLOB CHECK(binding_digest IS NULL OR length(binding_digest) = 32)"
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
     }
 
     /// Upgrades rows written before the persistence API owned its state marker

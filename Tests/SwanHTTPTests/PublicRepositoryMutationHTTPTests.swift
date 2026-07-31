@@ -22,6 +22,113 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
     private static let collection = "app.bsky.feed.post"
     private static let mutationPath = "/xrpc/com.atproto.repo.createRecord"
     private static let applyPath = "/xrpc/com.atproto.repo.applyWrites"
+    private static let uploadPath = "/xrpc/com.atproto.repo.uploadBlob"
+
+    func testUploadBlobUsesSharedSpoolAdmissionAndReleasesLease() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.upload")
+        ).test(.router) { client in
+            var headers = try fixture.headers(
+                jti: "upload-blob",
+                method: "POST",
+                path: Self.uploadPath
+            )
+            headers[.contentType] = "application/octet-stream"
+            let response = try await client.execute(
+                uri: Self.uploadPath,
+                method: .post,
+                headers: headers,
+                body: ByteBuffer(data: Data("public-upload".utf8))
+            )
+            XCTAssertEqual(
+                response.status,
+                .ok,
+                String(decoding: response.body.readableBytesView, as: UTF8.self)
+            )
+            let object = try self.jsonObject(response.body)
+            let blob = try XCTUnwrap(object["blob"] as? [String: Any])
+            XCTAssertEqual(blob["mimeType"] as? String, "application/octet-stream")
+            XCTAssertEqual(blob["size"] as? Int, 13)
+            XCTAssertNotNil((blob["ref"] as? [String: Any])?["$link"] as? String)
+        }
+
+        XCTAssertEqual(fixture.publicBlobSpoolAdmission.snapshot.activeLeases, 0)
+        XCTAssertEqual(fixture.publicBlobSpoolAdmission.snapshot.reservedBytes, 0)
+    }
+
+    func testUploadBlobFailsClosedWithoutAdmissionBeforeCreatingSpool() async throws {
+        let fixture = try await makeFixture(includePublicBlobSpoolAdmission: false)
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.upload-closed")
+        ).test(.router) { client in
+            var headers = try fixture.headers(
+                jti: "upload-without-admission",
+                method: "POST",
+                path: Self.uploadPath
+            )
+            headers[.contentType] = "application/octet-stream"
+            let response = try await client.execute(
+                uri: Self.uploadPath,
+                method: .post,
+                headers: headers,
+                body: ByteBuffer(data: Data("must-not-stage".utf8))
+            )
+            XCTAssertEqual(response.status, .serviceUnavailable)
+            XCTAssertEqual(
+                try self.jsonObject(response.body)["error"] as? String,
+                "temporarily_unavailable"
+            )
+        }
+    }
+
+    func testPublicBlobSpoolAdmissionIsAtomicUnderConcurrentReservations() async throws {
+        let maximumBytes = 256 * 1_024 * 1_024
+        let admission = try PublicRepositorySpoolAdmission(
+            maximumGlobalBytes: maximumBytes * 2,
+            maximumPerAccountBytes: maximumBytes * 2
+        )
+        let barrier = UploadAdmissionBarrier(expected: 8)
+        let successes = await withTaskGroup(of: Bool.self, returning: [Bool].self) {
+            group in
+            for _ in 0 ..< 8 {
+                group.addTask {
+                    let lease = admission.reserve(
+                        accountDID: Self.did,
+                        maximumBytes: maximumBytes
+                    )
+                    await barrier.arriveAndWait()
+                    lease?.release()
+                    return lease != nil
+                }
+            }
+            var values: [Bool] = []
+            for await value in group {
+                values.append(value)
+            }
+            return values
+        }
+
+        XCTAssertEqual(successes.filter { $0 }.count, 2)
+        XCTAssertEqual(admission.snapshot.activeLeases, 0)
+        XCTAssertEqual(admission.snapshot.reservedBytes, 0)
+    }
 
     func testExplicitRKeyPutDeleteNoOpAndSwapSemantics() async throws {
         let fixture = try await makeFixture()
@@ -297,7 +404,9 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    private func makeFixture() async throws -> Fixture {
+    private func makeFixture(
+        includePublicBlobSpoolAdmission: Bool = true
+    ) async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "SwanPublicRepositoryMutationHTTPTests-" + UUID().uuidString)
         let control = try await SQLiteControlDatabase(dataDirectory: root)
@@ -329,11 +438,15 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
             )
             let token = try await issueToken(runtime: runtime)
             let directory = TestMutationDirectory(did: Self.did, database: database)
+            let publicBlobSpoolAdmission = try PublicRepositorySpoolAdmission()
             let server = try makeServer(
                 runtime: runtime,
                 control: control,
                 directory: directory,
-                signer: P256PublicRepositoryCommitSigner(privateKey: signingKey)
+                signer: P256PublicRepositoryCommitSigner(privateKey: signingKey),
+                publicBlobSpoolAdmission: includePublicBlobSpoolAdmission
+                    ? publicBlobSpoolAdmission
+                    : nil
             )
             return Fixture(
                 root: root,
@@ -343,7 +456,8 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
                 token: token.token,
                 key: token.key,
                 jwk: token.jwk,
-                runtime: runtime
+                runtime: runtime,
+                publicBlobSpoolAdmission: publicBlobSpoolAdmission
             )
         } catch {
             try? await control.close()
@@ -356,7 +470,8 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         runtime: SwanOAuthRuntime,
         control: SQLiteControlDatabase,
         directory: TestMutationDirectory,
-        signer: any PublicRepositoryCommitSigner
+        signer: any PublicRepositoryCommitSigner,
+        publicBlobSpoolAdmission: PublicRepositorySpoolAdmission?
     ) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
             from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-30.json")
@@ -368,7 +483,8 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
             authenticatedGetSpaceDirectory: NoopSimpleSpaceDirectory(),
             accountControlStore: control,
             publicRepositoryMutationDirectory: directory,
-            publicRepositoryMutationSignerProvider: TestSignerProvider(signer: signer)
+            publicRepositoryMutationSignerProvider: TestSignerProvider(signer: signer),
+            publicBlobSpoolAdmission: publicBlobSpoolAdmission
         )
     }
 
@@ -475,6 +591,7 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         let key: P256.Signing.PrivateKey
         let jwk: OAuthJSONWebKey
         let runtime: SwanOAuthRuntime
+        let publicBlobSpoolAdmission: PublicRepositorySpoolAdmission
 
         func headers(
             jti: String,
@@ -535,6 +652,31 @@ private actor TestMutationDirectory: PublicRepositoryMutationDirectory {
             status: .active,
             store: database
         )
+    }
+}
+
+private actor UploadAdmissionBarrier {
+    private let expected: Int
+    private var arrivals = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(expected: Int) {
+        self.expected = expected
+    }
+
+    func arriveAndWait() async {
+        arrivals += 1
+        guard arrivals < expected else {
+            let pending = waiters
+            waiters.removeAll()
+            for waiter in pending {
+                waiter.resume()
+            }
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
     }
 }
 

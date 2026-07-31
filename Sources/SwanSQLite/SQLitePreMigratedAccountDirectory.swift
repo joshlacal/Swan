@@ -22,7 +22,11 @@ public actor SQLitePreMigratedAccountDirectory:
 {
     private let controlStore: any AccountControlStore
     private let publicIdentityVerifier: (any PublicPLCGenesisVerifying)?
-    private let publicCARSpoolAdmission: PublicRepositorySpoolAdmission
+    /// Shared process-wide/per-account disk admission for every public
+    /// descriptor-backed transfer, including CAR reads and public blob
+    /// uploads.  The value is immutable after bootstrap so HTTP capabilities
+    /// cannot accidentally construct a second, uncoordinated budget.
+    public nonisolated let publicRepositorySpoolAdmission: PublicRepositorySpoolAdmission
     private let dataDirectory: URL
     private var databases: [String: SQLiteAccountDatabase]
     private var publicReadGenerations:
@@ -65,7 +69,7 @@ public actor SQLitePreMigratedAccountDirectory:
         self.dataDirectory = dataDirectory
         self.controlStore = controlStore
         self.publicIdentityVerifier = publicIdentityVerifier
-        self.publicCARSpoolAdmission = publicCARSpoolAdmission
+        self.publicRepositorySpoolAdmission = publicCARSpoolAdmission
         self.databases = databases
         self.publicReadGenerations = publicReadGenerations
     }
@@ -1235,7 +1239,7 @@ public actor SQLitePreMigratedAccountDirectory:
             ))
         }
         let (database, generation) = try activePublicReadContext(account)
-        guard let lease = publicCARSpoolAdmission.reserve(
+        guard let lease = publicRepositorySpoolAdmission.reserve(
             accountDID: account.did,
             maximumBytes: PublicRepositoryLimits.standard.maximumCARBytes
         ) else {
@@ -1729,7 +1733,8 @@ public actor SQLitePreMigratedAccountDirectory:
 }
 
 private actor SQLiteGenerationRefreshingPublicMutationStore:
-    PublicRepositoryMutationStore
+    PublicRepositoryMutationStore,
+    StreamingBlobStore
 {
     let did: String
     let database: SQLiteAccountDatabase
@@ -1792,5 +1797,55 @@ private actor SQLiteGenerationRefreshingPublicMutationStore:
         _ reservation: PublicRepositoryMutationReservation
     ) async throws {
         try await database.abandonPublicRepositoryReservation(reservation)
+    }
+
+    // Public repository mutation targets are deliberately exposed through the
+    // narrow mutation-store protocol above.  The HTTP upload/getBlob paths
+    // need the separate streaming capability as well, but must retain the
+    // generation-refreshing wrapper so a successful mutation is published to
+    // the read directory before the response is returned.  Delegate the
+    // blob surface here rather than handing the raw account database to the
+    // request path (which would bypass that publication boundary).
+    func put(
+        _ data: Data,
+        namespace: BlobNamespace
+    ) async throws -> BlobReference {
+        try await database.put(data, namespace: namespace)
+    }
+
+    func data(for reference: BlobReference) async throws -> Data {
+        try await database.data(for: reference)
+    }
+
+    func publicData(cid: String) async throws -> Data? {
+        try await database.publicData(cid: cid)
+    }
+
+    func remove(_ reference: BlobReference) async throws {
+        try await database.remove(reference)
+    }
+
+    func putStreaming(
+        namespace: BlobNamespace,
+        mimeType: String?,
+        maximumBytes: Int,
+        source: @escaping @Sendable (
+            @escaping (Data) async throws -> Void
+        ) async throws -> Void
+    ) async throws -> BlobReference {
+        try await database.putStreaming(
+            namespace: namespace,
+            mimeType: mimeType,
+            maximumBytes: maximumBytes,
+            source: source
+        )
+    }
+
+    func publicBlob(cid: String) async throws -> PublicBlob? {
+        try await database.publicBlob(cid: cid)
+    }
+
+    func publicBlobExists(cid: String) async throws -> Bool {
+        try await database.publicBlobExists(cid: cid)
     }
 }
