@@ -28,10 +28,14 @@ command="${1:-}"
 subcommand="${2:-}"
 shift 2 || true
 handle=""
+expected_did=""
 while [ "$#" -gt 0 ]; do
     if [ "$1" = '--handle' ] && [ "$#" -ge 2 ]; then
         shift
         handle="$1"
+    elif [ "$1" = '--expected-did' ] && [ "$#" -ge 2 ]; then
+        shift
+        expected_did="$1"
     fi
     shift
 done
@@ -48,8 +52,14 @@ case "${command} ${subcommand}" in
     'account prepare-plc')
         : > "${STUB_PREPARE_MARKER:?}"
         case "$handle" in
-            authority.test) printf '%s\n' '{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"}' ;;
-            member.test) printf '%s\n' '{"did":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"}' ;;
+            authority.test)
+                test "$expected_did" = 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa'
+                printf '%s\n' '{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"}'
+                ;;
+            member.test)
+                test "$expected_did" = 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb'
+                printf '%s\n' '{"did":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"}'
+                ;;
             *) exit 1 ;;
         esac
         ;;

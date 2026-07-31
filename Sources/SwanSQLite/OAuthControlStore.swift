@@ -191,6 +191,12 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
     private static let migrationBusyMaximumDelayNanoseconds: UInt64 = 80_000_000
     private static let oauthCleanupBatchSize = 512
     private static let clientMetadataFreshnessRetention: TimeInterval = 3_600
+    /// Blind password-recovery admission is deliberately durable, so its
+    /// account-free marker table needs an independent global bound. These are
+    /// internal rather than configurable per request: callers must not be able
+    /// to trade the enumeration-resistant write shape for unbounded storage.
+    static let maximumPasswordRecoveryWorkMarkers = 4_096
+    static let passwordRecoveryWorkPurgeBatchSize = 256
 
     let connection: SQLiteConnection
     let connectionGate = ControlSQLiteConnectionGate()

@@ -7,6 +7,7 @@ public struct SwanManagementPLCPrepareInput: Sendable {
     public let handle: String
     public let pdsOrigin: URL
     public let repositoryRevision: String
+    public let expectedDID: String?
     public let plcConfiguration: PLCClientConfiguration
 
     public init(
@@ -14,12 +15,14 @@ public struct SwanManagementPLCPrepareInput: Sendable {
         handle: String,
         pdsOrigin: URL,
         repositoryRevision: String,
+        expectedDID: String? = nil,
         plcConfiguration: PLCClientConfiguration
     ) {
         self.requestID = requestID
         self.handle = handle
         self.pdsOrigin = pdsOrigin
         self.repositoryRevision = repositoryRevision
+        self.expectedDID = expectedDID
         self.plcConfiguration = plcConfiguration
     }
 }
@@ -197,7 +200,8 @@ public actor SwanManagementPLCProvisioningRuntime:
             requestID: input.requestID,
             handle: input.handle,
             pdsOrigin: input.pdsOrigin,
-            repositoryRevision: input.repositoryRevision
+            repositoryRevision: input.repositoryRevision,
+            expectedDID: input.expectedDID
         )
         return .init(identity: identity)
     }

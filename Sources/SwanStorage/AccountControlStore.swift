@@ -1206,7 +1206,9 @@ public protocol AccountControlStore: Sendable {
         _ request: AccountPasswordRecoveryDeliveryRequest
     ) async throws
     /// Claims one due delivery under a bounded lease. Expired leases are
-    /// reclaimable after restart; SMTP happens outside this transaction.
+    /// reclaimable after restart; SMTP happens outside this transaction. Once
+    /// `beginEmailDeliveryAttempt` succeeds, the storage implementation keeps
+    /// the lease alive through its bounded network-attempt window.
     func claimNextEmailDelivery(
         workerID: String,
         now: Date,
@@ -1214,8 +1216,8 @@ public protocol AccountControlStore: Sendable {
     ) async throws -> AccountEmailDeliveryLease?
     /// Establishes the durable pre-network fence for one claimed delivery.
     /// Deletion and this transition serialize in control.sqlite: if this call
-    /// succeeds, deletion must not scrub the row until the SMTP attempt has
-    /// finished; if deletion wins first, this returns false and no network
+    /// succeeds, deletion must not scrub the row until the bounded SMTP attempt
+    /// has finished; if deletion wins first, this returns false and no network
     /// operation may begin.
     func beginEmailDeliveryAttempt(
         deliveryID: AccountEmailDeliveryID,

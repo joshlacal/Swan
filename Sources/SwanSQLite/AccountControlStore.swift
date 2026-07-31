@@ -1,9 +1,17 @@
 import Foundation
 import SQLiteNIO
+import SwanCore
 import SwanStorage
 
 extension SQLiteControlDatabase {
     // MARK: Account control schema
+
+    /// Once a delivery crosses the durable pre-network fence, keep its lease
+    /// alive for the maximum bounded SMTP attempt window. This prevents a
+    /// normal short claim lease from being reclaimed while the network call is
+    /// still in flight; the delivery service must complete or fail within the
+    /// same five-minute bound.
+    static let maximumEmailDeliveryAttemptDuration: TimeInterval = 300
 
     /// Evolves the alpha `accounts` registry in place. Legacy accounts retain
     /// a NULL verifier, which decodes only as `.missing`; migration never
@@ -213,6 +221,7 @@ extension SQLiteControlDatabase {
             ON account_password_recovery_work(expires_at, lookup_digest)
             """
         )
+        try await trimPasswordRecoveryWorkOverflowLocked()
         _ = try await connection.query(
             """
             CREATE TRIGGER IF NOT EXISTS account_email_tokens_email_required_insert
@@ -629,6 +638,38 @@ extension SQLiteControlDatabase {
                     "DELETE FROM account_password_recovery_work WHERE expires_at <= ?",
                     [.integer(created)]
                 )
+                let existingMarker = try await connection.query(
+                    """
+                    SELECT 1
+                    FROM account_password_recovery_work
+                    WHERE lookup_digest = ?
+                    LIMIT 1
+                    """,
+                    [blob(request.lookupDigest)]
+                )
+                guard existingMarker.count <= 1 else {
+                    throw AccountControlStoreError.malformedRecord
+                }
+                if existingMarker.isEmpty {
+                    let countRows = try await connection.query(
+                        "SELECT COUNT(*) AS row_count FROM account_password_recovery_work"
+                    )
+                    guard countRows.count == 1,
+                          case let .integer(rowCount) =
+                              countRows[0].column("row_count"),
+                          rowCount >= 0 else {
+                        throw AccountControlStoreError.malformedRecord
+                    }
+                    guard rowCount < Self.maximumPasswordRecoveryWorkMarkers else {
+                        // The HTTP layer collapses this with all other
+                        // account-dependent recovery outcomes. Rejecting the
+                        // new marker keeps the blind response contract while
+                        // preserving the durable capacity invariant.
+                        throw SwanError.unavailable(
+                            "password recovery work capacity is exhausted"
+                        )
+                    }
+                }
                 _ = try await connection.query(
                     """
                     INSERT INTO account_password_recovery_work(
@@ -776,12 +817,19 @@ extension SQLiteControlDatabase {
             throw AccountControlStoreError.invalidInput
         }
         let timestamp = try controlTimestamp(now)
+        let fenceExpiry = try controlTimestamp(
+            now.addingTimeInterval(Self.maximumEmailDeliveryAttemptDuration)
+        )
         return try await withConnectionGate {
             try await transaction {
                 let rows = try await connection.query(
                     """
                     UPDATE account_email_delivery_outbox
-                    SET send_started_at = ?
+                    SET send_started_at = ?,
+                        lease_expires_at = CASE
+                            WHEN lease_expires_at < ? THEN ?
+                            ELSE lease_expires_at
+                        END
                     WHERE delivery_id = ?
                       AND state = 'leased'
                       AND lease_owner = ?
@@ -804,7 +852,8 @@ extension SQLiteControlDatabase {
                     RETURNING delivery_id
                     """,
                     [
-                        .integer(timestamp), .text(deliveryID.rawValue),
+                        .integer(timestamp), .integer(fenceExpiry),
+                        .integer(fenceExpiry), .text(deliveryID.rawValue),
                         .text(workerID), .integer(timestamp), .integer(timestamp),
                     ]
                 )
@@ -1824,8 +1873,48 @@ extension SQLiteControlDatabase {
             [.integer(timestamp)]
         )
         _ = try await connection.query(
-            "DELETE FROM account_password_recovery_work WHERE expires_at <= ?",
-            [.integer(timestamp)]
+            """
+            DELETE FROM account_password_recovery_work
+            WHERE lookup_digest IN (
+                SELECT lookup_digest
+                FROM account_password_recovery_work
+                WHERE expires_at <= ?
+                ORDER BY expires_at, created_at, lookup_digest
+                LIMIT ?
+            )
+            """,
+            [
+                .integer(timestamp),
+                .integer(Self.passwordRecoveryWorkPurgeBatchSize),
+            ]
+        )
+    }
+
+    /// Keep a legacy database within the same bound enforced for new
+    /// requests. The migration runs inside BEGIN IMMEDIATE, so no writer can
+    /// observe an over-capacity state after this normalization completes.
+    private func trimPasswordRecoveryWorkOverflowLocked() async throws {
+        let countRows = try await connection.query(
+            "SELECT COUNT(*) AS row_count FROM account_password_recovery_work"
+        )
+        guard countRows.count == 1,
+              case let .integer(rowCount) = countRows[0].column("row_count"),
+              rowCount >= 0 else {
+            throw AccountControlStoreError.malformedRecord
+        }
+        let overflow = rowCount - Self.maximumPasswordRecoveryWorkMarkers
+        guard overflow > 0 else { return }
+        _ = try await connection.query(
+            """
+            DELETE FROM account_password_recovery_work
+            WHERE lookup_digest IN (
+                SELECT lookup_digest
+                FROM account_password_recovery_work
+                ORDER BY expires_at, created_at, lookup_digest
+                LIMIT ?
+            )
+            """,
+            [.integer(overflow)]
         )
     }
 

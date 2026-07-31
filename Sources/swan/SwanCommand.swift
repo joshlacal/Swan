@@ -2377,6 +2377,9 @@ extension SwanCommand {
             @Option(name: .long, help: "Valid repository-v3 revision for the empty public genesis")
             var repositoryRevision: String
 
+            @Option(name: .long, help: "Owner-supplied DID that must match the staged PLC identity before any PLC submission")
+            var expectedDID: String?
+
             @Option(name: .long, help: "PLC directory origin")
             var plcOrigin: String = PLCClientConfiguration.defaultProductionOrigin.absoluteString
 
@@ -2511,6 +2514,7 @@ extension SwanCommand {
                         handle: handle,
                         pdsOrigin: preparedConfiguration.pdsOrigin,
                         repositoryRevision: repositoryRevision,
+                        expectedDID: expectedDID,
                         plcConfiguration: preparedConfiguration.plc
                     ))
                     try await createdRuntime.close()

@@ -81,6 +81,7 @@ public actor PLCAccountPreparationService {
         handle rawHandle: String,
         pdsOrigin rawPDSOrigin: URL,
         repositoryRevision: String,
+        expectedDID: String? = nil,
         now: Date = Date()
     ) async throws -> PreparedPLCAccountIdentity {
         let handle: String
@@ -94,6 +95,11 @@ public actor PLCAccountPreparationService {
             }
             handle = try AccountIdentifiers.canonicalHandle(rawHandle)
             try PublicRepositoryGenesisCodec.validateRevision(repositoryRevision)
+            if let expectedDID {
+                guard AccountControlIdentifiers.isDID(expectedDID) else {
+                    throw PLCAccountPreparationError.conflict
+                }
+            }
         } catch {
             throw PLCAccountPreparationError.conflict
         }
@@ -125,9 +131,19 @@ public actor PLCAccountPreparationService {
                 pdsOrigin: rawPDSOrigin,
                 repositoryRevision: repositoryRevision
             )
+            if let expectedDID, staged.did != expectedDID {
+                // The key store is the first component which can derive the
+                // PLC DID. Reject an owner-supplied mismatch before reserving
+                // an intent, opening an account database, or touching the PLC.
+                throw PLCAccountPreparationError.remoteMismatch
+            }
             try await hooks.afterKeysStaged?(staged)
             intent = try await reserveInitialIntent(staged)
             stagedIdentity = staged
+        }
+
+        if let expectedDID, intent.did != expectedDID {
+            throw PLCAccountPreparationError.remoteMismatch
         }
 
         try await hooks.afterIntentReserved?()

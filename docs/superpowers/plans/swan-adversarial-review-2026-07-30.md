@@ -344,3 +344,44 @@ explicitly open security/availability items above.
   checksummed disposable overlay, not an upstream replacement.
 - Permissioned data remains access-controlled rather than end-to-end
   encrypted; this review does not change that declared trust model.
+
+## Adversarial remediation addendum: 2026-07-31
+
+The Luna-era follow-up was rechecked against the current working copy rather
+than relying on the historical green-suite receipts above.
+
+- **ADV-50 recovery-marker admission:** the account-free password-recovery
+  marker table now has a non-configurable per-control-database ceiling of
+  4,096 rows. Migration trims legacy overflow; enqueue rejects a new digest
+  once the ceiling is full; expiry cleanup is batch-limited. The regression
+  fills the ceiling with non-expired markers, proves a new digest fails closed,
+  and proves an existing digest can still refresh without increasing the
+  count. Control timestamps are seeded in the database's microsecond unit.
+- **ADV-55 email deletion/send race:** crossing the durable SMTP fence now
+  extends a short claim lease through the bounded five-minute network-attempt
+  contract. Deletion and reclaim remain blocked throughout that window, and a
+  stale worker can acknowledge only its original delivery. The focused
+  SQLite selection passed the short-lease, deletion-before-fence,
+  deletion-after-fence, expired-lease, and restart/retry cases.
+- **ADV-63/65 bootstrap identity binding:** an owner-supplied expected DID is
+  validated against the staged identity and any existing preparation intent
+  before intent reservation, account-store activation, or PLC submission. The
+  CLI and local bootstrap script pass this value, and a valid-but-wrong DID
+  regression proves PLC submission count remains zero. The fail-closed lookup
+  shell checks and interop static/effective checks pass.
+- **Public-read hang recheck:** with
+  `SWIFTPM_MAX_CONCURRENT_OPERATIONS=1`, a unique scratch path, and
+  `--jobs 1`, the formerly hanging `PublicRepositoryReadHTTPTests` filter
+  completed 12/12 in 0.190 seconds after its clean dependency build. The
+  opt-in `SWAN_RUN_256MIB_PUBLIC_GET_REPO=1` production-directory RSS test
+  also passed in 5.830 seconds. This identifies the earlier symptom as
+  SwiftPM/Xcode-beta dependency/build contention, not an HTTP route deadlock.
+
+These remediations close the reviewed local boundaries, but they do not close
+the alpha. The following remain explicitly unproven and must not be described
+as complete: value-bearing TypeScript incremental sync and compaction-gap
+full-CAR recovery, corrupted-operation/CAR rejection with durable last-good
+state across hosts, a reproducible remote delegation-key provisioning path,
+the cross-implementation OAuth/browser and lifecycle matrix, and clean-cache
+Linux acceptance. The pinned TypeScript cache and its known unsupported
+value-bearing behavior remain unchanged.

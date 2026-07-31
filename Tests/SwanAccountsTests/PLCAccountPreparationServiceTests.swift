@@ -139,6 +139,39 @@ final class PLCAccountPreparationServiceTests: XCTestCase {
         try await fixture.close()
     }
 
+    func testExpectedDIDMismatchFailsBeforeIntentReservationOrPLCSubmission() async throws {
+        let fixture = try await PreparationFixture()
+        defer { fixture.removeFiles() }
+
+        await XCTAssertThrowsErrorAsync(
+            try await fixture.service().prepare(
+                requestID: "request-expected-did",
+                handle: "expected-did.example.com",
+                pdsOrigin: URL(string: "https://pds.example.com")!,
+                repositoryRevision: "3lqby3xuo4k2m",
+                expectedDID: "did:plc:abcdefghijklmnopqrstuvwx"
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? PLCAccountPreparationError,
+                .remoteMismatch
+            )
+        }
+        let intent = try await fixture.control
+            .plcAccountPreparationIntent(requestID: "request-expected-did")
+        XCTAssertNil(intent)
+        let submissionCount = await fixture.plc.submitCount()
+        XCTAssertEqual(submissionCount, 0)
+        let staged = try await fixture.keyStore.stagedPLCAccountIdentity(
+            requestID: "request-expected-did",
+            canonicalHandle: "expected-did.example.com",
+            pdsOrigin: URL(string: "https://pds.example.com")!,
+            repositoryRevision: "3lqby3xuo4k2m"
+        )
+        XCTAssertNotNil(staged)
+        try await fixture.close()
+    }
+
     func testRecoveryAtEveryDurableStageAndAcceptedBeforeLocalStage() async throws {
         for failure in PreparationFailure.allCases {
             let fixture = try await PreparationFixture()

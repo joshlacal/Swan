@@ -54,6 +54,7 @@ ensure_account() {
     "${SWAN_BIN}" account prepare-plc \
         --data-directory "${DATA_DIRECTORY}" \
         --handle "${handle}" \
+        --expected-did "${expected_did}" \
         --request-id "${request_id}" \
         --pds-origin "https://swan.test" \
         --repository-revision "${revision}" \

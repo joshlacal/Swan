@@ -1,6 +1,7 @@
 import Foundation
 import SQLiteNIO
 @testable import SwanSQLite
+import SwanCore
 import SwanStorage
 import XCTest
 
@@ -132,6 +133,79 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
         XCTAssertEqual(lease.did, did)
         XCTAssertEqual(lease.email, email)
         XCTAssertEqual(lease.purpose, .passwordRecovery)
+    }
+
+    func testPasswordRecoveryMarkersRespectGlobalCapacity() async throws {
+        let fixture = try await Fixture(testCase: self)
+        addTeardownBlock {
+            try? await fixture.database.close()
+            fixture.cleanup()
+        }
+        let now = fixture.now
+        let capacity = SQLiteControlDatabase.maximumPasswordRecoveryWorkMarkers
+
+        let seedValues = (0 ..< capacity).map { value in
+            let digestHex = String(repeating: "00", count: 28)
+                + String(format: "%08x", value)
+            return "(X'"
+                + digestHex
+                + "', 1750000601000000, "
+                + String(1750000001000000 + value)
+                + ")"
+        }.joined(separator: ",")
+        _ = try await fixture.database.connection.query(
+            "INSERT INTO account_password_recovery_work(lookup_digest, expires_at, created_at) VALUES "
+                + seedValues
+        )
+        let seeded = try await fixture.database.connection.query(
+            "SELECT COUNT(*) AS row_count FROM account_password_recovery_work"
+        )
+        XCTAssertEqual(seeded.first?.column("row_count")?.integer, capacity)
+
+        let overflowRequest = try passwordRecoveryRequest(
+            email: AccountEmailAddress("overflow@example.com"),
+            deliveryByte: 0x41,
+            proofByte: 0x51,
+            lookupDigest: Data(repeating: 0xff, count: 32),
+            now: now.addingTimeInterval(1)
+        )
+        do {
+            try await fixture.database.enqueuePasswordRecoveryDelivery(
+                overflowRequest
+            )
+            XCTFail("expected global recovery marker capacity to reject a new digest")
+        } catch let error as SwanError {
+            guard case .unavailable = error else {
+                return XCTFail("unexpected Swan error: \(error)")
+            }
+        }
+
+        let afterReject = try await fixture.database.connection.query(
+            "SELECT COUNT(*) AS row_count FROM account_password_recovery_work"
+        )
+        XCTAssertEqual(
+            afterReject.first?.column("row_count")?.integer,
+            capacity
+        )
+
+        let existingDigest = Data(repeating: 0, count: 32)
+        let existingRequest = try passwordRecoveryRequest(
+            email: AccountEmailAddress("existing-marker@example.com"),
+            deliveryByte: 0x42,
+            proofByte: 0x52,
+            lookupDigest: existingDigest,
+            now: now.addingTimeInterval(2)
+        )
+        try await fixture.database.enqueuePasswordRecoveryDelivery(
+            existingRequest
+        )
+        let afterRefresh = try await fixture.database.connection.query(
+            "SELECT COUNT(*) AS row_count FROM account_password_recovery_work"
+        )
+        XCTAssertEqual(
+            afterRefresh.first?.column("row_count")?.integer,
+            capacity
+        )
     }
 
     func testAccountRevisionRemainsMonotonicWhenWallClockMovesBackward() async throws {
@@ -290,6 +364,56 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
             declaration: .init(),
             now: now.addingTimeInterval(4)
         )
+    }
+
+    func testNetworkFenceExtendsShortClaimLeaseUntilBoundedAttemptWindow() async throws {
+        let fixture = try await Fixture(testCase: self)
+        addTeardownBlock { try? await fixture.database.close(); fixture.cleanup() }
+        let now = fixture.now
+        _ = try await fixture.database.createAccount(try registration())
+        try await fixture.database.associateEmail(did: did, email: email, now: now)
+        let request = try deliveryRequest(
+            purpose: .verifyEmail,
+            deliveryByte: 0x1c,
+            proofByte: 0x2c,
+            now: now
+        )
+        _ = try await fixture.database.enqueueEmailProofDelivery(request)
+        let claimed = try await fixture.database.claimNextEmailDelivery(
+            workerID: "email-worker",
+            now: now,
+            leaseDuration: 1
+        )
+        let lease = try XCTUnwrap(claimed)
+
+        let fenced = try await fixture.database.beginEmailDeliveryAttempt(
+            deliveryID: lease.deliveryID,
+            workerID: "email-worker",
+            now: now.addingTimeInterval(0.5)
+        )
+        XCTAssertTrue(fenced)
+        do {
+            _ = try await fixture.database.beginDeletion(
+                did: did,
+                declaration: .init(),
+                now: now.addingTimeInterval(2)
+            )
+            XCTFail("deletion crossed a live SMTP fence after the claim lease expired")
+        } catch let error as AccountDeletionStoreError {
+            XCTAssertEqual(error, .conflict)
+        }
+        let replacement = try await fixture.database.claimNextEmailDelivery(
+            workerID: "replacement-worker",
+            now: now.addingTimeInterval(2),
+            leaseDuration: 1
+        )
+        XCTAssertNil(replacement)
+        let acknowledged = try await fixture.database.acknowledgeEmailDelivery(
+            deliveryID: lease.deliveryID,
+            workerID: "email-worker",
+            now: now.addingTimeInterval(3)
+        )
+        XCTAssertTrue(acknowledged)
     }
 
     func testDeletionWinsBeforeEmailWorkerFenceAndWorkerCannotSend() async throws {
@@ -483,6 +607,7 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
         email: AccountEmailAddress,
         deliveryByte: UInt8,
         proofByte: UInt8,
+        lookupDigest: Data? = nil,
         now: Date,
         lifetime: TimeInterval = 600
     ) throws -> AccountPasswordRecoveryDeliveryRequest {
@@ -492,6 +617,7 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
             ),
             email: email,
             proofDigest: Data(repeating: proofByte, count: 32),
+            lookupDigest: lookupDigest,
             expiresAt: now.addingTimeInterval(lifetime),
             now: now
         )
