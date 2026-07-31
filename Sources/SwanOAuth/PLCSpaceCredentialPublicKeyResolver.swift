@@ -536,13 +536,19 @@ public actor PLCSpaceCredentialPublicKeyResolver:
             throw SwanError.unavailable("PLC credential-key resolution capacity exhausted")
         }
 
+        // Positive entries are a value-TTL cache, not the durable continuity
+        // anchor. Once an entry expires it must release an issuer-capacity
+        // slot; otherwise a bounded burst of distinct request issuers would
+        // permanently deny every later issuer until process restart.
+        let hadPositiveCacheEntry = cache[issuer] != nil
+        pruneExpiredCacheEntries(now: now)
         pruneExpiredNegativeEntries(now: now)
 
         // Refreshes for a previously authenticated issuer do not consume the
         // new-issuer budget. An untrusted stream of distinct space authorities
         // therefore has a hard outbound-request ceiling as well as a
         // concurrency ceiling.
-        guard cache[issuer] == nil else { return }
+        guard hadPositiveCacheEntry || cache[issuer] == nil else { return }
         let retainedIssuers = Set(cache.keys)
             .union(negativeCache.keys)
             .union(inFlight.issuers)
@@ -553,6 +559,7 @@ public actor PLCSpaceCredentialPublicKeyResolver:
             // continuity store and are not evicted with cached document data.
             throw SwanError.unavailable("PLC credential-key issuer capacity exhausted")
         }
+        guard !hadPositiveCacheEntry else { return }
         if let startedAt = newIssuerWindowStartedAt {
             if now < startedAt ||
                 now - startedAt >= Self.oneMinuteNanoseconds {
@@ -587,6 +594,15 @@ public actor PLCSpaceCredentialPublicKeyResolver:
         }
         for issuer in expired {
             negativeCache.removeValue(forKey: issuer)
+        }
+    }
+
+    private func pruneExpiredCacheEntries(now: UInt64) {
+        let expired = cache.compactMap { issuer, entry in
+            entry.expiresAt <= now ? issuer : nil
+        }
+        for issuer in expired {
+            cache.removeValue(forKey: issuer)
         }
     }
 

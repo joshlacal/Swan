@@ -44,6 +44,16 @@ public enum SpaceCredentialPublicKeyResolutionError:
     case unavailable
 }
 
+/// Opaque terminal failure for a locally managed delegation issuer which was
+/// found but cannot currently authorize verification. A managed account must
+/// never fall through to an operator pin or remote PLC key when its lifecycle,
+/// generation metadata, or public key projection is unavailable.
+public enum SpaceDelegationPublicKeyResolutionError:
+    Error, Sendable, Equatable
+{
+    case unavailable
+}
+
 /// Resolves the public material for a credential already inspected for its
 /// exact type and accepted dedicated-or-fallback key ID. When used as the
 /// authoritative local source in a composite, `nil` has the narrow meaning
@@ -331,18 +341,74 @@ public struct LocalAccountSpaceDelegationPublicKeyResolver:
         for issuer: String,
         keyID: String
     ) async throws -> PermissionedDataJWTVerificationKey? {
-        guard keyID == PermissionedDataJWT.delegationKeyID,
-              let account = try await accounts.account(did: issuer),
-              account.status.authorizesAccount,
-              let references = try await accounts.keyReferences(did: issuer),
-              let encoded = try await publicKeyStore.publicKey(for: references.signing) else {
-            return nil
-        }
+        let account: AccountControlAccount
         do {
-            return .p256(try P256.Signing.PublicKey(x963Representation: encoded))
+            guard let managed = try await accounts.account(did: issuer) else {
+                // Only a proven absence from the local account directory may
+                // fall through to an operator pin or remote PLC resolver.
+                return nil
+            }
+            account = managed
         } catch {
-            throw SwanError.unavailable("delegation verification key is unavailable")
+            throw SpaceDelegationPublicKeyResolutionError.unavailable
         }
+
+        guard account.status.authorizesAccount,
+              keyID == PermissionedDataJWT.delegationKeyID,
+              let expectedSigning = account.signingKey,
+              let expectedRotation = account.rotationKey,
+              expectedSigning.generation == expectedRotation.generation else {
+            throw SpaceDelegationPublicKeyResolutionError.unavailable
+        }
+
+        let references: (signing: AccountKeyReference, rotation: AccountKeyReference)
+        do {
+            guard let current = try await accounts.keyReferences(did: issuer),
+                  current.signing.generation == expectedSigning.generation,
+                  current.rotation.generation == expectedRotation.generation else {
+                throw SpaceDelegationPublicKeyResolutionError.unavailable
+            }
+            references = current
+        } catch {
+            throw SpaceDelegationPublicKeyResolutionError.unavailable
+        }
+
+        let encoded: Data
+        do {
+            guard let current = try await publicKeyStore.publicKey(
+                for: references.signing
+            ) else {
+                throw SpaceDelegationPublicKeyResolutionError.unavailable
+            }
+            encoded = current
+        } catch {
+            throw SpaceDelegationPublicKeyResolutionError.unavailable
+        }
+
+        let verificationKey: PermissionedDataJWTVerificationKey
+        do {
+            verificationKey = .p256(
+                try P256.Signing.PublicKey(x963Representation: encoded)
+            )
+        } catch {
+            throw SpaceDelegationPublicKeyResolutionError.unavailable
+        }
+
+        // The directory does not currently expose one atomic account/key
+        // projection. Re-read the complete account generation and lifecycle
+        // after the external metadata read, and treat any intervening change
+        // as a terminal local negative. A caller may retry against the new
+        // generation; it must never verify through an old pin or remote key.
+        do {
+            guard let currentAccount = try await accounts.account(did: issuer),
+                  currentAccount == account,
+                  currentAccount.status.authorizesAccount else {
+                throw SpaceDelegationPublicKeyResolutionError.unavailable
+            }
+        } catch {
+            throw SpaceDelegationPublicKeyResolutionError.unavailable
+        }
+        return verificationKey
     }
 }
 

@@ -71,6 +71,198 @@ final class LocalCredentialAuthorityFailClosedTests: XCTestCase {
         }
     }
 
+    func testDeactivatedManagedDelegationIssuerDoesNotReachFallbacks() async throws {
+        try await withManagedIssuerFixture { fixture in
+            _ = try await fixture.accounts.transitionStatus(
+                did: fixture.did,
+                to: .deactivated,
+                now: createdAt.addingTimeInterval(1)
+            )
+            try await assertManagedDelegationIssuerDoesNotReachFallbacks(fixture)
+        }
+    }
+
+    func testDeletedManagedDelegationIssuerDoesNotReachFallbacks() async throws {
+        try await withManagedIssuerFixture { fixture in
+            _ = try await fixture.control.beginDeletion(
+                did: fixture.did,
+                declaration: AccountLifecycleDeclaration(
+                    tombstone: try AccountTombstoneMetadata(
+                        declaredAt: createdAt.addingTimeInterval(1),
+                        reason: "delegation-resolver-test"
+                    )
+                ),
+                now: createdAt.addingTimeInterval(1)
+            )
+            try await assertManagedDelegationIssuerDoesNotReachFallbacks(fixture)
+        }
+    }
+
+    func testManagedDelegationIssuerWithUnsupportedKeyIDDoesNotReachFallbacks() async throws {
+        try await withManagedIssuerFixture { fixture in
+            let localKeys = GenerationPublicKeyStore(keys: [
+                1: fixture.initialKey.publicKey.x963Representation,
+            ])
+            let remote = DelegationResolverProbe(key: .p256(fixture.initialKey.publicKey))
+            let resolver = try await CompositeSpaceDelegationPublicKeyResolver(
+                local: LocalAccountSpaceDelegationPublicKeyResolver(
+                    accounts: fixture.accounts,
+                    publicKeyStore: localKeys
+                ),
+                remote: remote,
+                pinned: []
+            )
+
+            await assertManagedDelegationUnavailable {
+                _ = try await resolver.publicKey(
+                    for: fixture.did,
+                    keyID: "#retired-delegation-key"
+                )
+            }
+            let remoteCalls = await remote.callCount()
+            let keyReads = await localKeys.readCount()
+            XCTAssertEqual(remoteCalls, 0)
+            XCTAssertEqual(keyReads, 0)
+        }
+    }
+
+    func testManagedDelegationIssuerWithMissingPublicKeyDoesNotReachFallbacks() async throws {
+        try await withManagedIssuerFixture { fixture in
+            let localKeys = GenerationPublicKeyStore(keys: [:])
+            let remote = DelegationResolverProbe(key: .p256(fixture.initialKey.publicKey))
+            let resolver = try await CompositeSpaceDelegationPublicKeyResolver(
+                local: LocalAccountSpaceDelegationPublicKeyResolver(
+                    accounts: fixture.accounts,
+                    publicKeyStore: localKeys
+                ),
+                remote: remote,
+                pinned: []
+            )
+
+            await assertManagedDelegationUnavailable {
+                _ = try await resolver.publicKey(
+                    for: fixture.did,
+                    keyID: PermissionedDataJWT.delegationKeyID
+                )
+            }
+            let remoteCalls = await remote.callCount()
+            let keyReads = await localKeys.readCount()
+            XCTAssertEqual(remoteCalls, 0)
+            XCTAssertEqual(keyReads, 1)
+        }
+    }
+
+    func testManagedDelegationIssuerWithCorruptPublicKeyDoesNotReachFallbacks() async throws {
+        try await withManagedIssuerFixture { fixture in
+            let localKeys = GenerationPublicKeyStore(keys: [1: Data([0x04, 0x01])])
+            let remote = DelegationResolverProbe(key: .p256(fixture.initialKey.publicKey))
+            let resolver = try await CompositeSpaceDelegationPublicKeyResolver(
+                local: LocalAccountSpaceDelegationPublicKeyResolver(
+                    accounts: fixture.accounts,
+                    publicKeyStore: localKeys
+                ),
+                remote: remote,
+                pinned: []
+            )
+
+            await assertManagedDelegationUnavailable {
+                _ = try await resolver.publicKey(
+                    for: fixture.did,
+                    keyID: PermissionedDataJWT.delegationKeyID
+                )
+            }
+            let remoteCalls = await remote.callCount()
+            let keyReads = await localKeys.readCount()
+            XCTAssertEqual(remoteCalls, 0)
+            XCTAssertEqual(keyReads, 1)
+        }
+    }
+
+    func testDelegationLifecycleChangeDuringKeyReadDoesNotReachFallbacks() async throws {
+        try await withManagedIssuerFixture { fixture in
+            let localKeys = LifecycleFlippingPublicKeyStore(
+                accounts: fixture.accounts,
+                did: fixture.did,
+                key: fixture.initialKey.publicKey.x963Representation,
+                transitionAt: createdAt.addingTimeInterval(2)
+            )
+            let remote = DelegationResolverProbe(key: .p256(fixture.initialKey.publicKey))
+            let resolver = try await CompositeSpaceDelegationPublicKeyResolver(
+                local: LocalAccountSpaceDelegationPublicKeyResolver(
+                    accounts: fixture.accounts,
+                    publicKeyStore: localKeys
+                ),
+                remote: remote,
+                pinned: []
+            )
+
+            await assertManagedDelegationUnavailable {
+                _ = try await resolver.publicKey(
+                    for: fixture.did,
+                    keyID: PermissionedDataJWT.delegationKeyID
+                )
+            }
+            let remoteCalls = await remote.callCount()
+            XCTAssertEqual(remoteCalls, 0)
+        }
+    }
+
+    func testUnknownDelegationIssuerFallsThroughToConfiguredRemoteResolver() async throws {
+        try await withManagedIssuerFixture { fixture in
+            let expected = P256.Signing.PrivateKey()
+            let remote = DelegationResolverProbe(key: .p256(expected.publicKey))
+            let resolver = try await CompositeSpaceDelegationPublicKeyResolver(
+                local: LocalAccountSpaceDelegationPublicKeyResolver(
+                    accounts: fixture.accounts,
+                    publicKeyStore: GenerationPublicKeyStore(keys: [
+                        1: fixture.initialKey.publicKey.x963Representation,
+                    ])
+                ),
+                remote: remote,
+                pinned: []
+            )
+
+            let resolved = try await resolver.publicKey(
+                for: unknownDID,
+                keyID: PermissionedDataJWT.delegationKeyID
+            )
+            XCTAssertEqual(
+                resolved?.deterministicIdentity,
+                PermissionedDataJWTVerificationKey.p256(expected.publicKey)
+                    .deterministicIdentity
+            )
+            let remoteCalls = await remote.callCount()
+            XCTAssertEqual(remoteCalls, 1)
+        }
+    }
+
+    func testStartupDelegationPinPreflightRejectsDeactivatedManagedIssuer() async throws {
+        try await withManagedIssuerFixture { fixture in
+            _ = try await fixture.accounts.transitionStatus(
+                did: fixture.did,
+                to: .deactivated,
+                now: createdAt.addingTimeInterval(1)
+            )
+            await assertManagedDelegationUnavailable {
+                _ = try await CompositeSpaceDelegationPublicKeyResolver(
+                    local: LocalAccountSpaceDelegationPublicKeyResolver(
+                        accounts: fixture.accounts,
+                        publicKeyStore: GenerationPublicKeyStore(keys: [
+                            1: fixture.initialKey.publicKey.x963Representation,
+                        ])
+                    ),
+                    pinned: [
+                        try .init(
+                            issuer: fixture.did,
+                            generation: 1,
+                            publicKey: fixture.initialKey.publicKey
+                        ),
+                    ]
+                )
+            }
+        }
+    }
+
     func testManagedIssuerWithMissingPublicKeyDoesNotReachFallbacks() async throws {
         try await withManagedIssuerFixture { fixture in
             let localKeys = GenerationPublicKeyStore(keys: [:])
@@ -402,6 +594,34 @@ final class LocalCredentialAuthorityFailClosedTests: XCTestCase {
         XCTAssertEqual(keyReads, 0)
     }
 
+    private func assertManagedDelegationIssuerDoesNotReachFallbacks(
+        _ fixture: ManagedIssuerFixture
+    ) async throws {
+        let localKeys = GenerationPublicKeyStore(keys: [
+            1: fixture.initialKey.publicKey.x963Representation,
+        ])
+        let remote = DelegationResolverProbe(key: .p256(fixture.initialKey.publicKey))
+        let resolver = try await CompositeSpaceDelegationPublicKeyResolver(
+            local: LocalAccountSpaceDelegationPublicKeyResolver(
+                accounts: fixture.accounts,
+                publicKeyStore: localKeys
+            ),
+            remote: remote,
+            pinned: []
+        )
+
+        await assertManagedDelegationUnavailable {
+            _ = try await resolver.publicKey(
+                for: fixture.did,
+                keyID: PermissionedDataJWT.delegationKeyID
+            )
+        }
+        let remoteCalls = await remote.callCount()
+        let keyReads = await localKeys.readCount()
+        XCTAssertEqual(remoteCalls, 0)
+        XCTAssertEqual(keyReads, 0)
+    }
+
     private func withManagedIssuerFixture<T>(
         _ body: (ManagedIssuerFixture) async throws -> T
     ) async throws -> T {
@@ -537,6 +757,27 @@ private actor ResolverProbe: SpaceCredentialPublicKeyResolver {
     }
 }
 
+private actor DelegationResolverProbe: SpaceDelegationPublicKeyResolver {
+    private let key: PermissionedDataJWTVerificationKey?
+    private var calls = 0
+
+    init(key: PermissionedDataJWTVerificationKey?) {
+        self.key = key
+    }
+
+    func publicKey(
+        for _: String,
+        keyID _: String
+    ) -> PermissionedDataJWTVerificationKey? {
+        calls += 1
+        return key
+    }
+
+    func callCount() -> Int {
+        calls
+    }
+}
+
 private func assertManagedAuthorityUnavailable<T>(
     _ expression: () async throws -> T,
     file: StaticString = #filePath,
@@ -550,6 +791,25 @@ private func assertManagedAuthorityUnavailable<T>(
     } catch {
         XCTFail(
             "expected opaque credential-key resolution error, got \(error)",
+            file: file,
+            line: line
+        )
+    }
+}
+
+private func assertManagedDelegationUnavailable<T>(
+    _ expression: () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("expected managed delegation resolution to fail closed", file: file, line: line)
+    } catch let error as SpaceDelegationPublicKeyResolutionError {
+        XCTAssertEqual(error, .unavailable, file: file, line: line)
+    } catch {
+        XCTFail(
+            "expected opaque delegation-key resolution error, got \(error)",
             file: file,
             line: line
         )

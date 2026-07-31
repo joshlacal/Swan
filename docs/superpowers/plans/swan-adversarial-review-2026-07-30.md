@@ -121,8 +121,11 @@ overstated several gates. The most important adversarial findings were:
 | ADV-61 | P2 | The clean-cache acceptance runner did not pin the CLI subprocess executable for the root checkout. Its child tests clear their environment, so an old `.build/debug/swan` could create false failures or accidentally exercise stale profile behavior. | Remediated in `Scripts/run-clean-cache-acceptance.sh`: every run builds `swan` in the isolated scratch tree and exports `SWAN_TEST_EXECUTABLE`; the fresh macOS clean-cache gate passed 858 XCTest cases, 8 explicit skips, and zero failures. |
 | ADV-62 | P1 | The live OAuth client used `URLComponents.queryItems` for the authorization redirect. Foundation leaves `?` and `&` from a nested `client_id` metadata URL unescaped, so Swan saw a truncated client binding and returned an opaque authorization error before the login form. The Compose Caddy bridge also deleted the replacement `X-Swan-Client-IP` after setting it, so browser login POSTs failed with a misleading missing-CSRF error. | Remediated in source with RFC 3986 component encoding and a regression test that round-trips the nested localhost metadata URL. The Caddy rule now overwrites the caller header from `{http.request.remote.host}` without a delete-after-set or append operation; a disposable echo upstream proved forged input is replaced. Direct and proxied PAR/login GETs now reach the server. A fresh cross-host semantic run remains blocked at the expected unpinned TypeScript delegation-key boundary. |
 | ADV-63 | P1 | Compose bootstrap treated an existing account as valid when its handle matched, without checking the owner-only DID identity. Reusing a persistent `swan-data` volume with a different secret directory therefore let the OAuth subject diverge from the configured space authority and produced misleading `SpaceNotFound`/401 failures. | Remediated in `bootstrap-local-space.sh`: existing accounts now fail closed unless the durable DID exactly matches `authority.did`/`member.did`; static verifier coverage requires the check. A reused mismatched volume now exits before Swan starts. Fresh-volume provisioning still needs an explicit identity-source workflow because PLC genesis creates a DID rather than accepting one as an input. |
-| ADV-64 | P1 | The checked-in notification configuration has no pinned TypeScript user delegation key. The real cross-host run can obtain a delegation token from the pinned PDS, but Swan rejects `getSpaceCredential` with HTTP 401 because the local resolver intentionally refuses unpinned remote verification. | Retained as an explicit interop gate: derive the member DID's `#atproto` verification key from the lab PLC, add it only as an operator-supplied disposable pin, and rerun the value-bearing member-read/full-CAR matrix. Do not weaken the resolver into request-time DID/PLC discovery. |
+| ADV-64 | P1 | The checked-in notification configuration has no pinned TypeScript user delegation key. The real cross-host run can obtain a delegation token from the pinned PDS, but Swan rejects `getSpaceCredential` with HTTP 401 when neither a pin nor an explicit remote resolver is configured. | The resolver now supports an optional startup-bound `delegationKeyPLC` with an issuer allowlist, bounded/audited PLC state, continuity, and SSRF-safe transport; the checked-in lab still deliberately uses no remote delegation resolver. The live dynamic-PLC run and value-bearing member-read/full-CAR matrix remain open; a disposable operator pin is still a valid controlled proof path. |
 | ADV-65 | P1 | Bootstrap treated any nonzero `account show` result as "not found". A locked/unavailable/corrupt control database could therefore fall through to PLC preparation and write an identity journal during an infrastructure failure. | Remediated in `bootstrap-local-space.sh`: only the exact sanitized `account not found` diagnostic permits preparation; all other lookup failures fail closed before mutation. The static lab verifier requires both branches. |
+| ADV-66 | P1 | The local `#atproto` delegation-key resolver returned `nil` for a managed account whenever it was deactivated/deleted, had an unsupported or missing generation, or had unavailable key material. The composite resolver interprets `nil` as an unknown issuer and could then accept a configured operator pin or remote PLC key for that same DID, bypassing the account lifecycle gate. | Remediated in `LocalAccountSpaceDelegationPublicKeyResolver`: only proven local absence returns `nil`; every managed lifecycle, generation, key-store, corruption, and read-race failure throws an opaque terminal error. Added deactivation/deletion, unsupported/missing/corrupt-key, lifecycle-race, startup-pin, and unknown-issuer regression coverage; the focused OAuth/composition selection passed 23/23. |
+| ADV-67 | P2 | The bounded PLC resolver retained expired positive cache entries in its issuer-capacity set. After a bounded burst filled `maximumEntries`, later issuers could remain rejected forever even after the value TTL elapsed, despite durable continuity state being independent of the cache. | Remediated by pruning expired positive entries during lookup admission while preserving the “previously authenticated issuer” budget exemption and the durable terminal-CID checkpoint. A one-entry cache test now proves a second issuer resolves after expiry; the PLC resolver selection passed 13/13. |
+| ADV-68 | P2 | A holder of a valid read credential could register an unbounded number of distinct notification endpoints for one space. Space deletion copied every active endpoint into one transaction, so endpoint churn could grow the database and turn a later lifecycle operation into an unbounded fanout/lockout workload even though outbound delivery was SSRF-safe. | Remediated with a transactional per-space cap of 1,024 active registrations. Expired rows are pruned before admission, existing endpoints remain replaceable at capacity, and the capacity/expiry regression covers the read-credential path. The complete `SpaceNotificationSQLiteTests` class passed 5/5 in a serialized rerun. |
 
 ### Provenance limitation
 
@@ -602,3 +605,66 @@ This does not close the alpha sign-off. The stock pinned TypeScript image still
 lacks the value-bearing recovery surfaces, and the native-Linux host,
 reverse-authority OAuth/browser/lifecycle matrix, corrupted/compaction-gap
 recovery, and live dynamic-PLC cross-host run remain required evidence.
+
+## Managed delegation lifecycle rereview: 2026-07-31
+
+The delegation resolver added for the dynamic PLC path was reviewed as a
+separate trust-boundary surface. Its local implementation returned `nil` when a
+known account was inactive or when its generation/key projection could not be
+read. `CompositeSpaceDelegationPublicKeyResolver` intentionally treats `nil`
+as "unmanaged issuer" and therefore proceeded to an operator pin or the
+startup-configured remote PLC resolver. A DID that Swan still managed locally
+could consequently present a valid delegation signed by a pinned or PLC
+published key after local deactivation/deletion.
+
+The local resolver now mirrors the credential resolver's terminal-negative
+contract: it looks up the account first, permits fallback only for a proven
+local absence, checks active lifecycle and matching signing/rotation
+generations, reads the authenticated public projection, validates the key, and
+re-reads the complete account before returning it. All other failures map to a
+non-descriptive `SpaceDelegationPublicKeyResolutionError.unavailable`, so
+composition cannot reach another authority for a managed DID.
+
+Regression coverage includes deactivated and deleted issuers, unsupported
+key IDs, missing and corrupt public keys, a lifecycle change during the key
+read, startup pin preflight, and the preserved unknown-issuer remote fallback.
+The serialized focused run completed 23 tests with zero failures. This closes
+the lifecycle portion of the dynamic delegation resolver review, but does not
+close the outstanding dynamic-PLC live run or the other alpha gates listed
+above.
+
+The same pass found a separate availability defect in PLC admission. Expired
+positive cache entries were never removed from the issuer-capacity set, so a
+bounded stream of distinct issuers could make the resolver reject every new
+issuer until restart. The resolver now prunes expired value entries before
+capacity accounting; durable PLC terminal-CID continuity remains in the
+control store and is not evicted with the value cache. The new expiry/capacity
+test and the complete PLC resolver selection passed 13/13.
+
+The post-remediation serialized full SwiftPM run was repeated with the
+scratch-built `swan` executable explicitly pinned. Every XCTest bundle and the
+Swift Testing wire bundle passed with zero failures; eight opt-in stress/cache
+tests remained intentionally skipped (including the 256 MiB gates and the
+uncached reference-lab check). `verify-profile.sh`, `verify-interop-lab.sh`,
+the verifier mutation suite, and reference-overlay qualification also passed.
+
+## Notification-cardinality follow-up: 2026-07-31
+
+The notification registry was independently reviewed as a lower-privilege
+availability boundary. Registration requires a space read credential and
+endpoint syntax is validated; nevertheless, the schema had no per-space row
+limit and deletion materialized all active recipients into one transaction.
+The implementation now deletes expired rows for the target space, counts
+active rows in the same transaction, rejects a new endpoint at 1,024 rows with
+`SwanError.unavailable`, and still permits an existing endpoint to be
+replaced. A storage regression fills the budget through the public API,
+proves replacement and rejection, then proves expiry returns capacity.
+
+The first post-change focused build did not reach test execution: the fresh
+scratch path exhausted the host data volume during XCTest bundle code signing.
+The explicitly created scratch directory was removed, and a stale one-hour
+`swan-recovery-marker` test process from the earlier hung run was terminated.
+A rerun using the existing serialized scratch tree then built successfully;
+the capacity regression passed in 0.51 seconds and the complete notification
+SQLite class passed 5/5 with zero failures. The disk-space failure remains a
+reproducibility warning for clean scratch runs, not a code/test failure.

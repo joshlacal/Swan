@@ -1462,6 +1462,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let fileBackedBlobLifecycleMigrationVersion = 5
     private static let physicalBlobCASLifecycleMigrationVersion = 6
 
+    /// A read credential may register notification recipients, but it must
+    /// not be able to turn the later deletion fanout into an unbounded
+    /// transaction. Keep the limit per space so one noisy space cannot grow
+    /// another space's delivery work; re-registering an existing endpoint is
+    /// still allowed when the limit has been reached.
+    static let maximumNotificationRegistrationsPerSpace = 1_024
+
     let connection: SQLiteConnection
     let connectionGate = SQLiteConnectionGate()
     let dataDirectory: URL
@@ -4998,6 +5005,42 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await transaction {
                 let state = try await requiredSimpleSpace(registration.space)
                 try requireActiveSimpleSpace(state.state)
+                // Expired registrations are no longer recipients. Prune them
+                // before admission so expiry immediately returns capacity and
+                // the count below is part of the same write transaction.
+                _ = try await connection.query(
+                    """
+                    DELETE FROM permissioned_space_notification_registrations
+                    WHERE space_uri = ? AND expires_at <= ?
+                    """,
+                    [.text(registration.space.rawValue), .integer(timestamp)]
+                )
+                let existing = try await connection.query(
+                    """
+                    SELECT 1
+                    FROM permissioned_space_notification_registrations
+                    WHERE space_uri = ? AND endpoint = ?
+                    LIMIT 1
+                    """,
+                    [.text(registration.space.rawValue), .text(endpoint)]
+                )
+                if existing.isEmpty {
+                    let countRows = try await connection.query(
+                        """
+                        SELECT COUNT(*) AS registration_count
+                        FROM permissioned_space_notification_registrations
+                        WHERE space_uri = ?
+                        """,
+                        [.text(registration.space.rawValue)]
+                    )
+                    guard let countRow = countRows.first,
+                          try requiredNonnegativeInteger(countRow, "registration_count")
+                              < Self.maximumNotificationRegistrationsPerSpace else {
+                        throw SwanError.unavailable(
+                            "notification registration capacity exhausted"
+                        )
+                    }
+                }
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_notification_registrations(
@@ -5013,13 +5056,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         registration.repository.map(SQLiteData.text) ?? .null,
                         .integer(expiry), .integer(timestamp),
                     ]
-                )
-                // A naturally expired row is a removed registration. Keep
-                // cleanup inside the same transaction so a later fanout never
-                // chooses a known-expired recipient.
-                _ = try await connection.query(
-                    "DELETE FROM permissioned_space_notification_registrations WHERE expires_at <= ?",
-                    [.integer(timestamp)]
                 )
             }
         }

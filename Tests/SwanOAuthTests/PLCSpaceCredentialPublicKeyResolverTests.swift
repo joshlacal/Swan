@@ -159,6 +159,44 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         XCTAssertEqual(cachedFetchCount, 3)
     }
 
+    func testExpiredPositiveEntriesReleaseIssuerCapacity() async throws {
+        let clock = ResolverClock(Date(timeIntervalSince1970: 1_750_000_000))
+        let secondIssuer = "did:plc:bcdefghijklmnopqrstuvwxy"
+        let key = P256.Signing.PrivateKey().publicKey
+        let plc = ResolverPLCFixture(snapshots: [
+            issuer: try snapshot(
+                methods: ["atproto_space": P256DIDKey(publicKey: key).value]
+            ),
+            secondIssuer: try snapshot(
+                issuer: secondIssuer,
+                methods: ["atproto_space": P256DIDKey(publicKey: key).value]
+            ),
+        ])
+        let resolver = try PLCSpaceCredentialPublicKeyResolver(
+            plc: plc,
+            continuityStore: ResolverCheckpointStore(),
+            cacheConfiguration: .init(
+                lifetime: 10,
+                maximumEntries: 1
+            ),
+            clock: { clock.now() }
+        )
+
+        let initial = try await resolver.publicKey(
+            for: issuer,
+            keyID: PermissionedDataJWT.spaceCredentialKeyID
+        )
+        XCTAssertNotNil(initial)
+        clock.advance(by: 11)
+        let second = try await resolver.publicKey(
+            for: secondIssuer,
+            keyID: PermissionedDataJWT.spaceCredentialKeyID
+        )
+        XCTAssertNotNil(second)
+        let fetchCount = await plc.fetchCount()
+        XCTAssertEqual(fetchCount, 2)
+    }
+
     func testConcurrentRequestsForOneIssuerShareOnePLCRefresh() async throws {
         let key = P256.Signing.PrivateKey().publicKey
         let plc = ResolverPLCFixture(

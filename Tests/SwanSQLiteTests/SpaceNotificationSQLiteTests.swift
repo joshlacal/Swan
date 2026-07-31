@@ -171,6 +171,88 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         XCTAssertNil(String(describing: pending).range(of: "private record value"))
     }
 
+    func testNotificationRegistrationCapacityIsBoundedPerSpaceAndReclaimsExpiredRows()
+        async throws
+    {
+        let fixture = try NotificationFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+
+        let now = Date()
+        let credential = AuthorizationContext.spaceCredential(.init(
+            subject: fixture.reader,
+            space: fixture.space,
+            permissions: [.read],
+            expiresAt: now.addingTimeInterval(7_200)
+        ))
+        let maximum = SQLiteAccountDatabase.maximumNotificationRegistrationsPerSpace
+        func endpoint(_ index: Int) -> String {
+            "https://notify-\(index).example/xrpc/com.atproto.space.notifyWrite"
+        }
+
+        // Fill the admission budget with short-lived rows. This deliberately
+        // exercises the public registration API rather than inserting rows
+        // directly, so the authorization and endpoint checks remain in the
+        // path under review.
+        for index in 0 ..< maximum {
+            try await database.registerSpaceNotification(
+                .init(
+                    space: fixture.space,
+                    endpoint: endpoint(index),
+                    repository: fixture.writer,
+                    expiresAt: now.addingTimeInterval(60)
+                ),
+                authorization: credential,
+                now: now
+            )
+        }
+
+        // Replacement is idempotent even when the budget is full.
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: endpoint(0),
+                repository: nil,
+                expiresAt: now.addingTimeInterval(120)
+            ),
+            authorization: credential,
+            now: now
+        )
+
+        do {
+            try await database.registerSpaceNotification(
+                .init(
+                    space: fixture.space,
+                    endpoint: endpoint(maximum),
+                    repository: fixture.writer,
+                    expiresAt: now.addingTimeInterval(120)
+                ),
+                authorization: credential,
+                now: now
+            )
+            XCTFail("a new endpoint must not exceed the per-space registration budget")
+        } catch let error as SwanError {
+            guard case .unavailable = error else {
+                XCTFail("expected unavailable capacity error, got \(error)")
+                return
+            }
+        }
+
+        // Once the short-lived rows expire, the same transaction that admits
+        // a new endpoint reclaims them before counting active registrations.
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: endpoint(maximum + 1),
+                repository: fixture.writer,
+                expiresAt: now.addingTimeInterval(180)
+            ),
+            authorization: credential,
+            now: now.addingTimeInterval(61)
+        )
+    }
+
     func testRecipientDeletionDurablyClosesLocalRepositoryAndClearsStaleOutbox() async throws {
         let fixture = try NotificationFixture()
         let writerDatabase = try await SQLiteAccountDatabase(
