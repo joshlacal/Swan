@@ -591,6 +591,13 @@ review also removed a request-derived `try!` and result-CID force unwrap from
 public `repo.applyWrites`, mapping invariant violations to a bounded
 `temporarily_unavailable` response instead of a process crash.
 
+After those changes, the serialized cached macOS graph completed 864 tests
+with 8 explicit skips and zero failures. The focused public read and mutation
+targets completed 12/12 and 3/3 respectively; profile, lab, mutation, and
+reference-overlay qualification scripts also passed. This is host-local
+evidence only and does not substitute for the outstanding Linux and live
+dynamic-PLC gates below.
+
 This does not close the alpha sign-off. The stock pinned TypeScript image still
 lacks the value-bearing recovery surfaces, and the native-Linux host,
 reverse-authority OAuth/browser/lifecycle matrix, corrupted/compaction-gap
