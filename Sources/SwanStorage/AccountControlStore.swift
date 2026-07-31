@@ -877,11 +877,16 @@ public struct AccountEmailProofDeliveryRequest: Sendable, Equatable {
 
 /// Enumeration-resistant password-recovery enqueue input. It deliberately has
 /// no caller-supplied DID; the transaction resolves the exact verified active
-/// account by canonical email or performs no write.
+/// account by canonical email. Every canonical request also records a keyed,
+/// account-free work marker so unknown and known addresses take a durable
+/// write path without retaining a plaintext address for an unknown account.
 public struct AccountPasswordRecoveryDeliveryRequest: Sendable, Equatable {
     public let deliveryID: AccountEmailDeliveryID
     public let email: AccountEmailAddress
     public let proofDigest: Data
+    /// HMAC-derived canonical-address marker used only for blind recovery
+    /// admission. It is not a bearer proof and is never exposed to callers.
+    public let lookupDigest: Data
     public let expiresAt: Date
     public let createdAt: Date
 
@@ -889,11 +894,14 @@ public struct AccountPasswordRecoveryDeliveryRequest: Sendable, Equatable {
         deliveryID: AccountEmailDeliveryID,
         email: AccountEmailAddress,
         proofDigest: Data,
+        lookupDigest: Data? = nil,
         expiresAt: Date,
         now: Date
     ) throws {
+        let effectiveLookupDigest = lookupDigest ?? proofDigest
         guard (try? AccountEmailAddress(email.value)) == email,
               proofDigest.count == 32,
+              effectiveLookupDigest.count == 32,
               AccountControlMetadata.isControlDate(expiresAt),
               AccountControlMetadata.isControlDate(now),
               expiresAt > now else {
@@ -902,6 +910,7 @@ public struct AccountPasswordRecoveryDeliveryRequest: Sendable, Equatable {
         self.deliveryID = deliveryID
         self.email = email
         self.proofDigest = proofDigest
+        self.lookupDigest = effectiveLookupDigest
         self.expiresAt = expiresAt
         createdAt = now
     }
@@ -1191,8 +1200,8 @@ public protocol AccountControlStore: Sendable {
         _ request: AccountEmailProofDeliveryRequest
     ) async throws -> AccountEmailEnqueueOutcome
     /// Enumeration-resistant recovery request. A canonical address which is
-    /// unknown, unverified, or inactive performs no write and still returns
-    /// successfully.
+    /// unknown, unverified, or inactive performs only a keyed blind-work write
+    /// and still returns successfully.
     func enqueuePasswordRecoveryDelivery(
         _ request: AccountPasswordRecoveryDeliveryRequest
     ) async throws

@@ -631,11 +631,9 @@ final class AccountEmailXRPCTests: XCTestCase, @unchecked Sendable {
                 headers: self.jsonHeaders(),
                 body: ByteBuffer(string: #"{"email":"\#(sensitiveEmail)"}"#)
             ) { response in
-                self.assertError(
-                    response,
-                    status: .serviceUnavailable,
-                    code: "temporarily_unavailable"
-                )
+                // Delivery/storage failures are intentionally collapsed into
+                // the same opaque success as an unknown address.
+                self.assertEmptySuccess(response)
                 let rendered = String(
                     decoding: response.body.readableBytesView,
                     as: UTF8.self

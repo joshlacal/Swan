@@ -195,6 +195,24 @@ extension SQLiteControlDatabase {
             ) WITHOUT ROWID
             """
         )
+        // Password-recovery requests always leave this short-lived, keyed
+        // marker. It contains no DID or plaintext mailbox, and gives unknown
+        // and known canonical addresses the same durable admission shape.
+        _ = try await connection.query(
+            """
+            CREATE TABLE IF NOT EXISTS account_password_recovery_work (
+                lookup_digest BLOB PRIMARY KEY CHECK(length(lookup_digest) = 32),
+                expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+                created_at INTEGER NOT NULL CHECK(created_at >= 0)
+            ) WITHOUT ROWID
+            """
+        )
+        _ = try await connection.query(
+            """
+            CREATE INDEX IF NOT EXISTS account_password_recovery_work_expiry
+            ON account_password_recovery_work(expires_at, lookup_digest)
+            """
+        )
         _ = try await connection.query(
             """
             CREATE TRIGGER IF NOT EXISTS account_email_tokens_email_required_insert
@@ -595,7 +613,8 @@ extension SQLiteControlDatabase {
         _ request: AccountPasswordRecoveryDeliveryRequest
     ) async throws {
         guard (try? AccountEmailAddress(request.email.value)) == request.email,
-              request.proofDigest.count == 32 else {
+              request.proofDigest.count == 32,
+              request.lookupDigest.count == 32 else {
             throw AccountControlStoreError.invalidInput
         }
         let expiry = try controlTimestamp(request.expiresAt)
@@ -603,6 +622,29 @@ extension SQLiteControlDatabase {
         guard expiry > created else { throw AccountControlStoreError.invalidInput }
         try await withConnectionGate {
             try await transaction {
+                // Every canonical request performs one keyed, account-free
+                // write before the account lookup. The marker is deliberately
+                // not tied to a DID and expires with the requested proof.
+                _ = try await connection.query(
+                    "DELETE FROM account_password_recovery_work WHERE expires_at <= ?",
+                    [.integer(created)]
+                )
+                _ = try await connection.query(
+                    """
+                    INSERT INTO account_password_recovery_work(
+                        lookup_digest, expires_at, created_at
+                    ) VALUES (?, ?, ?)
+                    ON CONFLICT(lookup_digest) DO UPDATE SET
+                        expires_at = excluded.expires_at,
+                        created_at = excluded.created_at
+                    """,
+                    [
+                        blob(request.lookupDigest),
+                        .integer(expiry),
+                        .integer(created),
+                    ]
+                )
+
                 // This exact query and the intentionally empty return value
                 // make the request surface enumeration resistant.
                 let rows = try await connection.query(
@@ -1781,6 +1823,10 @@ extension SQLiteControlDatabase {
             "DELETE FROM account_email_tokens WHERE expires_at <= ?",
             [.integer(timestamp)]
         )
+        _ = try await connection.query(
+            "DELETE FROM account_password_recovery_work WHERE expires_at <= ?",
+            [.integer(timestamp)]
+        )
     }
 
     private func decodeEmailDeliveryLease(
@@ -1904,6 +1950,7 @@ extension SQLiteControlDatabase {
             "account_email_tokens",
             "account_email_delivery_outbox",
             "account_email_rate_limits",
+            "account_password_recovery_work",
             "account_login_rate_limits",
             "account_deletion_jobs",
             "account_deletion_staging_keys",

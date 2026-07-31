@@ -318,12 +318,12 @@ if [[ "$SWAN_INTEROP_REQUIRE_EFFECTIVE_COMPOSE" == "1" ]]; then
 fi
 
 mutate_file_and_require_rejection \
-  caddy-preserves-forged-client-ip \
+  caddy-adds-forged-client-ip \
   interop/Caddyfile \
-  $'\t\theader_up -X-Swan-Client-IP\n' \
-  '' \
+  $'\t\theader_up X-Swan-Client-IP {http.request.remote.host}\n' \
+  $'\t\theader_up +X-Swan-Client-IP {http.request.remote.host}\n' \
   SWAN_INTEROP_CADDYFILE \
-  'Caddy must delete the inbound login client identity header exactly once'
+  'Caddy must set the login client identity from its direct peer exactly once'
 
 mutate_file_and_require_rejection \
   caddy-trusts-forwarded-client-ip \
@@ -383,4 +383,5 @@ mutate_file_and_require_rejection \
   SWAN_INTEROP_SWAN_DOCKERIGNORE \
   'the Swan image build context must not expose a reference-source cache exception'
 
+./Scripts/test-bootstrap-local-space.sh
 echo "INTEROP LAB VERIFIER MUTATION TESTS OK"

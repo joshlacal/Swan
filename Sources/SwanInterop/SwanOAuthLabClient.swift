@@ -159,7 +159,7 @@ public actor SwanOAuthLabClient {
             state: state,
             codeChallenge: challenge
         )
-        let authorizePath = try queryPath(
+        let authorizePath = try Self.queryPath(
             "/oauth/authorize",
             [
                 URLQueryItem(name: "client_id", value: clientID.absoluteString),
@@ -442,12 +442,40 @@ public actor SwanOAuthLabClient {
             + (targetComponents.percentEncodedQuery.map { "?\($0)" } ?? "")
     }
 
-    private func queryPath(_ path: String, _ items: [URLQueryItem]) throws -> String {
-        var components = URLComponents()
-        components.path = path
-        components.queryItems = items
-        guard let result = components.string else { throw InteropHTTPError.invalidURL }
-        return result
+    /// Builds an XHR/browser query path without allowing nested URLs in a
+    /// query value to become top-level parameters.  `URLComponents` leaves
+    /// characters such as `?` and `&` unescaped when it is handed a
+    /// `URLQueryItem` value, which is incorrect for the localhost OAuth
+    /// client metadata URL (`client_id=http://localhost?...`).  A server then
+    /// sees a truncated client id and rejects the otherwise valid PAR binding
+    /// with a browser-looking error page.
+    static func queryPath(_ path: String, _ items: [URLQueryItem]) throws -> String {
+        guard !path.isEmpty, path.first == "/", !path.contains("#") else {
+            throw InteropHTTPError.invalidURL
+        }
+
+        let query = items.map { item in
+            "\(percentEncodeQueryComponent(item.name))=\(percentEncodeQueryComponent(item.value ?? ""))"
+        }.joined(separator: "&")
+        return query.isEmpty ? path : "\(path)?\(query)"
+    }
+
+    private static func percentEncodeQueryComponent(_ value: String) -> String {
+        let hexadecimal = Array("0123456789ABCDEF".utf8)
+        var encoded = String()
+        encoded.reserveCapacity(value.utf8.count)
+        for byte in value.utf8 {
+            switch byte {
+            case 0x41 ... 0x5A, 0x61 ... 0x7A, 0x30 ... 0x39,
+                 0x2D, 0x2E, 0x5F, 0x7E:
+                encoded.append(Character(UnicodeScalar(byte)))
+            default:
+                encoded.append("%")
+                encoded.append(Character(UnicodeScalar(hexadecimal[Int(byte >> 4)])))
+                encoded.append(Character(UnicodeScalar(hexadecimal[Int(byte & 0x0F)])))
+            }
+        }
+        return encoded
     }
 
     private func hiddenFormValue(named name: String, in data: Data) throws -> String {

@@ -54,6 +54,10 @@ if [[ ! -x "$notification_restart_scenario" ]]; then
   echo "notification restart scenario must be executable" >&2
   exit 1
 fi
+if [[ ! -x "Scripts/test-bootstrap-local-space.sh" ]]; then
+  echo "bootstrap fail-closed regression must be executable" >&2
+  exit 1
+fi
 
 ./interop/verify-reference.sh
 
@@ -281,8 +285,8 @@ rg -q 'reverse_proxy toxiproxy:8666' "$caddyfile"
 delete_client_header_count="$(
   rg -c '^[[:space:]]*header_up -X-Swan-Client-IP$' "$caddyfile" || true
 )"
-if [[ "${delete_client_header_count:-0}" -ne 1 ]]; then
-  echo "Caddy must delete the inbound login client identity header exactly once" >&2
+if [[ "${delete_client_header_count:-0}" -ne 0 ]]; then
+  echo "Caddy must not delete its replacement login client identity header" >&2
   exit 1
 fi
 set_client_header_count="$(
@@ -308,6 +312,13 @@ rg -q 'COPY Swan/interop/prepare-interop-secrets\.sh /usr/local/bin/swan-interop
 rg -q 'COPY Swan/interop/prepare-caddy-trust\.sh /usr/local/bin/swan-interop-caddy-trust' Dockerfile
 rg -q 'COPY Swan/interop/run-reference-pds\.sh /usr/local/bin/reference-pds-with-file-secrets' "$reference_pds_dockerfile"
 rg -q '^CMD \["/usr/local/bin/reference-pds-with-file-secrets",' "$reference_pds_dockerfile"
+rg -q 'account show' interop/bootstrap-local-space.sh
+rg -q 'account not found' interop/bootstrap-local-space.sh
+rg -q 'could not inspect existing account' interop/bootstrap-local-space.sh
+rg -q 'expected_did' interop/bootstrap-local-space.sh
+rg -q 'authority\.did' interop/bootstrap-local-space.sh
+rg -q 'member\.did' interop/bootstrap-local-space.sh
+rg -q 'prepared PLC DID does not match' interop/bootstrap-local-space.sh
 rg -q 'find "\$source" -perm /077' interop/prepare-interop-secrets.sh
 rg -q 'install -o "\$owner" -g "\$group" -m 0400' interop/prepare-interop-secrets.sh
 rg -q 'prepare_directory "\$runtime_directory" swan swan' interop/prepare-interop-secrets.sh

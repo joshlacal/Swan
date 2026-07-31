@@ -67,6 +67,26 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
             now: now
         )
         try await fixture.database.enqueuePasswordRecoveryDelivery(unknown)
+        let blindWork = try await fixture.database.connection.query(
+            "SELECT lookup_digest, expires_at, created_at FROM account_password_recovery_work"
+        )
+        XCTAssertEqual(blindWork.count, 1)
+        let blindRow = try XCTUnwrap(blindWork.first)
+        guard case let .blob(blindDigest) = blindRow.column("lookup_digest") else {
+            return XCTFail("blind recovery marker was not stored as a blob")
+        }
+        XCTAssertEqual(blindDigest.readableBytes, 32)
+        let blindColumns = try await fixture.database.connection.query(
+            "PRAGMA table_info(account_password_recovery_work)"
+        )
+        let blindColumnNames = blindColumns.compactMap { row -> String? in
+            guard case let .text(name) = row.column("name") else { return nil }
+            return name
+        }
+        XCTAssertEqual(
+            blindColumnNames,
+            ["lookup_digest", "expires_at", "created_at"]
+        )
         let unknownLease = try await fixture.database.claimNextEmailDelivery(
             workerID: "worker-a",
             now: now,
@@ -98,6 +118,10 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
             now: now.addingTimeInterval(2)
         )
         try await fixture.database.enqueuePasswordRecoveryDelivery(recovery)
+        let knownAndUnknownWork = try await fixture.database.connection.query(
+            "SELECT lookup_digest FROM account_password_recovery_work"
+        )
+        XCTAssertEqual(knownAndUnknownWork.count, 2)
         let leaseResult = try await fixture.database.claimNextEmailDelivery(
             workerID: "worker-a",
             now: now.addingTimeInterval(2),

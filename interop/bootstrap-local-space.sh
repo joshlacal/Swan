@@ -18,12 +18,34 @@ read_secret() {
 ensure_account() {
     label="$1"
     handle="$2"
-    revision="$3"
-    password_file="$4"
+    expected_did="$3"
+    revision="$4"
+    password_file="$5"
     request_id="interop-${label}-plc"
     identity_file="${DATA_DIRECTORY}/interop-${label}-identity.json"
-    if "${SWAN_BIN}" account show --data-directory "${DATA_DIRECTORY}" --handle "${handle}" >/dev/null 2>&1; then
+    account_lookup_output=""
+    account_lookup_status=0
+    if account_lookup_output="$(${SWAN_BIN} account show \
+        --data-directory "${DATA_DIRECTORY}" \
+        --handle "${handle}" 2>&1)"; then
+        existing_account="${account_lookup_output}"
+        actual_did="$(printf '%s\n' "$existing_account" | tr -d '\n' | sed -n 's/.*"did":"\([^"]*\)".*/\1/p')"
+        if [ -z "$actual_did" ] || [ "$actual_did" != "$expected_did" ]; then
+            echo "interop account DID does not match the owner-only bootstrap identity" >&2
+            exit 1
+        fi
         return 0
+    else
+        account_lookup_status="$?"
+        # `account show` uses the same nonzero CLI status for a missing row
+        # and for storage/configuration failures. Only the exact sanitized
+        # not-found diagnostic is safe to treat as an invitation to prepare
+        # an account; every other failure must stop bootstrap before it can
+        # mutate a PLC journal or identity file.
+        if [ "$account_lookup_status" -ne 64 ] || ! printf '%s\n' "$account_lookup_output" | grep -q '^Error: account not found$'; then
+            echo "interop bootstrap could not inspect existing account" >&2
+            exit 1
+        fi
     fi
 
     # The Compose account must be a real PLC-backed identity. `install-local`
@@ -44,6 +66,12 @@ ensure_account() {
         > "${identity_file}.tmp"
     chmod 0600 "${identity_file}.tmp"
     mv -f "${identity_file}.tmp" "${identity_file}"
+
+    prepared_did="$(tr -d '\r\n' < "${identity_file}" | sed -n 's/.*"did":"\([^\"]*\)".*/\1/p')"
+    if [ -z "$prepared_did" ] || [ "$prepared_did" != "$expected_did" ]; then
+        echo "prepared PLC DID does not match the owner-only bootstrap identity" >&2
+        exit 1
+    fi
 
     "${SWAN_BIN}" account activate-plc \
         --data-directory "${DATA_DIRECTORY}" \
@@ -67,12 +95,14 @@ fi
 ensure_account \
     authority \
     "$(read_secret authority.handle)" \
+    "$(read_secret authority.did)" \
     "${empty_revision}" \
     "${SECRETS_DIR}/authority.password"
 
 ensure_account \
     member \
     "$(read_secret member.handle)" \
+    "$(read_secret member.did)" \
     "${empty_revision}" \
     "${SECRETS_DIR}/member.password"
 

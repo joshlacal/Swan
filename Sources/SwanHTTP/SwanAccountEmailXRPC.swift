@@ -307,22 +307,32 @@ public typealias SwanAccountEmailRequestContext = SwanHTTPRequestContext
 /// testing without adding any alternate forwarded-header interpretation.
 public struct SwanAccountEmailXRPCServer: Sendable {
     public static let maximumJSONBytes = 8 * 1024
+    /// Bounds the remote timing signal from the account-dependent recovery
+    /// transaction. The floor is intentionally applied only after syntax,
+    /// authorization, and rate-limit admission have succeeded.
+    public static let defaultMinimumPasswordRecoveryResponseDuration: Duration =
+        .milliseconds(50)
 
     private let authorizer: any SwanAccountEmailResourceAuthorizing
     private let recovery: any SwanAccountEmailXRPCRecovering
     private let rateLimiter: any SwanAccountEmailXRPCRateLimiting
     private let loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
+    private let minimumPasswordRecoveryResponseDuration: Duration
 
     public init(
         authorizer: any SwanAccountEmailResourceAuthorizing,
         recovery: any SwanAccountEmailXRPCRecovering,
         rateLimiter: any SwanAccountEmailXRPCRateLimiting,
-        loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
+        loginClientIdentityPolicy: SwanLoginClientIdentityPolicy,
+        minimumPasswordRecoveryResponseDuration: Duration =
+            SwanAccountEmailXRPCServer.defaultMinimumPasswordRecoveryResponseDuration
     ) {
         self.authorizer = authorizer
         self.recovery = recovery
         self.rateLimiter = rateLimiter
         self.loginClientIdentityPolicy = loginClientIdentityPolicy
+        self.minimumPasswordRecoveryResponseDuration =
+            minimumPasswordRecoveryResponseDuration
     }
 
     public func buildRouter() -> Router<SwanHTTPRequestContext> {
@@ -340,7 +350,9 @@ public struct SwanAccountEmailXRPCServer: Sendable {
             authorizer: authorizer,
             recovery: recovery,
             rateLimiter: rateLimiter,
-            loginClientIdentityPolicy: loginClientIdentityPolicy
+            loginClientIdentityPolicy: loginClientIdentityPolicy,
+            minimumPasswordRecoveryResponseDuration:
+                minimumPasswordRecoveryResponseDuration
         )
         let requestConfirmationPath = Self.path(
             ComAtprotoServerRequestEmailConfirmation.endpointDescriptor.nsid
@@ -437,6 +449,7 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
     let recovery: any SwanAccountEmailXRPCRecovering
     let rateLimiter: any SwanAccountEmailXRPCRateLimiting
     let loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
+    let minimumPasswordRecoveryResponseDuration: Duration
 
     func requestEmailConfirmation(
         _ request: Request,
@@ -588,6 +601,7 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
             } catch {
                 throw AccountEmailXRPCFailure.invalidRequest
             }
+            let started = ContinuousClock().now
             try await admit(
                 operation: .requestPasswordReset,
                 did: nil,
@@ -596,16 +610,37 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
                 context: context,
                 now: now
             )
-            // The service performs the same no-write success for an unknown,
-            // unverified, inactive, or deleted account.
-            try await recovery.requestPasswordRecovery(
-                email: email,
-                now: now
-            )
-            return accountEmailSuccess()
+            do {
+                try await recovery.requestPasswordRecovery(
+                    email: email,
+                    now: now
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Account-dependent failures must not become an account
+                // existence oracle. The durable service already uses a blind
+                // marker for canonical requests; this boundary also collapses
+                // storage, capacity, and delivery failures to the same empty
+                // response while retaining a bounded timing floor.
+            }
+            return await passwordRecoverySuccess(startedAt: started)
         } catch {
             return await response(for: error, now: now)
         }
+    }
+
+    private func passwordRecoverySuccess(
+        startedAt: ContinuousClock.Instant
+    ) async -> Response {
+        let clock = ContinuousClock()
+        let deadline = startedAt.advanced(
+            by: minimumPasswordRecoveryResponseDuration
+        )
+        if clock.now < deadline {
+            try? await clock.sleep(until: deadline)
+        }
+        return accountEmailSuccess()
     }
 
     func resetPassword(

@@ -7,7 +7,6 @@
 https://swan.test {
 	tls internal
 	reverse_proxy swan:3000 {
-		header_up -X-Swan-Client-IP
 		header_up X-Swan-Client-IP {http.request.remote.host}
 	}
 }

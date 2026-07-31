@@ -736,6 +736,29 @@ final class SwanInteropTests: XCTestCase {
         )
     }
 
+    func testOAuthLabQueryPathEscapesNestedClientMetadataURL() throws {
+        let clientID = URL(string: "http://localhost?scope=atproto&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback")!
+        let path = try SwanOAuthLabClient.queryPath(
+            "/oauth/authorize",
+            [
+                URLQueryItem(name: "client_id", value: clientID.absoluteString),
+                URLQueryItem(name: "request_uri", value: "urn:ietf:params:oauth:request_uri:fixture"),
+            ]
+        )
+
+        XCTAssertEqual(
+            path,
+            "/oauth/authorize?client_id=http%3A%2F%2Flocalhost%3Fscope%3Datproto%26redirect_uri%3Dhttp%253A%252F%252F127.0.0.1%252Fcallback&request_uri=urn%3Aietf%3Aparams%3Aoauth%3Arequest_uri%3Afixture"
+        )
+        let components = try XCTUnwrap(URLComponents(string: path))
+        XCTAssertEqual(components.queryItems?.count, 2)
+        XCTAssertEqual(components.queryItems?.first?.value, clientID.absoluteString)
+        XCTAssertEqual(
+            components.queryItems?.last?.value,
+            "urn:ietf:params:oauth:request_uri:fixture"
+        )
+    }
+
     func testLiveFixtureRecordingStripsSelectorsAndKeepsOnlyResponseDigests() async throws {
         let recorder = InteropFixtureRecorder()
         let response = InteropHTTPResponse(

@@ -45,6 +45,15 @@ final class AccountEmailOutboxRuntimeTests: XCTestCase {
         XCTAssertNotEqual(firstProof, deliveryID.rawValue)
         let firstDigest = try codec.digest(proof: firstProof)
         XCTAssertEqual(firstDigest.count, 32)
+        let lookupDigest = codec.lookupDigest(
+            email: try AccountEmailAddress("Person@Example.COM")
+        )
+        XCTAssertEqual(lookupDigest.count, 32)
+        XCTAssertEqual(
+            lookupDigest,
+            codec.lookupDigest(email: try AccountEmailAddress("person@example.com"))
+        )
+        XCTAssertNotEqual(lookupDigest, firstDigest)
 
         let emailKey = try codec.rateLimitKey(scope: .email, value: "person@example.com")
         let peerKey = try codec.rateLimitKey(scope: .directPeer, value: "person@example.com")

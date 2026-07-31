@@ -50,6 +50,9 @@ overstated several gates. The most important adversarial findings were:
     preparation opener retains the same closed actor for every exact retry;
 12. Mailpit verification/recovery storage existed without a safe live
    HTTP/CLI, delivery, throttling, and OAuth-revocation composition.
+13. Compose bootstrap treated every failed account lookup as an absent account,
+   so a control-database/storage failure could fall through into PLC preparation
+   and mutate bootstrap state instead of failing closed.
 
 ## Finding ledger
 
@@ -104,7 +107,7 @@ overstated several gates. The most important adversarial findings were:
 | ADV-47 | P1 | `OAuthBoundedJSONPoster` validates DNS before a notification but does not pass that approved peer set into the POST transport. A stale or misconfigured static pin can therefore receive the service JWT and body before the post-response DNS comparison rejects it. | Remediated and green in the serialized macOS suite: the approved peer set is passed into the POST transport and checked before connect/write; the postflight DNS intersection remains, with a zero-accept/no-body regression. |
 | ADV-48 | P1 | A malicious interop peer can reflect a bearer or space credential as an arbitrary `cid`; failed artifacts persist that peer-controlled string, and matching reflected values can appear converged. | Remediated in source and focused `InteropArtifactBoundaryTests` are green: canonical CID validation and recursive artifact-boundary checks reject reflected opaque material. Live cross-host artifact recording remains part of ADV-56/interop closure. |
 | ADV-49 | P1 | Password-recovery rate limits use only the accepted socket peer. Once routed through Caddy, one attacker can consume the shared 15/hour proxy bucket and deny recovery to every user. | Standalone trusted-proxy policy and focused HTTP tests are green. Through-Caddy recovery/rate-limit behavior is composed in source but not exercised live; that runtime gate remains tracked by ADV-56. |
-| ADV-50 | P2 | Known password-reset mailboxes perform token/outbox writes while unknown mailboxes return early; known-only storage failures can also produce a distinct error response. | Open. Collapse account-dependent failures to the opaque empty success contract and equalize the bounded observable transaction/work shape. |
+| ADV-50 | P2 | Known password-reset mailboxes perform token/outbox writes while unknown mailboxes return early; known-only storage failures can also produce a distinct error response. | Partially remediated in source and focused tests: every canonical request now records a keyed, account-free blind-work marker; request-dependent storage/delivery failures collapse to the no-store empty success; and a 50 ms response floor bounds the direct timing signal. The known-account path still performs additional token/outbox writes, so strict constant-work equivalence under arbitrary SQLite contention remains an explicit follow-up. |
 | ADV-51 | P2 | New 256 MiB RSS helpers inherit the entire parent environment and relay unbounded child output into XCTest failures. | Remediated in source and focused helper tests are green: child environment is allowlisted and diagnostics are bounded/redacted. |
 | ADV-52 | P2 | Password-reset tests assert access-token revocation but discard the seeded refresh digest, so refresh-family regressions could pass unnoticed. | Remediated and focused refresh-family tests are green: the target family is revoked while an unrelated subject can still rotate. |
 | ADV-53 | P2 | Permanent-deletion outbox coverage is vacuous because the fixture asserts an empty outbox without ever seeding one. | Remediated and focused deletion-outbox tests are green with retained target rows and exact scoped-purge assertions. |
@@ -116,6 +119,10 @@ overstated several gates. The most important adversarial findings were:
 | ADV-59 | P1 | Concurrent PLC preparation retries could install a journal while the winner had already advanced it to `submitted`; the retry compared the entire record, treated monotonic stage/CID progress as a conflict, and failed (or leaked its SQLite connection during error cleanup). | Remediated in source: create-only replay now compares immutable identity/operation/key fields and returns the already-advanced journal; the fixture has async teardown. Repeated focused concurrency and continuity tests are green. |
 | ADV-60 | P1 | If `admitActivatedAccount` rejects a transferred database after the activation service has made the control row active, it closes the database actor but `SQLitePLCAccountPreparationStoreOpener` retains it in `transferredDatabases`. An exact management retry receives the same closed actor and cannot recover without a process restart. | Remediated in source and focused retry test: failed live-directory admission now discards the transferred actor before returning the error, so the exact retry opens a fresh database/journal actor rather than reusing a closed connection. |
 | ADV-61 | P2 | The clean-cache acceptance runner did not pin the CLI subprocess executable for the root checkout. Its child tests clear their environment, so an old `.build/debug/swan` could create false failures or accidentally exercise stale profile behavior. | Remediated in `Scripts/run-clean-cache-acceptance.sh`: every run builds `swan` in the isolated scratch tree and exports `SWAN_TEST_EXECUTABLE`; the fresh macOS clean-cache gate passed 858 XCTest cases, 8 explicit skips, and zero failures. |
+| ADV-62 | P1 | The live OAuth client used `URLComponents.queryItems` for the authorization redirect. Foundation leaves `?` and `&` from a nested `client_id` metadata URL unescaped, so Swan saw a truncated client binding and returned an opaque authorization error before the login form. The Compose Caddy bridge also deleted the replacement `X-Swan-Client-IP` after setting it, so browser login POSTs failed with a misleading missing-CSRF error. | Remediated in source with RFC 3986 component encoding and a regression test that round-trips the nested localhost metadata URL. The Caddy rule now overwrites the caller header from `{http.request.remote.host}` without a delete-after-set or append operation; a disposable echo upstream proved forged input is replaced. Direct and proxied PAR/login GETs now reach the server. A fresh cross-host semantic run remains blocked at the expected unpinned TypeScript delegation-key boundary. |
+| ADV-63 | P1 | Compose bootstrap treated an existing account as valid when its handle matched, without checking the owner-only DID identity. Reusing a persistent `swan-data` volume with a different secret directory therefore let the OAuth subject diverge from the configured space authority and produced misleading `SpaceNotFound`/401 failures. | Remediated in `bootstrap-local-space.sh`: existing accounts now fail closed unless the durable DID exactly matches `authority.did`/`member.did`; static verifier coverage requires the check. A reused mismatched volume now exits before Swan starts. Fresh-volume provisioning still needs an explicit identity-source workflow because PLC genesis creates a DID rather than accepting one as an input. |
+| ADV-64 | P1 | The checked-in notification configuration has no pinned TypeScript user delegation key. The real cross-host run can obtain a delegation token from the pinned PDS, but Swan rejects `getSpaceCredential` with HTTP 401 because the local resolver intentionally refuses unpinned remote verification. | Retained as an explicit interop gate: derive the member DID's `#atproto` verification key from the lab PLC, add it only as an operator-supplied disposable pin, and rerun the value-bearing member-read/full-CAR matrix. Do not weaken the resolver into request-time DID/PLC discovery. |
+| ADV-65 | P1 | Bootstrap treated any nonzero `account show` result as "not found". A locked/unavailable/corrupt control database could therefore fall through to PLC preparation and write an identity journal during an infrastructure failure. | Remediated in `bootstrap-local-space.sh`: only the exact sanitized `account not found` diagnostic permits preparation; all other lookup failures fail closed before mutation. The static lab verifier requires both branches. |
 
 ### Provenance limitation
 
@@ -229,6 +236,11 @@ does not claim that a particular agent introduced a particular defect.
   with 858 XCTest cases, 8 explicit opt-in/reference-cache skips, and zero
   failures; it still prints the deliberate "LIVE CROSS-HOST SEMANTIC MATRIX
   NOT RUN" boundary.
+- A bare full `swift test` without `SWAN_TEST_EXECUTABLE` reproduced the known
+  stale-child-CLI failure mode (backup/restore/profile-manifest cases). With
+  `SWAN_TEST_EXECUTABLE` pointed at the same scratch-tree `swan` binary, the
+  full serialized suite passed with zero failures; the unpinned invocation is
+  not accepted as test evidence.
 - The live notification restart acceptance was rerun after the harness privacy
   check was tightened. The disposable Compose path passed a real committed
   notification through a loopback proxy across authority SIGKILL/restart and a
@@ -239,6 +251,36 @@ does not claim that a particular agent introduced a particular defect.
   Mailpit service after a durable outbox/token seed and Swan restart. Mailpit
   received exactly one reset message, and the message body contained only the
   one-time proof token; no host-side artifact retained the token or mailbox.
+- Password-recovery enumeration hardening is now covered by focused SQLite and
+  HTTP tests: unknown requests leave only a 32-byte keyed marker with no DID or
+  email columns, known requests still enqueue exactly one delivery, and a
+  simulated delivery failure returns the same empty no-store success. The
+  HTTP adapter applies the configured 50 ms minimum response duration after
+  successful syntax/auth/rate-limit admission.
+- A disposable Caddy echo upstream proved the login identity bridge's exact
+  overwrite semantics: a forged inbound `X-Swan-Client-IP` is replaced by the
+  Caddy peer-derived value. The earlier delete-plus-set rule silently removed
+  the header from the upstream request.
+- Reusing the existing Compose data volume with the current owner-only secret
+  directory exposed a DID mismatch between durable accounts and bootstrap
+  identities. After the bootstrap check was rebuilt into the dependency image,
+  the stack failed closed with `interop account DID does not match the
+  owner-only bootstrap identity` before starting Swan.
+- The bootstrap lookup regression exercises both an absent-account success path
+  and an unavailable-control-database failure path. Only the former reaches PLC
+  preparation; the latter leaves no identity journal or temporary output.
+- A fresh live run with the corrected proxy completed OAuth and space
+  provisioning, then stopped at the intended unpinned remote delegation-key
+  boundary: `getDelegationToken` returned 200 and
+  `getSpaceCredential` returned 401. This is not recorded as cross-host
+  convergence evidence.
+- A fresh Compose adversarial run initially exposed a P1 OAuth harness defect:
+  the nested localhost `client_id` query was not percent-encoded when the
+  authorization URL was assembled, producing a misleading missing-CSRF error.
+  The harness now encodes every query component from UTF-8 bytes, and its
+  focused URL regression passes. The rebuilt rerun reaches OAuth and space
+  provisioning; its remaining 401 is the separately tracked delegation-key
+  pin gate above.
 - The clean-cache macOS workload was rerun after the final harness and
   diagnostic-hook cleanup. Profile verification, effective/static/mutation
   interop checks, a fresh SwiftPM build, and the full test suite completed with
@@ -271,14 +313,24 @@ explicitly open security/availability items above.
    more than the response budget (ADV-26).
 6. Finish the full-CAR installer caller binding to authorized origin/DID/key/
    freshness and run the remote-replica cross-host path (ADV-21).
-7. Close the known/unknown password-reset work-shape and failure-equivalence
-   gap (ADV-50).
+7. Tighten the remaining known/unknown password-reset work-shape gap under
+   contention and decide whether to promote the current blind-marker/floor
+   mitigation to a fully equivalent asynchronous design (ADV-50).
 8. Run the complete serialized Swift suite and both lab verifier suites.
 9. Run the real cross-host value-bearing, reverse-authority, compaction-gap,
    corruption, lifecycle/OAuth, and recovery matrix under Toxiproxy faults.
 10. Run clean-cache acceptance on an actual Linux host. Docker-Linux on macOS
     is useful build evidence but is not Linux-host evidence.
-11. Record sanitized artifacts and only then reassess alpha readiness.
+11. Generate a disposable operator pin for the TypeScript member's `#atproto`
+    key, exercise `getSpaceCredential`/member read/list-ops/full-CAR, and then
+    remove the pin and confirm the same request fails closed.
+12. Exercise bootstrap identity rotation/replacement across fresh and reused
+    data volumes, proving that the secret directory, PLC document, account row,
+    and space authority cannot drift independently.
+13. Exercise bootstrap lookup failures (unavailable/corrupt control database)
+    and prove they fail before PLC preparation or identity-file mutation
+    (ADV-65).
+14. Record sanitized artifacts and only then reassess alpha readiness.
 
 ## Non-findings and retained boundaries
 

@@ -595,6 +595,8 @@ public struct AccountEmailProofCodec: Sendable {
         Data("swan.account-email.proof.v1\u{0}".utf8)
     private static let digestDomain =
         Data("swan.account-email.proof-digest.v1\u{0}".utf8)
+    private static let lookupDomain =
+        Data("swan.account-email.lookup.v1\u{0}".utf8)
     private static let rateDomain =
         Data("swan.account-email.rate-limit.v1\u{0}".utf8)
 
@@ -617,6 +619,13 @@ public struct AccountEmailProofCodec: Sendable {
             throw AccountEmailRecoveryError.invalidProof
         }
         return authenticate(Self.digestDomain + Data(proof.utf8))
+    }
+
+    /// Returns a keyed marker for a canonical address. The marker is used to
+    /// perform blind password-recovery work for unknown addresses without
+    /// storing or exposing their plaintext mailbox value.
+    public func lookupDigest(email: AccountEmailAddress) -> Data {
+        authenticate(Self.lookupDomain + Data(email.value.utf8))
     }
 
     public func rateLimitKey(
@@ -904,6 +913,7 @@ public actor AccountEmailRecoveryService {
                 deliveryID: deliveryID,
                 email: email,
                 proofDigest: proofCodec.digest(proof: proof),
+                lookupDigest: proofCodec.lookupDigest(email: email),
                 expiresAt: now.addingTimeInterval(tokenLifetime),
                 now: now
             )
