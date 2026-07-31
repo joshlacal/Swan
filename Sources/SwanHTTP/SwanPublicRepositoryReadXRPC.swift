@@ -429,9 +429,15 @@ func registerPublicRepositoryReadEndpoints(
     router.get("/xrpc/com.atproto.sync.getLatestCommit") { request, _ async -> Response in
         do {
             let query = try publicReadQuery(request, required: ["did"])
+            guard let rawDID = query["did"] else {
+                throw PublicReadHandlerFailure.invalidRequest
+            }
+            let did: DID = try publicReadWireParameters {
+                try DID(didString: rawDID)
+            }
             let output = try await latestCommitHandler.handle(
                 parameters: try publicReadWireParameters {
-                    .init(did: try DID(didString: query["did"]!))
+                    .init(did: did)
                 },
                 input: (),
                 context: request
@@ -449,9 +455,15 @@ func registerPublicRepositoryReadEndpoints(
     router.get("/xrpc/com.atproto.sync.getRepoStatus") { request, _ async -> Response in
         do {
             let query = try publicReadQuery(request, required: ["did"])
+            guard let rawDID = query["did"] else {
+                throw PublicReadHandlerFailure.invalidRequest
+            }
+            let did: DID = try publicReadWireParameters {
+                try DID(didString: rawDID)
+            }
             let output = try await repoStatusHandler.handle(
                 parameters: try publicReadWireParameters {
-                    .init(did: try DID(didString: query["did"]!))
+                    .init(did: did)
                 },
                 input: (),
                 context: request
@@ -474,12 +486,15 @@ func registerPublicRepositoryReadEndpoints(
             guard query["since"] == nil else {
                 return publicReadError(.badRequest, "InvalidRequest")
             }
-            _ = try publicReadWireParameters {
-                try DID(didString: query["did"]!)
+            guard let rawDID = query["did"] else {
+                throw PublicReadHandlerFailure.invalidRequest
+            }
+            let did: DID = try publicReadWireParameters {
+                try DID(didString: rawDID)
             }
             let car: PublicRepositoryReadCAR
             switch try await directory.publicRepositoryCAROutcome(
-                selector: query["did"]!
+                selector: did.didString()
             ) {
             case .notFound:
                 return publicReadError(.badRequest, "RepoNotFound")

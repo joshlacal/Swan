@@ -144,6 +144,7 @@ overstated several gates. The most important adversarial findings were:
 | ADV-76 | P2 | Canonicalizing a valid `http://[::1]` laboratory origin through `URLComponents` dropped the required IPv6 brackets and rejected the source binding. This made a supported loopback recovery path fail closed and could have encouraged an unsafe workaround. | Remediated by rebuilding the bracketed literal and adding a regression for `http://[::1]:3000/`. Non-loopback HTTP, credentials, paths, queries, and fragments remain rejected. |
 | ADV-77 | P2 | `PermissionedRemoteReplicaSourceSession` allowed callers to omit cleanup, and the orchestrator invoked a caller-supplied cleanup closure from multiple terminal paths without enforcing idempotence. A custom file-backed source could leak a descriptor/spool or double-release an external lease. | Remediated in the working copy: cleanup is now mandatory at session construction and an actor-backed close gate executes it exactly once. Verification-failure and preflight-rejection regressions pass; the HTTP provider remains the owner of the file/lease callback. |
 | ADV-78 | P2 | The durable replay result stores only `base_generation`, while the orchestrator's request digest historically omitted the remaining expected-base fields. A direct caller of the storage protocol could reuse a request ID/digest with a forged same-generation base and receive a committed replay instead of a conflicting-reuse error. The production orchestrator obtains the base from the receiver database, so this is a storage-boundary integrity hardening issue rather than an HTTP bypass. | Remediated in migration 8: the result projection stores a domain-separated digest of the complete expected-base binding and replay requires an exact match; legacy rows without the digest fail closed. |
+| ADV-79 | P3 | Three public `sync` read routes force-unwrapped the request-derived `did` query entry. The strict parser currently guarantees the key, but a future parser change or bypass could turn malformed input into a process trap instead of `InvalidRequest`. | Remediated with explicit key guards and one typed `DID` parse per route. `PublicRepositoryReadHTTPTests` passed 12/12; no authorization or privacy bypass was reproduced. |
 
 ### Provenance limitation
 
@@ -977,3 +978,18 @@ The PLC service was then rebuilt with the final adapter, recreated against
 the same named volume, and health-checked before a second permissioned write.
 That post-restart stateful run also passed all 26 assertions; its sanitized
 artifact is `/private/tmp/permissioned-after-plc-restart-20260731c.json`.
+
+## Request-boundary rereview: 2026-07-31
+
+An independent pass over the public repository read routes found three
+request-derived dictionary force unwraps in `sync.getLatestCommit`,
+`sync.getRepoStatus`, and `sync.getRepo`. The strict query parser currently
+guarantees the `did` key, so this was not a reproducible authorization or
+privacy bypass; it was a fail-closed robustness defect if that parser contract
+ever changes or is bypassed. The routes now guard the key explicitly, parse a
+typed `DID` once, and use that value for downstream dispatch and repository
+selection. The existing `PublicRepositoryReadHTTPTests` malformed-selector and
+JSON/read coverage passed 12/12 after a serialized clean-scratch build
+(`SWIFTPM_MAX_CONCURRENT_OPERATIONS=1`, `--jobs 1`). No new P1 authorization,
+public/private-isolation, CAR-integrity, credential, or recovery bypass was
+reproduced.
