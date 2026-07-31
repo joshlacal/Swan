@@ -385,3 +385,50 @@ state across hosts, a reproducible remote delegation-key provisioning path,
 the cross-implementation OAuth/browser and lifecycle matrix, and clean-cache
 Linux acceptance. The pinned TypeScript cache and its known unsupported
 value-bearing behavior remain unchanged.
+
+## Live adversarial addendum: 2026-07-31
+
+The disposable reference account and PLC document were exercised against the
+running Compose network rather than fixture-only credentials. An operator-only
+pin for the member DID's real PLC `#atproto` key was supplied outside the
+repository. With that pin in place, the cross-host credential path is now
+proven: the TypeScript member returned `getDelegationToken` 200, Swan returned
+`getSpaceCredential` 200, the member `createRecord` returned 200, and the
+credential-authenticated member `getRecord` returned 200 with a matching CID.
+This closes the credential-resolution portion of ADV-64, but not the
+stateful alpha gate.
+
+The corrected stateful run remains failed for two reference-host reasons. The
+default pinned TypeScript image returned HTTP 500 for value-bearing
+`com.atproto.space.listRepoOps`; its enabled log records SQLite's
+`ambiguous column name: space` from the joined value query. The same endpoint
+returned 200 for `excludeValues=true` after the verifier was given the actual
+actor repository key. The default image returned HTTP 501
+`MethodNotImplemented` for `com.atproto.space.getRepo`. The checked-in
+reference overlay contains a qualification patch for those recovery surfaces,
+but `Dockerfile.reference-pds` and the default Compose service do not apply
+that patch. Therefore a clean Compose run cannot claim value-bearing
+incremental-sync or full-CAR recovery until the overlay is explicitly built
+and exercised as a separate pinned lab image.
+
+The review also caught a harness-key provenance error: the first disposable
+`ts-repo-author-key.txt` did not match the actor key at
+`/pds/actors/d6/did:plc:czvbc6dpzwve7eh4niqmj2dg/key`, producing a misleading
+`ContextSignatureMismatch` on the metadata-only run. Re-deriving the public
+key from that actor-specific key file made metadata-only sync pass. Future
+fixtures must derive the repository verification key from the actor store and
+record only the public-key provenance, never from the PDS-global secret.
+
+Finally, replaying the fixed disposable record key against the reference PDS
+returns HTTP 500 (`Record already exists`) rather than a typed conflict. Live
+scenarios must use a fresh rkey or delete the disposable record before retry;
+otherwise a failed-looking replay can be mistaken for a Swan write or
+transport failure. This is an upstream reference behavior, not a Swan
+authorization result.
+
+Removing the operator pin was also exercised against a fresh no-pin Swan
+container: the same real TypeScript delegation request still returned 200, but
+Swan rejected the credential exchange with HTTP 401 before any write or read.
+The resolver therefore fails closed as intended; the remaining ADV-64 work is
+the reference overlay/full-CAR and fault-matrix proof, not broadening remote
+key discovery.

@@ -60,6 +60,25 @@ require_private_owner_file() {
   fi
 }
 
+validate_identity_source() {
+  name="$1"
+  value="$(tr -d '\r\n' < "${secret_directory}/${name}")"
+  case "$value" in
+    generate)
+      ;;
+    did:*)
+      if [[ "$value" =~ [[:space:]] ]]; then
+        echo "interop identity source is malformed" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "interop identity source must be a canonical DID or generate" >&2
+      exit 1
+      ;;
+  esac
+}
+
 directory_mode="$(stat_mode "$secret_directory")"
 if (( (8#${directory_mode} & 077) != 0 )) \
   || [[ "$(stat_uid "$secret_directory")" -ne "$(id -u)" ]]; then
@@ -87,5 +106,8 @@ for name in \
 do
   require_private_owner_file "$name"
 done
+
+validate_identity_source authority.did
+validate_identity_source member.did
 
 printf '%s\n' "$secret_directory"

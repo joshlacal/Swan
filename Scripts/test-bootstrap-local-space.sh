@@ -53,12 +53,22 @@ case "${command} ${subcommand}" in
         : > "${STUB_PREPARE_MARKER:?}"
         case "$handle" in
             authority.test)
-                test "$expected_did" = 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa'
-                printf '%s\n' '{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"}'
+                if [ "${STUB_GENERATED:-0}" = '1' ]; then
+                    test -z "$expected_did"
+                    printf '%s\n' '{"did":"did:plc:cccccccccccccccccccccccc"}'
+                else
+                    test "$expected_did" = 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa'
+                    printf '%s\n' '{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"}'
+                fi
                 ;;
             member.test)
-                test "$expected_did" = 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb'
-                printf '%s\n' '{"did":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"}'
+                if [ "${STUB_GENERATED:-0}" = '1' ]; then
+                    test -z "$expected_did"
+                    printf '%s\n' '{"did":"did:plc:dddddddddddddddddddddddd"}'
+                else
+                    test "$expected_did" = 'did:plc:bbbbbbbbbbbbbbbbbbbbbbbb'
+                    printf '%s\n' '{"did":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"}'
+                fi
                 ;;
             *) exit 1 ;;
         esac
@@ -99,5 +109,26 @@ test "$status" -ne 0
 test ! -e "$failure_marker"
 test ! -e "${failure_data_directory}/interop-authority-identity.json.tmp"
 test ! -e "${failure_data_directory}/interop-authority-identity.json"
+
+# Fresh disposable labs may opt into generated PLC identities. The bootstrap
+# must omit --expected-did, persist the generated identity, and bind a later
+# restart to that durable DID rather than accepting an arbitrary account row.
+generated_secrets_directory="${test_root}/generated-secrets"
+generated_data_directory="${test_root}/generated-data"
+mkdir -p "$generated_secrets_directory" "$generated_data_directory"
+cp "${secrets_directory}/"* "$generated_secrets_directory/"
+printf '%s\n' generate > "${generated_secrets_directory}/authority.did"
+printf '%s\n' generate > "${generated_secrets_directory}/member.did"
+generated_marker="${test_root}/generated-prepare-called"
+STUB_MODE=missing \
+STUB_GENERATED=1 \
+STUB_PREPARE_MARKER="$generated_marker" \
+SWAN_BIN="$stub" \
+DATA_DIRECTORY="$generated_data_directory" \
+SWAN_INTEROP_SECRETS_DIR="$generated_secrets_directory" \
+    "$bootstrap_script" >/dev/null
+test -e "$generated_marker"
+test "$(sed -n 's/.*\"did\":\"\([^\"]*\)\".*/\1/p' "${generated_data_directory}/interop-authority-identity.json")" = 'did:plc:cccccccccccccccccccccccc'
+test "$(sed -n 's/.*\"did\":\"\([^\"]*\)\".*/\1/p' "${generated_data_directory}/interop-member-identity.json")" = 'did:plc:dddddddddddddddddddddddd'
 
 echo 'BOOTSTRAP LOOKUP FAIL-CLOSED TESTS OK'

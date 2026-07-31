@@ -141,8 +141,12 @@ files at mode `0600`:
 - `pds-plc-rotation-key`
 
 Both `oauth-server-key` and `account-kek` contain URL-safe Base64 encodings of
-32-byte keys. The account identity files must contain canonical DIDs/handles,
-and `public-repo-revision` must be a valid repository-v3 revision. PDS files
+32-byte keys. The account identity files normally contain canonical DIDs/handles.
+For a fresh disposable lab, either DID file may instead contain exactly
+`generate`: bootstrap then creates the PLC-backed identity, records the generated
+DID in the durable data volume, and requires that same DID on later starts. This
+mode is explicit and is not accepted for production provisioning. `public-repo-revision`
+must be a valid repository-v3 revision. PDS files
 use the formats required by the pinned reference PDS; all files must be
 nonempty even though this preflight intentionally never prints their values.
 
