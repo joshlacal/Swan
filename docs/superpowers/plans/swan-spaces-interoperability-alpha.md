@@ -346,7 +346,8 @@ revisions matched, LtHash commitments matched, the expected record was present
 in the recovered CAR, and the sync/CAR verifier accepted the final state. This
 is qualified overlay evidence only; the stock pinned TypeScript image remains
 the source of truth for normal compatibility and still lacks those recovery
-surfaces. Dynamic remote key discovery, reverse authority placement, full
+surfaces. Dynamic remote key discovery against a configured Swan peer,
+reverse authority placement, full
 cross-implementation OAuth/browser/lifecycle coverage, corrupted-operation and
 compaction-gap fault runs, and a native Linux host run remain open.
 
@@ -357,3 +358,22 @@ stateful matrix passed credential issuance, member write/read, value-bearing
 incremental sync, signed commitment verification, and two-root CAR recovery.
 The pin is operator-supplied disposable evidence, not automatic remote-key
 discovery.
+
+## 2026-07-31 live dynamic delegation-key checkpoint
+
+The dynamic PLC delegation resolver was exercised against the running
+Compose network with no static delegation-key pin. A disposable Swan process
+was started with a startup-only `delegationKeyPLC` allowlist containing the
+current member DID and the laboratory PLC origin. The member's PLC
+`#atproto` key was fetched and verified through the bounded PLC state/audit
+path; the same run then completed OAuth/DPoP, space credential exchange,
+permissioned write/read, value-bearing `listRepoOps`, and two-root `getRepo`
+CAR verification with matching CID, revision, and commitment. The evidence
+artifact is sanitized and ignored under `artifacts/live/`; the temporary
+configuration was removed after the run and the normal checked-in Compose
+configuration was restored.
+
+This closes the live dynamic-resolver capability for a configured Swan peer,
+but not the full alpha: dynamic discovery against a TypeScript member,
+reverse-authority OAuth/browser/lifecycle coverage, corrupted-operation and
+compaction-gap recovery, and a native Linux-host run remain required.

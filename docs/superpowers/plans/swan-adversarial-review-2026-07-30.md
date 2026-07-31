@@ -604,7 +604,8 @@ dynamic-PLC gates below.
 This does not close the alpha sign-off. The stock pinned TypeScript image still
 lacks the value-bearing recovery surfaces, and the native-Linux host,
 reverse-authority OAuth/browser/lifecycle matrix, corrupted/compaction-gap
-recovery, and live dynamic-PLC cross-host run remain required evidence.
+recovery, and live dynamic-PLC cross-host run remain required evidence. The
+configured-Swan dynamic resolver capability is recorded separately below.
 
 ## Managed delegation lifecycle rereview: 2026-07-31
 
@@ -629,9 +630,9 @@ Regression coverage includes deactivated and deleted issuers, unsupported
 key IDs, missing and corrupt public keys, a lifecycle change during the key
 read, startup pin preflight, and the preserved unknown-issuer remote fallback.
 The serialized focused run completed 23 tests with zero failures. This closes
-the lifecycle portion of the dynamic delegation resolver review, but does not
-close the outstanding dynamic-PLC live run or the other alpha gates listed
-above.
+the lifecycle portion of the dynamic delegation resolver review; the live
+configured-Swan exercise is recorded below, while the cross-implementation
+dynamic-PLC and other alpha gates remain open.
 
 The same pass found a separate availability defect in PLC admission. Expired
 positive cache entries were never removed from the issuer-capacity set, so a
@@ -668,3 +669,24 @@ A rerun using the existing serialized scratch tree then built successfully;
 the capacity regression passed in 0.51 seconds and the complete notification
 SQLite class passed 5/5 with zero failures. The disk-space failure remains a
 reproducibility warning for clean scratch runs, not a code/test failure.
+
+## Live dynamic delegation rereview: 2026-07-31
+
+The optional PLC-backed delegation resolver was exercised against the running
+Compose network without a static delegation-key pin. A disposable Swan
+container used a startup-only `delegationKeyPLC` allowlist for the current
+member DID and the lab PLC origin. The member `#atproto` key was fetched and
+authenticated through the PLC state/audit and continuity path; OAuth/DPoP,
+credential exchange, permissioned write/read, value-bearing `listRepoOps`,
+and two-root `getRepo` verification then passed with matching CID, revision,
+and commitment. The artifact retained only sanitized status, digest, CID,
+and endpoint summaries, and the normal checked-in Compose container was
+restored afterward.
+
+This is live dynamic-resolver evidence for a configured Swan peer, not a
+claim of automatic discovery for arbitrary issuers or of TypeScript OAuth
+convergence. Dynamic discovery against a TypeScript member, reverse-authority
+browser/lifecycle coverage, corrupted-operation and compaction-gap recovery,
+and native-Linux execution remain open. No new reportable authorization,
+public/private-isolation, credential, CAR-integrity, or resolver-lifecycle
+finding was reproduced in this rereview.
