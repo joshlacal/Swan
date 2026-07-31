@@ -30,6 +30,7 @@ struct ServeNotificationRuntime {
     let servicePins: [PinnedSpaceServicePublicKey]
     let credentialPublicKeys: PinnedSpaceCredentialPublicKeyResolver
     let remoteCredentialPublicKeys: (any SpaceCredentialPublicKeyResolver)?
+    let remoteDelegationPublicKeys: (any SpaceDelegationPublicKeyResolver)?
     let delegationPublicKeys: PinnedSpaceDelegationPublicKeyResolver
     let servicePublicKeys: PinnedSpaceServicePublicKeyResolver
     let recipientBindings: SwanSpaceNotificationRecipientBindings
@@ -46,12 +47,20 @@ struct ServeNotificationRuntime {
         let recipientServiceBindings: [RecipientServiceBinding]?
         let managingServiceAudience: String?
         let credentialKeyPLC: CredentialKeyPLC?
+        let delegationKeyPLC: DelegationKeyPLC?
     }
 
     private struct CredentialKeyPLC: Decodable {
         let origin: String
         let laboratory: Bool
         let allowlistedHost: String?
+    }
+
+    private struct DelegationKeyPLC: Decodable {
+        let origin: String
+        let laboratory: Bool
+        let allowlistedHost: String?
+        let allowedIssuers: [String]
     }
 
     private struct CredentialKey: Decodable {
@@ -152,6 +161,47 @@ struct ServeNotificationRuntime {
             } else {
                 remoteCredentialPublicKeys = nil
             }
+            let remoteDelegationPublicKeys: (any SpaceDelegationPublicKeyResolver)?
+            if let plc = configuration.delegationKeyPLC {
+                let allowedIssuers = Set(plc.allowedIssuers)
+                guard !allowedIssuers.isEmpty,
+                      allowedIssuers.count == plc.allowedIssuers.count,
+                      allowedIssuers.allSatisfy({
+                          (try? AccountIdentifiers.validateDID($0)) != nil
+                      }) else {
+                    throw SwanError.malformed(
+                        "notification delegation PLC issuer allowlist is invalid"
+                    )
+                }
+                guard let origin = URL(string: plc.origin) else {
+                    throw SwanError.malformed(
+                        "notification delegation PLC origin is invalid"
+                    )
+                }
+                let plcConfiguration: PLCClientConfiguration
+                if plc.laboratory {
+                    plcConfiguration = try PLCClientConfiguration.laboratory(
+                        origin: origin,
+                        allowlistedHost: plc.allowlistedHost
+                    )
+                } else {
+                    guard plc.allowlistedHost == nil else {
+                        throw SwanError.malformed(
+                            "production notification delegation PLC cannot use a host allowlist"
+                        )
+                    }
+                    plcConfiguration = try PLCClientConfiguration.production(
+                        origin: origin
+                    )
+                }
+                remoteDelegationPublicKeys = try PLCSpaceCredentialPublicKeyResolver(
+                    configuration: plcConfiguration,
+                    continuityStore: continuityStore,
+                    allowedIssuers: allowedIssuers
+                )
+            } else {
+                remoteDelegationPublicKeys = nil
+            }
             var authorities: [String: SwanSpaceNotificationDestination] = [:]
             var registrations: [String: SwanSpaceNotificationDestination] = [:]
             var peers: [String: OAuthIPAddress] = [:]
@@ -192,6 +242,7 @@ struct ServeNotificationRuntime {
                     pins: credentialPins
                 ),
                 remoteCredentialPublicKeys: remoteCredentialPublicKeys,
+                remoteDelegationPublicKeys: remoteDelegationPublicKeys,
                 delegationPublicKeys: try PinnedSpaceDelegationPublicKeyResolver(
                     pins: delegationPins
                 ),
@@ -227,6 +278,7 @@ struct ServeNotificationRuntime {
                 "recipientServiceBindings",
                 "managingServiceAudience",
                 "credentialKeyPLC",
+                "delegationKeyPLC",
             ]
         )
         try validateObjectArray(
@@ -284,6 +336,26 @@ struct ServeNotificationRuntime {
                 in: plc,
                 allowed: ["origin", "laboratory", "allowlistedHost"]
             )
+        }
+        if let plc = configuration["delegationKeyPLC"] {
+            guard let plc = plc as? [String: Any] else {
+                throw ConfigurationShapeError.invalid
+            }
+            try rejectUnknownKeys(
+                in: plc,
+                allowed: [
+                    "origin",
+                    "laboratory",
+                    "allowlistedHost",
+                    "allowedIssuers",
+                ]
+            )
+            guard let issuers = plc["allowedIssuers"] as? [Any],
+                  !issuers.isEmpty,
+                  issuers.count <= 1_024,
+                  issuers.allSatisfy({ $0 is String }) else {
+                throw ConfigurationShapeError.invalid
+            }
         }
     }
 
@@ -713,6 +785,7 @@ struct ServePermissionedRuntime {
             )
             delegationPublicKeys = try await CompositeSpaceDelegationPublicKeyResolver(
                 local: local.delegationPublicKeys,
+                remote: notification.remoteDelegationPublicKeys,
                 pinned: notification.delegationPins
             )
             servicePublicKeys = try await CompositeSpaceServicePublicKeyResolver(
@@ -729,7 +802,11 @@ struct ServePermissionedRuntime {
                 remote: notification.remoteCredentialPublicKeys,
                 pinned: notification.credentialPins
             )
-            delegationPublicKeys = notification.delegationPublicKeys
+            delegationPublicKeys = try await CompositeSpaceDelegationPublicKeyResolver(
+                local: UnavailableSpaceDelegationPublicKeyResolver(),
+                remote: notification.remoteDelegationPublicKeys,
+                pinned: notification.delegationPins
+            )
             servicePublicKeys = notification.servicePublicKeys
         case (nil, nil):
             credentialPublicKeys = nil

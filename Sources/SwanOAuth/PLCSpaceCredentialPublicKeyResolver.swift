@@ -95,7 +95,8 @@ private actor PLCProcessLookupPermit {
     }
 }
 
-/// PLC-backed discovery for remote space-credential verification keys.
+/// PLC-backed discovery for remote space-credential and delegation
+/// verification keys.
 ///
 /// The resolver only speaks to a supplied ``PLCClient``. In particular, a
 /// credential issuer is never treated as a URL and cannot trigger a DID-web,
@@ -103,7 +104,10 @@ private actor PLCProcessLookupPermit {
 /// state response against the PLC audit chain before this resolver consumes a
 /// verification method. Cached state is used only until its short TTL ends;
 /// an expired entry is never used if PLC refresh fails.
-public actor PLCSpaceCredentialPublicKeyResolver: SpaceCredentialPublicKeyResolver {
+public actor PLCSpaceCredentialPublicKeyResolver:
+    SpaceCredentialPublicKeyResolver,
+    SpaceDelegationPublicKeyResolver
+{
     /// Monotonic time source for cache and admission deadlines.
     ///
     /// Production uses process uptime. The public closure initializer exists

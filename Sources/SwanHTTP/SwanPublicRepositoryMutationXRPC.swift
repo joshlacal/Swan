@@ -137,11 +137,39 @@ private struct PublicMutationHandlers {
             requestID: UUID().uuidString, bodyDigest: bodyDigest,
             signerProvider: capability.signerProvider
         )
-        let results: [SwanPublicWire.ComAtprotoRepoApplyWrites.OutputResultsUnion] = committed.recordResults.map { result in
-            let uri = try! ATProtocolURI(uriString: "at://\(target.did)/\(result.path.mstKey)")
+        let results: [SwanPublicWire.ComAtprotoRepoApplyWrites.OutputResultsUnion] = try committed.recordResults.map { result in
+            let uri: ATProtocolURI
+            do {
+                uri = try ATProtocolURI(uriString: "at://\(target.did)/\(result.path.mstKey)")
+            } catch {
+                // A coordinator/storage invariant failure must become a
+                // bounded protocol error, never a process crash from a
+                // request-derived path.
+                throw PublicMutationFailure.unavailable
+            }
             switch result.action {
-            case .create: return .comAtprotoRepoApplyWritesCreateResult(.init(uri: uri, cid: result.recordCID!, validationStatus: input.validate == nil ? nil : "valid"))
-            case .update: return .comAtprotoRepoApplyWritesUpdateResult(.init(uri: uri, cid: result.recordCID!, validationStatus: input.validate == nil ? nil : "valid"))
+            case .create:
+                guard let recordCID = result.recordCID else {
+                    throw PublicMutationFailure.unavailable
+                }
+                return .comAtprotoRepoApplyWritesCreateResult(
+                    .init(
+                        uri: uri,
+                        cid: recordCID,
+                        validationStatus: input.validate == nil ? nil : "valid"
+                    )
+                )
+            case .update:
+                guard let recordCID = result.recordCID else {
+                    throw PublicMutationFailure.unavailable
+                }
+                return .comAtprotoRepoApplyWritesUpdateResult(
+                    .init(
+                        uri: uri,
+                        cid: recordCID,
+                        validationStatus: input.validate == nil ? nil : "valid"
+                    )
+                )
             case .delete: return .comAtprotoRepoApplyWritesDeleteResult(.init())
             }
         }

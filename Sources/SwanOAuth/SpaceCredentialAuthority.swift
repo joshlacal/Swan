@@ -88,9 +88,11 @@ public protocol SpaceCredentialAuthorizationVerifier: Sendable {
 /// delegation. This is a separate protocol from
 /// ``SpaceCredentialPublicKeyResolver`` because delegations are signed by the
 /// user's `#atproto` key while space credentials are signed by an authority's
-/// dedicated `#atproto_space` key. Implementations supplied in this alpha are
-/// local or operator-pinned only and never fetch DID, PLC, DNS, or HTTP data
-/// while handling a request.
+/// dedicated `#atproto_space` key. Implementations may be local,
+/// operator-pinned, or explicitly startup-bound to a PLC. Any remote
+/// implementation must keep its issuer allowlist, transport policy,
+/// continuity checks, and cache bounds outside request input; the protocol
+/// itself never authorizes a request to choose a DID, PLC, DNS, or HTTP source.
 public protocol SpaceDelegationPublicKeyResolver: Sendable {
     func publicKey(
         for issuer: String,
@@ -531,9 +533,9 @@ public struct PinnedSpaceDelegationPublicKeyResolver:
     }
 }
 
-/// Explicitly refuses remote authority resolution. This is the only default
-/// remote behavior until a future DID/PLC cache can satisfy the same limits
-/// and SSRF controls as Swan's OAuth metadata loader.
+/// Explicitly refuses remote authority resolution when no startup-bound
+/// resolver has been configured. It never turns request input into a DID/PLC
+/// or network lookup.
 public struct UnavailableSpaceCredentialPublicKeyResolver:
     SpaceCredentialPublicKeyResolver
 {
@@ -547,9 +549,9 @@ public struct UnavailableSpaceCredentialPublicKeyResolver:
     }
 }
 
-/// Explicitly refuses remote user-key resolution for delegation exchange.
-/// This prevents a Bearer token from becoming an SSRF or request-time DID/PLC
-/// lookup primitive until an independently bounded cache is implemented.
+/// Explicitly refuses remote user-key resolution for delegation exchange when
+/// no startup-bound resolver has been configured. This prevents a bearer token
+/// from becoming an SSRF or request-time DID/PLC lookup primitive.
 public struct UnavailableSpaceDelegationPublicKeyResolver:
     SpaceDelegationPublicKeyResolver
 {

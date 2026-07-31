@@ -570,3 +570,28 @@ member-host read, value-bearing incremental sync, signed commitment checks, and
 two-root CAR recovery, with sync/CAR commitment and revision equality. This is
 controlled pinned-key evidence; it does not turn the checked-in configuration
 into an automatic remote-key discovery policy.
+
+## Follow-up implementation review: 2026-07-31
+
+The remaining delegation-key gap was addressed as an explicit configuration
+boundary rather than by allowing request-time DID/PLC discovery. Notification
+configuration now accepts an optional `delegationKeyPLC` object with a
+duplicate-free allowlist of canonical `did:plc:` issuers. Its resolver reuses
+the bounded PLC state/audit verifier, durable terminal-CID continuity store,
+negative cache, and process-wide lookup admission already used for credential
+keys. Local account keys and operator pins are checked first; the remote
+resolver is consulted only when both decline, and the request supplies no
+origin, issuer allowlist, or transport choice. Malformed shapes, duplicate or
+non-DID issuers, production host allowlists, and invalid origins fail at
+startup.
+
+The focused composition test proves remote delegation fallback and local-key
+precedence; notification-shape tests cover nested unknown fields. The same
+review also removed a request-derived `try!` and result-CID force unwrap from
+public `repo.applyWrites`, mapping invariant violations to a bounded
+`temporarily_unavailable` response instead of a process crash.
+
+This does not close the alpha sign-off. The stock pinned TypeScript image still
+lacks the value-bearing recovery surfaces, and the native-Linux host,
+reverse-authority OAuth/browser/lifecycle matrix, corrupted/compaction-gap
+recovery, and live dynamic-PLC cross-host run remain required evidence.

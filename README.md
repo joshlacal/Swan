@@ -127,6 +127,29 @@ material only and must remain outside the repository. This proves credential
 issuance and repository-host verification, but is not a substitute for the
 full TypeScript semantic matrix or dynamic DID/PLC/JWKS discovery.
 
+An operator may instead configure delegation-key discovery explicitly in a
+notification configuration, without making the request path choose an
+authority:
+
+```json
+{
+  "delegationKeyPLC": {
+    "origin": "http://reference-plc:2582",
+    "laboratory": true,
+    "allowlistedHost": "reference-plc",
+    "allowedIssuers": ["did:plc:abcdefghijklmnopqrstuvwx"]
+  }
+}
+```
+
+The issuer list is required, duplicate-free, and DID-validated. Swan uses the
+same bounded PLC state/audit verification, durable key-continuity checkpoint,
+negative cache, and process-wide lookup admission as credential-key discovery;
+local account keys and explicit pins always win, and a failed remote lookup is
+opaque and fail-closed. The checked-in Compose notification file deliberately
+does not enable this optional field; production origins must be HTTPS and
+laboratory HTTP is restricted to the configured host allowlist.
+
 ## Disposable Compose interoperability lab
 
 The lab accepts no secret values through Compose environment interpolation.

@@ -430,7 +430,7 @@ required_root = {
     "managingServiceAudience",
     "credentialKeyPLC",
 }
-allowed_root = required_root | {"delegationPublicKeys"}
+allowed_root = required_root | {"delegationPublicKeys", "delegationKeyPLC"}
 require_object(configuration, "$", allowed_root, required_root)
 
 credential_fields = {
@@ -559,6 +559,45 @@ if plc != {
     "allowlistedHost": "reference-plc",
 }:
     raise SystemExit("checked-in notification PLC resolver is not the pinned lab origin")
+
+if "delegationKeyPLC" in configuration:
+    delegation_plc = configuration["delegationKeyPLC"]
+    delegation_plc_fields = {
+        "origin",
+        "laboratory",
+        "allowlistedHost",
+        "allowedIssuers",
+    }
+    require_object(
+        delegation_plc,
+        "$.delegationKeyPLC",
+        delegation_plc_fields,
+        delegation_plc_fields,
+    )
+    if delegation_plc["origin"] != "http://reference-plc:2582":
+        raise SystemExit(
+            "checked-in notification delegation PLC is not the pinned lab origin"
+        )
+    if delegation_plc["laboratory"] is not True or delegation_plc["allowlistedHost"] != "reference-plc":
+        raise SystemExit(
+            "checked-in notification delegation PLC is not loopback-lab-only"
+        )
+    issuers = delegation_plc["allowedIssuers"]
+    require_array(issuers, "$.delegationKeyPLC.allowedIssuers")
+    if not issuers:
+        raise SystemExit(
+            "checked-in notification delegation PLC issuer allowlist is empty"
+        )
+    for index, issuer in enumerate(issuers):
+        require_string(issuer, f"$.delegationKeyPLC.allowedIssuers[{index}]")
+        if not issuer.startswith("did:plc:"):
+            raise SystemExit(
+                "checked-in notification delegation PLC issuer is not a PLC DID"
+            )
+    if len(set(issuers)) != len(issuers):
+        raise SystemExit(
+            "checked-in notification delegation PLC issuer allowlist has duplicates"
+        )
 PY
 
 # The live closure is opt-in, but its proof contract is checked offline. It

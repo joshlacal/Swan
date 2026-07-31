@@ -169,6 +169,47 @@ final class PermissionedResolverCompositionTests: XCTestCase {
         }
     }
 
+    func testDelegationRemoteResolverIsFallbackAfterLocalAndPins() async throws {
+        let localKey = P256.Signing.PrivateKey()
+        let remoteKey = P256.Signing.PrivateKey()
+        let remote = CountingDelegationKeys(
+            keys: [
+                "\(remoteMember)|\(PermissionedDataJWT.delegationKeyID)":
+                    .p256(remoteKey.publicKey),
+            ]
+        )
+        let resolver = try await CompositeSpaceDelegationPublicKeyResolver(
+            local: StaticDelegationKeys(keys: [
+                "\(localDID)|\(PermissionedDataJWT.delegationKeyID)":
+                    .p256(localKey.publicKey),
+            ]),
+            remote: remote,
+            pinned: []
+        )
+
+        let local = try await resolver.publicKey(
+            for: localDID,
+            keyID: PermissionedDataJWT.delegationKeyID
+        )
+        XCTAssertEqual(
+            local?.deterministicIdentity,
+            Data([0x01]) + localKey.publicKey.x963Representation
+        )
+        let localCallCount = await remote.callCount
+        XCTAssertEqual(localCallCount, 0)
+
+        let remoteResolved = try await resolver.publicKey(
+            for: remoteMember,
+            keyID: PermissionedDataJWT.delegationKeyID
+        )
+        XCTAssertEqual(
+            remoteResolved?.deterministicIdentity,
+            Data([0x01]) + remoteKey.publicKey.x963Representation
+        )
+        let remoteCallCount = await remote.callCount
+        XCTAssertEqual(remoteCallCount, 1)
+    }
+
     private static let remoteDelegation =
         "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWRlbGVnYXRpb24rand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eSIsImF1ZCI6ImRpZDpwbGM6YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4I2F0cHJvdG9fc3BhY2VfaG9zdCIsInN1YiI6ImF0Oi8vZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3gvc3BhY2UvYXBwLmJza3kuYm9va21hcmtzL3RzLWdvbGRlbiIsImlhdCI6MTc1MDAwMDAwMCwiZXhwIjoxNzUwMDAwMDYwLCJqdGkiOiJ0cy1ub25jZV8wMSJ9.CiWW_bplyq9ZtybzoUL9f7J_lqlcFKkmAbY2YsVlf5Bly4Ufue7e9QN6_8PioonLWqKnmm6T-RW3Mq2C_JTC6A"
     private static let remoteCredential =
@@ -196,6 +237,23 @@ private struct StaticDelegationKeys: SpaceDelegationPublicKeyResolver {
         keyID: String
     ) async throws -> PermissionedDataJWTVerificationKey? {
         keys["\(issuer)|\(keyID)"]
+    }
+}
+
+private actor CountingDelegationKeys: SpaceDelegationPublicKeyResolver {
+    let keys: [String: PermissionedDataJWTVerificationKey]
+    private(set) var callCount = 0
+
+    init(keys: [String: PermissionedDataJWTVerificationKey]) {
+        self.keys = keys
+    }
+
+    func publicKey(
+        for issuer: String,
+        keyID: String
+    ) async throws -> PermissionedDataJWTVerificationKey? {
+        callCount += 1
+        return keys["\(issuer)|\(keyID)"]
     }
 }
 

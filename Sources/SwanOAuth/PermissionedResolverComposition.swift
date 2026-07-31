@@ -96,16 +96,35 @@ public struct CompositeSpaceCredentialPublicKeyResolver:
 }
 
 /// Delegation-key counterpart to
-/// ``CompositeSpaceCredentialPublicKeyResolver``. It performs no DID, PLC,
-/// DNS, or HTTP lookup.
+/// ``CompositeSpaceCredentialPublicKeyResolver``. Its optional remote source
+/// is supplied at startup; the request path cannot select a DID, PLC, DNS, or
+/// HTTP authority.
 public struct CompositeSpaceDelegationPublicKeyResolver:
     SpaceDelegationPublicKeyResolver
 {
     private let local: any SpaceDelegationPublicKeyResolver
+    private let remote: (any SpaceDelegationPublicKeyResolver)?
     private let pinned: PinnedSpaceDelegationPublicKeyResolver
 
     public init(
         local: any SpaceDelegationPublicKeyResolver,
+        pinned pins: [PinnedSpaceDelegationPublicKey]
+    ) async throws {
+        try await self.init(
+            local: local,
+            remote: nil,
+            pinned: pins
+        )
+    }
+
+    /// Compose local account keys, explicit operator pins, and an optional
+    /// startup-configured remote resolver.  The remote resolver is consulted
+    /// only after both local sources decline an issuer, and it must enforce its
+    /// own issuer allowlist, transport policy, continuity, and cache bounds.
+    /// A request never supplies a resolver or an allowlist.
+    public init(
+        local: any SpaceDelegationPublicKeyResolver,
+        remote: (any SpaceDelegationPublicKeyResolver)?,
         pinned pins: [PinnedSpaceDelegationPublicKey]
     ) async throws {
         let pinned = try PinnedSpaceDelegationPublicKeyResolver(pins: pins)
@@ -114,10 +133,12 @@ public struct CompositeSpaceDelegationPublicKeyResolver:
                 issuer: pin.issuer,
                 keyID: pin.keyID,
                 local: local,
+                remote: nil,
                 pinned: pinned
             )
         }
         self.local = local
+        self.remote = remote
         self.pinned = pinned
     }
 
@@ -129,6 +150,7 @@ public struct CompositeSpaceDelegationPublicKeyResolver:
             issuer: issuer,
             keyID: keyID,
             local: local,
+            remote: remote,
             pinned: pinned
         )
     }
@@ -137,13 +159,16 @@ public struct CompositeSpaceDelegationPublicKeyResolver:
         issuer: String,
         keyID: String,
         local: any SpaceDelegationPublicKeyResolver,
+        remote: (any SpaceDelegationPublicKeyResolver)?,
         pinned: PinnedSpaceDelegationPublicKeyResolver
     ) async throws -> PermissionedDataJWTVerificationKey? {
-        try uniqueVerificationKey(
+        let known = try uniqueVerificationKey(
             local: try await local.publicKey(for: issuer, keyID: keyID),
             pinned: try await pinned.publicKey(for: issuer, keyID: keyID),
             conflict: "conflicting space delegation verification keys"
         )
+        if let known { return known }
+        return try await remote?.publicKey(for: issuer, keyID: keyID)
     }
 }
 

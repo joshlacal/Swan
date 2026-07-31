@@ -278,6 +278,15 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase {
         ]
         cases.append(("PLC configuration", plcConfig))
 
+        var delegationPLCConfig = base
+        delegationPLCConfig["delegationKeyPLC"] = [
+            "origin": "https://plc.example",
+            "laboratory": false,
+            "allowedIssuers": [remoteDID],
+            "privateKey": "must-not-be-accepted",
+        ]
+        cases.append(("delegation PLC configuration", delegationPLCConfig))
+
         for (label, object) in cases {
             let url = FileManager.default.temporaryDirectory.appending(
                 path: "swan-notification-shape-\(UUID().uuidString).json"
