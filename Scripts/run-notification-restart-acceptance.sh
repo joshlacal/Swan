@@ -85,11 +85,33 @@ recovery_id=""
 
 compose() {
   if [[ "${SWAN_NOTIFICATION_RESTART_NO_BUILD:-0}" == "1" && "${1:-}" == "up" ]]; then
-    shift
-    ./interop/compose.sh --project-name "$project_name" up --no-build "$@"
-  else
-    ./interop/compose.sh --project-name "$project_name" "$@"
+    # Compose names build-only images after the project. A caller may choose a
+    # fresh project name while reusing a previously built cache; in that case
+    # `up --no-build` fails before any service starts because the new image
+    # names do not exist. Keep the fast path when every required local image
+    # is present, but fall back to the normal pinned build instead of turning
+    # an image-tag mismatch into a false acceptance failure.
+    local images_available=1
+    local service
+    for service in \
+      caddy-ca-ready caddy reference-pds reference-plc swan-bootstrap \
+      swan-data-init swan-secrets-init swan
+    do
+      if ! docker image inspect "${project_name}-${service}:latest" \
+        >/dev/null 2>&1
+      then
+        images_available=0
+        break
+      fi
+    done
+    if ((images_available)); then
+      shift
+      ./interop/compose.sh --project-name "$project_name" up --no-build "$@"
+      return
+    fi
+    echo "notification acceptance: project-scoped images unavailable; building pinned services" >&2
   fi
+  ./interop/compose.sh --project-name "$project_name" "$@"
 }
 
 bounded_cleanup_command() {

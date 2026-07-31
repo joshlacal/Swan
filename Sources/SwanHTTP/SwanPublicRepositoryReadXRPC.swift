@@ -261,14 +261,36 @@ func registerPublicRepositoryReadEndpoints(
     router.get("/xrpc/com.atproto.repo.describeRepo") { request, _ async -> Response in
         do {
             let query = try publicReadQuery(request, required: ["repo"])
-            let output = try await describeHandler.handle(
-                parameters: try publicReadWireParameters {
-                    .init(repo: try ATIdentifier(string: query["repo"]!))
-                },
-                input: (),
-                context: request
-            )
-            return publicReadJSON(.ok, output)
+            guard let repo = query["repo"] else {
+                throw PublicReadHandlerFailure.invalidRequest
+            }
+            guard let lease = jsonReadAdmission.reserve(
+                maximumResponseBytes: PublicRepositoryJSONReadLimits
+                    .maximumListRecordsResponseBytes
+            ) else {
+                return publicReadError(
+                    .serviceUnavailable, "temporarily_unavailable"
+                )
+            }
+            do {
+                let output = try await describeHandler.handle(
+                    parameters: try publicReadWireParameters {
+                        .init(repo: try ATIdentifier(string: repo))
+                    },
+                    input: (),
+                    context: request
+                )
+                return publicReadJSON(
+                    .ok,
+                    output,
+                    maximumBytes: PublicRepositoryJSONReadLimits
+                        .maximumListRecordsResponseBytes,
+                    lease: lease
+                )
+            } catch {
+                lease.release()
+                throw error
+            }
         } catch let failure as PublicReadHandlerFailure {
             return publicReadResponse(failure)
         } catch PublicRepositoryReadError.invalidSelector {
@@ -285,9 +307,14 @@ func registerPublicRepositoryReadEndpoints(
                 required: ["repo", "collection", "rkey"],
                 optional: ["cid"]
             )
+            guard let repo = query["repo"],
+                  let collectionQuery = query["collection"],
+                  let recordKeyQuery = query["rkey"] else {
+                throw PublicReadHandlerFailure.invalidRequest
+            }
             let path = try PublicRepositoryPath(
-                collection: query["collection"]!,
-                recordKey: query["rkey"]!
+                collection: collectionQuery,
+                recordKey: recordKeyQuery
             )
             let expectedCID = try query["cid"].map(publicReadCID)
             guard let lease = jsonReadAdmission.reserve(
@@ -302,7 +329,7 @@ func registerPublicRepositoryReadEndpoints(
                 let output = try await getRecordHandler.handle(
                     parameters: try publicReadWireParameters {
                         .init(
-                            repo: try ATIdentifier(string: query["repo"]!),
+                            repo: try ATIdentifier(string: repo),
                             collection: try NSID(nsidString: path.collection),
                             rkey: try RecordKey(keyString: path.recordKey),
                             cid: expectedCID
@@ -342,8 +369,12 @@ func registerPublicRepositoryReadEndpoints(
                 required: ["repo", "collection"],
                 optional: ["limit", "cursor", "reverse"]
             )
+            guard let repo = query["repo"],
+                  let collectionQuery = query["collection"] else {
+                throw PublicReadHandlerFailure.invalidRequest
+            }
             _ = try PublicRepositoryPath(
-                collection: query["collection"]!,
+                collection: collectionQuery,
                 recordKey: "validation"
             )
             let limit = try query["limit"].map(publicReadLimit) ?? 50
@@ -360,8 +391,8 @@ func registerPublicRepositoryReadEndpoints(
                 let output = try await listRecordsHandler.handle(
                     parameters: try publicReadWireParameters {
                         .init(
-                            repo: try ATIdentifier(string: query["repo"]!),
-                            collection: try NSID(nsidString: query["collection"]!),
+                            repo: try ATIdentifier(string: repo),
+                            collection: try NSID(nsidString: collectionQuery),
                             limit: limit,
                             cursor: query["cursor"],
                             reverse: reverse

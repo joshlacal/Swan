@@ -54,32 +54,94 @@ extension SQLiteAccountDatabase {
     public func publicRepositoryBlobCIDs() async throws -> [CID] {
         try await withConnectionGate {
             try await readTransaction {
-                let rows = try await connection.query(
-                    """
-                    SELECT collection, rkey, record_cid
-                    FROM public_repository_record_index
-                    ORDER BY collection ASC, rkey ASC
-                    """
-                )
+                // Reject oversized or malformed index projections before the
+                // optional promoter decodes any record block. The preflight
+                // itself is a bounded keyset walk and never selects values.
+                try await preflightPublicReadProjectionWithoutGate()
                 var cidsByString: [String: CID] = [:]
-                for row in rows {
-                    let collection = try publicReadRequiredText(row, "collection")
-                    let rkey = try publicReadRequiredText(row, "rkey")
-                    let path = try PublicRepositoryPath(
-                        collection: collection, recordKey: rkey
-                    )
-                    let recordCID = try publicReadCID(
-                        try publicReadRequiredText(row, "record_cid")
-                    )
-                    let bytes = try await blockBytesWithoutGate(recordCID)
-                    let value = try RepositoryMSTValidation.decodeRecordBlock(
-                        bytes, for: path
-                    )
-                    let record = try PublicRepositoryRecordCodec.publicRecord(
-                        from: value, collection: collection
-                    )
-                    for cid in PublicRepositoryRecordCodec.publicBlobCIDs(in: record) {
-                        cidsByString[cid.string] = cid
+                var lastCollection: String?
+                var lastRecordKey: String?
+                var scannedRecords = 0
+                while true {
+                    try Task.checkCancellation()
+                    let rows: [SQLiteRow]
+                    if let lastCollection, let lastRecordKey {
+                        rows = try await connection.query(
+                            """
+                            SELECT collection, rkey, record_cid
+                            FROM public_repository_record_index
+                            WHERE collection > ?
+                               OR (collection = ? AND rkey > ?)
+                            ORDER BY collection ASC, rkey ASC
+                            LIMIT ?
+                            """,
+                            [
+                                .text(lastCollection),
+                                .text(lastCollection),
+                                .text(lastRecordKey),
+                                .integer(
+                                    PublicRepositoryReadLimits
+                                        .blobPromotionPageSize
+                                ),
+                            ]
+                        )
+                    } else {
+                        rows = try await connection.query(
+                            """
+                            SELECT collection, rkey, record_cid
+                            FROM public_repository_record_index
+                            ORDER BY collection ASC, rkey ASC
+                            LIMIT ?
+                            """,
+                            [
+                                .integer(
+                                    PublicRepositoryReadLimits
+                                        .blobPromotionPageSize
+                                ),
+                            ]
+                        )
+                    }
+                    if rows.isEmpty { break }
+                    guard rows.count <= PublicRepositoryReadLimits
+                        .maximumBlobPromotionIndexEntries - scannedRecords else {
+                        throw PublicRepositoryReadError.resourceLimitExceeded
+                    }
+                    scannedRecords += rows.count
+                    for row in rows {
+                        let collection = try publicReadRequiredText(
+                            row, "collection"
+                        )
+                        let rkey = try publicReadRequiredText(row, "rkey")
+                        let path = try PublicRepositoryPath(
+                            collection: collection, recordKey: rkey
+                        )
+                        let recordCID = try publicReadCID(
+                            try publicReadRequiredText(row, "record_cid")
+                        )
+                        let bytes = try await blockBytesWithoutGate(recordCID)
+                        let value = try RepositoryMSTValidation.decodeRecordBlock(
+                            bytes, for: path
+                        )
+                        let record = try PublicRepositoryRecordCodec.publicRecord(
+                            from: value, collection: collection
+                        )
+                        for cid in PublicRepositoryRecordCodec.publicBlobCIDs(
+                            in: record
+                        ) {
+                            if cidsByString[cid.string] == nil {
+                                guard cidsByString.count < PublicRepositoryReadLimits
+                                    .maximumBlobPromotionUniqueCIDs else {
+                                    throw PublicRepositoryReadError
+                                        .resourceLimitExceeded
+                                }
+                                cidsByString[cid.string] = cid
+                            }
+                        }
+                        lastCollection = collection
+                        lastRecordKey = rkey
+                    }
+                    if rows.count < PublicRepositoryReadLimits.blobPromotionPageSize {
+                        break
                     }
                 }
                 return cidsByString.keys.sorted().compactMap { cidsByString[$0] }
@@ -98,6 +160,7 @@ extension SQLiteAccountDatabase {
                 guard let state = try await loadPublicRepositoryStateWithoutGate() else {
                     throw PublicRepositoryReadError.unavailable
                 }
+                try await preflightPublicReadProjectionWithoutGate()
                 try await verifyProjectionWithoutGate(state: state)
                 let rows = try await connection.query(
                     """
@@ -256,6 +319,91 @@ extension SQLiteAccountDatabase {
         }
     }
 
+    private func preflightPublicReadProjectionWithoutGate() async throws {
+        var recordCount = 0
+        var collectionCount = 0
+        var collectionBytes = 0
+        var lastCollection: String?
+        var lastRecordKey: String?
+
+        while true {
+            try Task.checkCancellation()
+            let rows: [SQLiteRow]
+            if let lastCollection, let lastRecordKey {
+                rows = try await connection.query(
+                    """
+                    SELECT collection, rkey
+                    FROM public_repository_record_index
+                    WHERE collection > ?
+                       OR (collection = ? AND rkey > ?)
+                    ORDER BY collection ASC, rkey ASC
+                    LIMIT ?
+                    """,
+                    [
+                        .text(lastCollection),
+                        .text(lastCollection),
+                        .text(lastRecordKey),
+                        .integer(
+                            PublicRepositoryReadLimits
+                                .projectionPreflightPageSize
+                        ),
+                    ]
+                )
+            } else {
+                rows = try await connection.query(
+                    """
+                    SELECT collection, rkey
+                    FROM public_repository_record_index
+                    ORDER BY collection ASC, rkey ASC
+                    LIMIT ?
+                    """,
+                    [
+                        .integer(
+                            PublicRepositoryReadLimits
+                                .projectionPreflightPageSize
+                        ),
+                    ]
+                )
+            }
+            if rows.isEmpty { break }
+
+            for row in rows {
+                recordCount += 1
+                guard recordCount <= PublicRepositoryReadLimits
+                    .maximumGenerationIndexEntries else {
+                    throw PublicRepositoryReadError.resourceLimitExceeded
+                }
+                let collection = try publicReadRequiredText(row, "collection")
+                let recordKey = try publicReadRequiredText(row, "rkey")
+                _ = try PublicRepositoryPath(
+                    collection: collection, recordKey: recordKey
+                )
+                if collection != lastCollection {
+                    collectionCount += 1
+                    let collectionByteCount = collection.utf8.count
+                    guard collectionCount <= PublicRepositoryReadLimits
+                        .maximumDescribeRepoCollections,
+                        collectionByteCount <= Int(
+                            PublicRepositoryReadLimits
+                                .maximumDescribeRepoCollectionBytes
+                        ),
+                        collectionBytes <= PublicRepositoryReadLimits
+                            .maximumDescribeRepoCollectionBytes
+                            - collectionByteCount else {
+                        throw PublicRepositoryReadError.resourceLimitExceeded
+                    }
+                    collectionBytes += collectionByteCount
+                    lastCollection = collection
+                }
+                lastRecordKey = recordKey
+            }
+            if rows.count < PublicRepositoryReadLimits
+                .projectionPreflightPageSize {
+                break
+            }
+        }
+    }
+
     /// Compatibility entry point for storage-level callers. Production
     /// request routing uses the admitted generation methods below and never
     /// repeats the full projection walk.
@@ -316,7 +464,16 @@ extension SQLiteAccountDatabase {
                         record: nil
                     )
                 }
+                // Check SQLite's scalar length before selecting the BLOB. A
+                // corrupt or hostile record index must not make the single
+                // record endpoint materialize an over-budget body merely to
+                // reject it in `PublicRepositoryReadRecord`.
+                let byteCount = try await
+                    publicRepositoryRecordBlockByteCountWithoutGate(cid)
                 let bytes = try await blockBytesWithoutGate(cid)
+                guard bytes.count == byteCount else {
+                    throw PublicRepositoryReadError.unavailable
+                }
                 let record = try PublicRepositoryReadRecord(
                     path: path,
                     cid: cid,

@@ -51,6 +51,25 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
     }
 
+    func testMalformedDefaultHostFailsAsValidationInsteadOfCrashing() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appending(path: "data")
+
+        let result = try runServe(
+            data: data,
+            arguments: ["--host", "%"]
+        )
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.isEmpty)
+        XCTAssertTrue(
+            result.error.contains("valid default public URL"),
+            "unexpected validation output: \(result.error)"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
+    }
+
     func testLocalInteropRejectsCleartextAndMissingNotificationConfigWithoutLeakingPaths() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

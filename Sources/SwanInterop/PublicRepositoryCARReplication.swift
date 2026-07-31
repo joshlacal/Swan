@@ -26,6 +26,7 @@ public enum PublicRepositoryCARReplicationError: Error, Sendable, Equatable {
 /// content-addressed public namespace transaction.
 public enum PublicRepositoryBlobPromotionError: Error, Sendable, Equatable {
     case invalidRepositoryDID
+    case repositoryTooLarge
     case invalidCID
     case unexpectedStatus(Int)
     case unexpectedContentType
@@ -62,6 +63,7 @@ public enum PublicRepositoryCARImportFailureCode {
         case let error as PublicRepositoryBlobPromotionError:
             switch error {
             case .invalidRepositoryDID: return "BlobInvalidRepositoryDID"
+            case .repositoryTooLarge: return "BlobRepositoryTooLarge"
             case .invalidCID: return "BlobInvalidCID"
             case let .unexpectedStatus(status): return "BlobUnexpectedStatus_\(status)"
             case .unexpectedContentType: return "BlobUnexpectedContentType"
@@ -484,7 +486,14 @@ public struct RemotePublicRepositoryBlobPromoter: Sendable {
         guard await database.publicRepositoryDID() == did else {
             throw PublicRepositoryBlobPromotionError.invalidRepositoryDID
         }
-        let referenced = try await database.publicRepositoryBlobCIDs()
+        let referenced: [CID]
+        do {
+            referenced = try await database.publicRepositoryBlobCIDs()
+        } catch PublicRepositoryReadError.resourceLimitExceeded {
+            throw PublicRepositoryBlobPromotionError.repositoryTooLarge
+        } catch {
+            throw PublicRepositoryBlobPromotionError.unexpectedStatus(0)
+        }
         var promoted = 0
         for cid in referenced {
             guard cid.codec == .raw,

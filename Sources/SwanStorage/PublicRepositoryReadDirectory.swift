@@ -12,6 +12,7 @@ public enum PublicRepositoryReadError: Error, Sendable, Equatable {
     case invalidSelector
     case invalidLimit
     case invalidCursor
+    case resourceLimitExceeded
     case unavailable
 }
 
@@ -225,6 +226,30 @@ public enum PublicRepositoryJSONReadLimits {
     public static let maximumAggregateRecordBlockBytes = 4 * 1_024 * 1_024
     public static let maximumGetRecordResponseBytes = 8 * 1_024 * 1_024
     public static let maximumListRecordsResponseBytes = 16 * 1_024 * 1_024
+}
+
+/// Explicit bounds for public-repository projections that are prepared before
+/// an anonymous request can read them. These are Swan availability policy, not
+/// changes to repository-v3 semantics: an account exceeding them remains
+/// valid repository data but is not exposed through the alpha public surface.
+public enum PublicRepositoryReadLimits {
+    /// Keeps startup/mutation admission's SQLite index and MST leaf metadata
+    /// below the whole-repository retained-block validator's larger import
+    /// ceiling.
+    public static let maximumGenerationIndexEntries = 100_000
+
+    /// `describeRepo` must be encodable well below the 16 MiB anonymous JSON
+    /// response budget, including quotes, commas, and fixed DID-document data.
+    public static let maximumDescribeRepoCollections = 100_000
+    public static let maximumDescribeRepoCollectionBytes = 8 * 1_024 * 1_024
+
+    /// Blob promotion is an optional operator/interop helper. Page the index
+    /// and refuse a repository whose record or unique-blob set exceeds these
+    /// bounds instead of retaining an unbounded projection in the process.
+    public static let maximumBlobPromotionIndexEntries = 100_000
+    public static let maximumBlobPromotionUniqueCIDs = 100_000
+    public static let blobPromotionPageSize = 256
+    public static let projectionPreflightPageSize = 256
 }
 
 public struct PublicRepositoryReadPage: Sendable, Equatable {

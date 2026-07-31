@@ -235,6 +235,42 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
         try await database.close()
     }
 
+    func testAbandonReservationRejectsMalformedPersistedDigest() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let key = P256.Signing.PrivateKey()
+        let database = try await installedDatabase(root: root, key: key)
+        let maybeState = try await database.loadPublicRepositoryState()
+        let state = try XCTUnwrap(maybeState)
+        let request = try PublicRepositoryMutationRequest(
+            id: "malformed-abandon-digest",
+            canonicalDigest: Data(repeating: 0x71, count: 32),
+            baseCommitCID: state.commitCID
+        )
+        guard case let .reserved(reservation) = try await database
+            .reservePublicRepositoryRevision(request, wallClockMicroseconds: 1)
+        else {
+            return XCTFail("new request unexpectedly replayed")
+        }
+        let raw = try await openRawAccountDatabase(root: root)
+        _ = try await raw.query("PRAGMA ignore_check_constraints = ON")
+        _ = try await raw.query(
+            "UPDATE public_repository_mutation_requests SET request_digest = zeroblob(0) WHERE request_id = ?",
+            [.text(request.id)]
+        )
+        try await raw.close()
+
+        await XCTAssertThrowsAsync(
+            try await database.abandonPublicRepositoryReservation(reservation)
+        ) { error in
+            XCTAssertEqual(
+                error as? PublicRepositoryMutationStoreError,
+                .corruptRepository
+            )
+        }
+        try await database.close()
+    }
+
     func testTwoConnectionsRaceFromOneBaseWithExactlyOneAtomicWinner() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

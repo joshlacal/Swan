@@ -148,6 +148,25 @@ checksum-verified way to populate the ignored reference cache.
 - The explicit 256 MiB bounded-transfer gates pass for the permissioned CAR
   spool, private blob CAS stream, and staged CAR import. These are local
   memory/streaming gates; they do not replace Docker or Linux evidence.
+- The 2026-07-31 adversarial rereview scoped notification receipts by space,
+  added the single-record public-read SQLite length preflight, and put
+  `describeRepo` behind the shared anonymous JSON response admission. The
+  focused suites passed 6/6, 14/14, and 12/12 respectively (the opt-in 256
+  MiB directory test remains skipped). A malformed default `swan serve
+  --host` now returns a validation error instead of crashing, and malformed
+  public-mutation reservation digests fail closed instead of trapping the
+  process. These harden boundedness and operator availability but do not close
+  the native-Linux, cross-host recovery, or reverse-authority gates.
+- Public-read startup admission and the optional public-blob promoter now have
+  explicit index ceilings. Admission rejects more than 100,000 retained index
+  rows, 100,000 distinct collections, or 8 MiB of collection-name bytes before
+  the full projection validator; promotion rejects the same row ceiling,
+  scans in 256-row keyset pages, and caps unique raw CIDs at 100,000. The
+  synthetic oversized-index regression passed as part of
+  `PublicRepositoryReadDirectoryTests` (15/15, with the opt-in 256 MiB RSS
+  test skipped); the opt-in RSS test also passed 1/1 when enabled explicitly.
+  This is macOS source-level boundedness evidence; a native Linux
+  hostile-index/RSS run remains open.
 - The pinned TypeScript source cache was booted in a disposable localhost
   smoke runtime. Account creation, authenticated public record creation,
   record read/list, and `sync.getRepo` succeeded. Blob upload remained staged
@@ -377,3 +396,25 @@ This closes the live dynamic-resolver capability for a configured Swan peer,
 but not the full alpha: dynamic discovery against a TypeScript member,
 reverse-authority OAuth/browser/lifecycle coverage, corrupted-operation and
 compaction-gap recovery, and a native Linux-host run remain required.
+
+## 2026-07-31 notification crash/restart acceptance
+
+The disposable Compose notification acceptance completed against the pinned
+Swan image. A real OAuth permissioned write was committed with delivery
+disabled, the seed process was terminated, and a recovery-enabled process
+forwarded the same outbox event twice while the proxy dropped the first
+acknowledgement. The receiver applied exactly one effect and the sender
+outbox converged to empty. The scenario retained only bounded counts and
+digests; no credentials, tokens, request bodies, or permissioned values were
+written to the repository.
+
+The acceptance harness now falls back to a normal pinned build when a fresh
+project name has no project-scoped Docker image tags, so `NO_BUILD=1` cannot
+fail before service startup merely because the cache was built under another
+disposable project name.
+
+The notification receipt table was also hardened for cross-space replay
+isolation. Receipt uniqueness and duplicate lookup now include `space_uri`,
+with a transactional migration for existing account databases. The focused
+SQLite notification suite passes 6/6, including reuse of one writer JTI across
+two spaces without suppressing either writer hint.

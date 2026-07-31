@@ -298,7 +298,7 @@ public enum SQLiteLayout {
             event_id TEXT NOT NULL,
             space_uri TEXT NOT NULL,
             received_at INTEGER NOT NULL CHECK(received_at >= 0),
-            PRIMARY KEY(issuer, event_id)
+            PRIMARY KEY(issuer, event_id, space_uri)
         )
         """,
         """
@@ -1461,6 +1461,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let fileBackedBlobSchemaMigrationVersion = 4
     private static let fileBackedBlobLifecycleMigrationVersion = 5
     private static let physicalBlobCASLifecycleMigrationVersion = 6
+    private static let spaceNotificationReceiptMigrationVersion = 7
 
     /// A read credential may register notification recipients, but it must
     /// not be able to turn the later deletion fanout into an unbounded
@@ -1808,6 +1809,60 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             for statement in SQLiteLayout.spaceNotificationSchemaStatements {
                 _ = try await connection.query(statement)
             }
+        }
+        try await migrateSpaceNotificationReceiptScopeIfNeeded()
+    }
+
+    /// The first notification schema keyed receipts only by issuer and JTI.
+    /// A service JTI is consumed in the context of one space, so retaining that
+    /// key globally could suppress a valid announcement for a second space if
+    /// a writer reused a JTI. Rebuild the small receipt table transactionally;
+    /// no record or blob data is involved, and the existing rows remain valid.
+    private func migrateSpaceNotificationReceiptScopeIfNeeded() async throws {
+        let version = Self.spaceNotificationReceiptMigrationVersion
+        try await transaction {
+            let applied = try await connection.query(
+                "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+                [.integer(version)]
+            )
+            guard applied.isEmpty else { return }
+
+            _ = try await connection.query(
+                "ALTER TABLE permissioned_space_notification_receipts RENAME TO permissioned_space_notification_receipts_v6"
+            )
+            _ = try await connection.query(
+                """
+                CREATE TABLE permissioned_space_notification_receipts (
+                    issuer TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    space_uri TEXT NOT NULL,
+                    received_at INTEGER NOT NULL CHECK(received_at >= 0),
+                    PRIMARY KEY(issuer, event_id, space_uri)
+                )
+                """
+            )
+            _ = try await connection.query(
+                """
+                INSERT INTO permissioned_space_notification_receipts(
+                    issuer, event_id, space_uri, received_at
+                )
+                SELECT issuer, event_id, space_uri, received_at
+                FROM permissioned_space_notification_receipts_v6
+                """
+            )
+            _ = try await connection.query(
+                "DROP TABLE permissioned_space_notification_receipts_v6"
+            )
+            _ = try await connection.query(
+                """
+                INSERT INTO permissioned_repository_migrations(version, applied_at)
+                VALUES (?, ?)
+                """,
+                [
+                    .integer(version),
+                    .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+                ]
+            )
         }
     }
 
@@ -5133,9 +5188,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 let receipt = try await connection.query(
                     """
                     SELECT 1 FROM permissioned_space_notification_receipts
-                    WHERE issuer = ? AND event_id = ?
+                    WHERE issuer = ? AND event_id = ? AND space_uri = ?
                     """,
-                    [.text(notification.issuer), .text(eventID)]
+                    [
+                        .text(notification.issuer), .text(eventID),
+                        .text(notification.space.rawValue),
+                    ]
                 )
                 guard receipt.isEmpty else { return }
 
@@ -5229,7 +5287,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     INSERT INTO permissioned_space_notification_receipts(
                         issuer, event_id, space_uri, received_at
                     ) VALUES (?, ?, ?, ?)
-                    ON CONFLICT(issuer, event_id) DO NOTHING
+                    ON CONFLICT(issuer, event_id, space_uri) DO NOTHING
                     """,
                     [.text(issuer), .text(eventID), .text(space.rawValue), .integer(timestamp)]
                 )

@@ -7,6 +7,47 @@ import SwanStorage
 import XCTest
 
 final class SpaceNotificationSQLiteTests: XCTestCase {
+    func testReusedWriterJTIIsScopedToEachSpace() async throws {
+        let fixture = try NotificationFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+        try await fixture.createSecondaryAuthorityState(on: database)
+
+        let eventID = "writer-event-reused-across-spaces"
+        try await database.receiveSpaceWriteNotification(
+            fixture.writeNotification(
+                eventID: eventID,
+                revision: try fixture.tid(1),
+                commitmentByte: 1,
+                space: fixture.space
+            )
+        )
+        try await database.receiveSpaceWriteNotification(
+            fixture.writeNotification(
+                eventID: eventID,
+                revision: try fixture.tid(1),
+                commitmentByte: 2,
+                space: fixture.secondarySpace
+            )
+        )
+
+        let primary = try await database.spaceWriters(
+            space: fixture.space,
+            limit: 100,
+            cursor: nil,
+            authorization: fixture.readCredential(for: fixture.space)
+        )
+        let secondary = try await database.spaceWriters(
+            space: fixture.secondarySpace,
+            limit: 100,
+            cursor: nil,
+            authorization: fixture.readCredential(for: fixture.secondarySpace)
+        )
+        XCTAssertEqual(primary.first?.commitment, Data(repeating: 1, count: 32))
+        XCTAssertEqual(secondary.first?.commitment, Data(repeating: 2, count: 32))
+    }
+
     func testWriterNotificationsAreIdempotentMonotonicAndNeverEnqueueAuthorityFanout() async throws {
         let fixture = try NotificationFixture()
         let database = try await fixture.open()
@@ -338,6 +379,7 @@ private struct NotificationFixture {
     let writer = "did:plc:bob"
     let reader = "did:plc:reader"
     let space: SpaceURI
+    let secondarySpace: SpaceURI
 
     init() throws {
         root = FileManager.default.temporaryDirectory
@@ -346,6 +388,11 @@ private struct NotificationFixture {
             authority: authority,
             spaceType: "app.bsky.bookmarks",
             skey: "notifications"
+        )
+        secondarySpace = try SpaceURI(
+            authority: authority,
+            spaceType: "app.bsky.bookmarks",
+            skey: "notifications-secondary"
         )
     }
 
@@ -368,8 +415,24 @@ private struct NotificationFixture {
         )
     }
 
-    func readCredential() -> AuthorizationContext {
-        .spaceCredential(.init(
+    func createSecondaryAuthorityState(on database: SQLiteAccountDatabase) async throws {
+        let authority = DurableSimpleSpaceAuthority(lifecycleDatabase: database)
+        _ = try await authority.create(
+            space: secondarySpace,
+            owner: self.authority,
+            configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
+            authorization: .accountOAuth(subject: self.authority, scopes: ["atproto"])
+        )
+        _ = try await authority.addMember(
+            space: secondarySpace,
+            member: writer,
+            authorization: .accountOAuth(subject: self.authority, scopes: ["atproto"])
+        )
+    }
+
+    func readCredential(for space: SpaceURI? = nil) -> AuthorizationContext {
+        let space = space ?? self.space
+        return .spaceCredential(.init(
             subject: reader,
             space: space,
             permissions: [.read],
@@ -393,9 +456,11 @@ private struct NotificationFixture {
     func writeNotification(
         eventID: String,
         revision: TID,
-        commitmentByte: UInt8
+        commitmentByte: UInt8,
+        space: SpaceURI? = nil
     ) -> AuthorizedSpaceWriteNotification {
-        .init(
+        let space = space ?? self.space
+        return AuthorizedSpaceWriteNotification(
             eventID: eventID,
             space: space,
             repository: writer,

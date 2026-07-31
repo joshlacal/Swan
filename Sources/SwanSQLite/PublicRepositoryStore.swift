@@ -410,7 +410,11 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 )
                 guard let row = rows.first,
                       try requiredText(row, "status") == "reserved" else { return }
-                let digest = Data(sqliteData: row.column("request_digest")!)!
+                guard let digestValue = row.column("request_digest"),
+                      let digest = Data(sqliteData: digestValue),
+                      digest.count == 32 else {
+                    throw PublicRepositoryMutationStoreError.corruptRepository
+                }
                 let baseCID = try requiredText(row, "base_commit_cid")
                 let baseRevision = try requiredText(row, "base_revision")
                 let nextRevision = try requiredText(row, "next_revision")

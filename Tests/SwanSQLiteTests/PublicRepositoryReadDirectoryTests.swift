@@ -456,6 +456,58 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
         try await fixture.control.close()
     }
 
+    // Production mutation caught: the scalar-length preflight was present
+    // for list pages but not the single-record JSON path. A corrupt block
+    // larger than the public read budget must fail before its BLOB is selected
+    // and decoded.
+    func testSingleRecordReadRejectsOverBudgetBodyBeforeDecode() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let store = await fixture.directory.preopenedPublicMutationStore(
+            did: did
+        )
+        let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
+        let maybeAccount = try await fixture.control.account(did: did)
+        let account = try XCTUnwrap(maybeAccount)
+        let generation = try await database.admitPublicRepositoryGeneration(
+            account: account,
+            identityVerifier: TestPublicPLCGenesisVerifier(
+                operationCID: fixture.genesisOperationCID
+            )
+        )
+        let path = try PublicRepositoryPath(
+            collection: collection, recordKey: "one"
+        )
+        let maybeCID = try await database.publicRepositoryRecordCID(for: path)
+        let cid = try XCTUnwrap(maybeCID)
+        _ = try await database.connection.query(
+            """
+            UPDATE public_repository_blocks
+            SET bytes = ?
+            WHERE cid = ?
+            """,
+            [
+                .text(String(
+                    repeating: "x",
+                    count: PublicRepositoryLimits.standard
+                        .maximumRecordBlockBytes + 1
+                )),
+                .text(cid.string),
+            ]
+        )
+
+        await XCTAssertThrowsPublicReadUnavailable(
+            try await database.readPublicRepositoryRecord(
+                path: path,
+                expectedCID: nil,
+                generation: generation
+            )
+        )
+
+        try await fixture.directory.close()
+        try await fixture.control.close()
+    }
+
     func testDescribeRepoFailsClosedForTamperedGenesisAndIntentCID() async throws {
         // Startup admission authenticates both the signed PLC genesis facts
         // and the durable preparation intent before publishing a directory.
@@ -481,6 +533,91 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
                 }
             }
         }
+    }
+
+    func testPublicReadAdmissionAndBlobPromotionRejectOversizedIndexBeforeWalk() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let store = await fixture.directory.preopenedPublicMutationStore(did: did)
+            let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
+            let firstPath = try PublicRepositoryPath(
+                collection: collection, recordKey: "one"
+            )
+            let maybeFirstCID = try await database.publicRepositoryRecordCID(
+                for: firstPath
+            )
+            let firstCID = try XCTUnwrap(maybeFirstCID)
+            let raw = try await SQLiteConnection.open(
+                storage: .file(
+                    path: SQLiteLayout.accountDatabase(
+                        in: fixture.root, did: did
+                    ).path
+                )
+            )
+            do {
+                // Ten decimal digits crossed five independent CTE dimensions,
+                // producing 100,000 valid index paths without constructing a
+                // large Swift array. The final row crosses the admission bound.
+                _ = try await raw.query(
+                    """
+                    WITH digit(n) AS (
+                        VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)
+                    ),
+                    numbers(n) AS (
+                        SELECT a.n * 10000 + b.n * 1000 + c.n * 100
+                            + d.n * 10 + e.n
+                        FROM digit a
+                        CROSS JOIN digit b
+                        CROSS JOIN digit c
+                        CROSS JOIN digit d
+                        CROSS JOIN digit e
+                    )
+                    INSERT INTO public_repository_record_index(
+                        collection, rkey, record_cid
+                    )
+                    SELECT 'app.bsky.feed.post', printf('%05d', n), ?
+                    FROM numbers
+                    UNION ALL
+                    SELECT 'app.bsky.feed.post', '100000', ?
+                    """,
+                    [.text(firstCID.string), .text(firstCID.string)]
+                )
+                try await raw.close()
+            } catch {
+                try? await raw.close()
+                throw error
+            }
+
+            do {
+                _ = try await database.publicRepositoryBlobCIDs()
+                XCTFail("oversized blob-promotion index must fail before decoding")
+            } catch let error as PublicRepositoryReadError {
+                XCTAssertEqual(error, .resourceLimitExceeded)
+            }
+
+            let maybeAccount = try await fixture.control.account(did: did)
+            let account = try XCTUnwrap(maybeAccount)
+            do {
+                _ = try await database.admitPublicRepositoryGeneration(
+                    account: account,
+                    identityVerifier: TestPublicPLCGenesisVerifier(
+                        operationCID: fixture.genesisOperationCID
+                    )
+                )
+                XCTFail("oversized public-read index must fail before projection validation")
+            } catch let error as PublicRepositoryReadError {
+                XCTAssertEqual(error, .resourceLimitExceeded)
+            }
+
+            try await fixture.directory.close()
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.directory.close()
+            try? await fixture.control.close()
+            throw error
+        }
+
     }
 
     func testPublicRepositoryBlobCIDsExtractsTypedRawLinksFromInstalledRecords() async throws {

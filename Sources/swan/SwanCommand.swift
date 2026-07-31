@@ -1679,7 +1679,14 @@ extension SwanCommand {
             let baseURL = try publicURL.map { value in
                 guard let url = URL(string: value) else { throw ValidationError("--public-url must be a URL") }
                 return url
-            } ?? URL(string: "http://\(host):\(port)")!
+            } ?? {
+                guard let url = URL(string: "http://\(host):\(port)") else {
+                    throw ValidationError(
+                        "--host and --port do not form a valid default public URL"
+                    )
+                }
+                return url
+            }()
             if enableLocalSpaceInterop,
                baseURL.scheme?.lowercased() != "https" {
                 throw ValidationError(

@@ -83,7 +83,7 @@ overstated several gates. The most important adversarial findings were:
 | ADV-23 | P1 | Portable export/restore accepted a permissioned blob whose space had no matching space CAR. With no restored closure or repository-existence check, the published account could stream that orphan through `getBlob`. | Remediated and green: restore requires matching repository state before persistence, request reads check state/closure/tombstones/exact reference in one snapshot, and the legitimate closed operator-restore path remains supported. |
 | ADV-24 | P1 | Password login has no durable per-account/source failure admission, and PAR/replay persistence has no live-row cardinality cap. Argon work and unbounded expiry deletes can monopolize the process-local queue and serialized control database. | Login admission and the OAuth storage ceilings are remediated in source: metadata/PAR/replay plus authorization-code, token-family, access-token, and refresh-token rows now use transactional hard caps. Focused cap tests are green; the serialized suite remains the execution gate. |
 | ADV-25 | P2 | Unknown/inactive login identities return before Argon verification, while an active account with a wrong password performs expensive work. Uniform HTTP status/body therefore still exposes a remote timing oracle. | Remediated and focused login tests are green: unknown, inactive, stale-PHC, and wrong-password cases use the same admitted configured-cost verification path. |
-| ADV-26 | P1 | `getRecord`, `listRecords`, and `describeRepo` still walk and materialize the full MST and record index on every unauthenticated request; the HTTP get/list handlers ordinarily trigger that validation twice. | Bounded lazy pages, trusted authenticated generations, aggregate body budgets, and process admission are green in the serialized macOS suite and explicit 256 MiB gates. The remaining concern is request-time JSON/index materialization beyond the bounded response budget. |
+| ADV-26 | P1 | Public-read admission and the optional blob promoter can materialize large MST/index projections, and the anonymous JSON handlers can encode a large collection list. | Remediated in source and focused tests: startup admission now performs a bounded keyset preflight (100,000 index rows, 100,000 collections, 8 MiB collection names), while the blob promoter rejects oversized indexes and scans records in 256-row pages with a 100,000-unique-CID ceiling. Anonymous JSON routes retain their aggregate body budgets and process-wide admission. Native-Linux/RSS evidence for hostile large indexes remains an open platform gate. |
 | ADV-27 | P1 | Public admission validates structural commit/MST/index consistency but does not authenticate the current commit signature or bind the admitted state to the PLC terminal signing key. Admission is also split across separate read snapshots. | Current-head authentication is remediated and green for P-256 and secp256k1 DID keys; a canonical wrong-key head is rejected before publication. The single authenticated generation/snapshot optimization remains part of ADV-26. |
 | ADV-28 | P1 | OAuth metadata single-flight is keyed only by exact URL and mode, with no process-wide or per-origin permit bound. An attacker can use many distinct valid client IDs to create unbounded detached DNS/HTTP/JWKS work. | Remediated and green with one process-wide nonqueueing eight-flight budget held across metadata plus remote JWKS; excess work fails typed unavailable before network I/O. Per-origin fairness and bounded blocking-DNS execution remain follow-up hardening. |
 | ADV-29 | P1 | Cached-load and revalidation flights for one OAuth client can run concurrently and unconditionally overwrite the same cache row. A delayed older response can replace newly rotated JWKS and re-enable a retired client key. | Remediated and green with durable per-client monotonic fetch tickets and CAS publication. Freshness watermarks intentionally survive cache expiry; bounded safe compaction remains follow-up work. |
@@ -126,6 +126,11 @@ overstated several gates. The most important adversarial findings were:
 | ADV-66 | P1 | The local `#atproto` delegation-key resolver returned `nil` for a managed account whenever it was deactivated/deleted, had an unsupported or missing generation, or had unavailable key material. The composite resolver interprets `nil` as an unknown issuer and could then accept a configured operator pin or remote PLC key for that same DID, bypassing the account lifecycle gate. | Remediated in `LocalAccountSpaceDelegationPublicKeyResolver`: only proven local absence returns `nil`; every managed lifecycle, generation, key-store, corruption, and read-race failure throws an opaque terminal error. Added deactivation/deletion, unsupported/missing/corrupt-key, lifecycle-race, startup-pin, and unknown-issuer regression coverage; the focused OAuth/composition selection passed 23/23. |
 | ADV-67 | P2 | The bounded PLC resolver retained expired positive cache entries in its issuer-capacity set. After a bounded burst filled `maximumEntries`, later issuers could remain rejected forever even after the value TTL elapsed, despite durable continuity state being independent of the cache. | Remediated by pruning expired positive entries during lookup admission while preserving the “previously authenticated issuer” budget exemption and the durable terminal-CID checkpoint. A one-entry cache test now proves a second issuer resolves after expiry; the PLC resolver selection passed 13/13. |
 | ADV-68 | P2 | A holder of a valid read credential could register an unbounded number of distinct notification endpoints for one space. Space deletion copied every active endpoint into one transaction, so endpoint churn could grow the database and turn a later lifecycle operation into an unbounded fanout/lockout workload even though outbound delivery was SSRF-safe. | Remediated with a transactional per-space cap of 1,024 active registrations. Expired rows are pruned before admission, existing endpoints remain replaceable at capacity, and the capacity/expiry regression covers the read-credential path. The complete `SpaceNotificationSQLiteTests` class passed 5/5 in a serialized rerun. |
+| ADV-69 | P3 | Inbound notification replay receipts were keyed only by issuer and event ID, so a writer JTI reused across spaces could suppress a valid hint in a second space. | Remediated with migration 7 and a space-scoped duplicate lookup; `SpaceNotificationSQLiteTests` passed 6/6, including cross-space JTI reuse. Availability-only; no authorization or data exposure was demonstrated. |
+| ADV-70 | P3 | The single-record public read path selected a SQLite BLOB before checking its scalar length, leaving a corrupt/hostile index able to force one over-budget body allocation before rejection. | Remediated by preflighting `length(bytes)` and checking the selected byte count before decode; `PublicRepositoryReadDirectoryTests` passed 14/14 (one opt-in RSS test skipped). Startup projection and optional whole-index promotion paths remain separate boundedness follow-ups. |
+| ADV-71 | P3 | `swan serve` force-unwrapped the default URL assembled from operator-supplied `--host`/`--port`, turning malformed configuration into a process crash. | Remediated with `ValidationError` mapping and a child CLI regression using the scratch-built executable. Operator availability only; no remote request path was involved. |
+| ADV-72 | P2 | Anonymous `describeRepo` encoded a potentially large admitted collection list without reserving the process-wide JSON response lease used by `getRecord` and `listRecords`, allowing concurrent callers to multiply response allocations. | Remediated by reserving the same 16 MiB response lease and releasing it on handler, encoding, and body-drain failures. `PublicRepositoryReadHTTPTests` passed 12/12, including a regression that blocks `describeRepo` behind an active list lease. |
+| ADV-73 | P2 | `abandonPublicRepositoryReservation` force-unwrapped the persisted request digest and did not enforce its 32-byte invariant, so a corrupt reservation row could crash the process or be abandoned with an invalid integrity input. | Remediated with checked blob decoding and an exact 32-byte guard; malformed rows now return `corruptRepository`. `PublicRepositoryMutationStoreTests/testAbandonReservationRejectsMalformedPersistedDigest` covers the failure. |
 
 ### Provenance limitation
 
@@ -485,9 +490,10 @@ Linux-host run remains required before the platform gate can be called green.
 ## Adversarial rereview: 2026-07-31
 
 The Luna-era changes were rechecked from a fresh serialized SwiftPM scratch
-build and against the current pinned reference cache. No new reportable
+build and against the current pinned reference cache. Two bounded availability
+defects were reproduced and remediated (ADV-72 and ADV-73); no new
 authorization, public/private isolation, CAR-integrity, credential, or
-recovery defect was reproduced.
+recovery bypass was reproduced.
 
 Evidence from this rereview:
 
@@ -521,18 +527,86 @@ operations, matching Swan's documented pinned-TypeScript exception. Recovery
 marker cleanup is now bounded both by the 4,096-row invariant and the
 256-row-per-request purge batch; strict constant-work behavior under arbitrary
 SQLite contention remains an ADV-50 follow-up. The request-time JSON/index
-materialization concern remains ADV-26 follow-up work even though response-size
-and process-admission gates are green.
+materialization concern remains an ADV-26 follow-up for startup projection and
+the optional whole-index promoter, although all anonymous JSON endpoints now
+reserve the response-size/process-admission budget and the focused HTTP gate is
+green.
 
 The review is not an alpha-completion sign-off. The remaining closure gates are
 the native-Linux host run, reverse-authority and cross-implementation
 OAuth/browser/lifecycle coverage, the value-bearing TypeScript incremental and
 compaction-gap matrix using the explicit recovery overlay, corrupted
-cross-host operation/CAR recovery, and an operator-supplied disposable
-TypeScript delegation-key pin. The dedicated Codex Security launcher was also
+cross-host operation/CAR recovery, and stock-TypeScript delegation-key
+provisioning or dynamic discovery without a disposable operator pin. The
+dedicated Codex Security launcher was also
 unavailable in this environment because its bundled Python helper failed to
 start; this document is therefore a bounded manual adversarial review, not an
 official security-scan report.
+
+## Request-boundary hardening follow-up: 2026-07-31
+
+Additional availability edges were closed during the rereview. The
+permissioned notification receipt table now scopes replay uniqueness by
+`(issuer, event_id, space_uri)` through migration 7; a reused writer JTI in one
+space can no longer suppress a valid hint in another. `SpaceNotificationSQLiteTests`
+passed 6/6, including the cross-space replay regression.
+
+The single-record public repository read now asks SQLite for the scalar BLOB
+length before selecting the record body and rejects a length/count mismatch
+before canonical decoding. `PublicRepositoryReadDirectoryTests` passed 14/14
+(with its one opt-in 256 MiB test intentionally skipped), including an
+over-budget-body regression. This closes the request-time scalar-body gap for
+that endpoint; startup projection verification and the optional
+`publicRepositoryBlobCIDs()` promotion helper still have separate whole-index
+materialization follow-ups.
+
+The anonymous `describeRepo` route now participates in the same process-wide
+JSON admission as `getRecord` and `listRecords`. Its lease is held through
+response-body drain and is released on handler, encoding, and writer failures.
+The HTTP regression holds a list lease open and confirms a concurrent
+`describeRepo` receives `temporarily_unavailable`; the focused
+`PublicRepositoryReadHTTPTests` selection passed 12/12.
+
+The `swan serve` default URL construction also maps a malformed `--host` value
+to `ValidationError` instead of force-unwrapping `URL(string:)`. The child CLI
+regression passed with the scratch-built executable pinned. This is an
+operator-availability fix, not a protocol or authorization change.
+
+Finally, public mutation reservation abandonment now validates the persisted
+32-byte request digest before computing the terminal integrity digest. A
+deliberately malformed SQLite row returns `corruptRepository` rather than
+trapping the process; the full `PublicRepositoryMutationStoreTests` class
+passed 12/12.
+
+The remaining ADV-26 index materialization seam was then closed with an
+explicit availability policy. Startup public-read admission performs a scalar
+SQLite preflight before the retained-block validator or collection projection:
+the alpha refuses more than 100,000 index rows, more than 100,000 distinct
+collections, or more than 8 MiB of collection-name bytes. The optional
+`publicRepositoryBlobCIDs()` promoter first applies the same 100,000-row
+ceiling, then walks the index in 256-row `(collection, rkey)` pages and caps
+the unique raw-CID result at 100,000 entries. An oversized synthetic index is
+rejected before record decoding by
+`testPublicReadAdmissionAndBlobPromotionRejectOversizedIndexBeforeWalk`;
+`PublicRepositoryReadDirectoryTests` passed 15/15 with its one opt-in 256 MiB
+RSS test intentionally skipped, and that RSS test passed 1/1 when explicitly
+enabled with `SWAN_RUN_256MIB_PUBLIC_GET_REPO=1`. This closes the unbounded-
+index policy gap in the macOS source/test path; native-Linux execution and a
+hostile large-index RSS measurement remain platform acceptance evidence, not
+silently claimed here.
+
+The post-remediation serialized SwiftPM graph was also rerun with the
+scratch-built `swan` executable explicitly pinned (`--jobs 1`, one scratch
+path, no SDK/toolchain overrides inherited). XCTest and Swift Testing both
+completed with exit code 0; the focused public-read selections above remain
+the more specific evidence for the new index policy. This is macOS evidence
+only and does not close the native-Linux or cross-host semantic gates.
+
+The same route pass removed the last request-derived dictionary force
+unwraps from the public `describeRepo`, `getRecord`, and `listRecords` JSON
+constructors. Missing required values now take the bounded `InvalidRequest`
+response path before a generated handler is called; the existing malformed
+parameter suite remains green.
 
 ## Live cross-host adversarial evidence: 2026-07-31
 
@@ -689,4 +763,36 @@ convergence. Dynamic discovery against a TypeScript member, reverse-authority
 browser/lifecycle coverage, corrupted-operation and compaction-gap recovery,
 and native-Linux execution remain open. No new reportable authorization,
 public/private-isolation, credential, CAR-integrity, or resolver-lifecycle
-finding was reproduced in this rereview.
+bypass was reproduced in this rereview; the bounded availability findings are
+tracked as ADV-72 and ADV-73 above.
+
+## Notification crash/restart acceptance rereview: 2026-07-31
+
+The live disposable notification scenario passed with the pinned Compose
+image: a delivery-disabled seed committed one permissioned write, survived a
+forced process stop with one opaque pending outbox row, and a recovery process
+forwarded the event twice after the proxy discarded the first acknowledgement.
+The authority retained one receipt and one writer effect, while the sender
+outbox converged to empty. The result contained only transport counts and
+digests.
+
+The run also exposed and corrected a harness-only reproducibility trap. A
+fresh project name cannot use `up --no-build` unless its project-scoped image
+tags already exist. The acceptance script now detects that condition and
+falls back to the normal pinned build, preserving the fast path when cached
+tags are present. This was not a Swan protocol or authorization failure.
+
+## Notification receipt scope hardening: 2026-07-31
+
+The rereview found that inbound writer receipts were keyed only by
+`(issuer,event_id)`, even though the service JTI is consumed in a specific
+space. A writer reusing a valid JTI across two spaces could therefore suppress
+the second writer hint. This was an availability-only defense-in-depth issue:
+it did not grant access or expose records, and normal Swan senders use fresh
+UUID-backed JTIs.
+
+The account migration now rebuilds the receipt table with
+`(issuer,event_id,space_uri)` uniqueness, scopes the duplicate lookup to the
+space, and preserves existing receipts transactionally. A regression creates
+two spaces under one authority and proves the same writer JTI advances both
+writer sets. `SpaceNotificationSQLiteTests` passed 6/6 after the migration.

@@ -439,6 +439,16 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
                             "temporarily_unavailable"
                         )
                     }
+                    try await client.execute(
+                        uri: "/xrpc/com.atproto.repo.describeRepo?repo=\(did)",
+                        method: .get
+                    ) { response in
+                        XCTAssertEqual(response.status, .serviceUnavailable)
+                        XCTAssertEqual(
+                            try self.object(response.body)["error"] as? String,
+                            "temporarily_unavailable"
+                        )
+                    }
                 } catch {
                     await barrier.release()
                     throw error
