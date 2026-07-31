@@ -353,10 +353,12 @@ than relying on the historical green-suite receipts above.
 - **ADV-50 recovery-marker admission:** the account-free password-recovery
   marker table now has a non-configurable per-control-database ceiling of
   4,096 rows. Migration trims legacy overflow; enqueue rejects a new digest
-  once the ceiling is full; expiry cleanup is batch-limited. The regression
-  fills the ceiling with non-expired markers, proves a new digest fails closed,
-  and proves an existing digest can still refresh without increasing the
-  count. Control timestamps are seeded in the database's microsecond unit.
+  once the ceiling is full; request-time and background expiry cleanup are
+  both batch-limited to 256 rows. The regression fills the ceiling with
+  non-expired markers, proves a new digest fails closed, proves an existing
+  digest can still refresh without increasing the count, and proves a full
+  expired table cannot be mass-deleted by one request. Control timestamps are
+  seeded in the database's microsecond unit.
 - **ADV-55 email deletion/send race:** crossing the durable SMTP fence now
   extends a short claim lease through the bounded five-minute network-attempt
   contract. Deletion and reclaim remain blocked throughout that window, and a
@@ -513,11 +515,11 @@ Two suspected scope/timing concerns were also classified rather than silently
 promoted to findings. `getSpace` intentionally requires an authority
 `atproto` token; qualified space scopes are enforced on record/repository
 operations, matching Swan's documented pinned-TypeScript exception. Recovery
-marker cleanup is bounded by the 4,096-row invariant, but a single request can
-still delete the expired portion of that bounded table; strict constant-work
-behavior under arbitrary SQLite contention remains an ADV-50 follow-up. The
-request-time JSON/index materialization concern remains ADV-26 follow-up work
-even though response-size and process-admission gates are green.
+marker cleanup is now bounded both by the 4,096-row invariant and the
+256-row-per-request purge batch; strict constant-work behavior under arbitrary
+SQLite contention remains an ADV-50 follow-up. The request-time JSON/index
+materialization concern remains ADV-26 follow-up work even though response-size
+and process-admission gates are green.
 
 The review is not an alpha-completion sign-off. The remaining closure gates are
 the native-Linux host run, reverse-authority and cross-implementation

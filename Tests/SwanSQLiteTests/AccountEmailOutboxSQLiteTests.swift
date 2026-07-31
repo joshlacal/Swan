@@ -208,6 +208,50 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
         )
     }
 
+    func testPasswordRecoveryRequestPurgesOnlyOneBoundedBatchOfExpiredMarkers() async throws {
+        let fixture = try await Fixture(testCase: self)
+        addTeardownBlock {
+            try? await fixture.database.close()
+            fixture.cleanup()
+        }
+        let now = fixture.now
+        let capacity = SQLiteControlDatabase.maximumPasswordRecoveryWorkMarkers
+
+        let seedValues = (0 ..< capacity).map { value in
+            let digestHex = String(repeating: "00", count: 28)
+                + String(format: "%08x", value)
+            return "(X'"
+                + digestHex
+                + "', 1749999900000000, "
+                + String(1749999800000000 + value)
+                + ")"
+        }.joined(separator: ",")
+        _ = try await fixture.database.connection.query(
+            "INSERT INTO account_password_recovery_work(lookup_digest, expires_at, created_at) VALUES "
+                + seedValues
+        )
+
+        let request = try passwordRecoveryRequest(
+            email: AccountEmailAddress("bounded-cleanup@example.com"),
+            deliveryByte: 0x43,
+            proofByte: 0x53,
+            lookupDigest: Data(repeating: 0xff, count: 32),
+            now: now
+        )
+        try await fixture.database.enqueuePasswordRecoveryDelivery(request)
+
+        let remaining = try await fixture.database.connection.query(
+            "SELECT COUNT(*) AS row_count FROM account_password_recovery_work"
+        )
+        // One bounded purge plus the new marker.  If this request regresses
+        // to a predicate-only DELETE, the count would be one instead.
+        let expectedRemaining = 3_841 // 4,096 - 256 + 1
+        XCTAssertEqual(
+            remaining.first?.column("row_count")?.integer,
+            expectedRemaining
+        )
+    }
+
     func testAccountRevisionRemainsMonotonicWhenWallClockMovesBackward() async throws {
         let fixture = try await Fixture(testCase: self)
         addTeardownBlock {

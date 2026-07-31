@@ -634,9 +634,28 @@ extension SQLiteControlDatabase {
                 // Every canonical request performs one keyed, account-free
                 // write before the account lookup. The marker is deliberately
                 // not tied to a DID and expires with the requested proof.
+                // Keep request-time cleanup bounded.  This table has a hard
+                // global capacity, but a legacy or crash-recovered database
+                // may still contain the full expired set.  A plain DELETE
+                // over the indexed expiry column would turn one blind
+                // request into an unbounded write transaction and could
+                // monopolize the shared control database.  The same batch
+                // contract is used by the background/claim purge path.
                 _ = try await connection.query(
-                    "DELETE FROM account_password_recovery_work WHERE expires_at <= ?",
-                    [.integer(created)]
+                    """
+                    DELETE FROM account_password_recovery_work
+                    WHERE lookup_digest IN (
+                        SELECT lookup_digest
+                        FROM account_password_recovery_work
+                        WHERE expires_at <= ?
+                        ORDER BY expires_at, created_at, lookup_digest
+                        LIMIT ?
+                    )
+                    """,
+                    [
+                        .integer(created),
+                        .integer(Self.passwordRecoveryWorkPurgeBatchSize),
+                    ]
                 )
                 let existingMarker = try await connection.query(
                     """
