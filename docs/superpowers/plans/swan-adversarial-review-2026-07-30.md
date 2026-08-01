@@ -1070,3 +1070,44 @@ authority OAuth/browser and lifecycle coverage, corrupted-operation and
 compaction-gap traffic, and the official security launcher remain open. The
 clean-cache wrapper still explicitly reports that the live cross-host semantic
 matrix was not run.
+
+## Luna-era adversarial reconciliation and clean-cache rerun: 2026-07-31
+
+An independent review of the Luna-era account-recovery surfaces compared the
+reported candidates with the current source and focused tests rather than
+accepting the historical receipts as proof.
+
+- The suspected unbounded recovery-marker sink is closed locally. The control
+  database enforces a 4,096-row marker ceiling, trims legacy overflow during
+  migration, rejects a new digest at capacity, and limits request/background
+  expiry purges to 256 rows. Existing-marker refresh remains allowed. The
+  focused `AccountEmailOutboxSQLiteTests` capacity selection passed.
+- The suspected SMTP lease/reclaim race is narrowed but not erased by policy.
+  Crossing the durable send fence extends the lease to the five-minute
+  bounded attempt window, while the recovery coordinator cancels a delivery
+  after 240 seconds. This protects the supported Mailpit implementation and
+  the tested cancellation path. A deliberately non-cancellable third-party
+  `AccountEmailDelivery` could still outlive the five-minute fence; that is a
+  residual implementation-contract risk, not evidence of a current account
+  authorization bypass.
+- Password-reset responses still have a known-work-shape difference: a matched
+  active mailbox performs token/outbox writes after the account-free marker,
+  while an unknown mailbox does not. The fixed empty response, keyed marker,
+  rate limits, and 50 ms floor reduce the direct oracle, but no runtime
+  distribution test under SQLite contention proves strict constant work. Keep
+  this as an availability/privacy follow-up (ADV-50), not a completed
+  constant-time claim.
+- The review also found a clean-cache harness defect in the newly added
+  collision-avoidance override: it rendered `172.34.0/24` and invalid service
+  addresses instead of `172.34.0.0/24`/`172.34.0.x`. The generator now retains
+  the first three octets and chooses a free loopback Caddy port without
+  mutating the checked-in Compose file. `bash -n`, `git diff --check`, profile
+  verification, effective/static/mutation lab verification, a fresh copied
+  SwiftPM build, the full copied-tree test graph, and Compose health all pass.
+
+The clean-cache run was executed on macOS through Docker's Linux containers;
+it is not native-Linux evidence and it intentionally does not run the live
+cross-host semantic matrix. The release boundary is unchanged: native Linux,
+stock pinned-TypeScript value-bearing incremental/recovery behavior, reverse
+authority OAuth/browser/lifecycle coverage, corrupted-operation and
+compaction-gap traffic, and the official security launcher remain open.

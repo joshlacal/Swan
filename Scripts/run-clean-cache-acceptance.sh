@@ -192,10 +192,180 @@ mkdir -p "$workspace_copy"
     Petrel/Package.swift Petrel/Sources
   ) | tar -xf - -C "$workspace_copy"
 
+prepare_compose_network_override() {
+  # The checked-in Compose file intentionally uses a fixed subnet and fixed
+  # addresses: the Caddy peer address is part of the trusted-proxy contract
+  # and the static verifier must continue to inspect those exact values. A
+  # clean acceptance run, however, must also be safe to execute while another
+  # disposable lab project is still running. In that case generate an
+  # untracked Compose override for this run only. The source Compose file and
+  # its static invariants are never mutated.
+  [[ -z "${COMPOSE_FILE:-}" ]] || return 0
+
+  local network_ids
+  network_ids="$(docker network ls -q)"
+  local configured_subnets=""
+  if [[ -n "$network_ids" ]]; then
+    configured_subnets="$(
+      printf '%s\n' "$network_ids" \
+        | xargs docker network inspect \
+            --format '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' \
+            2>/dev/null || true
+    )"
+  fi
+  local network_prefix
+  network_prefix="$(python3 - "$configured_subnets" <<'PY'
+import ipaddress
+import sys
+
+configured = []
+for raw in sys.argv[1].splitlines():
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        configured.append(ipaddress.ip_network(raw, strict=False))
+    except ValueError:
+        pass
+
+# Keep the first candidate equal to the checked-in network when it is free.
+# The remaining candidates are private /24s reserved for this disposable
+# harness and are selected only when a live Docker network overlaps it.
+for third_octet in [30, *range(31, 255)]:
+    candidate = ipaddress.ip_network(f"172.{third_octet}.0.0/24")
+    if any(candidate.overlaps(existing) for existing in configured):
+        continue
+    # Keep the first three octets as the reusable address prefix.  The
+    # checked-in Compose file uses 172.30.0.x, so a generated run must retain
+    # that same shape rather than producing the malformed 172.30.x form.
+    print(f"172.{third_octet}.0")
+    break
+else:
+    raise SystemExit("no unused 172.x.0.0/24 subnet is available")
+PY
+  )"
+  [[ "$network_prefix" =~ ^172\.[0-9]+\.0$ ]] || {
+    echo "clean acceptance could not choose an isolated Compose subnet" >&2
+    exit 1
+  }
+
+  local published_port
+  published_port="$(python3 - <<'PY'
+import socket
+
+for port in range(443, 5000):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", port))
+    except OSError:
+        sock.close()
+        continue
+    sock.close()
+    print(port)
+    break
+else:
+    raise SystemExit("no loopback port is available for Caddy")
+PY
+  )"
+  [[ "$published_port" =~ ^[0-9]+$ ]] || {
+    echo "clean acceptance could not choose a loopback Caddy port" >&2
+    exit 1
+  }
+
+  local override="$scratch_path/compose-network-override.yml"
+  cat > "$override" <<EOF
+services:
+  swan-bootstrap:
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.6
+  swan:
+    command:
+      - serve
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "3000"
+      - --public-url
+      - "https://swan.test"
+      - --profile
+      - /usr/local/share/swan/Profiles/permissioned-data-0016-2026-07-30.json
+      - --data-directory
+      - /var/lib/swan/data
+      - --enable-local-space-interop
+      - --space-account-kek-file
+      - /run/secrets/swan-runtime/account-kek
+      - --space-account-kek-id
+      - primary
+      - --enable-public-repository-mutations
+      - --public-account-kek-file
+      - /run/secrets/swan-runtime/account-kek
+      - --public-account-kek-id
+      - primary
+      - --oauth-server-key-file
+      - /run/secrets/swan-runtime/oauth-server-key
+      - --enable-oauth-authorization-server
+      - --oauth-allow-localhost-development-client
+      - --login-trusted-proxy-peer
+      - "${network_prefix}.2"
+      - --notification-config
+      - /etc/swan/interop/notification-config.json
+      - --enable-notification-delivery
+      - --managing-service-audience
+      - did:web:interop-swan-managing-service
+      - --enable-email-recovery
+      - --email-proof-key-file
+      - /run/secrets/swan-runtime/email-proof-key
+      - --email-sender
+      - no-reply@swan.local
+      - --email-smtp-host
+      - mailpit
+      - --email-smtp-port
+      - "1025"
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.5
+  reference-pds:
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.4
+  reference-plc:
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.3
+  caddy:
+    ports: !override
+      - "127.0.0.1:${published_port}:443"
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.2
+  mailpit:
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.7
+  toxiproxy:
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.8
+  toxiproxy-setup:
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.9
+networks:
+  swan:
+    ipam:
+      config:
+        - subnet: ${network_prefix}.0/24
+EOF
+  export COMPOSE_FILE="docker-compose.yml:$override"
+  echo "CLEAN-CACHE COMPOSE OVERRIDE: subnet=${network_prefix}.0/24 caddy=127.0.0.1:${published_port}" >&2
+}
+
 (
   cd "$source_root"
   ./interop/fetch-reference.sh
   run_static_and_swift "$source_root"
+  prepare_compose_network_override
   project_name="swan-clean-cache-$(python3 - <<'PY'
 import secrets
 
