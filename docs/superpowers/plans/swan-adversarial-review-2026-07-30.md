@@ -147,6 +147,7 @@ overstated several gates. The most important adversarial findings were:
 | ADV-79 | P3 | Three public `sync` read routes force-unwrapped the request-derived `did` query entry. The strict parser currently guarantees the key, but a future parser change or bypass could turn malformed input into a process trap instead of `InvalidRequest`. | Remediated with explicit key guards and one typed `DID` parse per route. `PublicRepositoryReadHTTPTests` passed 12/12; no authorization or privacy bypass was reproduced. |
 | ADV-97 | P1 | Deactivation followed by reactivation updates `control.sqlite` but leaves the preopened public-read generation bound to the old `AccountControlAccount` (including its `updatedAt`). Public reads therefore remain unavailable after lifecycle reactivation. | Remediated with an existing-database-only async generation refresh that revalidates PLC identity, preparation intent, path identity, and the exact active control row before publication. A permanent regression covers status, description, record, and CAR reads after reactivation. |
 | ADV-98 | P2 | Portable archive verification bounded manifest/payload bytes but recursively materialized every filesystem entry into `String`/`Set` collections without a count or depth bound. An untrusted restore archive could exhaust memory or the call stack with extra empty entries before the expected-path mismatch was reported. | Remediated with a manifest file-count ceiling, exact expected-entry admission, bounded per-directory enumeration, and a 256-level recursion ceiling. The new archive-inventory regression passes. |
+| ADV-99 | P1 | Public-read admission bounded the SQLite index with a keyset preflight but then retained the full validated MST and leaf projection in Swift, allowing a valid near-policy-ceiling repository to create a large startup/generation-refresh allocation. | Remediated with `validateProjection` and a connection-local SQLite TEMP projection sink; the storage-level verifier now applies the same preflight. macOS and native Linux public-directory/HTTP selections pass; full Linux/RSS receipts remain open. |
 
 ### Provenance limitation
 
@@ -1991,3 +1992,52 @@ gate can be called complete. The stock pinned-TypeScript value-bearing
 incremental/full-CAR limitation, reverse-authority browser/lifecycle matrix,
 corrupted-operation and compaction-gap traffic, strict password-reset
 work-shape proof, and unavailable formal security launcher remain open.
+
+## Adversarial rereview: public-admission projection retention — 2026-08-01
+
+The Luna-era public-read admission hardening had a subtle split boundary. Its
+keyset preflight bounded the durable index to 100,000 entries, but admission
+then called the older `RepositoryMSTValidation.validate` API, which retained
+all reachable MST block bodies, leaves, and record-CID sets in Swift before
+comparing the projection. A valid repository near the 512 MiB hostile-import
+ceiling could therefore pass the preflight and still create a large
+process-local allocation during startup or generation refresh.
+
+The admission path now uses `validateProjection` with a connection-local
+SQLite TEMP projection sink. MST and record block bodies are released after
+each validation step; only the bounded validator topology metadata and the
+durable index comparison remain. The storage-level projection verifier also
+runs the same preflight, so it cannot bypass the public-read bound when called
+outside bootstrap. TEMP state is dropped on success and every failure path,
+and no durable repository rows are modified.
+
+Evidence:
+
+- `PublicRepositoryReadDirectoryTests`: 16 tests, 1 intentional opt-in skip,
+  0 failures; the 100,001-row admission rejection still returns
+  `resourceLimitExceeded` before projection traversal;
+- `PublicRepositoryReadHTTPTests`: 13/13, 0 failures, warmed serialized
+  invocation in 0.197 seconds; and
+- the source compiles under the same pinned SwiftPM graph used by the clean
+  acceptance path.
+
+This closes the remaining public-admission whole-MST retention seam locally.
+The separate non-admission compatibility validators and the explicitly
+bounded public CAR writer remain unchanged. Native-Linux execution of this
+new source revision, full Linux/RSS receipts, stock pinned-TypeScript
+value-bearing incremental/full-CAR behavior, reverse-authority
+browser/lifecycle coverage, corrupted-operation and compaction-gap traffic,
+strict password-reset work-shape proof, and the unavailable formal security
+launcher remain release gates.
+
+The new admission implementation was then rebuilt from the current source in
+the same Ubuntu 26.04 ARM64 VM. Native Linux selectors passed as follows:
+
+- `PublicRepositoryReadDirectoryTests`: 16 tests, 1 intentional opt-in skip,
+  0 failures, 9.804 seconds;
+- `PublicRepositoryReadHTTPTests`: 13/13, 0 failures, 0.384 seconds.
+
+The XCTest platform remained `aarch64-unknown-linux-gnu`. The repeated
+`cd` diagnostics from `limactl shell` refer only to the host working-directory
+forwarding and did not affect the VM command; the source rsync and both test
+invocations completed successfully.

@@ -160,7 +160,6 @@ extension SQLiteAccountDatabase {
                 guard let state = try await loadPublicRepositoryStateWithoutGate() else {
                     throw PublicRepositoryReadError.unavailable
                 }
-                try await preflightPublicReadProjectionWithoutGate()
                 try await verifyProjectionWithoutGate(state: state)
                 let rows = try await connection.query(
                     """
@@ -319,7 +318,7 @@ extension SQLiteAccountDatabase {
         }
     }
 
-    private func preflightPublicReadProjectionWithoutGate() async throws {
+    func preflightPublicReadProjectionWithoutGate() async throws {
         var recordCount = 0
         var collectionCount = 0
         var collectionBytes = 0

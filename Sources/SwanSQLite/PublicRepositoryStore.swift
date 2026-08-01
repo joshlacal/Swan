@@ -30,6 +30,44 @@ struct SQLitePublicRepositoryBlockSource: PublicRepositoryBlockSource {
     }
 }
 
+/// Admission only needs to prove that the durable index is exactly the
+/// projection of the authenticated MST. Keep that projection in SQLite's
+/// connection-local TEMP schema rather than retaining every MST block and
+/// leaf in a `ValidatedPublicRepositoryMST` value.
+private struct SQLitePublicRepositoryProjectionSink:
+    PublicRepositoryReachableProjectionSink
+{
+    let connection: SQLiteConnection
+
+    func recordReachableBlock(
+        cid: CID,
+        kind: PublicRepositoryReachableBlockKind
+    ) async throws {
+        // The validator authenticates each block before this callback. The
+        // public admission comparison needs only the record-path projection;
+        // block bodies and their identifiers must not accumulate in Swift.
+        _ = cid
+        _ = kind
+    }
+
+    func recordRepositoryIndex(
+        path: PublicRepositoryPath,
+        recordCID: CID
+    ) async throws {
+        _ = try await connection.query(
+            """
+            INSERT INTO temp.swan_public_verified_index(
+                collection, rkey, record_cid
+            ) VALUES (?, ?, ?)
+            """,
+            [
+                .text(path.collection), .text(path.recordKey),
+                .text(recordCID.string),
+            ]
+        )
+    }
+}
+
 extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
     public func loadPublicRepositoryState() async throws -> PublicRepositoryState? {
         try await withConnectionGate {
@@ -547,36 +585,74 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         state: PublicRepositoryState
     ) async throws {
         do {
-            let repository = try await RepositoryMSTValidation.validate(
-                rootCID: state.dataCID,
-                blocks: SQLitePublicRepositoryBlockSource(connection: connection)
+            // Keep this guard here as well as in generation admission: this
+            // storage-level API is also callable directly by maintenance and
+            // must not bypass the public projection bound.
+            try await preflightPublicReadProjectionWithoutGate()
+            _ = try await connection.query(
+                "DROP TABLE IF EXISTS temp.swan_public_verified_index"
             )
-            let indexRows = try await connection.query(
+            _ = try await connection.query(
+                """
+                CREATE TEMP TABLE swan_public_verified_index(
+                    collection TEXT NOT NULL,
+                    rkey TEXT NOT NULL,
+                    record_cid TEXT NOT NULL,
+                    PRIMARY KEY(collection, rkey)
+                ) WITHOUT ROWID
+                """
+            )
+            let projection = try await RepositoryMSTValidation.validateProjection(
+                rootCID: state.dataCID,
+                blocks: SQLitePublicRepositoryBlockSource(connection: connection),
+                projection: SQLitePublicRepositoryProjectionSink(
+                    connection: connection
+                )
+            )
+            guard projection.recordCount <= PublicRepositoryReadLimits
+                .maximumGenerationIndexEntries else {
+                throw PublicRepositoryReadError.resourceLimitExceeded
+            }
+            let missing = try await connection.query(
+                """
+                SELECT collection, rkey, record_cid
+                FROM temp.swan_public_verified_index
+                EXCEPT
+                SELECT collection, rkey, record_cid
+                FROM public_repository_record_index
+                LIMIT 1
+                """
+            )
+            let extra = try await connection.query(
                 """
                 SELECT collection, rkey, record_cid
                 FROM public_repository_record_index
+                EXCEPT
+                SELECT collection, rkey, record_cid
+                FROM temp.swan_public_verified_index
+                LIMIT 1
                 """
             )
-            var index: [PublicRepositoryPath: CID] = [:]
-            for row in indexRows {
-                let path = try PublicRepositoryPath(
-                    collection: try requiredText(row, "collection"),
-                    recordKey: try requiredText(row, "rkey")
-                )
-                guard index[path] == nil else {
-                    throw PublicRepositoryMutationStoreError.corruptRepository
-                }
-                index[path] = try parseCID(try requiredText(row, "record_cid"))
-            }
-            let mstIndex = Dictionary(
-                uniqueKeysWithValues: repository.leaves.map { ($0.path, $0.recordCID) }
-            )
-            guard index == mstIndex else {
+            guard missing.isEmpty, extra.isEmpty else {
                 throw PublicRepositoryMutationStoreError.corruptRepository
             }
+            _ = try await connection.query(
+                "DROP TABLE temp.swan_public_verified_index"
+            )
+        } catch let error as PublicRepositoryReadError {
+            _ = try? await connection.query(
+                "DROP TABLE IF EXISTS temp.swan_public_verified_index"
+            )
+            throw error
         } catch let error as PublicRepositoryMutationStoreError {
+            _ = try? await connection.query(
+                "DROP TABLE IF EXISTS temp.swan_public_verified_index"
+            )
             throw error
         } catch {
+            _ = try? await connection.query(
+                "DROP TABLE IF EXISTS temp.swan_public_verified_index"
+            )
             throw PublicRepositoryMutationStoreError.corruptRepository
         }
     }
