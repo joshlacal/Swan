@@ -6212,9 +6212,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// Streams one already-reachable blob without turning the export path
     /// into a whole-payload `Data` allocation. CAS-v1 blobs use the same
     /// descriptor-backed body as HTTP. Legacy SQLite rows are still selected
-    /// by SQLite as one row (they are migrated by normal write opens), but are
-    /// delivered to the caller in fixed-size chunks and remain subject to the
-    /// caller's aggregate byte bound.
+    /// through bounded SQLite substr() slices and remain subject to the
+    /// caller's aggregate byte bound. Ordinary compatibility reads may still
+    /// materialize a legacy row so they can migrate it to CAS.
     public func streamBlobData(
         for reference: BlobReference,
         maximumBytes: Int,
@@ -6227,30 +6227,20 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let stored = try await blobPayload(
             cid: reference.cid,
             namespaceKind: columns.kind,
-            spaceURI: columns.spaceURI
+            spaceURI: columns.spaceURI,
+            includeLegacyPayload: false
         )
         guard stored.byteCount <= maximumBytes else {
             throw SwanError.unavailable("blob exceeds export limits")
         }
         switch stored.storageKind {
         case .legacySQLite:
-            guard let payload = stored.legacyPayload,
-                  payload.count == stored.byteCount,
-                  legacyBlobCID(payload) == stored.cid else {
-                throw SQLiteRepositoryError.corruptDatabase(
-                    "invalid legacy blob payload"
-                )
-            }
-            var offset = 0
-            while offset < payload.count {
-                try Task.checkCancellation()
-                let end = min(
-                    offset + SpaceCARBodySpool.maximumChunkBytes,
-                    payload.count
-                )
-                try await consume(Data(payload[offset ..< end]))
-                offset = end
-            }
+            try await streamLegacySQLiteBlobData(
+                stored: stored,
+                namespaceKind: columns.kind,
+                spaceURI: columns.spaceURI,
+                consume: consume
+            )
         case .casV1:
             let body = try await fileBackedBlobBody(stored)
             try await body.streamBody(
@@ -6809,12 +6799,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private func blobPayload(
         cid: String,
         namespaceKind: String,
-        spaceURI: String
+        spaceURI: String,
+        includeLegacyPayload: Bool = true
     ) async throws -> StoredBlobPayload {
         guard let stored = try await blobPayloadIfReachable(
             cid: cid,
             namespaceKind: namespaceKind,
-            spaceURI: spaceURI
+            spaceURI: spaceURI,
+            includeLegacyPayload: includeLegacyPayload
         ) else {
             throw SwanError.unauthorized("blob is not reachable in this namespace")
         }
@@ -6824,13 +6816,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private func blobPayloadIfReachable(
         cid: String,
         namespaceKind: String,
-        spaceURI: String
+        spaceURI: String,
+        includeLegacyPayload: Bool = true
     ) async throws -> StoredBlobPayload? {
         try await withConnectionGate {
             try await blobPayloadIfReachableWithoutGate(
                 cid: cid,
                 namespaceKind: namespaceKind,
-                spaceURI: spaceURI
+                spaceURI: spaceURI,
+                includeLegacyPayload: includeLegacyPayload
             )
         }
     }
@@ -6899,13 +6893,22 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private func blobPayloadIfReachableWithoutGate(
         cid: String,
         namespaceKind: String,
-        spaceURI: String
+        spaceURI: String,
+        includeLegacyPayload: Bool = true
     ) async throws -> StoredBlobPayload? {
+        // The legacy payload is selected only by compatibility reads that
+        // explicitly need a materialized value. Export streaming uses the
+        // metadata-only form and reads bounded substr() slices below, so a
+        // historical SQLite row cannot become an unbounded Data allocation.
+        let payloadSelection = includeLegacyPayload
+            ? "blob_payloads.payload"
+            : "NULL AS payload"
         let rows = try await connection.query(
             """
-            SELECT blob_payloads.cid, blob_payloads.payload,
+            SELECT blob_payloads.cid, \(payloadSelection),
                    blob_payloads.storage_kind, blob_payloads.cas_digest,
                    blob_payloads.byte_count,
+                   length(blob_payloads.payload) AS payload_length,
                    blob_payloads.mime_type
             FROM blob_payloads
             JOIN blob_namespace_references USING(cid)
@@ -6929,7 +6932,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             }
             storedByteCount = integer
         } else if storageKind == .legacySQLite {
-            storedByteCount = try requiredBlob(row, "payload").count
+            guard let payloadLength = row.column("payload_length")?.integer,
+                  payloadLength >= 0 else {
+                throw SQLiteRepositoryError.corruptDatabase("invalid legacy blob size")
+            }
+            storedByteCount = payloadLength
         } else {
             throw SQLiteRepositoryError.corruptDatabase("missing blob size")
         }
@@ -6946,14 +6953,18 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let casDigest: String?
         switch storageKind {
         case .legacySQLite:
-            let payload = try requiredBlob(row, "payload")
-            guard legacyBlobCID(payload) == storedCID,
-                  payload.count == storedByteCount else {
-                throw SQLiteRepositoryError.corruptDatabase(
-                    "legacy blob payload does not match metadata"
-                )
+            if includeLegacyPayload {
+                let payload = try requiredBlob(row, "payload")
+                guard legacyBlobCID(payload) == storedCID,
+                      payload.count == storedByteCount else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "legacy blob payload does not match metadata"
+                    )
+                }
+                legacyPayload = payload
+            } else {
+                legacyPayload = nil
             }
-            legacyPayload = payload
             casDigest = nil
         case .casV1:
             let digest = try blobDigestHex(cid: storedCID, allowLegacy: true)
@@ -6973,6 +6984,70 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             casDigest: casDigest,
             legacyPayload: legacyPayload
         )
+    }
+
+    /// Streams a historical SQLite blob without selecting its payload as a
+    /// client-side Data value. SQLite's substr() operates on the BLOB inside
+    /// the engine and returns one bounded chunk per query. A read transaction
+    /// keeps the metadata, chunks, and digest verification on one snapshot;
+    /// the caller's consumer is invoked only with the current chunk.
+    private func streamLegacySQLiteBlobData(
+        stored: StoredBlobPayload,
+        namespaceKind: String,
+        spaceURI: String,
+        consume: @escaping @Sendable (Data) async throws -> Void
+    ) async throws {
+        guard stored.storageKind == .legacySQLite,
+              stored.legacyPayload == nil,
+              let expectedDigest = legacyBlobDigest(stored.cid) else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "invalid legacy blob metadata"
+            )
+        }
+        try await withConnectionGate {
+            try await readTransaction {
+                var offset = 0
+                var digest = SHA256()
+                let chunkSize = SpaceCARBodySpool.maximumChunkBytes
+                while offset < stored.byteCount {
+                    try Task.checkCancellation()
+                    let rows = try await connection.query(
+                        """
+                        SELECT substr(blob_payloads.payload, ?, ?) AS chunk
+                        FROM blob_payloads
+                        JOIN blob_namespace_references USING(cid)
+                        WHERE blob_payloads.cid = ?
+                          AND namespace_kind = ? AND space_uri = ?
+                        """,
+                        [
+                            .integer(offset + 1), .integer(chunkSize),
+                            .text(stored.cid), .text(namespaceKind),
+                            .text(spaceURI),
+                        ]
+                    )
+                    guard let row = rows.first else {
+                        throw SwanError.unauthorized(
+                            "blob is not reachable in this namespace"
+                        )
+                    }
+                    let chunk = try requiredBlob(row, "chunk")
+                    guard !chunk.isEmpty,
+                          chunk.count <= min(chunkSize, stored.byteCount - offset) else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "invalid legacy blob chunk"
+                        )
+                    }
+                    digest.update(data: chunk)
+                    try await consume(chunk)
+                    offset += chunk.count
+                }
+                guard Data(digest.finalize()) == expectedDigest else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "legacy blob payload does not match metadata"
+                    )
+                }
+            }
+        }
     }
 
     private func materializeBlobData(_ stored: StoredBlobPayload) async throws -> Data {

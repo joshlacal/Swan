@@ -2197,6 +2197,54 @@ final class SwanSQLiteTests: XCTestCase {
         XCTAssertEqual(reopenedPayload, payload)
     }
 
+    func testStreamLegacySQLiteBlobUsesBoundedSQLiteSlices() async throws {
+        let fixture = try Fixture()
+        var database: SQLiteAccountDatabase? = try await fixture.open()
+        let payload = Data(
+            repeating: 0x5a,
+            count: (64 * 1_024 * 3) + 17
+        )
+        let legacyCID = "sha256:\(Hex.encode(SHA256.hash(data: payload)))"
+        let reference = BlobReference(
+            cid: legacyCID,
+            namespace: .space(fixture.space)
+        )
+        try await database!.close()
+        database = nil
+        try await insertLegacyBlob(
+            fixture: fixture,
+            cid: legacyCID,
+            payload: payload,
+            byteCount: payload.count
+        )
+
+        let streamDatabase = try await fixture.open()
+        defer { Task { try? await streamDatabase.close() } }
+        let collector = LegacyBlobChunkCollector()
+        try await streamDatabase.streamBlobData(
+            for: reference,
+            maximumBytes: payload.count
+        ) { chunk in
+            await collector.append(chunk)
+        }
+
+        let received = await collector.data
+        let maximumChunk = await collector.maximumChunk
+        XCTAssertEqual(received, payload)
+        XCTAssertLessThanOrEqual(maximumChunk, 64 * 1_024)
+        let connection = try await SQLiteConnection.open(
+            storage: .file(path: SQLiteLayout.accountDatabase(
+                in: fixture.root, did: fixture.author
+            ).path)
+        )
+        let rows = try await connection.query(
+            "SELECT storage_kind FROM blob_payloads WHERE cid = ?",
+            [.text(legacyCID)]
+        )
+        XCTAssertEqual(rows.first?.column("storage_kind")?.string, "legacy-sqlite")
+        try await connection.close()
+    }
+
     func testLegacyAndRawCIDAliasesProtectOnePhysicalCASAcrossRemovalAndRestart() async throws {
         let fixture = try Fixture()
         var database: SQLiteAccountDatabase? = try await fixture.open()
@@ -4193,6 +4241,16 @@ private actor BlockingOutboxTransport: PermissionedSpaceOutboxTransport {
     }
 
     func notifications() -> [PermissionedSpaceOutboxNotification] { delivered }
+}
+
+private actor LegacyBlobChunkCollector {
+    private(set) var data = Data()
+    private(set) var maximumChunk = 0
+
+    func append(_ chunk: Data) {
+        data.append(chunk)
+        maximumChunk = max(maximumChunk, chunk.count)
+    }
 }
 
 private actor OutboxDeliveryBarrier {

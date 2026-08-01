@@ -1796,6 +1796,39 @@ this pass. The attribution remains a surface/time boundary: the repository
 does not preserve per-agent authorship, so these results do not assign or
 exonerate a particular Luna agent.
 
+## Adversarial rereview: legacy SQLite blob streaming — 2026-08-01
+
+The remaining legacy-row concern was reproduced at the code boundary. The
+private export stream previously selected `blob_payloads.payload` as a full
+SQLiteNIO `Data` value and only then split it into 64 KiB callback chunks. A
+large historical row could therefore bypass the otherwise bounded export
+stream before the caller's aggregate limit was applied.
+
+`streamBlobData` now performs a metadata-only reachability query for legacy
+rows, derives the size with SQLite `length`, and reads the payload through
+bounded `substr` slices inside one read transaction. Each slice is hashed and
+delivered to the caller; the legacy `sha256:` CID is checked before the stream
+is accepted as complete. Ordinary compatibility `blobData` reads still
+materialize and migrate legacy rows, so the compatibility behavior is not
+silently changed.
+
+Evidence:
+
+- `SwanSQLiteTests.testStreamLegacySQLiteBlobUsesBoundedSQLiteSlices`: 1/1;
+  a 196,625-byte legacy row was returned with a maximum 64 KiB chunk and the
+  database row remained legacy after the stream;
+- the legacy migration/alias selection: 3/3;
+- `SwanAccountExportTests`: 42/42; and
+- the pre-v4 migration regression: 1/1.
+
+This closes the managed legacy-row export allocation seam. The public HTTP
+blob route remains CAS-only and fail-closed for legacy rows. Native Linux
+execution was also attempted in the real Ubuntu Swift 6.2.3 VM, but the
+current mounted virtiofs checkout failed during SwiftPM resource copying with
+`NSCocoaErrorDomain Code=512` before the selected test executed. That is
+environment/tooling evidence, not a Linux pass, so the native-Linux gate
+remains open.
+
 The platform evidence needs a provenance correction before release approval.
 `/private/tmp/swan-clean-linux-20260801.log` identifies its host as `Darwin`
 and ends with `swan-secrets-init` exit 1; it is a failed macOS Docker/Compose
