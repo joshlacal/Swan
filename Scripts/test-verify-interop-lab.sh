@@ -211,6 +211,16 @@ rg -Fq -- '--reference-variant pinned|recovery' Scripts/run-clean-cache-acceptan
 rg -Fq -- 'reference-pds-recovery' Scripts/run-clean-cache-acceptance.sh
 
 require_acceptance_preflight_rejection \
+  invalid-dynamic-direction \
+  'SWAN_DYNAMIC_DELEGATION_DIRECTION must be member or authority' \
+  env SWAN_DYNAMIC_DELEGATION_DIRECTION=unsupported \
+    SWAN_DYNAMIC_DELEGATION_PROJECT=preflight-only \
+    ./Scripts/run-reference-member-dynamic-delegation-acceptance.sh
+
+rg -Fq -- 'credentialKeyPLC' Scripts/run-reference-member-dynamic-delegation-acceptance.sh
+rg -Fq -- 'reference-authority-dynamic-credential' Scripts/run-reference-member-dynamic-delegation-acceptance.sh
+
+require_acceptance_preflight_rejection \
   caller-selected-notification-project \
   'SWAN_NOTIFICATION_RESTART_PROJECT is not accepted' \
   env SWAN_NOTIFICATION_RESTART_PROJECT=existing-lab \

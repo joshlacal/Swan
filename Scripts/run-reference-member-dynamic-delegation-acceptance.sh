@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Exercise the pinned TypeScript PDS as a permissioned repository host while
-# Swan is the authority.  The reference member's delegation key is discovered
-# from the laboratory PLC through Swan's bounded, issuer-allowlisted resolver;
-# no static public-key pin is supplied to the authority.
+# Exercise a pinned TypeScript/Swan permissioned round trip with dynamic PLC
+# key discovery. The default `member` direction uses the TypeScript host as a
+# member while Swan is the authority; `authority` reverses that placement so
+# Swan is the member and dynamically resolves the TypeScript authority's
+# credential-signing key. No static public-key pin is supplied in either case.
 #
 # This harness attaches to an already-running disposable Compose project.  It
 # creates one disposable reference-PDS account, temporarily replaces only that
@@ -20,6 +21,7 @@ project_name="${SWAN_DYNAMIC_DELEGATION_PROJECT:-}"
 output_path="${SWAN_DYNAMIC_DELEGATION_OUTPUT:-${root}/artifacts/live/reference-member-dynamic-delegation.json}"
 wait_timeout="${SWAN_DYNAMIC_DELEGATION_TIMEOUT:-180}"
 stateful_mode="${SWAN_DYNAMIC_DELEGATION_STATEFUL:-0}"
+direction="${SWAN_DYNAMIC_DELEGATION_DIRECTION:-member}"
 
 [[ "$project_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$ ]] || {
   echo "SWAN_DYNAMIC_DELEGATION_PROJECT must name a running disposable Compose project" >&2
@@ -39,6 +41,14 @@ case "$stateful_mode" in
   0|1) ;;
   *) echo "SWAN_DYNAMIC_DELEGATION_STATEFUL must be 0 or 1" >&2; exit 64 ;;
 esac
+case "$direction" in
+  member|authority) ;;
+  *) echo "SWAN_DYNAMIC_DELEGATION_DIRECTION must be member or authority" >&2; exit 64 ;;
+esac
+if [[ "$direction" == "authority" && "$stateful_mode" == "1" ]]; then
+  echo "stateful recovery is supported only for the TypeScript-member direction" >&2
+  exit 64
+fi
 [[ -n "${SWAN_INTEROP_SECRETS_DIR:-}" ]] || {
   echo "SWAN_INTEROP_SECRETS_DIR is required" >&2
   exit 64
@@ -152,24 +162,35 @@ wait_for_container "$normal_swan_id" "Swan"
 wait_for_container "$reference_pds_id" "reference PDS"
 wait_for_container "$caddy_id" "Caddy"
 
-authority_handle="$(read_lab_value authority.handle)"
-authority_metadata="$({
+if [[ "$direction" == "member" ]]; then
+  swan_role="authority"
+else
+  swan_role="member"
+fi
+swan_handle="$(read_lab_value "${swan_role}.handle")"
+swan_metadata="$({
   docker exec "$normal_swan_id" \
     /usr/local/bin/swan account show \
     --data-directory /var/lib/swan/data \
-    --handle "$authority_handle"
+    --handle "$swan_handle"
 })" || {
-  echo "the Compose project has no provisioned Swan authority" >&2
+  echo "the Compose project has no provisioned Swan ${swan_role}" >&2
   exit 1
 }
-authority_did="$(printf '%s' "$authority_metadata" | json_field did)" || {
-  echo "the Swan authority metadata is invalid" >&2
+swan_did="$(printf '%s' "$swan_metadata" | json_field did)" || {
+  echo "the Swan ${swan_role} metadata is invalid" >&2
   exit 1
 }
-authority_handle="$(printf '%s' "$authority_metadata" | json_field canonicalHandle)" || {
-  echo "the Swan authority handle is invalid" >&2
+swan_handle="$(printf '%s' "$swan_metadata" | json_field canonicalHandle)" || {
+  echo "the Swan ${swan_role} handle is invalid" >&2
   exit 1
 }
+if [[ "$direction" == "member" ]]; then
+  space_authority_did="$swan_did"
+  local_consumer_handle="$swan_handle"
+else
+  space_member_did="$swan_did"
+fi
 
 # The pinned PDS permits at most 18 characters before its service-domain
 # suffix. "dynamic-" plus eight random hexadecimal characters is exactly 16.
@@ -253,6 +274,12 @@ reference_access_token="$(printf '%s' "$reference_account" | json_field accessJw
   exit 1
 }
 unset reference_account reference_password reference_email
+
+if [[ "$direction" == "member" ]]; then
+  space_member_did="$reference_did"
+else
+  space_authority_did="$reference_did"
+fi
 
 reference_commit_key=""
 if [[ "$stateful_mode" == "1" ]]; then
@@ -378,12 +405,12 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 
-python3 - "$notification_config_path" "$authority_did" "$reference_did" <<'PY'
+python3 - "$notification_config_path" "$space_authority_did" "$space_member_did" "$direction" <<'PY'
 import json
 import os
 import sys
 
-path, authority, member = sys.argv[1:]
+path, authority, member, direction = sys.argv[1:]
 configuration = {
     "credentialPublicKeys": [],
     "servicePublicKeys": [],
@@ -396,18 +423,20 @@ configuration = {
     "registrationDestinations": [],
     "recipientServiceBindings": [],
     "managingServiceAudience": "did:web:interop-swan-managing-service",
-    "credentialKeyPLC": {
-        "origin": "http://reference-plc:2582",
-        "laboratory": True,
-        "allowlistedHost": "reference-plc",
-    },
-    "delegationKeyPLC": {
+}
+if direction == "member":
+    configuration["delegationKeyPLC"] = {
         "origin": "http://reference-plc:2582",
         "laboratory": True,
         "allowlistedHost": "reference-plc",
         "allowedIssuers": [member],
-    },
-}
+    }
+else:
+    configuration["credentialKeyPLC"] = {
+        "origin": "http://reference-plc:2582",
+        "laboratory": True,
+        "allowlistedHost": "reference-plc",
+    }
 with open(path, "x", encoding="utf-8") as output:
     json.dump(configuration, output, sort_keys=True, separators=(",", ":"))
     output.write("\n")
@@ -449,10 +478,26 @@ docker run --detach \
   >/dev/null
 wait_for_swan_http "$dynamic_container" "dynamic-key Swan"
 
-space_uri="at://${authority_did}/space/app.bsky.bookmarks/dynamic-${suffix}"
+space_uri="at://${space_authority_did}/space/app.bsky.bookmarks/dynamic-${suffix}"
+space_scope="space:app.bsky.bookmarks?authority=${space_authority_did}&skey=dynamic-${suffix}&action=read"
+write_scope="space:app.bsky.bookmarks?authority=${space_authority_did}&skey=dynamic-${suffix}&action=create&collection=app.bsky.feed.post"
+space_scope_client_id="$(python3 - "$space_scope" "$write_scope" <<'PY'
+import sys
+from urllib.parse import quote
+
+print("http://localhost?scope=" + quote("atproto " + sys.argv[1] + " " + sys.argv[2], safe="") +
+      "&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback")
+PY
+)"
 collection="app.bsky.feed.post"
 rkey="dynamic-${suffix}"
-export SWAN_LAB_PRODUCER_TOKEN="$reference_access_token"
+if [[ "$direction" == "member" ]]; then
+  export SWAN_LAB_PRODUCER_TOKEN="$reference_access_token"
+  export SWAN_LAB_CONSUMER_TOKEN=""
+else
+  export SWAN_LAB_PRODUCER_TOKEN=""
+  export SWAN_LAB_CONSUMER_TOKEN="$reference_access_token"
+fi
 
 docker run --rm \
   --network "$network_name" \
@@ -462,7 +507,12 @@ docker run --rm \
   --mount "type=volume,src=${caddy_trust_volume},dst=/etc/ssl/certs,readonly" \
   --mount "type=bind,src=${temporary_directory},dst=/run/acceptance" \
   --env SWAN_LAB_PRODUCER_TOKEN \
+  --env SWAN_LAB_CONSUMER_TOKEN \
+  --env SWAN_DYNAMIC_DELEGATION_DIRECTION="$direction" \
   --env SWAN_DYNAMIC_DELEGATION_STATEFUL="$stateful_mode" \
+  --env SWAN_DYNAMIC_DELEGATION_SPACE_SCOPE="$space_scope" \
+  --env SWAN_DYNAMIC_DELEGATION_WRITE_SCOPE="$write_scope" \
+  --env SWAN_DYNAMIC_DELEGATION_SCOPE_CLIENT_ID="$space_scope_client_id" \
   --env SWAN_LAB_PERMISSIONED_COMMIT_KEY="$reference_commit_key" \
   --entrypoint /bin/sh \
   "$swan_image" \
@@ -474,28 +524,45 @@ docker run --rm \
       "$1" "$2" "$3" "$4" "$private_value" \
       >/tmp/permissioned-record.json
     export SSL_CERT_FILE=/etc/ssl/certs/caddy-local-root.crt
-    export SWAN_LAB_CONSUMER_HANDLE="$5"
-    SWAN_LAB_CONSUMER_PASSWORD="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/authority.password)"
-    export SWAN_LAB_CONSUMER_PASSWORD
+    if [ "${SWAN_DYNAMIC_DELEGATION_DIRECTION:-member}" = "member" ]; then
+      export SWAN_LAB_CONSUMER_HANDLE="$5"
+      SWAN_LAB_CONSUMER_PASSWORD="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/authority.password)"
+      export SWAN_LAB_CONSUMER_PASSWORD
+      producer_url="https://pds.test"
+      consumer_url="https://swan.test"
+      producer_auth_args="--producer-auth bearer"
+      consumer_auth_args="--consumer-auth oauth --consumer-client-id http://localhost?scope=atproto&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback --consumer-redirect-uri http://127.0.0.1/callback"
+      scope_args="--scope atproto"
+      read_host="member"
+      scenario_name="reference-member-dynamic-delegation"
+    else
+      SWAN_LAB_PRODUCER_HANDLE="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/member.handle)"
+      SWAN_LAB_PRODUCER_PASSWORD="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/member.password)"
+      export SWAN_LAB_PRODUCER_HANDLE SWAN_LAB_PRODUCER_PASSWORD
+      producer_url="https://swan.test"
+      consumer_url="https://pds.test"
+      producer_auth_args="--producer-auth oauth --producer-handle-env SWAN_LAB_PRODUCER_HANDLE --producer-password-env SWAN_LAB_PRODUCER_PASSWORD --producer-client-id ${SWAN_DYNAMIC_DELEGATION_SCOPE_CLIENT_ID} --producer-redirect-uri http://127.0.0.1/callback"
+      consumer_auth_args="--consumer-auth bearer --consumer-token-env SWAN_LAB_CONSUMER_TOKEN"
+      scope_args="--scope atproto --scope ${SWAN_DYNAMIC_DELEGATION_SPACE_SCOPE} --scope ${SWAN_DYNAMIC_DELEGATION_WRITE_SCOPE}"
+      read_host="member"
+      scenario_name="reference-authority-dynamic-credential"
+    fi
     if [ "${SWAN_DYNAMIC_DELEGATION_STATEFUL:-0}" = "1" ]; then
       export SWAN_LAB_PERMISSIONED_COMMIT_KEY
       stateful_flags="--permissioned-list-ops --permissioned-get-repo --permissioned-stateful-matrix"
     else
       stateful_flags=""
     fi
-    client_id="http://localhost?scope=atproto&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"
     if ! /usr/local/bin/swan lab live \
       --mode permissioned \
-      --name reference-member-dynamic-delegation \
-      --producer-url https://pds.test \
-      --consumer-url https://swan.test \
-      --producer-auth bearer \
-      --consumer-auth oauth \
-      --consumer-client-id "$client_id" \
-      --consumer-redirect-uri http://127.0.0.1/callback \
-      --scope atproto \
+      --name "$scenario_name" \
+      --producer-url "$producer_url" \
+      --consumer-url "$consumer_url" \
+      $producer_auth_args \
+      $consumer_auth_args \
+      $scope_args \
       --space "$1" \
-      --permissioned-read-host member \
+      --permissioned-read-host "$read_host" \
       --provision-space \
       --body-file /tmp/permissioned-record.json \
       --read-query \
@@ -510,7 +577,10 @@ docker run --rm \
       tail -n 40 /tmp/live-interop.log >&2 || true
       exit 1
     fi
-    grep -q '"'"'"status":"passed"'"'"' /tmp/sanitized-artifact.json
+    if ! grep -q '"'"'"status":"passed"'"'"' /tmp/sanitized-artifact.json; then
+      tail -n 40 /tmp/live-interop.log >&2 || true
+      exit 1
+    fi
     if grep -F -- "$private_value" /tmp/sanitized-artifact.json >/dev/null; then
       echo "sanitized artifact retained a permissioned value" >&2
       exit 1
@@ -519,9 +589,9 @@ docker run --rm \
     chmod 0600 /run/acceptance/artifact.json
     unset private_value SWAN_LAB_CONSUMER_PASSWORD
   ' _ \
-  "$space_uri" "$reference_did" "$collection" "$rkey" "$authority_handle"
+  "$space_uri" "$space_member_did" "$collection" "$rkey" "${local_consumer_handle:-}"
 
-unset SWAN_LAB_PRODUCER_TOKEN reference_access_token reference_commit_key
+unset SWAN_LAB_PRODUCER_TOKEN SWAN_LAB_CONSUMER_TOKEN reference_access_token reference_commit_key
 mkdir -p "$(dirname "$output_path")"
 install -m 0600 "$runner_output_path" "$output_path"
 
@@ -530,4 +600,4 @@ docker start "$normal_swan_id" >/dev/null
 normal_stopped=0
 wait_for_container "$normal_swan_id" "restored Swan"
 
-echo "REFERENCE MEMBER DYNAMIC DELEGATION OK: artifact=${output_path}"
+echo "REFERENCE DYNAMIC PERMISSIONED INTEROP OK: direction=${direction} artifact=${output_path}"

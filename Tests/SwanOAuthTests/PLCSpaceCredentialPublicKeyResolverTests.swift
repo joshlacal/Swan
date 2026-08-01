@@ -64,9 +64,32 @@ final class PLCSpaceCredentialPublicKeyResolverTests: XCTestCase, @unchecked Sen
         XCTAssertEqual(fetchCount, 1, "one PLC state serves both key IDs")
     }
 
-    func testUnknownIssuerAndKeyFailClosedWithoutUnsafeFallback() async throws {
+    func testDedicatedCredentialKeyFallsBackToOrdinaryPLCKeyWhenAbsent() async throws {
         let plc = ResolverPLCFixture(snapshots: [
             issuer: try snapshot(methods: ["atproto": referenceSecp256k1Key]),
+        ])
+        let resolver = try PLCSpaceCredentialPublicKeyResolver(
+            plc: plc,
+            continuityStore: ResolverCheckpointStore()
+        )
+
+        let resolved = try await resolver.publicKey(
+            for: issuer,
+            keyID: PermissionedDataJWT.spaceCredentialKeyID
+        )
+        guard case let .secp256k1PublicKey(actual) = try XCTUnwrap(resolved),
+              case let .secp256k1(expected) = try PLCDIDKeyCodec.decode(referenceSecp256k1Key)
+        else {
+            return XCTFail("expected ordinary PLC key fallback")
+        }
+        XCTAssertEqual(actual, expected)
+        let fetchCount = await plc.fetchCount()
+        XCTAssertEqual(fetchCount, 1)
+    }
+
+    func testUnknownIssuerAndKeyFailClosedWithoutUnsafeFallback() async throws {
+        let plc = ResolverPLCFixture(snapshots: [
+            issuer: try snapshot(methods: ["unrelated": referenceSecp256k1Key]),
         ])
         let resolver = try PLCSpaceCredentialPublicKeyResolver(
             plc: plc,

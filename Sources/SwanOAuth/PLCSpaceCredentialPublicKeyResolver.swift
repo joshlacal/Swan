@@ -344,29 +344,43 @@ public actor PLCSpaceCredentialPublicKeyResolver:
         guard (try? AccountIdentifiers.validateDID(issuer)) != nil,
               issuer.hasPrefix("did:plc:"),
               allowedIssuers.map({ $0.contains(issuer) }) ?? true,
-              let methodName = Self.methodName(for: keyID) else {
+              let methodNames = Self.methodNames(for: keyID) else {
             return nil
         }
 
         try Task.checkCancellation()
         let now = monotonicClock.now()
         let state = try await state(for: issuer, now: now)
-        guard state.did == issuer,
-              let encodedKey = state.verificationMethods[methodName] else {
+        guard state.did == issuer else {
             return nil
         }
-        do {
-            switch try PLCDIDKeyCodec.decode(encodedKey) {
-            case let .p256(publicKey):
-                return .p256(publicKey)
-            case let .secp256k1(publicKey):
-                return try .init(secp256k1PublicKey: publicKey)
+
+        // The pinned TypeScript PDS emits `kid: #atproto_space` while its
+        // current simplespace authority publishes only the ordinary
+        // `#atproto` method. Proposal 0016 defines the dedicated method as
+        // preferred with an ordinary-account-key fallback, so try the
+        // fallback only when the dedicated method is genuinely absent. A
+        // present-but-malformed dedicated method remains fail-closed and
+        // never silently downgrades to another key.
+        for methodName in methodNames {
+            guard let encodedKey = state.verificationMethods[methodName] else {
+                continue
             }
-        } catch {
-            // A malformed or unsupported method in an otherwise authenticated
-            // PLC state is not a reason to try a second network authority.
-            return nil
+            do {
+                switch try PLCDIDKeyCodec.decode(encodedKey) {
+                case let .p256(publicKey):
+                    return .p256(publicKey)
+                case let .secp256k1(publicKey):
+                    return try .init(secp256k1PublicKey: publicKey)
+                }
+            } catch {
+                // A malformed or unsupported method in an otherwise
+                // authenticated PLC state is not a reason to try a second
+                // network authority.
+                return nil
+            }
         }
+        return nil
     }
 
     private func state(
@@ -631,12 +645,12 @@ public actor PLCSpaceCredentialPublicKeyResolver:
         return UInt64(nanoseconds.rounded(.down))
     }
 
-    private static func methodName(for keyID: String) -> String? {
+    private static func methodNames(for keyID: String) -> [String]? {
         switch keyID {
         case PermissionedDataJWT.spaceCredentialKeyID:
-            "atproto_space"
+            ["atproto_space", "atproto"]
         case PermissionedDataJWT.spaceCredentialFallbackKeyID:
-            "atproto"
+            ["atproto"]
         default:
             nil
         }

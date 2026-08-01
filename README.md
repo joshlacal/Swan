@@ -188,6 +188,20 @@ owner-only. It is qualified evidence for the disposable overlay; the default
 stock TypeScript image remains immutable and its known value-bearing
 `listRepoOps`/`getRepo` limitations are not hidden.
 
+For the reverse-authority placement, set
+`SWAN_DYNAMIC_DELEGATION_DIRECTION=authority`. This makes the disposable
+TypeScript account the space authority, keeps the provisioned Swan account as
+the member, and requires Swan to resolve the authority credential key from the
+allowlisted PLC audit rather than a checked-in pin:
+
+```sh
+SWAN_INTEROP_SECRETS_DIR=/absolute/path/to/owner-only-lab-secrets \
+SWAN_DYNAMIC_DELEGATION_PROJECT=disposable-compose-project \
+SWAN_DYNAMIC_DELEGATION_DIRECTION=authority \
+SWAN_DYNAMIC_DELEGATION_NO_BUILD=1 \
+Scripts/run-reference-member-dynamic-delegation-acceptance.sh
+```
+
 ## Disposable Compose interoperability lab
 
 The lab accepts no secret values through Compose environment interpolation.

@@ -1598,3 +1598,36 @@ Compose project were stopped/removed. This is harness/process hygiene evidence,
 not a Swan HTTP deadlock; future runs should use the bounded no-build mode only
 after verifying the project-scoped image and should keep the serialized SwiftPM
 settings.
+
+## Adversarial cross-host witness: reverse authority — 2026-08-01
+
+The generalized dynamic harness now exercises both authority placements. The
+first reverse run found two real compatibility defects rather than treating a
+failed HTTP response as an interop pass: Swan requested only the base
+`atproto` OAuth grant even though `getDelegationToken` requires a whole-space
+qualified read grant, and Swan's PLC resolver did not apply the proposal's
+ordinary `#atproto` fallback when a TypeScript credential declared
+`kid: #atproto_space` without publishing a dedicated `atproto_space` method.
+
+The harness now advertises exact space-read and collection-create scopes in its
+localhost client metadata. The PLC resolver prefers `atproto_space`, falls
+back to `atproto` only when the dedicated method is absent, and remains
+fail-closed when a present dedicated method is malformed. The fallback is
+covered by a focused resolver test (14/14 resolver tests passed).
+
+Fresh disposable evidence after rebuilding the current Linux release image:
+
+- TypeScript authority -> Swan member dynamic credential path: delegation,
+  credential exchange, member write, and member read all returned HTTP 200;
+- write and credential-read CIDs matched and the sanitized artifact reported
+  `status: passed`, `credentialIssued: true`, and `converged: true`;
+- the artifact was mode 0600 and contained no bearer material, DPoP proof,
+  password, record value, or personal selector; and
+- the original TypeScript-member/Swan-authority direction was rerun after the
+  changes and also returned four HTTP 200 events with matching CIDs.
+
+This closes the reverse dynamic credential/write/read witness, not the full
+reverse-authority account lifecycle or fault matrix. Stock pinned-TypeScript
+value-bearing incremental/full-CAR behavior, native Linux-host evidence,
+strict password-reset constant-work/non-cooperative delivery cancellation,
+and the unavailable formal Codex Security launcher remain open gates.
