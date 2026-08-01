@@ -1704,3 +1704,41 @@ pinned-TypeScript value-bearing incremental/full-CAR matrix,
 reverse-authority OAuth/browser/account lifecycle, native Linux evidence,
 strict password-reset timing, non-cooperative delivery cancellation, export
 boundedness, and the formal security scan.
+
+## Fresh reference and recovery rerun — 2026-08-01
+
+The disposable lab was rerun against the current Swift image and the
+unmodified pinned TypeScript image. The dynamic credential/write/read path
+still returned HTTP 200 for delegation, credential exchange, create, and
+read, with matching write/read CIDs. The stateful request then produced the
+following sanitized failure artifact (0600):
+
+- `com.atproto.space.listRepoOps`: HTTP 500 when values were requested;
+- `com.atproto.space.getRepo`: HTTP 501; and
+- the round trip consequently failed the incremental commitment and
+  full-CAR assertions.
+
+The artifact is now retained as <requested-output>.failed on an unsuccessful
+dynamic run. It contains only status, endpoint, byte-count, digest, and
+redacted error metadata; the runner still rejects any record value before
+publication. This makes a stock-reference failure reviewable without
+retaining credentials, tokens, DPoP material, request bodies, or selectors.
+The result confirms that the checked-in recovery overlay cannot be described
+as stock-reference interoperability.
+
+The separate current-image permissioned recovery acceptance passed with a
+real retention gap and a corrupted CAR response:
+
+- the source returned HTTP 409 `full_repo_recovery_required`;
+- a verified full-CAR replacement advanced the receiver from generation 1 to
+  generation 2 with seven records;
+- a deliberately corrupted CAR was rejected as `CARBlockCIDMismatch`; and
+- the last valid head remained preserved while the replacement CAS advanced.
+
+This closes the live compaction-gap/full-CAR replacement and corrupted-CAR
+rejection witness. It does not close corrupted-operation traffic before
+recovery, nor the stock TypeScript value-bearing/recovery endpoints. The
+remaining release gates are the stock pinned-TypeScript matrix,
+reverse-authority OAuth/browser/account lifecycle, strict password-reset
+timing, non-cooperative delivery cancellation, export boundedness, and the
+formal security scan.

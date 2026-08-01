@@ -393,6 +393,20 @@ cleanup() {
   local result=$?
   trap - EXIT INT TERM HUP
   unset reference_access_token
+  # Keep a sanitized semantic artifact for a failed run. The runner never
+  # writes credentials, request bodies, record values, or personal selectors
+  # to this file; preserving it makes an interoperability failure reviewable
+  # after the disposable container and its tmpfs have been removed.
+  if ((result != 0)) && [[ -f "${runner_output_path:-}" ]]; then
+    local failed_output="${output_path}.failed"
+    local failed_directory
+    failed_directory="$(dirname "$failed_output")"
+    mkdir -p "$failed_directory"
+    local failed_temporary
+    failed_temporary="$(mktemp "${failed_directory}/.reference-member-dynamic-failed.XXXXXX")"
+    install -m 0600 "$runner_output_path" "$failed_temporary"
+    mv -f "$failed_temporary" "$failed_output"
+  fi
   docker rm --force "$dynamic_container" >/dev/null 2>&1 || true
   if ((normal_stopped)); then
     docker start "$normal_swan_id" >/dev/null 2>&1 || true
@@ -572,11 +586,14 @@ docker run --rm \
         "rkey=$4" \
       $stateful_flags \
       --output /tmp/sanitized-artifact.json \
+      --no-fail-on-failure \
       >/tmp/live-interop.log 2>&1
     then
       tail -n 40 /tmp/live-interop.log >&2 || true
       exit 1
     fi
+    cp /tmp/sanitized-artifact.json /run/acceptance/artifact.json
+    chmod 0600 /run/acceptance/artifact.json
     if ! grep -q '"'"'"status":"passed"'"'"' /tmp/sanitized-artifact.json; then
       tail -n 40 /tmp/live-interop.log >&2 || true
       exit 1
@@ -585,8 +602,6 @@ docker run --rm \
       echo "sanitized artifact retained a permissioned value" >&2
       exit 1
     fi
-    cp /tmp/sanitized-artifact.json /run/acceptance/artifact.json
-    chmod 0600 /run/acceptance/artifact.json
     unset private_value SWAN_LAB_CONSUMER_PASSWORD
   ' _ \
   "$space_uri" "$space_member_did" "$collection" "$rkey" "${local_consumer_handle:-}"

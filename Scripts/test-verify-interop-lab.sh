@@ -219,6 +219,10 @@ require_acceptance_preflight_rejection \
 
 rg -Fq -- 'credentialKeyPLC' Scripts/run-reference-member-dynamic-delegation-acceptance.sh
 rg -Fq -- 'reference-authority-dynamic-credential' Scripts/run-reference-member-dynamic-delegation-acceptance.sh
+rg -Fq -- 'sanitized semantic artifact for a failed run' \
+  Scripts/run-reference-member-dynamic-delegation-acceptance.sh
+rg -Fq -- 'reference-member-dynamic-failed.XXXXXX' \
+  Scripts/run-reference-member-dynamic-delegation-acceptance.sh
 
 require_acceptance_preflight_rejection \
   caller-selected-notification-project \
