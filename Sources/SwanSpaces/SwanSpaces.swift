@@ -1593,6 +1593,72 @@ public struct SpaceRecord: Sendable, Equatable {
 public enum SpaceWrite: Sendable, Equatable {
     case put(uri: SpaceRecordURI, value: Data)
     case delete(uri: SpaceRecordURI)
+
+    public var valueByteCount: Int {
+        switch self {
+        case let .put(_, value): value.count
+        case .delete: 0
+        }
+    }
+}
+
+/// Shared admission limits for permissioned repository mutations.
+///
+/// The HTTP decoder has the same limits, but keeping them here is important:
+/// storage and in-memory callers are public APIs too and must not be able to
+/// bypass the request-layer bound by handing an adapter a giant already-
+/// materialized array.  The aggregate value limit is intentionally below the
+/// CAR record limit because `applyWrites` is a JSON control-plane operation,
+/// not a streaming transfer.
+public enum SpaceWriteLimits {
+    public static let maximumOperations = 4_096
+    public static let maximumRecordValueBytes = 1 * 1_024 * 1_024
+    public static let maximumAggregateValueBytes = 1 * 1_024 * 1_024
+
+    public static func validate(_ writes: [SpaceWrite]) throws {
+        guard !writes.isEmpty else { return }
+        var aggregateValueBytes = 0
+        for write in writes {
+            switch write {
+            case let .put(_, value):
+                aggregateValueBytes = try addingValueBytes(
+                    aggregateValueBytes,
+                    value.count
+                )
+            case .delete:
+                break
+            }
+        }
+        try validate(
+            operationCount: writes.count,
+            aggregateValueBytes: aggregateValueBytes
+        )
+    }
+
+    public static func addingValueBytes(
+        _ current: Int,
+        _ next: Int
+    ) throws -> Int {
+        guard (0...maximumRecordValueBytes).contains(next), current >= 0 else {
+            throw SwanError.malformed("repository write value exceeds its limit")
+        }
+        let (total, overflow) = current.addingReportingOverflow(next)
+        guard !overflow, total <= maximumAggregateValueBytes else {
+            throw SwanError.malformed("repository write batch exceeds its limit")
+        }
+        return total
+    }
+
+    public static func validate(
+        operationCount: Int,
+        aggregateValueBytes: Int
+    ) throws {
+        guard (1...maximumOperations).contains(operationCount),
+              (0...maximumAggregateValueBytes).contains(aggregateValueBytes)
+        else {
+            throw SwanError.malformed("repository write batch exceeds its limit")
+        }
+    }
 }
 
 public struct SpaceOplogEntry: Sendable, Equatable {
@@ -2031,6 +2097,7 @@ public actor SpaceRepository {
         authorization: AuthorizationContext
     ) throws -> [SpaceOplogEntry] {
         guard !writes.isEmpty else { return [] }
+        try SpaceWriteLimits.validate(writes)
         if let expectedRevision, expectedRevision != revision {
             throw SwanError.conflict(expected: expectedRevision, actual: revision)
         }

@@ -710,7 +710,8 @@ private func authorizeWrite(
 /// blob transfer use different streaming endpoints; accepting a large record
 /// here would make this control-plane path an accidental buffering surface.
 let authenticatedSpaceWriteMaximumJSONBytes = 1 * 1024 * 1024
-private let authenticatedSpaceWriteMaximumOperations = 4_096
+private let authenticatedSpaceWriteMaximumOperations =
+    SpaceWriteLimits.maximumOperations
 
 private enum AuthenticatedSpaceWriteFailure: Error {
     case invalidRequest

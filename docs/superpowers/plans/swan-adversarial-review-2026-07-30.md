@@ -1295,3 +1295,78 @@ password-reset constant-work measurement, non-cooperative third-party email
 cancellation, and the official Codex Security launcher remain open. The
 checked-in recovery overlay is qualification evidence only and must not be
 described as stock-reference interoperability.
+
+## Adversarial rereview: notification restart and stateful CLI guard — 2026-08-01
+
+The crash-boundary acceptance was rerun after the stricter qualified-space
+scope enforcement landed. The restart harness still constructed a localhost
+OAuth client with only the broad `atproto` scope, so its seed write could not
+obtain the authority/self/action grants required for a permissioned record.
+That was a harness-validity defect rather than a server authorization failure.
+
+**ADV-91 (P2, test validity):** the notification restart acceptance now derives
+the authority DID from its space URI, encodes explicit read and collection-create
+space scopes in the development client metadata, and passes those scopes to
+both lab hosts alongside `atproto`. The disposable run then completed the real
+OAuth/DPoP seed write, forced a process stop between commit and delivery, and
+restarted the worker. It reported
+`NOTIFICATION RESTART OUTBOX CONVERGENCE OK: successful_forwards=2
+receiver_effects=1` with exit status 0. The private record value and credentials
+remain confined to container tmpfs and are not copied into the artifact.
+
+The same review found a documentation/harness mismatch: the README suggested
+combining metadata-only `listRepoOps` with the stateful matrix even though the
+stateful evaluator correctly requires values. The CLI now rejects that
+combination before reading a body or starting network work; the README labels
+metadata-only runs as compatibility smoke evidence and reserves the stateful
+gate for value-bearing endpoints.
+
+This closes the notification restart and CLI misuse findings. It does not close
+stock TypeScript value-bearing/recovery support, reverse-authority automatic
+key discovery, live corrupted-operation/compaction-gap traffic, or the formal
+security-launcher gate.
+
+Post-change local verification is current as of this addendum: with
+`SWIFTPM_MAX_CONCURRENT_OPERATIONS=1` and `--jobs 1`, the exact
+`--filter PublicRepositoryReadHTTPTests` invocation completed in 0.327 seconds
+with all 13 tests passing, and the serialized full macOS suite completed with
+906 XCTest cases, 8 intentional skips, and 0 failures. The Swift Testing
+profile suite added four passing tests. The formal Codex Security launcher was
+also attempted but could not start its bundled Python 3 helper; that remains an
+environmental release gate rather than a silently omitted scan.
+
+## Adversarial rereview: direct storage write admission — 2026-08-01
+
+The next pass deliberately bypassed Hummingbird and called the public
+in-memory and SQLite repository APIs with already-materialized mutation
+arrays. The HTTP `applyWrites` handler had a 4,096-operation/1 MiB body bound,
+but the lower layers did not enforce an equivalent limit. A trusted in-process
+caller (or a future adapter that forgot the HTTP route) could therefore make a
+large value-bearing transaction and outbox in one call.
+
+**ADV-92 (P2, availability/adapter consistency):** repository mutation
+admission now lives in `SpaceWriteLimits` and is enforced before revision
+lookups, metadata maps, or SQLite transactions. The in-memory repository,
+`SQLiteAccountDatabase.apply`, `DurableSpaceRepository.applyAtomically`,
+`applyAuthorizedWrites`, and `currentWireRevisionForWrite` all reject more
+than 4,096 operations, any value larger than 1 MiB, or an aggregate value body
+over 1 MiB. The HTTP operation cap uses the same domain constant. The guard is
+overflow-safe and deletes do not consume value bytes.
+
+Focused macOS evidence passed:
+
+- `SwanSpacesTests.testInMemoryRepositoryRejectsOversizedWriteBatchBeforeMutation`;
+- `SwanSQLiteTests.testPermissionedStorageRejectsOversizedWriteBatchBeforeTransaction`;
+- `SwanSQLiteTests.testWireOplogRejectsOversizedAtomicBatchBeforeValueMaterialization`.
+
+The last test now seeds a batch at the domain ceiling and requests an
+intentionally smaller value budget, proving the scalar preflight rejects it
+before the BLOB query. No partial repository state is left by the direct
+storage rejection.
+
+This finding is closed locally. The review still does not promote the alpha to
+release-ready: the stock pinned-TypeScript value-bearing incremental/recovery
+path, reverse-authority OAuth/browser/lifecycle matrix, live corrupted/
+compaction-gap traffic, stock delegation-key discovery, strict password-reset
+constant-work evidence, non-cooperative third-party email cancellation, and
+the unavailable official Codex Security launcher remain explicit gates.

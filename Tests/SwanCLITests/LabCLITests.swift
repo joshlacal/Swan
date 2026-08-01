@@ -192,6 +192,24 @@ final class LabCLITests: XCTestCase {
         XCTAssertTrue(combined.contains("live mode must be public or permissioned"), combined)
     }
 
+    func testLabLiveRejectsMetadataOnlyStatefulCombination() throws {
+        let result = try runCLI(
+            command: [
+                "live",
+                "--mode", "permissioned",
+                "--permissioned-stateful-matrix",
+                "--permissioned-list-ops-exclude-values",
+                "--body-file", "/definitely/missing/live-body.json",
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0)
+        let combined = String(decoding: result.stdout, as: UTF8.self) + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertTrue(
+            combined.contains("requires value-bearing listRepoOps"),
+            combined
+        )
+    }
+
     func testLabLiveWritesSanitizedFailureArtifactWithoutNetwork() throws {
         let directory = try temporaryDirectory()
         let body = directory.appending(path: "record.json")

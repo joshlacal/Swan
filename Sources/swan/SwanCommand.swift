@@ -3754,6 +3754,13 @@ extension SwanCommand {
                 guard normalizedMode == "public" || normalizedMode == "permissioned" else {
                     throw ValidationError("live mode must be public or permissioned")
                 }
+                guard !(normalizedMode == "permissioned"
+                    && permissionedStatefulMatrix
+                    && permissionedListOpsExcludeValues) else {
+                    throw ValidationError(
+                        "--permissioned-stateful-matrix requires value-bearing listRepoOps; remove --permissioned-list-ops-exclude-values"
+                    )
+                }
                 let normalizedScenario = try LabLiveSupport.identifier(name, label: "scenario")
                 let producerURL = try LabLiveSupport.url(
                     explicit: producerURL,

@@ -1052,6 +1052,16 @@ public enum SQLiteSpaceWrite: Sendable, Equatable {
              let .update(uri, _, _), let .delete(uri): uri
         }
     }
+
+    fileprivate var valueByteCount: Int {
+        switch self {
+        case let .create(_, value, _), let .put(_, value, _),
+             let .update(_, value, _):
+            value.count
+        case .delete:
+            0
+        }
+    }
 }
 
 public struct PersistedOplogCursor: Sendable, Hashable, Comparable {
@@ -2954,6 +2964,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         guard !writes.isEmpty else {
             throw SwanError.malformed("repository batch must contain a write")
         }
+        var aggregateValueBytes = 0
+        for write in writes {
+            aggregateValueBytes = try SpaceWriteLimits.addingValueBytes(
+                aggregateValueBytes,
+                write.valueByteCount
+            )
+        }
+        try SpaceWriteLimits.validate(
+            operationCount: writes.count,
+            aggregateValueBytes: aggregateValueBytes
+        )
         for write in writes {
             guard write.uri.space == space, write.uri.author == author else {
                 throw SwanError.unauthorized("record belongs to another repository")
@@ -9152,6 +9173,17 @@ public actor DurableSpaceRepository {
         authorization: AuthorizationContext
     ) async throws -> [DurableSpaceOplogEntry] {
         guard !writes.isEmpty else { return [] }
+        var aggregateValueBytes = 0
+        for write in writes {
+            aggregateValueBytes = try SpaceWriteLimits.addingValueBytes(
+                aggregateValueBytes,
+                write.valueByteCount
+            )
+        }
+        try SpaceWriteLimits.validate(
+            operationCount: writes.count,
+            aggregateValueBytes: aggregateValueBytes
+        )
         guard expectedRevision < UInt64(Int.max) else {
             throw SQLiteRepositoryError.revisionOutOfRange(expectedRevision)
         }
@@ -9243,6 +9275,17 @@ public actor DurableSpaceRepository {
         guard !writes.isEmpty else {
             throw SwanError.malformed("repository batch must contain a write")
         }
+        var aggregateValueBytes = 0
+        for write in writes {
+            aggregateValueBytes = try SpaceWriteLimits.addingValueBytes(
+                aggregateValueBytes,
+                write.valueByteCount
+            )
+        }
+        try SpaceWriteLimits.validate(
+            operationCount: writes.count,
+            aggregateValueBytes: aggregateValueBytes
+        )
 
         let state = try await database.repositoryState(space: space, author: author)
         let expectedRevision = state?.revision ?? 0
@@ -9399,6 +9442,17 @@ public actor DurableSpaceRepository {
         guard !writes.isEmpty else {
             throw SwanError.malformed("repository batch must contain a write")
         }
+        var aggregateValueBytes = 0
+        for write in writes {
+            aggregateValueBytes = try SpaceWriteLimits.addingValueBytes(
+                aggregateValueBytes,
+                write.valueByteCount
+            )
+        }
+        try SpaceWriteLimits.validate(
+            operationCount: writes.count,
+            aggregateValueBytes: aggregateValueBytes
+        )
         for write in writes {
             let uri = write.uri
             try requireRepositoryURI(uri)

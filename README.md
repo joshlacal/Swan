@@ -63,10 +63,13 @@ For the stateful permissioned alpha result, add
 the existing create/read flow and requires explicit write/read CID convergence,
 the matching `listRepoOps` operation CID and revision, a verified signed
 LtHash commitment that matches the verified full-CAR recovery commitment,
-and recovered CAR records before the artifact passes.
-It automatically enables both terminal verifiers; use
-`--permissioned-list-ops-exclude-values` for the pinned TypeScript branch's
-metadata-only incremental page.
+and recovered CAR records before the artifact passes. It automatically enables
+both terminal verifiers and therefore requires a value-bearing incremental page.
+`--permissioned-list-ops-exclude-values` is a separate metadata-only
+compatibility smoke for the stock pinned TypeScript branch; it deliberately
+reports `syncValuesIncluded: false` and must not be combined with the stateful
+matrix. Use the checked-in recovery overlay when the stateful alpha gate needs
+value-bearing incremental and full-CAR endpoints.
 
 The default Compose service intentionally remains the byte-for-byte pinned
 TypeScript image. That image currently has no `getRepo` implementation and

@@ -465,7 +465,15 @@ docker run --rm \
     SWAN_LAB_PRODUCER_PASSWORD="$(tr -d "\r\n" < "${secrets}/member.password")"
     SWAN_LAB_CONSUMER_PASSWORD="$(tr -d "\r\n" < "${secrets}/authority.password")"
     export SWAN_LAB_PRODUCER_PASSWORD SWAN_LAB_CONSUMER_PASSWORD
-    client_id="http://localhost?scope=atproto&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"
+    # The resource server deliberately distinguishes the management scope from
+    # the space-scoped read/create grants. Encode the same qualified scopes in
+    # the localhost client metadata so the lab exercises the real authorization
+    # path instead of relying on a broad implicit grant.
+    authority_did="${1#at://}"
+    authority_did="${authority_did%%/space/*}"
+    read_scope="space:app.bsky.bookmarks?authority=${authority_did}&skey=${4}&action=read"
+    create_scope="space:app.bsky.bookmarks?authority=${authority_did}&skey=${4}&action=create&collection=${3}"
+    client_id="http://localhost?scope=atproto%20space%3Aapp.bsky.bookmarks%3Fauthority%3D${authority_did}%26skey%3D${4}%26action%3Dread%20space%3Aapp.bsky.bookmarks%3Fauthority%3D${authority_did}%26skey%3D${4}%26action%3Dcreate%26collection%3D${3}&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"
     if ! /usr/local/bin/swan lab live \
       --mode permissioned \
       --name notification-restart-seed \
@@ -478,6 +486,8 @@ docker run --rm \
       --consumer-client-id "$client_id" \
       --consumer-redirect-uri http://127.0.0.1/callback \
       --scope atproto \
+      --scope "$read_scope" \
+      --scope "$create_scope" \
       --space "$1" \
       --provision-space \
       --body-file /tmp/permissioned-record.json \

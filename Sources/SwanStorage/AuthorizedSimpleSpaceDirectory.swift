@@ -21,6 +21,15 @@ public enum AuthorizedSpaceRepositoryWrite: Sendable, Equatable {
         case let .delete(uri): return uri
         }
     }
+
+    public var valueByteCount: Int {
+        switch self {
+        case let .create(_, value), let .put(_, value), let .update(_, value):
+            value.count
+        case .delete:
+            0
+        }
+    }
 }
 
 /// The privacy-safe subset of a committed mutation required to render the

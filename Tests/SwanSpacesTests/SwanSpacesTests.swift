@@ -284,6 +284,40 @@ final class SwanSpacesTests: XCTestCase {
         XCTAssertEqual(state.revision, 0)
     }
 
+    func testInMemoryRepositoryRejectsOversizedWriteBatchBeforeMutation() async throws {
+        let space = try SpaceURI(
+            authority: "did:plc:alice",
+            spaceType: "app.bsky.bookmarks",
+            skey: "bounded"
+        )
+        let repository = try SpaceRepository(space: space, author: "did:plc:alice")
+        let authorization = AuthorizationContext.accountOAuth(
+            subject: "did:plc:alice",
+            scopes: [
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=bounded&action=create&collection=app.bsky.feed.post"
+            ]
+        )
+        let value = Data([0xa1, 0x61, 0x76, 0x01])
+        let writes = try (0...SpaceWriteLimits.maximumOperations).map { index in
+            let uri = try SpaceRecordURI(
+                space: space,
+                author: "did:plc:alice",
+                collection: "app.bsky.feed.post",
+                rkey: "r\(index)"
+            )
+            return SpaceWrite.put(uri: uri, value: value)
+        }
+
+        await XCTAssertThrowsErrorAsync(
+            try await repository.applyAtomically(
+                writes,
+                authorization: authorization
+            )
+        )
+        let state = await repository.currentState()
+        XCTAssertEqual(state.revision, 0)
+    }
+
     func testSimpleSpaceEvaluatesMemberManagingAppAndClientPoliciesIndependently() async throws {
         let authority = SimpleSpaceAuthority(credentialSecret: Data(repeating: 4, count: 32))
         let memberSpace = try SpaceURI(authority: "did:plc:alice", spaceType: "app.bsky.bookmarks", skey: "members")

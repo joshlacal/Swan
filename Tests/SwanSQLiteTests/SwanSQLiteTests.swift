@@ -422,6 +422,46 @@ final class SwanSQLiteTests: XCTestCase {
         }
     }
 
+    func testPermissionedStorageRejectsOversizedWriteBatchBeforeTransaction() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close(); try? FileManager.default.removeItem(at: fixture.root) } }
+
+        let writes = try (0...SpaceWriteLimits.maximumOperations).map { index in
+            let uri = try SpaceRecordURI(
+                space: fixture.space,
+                author: fixture.author,
+                collection: "app.bsky.feed.post",
+                rkey: "r\(index)"
+            )
+            return SQLiteSpaceWrite.put(
+                uri: uri,
+                value: fixture.firstValue,
+                cid: fixture.firstCID
+            )
+        }
+
+        await XCTAssertThrowsErrorAsync(
+            try await database.apply(
+                space: fixture.space,
+                author: fixture.author,
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try fixture.tid(0),
+                writes: writes
+            )
+        ) { error in
+            guard case SwanError.malformed = error else {
+                return XCTFail("an oversized direct storage batch must fail closed")
+            }
+        }
+        let state = try await database.repositoryState(
+            space: fixture.space,
+            author: fixture.author
+        )
+        XCTAssertNil(state)
+    }
+
     func testWireOplogBoundsValueMaterializationAtAggregateBudget() async throws {
         let fixture = try Fixture()
         let database = try await fixture.open()
@@ -484,7 +524,11 @@ final class SwanSQLiteTests: XCTestCase {
 
         let value = Data([0xa1, 0x61, 0x76, 0x01])
         let cid = CID.fromDAGCBOR(value).string
-        let writes = try (0 ... PublicRepositoryJSONReadLimits.maximumListRepoOpsOperations)
+        // Keep this at the shared mutation ceiling while still creating a
+        // same-TID group larger than the requested oplog page. The read path
+        // must reject the group before selecting its value BLOBs; the write
+        // path rejects only batches above the domain admission limit.
+        let writes = try (0 ..< SpaceWriteLimits.maximumOperations)
             .map { index in
                 let uri = try SpaceRecordURI(
                     space: fixture.space,
@@ -515,7 +559,8 @@ final class SwanSQLiteTests: XCTestCase {
                 author: fixture.author,
                 since: nil,
                 limit: 1,
-                includeValues: true
+                includeValues: true,
+                maximumAggregateValueBytes: 1
             )
         ) { error in
             guard case SwanError.unavailable = error else {
