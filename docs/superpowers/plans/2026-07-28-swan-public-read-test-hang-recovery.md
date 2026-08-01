@@ -572,3 +572,24 @@ This recovery plan is complete when:
    minimal reviewed fix;
 5. Task 43 receives an independent PASS;
 6. Task 44 begins from its frozen brief, not from speculative hang debugging.
+
+## Current serialized rerun — 2026-08-01
+
+The selector was rerun against a fresh scratch path with one SwiftPM job:
+
+```sh
+SWIFTPM_MAX_CONCURRENT_OPERATIONS=1 \
+  swift test --jobs 1 \
+  --scratch-path /tmp/swan-public-http-filter-20260801 \
+  --filter PublicRepositoryReadHTTPTests
+```
+
+The first invocation took about eight minutes because it compiled the complete
+dependency graph and Swan test products from an empty scratch directory. A
+second invocation reused that build and completed in 9.7 seconds. The actual
+`PublicRepositoryReadHTTPTests` suite ran 13 tests in 0.224 seconds with zero
+failures. This confirms that the earlier apparent hang was SwiftPM/Xcode
+dependency/build work (made worse by concurrent processes), not a runtime
+deadlock in the filtered tests. Keep the serialized command and a unique
+scratch path for clean-cache diagnostics; use the warmed scratch path for
+repeat test debugging.
