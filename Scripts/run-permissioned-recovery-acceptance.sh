@@ -20,6 +20,9 @@ normal_swan_id=""
 normal_stopped=0
 recovery_container=""
 runner_container=""
+runner_id=""
+runner_id_file=""
+runner_cleanup_armed=0
 runner_pid=""
 operation_deadline=0
 temporary_directory=""
@@ -128,15 +131,33 @@ wait_for_caddy_health() {
   return 1
 }
 
+capture_runner_id() {
+  local candidate
+  if [[ -n "$runner_id" ]]; then
+    return 0
+  fi
+  [[ -n "$runner_id_file" && -f "$runner_id_file" ]] || return 1
+  candidate="$(tr -d '\r\n' < "$runner_id_file")"
+  [[ "$candidate" =~ ^[a-f0-9]{64}$ ]] || return 1
+  runner_id="$candidate"
+}
+
+remove_runner() {
+  # `docker create` writes the exact ID to an owner-only file before the
+  # attach client can exist. Do not resolve by name, and never wait for that
+  # client here: Docker tears down its attached stream when this remove wins.
+  if capture_runner_id; then
+    docker rm --force "$runner_id" >/dev/null 2>&1 || true
+  fi
+  runner_id=""
+  runner_pid=""
+  runner_cleanup_armed=0
+}
+
 restore_normal_swan() {
   local restore_deadline=$((SECONDS + wait_timeout))
-  if [[ -n "$runner_container" ]]; then
-    docker rm --force "$runner_container" >/dev/null 2>&1 || true
-    if [[ -n "$runner_pid" ]]; then
-      wait "$runner_pid" >/dev/null 2>&1 || true
-      runner_pid=""
-    fi
-    runner_container=""
+  if ((runner_cleanup_armed == 1)); then
+    remove_runner
   fi
   if [[ -n "$recovery_container" ]]; then
     docker rm --force "$recovery_container" >/dev/null 2>&1 || true
@@ -159,7 +180,7 @@ cleanup() {
   trap - EXIT
   trap '' INT TERM HUP
   set +e
-  if [[ -n "$runner_container" || -n "$recovery_container" || $normal_stopped -eq 1 ]]; then
+  if ((runner_cleanup_armed == 1)) || [[ -n "$recovery_container" ]] || ((normal_stopped == 1)); then
     if ! restore_normal_swan; then
       echo "failed to restore the exact normal Swan container ${normal_swan_id}" >&2
       result=1
@@ -343,7 +364,31 @@ space_uri="at://${authority_did}/space/app.bsky.bookmarks/${space_skey}"
 collection="app.bsky.feed.post"
 client_id="http://localhost?scope=atproto%20space%3Aapp.bsky.bookmarks%3Fauthority%3D${authority_did}%26skey%3D${space_skey}%26action%3Dread%20space%3Aapp.bsky.bookmarks%3Fauthority%3D${authority_did}%26skey%3D${space_skey}%26action%3Dcreate%26collection%3D${collection}&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"
 
-docker run --name "$runner_container" -i \
+wait_for_runner() {
+  [[ -n "$runner_pid" ]] || return 1
+  while kill -0 "$runner_pid" >/dev/null 2>&1; do
+    if ((SECONDS >= operation_deadline)); then
+      printf '%s\n' 'runner-timeout' > "${temporary_directory}/stage.txt"
+      remove_runner
+      return 124
+    fi
+    sleep 1
+  done
+  if ! wait "$runner_pid"; then
+    remove_runner
+    return 1
+  fi
+  remove_runner
+}
+
+# Arm cleanup before Docker can create the runner. The created ID is redirected
+# to an owner-only file, so cleanup can remove the exact object even if a
+# signal lands between `docker create` and shell assignment/start.
+runner_script="${temporary_directory}/runner.sh"
+runner_id_file="${temporary_directory}/runner.id"
+install -m 0700 "$root/Scripts/permissioned-recovery-runner.sh" "$runner_script"
+runner_cleanup_armed=1
+docker create --name "$runner_container" -i \
   --network "$network_name" \
   --read-only \
   --tmpfs /tmp:size=64m,mode=1777 \
@@ -353,181 +398,20 @@ docker run --name "$runner_container" -i \
   --mount "type=bind,src=${temporary_directory},dst=/run/acceptance" \
   --entrypoint /bin/bash \
   "$image_tag" \
-  -s -- \
+  /run/acceptance/runner.sh \
   "$space_uri" "$member_did" "$collection" "$client_id" \
-  "$member_handle" "$authority_handle" "$authority_did" "$space_skey" <<'RUNNER' &
-set -euo pipefail
-umask 077
-export HOME=/tmp
-export SSL_CERT_FILE=/etc/ssl/certs/caddy-local-root.crt
-
-space_uri="$1"
-member_did="$2"
-collection="$3"
-client_id="$4"
-member_handle="$5"
-authority_handle="$6"
-authority_did="$7"
-space_skey="$8"
-read_scope="space:app.bsky.bookmarks?authority=${authority_did}&skey=${space_skey}&action=read"
-create_scope="space:app.bsky.bookmarks?authority=${authority_did}&skey=${space_skey}&action=create&collection=${collection}"
-export SWAN_LAB_PRODUCER_HANDLE="$member_handle"
-export SWAN_LAB_CONSUMER_HANDLE="$authority_handle"
-SWAN_LAB_PRODUCER_PASSWORD="$(tr -d '\r\n' < /run/secrets/swan-bootstrap/member.password)"
-SWAN_LAB_CONSUMER_PASSWORD="$(tr -d '\r\n' < /run/secrets/swan-bootstrap/authority.password)"
-export SWAN_LAB_PRODUCER_PASSWORD SWAN_LAB_CONSUMER_PASSWORD
-stage() { printf '%s\n' "$1" > /run/acceptance/stage.txt; }
-diagnostic_code() {
-  case "$1" in
-    HTTP[1-5][0-9][0-9]|InvalidURL|ResponseTooLarge|UnexpectedRedirect|UnexpectedContentType|TransportFailure|FileFailure|InteropFailure|UnknownError)
-      printf '%s\n' "$1"
-      ;;
-    *)
-      printf '%s\n' unknown
-      ;;
-  esac
-}
-stage key-derivation-start
-SWAN_LAB_PERMISSIONED_COMMIT_KEY="$(/usr/local/bin/swan account recovery-commit-key \
-  --data-directory /var/lib/swan/data --did "$member_did")"
-case "$SWAN_LAB_PERMISSIONED_COMMIT_KEY" in ES256:*) ;; *) exit 1;; esac
-export SWAN_LAB_PERMISSIONED_COMMIT_KEY
-stage key-derived
-
-write_one() {
-  local index="$1"
-  local rkey="retention-${index}"
-  local private_value
-  private_value="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
-  printf '{"space":"%s","repo":"%s","collection":"%s","rkey":"%s","record":{"$type":"app.bsky.feed.post","text":"%s"}}\n' \
-    "$space_uri" "$member_did" "$collection" "$rkey" "$private_value" >/tmp/record.json
-  local -a command=(
-    /usr/local/bin/swan lab live
-    --mode permissioned --name "retention-write-${index}"
-    --producer-url https://swan.test --consumer-url https://swan.test
-    --producer-auth oauth --consumer-auth oauth
-    --producer-client-id "$client_id" --producer-redirect-uri http://127.0.0.1/callback
-    --consumer-client-id "$client_id" --consumer-redirect-uri http://127.0.0.1/callback
-    --scope atproto --scope "$read_scope" --scope "$create_scope"
-    --space "$space_uri" --body-file /tmp/record.json
-    --read-query "space=$space_uri" "repo=$member_did" "collection=$collection" "rkey=$rkey"
-    --output "/tmp/write-${index}.json"
-  )
-  if [[ "$index" == 1 ]]; then
-    command+=(--provision-space --permissioned-list-ops --permissioned-list-ops-exclude-values)
-  fi
-  stage "write-${index}-start"
-  if ! "${command[@]}" >/tmp/live.log 2>&1; then
-    error_code="$(sed -n 's/.*"errorCode":"\([A-Za-z0-9_]*\)".*/\1/p' "/tmp/write-${index}.json" || true)"
-    if [[ -n "$error_code" ]]; then
-      stage "write-${index}-failed-$(diagnostic_code "$error_code")"
-    elif grep -q 'permissioned space creation failed' /tmp/live.log; then
-      stage "write-${index}-failed-space-create"
-    elif grep -q 'permissioned space membership failed' /tmp/live.log; then
-      stage "write-${index}-failed-space-member"
-    elif grep -q 'OAuth' /tmp/live.log; then
-      stage "write-${index}-failed-oauth"
-    else
-      stage "write-${index}-failed-pre-artifact"
-    fi
-    exit 1
-  fi
-  grep -q '"status":"passed"' "/tmp/write-${index}.json"
-  if grep -F -- "$private_value" "/tmp/write-${index}.json" >/dev/null; then
-    exit 1
-  fi
-  stage "write-${index}-passed"
-}
-
-write_one 1
-earliest_tid="$(python3 - /tmp/write-1.json <<'PY'
-import json
-import re
-import sys
-
-value = json.load(open(sys.argv[1], encoding="utf-8")).get("syncOperationRevision")
-if not isinstance(value, str) or not re.fullmatch(r"[a-z2-7]{13}", value):
-    raise SystemExit(1)
-print(value)
-PY
-)"
-case "$earliest_tid" in [a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7][a-z2-7]) ;; *) exit 1;; esac
-stage earliest-tid-pruned
-write_one 2
-write_one 3
-echo "permissioned recovery acceptance: earliest wire TID was pruned"
-
-stage recovery-start
-if ! /usr/local/bin/swan lab recover-permissioned \
-  --receiver-did "$authority_did" --repository "$member_did" --space "$space_uri" \
-  --data-directory /var/lib/swan/data --name permissioned-retention-recovery \
-  --source-url https://swan.test --authority-url https://swan.test \
-  --source-auth oauth --source-client-id "$client_id" \
-  --source-redirect-uri http://127.0.0.1/callback \
-  --scope atproto --scope "$read_scope" --scope "$create_scope" \
-  --since "$earliest_tid" --output /run/acceptance/artifact.json \
-  --request-timeout-seconds 20 --no-fail-on-failure >/tmp/recovery.log 2>&1
-then
-  if grep -q 'OAuth' /tmp/recovery.log; then
-    stage recovery-command-failed-oauth
-  elif grep -q 'permissioned commit public key' /tmp/recovery.log; then
-    stage recovery-command-failed-key
-  elif grep -q 'receiver account' /tmp/recovery.log; then
-    stage recovery-command-failed-receiver
-  else
-    stage recovery-command-failed-pre-artifact
-  fi
+  "$member_handle" "$authority_handle" "$authority_did" "$space_skey" \
+  > "$runner_id_file"
+capture_runner_id || {
+  echo "Docker did not return a canonical runner ID" >&2
   exit 1
-fi
-chmod 0600 /run/acceptance/artifact.json
-stage "$(python3 - /run/acceptance/artifact.json <<'PY'
-import json
-import sys
-
-allowed = {
-    "CARBlockCIDMismatch", "RecoveryFailed", "RecoveryInvalidBinding",
-    "RecoveryInvalidTimestamp", "RecoveryReceiverMismatch",
-    "RecoveryUnknownSession", "RecoveryExpiredSession",
-    "RecoveryImportInProgress", "RecoveryPoisonedSession",
-    "RecoveryConflictingRequestReuse", "RecoveryBindingMismatch",
-    "RecoveryVerificationRequired", "RecoveryInvalidStatus",
-    "RetentionGapMissing", "CorruptRecoveryAccepted",
 }
-artifact = json.load(open(sys.argv[1], encoding="utf-8"))
-if artifact.get("status") == "passed":
-    print("recovery-artifact-passed")
-else:
-    code = artifact.get("errorCode")
-    print("recovery-artifact-failed-" + (code if code in allowed else "unknown"))
-PY
-)"
-unset earliest_tid SWAN_LAB_PERMISSIONED_COMMIT_KEY SWAN_LAB_PRODUCER_PASSWORD SWAN_LAB_CONSUMER_PASSWORD
-RUNNER
 
+# The create is synchronous and the attach client's PID is assigned as the
+# immediate next shell action. A failure between create and start is safe:
+# cleanup already owns the exact `runner_id` and removes it without waiting.
+docker start --attach --interactive "$runner_id" &
 runner_pid=$!
-wait_for_runner() {
-  while kill -0 "$runner_pid" >/dev/null 2>&1; do
-    if ((SECONDS >= operation_deadline)); then
-      printf '%s\n' 'runner-timeout' > "${temporary_directory}/stage.txt"
-      docker rm --force "$runner_container" >/dev/null 2>&1 || true
-      wait "$runner_pid" >/dev/null 2>&1 || true
-      runner_pid=""
-      runner_container=""
-      return 124
-    fi
-    sleep 1
-  done
-  if ! wait "$runner_pid"; then
-    docker rm --force "$runner_container" >/dev/null 2>&1 || true
-    runner_pid=""
-    runner_container=""
-    return 1
-  fi
-  docker rm "$runner_container" >/dev/null 2>&1 || true
-  runner_pid=""
-  runner_container=""
-}
-
 if ! wait_for_runner; then
   [[ -f "${temporary_directory}/stage.txt" ]] || \
     printf '%s\n' 'runner-failed-pre-artifact' > "${temporary_directory}/stage.txt"
@@ -536,7 +420,7 @@ fi
 
 if ! artifact_validation="$(python3 "$root/Scripts/validate-permissioned-recovery-artifact.py" "$runner_artifact")"; then
   case "$artifact_validation" in
-    mode|fields|scenario|profile|status|gap|corruption|preserved|head|records|commitment|revision|error|policy)
+    mode|fields|scenario|profile|status|gap|corruption|preserved|generation|prior|head|records|commitment|revision|error|policy)
       printf 'host-artifact-validation-%s\n' "$artifact_validation" > "${temporary_directory}/stage.txt"
       ;;
     *)
@@ -545,6 +429,10 @@ if ! artifact_validation="$(python3 "$root/Scripts/validate-permissioned-recover
   esac
   exit 1
 fi
+
+# `remove_runner` clears the lifecycle state only after Docker has received
+# the exact created ID. There is deliberately no cleanup-time client wait.
+runner_pid=""
 
 output_directory="$(dirname "$output_path")"
 mkdir -p "$output_directory"

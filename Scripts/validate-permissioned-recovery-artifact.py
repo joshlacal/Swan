@@ -36,7 +36,8 @@ def main(path: str) -> None:
     }
     required = {
         "scenario", "profileID", "priorHeadPresent", "corruptionRejected",
-        "lastValidHeadPreserved", "status", "fixturePolicy",
+        "lastValidHeadPreserved", "validHeadGeneration", "finalHeadGeneration",
+        "status", "fixturePolicy",
     }
     if not set(artifact).issubset(expected) or not required.issubset(artifact):
         fail("fields")
@@ -44,6 +45,8 @@ def main(path: str) -> None:
         fail("scenario")
     if artifact["profileID"] != EXPECTED_PROFILE:
         fail("profile")
+    if not isinstance(artifact["priorHeadPresent"], bool):
+        fail("prior")
     if artifact["status"] != "passed" or artifact.get("gapStatus") != 409:
         fail("status")
     if artifact.get("gapErrorCode") != "full_repo_recovery_required":
@@ -53,6 +56,11 @@ def main(path: str) -> None:
         fail("corruption")
     if artifact["lastValidHeadPreserved"] is not True:
         fail("preserved")
+    for field in ("validHeadGeneration", "finalHeadGeneration"):
+        if not isinstance(artifact[field], int) \
+                or isinstance(artifact[field], bool) \
+                or artifact[field] <= 0:
+            fail("generation")
     if artifact.get("validHeadGeneration") != artifact.get("finalHeadGeneration") \
             or artifact.get("validHeadRevision") != artifact.get("finalHeadRevision") \
             or artifact.get("validCommitment") != artifact.get("finalCommitment"):
