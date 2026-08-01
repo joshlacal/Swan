@@ -1427,3 +1427,41 @@ Reverse-authority OAuth/browser/lifecycle, password-reset timing and
 non-cooperative email cancellation, final native Linux/current-profile
 acceptance, clean-cache Compose, and formal security-scan completion remain
 open.
+
+## Adversarial closure: live permissioned recovery acceptance — 2026-08-01
+
+Task 45 now closes the previously open local recovery-acceptance gate. A live
+retention-2 Swan source returned the exact HTTP 409
+`full_repo_recovery_required`; the receiver installed the verified two-root
+CAR as a durable three-record head; a final-byte-corrupted retry failed only as
+`CARBlockCIDMismatch`; and the final durable generation, revision, and
+commitment remained equal to the last valid installed head. The semantic-only
+artifact is mode 0600 and contains no DIDs, space URI, credentials, tokens,
+DPoP material, record values, verifier material, paths, or raw LtHash state.
+
+Three independent remediation rounds found and closed acceptance-harness
+defects before approval:
+
+- the first harness trusted shape-checked plaintext PLC JSON rather than the
+  managed account's authenticated durable identity history;
+- the first runner lifecycle had signal/timeout and creation-response windows
+  that could outlive cleanup or leave a temporary container behind; and
+- the first artifact projection did not bind exact scenario/profile values or
+  strictly type its durable-head witnesses.
+
+The final harness obtains only an algorithm-tagged public commit key from a
+read-only CLI that verifies the canonical PLC operation/CID chain, rotation
+signatures, expected DID, and terminal `atproto` method. It synchronously
+creates a labelled runner, captures or safely recovers its exact full container
+ID using a fresh cleanup nonce, removes only that validated ID, ignores
+follow-on handled signals during restoration, and proves the exact original
+Swan through both loopback and Caddy health checks. Dynamic tests exercise the
+lost-create-response fallback and artifact mutations; ShellCheck and the
+focused Swift artifact suite pass. Independent spec and code-quality verdicts
+are both approved at head `ee31ffe97504`.
+
+This is Swan-to-Swan evidence, not alpha completion. Stock pinned-TypeScript
+value-bearing incremental/full-recovery behavior, reverse-authority
+OAuth/browser/account lifecycle, strict password-reset constant-work and
+non-cooperative delivery cancellation, native Linux, final clean-cache/current-
+profile acceptance, and formal security review remain open.
