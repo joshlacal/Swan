@@ -418,3 +418,23 @@ isolation. Receipt uniqueness and duplicate lookup now include `space_uri`,
 with a transactional migration for existing account databases. The focused
 SQLite notification suite passes 6/6, including reuse of one writer JTI across
 two spaces without suppressing either writer hint.
+
+## 2026-07-31 local acceptance checkpoint after adversarial rereview
+
+Commit `229d90b9` bounds permissioned JSON record projection with a keyset SQL
+page and aggregate byte admission, performs metadata-only write authorization,
+seeds the permissioned TID allocator from the durable write revision, and
+narrowed public OAuth low-level issuance/redemption APIs so production callers
+cannot disable active-account enforcement. Focused suites passed 13/13 for
+permissioned record reads/writes, 104/104 for OAuth, and 12/12 for public
+repository read HTTP behavior.
+
+A fresh dependency-cache macOS acceptance passed the complete XCTest graph with
+zero failures. The explicit bounded-transfer gates also passed: public
+production `getRepo` RSS, permissioned near-256 MiB CAR RSS, public CAR-spool
+RSS, 256 MiB staged CAR import, private CAS streaming, and the private CAR
+spool stress test. This is local macOS evidence only. The acceptance wrapper
+still reports the live cross-host semantic matrix as not run; native Linux,
+stock pinned TypeScript recovery/value interoperability, reverse-authority
+OAuth/browser/lifecycle coverage, and the corruption/compaction fault matrix
+remain required before calling the alpha complete.

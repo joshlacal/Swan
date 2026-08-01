@@ -1032,3 +1032,41 @@ does not change the release boundary: native Linux, unmodified pinned
 TypeScript semantic/recovery interoperability, reverse-authority OAuth and
 lifecycle coverage, corrupted-operation/compaction-gap traffic, and the
 official security launcher remain open.
+
+## Permissioned projection and API rereview: 2026-07-31
+
+The next adversarial pass targeted the remaining Luna-era read/write boundaries
+and the low-level OAuth test seams. Permissioned JSON record reads now use a
+keyset SQL page that selects metadata first, enforces the aggregate byte budget
+before loading values, and rejects a changed value length before publication.
+Permissioned writes perform a metadata-only authorization preflight; write-only
+callers do not receive a commit, commitment, or record-value snapshot. The
+durable SQLite wire revision seeds the process-local TID allocator, and a
+monotonicity-only retry reuses the same request identifier after a concurrent
+wire-revision race. No network I/O occurs in the transaction.
+
+The public OAuth issuance and redemption entry points no longer expose the
+active-subject opt-out or a caller-selected inactive-subject policy. Those
+arguments remain internal test seams only; production wrappers require an
+active-subject revision and always enforce active accounts. This removes a
+low-level API footgun without changing the protocol surface.
+
+Verification for commit `229d90b9` (`security: bound private reads and narrow
+OAuth issuance`) passed: the focused permissioned read/write suite passed 13/13,
+`SwanOAuthTests` passed 104/104, and `PublicRepositoryReadHTTPTests` passed
+12/12. A fresh clean-cache macOS build and full XCTest acceptance passed with
+exit code 0; the run reported the normal opt-in/reference-cache skips. The
+explicit transfer gates then passed on the same source: public production
+`getRepo` RSS, permissioned near-256 MiB CAR RSS, public CAR-spool RSS,
+256 MiB staged CAR import, and private CAS streaming. The permissioned CAR
+report verified 267,396,722 streamed bytes with a 19,922,944-byte peak RSS
+increase and 65,536-byte maximum chunks; the public spool report verified
+270,049,433 streamed bytes with a 17,301,504-byte RSS increase.
+
+These results close the current local read/write, API-footgun, and bounded
+transfer findings. They do not change the release boundary: native Linux,
+unmodified pinned TypeScript semantic/recovery interoperability, reverse-
+authority OAuth/browser and lifecycle coverage, corrupted-operation and
+compaction-gap traffic, and the official security launcher remain open. The
+clean-cache wrapper still explicitly reports that the live cross-host semantic
+matrix was not run.
