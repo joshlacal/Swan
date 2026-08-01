@@ -21,7 +21,7 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
     private static let publicURL = URL(string: "https://swan.example")!
     private static let path = "/xrpc/com.atproto.space.getDelegationToken"
 
-    func testMintsAndVerifiesShortLivedDelegationsForBroadAndWholeSpaceReadScopes() async throws {
+    func testMintsAndVerifiesShortLivedDelegationsForQualifiedWholeSpaceReadScopes() async throws {
         let fixture = try await Fixture.make()
         defer { fixture.cleanup() }
         do {
@@ -32,7 +32,6 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
                 publicKeys: fixture.localDelegationPublicKeys
             )
             let scopes = [
-                Set(["atproto"]),
                 Set([wholeSpaceReadScope(for: fixture.space)]),
                 Set([wildcardWholeSpaceReadScope()]),
             ]
@@ -84,6 +83,45 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
                 }
             }
             try await fixture.assertNoPrivateMaterialPersistence()
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    func testRejectsAtprotoOnlyScopeForSameSubject() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let app = try makeServer(fixture, enabled: true).buildApplication(
+                logger: Logger(label: "SpaceDelegationMintingHTTPTests.atproto-scope")
+            )
+            let access = try await issueToken(
+                runtime: fixture.runtime,
+                subject: Self.user,
+                scopes: ["atproto"]
+            )
+            let headers = try dpopHeaders(
+                token: access.token,
+                key: access.key,
+                jwk: access.jwk,
+                nonce: fixture.runtime.dpopNonceService.issue(),
+                jti: "delegation-atproto-only",
+                path: Self.path
+            )
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: delegationURI(fixture.space),
+                    method: .get,
+                    headers: headers
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    self.assertNoStore(response)
+                    XCTAssertEqual(try self.errorCode(response.body), "Unauthorized")
+                }
+            }
             try await fixture.close()
         } catch {
             try? await fixture.close()
@@ -154,7 +192,7 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
             let access = try await issueToken(
                 runtime: fixture.runtime,
                 subject: Self.user,
-                scopes: ["atproto"]
+                scopes: [wholeSpaceReadScope(for: fixture.space)]
             )
             try await app.test(.router) { client in
                 for uri in [
@@ -255,7 +293,7 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
             let unknown = try await issueToken(
                 runtime: fixture.runtime,
                 subject: Self.unknown,
-                scopes: ["atproto"]
+                scopes: [wholeSpaceReadScope(for: fixture.space)]
             )
             try await enabled.test(.router) { client in
                 try await client.execute(
@@ -276,7 +314,7 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
             let active = try await issueToken(
                 runtime: fixture.runtime,
                 subject: Self.user,
-                scopes: ["atproto"]
+                scopes: [wholeSpaceReadScope(for: fixture.space)]
             )
             let accountDatabase = SQLiteLayout.accountDatabase(in: fixture.root, did: Self.user)
             try FileManager.default.removeItem(at: accountDatabase)
@@ -315,7 +353,7 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
             let access = try await issueToken(
                 runtime: missingKey.runtime,
                 subject: Self.user,
-                scopes: ["atproto"]
+                scopes: [wholeSpaceReadScope(for: missingKey.space)]
             )
             try await app.test(.router) { client in
                 try await client.execute(

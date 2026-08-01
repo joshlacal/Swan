@@ -1691,7 +1691,10 @@ private struct Fixture: Sendable {
             )
             let memberAuthorization: AuthorizationContext = .accountOAuth(
                 subject: SpaceCredentialHTTPTests.member,
-                scopes: ["atproto"]
+                scopes: [
+                    "space:\(publicSpace.spaceType)?authority=\(publicSpace.authority)&skey=\(publicSpace.skey)&action=create&collection=app.bsky.feed.post",
+                    "space:\(memberSpace.spaceType)?authority=\(memberSpace.authority)&skey=\(memberSpace.skey)&action=create&collection=app.bsky.feed.post",
+                ]
             )
             let publicRepository = try DurableSpaceRepository(
                 database: memberDatabase,

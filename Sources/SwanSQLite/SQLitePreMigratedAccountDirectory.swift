@@ -470,22 +470,14 @@ public actor SQLitePreMigratedAccountDirectory:
             for: space,
             authorization: authorization
         )
-        guard let state = try await authority.space(space, authorization: authorization),
-              !state.space.isDeleted else {
-            throw AuthorizedSimpleSpaceLifecycleError.notFound
-        }
-        let members = state.space.members.sorted()
-        let selected: [String]
-        if let cursor {
-            selected = Array(members.lazy.filter { $0 > cursor }.prefix(limit))
-        } else {
-            selected = Array(members.prefix(limit))
-        }
-        try await requireLifecycleAuthorityStillAvailable(space.authority)
-        return AuthorizedSimpleSpaceMemberPage(
-            members: selected,
-            cursor: selected.last
+        let page = try await authority.memberPage(
+            space: space,
+            limit: limit,
+            cursor: cursor,
+            authorization: authorization
         )
+        try await requireLifecycleAuthorityStillAvailable(space.authority)
+        return page
     }
 
     // MARK: Authority credential policy
@@ -795,6 +787,7 @@ public actor SQLitePreMigratedAccountDirectory:
         since: String?,
         limit: Int,
         includeValues: Bool,
+        maximumAggregateValueBytes: Int,
         authorization: AuthorizationContext
     ) async throws -> AuthorizedSpaceRepositoryOplogRead {
         let database = try await preopenedRepositoryDatabase(
@@ -815,6 +808,7 @@ public actor SQLitePreMigratedAccountDirectory:
                 since: cursor,
                 limit: limit,
                 includeValues: includeValues,
+                maximumAggregateValueBytes: maximumAggregateValueBytes,
                 authorization: authorization
             )
             if case let .incremental(state, entries) = result {

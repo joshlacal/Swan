@@ -54,7 +54,12 @@ final class SwanSpacesTests: XCTestCase {
             _ = try await repository.apply(.put(uri: first, value: Data("first".utf8)), authorization: .public)
             XCTFail("a public context must never write a space repository")
         } catch {}
-        let author = AuthorizationContext.accountOAuth(subject: "did:plc:alice", scopes: ["atproto"])
+        let author = AuthorizationContext.accountOAuth(
+            subject: "did:plc:alice",
+            scopes: [
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=create&collection=app.bsky.feed.post",
+            ]
+        )
         _ = try await repository.apply(.put(uri: first, value: Data("first".utf8)), authorization: author)
         _ = try await repository.apply(.put(uri: second, value: Data("second".utf8)), authorization: author)
 
@@ -64,6 +69,101 @@ final class SwanSpacesTests: XCTestCase {
         }
         XCTAssertEqual(revision, 2)
         XCTAssertEqual(records.count, 2)
+    }
+
+    func testSameSubjectAtprotoOnlyCannotReadPermissionedRecord() async throws {
+        let author = "did:plc:alice"
+        let space = try SpaceURI(
+            authority: author,
+            spaceType: "app.bsky.bookmarks",
+            skey: "scope-boundary"
+        )
+        let uri = try SpaceRecordURI(
+            space: space,
+            author: author,
+            collection: "app.bsky.feed.post",
+            rkey: "private"
+        )
+        let repository = try SpaceRepository(space: space, author: author)
+        let createScope = "space:app.bsky.bookmarks?authority=did:plc:alice&skey=scope-boundary&action=create&collection=app.bsky.feed.post"
+        _ = try await repository.apply(
+            .put(uri: uri, value: Data("private".utf8)),
+            authorization: .accountOAuth(subject: author, scopes: [createScope])
+        )
+
+        await XCTAssertThrowsErrorAsync(
+            try await repository.record(
+                uri,
+                authorization: .accountOAuth(subject: author, scopes: ["atproto"])
+            )
+        )
+    }
+
+    func testAtprotoOnlyCannotListPermissionedSpacesButQualifiedWildcardCan() {
+        XCTAssertFalse(PermissionedSpaceScopeSyntax.permitsAggregateSpaceList(
+            ["atproto"],
+            spaceType: nil,
+            authority: nil
+        ))
+        XCTAssertTrue(PermissionedSpaceScopeSyntax.permitsAggregateSpaceList(
+            ["space:*?authority=*&skey=*&action=read"],
+            spaceType: nil,
+            authority: nil
+        ))
+    }
+
+    func testWildcardTupleScopesAuthorizeResourceAndManagementOperations() async throws {
+        let author = "did:plc:alice"
+        let space = try SpaceURI(
+            authority: author,
+            spaceType: "app.bsky.bookmarks",
+            skey: "wildcard"
+        )
+        let record = try SpaceRecordURI(
+            space: space,
+            author: author,
+            collection: "app.bsky.feed.post",
+            rkey: "wildcard"
+        )
+        let repository = try SpaceRepository(space: space, author: author)
+        let resourceAuthorization = AuthorizationContext.accountOAuth(
+            subject: author,
+            scopes: [
+                "space:*?authority=*&skey=*&action=create&collection=app.bsky.feed.post",
+                "space:*?authority=*&skey=*&action=read",
+            ]
+        )
+
+        _ = try await repository.apply(
+            .put(uri: record, value: Data("wildcard".utf8)),
+            authorization: resourceAuthorization
+        )
+        let readRecord = try await repository.record(
+            record,
+            authorization: resourceAuthorization
+        )
+        XCTAssertEqual(readRecord?.value, Data("wildcard".utf8))
+        await XCTAssertThrowsErrorAsync(
+            try await repository.record(
+                record,
+                authorization: .accountOAuth(
+                    subject: author,
+                    scopes: [
+                        "space:*?authority=*&skey=*&action=read&unexpected=ignored"
+                    ]
+                )
+            )
+        )
+        XCTAssertNoThrow(
+            try SpaceAuthorizationPolicy.requireManagement(
+                space: space,
+                authorization: .accountOAuth(
+                    subject: author,
+                    scopes: ["space:*?authority=*&skey=*&manage=create"]
+                ),
+                operation: .create
+            )
+        )
     }
 
     func testPrivateBlobCanNeverUseThePublicReadPath() async throws {
@@ -161,7 +261,14 @@ final class SwanSpacesTests: XCTestCase {
         let first = try SpaceRecordURI(space: space, author: "did:plc:alice", collection: "app.bsky.feed.post", rkey: "one")
         let missing = try SpaceRecordURI(space: space, author: "did:plc:alice", collection: "app.bsky.feed.post", rkey: "missing")
         let repository = try SpaceRepository(space: space, author: "did:plc:alice")
-        let authorization = AuthorizationContext.accountOAuth(subject: "did:plc:alice", scopes: ["atproto"])
+        let authorization = AuthorizationContext.accountOAuth(
+            subject: "did:plc:alice",
+            scopes: [
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=create&collection=app.bsky.feed.post",
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=delete&collection=app.bsky.feed.post",
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=read",
+            ]
+        )
 
         do {
             _ = try await repository.applyAtomically([
@@ -250,11 +357,74 @@ final class SwanSpacesTests: XCTestCase {
         )
     }
 
+    func testSimpleSpaceDomainRejectsMalformedIdentifiersAcrossAuthorityOperations() async throws {
+        await XCTAssertThrowsErrorAsync(
+            try SimpleSpaceConfiguration(
+                policy: .memberList,
+                appAccess: .allowList(["reader\u{0000}client"])
+            )
+        )
+        await XCTAssertThrowsErrorAsync(
+            try SimpleSpaceConfiguration(
+                policy: .managingApp,
+                appAccess: .open,
+                managingApp: "app\u{007f}service"
+            )
+        )
+
+        let authority = SimpleSpaceAuthority(credentialSecret: Data(repeating: 7, count: 32))
+        let space = try SpaceURI(
+            authority: "did:plc:alice",
+            spaceType: "app.bsky.bookmarks",
+            skey: "identifier-validation"
+        )
+        _ = try await authority.create(
+            space: space,
+            owner: space.authority,
+            configuration: try SimpleSpaceConfiguration(policy: .public)
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await authority.issueReadCredential(
+                space: space,
+                user: "not-a-did",
+                clientID: nil
+            )
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await authority.issueReadCredential(
+                space: space,
+                user: space.authority,
+                clientID: "reader\u{0000}client"
+            )
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await authority.setManagingAppAccess(
+                space: space,
+                user: "not-a-did",
+                allowed: true,
+                by: "unused"
+            )
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await authority.removeMember(
+                space: space,
+                member: "not-a-did",
+                by: space.authority
+            )
+        )
+    }
+
     func testTwoRootCARAuthenticatesIndexAndRecordBlocks() async throws {
         let space = try SpaceURI(authority: "did:plc:alice", spaceType: "app.bsky.bookmarks", skey: "shared")
         let uri = try SpaceRecordURI(space: space, author: "did:plc:alice", collection: "app.bsky.feed.post", rkey: "one")
         let repository = try SpaceRepository(space: space, author: "did:plc:alice")
-        let authorization = AuthorizationContext.accountOAuth(subject: "did:plc:alice", scopes: ["atproto"])
+        let authorization = AuthorizationContext.accountOAuth(
+            subject: "did:plc:alice",
+            scopes: [
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=shared&action=create&collection=app.bsky.feed.post",
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=shared&action=read",
+            ]
+        )
         // Canonical DAG-CBOR for {"text": "hello"}.
         let recordCBOR = Data([0xa1, 0x64, 0x74, 0x65, 0x78, 0x74, 0x65, 0x68, 0x65, 0x6c, 0x6c, 0x6f])
         _ = try await repository.apply(.put(uri: uri, value: recordCBOR), authorization: authorization)
@@ -495,6 +665,10 @@ final class SwanSpacesTests: XCTestCase {
         let collectionLimitedScope = """
         space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=\(fixture.first.collection)
         """
+        XCTAssertTrue(
+            PermissionedSpaceScopeSyntax.isQualified(collectionLimitedScope),
+            collectionLimitedScope.debugDescription
+        )
         let collectionLimited = AuthorizationContext.accountOAuth(
             subject: fixture.author,
             scopes: [collectionLimitedScope]
@@ -1265,7 +1439,15 @@ private struct DurableRepositoryFixture {
     let thirdValue = Data([0xa1, 0x64, 0x74, 0x65, 0x78, 0x74, 0x65, 0x74, 0x68, 0x69, 0x72, 0x64])
 
     var authorized: AuthorizationContext {
-        .accountOAuth(subject: author, scopes: ["atproto"])
+        .accountOAuth(
+            subject: author,
+            scopes: [
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=read",
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=create&collection=*",
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=update&collection=*",
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=delete&collection=*",
+            ]
+        )
     }
 
     init() throws {

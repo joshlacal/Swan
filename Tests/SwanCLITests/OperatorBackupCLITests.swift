@@ -526,8 +526,8 @@ private func cliExecutableURL() -> URL? {
         .deletingLastPathComponent()
         .deletingLastPathComponent()
     for candidate in [
-        packageRoot.appending(path: ".build-task21/debug/swan"),
         packageRoot.appending(path: ".build/debug/swan"),
+        packageRoot.appending(path: ".build-task21/debug/swan"),
     ] where FileManager.default.isExecutableFile(atPath: candidate.path) {
         return candidate
     }

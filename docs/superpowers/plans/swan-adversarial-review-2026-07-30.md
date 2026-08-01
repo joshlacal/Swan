@@ -1111,3 +1111,126 @@ cross-host semantic matrix. The release boundary is unchanged: native Linux,
 stock pinned-TypeScript value-bearing incremental/recovery behavior, reverse
 authority OAuth/browser/lifecycle coverage, corrupted-operation and
 compaction-gap traffic, and the official security launcher remain open.
+
+## Oplog admission and test-binary follow-up: 2026-08-01
+
+The follow-up review exercised the value-bearing oplog path with a direct
+storage caller that places 4,097 operations in one wire transaction. The
+previous aggregate guard rejected the page only after the second SQL query had
+already materialized the BLOB-bearing rows. The scalar operation-count
+preflight now rejects an oversized first transaction before that query; the
+regression `testWireOplogRejectsOversizedAtomicBatchBeforeValueMaterialization`
+passes alongside the existing aggregate-byte test. This closes a narrow local
+availability gap without changing the wire limit.
+
+The review also found that four child-process test helpers preferred stale
+`.build-task*` executables over the current `.build/debug/swan`, producing
+false `invalidManifest` and truncated-restore failures under an ordinary
+`swift test`. The helpers now prefer the current build and retain the task
+binary only as a fallback. The two affected CLI/export tests pass without an
+environment override; `PublicRepositoryReadHTTPTests` passes 12/12, and a
+serialized full macOS `swift test --jobs 1` run using the current executable
+exited 0 with no failures.
+
+No new authorization, credential, public/private-isolation, CAR-integrity, or
+recovery bypass was reproduced. The release boundary is unchanged: native
+Linux, unmodified pinned-TypeScript semantic/recovery interoperability,
+reverse-authority OAuth/browser and lifecycle coverage,
+corrupted-operation/compaction-gap traffic, and the official security launcher
+remain open.
+
+## Adversarial rereview: 2026-08-01
+
+The next pass targeted the scope parser, route composition, and simple-space
+authority state rather than accepting the preceding focused green suite as
+coverage of those seams.
+
+Three local defects were found and remediated:
+
+- **ADV-80 (P1, authorization):** `SpaceAuthorizationPolicy` accepted an
+  otherwise valid qualified scope with an unknown query member (for example,
+  `action=read&unexpected=ignored`). The matcher checked the required tuple
+  fields but not the complete key set, so a future scope extension could be
+  interpreted inconsistently across authorization boundaries. Resource scopes
+  now allow only `authority`, `skey`, `action`, and optional `collection`, while
+  management scopes require exactly `authority`, `skey`, and `manage`. A
+  regression proves the unknown-key grant cannot read a record.
+- **ADV-81 (P2, availability/control composition):** `SwanHTTPServer` accepted
+  a caller-provided `PublicRepositoryJSONReadAdmission`, but public repository
+  routes silently used the global default during `buildRouter`; authenticated
+  routes used the supplied instance. The server now stores one resolved
+  admission object and passes it to public, permissioned-record, and oplog
+  registration, so the configured process-wide response budget is actually
+  enforced.
+- **ADV-82 (P1, availability):** durable simple-space membership, client
+  allow-lists, and managing-app decisions were loaded into unbounded Swift
+  `Set`s, and `listMembers` sorted the entire membership set before applying a
+  page limit. The domain now caps members at 10,000, client entries at 1,000,
+  and managing-app decisions at 10,000; writes and schema migration reject or
+  trim oversized state. `listMembers` validates scalar authority facts and
+  cardinality, then uses a keyset SQL page without materializing the full
+  membership set. The regression covers cursor paging and a persisted
+  cap-plus-one state.
+
+Serialized focused evidence after these changes: wildcard resource/management,
+unknown-key denial, simple-space schema/tamper, and bounded keyset-page tests
+passed; `git diff --check` remains clean. The full suite and native-Linux/live
+interop gates are still pending, so this addendum is not an alpha sign-off.
+
+The review then found **ADV-83 (P2, adapter consistency)** in the process-local
+`SimpleSpaceAuthority`: unlike SQLite, it accepted control-character/oversized
+client identifiers and could issue credentials for a non-DID user. The shared
+`SimpleSpaceConfiguration` initializer now validates opaque app identifiers,
+and the in-memory credential/decision operations validate user DIDs. The
+existing SQLite adapter and the actor authority therefore reject the same
+malformed policy inputs. The new cross-adapter negative test and the prior
+scope/bounded-state focused tests pass. This is a local consistency fix; the
+native-Linux, stock-reference, reverse-authority, corruption/recovery, and
+security-launcher gates remain open.
+
+The custom JSON-admission regression was also moved from direct route
+registration to `SwanHTTPServer.buildRouter`, proving that a caller-supplied
+admission is retained by the actual server composition. `PublicRepositoryReadHTTPTests`
+passes 12/12 with the injected one-lease budget.
+
+Finally, **ADV-84 (P2, public projection availability)** moved the collection
+count and aggregate-name-byte checks from the SQLite-only preflight into
+`PublicRepositoryReadDescription` itself. Alternate `PublicRepositoryReadDirectory`
+implementations now fail before handing an oversized collection array to the
+JSON encoder; the new regression is included in the 13-test public-read suite.
+
+The adversarial pass also caught a test-harness authorization drift: the local
+semantic interop runner still requested only the bare `atproto` scope for
+permissioned record operations. That scope is intentionally sufficient for
+account/public lifecycle calls, but it must not substitute for a space grant.
+The runner now requests explicit authority/self/action/collection grants for
+each permissioned operation, so the fixture exercises the same policy as a
+real client (**ADV-85, P2, test validity**). `SwanInteropTests` is green at
+82/82, including durable convergence, recovery, corruption, and isolation
+scenarios.
+
+Verification completed on the current macOS checkout:
+
+- The serialized `swift test --scratch-path .build-scope-remediation --jobs 1`
+  run exited 0: 904 tests, 8 intentional skips, 0 failures across all ten
+  XCTest targets (plus the Swift Testing profile suite).
+- `PublicRepositoryReadHTTPTests` passes 13/13, including the injected
+  process-wide JSON admission and oversized projection checks.
+- `bash Scripts/verify-profile.sh` and `bash Scripts/verify-interop-lab.sh`
+  pass against the pinned profile/cache.
+- Opt-in near-256 MiB RSS tests pass for both public repository export and
+  permissioned CAR streaming; the permissioned run reported a 19,693,568-byte
+  peak RSS increase for a 267,396,722-byte CAR and rejected the over-limit
+  record before creating a spool.
+
+The following findings remain deliberately open rather than being hidden by
+the green local suite: the process-local `SimpleSpaceActor` retains an
+unbounded dictionary of spaces and managing-app decisions (a bounded durable
+SQLite path exists, but no total in-memory space cap); native Linux execution;
+live cross-host interop with the unmodified pinned TypeScript value-bearing
+incremental/recovery paths; reverse-authority OAuth/browser/lifecycle flows;
+corrupted-operation and compaction-gap traffic; stock TypeScript delegation
+key pin/dynamic discovery; strict password-reset constant-work evidence; the
+non-cooperative third-party email-delivery cancellation contract; and the
+official Codex Security launcher. These are release-gate items, not claims
+that the alpha is complete.

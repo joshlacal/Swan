@@ -249,12 +249,12 @@ public enum PermissionedSpaceScopeSyntax {
     /// `read_self` can never be amplified into a credential which reads every
     /// member repository.
     ///
-    /// The broad `atproto` scope remains the one explicit whole-account
-    /// grant. Profile-specific grants follow the pinned TypeScript matcher's
-    /// tuple comparison: each of type, authority, and skey may name the
-    /// requested value or `*`. They must still name exactly `action=read` and
-    /// have no collection parameter; extra or duplicate decoded query members
-    /// fail closed.
+    /// A base `atproto` scope is necessary for an AT Protocol OAuth session,
+    /// but is not itself a permissioned-space grant. Qualified grants follow
+    /// the pinned TypeScript matcher's tuple comparison: each of type,
+    /// authority, and skey may name the requested value or `*`. They must
+    /// still name exactly `action=read` and have no collection parameter;
+    /// extra or duplicate decoded query members fail closed.
     public static func permitsWholeSpaceRead(
         _ scopes: Set<String>,
         spaceType: String,
@@ -264,8 +264,6 @@ public enum PermissionedSpaceScopeSyntax {
         guard !spaceType.isEmpty, !authority.isEmpty, !skey.isEmpty else {
             return false
         }
-        if scopes.contains("atproto") { return true }
-
         return scopes.contains { scope in
             guard let type = strictSpaceType(scope),
                   (type == spaceType || type == "*"),
@@ -293,7 +291,6 @@ public enum PermissionedSpaceScopeSyntax {
         spaceType: String?,
         authority: String?
     ) -> Bool {
-        if scopes.contains("atproto") { return true }
         let requestedType = spaceType ?? "*"
         let requestedAuthority = authority ?? "*"
         return scopes.contains { scope in

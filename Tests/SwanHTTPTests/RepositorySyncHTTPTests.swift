@@ -48,6 +48,65 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
         XCTAssertNil(server.authenticatedSpaceBlobs?.credentialAuthorizer)
     }
 
+    func testListRepoOpsUsesSharedJSONAdmissionBeforeReadingRepository() async throws {
+        let fixture = try await Fixture.make()
+        defer { fixture.cleanup() }
+        do {
+            let admission = try PublicRepositoryJSONReadAdmission(
+                maximumConcurrentReads: 1,
+                maximumReservedResponseBytes: PublicRepositoryJSONReadLimits
+                    .maximumListRecordsResponseBytes
+            )
+            let held = try XCTUnwrap(admission.reserve(
+                maximumResponseBytes: PublicRepositoryJSONReadLimits
+                    .maximumListRecordsResponseBytes
+            ))
+            let app = try makeServer(
+                fixture,
+                enabled: true,
+                jsonReadAdmission: admission
+            ).buildApplication(
+                logger: Logger(label: "RepositorySyncHTTPTests.admission")
+            )
+            let oauth = try await issueToken(
+                runtime: fixture.runtime,
+                subject: Self.alice,
+                scopes: [wholeSpaceReadScope(for: fixture.space)]
+            )
+            let headers = try self.dpopHeaders(
+                token: oauth.token,
+                key: oauth.key,
+                jwk: oauth.jwk,
+                nonce: fixture.runtime.dpopNonceService.issue(),
+                jti: "oplog-admission-blocked",
+                path: Self.oplogPath
+            )
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: self.oplogURI(
+                        space: fixture.space,
+                        repo: Self.alice,
+                        limit: 1
+                    ),
+                    method: .get,
+                    headers: headers
+                ) { response in
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    XCTAssertEqual(
+                        try self.errorCode(response.body),
+                        "temporarily_unavailable"
+                    )
+                }
+            }
+            held.release()
+            XCTAssertEqual(admission.snapshot.activeLeases, 0)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     func testActualLocalServeRuntimeMountsKeysForDelegationExchangeAndSyncOnly() async throws {
         let fixture = try await Fixture.make()
         defer { try? await fixture.close() }
@@ -177,7 +236,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             let oauth = try await issueToken(
                 runtime: fixture.runtime,
                 subject: Self.alice,
-                scopes: ["atproto"]
+                scopes: [wholeSpaceReadScope(for: fixture.space)]
             )
             let credential = try await fixture.credential(for: fixture.space)
             try await app.test(.router) { client in
@@ -223,8 +282,8 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             let app = try makeServer(fixture, enabled: true).buildApplication(
                 logger: Logger(label: "RepositorySyncHTTPTests.getBlobBoundaries")
             )
-            let alice = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: ["atproto"])
-            let bob = try await issueToken(runtime: fixture.runtime, subject: Self.bob, scopes: ["atproto"])
+            let alice = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: [wholeSpaceReadScope(for: fixture.space)])
+            let bob = try await issueToken(runtime: fixture.runtime, subject: Self.bob, scopes: [wholeSpaceReadScope(for: fixture.space)])
             let narrowScope = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=app.bsky.feed.post"
             let narrow = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: [narrowScope])
             try await app.test(.router) { client in
@@ -311,7 +370,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             let oauth = try await issueToken(
                 runtime: fixture.runtime,
                 subject: Self.alice,
-                scopes: ["atproto"]
+                scopes: [wholeSpaceReadScope(for: fixture.space)]
             )
             let credential = try await fixture.credential(for: fixture.space)
             let firstIKM = DataBox()
@@ -402,7 +461,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             let oauth = try await issueToken(
                 runtime: fixture.runtime,
                 subject: Self.alice,
-                scopes: ["atproto"]
+                scopes: [wholeSpaceReadScope(for: fixture.space)]
             )
             let credential = try await fixture.credential(for: fixture.space)
             try await app.test(.router) { client in
@@ -598,8 +657,8 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             let app = try makeServer(fixture, enabled: true).buildApplication(
                 logger: Logger(label: "RepositorySyncHTTPTests.boundary")
             )
-            let alice = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: ["atproto"])
-            let bob = try await issueToken(runtime: fixture.runtime, subject: Self.bob, scopes: ["atproto"])
+            let alice = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: [wholeSpaceReadScope(for: fixture.space)])
+            let bob = try await issueToken(runtime: fixture.runtime, subject: Self.bob, scopes: [wholeSpaceReadScope(for: fixture.space)])
             let narrowScope = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=app.bsky.feed.post"
             let narrow = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: [narrowScope])
             let sibling = try SpaceURI(authority: Self.alice, spaceType: fixture.space.spaceType, skey: "other")
@@ -800,7 +859,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
             let app = try makeServer(fixture, enabled: true).buildApplication(
                 logger: Logger(label: "RepositorySyncHTTPTests.recovery")
             )
-            let access = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: ["atproto"])
+            let access = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: [wholeSpaceReadScope(for: fixture.space)])
             try await app.test(.router) { client in
                 let gapHeaders = try self.dpopHeaders(
                     token: access.token, key: access.key, jwk: access.jwk,
@@ -862,7 +921,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 enabled: true,
                 directory: corrupt
             ).buildApplication(logger: Logger(label: "RepositorySyncHTTPTests.corrupt"))
-            let access = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: ["atproto"])
+            let access = try await issueToken(runtime: fixture.runtime, subject: Self.alice, scopes: [wholeSpaceReadScope(for: fixture.space)])
             let headers = try dpopHeaders(
                 token: access.token, key: access.key, jwk: access.jwk,
                 nonce: fixture.runtime.dpopNonceService.issue(),
@@ -917,7 +976,8 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
     private func makeServer(
         _ fixture: Fixture,
         enabled: Bool,
-        directory: (any AuthorizedSimpleSpaceDirectory)? = nil
+        directory: (any AuthorizedSimpleSpaceDirectory)? = nil,
+        jsonReadAdmission: PublicRepositoryJSONReadAdmission? = nil
     ) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
             from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")
@@ -944,7 +1004,8 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                 commitSigner: LocalAccountSpaceRepositoryCommitSigner(
                     accounts: fixture.accounts, keyStore: fixture.keyStore
                 )
-            ) : nil
+            ) : nil,
+            jsonReadAdmission: jsonReadAdmission
         )
     }
 
@@ -993,6 +1054,10 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
 
     private func repoURI(space: SpaceURI, repo: String) -> String {
         "\(Self.repoPath)?space=\(percentEncode(space.rawValue))&repo=\(repo)"
+    }
+
+    private func wholeSpaceReadScope(for space: SpaceURI) -> String {
+        "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&action=read"
     }
 
     private func blobURI(space: SpaceURI, repo: String, cid: String) -> String {
@@ -1310,9 +1375,15 @@ private struct Fixture: Sendable {
                 skey: "sync"
             )
             let tids = try [0, 1, 2, 3, 4].map(tid)
+            let scopeBase = "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)"
             let authorization: AuthorizationContext = .accountOAuth(
                 subject: RepositorySyncHTTPTests.alice,
-                scopes: ["atproto"]
+                scopes: [
+                    "atproto",
+                    "\(scopeBase)&action=create&collection=app.bsky.feed.post",
+                    "\(scopeBase)&action=update&collection=app.bsky.feed.post",
+                    "\(scopeBase)&action=delete&collection=app.bsky.feed.post",
+                ]
             )
             let aliceDatabase = try await SQLiteAccountDatabase(dataDirectory: root, did: RepositorySyncHTTPTests.alice, oplogRetention: retention)
             _ = try await aliceDatabase.createSimpleSpace(
@@ -1347,7 +1418,7 @@ private struct Fixture: Sendable {
             let bobDatabase = try await SQLiteAccountDatabase(dataDirectory: root, did: RepositorySyncHTTPTests.bob, oplogRetention: retention)
             let bobRepository = try DurableSpaceRepository(database: bobDatabase, space: space, author: RepositorySyncHTTPTests.bob)
             let bobRecord = try SpaceRecordURI(space: space, author: RepositorySyncHTTPTests.bob, collection: "app.bsky.feed.post", rkey: "bob")
-            _ = try await bobRepository.apply(.put(uri: bobRecord, value: recordCBOR("bob")), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: tids[0]), authorization: .accountOAuth(subject: RepositorySyncHTTPTests.bob, scopes: ["atproto"]))
+            _ = try await bobRepository.apply(.put(uri: bobRecord, value: recordCBOR("bob")), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: tids[0]), authorization: .accountOAuth(subject: RepositorySyncHTTPTests.bob, scopes: ["\(scopeBase)&action=create&collection=app.bsky.feed.post"]))
             try await bobDatabase.close()
 
             let hasher = try LibsodiumArgon2idHasher(policy: .interactive)
@@ -1441,7 +1512,7 @@ private actor CorruptSyncDirectory: AuthorizedSimpleSpaceDirectory, AuthorizedSp
     func repositoryCommitState(space: SpaceURI, author: String, authorization _: AuthorizationContext) async throws -> AuthorizedSpaceRepositoryCommitState {
         .init(space: space, author: author, wireRevision: "2222222222222", commitment: Data(repeating: 0x01, count: 32))
     }
-    func repositoryOplog(space: SpaceURI, author: String, since _: String?, limit _: Int, includeValues _: Bool, authorization _: AuthorizationContext) async throws -> AuthorizedSpaceRepositoryOplogRead {
+    func repositoryOplog(space: SpaceURI, author: String, since _: String?, limit _: Int, includeValues _: Bool, maximumAggregateValueBytes _: Int, authorization _: AuthorizationContext) async throws -> AuthorizedSpaceRepositoryOplogRead {
         .incremental(
             state: .init(space: space, author: author, wireRevision: "2222222222222", commitment: Data(repeating: 0x01, count: 32)),
             entries: [.init(wireRevision: "2222222222222", collection: "app.bsky.feed.post", rkey: "secret", cid: "not-a-cid", previousCID: nil, value: Data("secret".utf8))]

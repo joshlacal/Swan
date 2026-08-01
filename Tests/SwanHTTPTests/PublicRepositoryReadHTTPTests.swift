@@ -391,27 +391,20 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
     // allocation without bound.
     func testAnonymousListAndGetShareBoundedProcessAdmission() async throws {
         let barrier = PublicJSONReadBarrier()
-        let fixture = try await makeFixture(
-            nonEmpty: true,
-            jsonReadBarrier: barrier
-        )
-        defer { try? FileManager.default.removeItem(at: fixture.root) }
-        let directory = fixture.server.publicRepositoryReadDirectory
-            as! TestPublicRepositoryReadDirectory
         let admission = try PublicRepositoryJSONReadAdmission(
             maximumConcurrentReads: 1,
             maximumReservedResponseBytes:
                 PublicRepositoryJSONReadLimits.maximumListRecordsResponseBytes
         )
-        let router = Router(context: SwanHTTPRequestContext.self)
-        registerPublicRepositoryReadEndpoints(
-            on: router,
-            directory: directory,
-            publicURL: URL(string: "https://swan.example")!,
+        let fixture = try await makeFixture(
+            nonEmpty: true,
+            jsonReadBarrier: barrier,
             jsonReadAdmission: admission
         )
-        let app = Application(
-            router: router,
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let directory = fixture.server.publicRepositoryReadDirectory
+            as! TestPublicRepositoryReadDirectory
+        let app = fixture.server.buildApplication(
             logger: Logger(label: "PublicRepositoryReadHTTPTests.json-admission")
         )
         let record = try XCTUnwrap(fixture.records.first)
@@ -569,6 +562,40 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testPublicDescriptionRejectsOversizedCollectionProjection() throws {
+        let state = try PublicRepositoryState(
+            did: did,
+            revision: "3jzfcijpj2z2a",
+            commitCID: CID.fromDAGCBOR(Data("commit".utf8)),
+            dataCID: CID.fromDAGCBOR(Data("mst".utf8))
+        )
+        let identity = try PublicRepositoryReadIdentity(
+            canonicalHandle: handle,
+            pdsOrigin: "https://swan.example",
+            signingDIDKey:
+                "did:key:zDnaejgmAHMLkBPMBWnkBxyGxpXx8LgE4WJAYDhwZzyoRAddF",
+            handleIsCorrect: true,
+            preparationRequestID: "description-budget",
+            genesisOperationCID: state.commitCID.string
+        )
+        XCTAssertThrowsError(
+            try PublicRepositoryReadDescription(
+                did: did,
+                canonicalHandle: handle,
+                status: .active,
+                state: state,
+                collections: Array(
+                    repeating: "app.bsky.feed.post",
+                    count: PublicRepositoryReadLimits
+                        .maximumDescribeRepoCollections + 1
+                ),
+                identity: identity
+            )
+        ) {
+            XCTAssertEqual($0 as? PublicRepositoryReadError, .resourceLimitExceeded)
+        }
+    }
+
     private func makeFixture(
         nonEmpty: Bool = false,
         identityHandle: String? = nil,
@@ -576,7 +603,8 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
         identitySigningDIDKey: String =
             "did:key:zDnaejgmAHMLkBPMBWnkBxyGxpXx8LgE4WJAYDhwZzyoRAddF",
         handleIsCorrect: Bool = true,
-        jsonReadBarrier: PublicJSONReadBarrier? = nil
+        jsonReadBarrier: PublicJSONReadBarrier? = nil,
+        jsonReadAdmission: PublicRepositoryJSONReadAdmission? = nil
     ) async throws -> (
         server: SwanHTTPServer,
         control: SQLiteControlDatabase,
@@ -641,7 +669,8 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
                 profile: profile,
                 configuration: .init(publicURL: URL(string: "https://swan.example")!),
                 oauthRuntime: runtime,
-                publicRepositoryReadDirectory: directory
+                publicRepositoryReadDirectory: directory,
+                jsonReadAdmission: jsonReadAdmission
             ),
             control, root, state, records
         )

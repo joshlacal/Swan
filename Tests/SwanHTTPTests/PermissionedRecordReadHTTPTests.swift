@@ -1019,8 +1019,17 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                 publicIdentityVerifier: nil
             )
             let runtime = try SwanOAuthRuntime(controlStore: control, serverKey: Data(repeating: 0xB7, count: 32))
-            let alice = try await issueToken(runtime, subject: Self.alice, scopes: ["atproto"])
-            let bob = try await issueToken(runtime, subject: Self.bob, scopes: ["atproto"])
+            let repositoryScopes = repositoryScopes(for: space)
+            let alice = try await issueToken(
+                runtime,
+                subject: Self.alice,
+                scopes: repositoryScopes
+            )
+            let bob = try await issueToken(
+                runtime,
+                subject: Self.bob,
+                scopes: repositoryScopes
+            )
             return Fixture(
                 root: root,
                 space: space,
@@ -1057,13 +1066,17 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                 try SpaceRecordURI(space: space, author: Self.alice, collection: Self.otherCollection, rkey: "third"),
             ]
             let values = ["first", "second", "third"]
+            let authorization = AuthorizationContext.accountOAuth(
+                subject: Self.alice,
+                scopes: repositoryScopes(for: space)
+            )
             for (index, record) in records.enumerated() {
                 _ = try await repository.apply(
                     .put(uri: record, value: recordCBOR(values[index])),
                     expectedRevision: UInt64(index),
                     requestID: UUID(),
                     wireRevision: try tid(index),
-                    authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"])
+                    authorization: authorization
                 )
             }
             let foreignRepository = try DurableSpaceRepository(
@@ -1082,7 +1095,10 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                 expectedRevision: 0,
                 requestID: UUID(),
                 wireRevision: try tid(0),
-                authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"])
+                authorization: .accountOAuth(
+                    subject: Self.alice,
+                    scopes: repositoryScopes(for: foreignSpace)
+                )
             )
             try await database.close()
             return records
@@ -1096,6 +1112,19 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         // Canonical DAG-CBOR for {"text": text}; fixtures use only these
         // short ASCII literals, keeping the durable source explicit.
         Data([0xa1, 0x64, 0x74, 0x65, 0x78, 0x74, UInt8(0x60 + text.utf8.count)]) + Data(text.utf8)
+    }
+
+    private func repositoryScopes(for space: SpaceURI) -> Set<String> {
+        let base = "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)"
+        return [
+            "\(base)&action=read",
+            "\(base)&action=create&collection=\(Self.collection)",
+            "\(base)&action=create&collection=\(Self.otherCollection)",
+            "\(base)&action=update&collection=\(Self.collection)",
+            "\(base)&action=update&collection=\(Self.otherCollection)",
+            "\(base)&action=delete&collection=\(Self.collection)",
+            "\(base)&action=delete&collection=\(Self.otherCollection)",
+        ]
     }
 
     private func installEmptyAccountDatabase(root: URL, did: String) async throws {

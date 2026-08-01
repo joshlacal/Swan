@@ -337,6 +337,11 @@ public struct SwanHTTPServer: Sendable {
     /// responses. The CLI passes the preopened directory's instance so
     /// public CAR, upload, and blob budgets remain coordinated.
     public let blobStreamAdmission: PublicRepositorySpoolAdmission
+    /// Shared process-wide/per-account admission for allocation-heavy JSON
+    /// responses. Public and permissioned read routes must use the same
+    /// instance; otherwise a caller-provided test/production budget can be
+    /// silently replaced by the global default during router construction.
+    public let jsonReadAdmission: PublicRepositoryJSONReadAdmission
 
     public init(
         profile: ProtocolProfile,
@@ -362,7 +367,8 @@ public struct SwanHTTPServer: Sendable {
         publicBlobSpoolAdmission: PublicRepositorySpoolAdmission? = nil,
         blobStreamAdmission: PublicRepositorySpoolAdmission? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
-        loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct
+        loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
+        jsonReadAdmission: PublicRepositoryJSONReadAdmission? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -371,6 +377,9 @@ public struct SwanHTTPServer: Sendable {
         self.loginClientIdentityPolicy = loginClientIdentityPolicy
         self.publicRepositoryReadDirectory = publicRepositoryReadDirectory
         self.accountEmailXRPC = accountEmailXRPC
+        let resolvedJSONReadAdmission = jsonReadAdmission
+            ?? PublicRepositoryJSONReadAdmission.processShared
+        self.jsonReadAdmission = resolvedJSONReadAdmission
         self.blobStreamAdmission = blobStreamAdmission
             ?? publicBlobSpoolAdmission
             ?? PublicRepositorySpoolAdmission.shared
@@ -461,7 +470,8 @@ public struct SwanHTTPServer: Sendable {
                 authenticatedSpaceRecords = SwanAuthenticatedSpaceRecordsCapability(
                     authorizer: authorizer,
                     directory: repositoryDirectory,
-                    credentialAuthorizer: credentialVerifier
+                    credentialAuthorizer: credentialVerifier,
+                    jsonReadAdmission: resolvedJSONReadAdmission
                 )
             } else {
                 authenticatedSpaceRecords = nil
@@ -537,7 +547,8 @@ public struct SwanHTTPServer: Sendable {
                     authorizer: authorizer,
                     directory: repositoryDirectory,
                     credentialAuthorizer: credentialVerifier,
-                    commitSigner: spaceRepositorySyncConfiguration.commitSigner
+                    commitSigner: spaceRepositorySyncConfiguration.commitSigner,
+                    jsonReadAdmission: resolvedJSONReadAdmission
                 )
             } else {
                 authenticatedSpaceRepositorySync = nil
@@ -825,7 +836,8 @@ public struct SwanHTTPServer: Sendable {
             registerPublicRepositoryReadEndpoints(
                 on: router,
                 directory: publicRepositoryReadDirectory,
-                publicURL: configuration.publicURL
+                publicURL: configuration.publicURL,
+                jsonReadAdmission: jsonReadAdmission
             )
         }
         if let publicRepositoryMutations {

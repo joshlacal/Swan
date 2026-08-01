@@ -159,6 +159,25 @@ public struct PublicRepositoryReadDescription: Sendable, Equatable {
         collections: [String],
         identity: PublicRepositoryReadIdentity
     ) throws {
+        guard collections.count <= PublicRepositoryReadLimits
+            .maximumDescribeRepoCollections else {
+            throw PublicRepositoryReadError.resourceLimitExceeded
+        }
+        var collectionBytes = 0
+        for collection in collections {
+            let (next, overflow) = collectionBytes.addingReportingOverflow(
+                collection.utf8.count
+            )
+            guard !overflow,
+                  collection.utf8.count <= Int(
+                      PublicRepositoryReadLimits.maximumDescribeRepoCollectionBytes
+                  ),
+                  next <= PublicRepositoryReadLimits
+                      .maximumDescribeRepoCollectionBytes else {
+                throw PublicRepositoryReadError.resourceLimitExceeded
+            }
+            collectionBytes = next
+        }
         guard AccountControlIdentifiers.isDID(did),
               AccountControlIdentifiers.isCanonicalHandle(canonicalHandle),
               status.isCanonicalValue,
@@ -226,6 +245,15 @@ public enum PublicRepositoryJSONReadLimits {
     public static let maximumAggregateRecordBlockBytes = 4 * 1_024 * 1_024
     public static let maximumGetRecordResponseBytes = 8 * 1_024 * 1_024
     public static let maximumListRecordsResponseBytes = 16 * 1_024 * 1_024
+    /// Value-bearing permissioned oplog pages are encoded as JSON rather than
+    /// streamed CARs. Keep their live-value aggregate below the response
+    /// ceiling so the storage query and encoder never retain a worst-case page
+    /// larger than the final HTTP budget.
+    public static let maximumListRepoOpsValueBytes = 8 * 1_024 * 1_024
+    /// Same-TID batches are returned atomically, so cap their metadata as well
+    /// as their live-value bytes. A pathological oversized batch fails closed
+    /// instead of allocating an unbounded operation array.
+    public static let maximumListRepoOpsOperations = 4_096
 }
 
 /// Explicit bounds for public-repository projections that are prepared before

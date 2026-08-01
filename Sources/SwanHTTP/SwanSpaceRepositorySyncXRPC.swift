@@ -18,17 +18,20 @@ public struct SwanAuthenticatedSpaceRepositorySyncCapability: Sendable {
     let directory: any AuthorizedSpaceRepositoryDirectory
     let credentialAuthorizer: (any SpaceCredentialAuthorizationVerifier)?
     let commitSigner: any SpaceRepositoryCommitSigner
+    let jsonReadAdmission: PublicRepositoryJSONReadAdmission
 
     init(
         authorizer: SwanOAuthResourceAuthorizer,
         directory: any AuthorizedSpaceRepositoryDirectory,
         credentialAuthorizer: (any SpaceCredentialAuthorizationVerifier)?,
-        commitSigner: any SpaceRepositoryCommitSigner
+        commitSigner: any SpaceRepositoryCommitSigner,
+        jsonReadAdmission: PublicRepositoryJSONReadAdmission = .processShared
     ) {
         self.authorizer = authorizer
         self.directory = directory
         self.credentialAuthorizer = credentialAuthorizer
         self.commitSigner = commitSigner
+        self.jsonReadAdmission = jsonReadAdmission
     }
 }
 
@@ -212,6 +215,8 @@ private struct AuthenticatedListRepoOpsHandler:
                 since: parameters.since,
                 limit: limit,
                 includeValues: parameters.excludeValues != true,
+                maximumAggregateValueBytes: PublicRepositoryJSONReadLimits
+                    .maximumListRepoOpsValueBytes,
                 authorization: authorization
             )
         } catch let error as SwanError {
@@ -490,12 +495,20 @@ func registerAuthenticatedListRepoOpsEndpoint(
         } catch {
             return authenticatedRepositorySyncError(.badRequest, code: "InvalidRequest")
         }
+        guard let lease = capability.jsonReadAdmission.reserve(
+            maximumResponseBytes: PublicRepositoryJSONReadLimits
+                .maximumListRecordsResponseBytes
+        ) else {
+            return authenticatedRepositorySyncError(.serviceUnavailable, code: "temporarily_unavailable")
+        }
         do {
             let output = try await handler.handle(parameters: parameters, input: (), context: request)
-            return authenticatedListRepoOpsJSON(.ok, output)
+            return authenticatedListRepoOpsJSON(.ok, output, lease: lease)
         } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
+            lease.release()
             return authenticatedRepositorySyncResponse(for: failure, capability: capability)
         } catch {
+            lease.release()
             return authenticatedRepositorySyncError(.serviceUnavailable, code: "temporarily_unavailable")
         }
     }
@@ -744,7 +757,8 @@ private func authenticatedGetLatestCommitJSON(
 
 private func authenticatedListRepoOpsJSON(
     _ status: HTTPResponse.Status,
-    _ output: ComAtprotoSpaceListRepoOps.Output
+    _ output: ComAtprotoSpaceListRepoOps.Output,
+    lease: PublicRepositoryJSONReadLease? = nil
 ) -> Response {
     authenticatedGetSpaceJSON(
         status,
@@ -760,6 +774,8 @@ private func authenticatedListRepoOpsJSON(
                 )
             },
             commit: signedCommitWire(output.commit)
-        )
+        ),
+        maximumBytes: PublicRepositoryJSONReadLimits.maximumListRecordsResponseBytes,
+        lease: lease
     )
 }

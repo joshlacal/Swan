@@ -301,25 +301,27 @@ public enum SpaceAuthorizationPolicy {
         permission: SpacePermission,
         collection: String?
     ) -> Bool {
-        if scopes.contains("atproto") { return true }
         let action = permission.rawValue
-        let base = "space:\(space.spaceType)"
-        guard scopes.contains(where: { $0.hasPrefix(base + "?") }) else {
-            return false
-        }
         // Shared OAuth boundaries reject unqualified grants. This domain
         // matcher is also fail-closed: a qualified grant must explicitly
-        // cover this authority/skey/action/collection. A bare `space:<type>`
-        // grant has no trusted authority or action context, and is not
-        // normalized here.
+        // cover this type/authority/skey/action/collection. The pinned
+        // matcher treats a literal `*` in each tuple dimension as overlap;
+        // it is not a prefix or substring match. A bare `space:<type>` grant
+        // has no trusted authority or action context, and is not normalized
+        // here.
         return scopes.contains { scope in
-            guard scope.hasPrefix(base + "?"),
+            guard let type = scopeType(scope),
+                  tupleElement(type, matches: space.spaceType),
                   PermissionedSpaceScopeSyntax.isQualified(scope),
-                  let parameters = strictQueryParameters(
-                    String(scope.dropFirst(base.count + 1))
+              let parameters = strictQueryParameters(
+                    String(scope.dropFirst(scopeTypePrefixLength(scope)))
                   ),
-                  parameters["authority"] == space.authority,
-                  parameters["skey"] == space.skey,
+                  parameters.keys.allSatisfy({
+                      ["authority", "skey", "action", "collection"].contains($0)
+                  }),
+                  parameters["manage"] == nil,
+                  tupleElement(parameters["authority"], matches: space.authority),
+                  tupleElement(parameters["skey"], matches: space.skey),
                   parameters["action"] == action
             else {
                 return false
@@ -339,8 +341,7 @@ public enum SpaceAuthorizationPolicy {
             // Space-management operations address the authority state rather
             // than one repository record, so their scoped grant has no
             // collection component.  Treating that as an implicit denial
-            // would make a syntactically valid `action=manage` scope useless
-            // while still allowing the broad `atproto` escape hatch.
+            // would make a syntactically valid `action=manage` scope useless.
             guard collection == nil else {
                 return parameters["collection"] == collection
                     || parameters["collection"] == "*"
@@ -354,14 +355,15 @@ public enum SpaceAuthorizationPolicy {
         space: SpaceURI,
         operation: SimpleSpaceManagementOperation
     ) -> Bool {
-        let base = "space:\(space.spaceType)"
-        guard scope.hasPrefix(base + "?"),
+        guard let type = scopeType(scope),
+              tupleElement(type, matches: space.spaceType),
               PermissionedSpaceScopeSyntax.isQualified(scope),
               let parameters = strictQueryParameters(
-                String(scope.dropFirst(base.count + 1))
+                String(scope.dropFirst(scopeTypePrefixLength(scope)))
               ),
-              parameters["authority"] == space.authority,
-              parameters["skey"] == space.skey,
+              Set(parameters.keys) == ["authority", "skey", "manage"],
+              tupleElement(parameters["authority"], matches: space.authority),
+              tupleElement(parameters["skey"], matches: space.skey),
               parameters["manage"] == operation.rawValue,
               parameters["action"] == nil,
               parameters["collection"] == nil else {
@@ -390,6 +392,28 @@ public enum SpaceAuthorizationPolicy {
             parameters[key] = value
         }
         return parameters
+    }
+
+    private static func scopeType(_ scope: String) -> String? {
+        let prefix = "space:"
+        guard scope.hasPrefix(prefix),
+              let queryStart = scope.firstIndex(of: "?") else {
+            return nil
+        }
+        let typeStart = scope.index(scope.startIndex, offsetBy: prefix.count)
+        guard typeStart < queryStart else { return nil }
+        return String(scope[typeStart..<queryStart])
+    }
+
+    private static func scopeTypePrefixLength(_ scope: String) -> Int {
+        guard let queryStart = scope.firstIndex(of: "?") else {
+            return 0
+        }
+        return scope.distance(from: scope.startIndex, to: queryStart) + 1
+    }
+
+    private static func tupleElement(_ grant: String?, matches target: String) -> Bool {
+        grant == target || grant == "*"
     }
 }
 
@@ -1621,6 +1645,20 @@ public enum SimpleSpaceAppAccess: Sendable, Codable, Equatable {
     case allowList(Set<String>)
 }
 
+/// Hard bounds for authority-owned simple-space policy state. These limits
+/// belong to the domain model so every adapter, including the in-memory
+/// laboratory authority, rejects state that would otherwise require
+/// materializing an unbounded member, client, or decision set.
+public enum SimpleSpaceLimits {
+    /// Maximum number of member DIDs in one space, including its owner.
+    public static let maximumMembersPerSpace = 10_000
+    /// Maximum number of client metadata URLs in an allow-list policy.
+    public static let maximumClientAllowListEntries = 1_000
+    /// Maximum number of persisted managing-app decisions in one space.
+    public static let maximumManagingAppDecisionsPerSpace = 10_000
+
+}
+
 /// A durable credential-policy denial whose wire meaning is narrower than a
 /// generic user authorization failure. It intentionally carries no client,
 /// space, or policy material.
@@ -1632,6 +1670,12 @@ public enum SimpleSpaceCredentialPolicyError: Error, Sendable, Equatable {
 /// made only by the authority; repo hosts merely verify the resulting read
 /// credential and never infer membership from a record request.
 public struct SimpleSpaceConfiguration: Sendable, Codable, Equatable {
+    private enum CodingKeys: String, CodingKey {
+        case policy
+        case appAccess
+        case managingApp
+    }
+
     public let policy: SimpleSpacePolicy
     public let appAccess: SimpleSpaceAppAccess
     public let managingApp: String?
@@ -1639,6 +1683,18 @@ public struct SimpleSpaceConfiguration: Sendable, Codable, Equatable {
     public init(policy: SimpleSpacePolicy = .memberList, appAccess: SimpleSpaceAppAccess = .open, managingApp: String? = nil) throws {
         guard managingApp?.isEmpty != true else {
             throw SwanError.malformed("managing app must not be empty")
+        }
+        if case let .allowList(clients) = appAccess,
+           clients.count > SimpleSpaceLimits.maximumClientAllowListEntries {
+            throw SwanError.malformed("simple-space client allow-list is too large")
+        }
+        if case let .allowList(clients) = appAccess {
+            for client in clients {
+                try Self.validateAppIdentifier(client)
+            }
+        }
+        if let managingApp {
+            try Self.validateAppIdentifier(managingApp)
         }
         // The pinned `updateSpace` handler patches each property independently:
         // a policy-only update must preserve an omitted `managingApp`, even
@@ -1649,6 +1705,31 @@ public struct SimpleSpaceConfiguration: Sendable, Codable, Equatable {
         self.policy = policy
         self.appAccess = appAccess
         self.managingApp = managingApp
+    }
+
+    /// Client identifiers are opaque app/service names in the wire protocol,
+    /// not URLs or DIDs. Keep their lexical contract in the shared domain
+    /// initializer so the in-memory authority and SQLite adapter cannot
+    /// disagree about what state is valid. The HTTP layer applies any stricter
+    /// transport policy before using an identifier as a network destination.
+    fileprivate static func validateAppIdentifier(_ identifier: String) throws {
+        guard !identifier.isEmpty,
+              identifier.utf8.count <= 2_048,
+              identifier.unicodeScalars.allSatisfy({
+                  $0.value >= 0x20 && $0.value != 0x7F
+              })
+        else {
+            throw SwanError.invalidIdentifier(identifier)
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            policy: container.decode(SimpleSpacePolicy.self, forKey: .policy),
+            appAccess: container.decode(SimpleSpaceAppAccess.self, forKey: .appAccess),
+            managingApp: container.decodeIfPresent(String.self, forKey: .managingApp)
+        )
     }
 }
 
@@ -1711,6 +1792,7 @@ public struct SimpleSpace: Sendable, Equatable {
     ) throws {
         guard owner == uri.authority,
               SpaceURI.isValidDID(owner),
+              members.count <= SimpleSpaceLimits.maximumMembersPerSpace,
               members.contains(owner),
               members.allSatisfy(SpaceURI.isValidDID)
         else {
@@ -1799,6 +1881,11 @@ public actor SimpleSpaceAuthority {
         var state = try activeSpace(space)
         try requireOwner(state, subject: subject)
         guard SpaceURI.isValidDID(member) else { throw SwanError.invalidIdentifier(member) }
+        guard state.members.contains(member)
+            || state.members.count < SimpleSpaceLimits.maximumMembersPerSpace
+        else {
+            throw SwanError.unavailable("simple-space member capacity exhausted")
+        }
         state.members.insert(member)
         spaces[space] = state
     }
@@ -1806,6 +1893,9 @@ public actor SimpleSpaceAuthority {
     public func removeMember(space: SpaceURI, member: String, by subject: String) throws {
         var state = try activeSpace(space)
         try requireOwner(state, subject: subject)
+        guard SpaceURI.isValidDID(member) else {
+            throw SwanError.invalidIdentifier(member)
+        }
         guard member != state.owner else { throw SwanError.malformed("a space owner cannot be removed") }
         state.members.remove(member)
         spaces[space] = state
@@ -1821,12 +1911,26 @@ public actor SimpleSpaceAuthority {
     /// A managing app can publish the result of its application-level access
     /// check. The authority consults this only for `managing-app` spaces.
     public func setManagingAppAccess(space: SpaceURI, user: String, allowed: Bool, by app: String) throws {
+        guard SpaceURI.isValidDID(user) else {
+            throw SwanError.invalidIdentifier(user)
+        }
         let state = try activeSpace(space)
         guard state.configuration.policy == .managingApp,
               state.configuration.managingApp == app else {
             throw SwanError.unauthorized("wrong managing app")
         }
-        if allowed { managingAppDecisions[space, default: []].insert(user) }
+        if allowed {
+            var decisions = managingAppDecisions[space, default: []]
+            guard decisions.contains(user)
+                || decisions.count < SimpleSpaceLimits.maximumManagingAppDecisionsPerSpace
+            else {
+                throw SwanError.unavailable(
+                    "simple-space managing-app decision capacity exhausted"
+                )
+            }
+            decisions.insert(user)
+            managingAppDecisions[space] = decisions
+        }
         else { managingAppDecisions[space, default: []].remove(user) }
     }
 
@@ -1834,6 +1938,12 @@ public actor SimpleSpaceAuthority {
     /// credential. The caller is responsible for first validating the signed
     /// delegation token and any required client attestation at the OAuth layer.
     public func issueReadCredential(space: SpaceURI, user: String, clientID: String?, now: Date = Date()) throws -> SignedSpaceCredential {
+        guard SpaceURI.isValidDID(user) else {
+            throw SwanError.invalidIdentifier(user)
+        }
+        if let clientID {
+            try SimpleSpaceConfiguration.validateAppIdentifier(clientID)
+        }
         let state = try activeSpace(space)
         switch state.configuration.appAccess {
         case .open: break

@@ -13,6 +13,15 @@ extension SQLiteControlDatabase {
     /// same five-minute bound.
     static let maximumEmailDeliveryAttemptDuration: TimeInterval = 300
 
+    /// Email rate-limit keys are intentionally keyed by HMAC digests, so an
+    /// attacker can otherwise create a durable row for every address they
+    /// submit. Keep the table globally bounded and reclaim only a capped
+    /// number of expired rows per request.
+    static let maximumEmailRateLimitEntries = 4_096
+    static let emailRateLimitPurgeBatchSize = 512
+    private static let legacyEmailRateLimitWindowMicroseconds =
+        86_400 * 1_000_000
+
     /// Evolves the alpha `accounts` registry in place. Legacy accounts retain
     /// a NULL verifier, which decodes only as `.missing`; migration never
     /// fabricates a usable credential from an absent column.
@@ -192,17 +201,128 @@ extension SQLiteControlDatabase {
             ON account_email_delivery_outbox(did, purpose)
             """
         )
-        _ = try await connection.query(
-            """
+        let currentEmailRateLimitTable = """
             CREATE TABLE IF NOT EXISTS account_email_rate_limits (
                 scope TEXT NOT NULL CHECK(scope IN ('did', 'email', 'direct-peer')),
                 key_digest BLOB NOT NULL CHECK(length(key_digest) = 32),
                 window_started_at INTEGER NOT NULL CHECK(window_started_at >= 0),
+                expires_at INTEGER NOT NULL CHECK(expires_at > window_started_at),
                 attempts INTEGER NOT NULL CHECK(attempts BETWEEN 1 AND 10000),
                 PRIMARY KEY(scope, key_digest)
             ) WITHOUT ROWID
             """
+        _ = try await connection.query(currentEmailRateLimitTable)
+        let rateLimitColumns = try await connection.query(
+            "PRAGMA table_info(account_email_rate_limits)"
         )
+        let rateLimitColumnNames = Set(
+            rateLimitColumns.compactMap { $0.column("name")?.string }
+        )
+        if !rateLimitColumnNames.contains("expires_at") {
+            let legacyColumns: Set<String> = [
+                "scope", "key_digest", "window_started_at", "attempts",
+            ]
+            guard legacyColumns.isSubset(of: rateLimitColumnNames) else {
+                throw AccountControlStoreError.malformedRecord
+            }
+            let invalidLegacyRows = try await connection.query(
+                """
+                SELECT 1
+                FROM account_email_rate_limits
+                WHERE scope NOT IN ('did', 'email', 'direct-peer')
+                   OR typeof(key_digest) != 'blob'
+                   OR length(key_digest) != 32
+                   OR typeof(window_started_at) != 'integer'
+                   OR window_started_at < 0
+                   OR window_started_at > ?
+                   OR typeof(attempts) != 'integer'
+                   OR attempts NOT BETWEEN 1 AND 10000
+                LIMIT 1
+                """,
+                [.integer(Int.max - Self.legacyEmailRateLimitWindowMicroseconds)]
+            )
+            guard invalidLegacyRows.isEmpty else {
+                throw AccountControlStoreError.malformedRecord
+            }
+            _ = try await connection.query(
+                "DROP INDEX IF EXISTS account_email_rate_limits_expiry"
+            )
+            _ = try await connection.query(
+                "DROP TRIGGER IF EXISTS account_email_rate_limit_count_insert"
+            )
+            _ = try await connection.query(
+                "DROP TRIGGER IF EXISTS account_email_rate_limit_count_delete"
+            )
+            _ = try await connection.query(
+                "ALTER TABLE account_email_rate_limits RENAME TO account_email_rate_limits_v1"
+            )
+            _ = try await connection.query(currentEmailRateLimitTable)
+            _ = try await connection.query(
+                """
+                INSERT INTO account_email_rate_limits(
+                    scope, key_digest, window_started_at, expires_at, attempts
+                )
+                SELECT scope, key_digest, window_started_at,
+                       window_started_at + ?, attempts
+                FROM account_email_rate_limits_v1
+                """,
+                [.integer(Self.legacyEmailRateLimitWindowMicroseconds)]
+            )
+            _ = try await connection.query(
+                "DROP TABLE account_email_rate_limits_v1"
+            )
+        } else {
+            let requiredColumns: Set<String> = [
+                "scope", "key_digest", "window_started_at", "expires_at", "attempts",
+            ]
+            guard requiredColumns.isSubset(of: rateLimitColumnNames) else {
+                throw AccountControlStoreError.malformedRecord
+            }
+        }
+        _ = try await connection.query(
+            """
+            CREATE INDEX IF NOT EXISTS account_email_rate_limits_expiry
+            ON account_email_rate_limits(expires_at, scope, key_digest)
+            """
+        )
+        _ = try await connection.query(
+            """
+            CREATE TABLE IF NOT EXISTS account_email_rate_limit_capacity (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                entry_count INTEGER NOT NULL CHECK(entry_count >= 0)
+            )
+            """
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO account_email_rate_limit_capacity(singleton, entry_count)
+            SELECT 1, COUNT(*) FROM account_email_rate_limits WHERE 1
+            ON CONFLICT(singleton) DO UPDATE SET entry_count = excluded.entry_count
+            """
+        )
+        _ = try await connection.query(
+            """
+            CREATE TRIGGER IF NOT EXISTS account_email_rate_limit_count_insert
+            AFTER INSERT ON account_email_rate_limits
+            BEGIN
+                UPDATE account_email_rate_limit_capacity
+                SET entry_count = entry_count + 1
+                WHERE singleton = 1;
+            END
+            """
+        )
+        _ = try await connection.query(
+            """
+            CREATE TRIGGER IF NOT EXISTS account_email_rate_limit_count_delete
+            AFTER DELETE ON account_email_rate_limits
+            BEGIN
+                UPDATE account_email_rate_limit_capacity
+                SET entry_count = entry_count - 1
+                WHERE singleton = 1;
+            END
+            """
+        )
+        try await trimEmailRateLimitOverflowLocked()
         // Password-recovery requests always leave this short-lived, keyed
         // marker. It contains no DID or plaintext mailbox, and gives unknown
         // and known canonical addresses the same durable admission shape.
@@ -1029,9 +1149,38 @@ extension SQLiteControlDatabase {
         }
         return try await withConnectionGate {
             try await transaction {
+                // Remove the requested expired row first, then perform only a
+                // bounded global cleanup. A legitimate key cannot be hidden
+                // behind an attacker-created backlog of expired digests.
+                _ = try await connection.query(
+                    """
+                    DELETE FROM account_email_rate_limits
+                    WHERE scope = ? AND key_digest = ? AND expires_at <= ?
+                    """,
+                    [
+                        .text(key.scope.rawValue), blob(key.digest),
+                        .integer(timestamp),
+                    ]
+                )
+                _ = try await connection.query(
+                    """
+                    DELETE FROM account_email_rate_limits
+                    WHERE (scope, key_digest) IN (
+                        SELECT scope, key_digest
+                        FROM account_email_rate_limits
+                        WHERE expires_at <= ?
+                        ORDER BY expires_at, scope, key_digest
+                        LIMIT ?
+                    )
+                    """,
+                    [
+                        .integer(timestamp),
+                        .integer(Self.emailRateLimitPurgeBatchSize),
+                    ]
+                )
                 let rows = try await connection.query(
                     """
-                    SELECT window_started_at, attempts
+                    SELECT window_started_at, expires_at, attempts
                     FROM account_email_rate_limits
                     WHERE scope = ? AND key_digest = ?
                     """,
@@ -1041,15 +1190,31 @@ extension SQLiteControlDatabase {
                     throw AccountControlStoreError.malformedRecord
                 }
                 guard let row = rows.first else {
+                    let capacityRows = try await connection.query(
+                        """
+                        SELECT entry_count
+                        FROM account_email_rate_limit_capacity
+                        WHERE singleton = 1
+                        """
+                    )
+                    guard capacityRows.count == 1,
+                          case let .integer(entryCount) =
+                          capacityRows[0].column("entry_count"),
+                          (0 ... Self.maximumEmailRateLimitEntries).contains(entryCount) else {
+                        throw AccountControlStoreError.malformedRecord
+                    }
+                    guard entryCount < Self.maximumEmailRateLimitEntries else {
+                        return .limited(until: now.addingTimeInterval(policy.window))
+                    }
                     _ = try await connection.query(
                         """
                         INSERT INTO account_email_rate_limits(
-                            scope, key_digest, window_started_at, attempts
-                        ) VALUES (?, ?, ?, 1)
+                            scope, key_digest, window_started_at, expires_at, attempts
+                        ) VALUES (?, ?, ?, ?, 1)
                         """,
                         [
                             .text(key.scope.rawValue), blob(key.digest),
-                            .integer(timestamp),
+                            .integer(timestamp), .integer(windowEnd),
                         ]
                     )
                     return .allowed(
@@ -1058,21 +1223,23 @@ extension SQLiteControlDatabase {
                 }
                 guard case let .integer(startedAt) =
                           row.column("window_started_at"),
+                      case let .integer(expiresAt) = row.column("expires_at"),
                       case let .integer(attempts) = row.column("attempts"),
                       startedAt >= 0,
+                      expiresAt > startedAt,
                       (1 ... 10_000).contains(attempts) else {
                     throw AccountControlStoreError.malformedRecord
                 }
-                if timestamp >= startedAt + windowWidth {
+                if timestamp >= expiresAt {
                     _ = try await connection.query(
                         """
                         UPDATE account_email_rate_limits
-                        SET window_started_at = ?, attempts = 1
+                        SET window_started_at = ?, expires_at = ?, attempts = 1
                         WHERE scope = ? AND key_digest = ?
                         """,
                         [
-                            .integer(timestamp), .text(key.scope.rawValue),
-                            blob(key.digest),
+                            .integer(timestamp), .integer(windowEnd),
+                            .text(key.scope.rawValue), blob(key.digest),
                         ]
                     )
                     return .allowed(
@@ -1083,7 +1250,7 @@ extension SQLiteControlDatabase {
                     return .limited(
                         until: Date(
                             timeIntervalSince1970:
-                                Double(startedAt + windowWidth) / 1_000_000
+                                Double(expiresAt) / 1_000_000
                         )
                     )
                 }
@@ -1906,6 +2073,50 @@ extension SQLiteControlDatabase {
                 .integer(timestamp),
                 .integer(Self.passwordRecoveryWorkPurgeBatchSize),
             ]
+        )
+        _ = try await connection.query(
+            """
+            DELETE FROM account_email_rate_limits
+            WHERE (scope, key_digest) IN (
+                SELECT scope, key_digest
+                FROM account_email_rate_limits
+                WHERE expires_at <= ?
+                ORDER BY expires_at, scope, key_digest
+                LIMIT ?
+            )
+            """,
+            [
+                .integer(timestamp),
+                .integer(Self.emailRateLimitPurgeBatchSize),
+            ]
+        )
+    }
+
+    /// Normalize any legacy table that was larger than the new global cap.
+    /// Deterministic oldest-first eviction keeps the migration bounded and
+    /// leaves active rows usable without exposing their HMAC preimages.
+    private func trimEmailRateLimitOverflowLocked() async throws {
+        let countRows = try await connection.query(
+            "SELECT COUNT(*) AS row_count FROM account_email_rate_limits"
+        )
+        guard countRows.count == 1,
+              case let .integer(rowCount) = countRows[0].column("row_count"),
+              rowCount >= 0 else {
+            throw AccountControlStoreError.malformedRecord
+        }
+        let overflow = rowCount - Self.maximumEmailRateLimitEntries
+        guard overflow > 0 else { return }
+        _ = try await connection.query(
+            """
+            DELETE FROM account_email_rate_limits
+            WHERE (scope, key_digest) IN (
+                SELECT scope, key_digest
+                FROM account_email_rate_limits
+                ORDER BY expires_at, scope, key_digest
+                LIMIT ?
+            )
+            """,
+            [.integer(overflow)]
         )
     }
 

@@ -47,7 +47,7 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
             let writer = try await SQLiteAccountDatabase(dataDirectory: fixture.root, did: Self.alice)
             let repository = try DurableSpaceRepository(database: writer, space: fixture.remote, author: Self.alice)
             let uri = try SpaceRecordURI(space: fixture.remote, author: Self.alice, collection: "app.example.records", rkey: "late")
-            _ = try await repository.apply(.put(uri: uri, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za2y"), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+            _ = try await repository.apply(.put(uri: uri, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za2y"), authorization: createAuthorization(for: fixture.remote))
             try await writer.close()
             let afterWrite = try signedHeaders(fixture.token, path: Self.path, runtime: fixture.runtime, jti: "remote-after-local-write")
             try await app.test(.router) { client in
@@ -136,7 +136,7 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
             let database = try await SQLiteAccountDatabase(dataDirectory: fixture.root, did: Self.alice)
             let ownerRepository = try DurableSpaceRepository(database: database, space: duplicate, author: Self.alice)
             let ownerRecord = try SpaceRecordURI(space: duplicate, author: Self.alice, collection: "app.example.records", rkey: "duplicate")
-            _ = try await ownerRepository.apply(.put(uri: ownerRecord, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za2z"), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+            _ = try await ownerRepository.apply(.put(uri: ownerRecord, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za2z"), authorization: createAuthorization(for: duplicate))
             _ = try await database.createSimpleSpace(space: deleted, owner: Self.alice, configuration: .init(policy: .public, appAccess: .open), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
             _ = try await database.deleteSimpleSpace(space: deleted, authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
             try await database.receiveSpaceDeletionNotification(space: tombstoned, issuer: Self.bob, audience: Self.alice, eventID: "tombstone-list")
@@ -147,9 +147,9 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
             let source = try await SQLiteAccountDatabase(dataDirectory: fixture.root.appending(path: "closure-source"), did: Self.alice)
             let closureRepository = try DurableSpaceRepository(database: source, space: fixture.remote, author: Self.alice)
             let closureRecord = try SpaceRecordURI(space: fixture.remote, author: Self.alice, collection: "app.example.records", rkey: "closure")
-            _ = try await closureRepository.apply(.put(uri: closureRecord, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za3a"), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+            _ = try await closureRepository.apply(.put(uri: closureRecord, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za3a"), authorization: createAuthorization(for: fixture.remote))
             let key = P256.Signing.PrivateKey()
-            let car = try await closureRepository.exportCAR(rev: "3k2l5u2q6za3b", signingKey: key, authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+            let car = try await closureRepository.exportCAR(rev: "3k2l5u2q6za3b", signingKey: key, authorization: readAuthorization(for: fixture.remote))
             let recovery = try SpaceCARCodec.verifyRecovery(car.data, space: fixture.remote, author: Self.alice, publicKey: key.publicKey)
             try await source.close()
             let restored = try await SQLiteAccountDatabase(dataDirectory: fixture.root.appending(path: "closure-restored"), did: Self.alice)
@@ -190,7 +190,7 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
             if includeRemoteRepository {
                 let repository = try DurableSpaceRepository(database: database, space: remote, author: Self.alice)
                 let uri = try SpaceRecordURI(space: remote, author: Self.alice, collection: "app.example.records", rkey: "one")
-                _ = try await repository.apply(.put(uri: uri, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za2y"), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+                _ = try await repository.apply(.put(uri: uri, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za2y"), authorization: createAuthorization(for: remote))
             }
             try await database.close()
             let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
@@ -199,12 +199,41 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
                 publicIdentityVerifier: nil
             )
             let runtime = try SwanOAuthRuntime(controlStore: control, serverKey: Data(repeating: 0xD1, count: 32))
-            return .init(root: root, owner: owner, remote: remote, control: control, directory: directory, runtime: runtime, token: try await issueToken(runtime, scopes: ["atproto"]))
+            return .init(
+                root: root,
+                owner: owner,
+                remote: remote,
+                control: control,
+                directory: directory,
+                runtime: runtime,
+                token: try await issueToken(
+                    runtime,
+                    scopes: ["space:*?authority=*&skey=*&action=read"]
+                )
+            )
         } catch { try? await control.close(); try? FileManager.default.removeItem(at: root); throw error }
     }
 
     private func makeServer(_ fixture: Fixture) throws -> SwanHTTPServer {
         try SwanHTTPServer(profile: ProtocolProfile.load(from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")), configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: Self.publicURL), oauthRuntime: fixture.runtime, authenticatedGetSpaceDirectory: fixture.directory, accountControlStore: fixture.control)
+    }
+
+    private func createAuthorization(for space: SpaceURI) -> AuthorizationContext {
+        .accountOAuth(
+            subject: Self.alice,
+            scopes: [
+                "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&action=create&collection=app.example.records",
+            ]
+        )
+    }
+
+    private func readAuthorization(for space: SpaceURI) -> AuthorizationContext {
+        .accountOAuth(
+            subject: Self.alice,
+            scopes: [
+                "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&action=read",
+            ]
+        )
     }
 
     private func packageRoot() -> URL {

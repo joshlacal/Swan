@@ -422,6 +422,110 @@ final class SwanSQLiteTests: XCTestCase {
         }
     }
 
+    func testWireOplogBoundsValueMaterializationAtAggregateBudget() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close(); try? FileManager.default.removeItem(at: fixture.root) } }
+
+        func largeValue(_ byte: UInt8) -> Data {
+            Data([0xa1, 0x61, 0x76, 0x59, 0x02, 0xbc])
+                + Data(repeating: byte, count: 700)
+        }
+        let firstURI = try SpaceRecordURI(
+            space: fixture.space,
+            author: fixture.author,
+            collection: "app.bsky.feed.post",
+            rkey: "large-first"
+        )
+        let secondURI = try SpaceRecordURI(
+            space: fixture.space,
+            author: fixture.author,
+            collection: "app.bsky.feed.post",
+            rkey: "large-second"
+        )
+        let firstValue = largeValue(0x01)
+        let secondValue = largeValue(0x02)
+        _ = try await database.apply(
+            space: fixture.space,
+            author: fixture.author,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(0),
+            writes: [.put(uri: firstURI, value: firstValue, cid: CID.fromDAGCBOR(firstValue).string)]
+        )
+        _ = try await database.apply(
+            space: fixture.space,
+            author: fixture.author,
+            expectedRevision: 1,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(1),
+            writes: [.put(uri: secondURI, value: secondValue, cid: CID.fromDAGCBOR(secondValue).string)]
+        )
+
+        let read = try await database.wireOplog(
+            space: fixture.space,
+            author: fixture.author,
+            since: nil,
+            limit: 100,
+            includeValues: true,
+            maximumAggregateValueBytes: 800
+        )
+        guard case let .incremental(_, entries) = read else {
+            return XCTFail("a retained oplog must return an incremental page")
+        }
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries.first?.value?.count, firstValue.count)
+    }
+
+    func testWireOplogRejectsOversizedAtomicBatchBeforeValueMaterialization() async throws {
+        let fixture = try Fixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close(); try? FileManager.default.removeItem(at: fixture.root) } }
+
+        let value = Data([0xa1, 0x61, 0x76, 0x01])
+        let cid = CID.fromDAGCBOR(value).string
+        let writes = try (0 ... PublicRepositoryJSONReadLimits.maximumListRepoOpsOperations)
+            .map { index in
+                let uri = try SpaceRecordURI(
+                    space: fixture.space,
+                    author: fixture.author,
+                    collection: "app.bsky.feed.post",
+                    rkey: "r\(index)"
+                )
+                return SQLiteSpaceWrite.put(uri: uri, value: value, cid: cid)
+            }
+        _ = try await database.apply(
+            space: fixture.space,
+            author: fixture.author,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(0),
+            writes: writes
+        )
+
+        let probe = WireOplogMaterializationProbe()
+        await database.installTestingHooks(
+            SQLiteTestingHooks(beforeWireOplogValueMaterialization: {
+                await probe.mark()
+            })
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await database.wireOplog(
+                space: fixture.space,
+                author: fixture.author,
+                since: nil,
+                limit: 1,
+                includeValues: true
+            )
+        ) { error in
+            guard case SwanError.unavailable = error else {
+                return XCTFail("oversized same-TID batch must fail as unavailable")
+            }
+        }
+        let materializationRan = await probe.didRun()
+        XCTAssertFalse(materializationRan)
+    }
+
     func testPermissionedStorageRejectsNonCanonicalOrMismatchedRecordBeforeMutation()
         async throws
     {
@@ -3390,6 +3494,83 @@ final class SwanSQLiteTests: XCTestCase {
         try await reopened.close()
     }
 
+    func testSimpleSpaceMemberPageUsesKeysetAndRejectsOversizedState() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanSQLiteSimpleSpacePageTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let owner = "did:plc:alice"
+        let space = try SpaceURI(
+            authority: owner,
+            spaceType: "app.bsky.bookmarks",
+            skey: "page"
+        )
+        let database = try await SQLiteAccountDatabase(dataDirectory: root, did: owner)
+        let authority = DurableSimpleSpaceAuthority(lifecycleDatabase: database)
+        let authorization: AuthorizationContext = .accountOAuth(
+            subject: owner,
+            scopes: ["atproto"]
+        )
+        _ = try await authority.create(
+            space: space,
+            owner: owner,
+            configuration: try SimpleSpaceConfiguration(policy: .memberList),
+            authorization: authorization
+        )
+        _ = try await database.addSimpleSpaceMember(
+            space: space,
+            member: "did:plc:bob",
+            authorization: authorization
+        )
+
+        let first = try await authority.memberPage(
+            space: space,
+            limit: 1,
+            cursor: nil,
+            authorization: authorization
+        )
+        XCTAssertEqual(first.members, [owner])
+        let second = try await authority.memberPage(
+            space: space,
+            limit: 1,
+            cursor: first.cursor,
+            authorization: authorization
+        )
+        XCTAssertEqual(second.members, ["did:plc:bob"])
+
+        // Corrupt the durable child table with one row beyond the domain cap.
+        // The page path must reject by a scalar count before it can map a page
+        // into Swift strings.
+        _ = try await database.connection.query(
+            """
+            WITH RECURSIVE n(i) AS (
+                SELECT 0
+                UNION ALL
+                SELECT i + 1 FROM n WHERE i < ?
+            )
+            INSERT OR IGNORE INTO permissioned_simple_space_members(space_uri, member_did)
+            SELECT ?, 'did:plc:member' || printf('%05d', i)
+            FROM n
+            """,
+            [
+                .integer(SimpleSpaceLimits.maximumMembersPerSpace),
+                .text(space.rawValue),
+            ]
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await authority.memberPage(
+                space: space,
+                limit: 1,
+                cursor: nil,
+                authorization: authorization
+            )
+        ) { error in
+            guard case .corruptDatabase = error as? SQLiteRepositoryError else {
+                return XCTFail("expected bounded-state corruption, got \(error)")
+            }
+        }
+        try await database.close()
+    }
+
     func testSimpleSpaceAuthoritySchemaMigrationPreservesPolicyOnlyManagingAppAndAllowsClear() async throws {
         let fixture = try Fixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -3746,6 +3927,18 @@ private struct Fixture {
     func tid(_ offset: Int) throws -> TID {
         let alphabet = Array("234567abcdefghijklmnopqrstuvwxyz")
         return try TID(tidString: "222222222222\(alphabet[offset])")
+    }
+}
+
+private actor WireOplogMaterializationProbe {
+    private var value = false
+
+    func mark() {
+        value = true
+    }
+
+    func didRun() -> Bool {
+        value
     }
 }
 

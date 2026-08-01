@@ -132,7 +132,12 @@ public enum LocalSemanticInteropRunner {
             let updatedFirstValue = canonicalRecord(text: "updated")
             let authorized = AuthorizationContext.accountOAuth(
                 subject: author,
-                scopes: ["atproto"]
+                scopes: [
+                    "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=read",
+                    "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=create&collection=*",
+                    "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=update&collection=*",
+                    "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=delete&collection=*",
+                ]
             )
 
             let sourceRoot = root.appending(path: "source", directoryHint: .isDirectory)

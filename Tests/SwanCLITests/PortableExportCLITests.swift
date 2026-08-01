@@ -198,8 +198,8 @@ final class PortableExportCLITests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         for candidate in [
-            packageRoot.appending(path: ".build-task19/debug/swan"),
             packageRoot.appending(path: ".build/debug/swan"),
+            packageRoot.appending(path: ".build-task19/debug/swan"),
         ] where FileManager.default.isExecutableFile(atPath: candidate.path) {
             return candidate
         }

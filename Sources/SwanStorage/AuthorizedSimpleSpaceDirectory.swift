@@ -528,6 +528,7 @@ public protocol AuthorizedSpaceRepositoryDirectory: Sendable {
         since: String?,
         limit: Int,
         includeValues: Bool,
+        maximumAggregateValueBytes: Int,
         authorization: AuthorizationContext
     ) async throws -> AuthorizedSpaceRepositoryOplogRead
 

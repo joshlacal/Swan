@@ -534,8 +534,8 @@ final class SwanPortableExportTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         for candidate in [
-            packageRoot.appending(path: ".build-task19/debug/swan"),
             packageRoot.appending(path: ".build/debug/swan"),
+            packageRoot.appending(path: ".build-task19/debug/swan"),
         ] where FileManager.default.isExecutableFile(atPath: candidate.path) {
             return candidate
         }
@@ -1202,7 +1202,12 @@ private struct ExporterFixture {
                 expectedRevision: 0,
                 requestID: UUID(),
                 wireRevision: try TID(tidString: "3jzfcijpj2z\(index + 2)a"),
-                authorization: .accountOAuth(subject: did, scopes: ["atproto"])
+                authorization: .accountOAuth(
+                    subject: did,
+                    scopes: [
+                        "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&action=create&collection=app.bsky.feed.post",
+                    ]
+                )
             )
         }
         let firstSpace = try SpaceURI(

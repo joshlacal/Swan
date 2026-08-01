@@ -626,6 +626,107 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
         XCTAssertEqual(durableLimit, .limited(until: now.addingTimeInterval(60)))
     }
 
+    func testRateLimitGlobalCapacityDoesNotAllocateUnboundedEmailKeys() async throws {
+        let fixture = try await Fixture(testCase: self)
+        addTeardownBlock { try? await fixture.database.close(); fixture.cleanup() }
+        let now = fixture.now
+        let policy = try AccountEmailRateLimitPolicy(maximumAttempts: 2, window: 60)
+        let capacity = SQLiteControlDatabase.maximumEmailRateLimitEntries
+
+        // Fill every globally admitted digest through the same durable API.
+        // A hostile caller can choose a fresh email digest on every request;
+        // the table must stop allocating before the process runs out of disk.
+        for index in 0 ..< capacity {
+            var digest = Data(repeating: 0, count: 32)
+            withUnsafeBytes(of: UInt32(index).bigEndian) { bytes in
+                digest.replaceSubrange(28 ..< 32, with: bytes)
+            }
+            let result = try await fixture.database.consumeEmailRateLimit(
+                key: try AccountEmailRateLimitKey(scope: .email, digest: digest),
+                policy: policy,
+                now: now
+            )
+            XCTAssertEqual(result, .allowed(remaining: 1))
+        }
+
+        let before = try await fixture.database.connection.query(
+            "SELECT COUNT(*) AS row_count FROM account_email_rate_limits"
+        )
+        XCTAssertEqual(before.first?.column("row_count")?.integer, capacity)
+
+        let overflow = try await fixture.database.consumeEmailRateLimit(
+            key: try AccountEmailRateLimitKey(
+                scope: .email,
+                digest: Data(repeating: 0xff, count: 32)
+            ),
+            policy: policy,
+            now: now
+        )
+        guard case .limited = overflow else {
+            return XCTFail("a fresh digest must be denied once the global table capacity is full")
+        }
+
+        let after = try await fixture.database.connection.query(
+            "SELECT COUNT(*) AS row_count FROM account_email_rate_limits"
+        )
+        XCTAssertEqual(after.first?.column("row_count")?.integer, capacity)
+    }
+
+    func testLegacyRateLimitSchemaMigratesToExpiringBoundedTable() async throws {
+        let fixture = try await Fixture(testCase: self)
+        addTeardownBlock { try? await fixture.database.close(); fixture.cleanup() }
+        let now = fixture.now
+        try await fixture.database.close()
+
+        let legacy = try await SQLiteConnection.open(
+            storage: .file(path: SQLiteLayout.controlDatabase(in: fixture.root).path)
+        )
+        _ = try await legacy.query("DROP TABLE account_email_rate_limits")
+        _ = try await legacy.query(
+            """
+            CREATE TABLE account_email_rate_limits (
+                scope TEXT NOT NULL,
+                key_digest BLOB NOT NULL,
+                window_started_at INTEGER NOT NULL,
+                attempts INTEGER NOT NULL,
+                PRIMARY KEY(scope, key_digest)
+            ) WITHOUT ROWID
+            """
+        )
+        let digest = Data(repeating: 0x44, count: 32)
+        _ = try await legacy.query(
+            """
+            INSERT INTO account_email_rate_limits(
+                scope, key_digest, window_started_at, attempts
+            ) VALUES ('email', ?, ?, 2)
+            """,
+            [
+                digest.sqliteData!,
+                .integer(Int(now.timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+        try await legacy.close()
+
+        let migrated = try await SQLiteControlDatabase(dataDirectory: fixture.root)
+        fixture.database = migrated
+        let columns = try await migrated.connection.query(
+            "PRAGMA table_info(account_email_rate_limits)"
+        )
+        XCTAssertTrue(columns.contains { $0.column("name")?.string == "expires_at" })
+        let capacityRows = try await migrated.connection.query(
+            "SELECT entry_count FROM account_email_rate_limit_capacity WHERE singleton = 1"
+        )
+        XCTAssertEqual(capacityRows.first?.column("entry_count")?.integer, 1)
+        let decision = try await migrated.consumeEmailRateLimit(
+            key: try AccountEmailRateLimitKey(scope: .email, digest: digest),
+            policy: try AccountEmailRateLimitPolicy(maximumAttempts: 2, window: 60),
+            now: now.addingTimeInterval(1)
+        )
+        guard case .limited = decision else {
+            return XCTFail("legacy attempts must remain active during migration")
+        }
+    }
+
     private func deliveryRequest(
         email: AccountEmailAddress? = nil,
         purpose: AccountEmailTokenPurpose,

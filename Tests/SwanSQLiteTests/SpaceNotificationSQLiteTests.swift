@@ -78,8 +78,9 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         // change. The pinned TypeScript receiver requires `iss == repo`, so
         // an authority cannot lawfully fan this write out to another host.
         try await database.receiveSpaceWriteNotification(first, now: now.addingTimeInterval(1))
-        // A reordered older TID records its receipt but cannot regress the
-        // authority hint or produce another recipient delivery.
+        // A reordered older TID cannot regress the authority hint or produce
+        // another recipient delivery. It also must not become permanent replay
+        // state: the writer row already makes the stale event harmless.
         try await database.receiveSpaceWriteNotification(
             fixture.writeNotification(
                 eventID: "writer-event-older",
@@ -102,6 +103,11 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         XCTAssertEqual(writers.first?.commitment, Data(repeating: 1, count: 32))
         XCTAssertTrue(pending.isEmpty)
         XCTAssertNil(String(describing: pending).range(of: "private record value"))
+
+        let receiptCount = try await database.connection.query(
+            "SELECT COUNT(*) AS row_count FROM permissioned_space_notification_receipts"
+        )
+        XCTAssertEqual(receiptCount.first?.column("row_count")?.integer, 1)
 
         do {
             try await database.receiveSpaceWriteNotification(
@@ -126,6 +132,69 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             authorization: credential
         )
         XCTAssertEqual(afterConflict.first?.commitment, Data(repeating: 1, count: 32))
+    }
+
+    func testNotificationReceiptsCompactToCurrentStateAndTombstonesStopGrowth() async throws {
+        let fixture = try NotificationFixture()
+        let authorityDatabase = try await fixture.open()
+        defer { Task { try? await authorityDatabase.close() } }
+        try await fixture.createAuthorityState(on: authorityDatabase)
+        let now = Date(timeIntervalSince1970: 1_750_000_050)
+
+        try await authorityDatabase.receiveSpaceWriteNotification(
+            fixture.writeNotification(
+                eventID: "writer-current-1",
+                revision: try fixture.tid(1),
+                commitmentByte: 1
+            ),
+            now: now
+        )
+        for index in 0 ..< 100 {
+            try await authorityDatabase.receiveSpaceWriteNotification(
+                fixture.writeNotification(
+                    eventID: "writer-stale-\(index)",
+                    revision: try fixture.tid(0),
+                    commitmentByte: 1
+                ),
+                now: now.addingTimeInterval(TimeInterval(index + 1))
+            )
+        }
+        let staleRows = try await authorityDatabase.connection.query(
+            "SELECT COUNT(*) AS row_count FROM permissioned_space_notification_receipts"
+        )
+        XCTAssertEqual(staleRows.first?.column("row_count")?.integer, 1)
+
+        try await authorityDatabase.receiveSpaceWriteNotification(
+            fixture.writeNotification(
+                eventID: "writer-current-2",
+                revision: try fixture.tid(2),
+                commitmentByte: 2
+            ),
+            now: now.addingTimeInterval(200)
+        )
+        let compactedRows = try await authorityDatabase.connection.query(
+            "SELECT COUNT(*) AS row_count FROM permissioned_space_notification_receipts"
+        )
+        XCTAssertEqual(compactedRows.first?.column("row_count")?.integer, 1)
+
+        let recipient = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root,
+            did: fixture.writer
+        )
+        defer { Task { try? await recipient.close() } }
+        for index in 0 ..< 100 {
+            try await recipient.receiveSpaceDeletionNotification(
+                space: fixture.space,
+                issuer: fixture.authority,
+                audience: fixture.writer,
+                eventID: "space-delete-\(index)",
+                now: now.addingTimeInterval(TimeInterval(index))
+            )
+        }
+        let deletionRows = try await recipient.connection.query(
+            "SELECT COUNT(*) AS row_count FROM permissioned_space_notification_receipts"
+        )
+        XCTAssertEqual(deletionRows.first?.column("row_count")?.integer, 1)
     }
 
     func testDeletionFanoutWorkerRetriesOutsideTransactionsAndRecoversLease() async throws {

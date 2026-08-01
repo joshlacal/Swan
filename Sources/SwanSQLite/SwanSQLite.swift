@@ -1441,6 +1441,7 @@ struct SQLiteTestingHooks: Sendable {
     var afterPublicRepositoryMutatingSQL: (@Sendable (Int) async throws -> Void)?
     var afterRemoteReplicaMutatingSQL: (@Sendable (Int) async throws -> Void)?
     var beforePermanentDeletionClose: (@Sendable () async throws -> Void)?
+    var beforeWireOplogValueMaterialization: (@Sendable () async throws -> Void)?
 
     init(
         beforeApplyCommit: (@Sendable () async throws -> Void)? = nil,
@@ -1450,7 +1451,8 @@ struct SQLiteTestingHooks: Sendable {
         afterBlobReclaimCommit: (@Sendable () async throws -> Void)? = nil,
         afterPublicRepositoryMutatingSQL: (@Sendable (Int) async throws -> Void)? = nil,
         afterRemoteReplicaMutatingSQL: (@Sendable (Int) async throws -> Void)? = nil,
-        beforePermanentDeletionClose: (@Sendable () async throws -> Void)? = nil
+        beforePermanentDeletionClose: (@Sendable () async throws -> Void)? = nil,
+        beforeWireOplogValueMaterialization: (@Sendable () async throws -> Void)? = nil
     ) {
         self.beforeApplyCommit = beforeApplyCommit
         self.afterSnapshotStateRead = afterSnapshotStateRead
@@ -1460,6 +1462,7 @@ struct SQLiteTestingHooks: Sendable {
         self.afterPublicRepositoryMutatingSQL = afterPublicRepositoryMutatingSQL
         self.afterRemoteReplicaMutatingSQL = afterRemoteReplicaMutatingSQL
         self.beforePermanentDeletionClose = beforePermanentDeletionClose
+        self.beforeWireOplogValueMaterialization = beforeWireOplogValueMaterialization
     }
 }
 
@@ -1487,6 +1490,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let physicalBlobCASLifecycleMigrationVersion = 6
     private static let spaceNotificationReceiptMigrationVersion = 7
     private static let permissionedRemoteReplicaResultBindingMigrationVersion = 8
+    private static let spaceNotificationReceiptCompactionMigrationVersion = 9
 
     /// A read credential may register notification recipients, but it must
     /// not be able to turn the later deletion fanout into an unbounded
@@ -1494,6 +1498,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// another space's delivery work; re-registering an existing endpoint is
     /// still allowed when the limit has been reached.
     static let maximumNotificationRegistrationsPerSpace = 1_024
+
+    /// Authority-owned simple-space tables are loaded into domain Sets for
+    /// policy evaluation. Keep the durable state bounded before any request
+    /// can cause that materialization, and keep these values aligned with the
+    /// public domain limits used by the in-memory authority.
+    static let maximumSimpleSpaceMembers = SimpleSpaceLimits.maximumMembersPerSpace
+    static let maximumSimpleSpaceClients = SimpleSpaceLimits.maximumClientAllowListEntries
+    static let maximumSimpleSpaceManagingAppDecisions =
+        SimpleSpaceLimits.maximumManagingAppDecisionsPerSpace
 
     let connection: SQLiteConnection
     let connectionGate = SQLiteConnectionGate()
@@ -1837,6 +1850,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             }
         }
         try await migrateSpaceNotificationReceiptScopeIfNeeded()
+        try await compactSpaceNotificationReceiptsIfNeeded()
     }
 
     /// The first notification schema keyed receipts only by issuer and JTI.
@@ -1878,6 +1892,51 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             )
             _ = try await connection.query(
                 "DROP TABLE permissioned_space_notification_receipts_v6"
+            )
+            _ = try await connection.query(
+                """
+                INSERT INTO permissioned_repository_migrations(version, applied_at)
+                VALUES (?, ?)
+                """,
+                [
+                    .integer(version),
+                    .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+                ]
+            )
+        }
+    }
+
+    /// Older alpha builds retained one receipt for every service event ID.
+    /// Once the durable writer row has advanced, an older event cannot change
+    /// state; after a recipient tombstone, no later event can change state at
+    /// all. Keep only the newest receipt for each issuer/space pair so replay
+    /// protection remains useful without turning an untrusted notification
+    /// stream into permanent account-database growth.
+    private func compactSpaceNotificationReceiptsIfNeeded() async throws {
+        let version = Self.spaceNotificationReceiptCompactionMigrationVersion
+        try await transaction {
+            let applied = try await connection.query(
+                "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+                [.integer(version)]
+            )
+            guard applied.isEmpty else { return }
+            _ = try await connection.query(
+                """
+                DELETE FROM permissioned_space_notification_receipts AS old
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM permissioned_space_notification_receipts AS newer
+                    WHERE newer.issuer = old.issuer
+                      AND newer.space_uri = old.space_uri
+                      AND (
+                          newer.received_at > old.received_at
+                          OR (
+                              newer.received_at = old.received_at
+                              AND newer.event_id > old.event_id
+                          )
+                      )
+                )
+                """
             )
             _ = try await connection.query(
                 """
@@ -2468,6 +2527,26 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 )
                 guard applied.isEmpty else { return }
 
+                // Validate the legacy child tables before copying them. A
+                // schema rebuild must not turn an oversized persisted policy
+                // into a large transient Swift Set or an unbounded INSERT
+                // transaction merely because the account is being reopened.
+                try await validateSimpleSpaceTableBounds(
+                    table: "permissioned_simple_space_members",
+                    maximum: Self.maximumSimpleSpaceMembers,
+                    label: "members"
+                )
+                try await validateSimpleSpaceTableBounds(
+                    table: "permissioned_simple_space_clients",
+                    maximum: Self.maximumSimpleSpaceClients,
+                    label: "clients"
+                )
+                try await validateSimpleSpaceTableBounds(
+                    table: "permissioned_simple_space_managing_app_decisions",
+                    maximum: Self.maximumSimpleSpaceManagingAppDecisions,
+                    label: "managing-app decisions"
+                )
+
                 try await renameSimpleSpaceAuthorityTablesForMigration()
                 for statement in SQLiteLayout.simpleSpaceAuthoritySchemaStatements {
                     _ = try await connection.query(statement)
@@ -2496,6 +2575,28 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         } catch {
             _ = try? await connection.query("PRAGMA foreign_keys = ON")
             throw error
+        }
+    }
+
+    private func validateSimpleSpaceTableBounds(
+        table: String,
+        maximum: Int,
+        label: String
+    ) async throws {
+        let rows = try await connection.query(
+            """
+            SELECT 1
+            FROM \(table)
+            GROUP BY space_uri
+            HAVING COUNT(*) > ?
+            LIMIT 1
+            """,
+            [.integer(maximum)]
+        )
+        guard rows.isEmpty else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "simple-space \(label) state exceeds its bound"
+            )
         }
     }
 
@@ -4490,10 +4591,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         author: String,
         since: TID?,
         limit: Int,
-        includeValues: Bool
+        includeValues: Bool,
+        maximumAggregateValueBytes: Int = PublicRepositoryJSONReadLimits
+            .maximumListRepoOpsValueBytes
     ) async throws -> PersistedWireOplogRead {
         try requireAccount(author)
-        guard (1 ... 1_000).contains(limit) else {
+        guard (1 ... 1_000).contains(limit),
+              maximumAggregateValueBytes > 0 else {
             throw SwanError.malformed("permissioned oplog page limit is invalid")
         }
         return try await withConnectionGate {
@@ -4504,7 +4608,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     author: author,
                     since: since,
                     limit: limit,
-                    includeValues: includeValues
+                    includeValues: includeValues,
+                    maximumAggregateValueBytes: maximumAggregateValueBytes
                 )
             }
         }
@@ -4515,7 +4620,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         author: String,
         since: TID?,
         limit: Int,
-        includeValues: Bool
+        includeValues: Bool,
+        maximumAggregateValueBytes: Int
     ) async throws -> PersistedWireOplogRead {
         guard let state = try await loadState(space: space, author: author) else {
             return .incremental(state: nil, entries: [])
@@ -4547,18 +4653,31 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             }
         }
 
-        // A wire TID is the only public cursor. Find the final revision in the
-        // requested prefix first, then return the entire equivalence class for
-        // that TID. Applying LIMIT directly to the projection would split an
-        // atomic batch and make its remaining rows unreachable once a client
-        // sends the last returned TID as `since`.
-        let boundaryRows = try await connection.query(
+        // A wire TID is the only public cursor. Summarize complete TID groups
+        // before selecting any BLOB values. This preserves atomic batches while
+        // enforcing both the requested operation limit and a byte budget using
+        // scalar metadata only; a same-TID batch that cannot fit fails closed.
+        let valueBytesExpression = includeValues
+            ? "COALESCE(SUM(COALESCE(length(live.value), 0)), 0)"
+            : "0"
+        let groupRows = try await connection.query(
             """
-            SELECT wire_revision
-            FROM permissioned_space_oplog
-            WHERE space_uri = ? AND author_did = ?
-              AND (? IS NULL OR wire_revision > ?)
-            ORDER BY revision, operation_index
+            SELECT oplog.wire_revision,
+                   MIN(oplog.revision) AS first_revision,
+                   MIN(oplog.operation_index) AS first_operation_index,
+                   COUNT(*) AS operation_count,
+                   \(valueBytesExpression) AS value_bytes
+            FROM permissioned_space_oplog AS oplog
+            LEFT JOIN permissioned_space_records AS live
+              ON live.space_uri = oplog.space_uri
+             AND live.author_did = oplog.author_did
+             AND live.collection = oplog.collection
+             AND live.rkey = oplog.rkey
+             AND live.cid = oplog.cid
+            WHERE oplog.space_uri = ? AND oplog.author_did = ?
+              AND (? IS NULL OR oplog.wire_revision > ?)
+            GROUP BY oplog.wire_revision
+            ORDER BY first_revision, first_operation_index
             LIMIT ?
             """,
             [
@@ -4568,13 +4687,60 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 .integer(limit),
             ]
         )
-        guard let boundaryRow = boundaryRows.last else {
+        guard !groupRows.isEmpty else {
             return .incremental(state: state, entries: [])
         }
-        let boundary = try requiredTID(boundaryRow, "wire_revision")
+
+        let maximumAggregateOperations = PublicRepositoryJSONReadLimits
+            .maximumListRepoOpsOperations
+        var selectedOperationCount = 0
+        var aggregateValueBytes = 0
+        var boundary: TID?
+        for row in groupRows {
+            let operationCount = try requiredNonnegativeInteger(
+                row,
+                "operation_count"
+            )
+            guard operationCount > 0 else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "oplog group has no operations"
+                )
+            }
+            guard operationCount <= maximumAggregateOperations else {
+                throw SwanError.unavailable(
+                    "permissioned oplog page exceeds response budget"
+                )
+            }
+            let valueBytes = try requiredNonnegativeInteger(row, "value_bytes")
+            let (nextBytes, bytesOverflow) = aggregateValueBytes
+                .addingReportingOverflow(valueBytes)
+            let (nextOperations, operationsOverflow) = selectedOperationCount
+                .addingReportingOverflow(operationCount)
+            guard !bytesOverflow, !operationsOverflow else {
+                throw SwanError.unavailable("permissioned oplog page exceeds response budget")
+            }
+            if boundary == nil && valueBytes > maximumAggregateValueBytes {
+                throw SwanError.unavailable("permissioned oplog page exceeds response budget")
+            }
+            if boundary != nil,
+               nextBytes > maximumAggregateValueBytes
+                || nextOperations > maximumAggregateOperations {
+                break
+            }
+            boundary = try requiredTID(row, "wire_revision")
+            aggregateValueBytes = nextBytes
+            selectedOperationCount = nextOperations
+            if selectedOperationCount >= limit {
+                break
+            }
+        }
+        guard let boundary else {
+            throw SwanError.unavailable("permissioned oplog page exceeds response budget")
+        }
 
         let rows: [SQLiteRow]
         if includeValues {
+            try await testingHooks.beforeWireOplogValueMaterialization?()
             rows = try await connection.query(
                 """
                 SELECT oplog.wire_revision, oplog.action, oplog.collection,
@@ -4617,6 +4783,26 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     .text(boundary.toString()),
                 ]
             )
+        }
+        guard rows.count <= maximumAggregateOperations else {
+            throw SwanError.unavailable("permissioned oplog page exceeds response budget")
+        }
+        if includeValues {
+            let actualValueBytes = try rows.reduce(into: 0) { total, row in
+                guard case let .blob(value) = row.column("current_value") else {
+                    return
+                }
+                let (next, overflow) = total.addingReportingOverflow(value.readableBytes)
+                guard !overflow else {
+                    throw SwanError.unavailable(
+                        "permissioned oplog page exceeds response budget"
+                    )
+                }
+                total = next
+            }
+            guard actualValueBytes <= maximumAggregateValueBytes else {
+                throw SwanError.unavailable("permissioned oplog page exceeds response budget")
+            }
         }
         return .incremental(
             state: state,
@@ -4828,6 +5014,204 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
+    /// Reads a bounded member page directly from SQLite.  The older facade
+    /// obtained `SimpleSpace` first and then sorted its `Set`, which made a
+    /// request for ten members materialize every member in the authority
+    /// account.  This path validates the scalar authority facts and cardinality
+    /// with bounded/counting queries, then uses a keyset predicate for the
+    /// actual page.
+    public func simpleSpaceMemberPage(
+        space: SpaceURI,
+        limit: Int,
+        cursor: String?,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSimpleSpaceMemberPage {
+        guard (1 ... 1_000).contains(limit) else {
+            throw SwanError.malformed("invalid member page limit")
+        }
+        if let cursor {
+            guard isValidSimpleSpaceDID(cursor) else {
+                throw SwanError.malformed("invalid member cursor")
+            }
+        }
+        try requireAuthorityAccount(space: space)
+        return try await withConnectionGate {
+            try await readTransaction {
+                try requireAuthorityManagement(
+                    space: space,
+                    authorization: authorization,
+                    operation: .update
+                )
+                let authorityRows = try await connection.query(
+                    """
+                    SELECT owner_did, policy, app_access, managing_app, is_deleted
+                    FROM permissioned_simple_space_authorities
+                    WHERE space_uri = ?
+                    LIMIT 1
+                    """,
+                    [.text(space.rawValue)]
+                )
+                guard let authorityRow = authorityRows.first else {
+                    throw AuthorizedSimpleSpaceLifecycleError.notFound
+                }
+                let owner = try requiredText(authorityRow, "owner_did")
+                guard owner == space.authority, isValidSimpleSpaceDID(owner) else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "invalid simple-space owner"
+                    )
+                }
+                let policyRaw = try requiredText(authorityRow, "policy")
+                guard let policy = SimpleSpacePolicy(rawValue: policyRaw) else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "invalid simple-space policy"
+                    )
+                }
+                let appAccessRaw = try requiredText(authorityRow, "app_access")
+                guard appAccessRaw == "open" || appAccessRaw == "allow-list" else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "invalid simple-space app access"
+                    )
+                }
+                if let managingApp = authorityRow.column("managing_app"), !managingApp.isNull {
+                    try validateSimpleSpaceAppIdentifier(
+                        try requiredText(authorityRow, "managing_app")
+                    )
+                }
+                let deleted = try requiredInteger(authorityRow, "is_deleted")
+                guard deleted == 0 || deleted == 1 else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "invalid simple-space deleted state"
+                    )
+                }
+                guard deleted == 0 else {
+                    throw AuthorizedSimpleSpaceLifecycleError.notFound
+                }
+
+                let memberCountRows = try await connection.query(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM permissioned_simple_space_members
+                    WHERE space_uri = ?
+                    """,
+                    [.text(space.rawValue)]
+                )
+                let memberCount = try requiredNonnegativeInteger(
+                    try requiredRow(memberCountRows),
+                    "count"
+                )
+                guard memberCount <= Self.maximumSimpleSpaceMembers else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "simple-space members exceed their bound"
+                    )
+                }
+                let ownerRows = try await connection.query(
+                    """
+                    SELECT 1
+                    FROM permissioned_simple_space_members
+                    WHERE space_uri = ? AND member_did = ?
+                    LIMIT 1
+                    """,
+                    [.text(space.rawValue), .text(owner)]
+                )
+                guard !ownerRows.isEmpty else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "simple-space owner is not a member"
+                    )
+                }
+
+                let clientCountRows = try await connection.query(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM permissioned_simple_space_clients
+                    WHERE space_uri = ?
+                    """,
+                    [.text(space.rawValue)]
+                )
+                let clientCount = try requiredNonnegativeInteger(
+                    try requiredRow(clientCountRows),
+                    "count"
+                )
+                guard clientCount <= Self.maximumSimpleSpaceClients else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "simple-space clients exceed their bound"
+                    )
+                }
+                if appAccessRaw == "open" {
+                    guard clientCount == 0 else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "open simple space has client restrictions"
+                        )
+                    }
+                }
+                let decisionCountRows = try await connection.query(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM permissioned_simple_space_managing_app_decisions
+                    WHERE space_uri = ?
+                    """,
+                    [.text(space.rawValue)]
+                )
+                let decisionCount = try requiredNonnegativeInteger(
+                    try requiredRow(decisionCountRows),
+                    "count"
+                )
+                guard decisionCount <= Self.maximumSimpleSpaceManagingAppDecisions else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "simple-space managing-app decisions exceed their bound"
+                    )
+                }
+                if policy != .managingApp {
+                    guard decisionCount == 0 else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "non-managing simple space has app decisions"
+                        )
+                    }
+                }
+
+                let memberRows: [SQLiteRow]
+                if let cursor {
+                    memberRows = try await connection.query(
+                        """
+                        SELECT member_did
+                        FROM permissioned_simple_space_members
+                        WHERE space_uri = ? AND member_did > ?
+                        ORDER BY member_did ASC
+                        LIMIT ?
+                        """,
+                        [
+                            .text(space.rawValue), .text(cursor),
+                            .integer(limit),
+                        ]
+                    )
+                } else {
+                    memberRows = try await connection.query(
+                        """
+                        SELECT member_did
+                        FROM permissioned_simple_space_members
+                        WHERE space_uri = ?
+                        ORDER BY member_did ASC
+                        LIMIT ?
+                        """,
+                        [.text(space.rawValue), .integer(limit)]
+                    )
+                }
+                let members = try memberRows.map { row in
+                    let member = try requiredText(row, "member_did")
+                    guard isValidSimpleSpaceDID(member) else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "invalid simple-space member"
+                        )
+                    }
+                    return member
+                }
+                return AuthorizedSimpleSpaceMemberPage(
+                    members: members,
+                    cursor: members.last
+                )
+            }
+        }
+    }
+
     public func updateSimpleSpace(
         space: SpaceURI,
         configuration: SimpleSpaceConfiguration,
@@ -4975,6 +5359,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 guard !stored.state.space.members.contains(member) else {
                     return stored.state
                 }
+                guard stored.state.space.members.count < Self.maximumSimpleSpaceMembers else {
+                    throw SwanError.unavailable(
+                        "simple-space member capacity exhausted"
+                    )
+                }
                 _ = try await connection.query(
                     "INSERT INTO permissioned_simple_space_members(space_uri, member_did) VALUES (?, ?)",
                     [.text(space.rawValue), .text(member)]
@@ -5054,6 +5443,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 }
                 guard currentlyAllowed != allowed else { return stored.state }
                 if allowed {
+                    let clientCount: Int
+                    if case let .allowList(clients) = stored.state.space.configuration.appAccess {
+                        clientCount = clients.count
+                    } else {
+                        clientCount = 0
+                    }
+                    guard clientCount < Self.maximumSimpleSpaceClients else {
+                        throw SwanError.unavailable(
+                            "simple-space client allow-list capacity exhausted"
+                        )
+                    }
                     _ = try await connection.query(
                         "INSERT INTO permissioned_simple_space_clients(space_uri, client_id) VALUES (?, ?)",
                         [.text(space.rawValue), .text(clientID)]
@@ -5105,6 +5505,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 let currentlyAllowed = stored.managingAppAllowedUsers.contains(user)
                 guard currentlyAllowed != allowed else { return stored.state }
                 if allowed {
+                    guard stored.managingAppAllowedUsers.count
+                        < Self.maximumSimpleSpaceManagingAppDecisions else {
+                        throw SwanError.unavailable(
+                            "simple-space managing-app decision capacity exhausted"
+                        )
+                    }
                     _ = try await connection.query(
                         "INSERT INTO permissioned_simple_space_managing_app_decisions(space_uri, user_did) VALUES (?, ?)",
                         [.text(space.rawValue), .text(user)]
@@ -5453,6 +5859,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     }
                 }
 
+                // The durable writer row is the replay-safe monotonic state.
+                // Do not retain a unique receipt for every reordered stale
+                // event; it cannot affect the state after this point.
+                guard advancesWriter else { return }
+
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_notification_receipts(
@@ -5464,7 +5875,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         .text(notification.space.rawValue), .integer(timestamp),
                     ]
                 )
-                guard advancesWriter else { return }
+                _ = try await connection.query(
+                    """
+                    DELETE FROM permissioned_space_notification_receipts
+                    WHERE issuer = ? AND space_uri = ? AND event_id != ?
+                    """,
+                    [
+                        .text(notification.issuer),
+                        .text(notification.space.rawValue),
+                        .text(eventID),
+                    ]
+                )
 
                 _ = try await connection.query(
                     """
@@ -5513,6 +5934,35 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let timestamp = try simpleSpaceTimestamp(now)
         try await withConnectionGate {
             try await transaction {
+                let tombstones = try await connection.query(
+                    """
+                    SELECT 1
+                    FROM permissioned_space_recipient_tombstones
+                    WHERE space_uri = ?
+                    """,
+                    [.text(space.rawValue)]
+                )
+                // A tombstone is terminal. Future event IDs are no-ops and
+                // must not create an unbounded replay-receipt stream.
+                guard tombstones.isEmpty else { return }
+                let duplicate = try await connection.query(
+                    """
+                    SELECT 1
+                    FROM permissioned_space_notification_receipts
+                    WHERE issuer = ? AND event_id = ? AND space_uri = ?
+                    """,
+                    [
+                        .text(issuer), .text(eventID), .text(space.rawValue),
+                    ]
+                )
+                guard duplicate.isEmpty else { return }
+                _ = try await connection.query(
+                    """
+                    DELETE FROM permissioned_space_notification_receipts
+                    WHERE issuer = ? AND space_uri = ?
+                    """,
+                    [.text(issuer), .text(space.rawValue)]
+                )
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_notification_receipts(
@@ -7110,6 +7560,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         case .open:
             break
         case let .allowList(clients):
+            guard clients.count <= Self.maximumSimpleSpaceClients else {
+                throw SwanError.unavailable(
+                    "simple-space client allow-list capacity exhausted"
+                )
+            }
             for client in clients {
                 try validateSimpleSpaceAppIdentifier(client)
             }
@@ -7283,9 +7738,18 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             FROM permissioned_simple_space_members
             WHERE space_uri = ?
             ORDER BY member_did
+            LIMIT ?
             """,
-            [.text(space.rawValue)]
+            [
+                .text(space.rawValue),
+                .integer(Self.maximumSimpleSpaceMembers + 1),
+            ]
         )
+        guard memberRows.count <= Self.maximumSimpleSpaceMembers else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "simple-space members exceed their bound"
+            )
+        }
         var members = Set<String>()
         for memberRow in memberRows {
             let member = try requiredText(memberRow, "member_did")
@@ -7302,9 +7766,18 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             FROM permissioned_simple_space_clients
             WHERE space_uri = ?
             ORDER BY client_id
+            LIMIT ?
             """,
-            [.text(space.rawValue)]
+            [
+                .text(space.rawValue),
+                .integer(Self.maximumSimpleSpaceClients + 1),
+            ]
         )
+        guard clientRows.count <= Self.maximumSimpleSpaceClients else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "simple-space clients exceed their bound"
+            )
+        }
         var clients = Set<String>()
         for clientRow in clientRows {
             let clientID = try requiredText(clientRow, "client_id")
@@ -7351,9 +7824,19 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             FROM permissioned_simple_space_managing_app_decisions
             WHERE space_uri = ?
             ORDER BY user_did
+            LIMIT ?
             """,
-            [.text(space.rawValue)]
+            [
+                .text(space.rawValue),
+                .integer(Self.maximumSimpleSpaceManagingAppDecisions + 1),
+            ]
         )
+        guard managingDecisionRows.count
+            <= Self.maximumSimpleSpaceManagingAppDecisions else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "simple-space managing-app decisions exceed their bound"
+            )
+        }
         var managingAppAllowedUsers = Set<String>()
         for decisionRow in managingDecisionRows {
             let user = try requiredText(decisionRow, "user_did")
@@ -7399,6 +7882,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             [.text(space.rawValue)]
         )
         guard case let .allowList(clients) = appAccess else { return }
+        guard clients.count <= Self.maximumSimpleSpaceClients else {
+            throw SwanError.unavailable(
+                "simple-space client allow-list capacity exhausted"
+            )
+        }
         for clientID in clients.sorted() {
             _ = try await connection.query(
                 "INSERT INTO permissioned_simple_space_clients(space_uri, client_id) VALUES (?, ?)",
@@ -8232,6 +8720,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return value
     }
 
+    private func requiredRow(_ rows: [SQLiteRow]) throws -> SQLiteRow {
+        guard rows.count == 1, let row = rows.first else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "aggregate query returned an invalid row count"
+            )
+        }
+        return row
+    }
+
     private func requiredInteger(
         _ row: SQLiteRow,
         _ column: String
@@ -8958,6 +9455,8 @@ public actor DurableSpaceRepository {
         since: TID?,
         limit: Int,
         includeValues: Bool,
+        maximumAggregateValueBytes: Int = PublicRepositoryJSONReadLimits
+            .maximumListRepoOpsValueBytes,
         authorization: AuthorizationContext
     ) async throws -> AuthorizedSpaceRepositoryOplogRead {
         try requireRead(uri: nil, authorization: authorization)
@@ -8966,7 +9465,8 @@ public actor DurableSpaceRepository {
             author: author,
             since: since,
             limit: limit,
-            includeValues: includeValues
+            includeValues: includeValues,
+            maximumAggregateValueBytes: maximumAggregateValueBytes
         ) {
         case let .incremental(state, entries):
             let projectedState: AuthorizedSpaceRepositoryCommitState
@@ -9311,6 +9811,20 @@ public actor DurableSimpleSpaceAuthority {
             member: member,
             authorization: authorization,
             now: now
+        )
+    }
+
+    public func memberPage(
+        space: SpaceURI,
+        limit: Int,
+        cursor: String?,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSimpleSpaceMemberPage {
+        try await database.simpleSpaceMemberPage(
+            space: space,
+            limit: limit,
+            cursor: cursor,
+            authorization: authorization
         )
     }
 
