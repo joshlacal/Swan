@@ -4311,7 +4311,7 @@ extension SwanCommand {
 
             @Option(
                 name: .customLong("permissioned-commit-key-env"),
-                help: "Environment variable containing ES256:<base64url-x963> or ES256K:<base64url> repository-author public key (untagged is legacy ES256K)"
+                help: "Environment variable containing a canonical did:key or ES256:<base64url-x963>/ES256K:<base64url> repository-author public key (untagged is legacy ES256K)"
             )
             var permissionedCommitKeyEnvironment = "SWAN_LAB_PERMISSIONED_COMMIT_KEY"
 
@@ -4840,6 +4840,24 @@ private enum LabLiveSupport {
         environment: String
     ) throws -> PermissionedDataJWTVerificationKey {
         let configured = try environmentValue(environment, label: "permissioned commit public key")
+        // Interop runners may supply the repository's canonical PLC
+        // verification method directly.  Decode the multicodec before the
+        // legacy base64 forms so curve selection remains bound to the
+        // published key rather than to an operator-supplied algorithm label.
+        if configured.hasPrefix("did:key:z") {
+            do {
+                switch try PLCDIDKeyCodec.decode(configured) {
+                case let .p256(publicKey):
+                    return .p256(publicKey)
+                case let .secp256k1(publicKey):
+                    return try PermissionedDataJWTVerificationKey(
+                        secp256k1PublicKey: publicKey
+                    )
+                }
+            } catch {
+                throw ValidationError("permissioned commit did:key is invalid")
+            }
+        }
         let pieces = configured.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
         let algorithm: String
         let encoded: String

@@ -5,7 +5,9 @@ set -euo pipefail
 # key discovery. The default `member` direction uses the TypeScript host as a
 # member while Swan is the authority; `authority` reverses that placement so
 # Swan is the member and dynamically resolves the TypeScript authority's
-# credential-signing key. No static public-key pin is supplied in either case.
+# credential-signing key. Stateful sync/full-CAR verification is supported in
+# both directions when the recovery-qualified reference image is selected.
+# No static public-key pin is supplied in either case.
 #
 # This harness attaches to an already-running disposable Compose project.  It
 # creates one disposable reference-PDS account, temporarily replaces only that
@@ -45,10 +47,6 @@ case "$direction" in
   member|authority) ;;
   *) echo "SWAN_DYNAMIC_DELEGATION_DIRECTION must be member or authority" >&2; exit 64 ;;
 esac
-if [[ "$direction" == "authority" && "$stateful_mode" == "1" ]]; then
-  echo "stateful recovery is supported only for the TypeScript-member direction" >&2
-  exit 64
-fi
 [[ -n "${SWAN_INTEROP_SECRETS_DIR:-}" ]] || {
   echo "SWAN_INTEROP_SECRETS_DIR is required" >&2
   exit 64
@@ -283,13 +281,17 @@ fi
 
 reference_commit_key=""
 if [[ "$stateful_mode" == "1" ]]; then
-  # The pinned PLC audit endpoint exposes the canonical did:key used by the
-  # reference repository signer. Decode its secp256k1 multicodec payload
-  # inside the reference Node image and pass only public verification material
-  # to the Swift runner.
+  # The PLC audit endpoint exposes the canonical did:key used by the
+  # repository signer. Resolve the repository DID (not merely the authority
+  # DID) so reverse-authority runs verify Swan's P-256 commit with Swan's key.
+  # The Swift runner validates the multicodec and curve before using it.
+  commit_repository_did="$reference_did"
+  if [[ "$direction" == "authority" ]]; then
+    commit_repository_did="$space_member_did"
+  fi
   reference_commit_key="$({
     docker exec \
-      --env SWAN_REFERENCE_DID="$reference_did" \
+      --env SWAN_REFERENCE_DID="$commit_repository_did" \
       "$reference_pds_id" \
       node -e '
 const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -324,19 +326,21 @@ async function main() {
     throw new Error("PLC atproto key is not canonical did:key")
   }
   const decoded = decode(encoded.slice("did:key:z".length))
-  if (decoded.length !== 35 || decoded[0] !== 0xe7 || decoded[1] !== 0x01) {
-    throw new Error("PLC atproto key is not secp256k1")
+  const secp256k1 = decoded.length === 35 && decoded[0] === 0xe7 && decoded[1] === 0x01
+  const p256 = decoded.length === 35 && decoded[0] === 0x80 && decoded[1] === 0x24
+  if (!secp256k1 && !p256) {
+    throw new Error("PLC atproto key is not a supported repository key")
   }
-  process.stdout.write(`ES256K:${decoded.subarray(2).toString("base64url")}\n`)
+  process.stdout.write(`${encoded}\n`)
 }
 main().catch((error) => { process.stderr.write(`${error.message}\n`); process.exit(1) })
  ' # end PLC audit script
   })" || {
-    echo "the reference PLC did not expose a canonical member signing key" >&2
+    echo "the PLC did not expose a canonical repository signing key" >&2
     exit 1
   }
-  [[ "$reference_commit_key" =~ ^ES256K:[A-Za-z0-9_-]{44}$ ]] || {
-    echo "the reference member signing key did not decode to a compressed secp256k1 point" >&2
+  [[ "$reference_commit_key" =~ ^did:key:z[A-Za-z0-9]+$ ]] || {
+    echo "the repository signing key did not decode to a canonical did:key" >&2
     exit 1
   }
 fi

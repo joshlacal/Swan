@@ -2119,3 +2119,39 @@ image: that image still returns HTTP 500/501 for the value-bearing
 fault injection across hosts, reverse-authority lifecycle/browser coverage,
 strict password-reset work-shape proof, and formal security scanning remain
 open.
+
+## Adversarial rereview: reverse-authority stateful recovery and signer binding — 2026-08-01
+
+The first attempt to enable stateful reverse-authority coverage exposed a
+test-validity defect: the harness supplied the TypeScript authority's
+secp256k1 key while verifying the Swan member's P-256 repository commit. The
+failure was `ContextSignatureMismatch`; it was not recorded as a product
+failure. The runner now resolves the repository DID's canonical `did:key`
+from the local PLC audit, and the CLI validates that multicodec before
+selecting ES256 or ES256K. This binds verification to the repository signer
+rather than to the authority placement or an operator-labelled curve.
+
+The recovery-qualified Compose project was rebuilt from the corrected current
+source. Both directions then passed the same 26-assertion stateful matrix:
+
+- TypeScript member / Swan authority: credential issuance, OAuth/DPoP write
+  and read, value-bearing `listRepoOps`, signed commitment verification,
+  two-root `getRepo` CAR verification, and equal sync/full-CAR commitments;
+- Swan member / TypeScript authority: the same checks with the repository
+  signer resolved as Swan's P-256 PLC key; and
+- both artifacts reported HTTP 200 for write/read/sync/full-CAR, matching
+  terminal revisions and commitments, `credentialIssued: true`,
+  `converged: true`, and `status: passed`.
+
+The owner-only artifacts are outside the repository at
+`/Users/joshlacalamito/.swan-live-artifacts/current-reference-member-stateful-recovery-v2.json`
+and
+`/Users/joshlacalamito/.swan-live-artifacts/current-reference-authority-stateful-recovery-v2.json`.
+Each is mode 0600 and contains no password, bearer/refresh token, private key,
+or record value. `interop/verify-reference.sh` passed afterward, proving the
+immutable pinned cache was unchanged. This closes the reverse-authority
+stateful recovery witness for the qualified overlay. It does not upgrade the
+stock pinned TypeScript image, whose value-bearing `listRepoOps`/`getRepo`
+surfaces remain HTTP 500/501, and it does not close the broader
+reverse-authority browser/account lifecycle or cross-host corruption/fault
+matrix.
