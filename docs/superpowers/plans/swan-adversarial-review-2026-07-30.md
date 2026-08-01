@@ -2090,3 +2090,32 @@ pinned-TypeScript value-bearing incremental/full-CAR limitation, reverse-
 authority browser/lifecycle coverage, corrupted-operation and compaction-gap
 traffic, strict password-reset work-shape proof, or the unavailable formal
 security launcher.
+
+## Adversarial rereview: qualified cross-host stateful recovery — 2026-08-01
+
+The checksum-pinned recovery overlay was then exercised as a separate
+disposable Compose project, without modifying the immutable reference cache.
+The current Swan image was rebuilt from this checkout, the overlay image was
+validated against the pinned archive and patch digest, and the dynamic PLC
+delegation harness ran the TypeScript-member/Swan-authority stateful path.
+
+The sanitized artifact was retained outside the repository at
+`/Users/joshlacalamito/.swan-live-artifacts/current-reference-member-stateful-recovery.json`.
+Its 26 assertions all passed:
+
+- credential issuance, OAuth/DPoP write, read, and matching write/read CIDs;
+- value-bearing `listRepoOps` with HTTP 200, a signed terminal revision, and
+  verified commitment;
+- two-root `getRepo` with HTTP 200, verified CAR integrity, and the expected
+  record; and
+- equality of the incremental-operation and full-CAR LtHash commitments.
+
+The live result reported `status: passed`, `credentialIssued: true`,
+`converged: true`, and `syncValuesIncluded: true`. The reference cache was
+revalidated afterward and remained unchanged. This closes the qualified
+overlay recovery witness. It does not upgrade the stock pinned TypeScript
+image: that image still returns HTTP 500/501 for the value-bearing
+`listRepoOps`/`getRepo` surfaces. Corrupted-operation traffic, compaction-gap
+fault injection across hosts, reverse-authority lifecycle/browser coverage,
+strict password-reset work-shape proof, and formal security scanning remain
+open.
