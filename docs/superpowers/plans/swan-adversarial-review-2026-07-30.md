@@ -147,7 +147,7 @@ overstated several gates. The most important adversarial findings were:
 | ADV-79 | P3 | Three public `sync` read routes force-unwrapped the request-derived `did` query entry. The strict parser currently guarantees the key, but a future parser change or bypass could turn malformed input into a process trap instead of `InvalidRequest`. | Remediated with explicit key guards and one typed `DID` parse per route. `PublicRepositoryReadHTTPTests` passed 12/12; no authorization or privacy bypass was reproduced. |
 | ADV-97 | P1 | Deactivation followed by reactivation updates `control.sqlite` but leaves the preopened public-read generation bound to the old `AccountControlAccount` (including its `updatedAt`). Public reads therefore remain unavailable after lifecycle reactivation. | Remediated with an existing-database-only async generation refresh that revalidates PLC identity, preparation intent, path identity, and the exact active control row before publication. A permanent regression covers status, description, record, and CAR reads after reactivation. |
 | ADV-98 | P2 | Portable archive verification bounded manifest/payload bytes but recursively materialized every filesystem entry into `String`/`Set` collections without a count or depth bound. An untrusted restore archive could exhaust memory or the call stack with extra empty entries before the expected-path mismatch was reported. | Remediated with a manifest file-count ceiling, exact expected-entry admission, bounded per-directory enumeration, and a 256-level recursion ceiling. The new archive-inventory regression passes. |
-| ADV-99 | P1 | Public-read admission bounded the SQLite index with a keyset preflight but then retained the full validated MST and leaf projection in Swift, allowing a valid near-policy-ceiling repository to create a large startup/generation-refresh allocation. | Remediated with `validateProjection` and a connection-local SQLite TEMP projection sink; the storage-level verifier now applies the same preflight. macOS and native Linux public-directory/HTTP selections pass; full Linux/RSS receipts remain open. |
+| ADV-99 | P1 | Public-read admission bounded the SQLite index with a keyset preflight but then retained the full validated MST and leaf projection in Swift, allowing a valid near-policy-ceiling repository to create a large startup/generation-refresh allocation. | Remediated with `validateProjection` and a connection-local SQLite TEMP projection sink; the storage-level verifier now applies the same preflight. macOS and native Linux public-directory/HTTP selections plus the native-Linux opt-in transfer/RSS gates pass; the full Linux receipt is recorded below. |
 
 ### Provenance limitation
 
@@ -1985,10 +1985,9 @@ legacy-row portability concern:
 The target platform reported by XCTest was
 `aarch64-unknown-linux-gnu`; the build completed in 342.43 seconds and the
 tests completed without failures. This is current native-Linux execution
-evidence for the focused selectors, not a claim that the entire Linux
-acceptance matrix has run. The full Linux suite and Linux opt-in 256 MiB/RSS
-selections still require a bounded, retained receipt before the platform
-gate can be called complete. The stock pinned-TypeScript value-bearing
+evidence for the focused selectors. The full-suite receipt and Linux opt-in
+256 MiB/RSS selections are recorded in the follow-up below. The stock
+pinned-TypeScript value-bearing
 incremental/full-CAR limitation, reverse-authority browser/lifecycle matrix,
 corrupted-operation and compaction-gap traffic, strict password-reset
 work-shape proof, and unavailable formal security launcher remain open.
@@ -2023,9 +2022,9 @@ Evidence:
 
 This closes the remaining public-admission whole-MST retention seam locally.
 The separate non-admission compatibility validators and the explicitly
-bounded public CAR writer remain unchanged. A full Linux XCTest receipt still
-remains open; the focused current-source and opt-in bounded-transfer Linux
-receipts are recorded below. Stock pinned-TypeScript value-bearing
+bounded public CAR writer remain unchanged. The focused current-source,
+opt-in bounded-transfer, and full-suite Linux receipts are recorded below.
+Stock pinned-TypeScript value-bearing
 incremental/full-CAR behavior, reverse-authority
 browser/lifecycle coverage, corrupted-operation and compaction-gap traffic,
 strict password-reset work-shape proof, and the unavailable formal security
@@ -2059,5 +2058,35 @@ that same warmed SwiftPM scratch path. All passed on `aarch64-unknown-linux-gnu`
 - private CAS blob streaming: 1/1 in 0.332 seconds.
 
 These close the current native-Linux bounded-transfer receipt for the tested
-selectors. They do not constitute a full Linux XCTest run or close the live
-stock-reference semantic/recovery and lifecycle gates.
+selectors. They do not close the live stock-reference semantic/recovery and
+lifecycle gates.
+
+## Adversarial rereview: native-Linux full-suite receipt and stale CLI trap — 2026-08-01
+
+The first bare native-Linux `swift test --jobs 1` invocation was intentionally
+not accepted as a product failure. It executed 929 tests with eight skips and
+eight failures because the CLI subprocess helpers found an old
+`.build/debug/swan` binary: `swift test` does not build the executable product
+when only test targets require it. The stale binary lacked the current
+`--receiver-did`, `--space-oplog-retention`, and
+`--permissioned-write-only-apply-writes` options. This is the Linux analogue
+of the previously documented stale-CLI reproducibility trap, not a source
+regression.
+
+The correct run first built the current `swan` product in the same scratch
+path, exported `SWAN_TEST_EXECUTABLE` to that exact binary, and then ran the
+full graph serially. On the native Ubuntu 26.04 ARM64 VM with Swift 6.2.3:
+
+- `swift build --product swan --jobs 1`: product built successfully in 2.97
+  seconds after the warmed source build;
+- `SWAN_TEST_EXECUTABLE=/tmp/swan-linux-test-20260801/aarch64-unknown-linux-gnu/debug/swan`
+  `swift test --jobs 1`: 929 tests, 8 intentional skips, 0 failures, 81.51
+  seconds; and
+- XCTest reported target `aarch64-unknown-linux-gnu`; the Swift Testing public
+  wire-profile suite also passed 4/4.
+
+This closes the native-Linux full XCTest receipt. It does not close the stock
+pinned-TypeScript value-bearing incremental/full-CAR limitation, reverse-
+authority browser/lifecycle coverage, corrupted-operation and compaction-gap
+traffic, strict password-reset work-shape proof, or the unavailable formal
+security launcher.
