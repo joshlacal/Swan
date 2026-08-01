@@ -1975,6 +1975,20 @@ extension SQLiteControlDatabase {
                         "DELETE FROM account_email_delivery_outbox WHERE did = ?",
                         [.text(did)]
                     )
+                    if account.status.authorizesAccount {
+                        // Families are created before authorization-code
+                        // redemption, so this permanently revokes every
+                        // pre-deactivation code, access token, and refresh
+                        // token without deleting their audit rows.
+                        _ = try await connection.query(
+                            """
+                            UPDATE oauth_control_token_families
+                            SET revoked_at = COALESCE(revoked_at, ?)
+                            WHERE subject = ?
+                            """,
+                            [.integer(timestamp), .text(did)]
+                        )
+                    }
                 }
                 return try await requiredAccount(did: did)
             }

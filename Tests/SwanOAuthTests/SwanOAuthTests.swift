@@ -579,7 +579,7 @@ final class SwanOAuthTests: XCTestCase {
         try await secondDatabase.close()
     }
 
-    func testRemoteTokenRedemptionChecksDurableLifecycleAndRefreshGrant() async throws {
+    func testDeactivationPermanentlyRevokesOAuthFamiliesAfterReactivation() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let now = Date(timeIntervalSince1970: 1_750_000_000)
@@ -599,78 +599,83 @@ final class SwanOAuthTests: XCTestCase {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
         let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
 
-        let noRefreshMetadata = try OAuthClientMetadata(
-            clientID: URL(string: "https://client.example/metadata")!,
-            redirectURIs: [URL(string: "https://client.example/callback")!],
-            grantTypes: ["authorization_code"], responseTypes: ["code"], scopes: ["atproto"],
-            dpopBoundAccessTokens: true
+        let session = try publicOAuthSession(dpopJKT: testDPoPJKT("L"), now: now)
+        let unredeemedCode = try await service.issueAuthorizationCode(
+            subject: did, session: session, codeChallengeS256: challenge, now: now)
+        let redeemedCode = try await service.issueAuthorizationCode(
+            subject: did, session: session, codeChallengeS256: challenge, now: now)
+        let preDeactivationGrant = try await service.redeemAuthorizationCodeForClient(
+            redeemedCode, verifier: verifier,
+            redirectURI: URL(string: "https://client.example/callback")!,
+            authorizationServerIssuer: "https://swan.example", client: session.client,
+            dpopProof: session.dpopProof, clientAssertion: nil, now: now
         )
-        let noRefreshSession = try OAuthValidatedSession(
-            issuer: "https://swan.example",
-            client: OAuthResolvedClientMetadata(metadata: noRefreshMetadata, keySet: nil),
-            redirectURI: URL(string: "https://client.example/callback")!, scopes: ["atproto"],
-            dpopProof: OAuthValidatedDPoPProof(
-                keyThumbprint: testDPoPJKT("L"), jwtID: "lifecycle-code", issuedAt: now),
-            now: now
-        )
-        let code = try await service.issueAuthorizationCode(
-            subject: did, session: noRefreshSession, codeChallengeS256: challenge, now: now)
+        let preDeactivationRefresh = try XCTUnwrap(preDeactivationGrant.refreshToken)
+
         _ = try await database.transitionStatus(
             did: did, to: .deactivated, declaration: .init(), now: now)
         await XCTAssertThrowsErrorAsync(
             try await service.redeemAuthorizationCodeForClient(
-                code, verifier: verifier,
+                unredeemedCode, verifier: verifier,
                 redirectURI: URL(string: "https://client.example/callback")!,
                 authorizationServerIssuer: "https://swan.example",
-                client: OAuthResolvedClientMetadata(metadata: noRefreshMetadata, keySet: nil),
-                dpopProof: noRefreshSession.dpopProof, clientAssertion: nil, now: now
+                client: session.client, dpopProof: session.dpopProof, clientAssertion: nil, now: now
             )
         )
-
-        // A failed active-status check leaves the code usable after an
-        // operator reactivates the account, but it still cannot mint a
-        // refresh capability that the metadata never declared.
-        _ = try await database.transitionStatus(
-            did: did, to: .active, declaration: .init(), now: now)
-        let noRefreshGrant = try await service.redeemAuthorizationCodeForClient(
-            code, verifier: verifier, redirectURI: URL(string: "https://client.example/callback")!,
-            authorizationServerIssuer: "https://swan.example",
-            client: OAuthResolvedClientMetadata(metadata: noRefreshMetadata, keySet: nil),
-            dpopProof: noRefreshSession.dpopProof, clientAssertion: nil, now: now
-        )
-        XCTAssertNil(noRefreshGrant.refreshToken)
-        _ = try await service.validateAccess(
-            noRefreshGrant.accessToken,
-            proof: noRefreshSession.dpopProof,
-            now: now
-        )
-
-        let refreshSession = try publicOAuthSession(dpopJKT: testDPoPJKT("M"), now: now)
-        let refreshCode = try await service.issueAuthorizationCode(
-            subject: did, session: refreshSession, codeChallengeS256: challenge, now: now)
-        let refreshMetadata = refreshSession.client.metadata
-        let refreshGrant = try await service.redeemAuthorizationCodeForClient(
-            refreshCode, verifier: verifier,
-            redirectURI: URL(string: "https://client.example/callback")!,
-            authorizationServerIssuer: "https://swan.example", client: refreshSession.client,
-            dpopProof: refreshSession.dpopProof, clientAssertion: nil, now: now
-        )
-        let refreshToken = try XCTUnwrap(refreshGrant.refreshToken)
-        _ = try await database.transitionStatus(
-            did: did, to: .deactivated, declaration: .init(), now: now)
         await XCTAssertThrowsErrorAsync(
             try await service.validateAccess(
-                noRefreshGrant.accessToken,
-                proof: noRefreshSession.dpopProof,
+                preDeactivationGrant.accessToken,
+                proof: session.dpopProof,
                 now: now
             )
         )
         await XCTAssertThrowsErrorAsync(
             try await service.redeemRefreshForClient(
-                refreshToken, client: OAuthResolvedClientMetadata(metadata: refreshMetadata, keySet: nil),
-                authorizationServerIssuer: "https://swan.example", dpopProof: refreshSession.dpopProof,
+                preDeactivationRefresh, client: session.client,
+                authorizationServerIssuer: "https://swan.example", dpopProof: session.dpopProof,
                 clientAssertion: nil, metadataLoader: try testMetadataLoader(database: database), now: now
             )
+        )
+
+        _ = try await database.transitionStatus(
+            did: did, to: .active, declaration: .init(), now: now)
+        await XCTAssertThrowsErrorAsync(
+            try await service.redeemAuthorizationCodeForClient(
+                unredeemedCode, verifier: verifier,
+                redirectURI: URL(string: "https://client.example/callback")!,
+                authorizationServerIssuer: "https://swan.example",
+                client: session.client, dpopProof: session.dpopProof, clientAssertion: nil, now: now
+            )
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await service.validateAccess(
+                preDeactivationGrant.accessToken,
+                proof: session.dpopProof,
+                now: now
+            )
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await service.redeemRefreshForClient(
+                preDeactivationRefresh, client: session.client,
+                authorizationServerIssuer: "https://swan.example", dpopProof: session.dpopProof,
+                clientAssertion: nil, metadataLoader: try testMetadataLoader(database: database), now: now
+            )
+        )
+
+        let freshCode = try await service.issueAuthorizationCode(
+            subject: did, session: session, codeChallengeS256: challenge, now: now)
+        let freshGrant = try await service.redeemAuthorizationCodeForClient(
+            freshCode, verifier: verifier,
+            redirectURI: URL(string: "https://client.example/callback")!,
+            authorizationServerIssuer: "https://swan.example", client: session.client,
+            dpopProof: session.dpopProof, clientAssertion: nil, now: now
+        )
+        XCTAssertEqual(freshGrant.subject, did)
+        XCTAssertNotNil(freshGrant.refreshToken)
+        _ = try await service.validateAccess(
+            freshGrant.accessToken,
+            proof: session.dpopProof,
+            now: now
         )
         try await database.close()
     }
