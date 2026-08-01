@@ -234,7 +234,33 @@ public actor DurableOAuthTokenService {
 
     /// Creates a code whose future token family is already durable. That lets
     /// the store revoke every resulting token if this code is replayed.
+    /// Issues a browser authorization code only against a durable active
+    /// subject revision. Production callers must provide the revision that
+    /// was checked with the login/consent session; the account-free variant
+    /// is kept internal for token-mechanics tests only.
     public func issueAuthorizationCode(
+        subject: String,
+        session: OAuthValidatedSession,
+        codeChallengeS256: String,
+        activeSubjectRevisionMicroseconds: Int64,
+        codeLifetime: TimeInterval = 60,
+        refreshLifetime: TimeInterval = 14 * 24 * 60 * 60,
+        familyID: UUID = UUID(),
+        now: Date = Date()
+    ) async throws -> String {
+        try await _issueAuthorizationCode(
+            subject: subject,
+            binding: session.durableBinding,
+            codeChallengeS256: codeChallengeS256,
+            activeSubjectRevisionMicroseconds: activeSubjectRevisionMicroseconds,
+            codeLifetime: codeLifetime,
+            refreshLifetime: refreshLifetime,
+            familyID: familyID,
+            now: now
+        )
+    }
+
+    func issueAuthorizationCode(
         subject: String,
         session: OAuthValidatedSession,
         codeChallengeS256: String,
@@ -244,7 +270,7 @@ public actor DurableOAuthTokenService {
         familyID: UUID = UUID(),
         now: Date = Date()
     ) async throws -> String {
-        try await issueAuthorizationCode(
+        try await _issueAuthorizationCode(
             subject: subject,
             binding: session.durableBinding,
             codeChallengeS256: codeChallengeS256,
@@ -264,11 +290,55 @@ public actor DurableOAuthTokenService {
         subject: String,
         binding: OAuthClientBinding,
         codeChallengeS256: String,
+        activeSubjectRevisionMicroseconds: Int64,
+        codeLifetime: TimeInterval = 60,
+        refreshLifetime: TimeInterval = 14 * 24 * 60 * 60,
+        familyID: UUID = UUID(),
+        now: Date = Date()
+    ) async throws -> String {
+        try await _issueAuthorizationCode(
+            subject: subject,
+            binding: binding,
+            codeChallengeS256: codeChallengeS256,
+            activeSubjectRevisionMicroseconds: activeSubjectRevisionMicroseconds,
+            codeLifetime: codeLifetime,
+            refreshLifetime: refreshLifetime,
+            familyID: familyID,
+            now: now
+        )
+    }
+
+    func issueAuthorizationCode(
+        subject: String,
+        binding: OAuthClientBinding,
+        codeChallengeS256: String,
         activeSubjectRevisionMicroseconds: Int64? = nil,
         codeLifetime: TimeInterval = 60,
         refreshLifetime: TimeInterval = 14 * 24 * 60 * 60,
         familyID: UUID = UUID(),
         now: Date = Date()
+    ) async throws -> String {
+        try await _issueAuthorizationCode(
+            subject: subject,
+            binding: binding,
+            codeChallengeS256: codeChallengeS256,
+            activeSubjectRevisionMicroseconds: activeSubjectRevisionMicroseconds,
+            codeLifetime: codeLifetime,
+            refreshLifetime: refreshLifetime,
+            familyID: familyID,
+            now: now
+        )
+    }
+
+    private func _issueAuthorizationCode(
+        subject: String,
+        binding: OAuthClientBinding,
+        codeChallengeS256: String,
+        activeSubjectRevisionMicroseconds: Int64?,
+        codeLifetime: TimeInterval,
+        refreshLifetime: TimeInterval,
+        familyID: UUID,
+        now: Date
     ) async throws -> String {
         guard codeLifetime > 0, refreshLifetime > 0,
               codeLifetime.isFinite, refreshLifetime.isFinite else {
@@ -305,7 +375,27 @@ public actor DurableOAuthTokenService {
     /// Verifies PKCE before atomically consuming the code and inserting both
     /// token digests. A second verified use revokes the family in that same
     /// durable transaction.
+    /// Redeems an authorization code only for an active account subject.
+    /// Token-mechanics tests use the internal overload below when they need a
+    /// synthetic subject with no account row.
     public func redeemAuthorizationCode(
+        _ code: String,
+        verifier: String,
+        session: OAuthValidatedSession,
+        accessLifetime: TimeInterval = 300,
+        now: Date = Date()
+    ) async throws -> OAuthTokenPair {
+        try await redeemAuthorizationCode(
+            code,
+            verifier: verifier,
+            session: session,
+            accessLifetime: accessLifetime,
+            requireActiveSubject: true,
+            now: now
+        )
+    }
+
+    func redeemAuthorizationCode(
         _ code: String,
         verifier: String,
         session: OAuthValidatedSession,
@@ -499,7 +589,29 @@ public actor DurableOAuthTokenService {
     /// Rotates a refresh token inside one durable transaction. Concurrent
     /// redemptions cannot both issue a pair: the loser observes `used_at` and
     /// atomically revokes the complete token family.
+    /// Rotates a refresh token only for an active account subject. The
+    /// bool-bearing overload is intentionally internal and exists solely for
+    /// account-free durable token tests.
     public func redeemRefresh(
+        _ refreshToken: String,
+        dpopProof: OAuthValidatedDPoPProof,
+        clientAssertion: OAuthValidatedClientAssertion?,
+        metadataLoader: OAuthClientMetadataLoader,
+        accessLifetime: TimeInterval = 300,
+        now: Date = Date()
+    ) async throws -> OAuthTokenPair {
+        try await redeemRefresh(
+            refreshToken,
+            dpopProof: dpopProof,
+            clientAssertion: clientAssertion,
+            metadataLoader: metadataLoader,
+            accessLifetime: accessLifetime,
+            requireActiveSubject: true,
+            now: now
+        )
+    }
+
+    func redeemRefresh(
         _ refreshToken: String,
         dpopProof: OAuthValidatedDPoPProof,
         clientAssertion: OAuthValidatedClientAssertion?,
@@ -611,13 +723,34 @@ public actor DurableOAuthTokenService {
     /// client identifier already validated by
     /// `OAuthClientMetadata.localhostDevelopmentMetadata`; it never bypasses
     /// remote metadata/JWKS revalidation for a confidential family.
+    /// Rotates a localhost public-client refresh token only for an active
+    /// account subject. The bool-bearing overload is internal test support.
     public func redeemLocalhostPublicRefresh(
         _ refreshToken: String,
         clientID: URL,
         dpopProof: OAuthValidatedDPoPProof,
         requestedScopes: Set<String>? = nil,
         accessLifetime: TimeInterval = 300,
-        requireActiveSubject: Bool = true,
+        now: Date = Date()
+    ) async throws -> OAuthTokenPair {
+        try await redeemLocalhostPublicRefresh(
+            refreshToken,
+            clientID: clientID,
+            dpopProof: dpopProof,
+            requestedScopes: requestedScopes,
+            accessLifetime: accessLifetime,
+            requireActiveSubject: true,
+            now: now
+        )
+    }
+
+    func redeemLocalhostPublicRefresh(
+        _ refreshToken: String,
+        clientID: URL,
+        dpopProof: OAuthValidatedDPoPProof,
+        requestedScopes: Set<String>? = nil,
+        accessLifetime: TimeInterval = 300,
+        requireActiveSubject: Bool,
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
         let metadata = try OAuthClientMetadata.localhostDevelopmentMetadata(clientID: clientID)

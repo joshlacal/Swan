@@ -748,6 +748,43 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
+    public func repositoryWriteWireRevision(
+        space: SpaceURI,
+        author: String,
+        writes: [AuthorizedSpaceRepositoryWrite],
+        authorization: AuthorizationContext
+    ) async throws -> String? {
+        let database = try await preopenedRepositoryDatabase(
+            for: author,
+            authorization: authorization
+        )
+        guard let database else {
+            throw SwanError.unauthorized("account repository is unavailable")
+        }
+        do {
+            let repository = try DurableSpaceRepository(
+                database: database,
+                space: space,
+                author: author
+            )
+            let revision = try await repository.currentWireRevisionForWrite(
+                writes,
+                authorization: authorization
+            )
+            guard try await isActiveAccount(author) else {
+                throw SwanError.unauthorized("account repository is unavailable")
+            }
+            guard !isClosed else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return revision
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
     /// Reads one strictly bounded, ordered permissioned oplog page through a
     /// startup-preopened account database.  A recovery gap remains a distinct
     /// domain result; no snapshot or historic record value becomes available

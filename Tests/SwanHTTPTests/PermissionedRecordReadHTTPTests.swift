@@ -715,6 +715,16 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testPermissionedTIDAllocatorObservesDurableRevisionAfterRestart() async throws {
+        let durableRevision = try TID(tidString: "7777777777777")
+        let allocator = SwanPermissionedTIDAllocator()
+        await allocator.observe(durableRevision)
+
+        let next = try await allocator.next()
+        XCTAssertGreaterThan(next, durableRevision)
+        XCTAssertEqual(next.toString().utf8.count, 13)
+    }
+
     func testApplyWritesCreateRejectsMalformedPresentRKeyWithoutMutationAndAcceptsOmission() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }

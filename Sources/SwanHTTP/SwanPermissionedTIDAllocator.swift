@@ -12,8 +12,16 @@ import SwanCore
 /// advances it by one whenever wall time does not. It is intentionally owned
 /// by SwanHTTP, not a process-global generator shared with unrelated work.
 actor SwanPermissionedTIDAllocator {
-    private static let alphabet = Array("234567abcdefghijklmnopqrstuvwxyz")
+    private static let alphabet = Array("234567abcdefghijklmnopqrstuvwxyz".utf8)
     private var lastValue: UInt64 = 0
+
+    /// Seeds the process-local sequence from a durable repository revision.
+    /// A service restart or a wall-clock rollback must not make the next
+    /// commit TID compare below the last value already accepted by SQLite.
+    func observe(_ tid: TID) {
+        guard let value = Self.decode(tid), value > lastValue else { return }
+        lastValue = value
+    }
 
     func next() throws -> TID {
         let seconds = Date().timeIntervalSince1970
@@ -45,12 +53,33 @@ actor SwanPermissionedTIDAllocator {
 
     private static func encode(_ value: UInt64) -> String {
         var remaining = value
-        var output: [Character] = []
+        var output: [UInt8] = []
         repeat {
             output.append(alphabet[Int(remaining & 31)])
             remaining >>= 5
         } while remaining != 0
-        while output.count < 13 { output.append("2") }
-        return String(output.reversed())
+        while output.count < 13 { output.append(alphabet[0]) }
+        return String(decoding: output.reversed(), as: UTF8.self)
+    }
+
+    private static func decode(_ tid: TID) -> UInt64? {
+        let bytes = Array(tid.toString().utf8)
+        guard bytes.count == 13 else { return nil }
+        var value: UInt64 = 0
+        for byte in bytes {
+            let digit: UInt64?
+            switch byte {
+            case UInt8(ascii: "2") ... UInt8(ascii: "7"):
+                digit = UInt64(byte - UInt8(ascii: "2"))
+            case UInt8(ascii: "a") ... UInt8(ascii: "z"):
+                digit = UInt64(byte - UInt8(ascii: "a")) + 6
+            default:
+                digit = nil
+            }
+            guard let digit,
+                  value <= (UInt64.max >> 5) else { return nil }
+            value = (value << 5) | digit
+        }
+        return value
     }
 }

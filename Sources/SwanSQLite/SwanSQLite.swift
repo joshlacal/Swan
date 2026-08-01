@@ -1022,6 +1022,22 @@ public struct PersistedSpaceRecord: Sendable, Equatable {
     public let revision: UInt64
 }
 
+/// The value-free facts required to preflight a permissioned write. Keeping
+/// this projection separate from ``PersistedSpaceRecord`` prevents a writer
+/// from materializing every existing record body merely to check whether a
+/// touched URI exists or to remove its LtHash element.
+public struct PersistedSpaceRecordMetadata: Sendable, Equatable {
+    public let uri: SpaceRecordURI
+    public let cid: String
+    public let revision: UInt64
+
+    public init(uri: SpaceRecordURI, cid: String, revision: UInt64) {
+        self.uri = uri
+        self.cid = cid
+        self.revision = revision
+    }
+}
+
 /// The write carries an already-derived CID, but the SQLite boundary verifies
 /// it against canonical DAG-CBOR before any transaction can persist it.
 public enum SQLiteSpaceWrite: Sendable, Equatable {
@@ -4269,6 +4285,178 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
+    /// Reads only the value-free facts needed to preflight a bounded write
+    /// batch. The query is performed inside one read transaction so a caller
+    /// cannot observe a mixture of repository generations, while record bodies
+    /// remain completely untouched.
+    public func spaceRecordMetadata(
+        space: SpaceURI,
+        author: String,
+        uris: [SpaceRecordURI]
+    ) async throws -> [SpaceRecordURI: PersistedSpaceRecordMetadata] {
+        try requireAccount(author)
+        guard uris.count <= 4_096 else {
+            throw SwanError.malformed("permissioned write batch is too large")
+        }
+        var uniqueURIs = Set<SpaceRecordURI>()
+        uniqueURIs.reserveCapacity(uris.count)
+        for uri in uris {
+            guard uri.space == space, uri.author == author else {
+                throw SwanError.unauthorized("record belongs to another repository")
+            }
+            uniqueURIs.insert(uri)
+        }
+        return try await withConnectionGate {
+            try await readTransaction {
+                try await requireLocalRepositorySpaceOpen(space)
+                var result: [SpaceRecordURI: PersistedSpaceRecordMetadata] = [:]
+                result.reserveCapacity(uniqueURIs.count)
+                for uri in uniqueURIs {
+                    if let metadata = try await loadRecordMetadata(uri) {
+                        result[uri] = metadata
+                    }
+                }
+                return result
+            }
+        }
+    }
+
+    /// Returns one deterministic permissioned page without selecting the
+    /// complete repository. SQLite first selects ordered keys and scalar value
+    /// lengths, enforcing the aggregate byte budget before it opens any record
+    /// body; only the accepted keys are then decoded from the same read
+    /// transaction. A page may be shorter than `limit` at the byte boundary,
+    /// and the caller continues with the last returned key.
+    public func repositoryRecordPage(
+        space: SpaceURI,
+        author: String,
+        collection: String?,
+        cursorCollection: String?,
+        cursorRKey: String?,
+        reverse: Bool,
+        limit: Int,
+        maximumAggregateRecordBytes: Int
+    ) async throws -> [PersistedSpaceRecord] {
+        try requireAccount(author)
+        guard (1 ... 100).contains(limit),
+              maximumAggregateRecordBytes > 0,
+              (cursorCollection == nil) == (cursorRKey == nil) else {
+            throw SwanError.malformed("permissioned record page is invalid")
+        }
+        if let collection {
+            _ = try SpaceRecordURI(
+                space: space,
+                author: author,
+                collection: collection,
+                rkey: "scope"
+            )
+        }
+        if let cursorCollection, let cursorRKey {
+            _ = try SpaceRecordURI(
+                space: space,
+                author: author,
+                collection: cursorCollection,
+                rkey: cursorRKey
+            )
+        }
+
+        return try await withConnectionGate {
+            try await readTransaction {
+                try await requireLocalRepositorySpaceOpen(space)
+
+                var predicates = [
+                    "space_uri = ?",
+                    "author_did = ?",
+                ]
+                var parameters: [SQLiteData] = [
+                    .text(space.rawValue),
+                    .text(author),
+                ]
+                if let collection {
+                    predicates.append("collection = ?")
+                    parameters.append(.text(collection))
+                }
+                if let cursorCollection, let cursorRKey {
+                    if reverse {
+                        predicates.append(
+                            "(collection > ? OR (collection = ? AND rkey > ?))"
+                        )
+                    } else {
+                        predicates.append(
+                            "(collection < ? OR (collection = ? AND rkey < ?))"
+                        )
+                    }
+                    parameters.append(.text(cursorCollection))
+                    parameters.append(.text(cursorCollection))
+                    parameters.append(.text(cursorRKey))
+                }
+                let order = reverse ? "ASC" : "DESC"
+                parameters.append(.integer(limit))
+                let rows = try await connection.query(
+                    """
+                    SELECT collection, rkey, cid, revision,
+                           length(value) AS value_bytes
+                    FROM permissioned_space_records
+                    WHERE \(predicates.joined(separator: " AND "))
+                    ORDER BY collection \(order), rkey \(order)
+                    LIMIT ?
+                    """,
+                    parameters
+                )
+
+                var selected: [(uri: SpaceRecordURI, valueBytes: Int)] = []
+                selected.reserveCapacity(rows.count)
+                var aggregateBytes = 0
+                for row in rows {
+                    let uri = try SpaceRecordURI(
+                        space: space,
+                        author: author,
+                        collection: try requiredText(row, "collection"),
+                        rkey: try requiredText(row, "rkey")
+                    )
+                    let valueBytes = try requiredNonnegativeInteger(
+                        row,
+                        "value_bytes"
+                    )
+                    let (next, overflow) = aggregateBytes
+                        .addingReportingOverflow(valueBytes)
+                    guard !overflow else {
+                        throw SwanError.unavailable(
+                            "permissioned record page exceeds response budget"
+                        )
+                    }
+                    guard next <= maximumAggregateRecordBytes else {
+                        // A single record is bounded at write time. If a
+                        // future schema permits a larger value, fail closed
+                        // rather than returning a page that can never be
+                        // encoded within the advertised response budget.
+                        if selected.isEmpty {
+                            throw SwanError.unavailable(
+                                "permissioned record page exceeds response budget"
+                            )
+                        }
+                        break
+                    }
+                    selected.append((uri: uri, valueBytes: valueBytes))
+                    aggregateBytes = next
+                }
+
+                var records: [PersistedSpaceRecord] = []
+                records.reserveCapacity(selected.count)
+                for item in selected {
+                    guard let record = try await loadRecord(item.uri),
+                          record.value.count == item.valueBytes else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "permissioned record page changed during snapshot"
+                        )
+                    }
+                    records.append(record)
+                }
+                return records
+            }
+        }
+    }
+
     public func spaceOplog(
         space: SpaceURI,
         author: String,
@@ -7465,6 +7653,46 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return try decodeRecord(row, space: uri.space, author: uri.author)
     }
 
+    private func loadRecordMetadata(
+        _ uri: SpaceRecordURI
+    ) async throws -> PersistedSpaceRecordMetadata? {
+        let rows = try await connection.query(
+            """
+            SELECT collection, rkey, cid, revision
+            FROM permissioned_space_records
+            WHERE space_uri = ? AND author_did = ?
+              AND collection = ? AND rkey = ?
+            """,
+            [
+                .text(uri.space.rawValue), .text(uri.author),
+                .text(uri.collection), .text(uri.rkey),
+            ]
+        )
+        guard let row = rows.first else { return nil }
+        let storedURI = try SpaceRecordURI(
+            space: uri.space,
+            author: uri.author,
+            collection: try requiredText(row, "collection"),
+            rkey: try requiredText(row, "rkey")
+        )
+        guard storedURI == uri else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "permissioned record metadata identity mismatch"
+            )
+        }
+        let cid = try requiredText(row, "cid")
+        guard (try? CID.parse(cid)) != nil else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "permissioned record metadata CID is invalid"
+            )
+        }
+        return PersistedSpaceRecordMetadata(
+            uri: storedURI,
+            cid: cid,
+            revision: try requiredRevision(row, "revision")
+        )
+    }
+
     private func decodeRecord(
         _ row: SQLiteRow,
         space: SpaceURI,
@@ -8431,22 +8659,24 @@ public actor DurableSpaceRepository {
             throw SQLiteRepositoryError.revisionOutOfRange(expectedRevision)
         }
 
-        let snapshot = try await database.repositorySnapshot(
+        let state = try await database.repositoryState(
             space: space,
             author: author
         )
-        let actualRevision = snapshot?.state.revision ?? 0
+        let actualRevision = state?.revision ?? 0
         guard actualRevision == expectedRevision else {
             throw SwanError.conflict(expected: expectedRevision, actual: actualRevision)
         }
         let finalRevision = expectedRevision + 1
 
-        var expectedRecords: [SpaceRecordURI: PersistedSpaceRecord] = [:]
-        for record in snapshot?.records ?? [] {
-            expectedRecords[record.uri] = record
-        }
+        let targetURIs = writes.map(uri(for:))
+        var expectedRecords = try await database.spaceRecordMetadata(
+            space: space,
+            author: author,
+            uris: targetURIs
+        )
         var nextLtHash = try LtHash(
-            serialized: snapshot?.state.ltHash
+            serialized: state?.ltHash
                 ?? Data(repeating: 0, count: LtHash.byteCount)
         )
         var sqliteWrites: [SQLiteSpaceWrite] = []
@@ -8469,9 +8699,8 @@ public actor DurableSpaceRepository {
                 }
                 nextLtHash.add(element: "\(uri.collection)/\(uri.rkey)/\(cid)")
                 sqliteWrites.append(.put(uri: uri, value: value, cid: cid))
-                expectedRecords[uri] = PersistedSpaceRecord(
+                expectedRecords[uri] = PersistedSpaceRecordMetadata(
                     uri: uri,
-                    value: value,
                     cid: cid,
                     revision: finalRevision
                 )
@@ -8518,10 +8747,13 @@ public actor DurableSpaceRepository {
             throw SwanError.malformed("repository batch must contain a write")
         }
 
-        let snapshot = try await database.repositorySnapshot(space: space, author: author)
-        let expectedRevision = snapshot?.state.revision ?? 0
-        var expectedRecords = Dictionary(
-            uniqueKeysWithValues: (snapshot?.records ?? []).map { ($0.uri, $0) }
+        let state = try await database.repositoryState(space: space, author: author)
+        let expectedRevision = state?.revision ?? 0
+        let targetURIs = writes.map(\.uri)
+        var expectedRecords = try await database.spaceRecordMetadata(
+            space: space,
+            author: author,
+            uris: targetURIs
         )
         var sqliteWrites: [SQLiteSpaceWrite] = []
 
@@ -8537,7 +8769,7 @@ public actor DurableSpaceRepository {
                 }
                 let cid = CID.fromDAGCBOR(value).string
                 sqliteWrites.append(.create(uri: uri, value: value, cid: cid))
-                expectedRecords[uri] = PersistedSpaceRecord(uri: uri, value: value, cid: cid, revision: expectedRevision + 1)
+                expectedRecords[uri] = PersistedSpaceRecordMetadata(uri: uri, cid: cid, revision: expectedRevision + 1)
             case let .put(_, value):
                 // A `putRecord` can be either branch when the transaction
                 // reaches SQLite, so both grants are mandatory before the
@@ -8546,7 +8778,7 @@ public actor DurableSpaceRepository {
                 try requireWrite(uri: uri, authorization: authorization, permission: .update)
                 let cid = CID.fromDAGCBOR(value).string
                 sqliteWrites.append(.put(uri: uri, value: value, cid: cid))
-                expectedRecords[uri] = PersistedSpaceRecord(uri: uri, value: value, cid: cid, revision: expectedRevision + 1)
+                expectedRecords[uri] = PersistedSpaceRecordMetadata(uri: uri, cid: cid, revision: expectedRevision + 1)
             case let .update(_, value):
                 try requireWrite(uri: uri, authorization: authorization, permission: .update)
                 guard existing != nil else {
@@ -8554,7 +8786,7 @@ public actor DurableSpaceRepository {
                 }
                 let cid = CID.fromDAGCBOR(value).string
                 sqliteWrites.append(.update(uri: uri, value: value, cid: cid))
-                expectedRecords[uri] = PersistedSpaceRecord(uri: uri, value: value, cid: cid, revision: expectedRevision + 1)
+                expectedRecords[uri] = PersistedSpaceRecordMetadata(uri: uri, cid: cid, revision: expectedRevision + 1)
             case .delete:
                 try requireWrite(uri: uri, authorization: authorization, permission: .delete)
                 guard existing != nil else {
@@ -8658,6 +8890,34 @@ public actor DurableSpaceRepository {
             wireRevision: nil,
             commitment: LtHash().commitment
         )
+    }
+
+    /// Returns only the durable wire revision after preflighting the exact
+    /// action grants in an XRPC write batch. It intentionally exposes no
+    /// commitment or record facts to a write-only caller.
+    public func currentWireRevisionForWrite(
+        _ writes: [AuthorizedSpaceRepositoryWrite],
+        authorization: AuthorizationContext
+    ) async throws -> String? {
+        guard !writes.isEmpty else {
+            throw SwanError.malformed("repository batch must contain a write")
+        }
+        for write in writes {
+            let uri = write.uri
+            try requireRepositoryURI(uri)
+            switch write {
+            case .create:
+                try requireWrite(uri: uri, authorization: authorization, permission: .create)
+            case .put:
+                try requireWrite(uri: uri, authorization: authorization, permission: .create)
+                try requireWrite(uri: uri, authorization: authorization, permission: .update)
+            case .update:
+                try requireWrite(uri: uri, authorization: authorization, permission: .update)
+            case .delete:
+                try requireWrite(uri: uri, authorization: authorization, permission: .delete)
+            }
+        }
+        return try await database.repositoryState(space: space, author: author)?.wireRevision.toString()
     }
 
     /// Creates a private, immutable full-recovery snapshot after applying the
@@ -8790,38 +9050,19 @@ public actor DurableSpaceRepository {
         }
         try requireRead(uri: authorizationURI, authorization: authorization)
 
-        let allRecords = try await database.repositorySnapshot(
-            space: space,
-            author: author
-        )?.records.map(record(from:)) ?? []
-        let filtered = allRecords.filter { record in
-            collection.map { record.uri.collection == $0 } ?? true
-        }
-        let ordered = filtered.sorted { lhs, rhs in
-            if lhs.uri.collection == rhs.uri.collection {
-                return reverse
-                    ? lhs.uri.rkey < rhs.uri.rkey
-                    : lhs.uri.rkey > rhs.uri.rkey
-            }
-            return reverse
-                ? lhs.uri.collection < rhs.uri.collection
-                : lhs.uri.collection > rhs.uri.collection
-        }
-
         let cursorKey = cursor.flatMap(Self.parseListCursor)
-        let afterCursor = ordered.filter { record in
-            guard let cursorKey else { return true }
-            let key = (collection: record.uri.collection, rkey: record.uri.rkey)
-            if key.collection == cursorKey.collection {
-                return reverse
-                    ? key.rkey > cursorKey.rkey
-                    : key.rkey < cursorKey.rkey
-            }
-            return reverse
-                ? key.collection > cursorKey.collection
-                : key.collection < cursorKey.collection
-        }
-        return Array(afterCursor.prefix(limit))
+        let records = try await database.repositoryRecordPage(
+            space: space,
+            author: author,
+            collection: collection,
+            cursorCollection: cursorKey?.collection,
+            cursorRKey: cursorKey?.rkey,
+            reverse: reverse,
+            limit: limit,
+            maximumAggregateRecordBytes: PublicRepositoryJSONReadLimits
+                .maximumAggregateRecordBlockBytes
+        )
+        return records.map(record(from:))
     }
 
     /// Builds a new, reader-specific commit envelope and complete CAR for each
@@ -8940,7 +9181,7 @@ public actor DurableSpaceRepository {
         )
     }
 
-    private func ltHashElement(for record: PersistedSpaceRecord) -> String {
+    private func ltHashElement(for record: PersistedSpaceRecordMetadata) -> String {
         "\(record.uri.collection)/\(record.uri.rkey)/\(record.cid)"
     }
 

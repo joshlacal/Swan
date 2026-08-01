@@ -289,11 +289,33 @@ private func authenticatedGetSpaceError(
 
 func authenticatedGetSpaceJSON(
     _ status: HTTPResponse.Status,
-    _ body: some Encodable
+    _ body: some Encodable,
+    maximumBytes: Int = PublicRepositoryJSONReadLimits
+        .maximumListRecordsResponseBytes,
+    lease: PublicRepositoryJSONReadLease? = nil
 ) -> Response {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    guard maximumBytes > 0 else {
+        lease?.release()
+        return authenticatedGetSpaceError(.serviceUnavailable, code: "temporarily_unavailable")
+    }
     let data = (try? encoder.encode(body)) ?? Data("{}".utf8)
+    guard data.count <= maximumBytes else {
+        lease?.release()
+        return authenticatedGetSpaceError(.serviceUnavailable, code: "temporarily_unavailable")
+    }
+    if let lease {
+        return Response(
+            status: status,
+            headers: [.contentType: "application/json", .cacheControl: "no-store"],
+            body: .init(contentLength: data.count) { writer in
+                defer { lease.release() }
+                try await writer.write(ByteBuffer(data: data))
+                try await writer.finish(nil)
+            }
+        )
+    }
     return Response(
         status: status,
         headers: [.contentType: "application/json", .cacheControl: "no-store"],
@@ -315,16 +337,21 @@ public struct SwanAuthenticatedSpaceRecordsCapability: Sendable {
     /// credential; it never sees DPoP access tokens.
     let credentialAuthorizer: (any SpaceCredentialAuthorizationVerifier)?
     let tidAllocator: SwanPermissionedTIDAllocator
+    /// Shared with anonymous public JSON reads so authenticated permissioned
+    /// pages cannot multiply the same allocation-heavy response buffers.
+    let jsonReadAdmission: PublicRepositoryJSONReadAdmission
 
     init(
         authorizer: SwanOAuthResourceAuthorizer,
         directory: any AuthorizedSpaceRepositoryDirectory,
-        credentialAuthorizer: (any SpaceCredentialAuthorizationVerifier)? = nil
+        credentialAuthorizer: (any SpaceCredentialAuthorizationVerifier)? = nil,
+        jsonReadAdmission: PublicRepositoryJSONReadAdmission = .processShared
     ) {
         self.authorizer = authorizer
         self.directory = directory
         self.credentialAuthorizer = credentialAuthorizer
         tidAllocator = SwanPermissionedTIDAllocator()
+        self.jsonReadAdmission = jsonReadAdmission
     }
 }
 
@@ -531,12 +558,20 @@ func registerAuthenticatedGetRecordEndpoint(
         } catch {
             return authenticatedSpaceRecordError(.badRequest, code: "InvalidRequest")
         }
+        guard let lease = capability.jsonReadAdmission.reserve(
+            maximumResponseBytes: PublicRepositoryJSONReadLimits
+                .maximumGetRecordResponseBytes
+        ) else {
+            return authenticatedSpaceRecordError(.serviceUnavailable, code: "temporarily_unavailable")
+        }
         do {
             let output = try await handler.handle(parameters: parameters, input: (), context: request)
-            return authenticatedGetRecordJSON(.ok, output)
+            return authenticatedGetRecordJSON(.ok, output, lease: lease)
         } catch let failure as AuthenticatedSpaceRecordFailure {
+            lease.release()
             return authenticatedSpaceRecordResponse(for: failure, capability: capability)
         } catch {
+            lease.release()
             return authenticatedSpaceRecordError(.serviceUnavailable, code: "temporarily_unavailable")
         }
     }
@@ -556,12 +591,20 @@ func registerAuthenticatedListRecordsEndpoint(
         } catch {
             return authenticatedSpaceRecordError(.badRequest, code: "InvalidRequest")
         }
+        guard let lease = capability.jsonReadAdmission.reserve(
+            maximumResponseBytes: PublicRepositoryJSONReadLimits
+                .maximumListRecordsResponseBytes
+        ) else {
+            return authenticatedSpaceRecordError(.serviceUnavailable, code: "temporarily_unavailable")
+        }
         do {
             let output = try await handler.handle(parameters: parameters, input: (), context: request)
-            return authenticatedListRecordsJSON(.ok, output)
+            return authenticatedListRecordsJSON(.ok, output, lease: lease)
         } catch let failure as AuthenticatedSpaceRecordFailure {
+            lease.release()
             return authenticatedSpaceRecordResponse(for: failure, capability: capability)
         } catch {
+            lease.release()
             return authenticatedSpaceRecordError(.serviceUnavailable, code: "temporarily_unavailable")
         }
     }
@@ -863,10 +906,42 @@ private func applyWrite(
     authorization: AuthorizationContext
 ) async throws -> [AuthorizedSpaceRepositoryWriteResult] {
     do {
-        return try await capability.directory.apply(
-            space: space, author: author, writes: writes, requestID: UUID(),
-            wireRevision: try await capability.tidAllocator.next().toString(), authorization: authorization
-        )
+        func seedAllocatorFromDurableState() async throws {
+            let currentRevision = try await capability.directory.repositoryWriteWireRevision(
+                space: space,
+                author: author,
+                writes: writes,
+                authorization: authorization
+            )
+            if let currentRevision,
+               let currentTID = try? TID(tidString: currentRevision) {
+                await capability.tidAllocator.observe(currentTID)
+            }
+        }
+        let requestID = UUID()
+        try await seedAllocatorFromDurableState()
+        do {
+            return try await capability.directory.apply(
+                space: space, author: author, writes: writes, requestID: requestID,
+                wireRevision: try await capability.tidAllocator.next().toString(),
+                authorization: authorization
+            )
+        } catch let error as SwanError {
+            // A concurrent writer can commit after the seed read but before
+            // this transaction. Retry only the durable monotonicity failure;
+            // all validation, authorization, and CAS errors remain visible
+            // to the normal XRPC mapping.
+            guard case let .malformed(message) = error,
+                  message == "wire revision must advance" else {
+                throw error
+            }
+            try await seedAllocatorFromDurableState()
+            return try await capability.directory.apply(
+                space: space, author: author, writes: writes, requestID: requestID,
+                wireRevision: try await capability.tidAllocator.next().toString(),
+                authorization: authorization
+            )
+        }
     } catch let error as SwanError {
         if case .conflict = error { throw AuthenticatedSpaceWriteFailure.conflict }
         if case .unauthorized = error { throw AuthenticatedSpaceWriteFailure.denied }
@@ -1300,7 +1375,8 @@ private struct ListRecordsWireOutput: Encodable {
 
 private func authenticatedGetRecordJSON(
     _ status: HTTPResponse.Status,
-    _ output: ComAtprotoSpaceGetRecord.Output
+    _ output: ComAtprotoSpaceGetRecord.Output,
+    lease: PublicRepositoryJSONReadLease? = nil
 ) -> Response {
     authenticatedGetSpaceJSON(
         status,
@@ -1308,13 +1384,16 @@ private func authenticatedGetRecordJSON(
             uri: output.uri.uriString(),
             cid: output.cid.string,
             value: output.value
-        )
+        ),
+        maximumBytes: PublicRepositoryJSONReadLimits.maximumGetRecordResponseBytes,
+        lease: lease
     )
 }
 
 private func authenticatedListRecordsJSON(
     _ status: HTTPResponse.Status,
-    _ output: ComAtprotoSpaceListRecords.Output
+    _ output: ComAtprotoSpaceListRecords.Output,
+    lease: PublicRepositoryJSONReadLease? = nil
 ) -> Response {
     authenticatedGetSpaceJSON(
         status,
@@ -1328,6 +1407,8 @@ private func authenticatedListRecordsJSON(
                     value: $0.value
                 )
             }
-        )
+        ),
+        maximumBytes: PublicRepositoryJSONReadLimits.maximumListRecordsResponseBytes,
+        lease: lease
     )
 }

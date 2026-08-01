@@ -506,6 +506,17 @@ public protocol AuthorizedSpaceRepositoryDirectory: Sendable {
         authorization: AuthorizationContext
     ) async throws -> AuthorizedSpaceRepositoryCommitState
 
+    /// Returns only the current wire revision after rechecking the exact
+    /// permissions needed by an ordered write batch. This is intentionally
+    /// distinct from ``repositoryCommitState``: a writer need not also hold a
+    /// repository-read grant merely to seed a monotonic request TID.
+    func repositoryWriteWireRevision(
+        space: SpaceURI,
+        author: String,
+        writes: [AuthorizedSpaceRepositoryWrite],
+        authorization: AuthorizationContext
+    ) async throws -> String?
+
     /// Returns an ordered, bounded page after the supplied wire TID cursor.
     /// A retention gap is intentionally distinct from an empty incremental
     /// page so HTTP cannot fabricate a convergent response from incomplete
@@ -542,4 +553,18 @@ public protocol AuthorizedSpaceRepositoryDirectory: Sendable {
         wireRevision: String,
         authorization: AuthorizationContext
     ) async throws -> [AuthorizedSpaceRepositoryWriteResult]
+}
+
+public extension AuthorizedSpaceRepositoryDirectory {
+    /// Test and alternate adapters that do not persist a durable wire
+    /// revision may opt out of seeding. The authoritative apply transaction
+    /// still enforces its own monotonicity check.
+    func repositoryWriteWireRevision(
+        space: SpaceURI,
+        author: String,
+        writes: [AuthorizedSpaceRepositoryWrite],
+        authorization: AuthorizationContext
+    ) async throws -> String? {
+        nil
+    }
 }
