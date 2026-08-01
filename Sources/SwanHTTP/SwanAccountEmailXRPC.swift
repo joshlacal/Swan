@@ -633,6 +633,22 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
     private func passwordRecoverySuccess(
         startedAt: ContinuousClock.Instant
     ) async -> Response {
+        await waitForPasswordRecoveryFloor(startedAt: startedAt)
+        return accountEmailSuccess()
+    }
+
+    private func passwordRecoveryFailure(
+        _ error: any Error,
+        now: Date,
+        startedAt: ContinuousClock.Instant
+    ) async -> Response {
+        await waitForPasswordRecoveryFloor(startedAt: startedAt)
+        return await response(for: error, now: now)
+    }
+
+    private func waitForPasswordRecoveryFloor(
+        startedAt: ContinuousClock.Instant
+    ) async {
         let clock = ContinuousClock()
         let deadline = startedAt.advanced(
             by: minimumPasswordRecoveryResponseDuration
@@ -640,7 +656,6 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
         if clock.now < deadline {
             try? await clock.sleep(until: deadline)
         }
-        return accountEmailSuccess()
     }
 
     func resetPassword(
@@ -648,6 +663,7 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
         context: SwanAccountEmailRequestContext
     ) async -> Response {
         let now = Date()
+        let started = ContinuousClock().now
         do {
             try requireNoQuery(request)
             let input: ComAtprotoServerResetPassword.Input =
@@ -676,14 +692,18 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
                 now: now
             ) {
             case .completed:
-                return accountEmailSuccess()
+                return await passwordRecoverySuccess(startedAt: started)
             case .expiredToken:
                 throw AccountEmailXRPCFailure.expiredToken
             case .invalidToken:
                 throw AccountEmailXRPCFailure.invalidToken
             }
         } catch {
-            return await response(for: error, now: now)
+            return await passwordRecoveryFailure(
+                error,
+                now: now,
+                startedAt: started
+            )
         }
     }
 

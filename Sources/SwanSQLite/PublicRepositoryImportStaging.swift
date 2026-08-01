@@ -71,6 +71,42 @@ private struct SQLiteStagedPublicRepositoryProjectionSink: PublicRepositoryReach
     }
 }
 
+/// The publication transaction must not turn a verified CAR into one large
+/// Swift object graph.  SQLiteNIO's `query` API returns an array, so all
+/// staging projections are read in small keyset pages and folded into scalar
+/// counts plus a streaming digest.
+private struct StagedPublicRepositoryProjectionSummary: Sendable {
+    let reachableBlockCount: Int
+    let recordCount: Int
+    let commitBlockCount: Int
+    let mstBlockCount: Int
+    let recordBlockCount: Int
+    let containsVerifiedCommit: Bool
+    let digest: Data
+}
+
+private struct VerifiedPublicRepositoryProjectionDigest {
+    private var hash = SHA256()
+
+    init(verified: VerifiedPublicRepositorySignedCommit) {
+        hash.update(data: Data("swan.public-repository.verified-projection.v1".utf8))
+        append(verified.commitCID.string)
+        append(verified.descriptor.dataCID.string)
+        append(verified.descriptor.revision.value)
+    }
+
+    mutating func append(_ value: String) {
+        let bytes = Data(value.utf8)
+        var length = UInt64(bytes.count).bigEndian
+        hash.update(data: Data(bytes: &length, count: MemoryLayout<UInt64>.size))
+        hash.update(data: bytes)
+    }
+
+    mutating func finalize() -> Data {
+        Data(hash.finalize())
+    }
+}
+
 private struct ExpiryCheckingCARByteSource: PublicRepositoryCARByteSource {
     let source: any PublicRepositoryCARByteSource
     let database: SQLiteAccountDatabase
@@ -695,54 +731,22 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
     ) async throws {
         try await withConnectionGate {
             try await transaction {
-                let reachableRows = try await connection.query(
-                    """
-                    SELECT cid, kind FROM public_repository_import_reachable
-                    WHERE session_id = ? AND EXISTS (
-                        SELECT 1 FROM public_repository_import_sessions
-                        WHERE session_id = ? AND expires_at > ?
-                    ) ORDER BY kind, cid
-                    """,
-                    [
-                        .text(sessionID), .text(sessionID),
-                        .integer(try Self.sqliteInteger(now)),
-                    ]
+                let staged = try await stagedPublicRepositoryProjectionSummary(
+                    sessionID: sessionID,
+                    verified: verified,
+                    validateBlocks: false,
+                    now: now
                 )
-                let indexRows = try await connection.query(
-                    """
-                    SELECT collection, rkey, record_cid
-                    FROM public_repository_import_record_index
-                    WHERE session_id = ? ORDER BY collection, rkey, record_cid
-                    """,
-                    [.text(sessionID)]
-                )
-                let commitCount = reachableRows.count(where: {
-                    requiredText($0, "kind") == "commit"
-                })
-                let mstCount = reachableRows.count(where: {
-                    requiredText($0, "kind") == "mst"
-                })
-                let recordBlockCount = reachableRows.count(where: {
-                    requiredText($0, "kind") == "record"
-                })
-                guard commitCount == 1,
-                      reachableRows.contains(where: {
-                          requiredText($0, "kind") == "commit"
-                              && requiredText($0, "cid") == verified.commitCID.string
-                      }),
-                      mstCount == projection.mstBlockCount,
-                      recordBlockCount == projection.recordBlockCount,
-                      indexRows.count == projection.recordCount,
-                      reachableRows.count
+                guard staged.commitBlockCount == 1,
+                      staged.containsVerifiedCommit,
+                      staged.mstBlockCount == projection.mstBlockCount,
+                      staged.recordBlockCount == projection.recordBlockCount,
+                      staged.recordCount == projection.recordCount,
+                      staged.reachableBlockCount
                         == projection.mstBlockCount + projection.recordBlockCount + 1
                 else {
                     throw PublicRepositoryImportStagingError.corruptStaging
                 }
-                let projectionDigest = Self.verifiedProjectionDigest(
-                    verified: verified,
-                    reachableRows: reachableRows,
-                    indexRows: indexRows
-                )
                 let rows = try await connection.query(
                     """
                     UPDATE public_repository_import_sessions
@@ -759,10 +763,10 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                         .text(verified.commitCID.string),
                         .text(verified.descriptor.dataCID.string),
                         .text(verified.descriptor.revision.value),
-                        .integer(reachableRows.count), .integer(projection.recordCount),
-                        .integer(commitCount), .integer(mstCount),
-                        .integer(recordBlockCount), .integer(indexRows.count),
-                        projectionDigest.sqliteData!,
+                        .integer(staged.reachableBlockCount), .integer(staged.recordCount),
+                        .integer(staged.commitBlockCount), .integer(staged.mstBlockCount),
+                        .integer(staged.recordBlockCount), .integer(staged.recordCount),
+                        staged.digest.sqliteData!,
                         .text(sessionID), .text(verified.commitCID.string),
                     ]
                 )
@@ -801,49 +805,24 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                 else {
                     throw PublicRepositoryImportStagingError.importedCommitMismatch
                 }
-                let reachableRows = try await connection.query(
-                    """
-                    SELECT cid, kind FROM public_repository_import_reachable
-                    WHERE session_id = ? ORDER BY kind, cid
-                    """,
-                    [.text(sessionID)]
+                let staged = try await stagedPublicRepositoryProjectionSummary(
+                    sessionID: sessionID,
+                    verified: verified,
+                    validateBlocks: true,
+                    now: now
                 )
-                let indexRows = try await connection.query(
-                    """
-                    SELECT collection, rkey, record_cid
-                    FROM public_repository_import_record_index
-                    WHERE session_id = ? ORDER BY collection, rkey, record_cid
-                    """,
-                    [.text(sessionID)]
-                )
-                let commitCount = reachableRows.count(where: {
-                    requiredText($0, "kind") == "commit"
-                })
-                let mstCount = reachableRows.count(where: {
-                    requiredText($0, "kind") == "mst"
-                })
-                let recordBlockCount = reachableRows.count(where: {
-                    requiredText($0, "kind") == "record"
-                })
                 guard try requiredInteger(sessionRow, "reachable_block_count")
-                        == reachableRows.count,
-                      try requiredInteger(sessionRow, "record_count") == indexRows.count,
-                      try requiredInteger(sessionRow, "commit_block_count") == commitCount,
-                      try requiredInteger(sessionRow, "mst_block_count") == mstCount,
+                        == staged.reachableBlockCount,
+                      try requiredInteger(sessionRow, "record_count") == staged.recordCount,
+                      try requiredInteger(sessionRow, "commit_block_count") == staged.commitBlockCount,
+                      try requiredInteger(sessionRow, "mst_block_count") == staged.mstBlockCount,
                       try requiredInteger(sessionRow, "record_block_count")
-                        == recordBlockCount,
-                      try requiredInteger(sessionRow, "index_count") == indexRows.count,
-                      commitCount == 1,
-                      reachableRows.contains(where: {
-                          requiredText($0, "kind") == "commit"
-                              && requiredText($0, "cid") == verified.commitCID.string
-                      }),
+                        == staged.recordBlockCount,
+                      try requiredInteger(sessionRow, "index_count") == staged.recordCount,
+                      staged.commitBlockCount == 1,
+                      staged.containsVerifiedCommit,
                       requiredData(sessionRow, "verified_projection_digest")
-                        == Self.verifiedProjectionDigest(
-                            verified: verified,
-                            reachableRows: reachableRows,
-                            indexRows: indexRows
-                        )
+                        == staged.digest
                 else {
                     throw PublicRepositoryImportStagingError.corruptStaging
                 }
@@ -858,26 +837,6 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                       let commitValue = stagedCommitRows.first?.column("bytes"),
                       Data(sqliteData: commitValue) == verified.signedCommitBytes else {
                     throw PublicRepositoryImportStagingError.corruptStaging
-                }
-                for row in reachableRows {
-                    let cid = try parseImportCID(requiredText(row, "cid"))
-                    let bodyRows = try await connection.query(
-                        """
-                        SELECT bytes FROM public_repository_import_blocks
-                        WHERE session_id = ? AND cid = ?
-                        """,
-                        [.text(sessionID), .text(cid.string)]
-                    )
-                    guard bodyRows.count == 1,
-                          let bodyValue = bodyRows.first?.column("bytes"),
-                          let body = Data(sqliteData: bodyValue) else {
-                        throw PublicRepositoryImportStagingError.corruptStaging
-                    }
-                    do {
-                        try PublicRepositoryCID.validate(cid, blockBytes: body)
-                    } catch {
-                        throw PublicRepositoryImportStagingError.corruptStaging
-                    }
                 }
                 guard let current = try await loadPublicRepositoryStateWithoutGate() else {
                     throw PublicRepositoryImportStagingError.repositoryNotInstalled
@@ -919,17 +878,22 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                     throw PublicRepositoryImportStagingError.corruptRepository
                 }
                 _ = try await connection.query("DELETE FROM public_repository_record_index")
-                let installedIndex = try await connection.query(
+                _ = try await connection.query(
                     """
                     INSERT INTO public_repository_record_index(collection, rkey, record_cid)
                     SELECT collection, rkey, record_cid
                     FROM public_repository_import_record_index
                     WHERE session_id = ?
-                    RETURNING collection
                     """,
                     [.text(sessionID)]
                 )
-                guard installedIndex.count == indexRows.count else {
+                let installedIndexCount = try await connection.query(
+                    "SELECT changes() AS count"
+                )
+                guard installedIndexCount.count == 1,
+                      let installedIndexCountRow = installedIndexCount.first,
+                      try requiredInteger(installedIndexCountRow, "count")
+                        == staged.recordCount else {
                     throw PublicRepositoryImportStagingError.corruptStaging
                 }
                 let advanced = try await connection.query(
@@ -1013,34 +977,52 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                 let stagedBlockCount = try requiredInteger(
                     stagedBlockCountRow, "count"
                 )
-                let deletedReachable = try await connection.query(
+                _ = try await connection.query(
                     """
                     DELETE FROM public_repository_import_reachable
-                    WHERE session_id = ? RETURNING cid
+                    WHERE session_id = ?
                     """,
                     [.text(sessionID)]
                 )
-                guard deletedReachable.count == reachableRows.count else {
+                let deletedReachableCount = try await connection.query(
+                    "SELECT changes() AS count"
+                )
+                guard deletedReachableCount.count == 1,
+                      let deletedReachableCountRow = deletedReachableCount.first,
+                      try requiredInteger(deletedReachableCountRow, "count")
+                        == staged.reachableBlockCount else {
                     throw PublicRepositoryImportStagingError.corruptStaging
                 }
-                let deletedIndex = try await connection.query(
+                _ = try await connection.query(
                     """
                     DELETE FROM public_repository_import_record_index
-                    WHERE session_id = ? RETURNING collection
+                    WHERE session_id = ?
                     """,
                     [.text(sessionID)]
                 )
-                guard deletedIndex.count == indexRows.count else {
+                let deletedIndexCount = try await connection.query(
+                    "SELECT changes() AS count"
+                )
+                guard deletedIndexCount.count == 1,
+                      let deletedIndexCountRow = deletedIndexCount.first,
+                      try requiredInteger(deletedIndexCountRow, "count")
+                        == staged.recordCount else {
                     throw PublicRepositoryImportStagingError.corruptStaging
                 }
-                let deletedBlocks = try await connection.query(
+                _ = try await connection.query(
                     """
                     DELETE FROM public_repository_import_blocks
-                    WHERE session_id = ? RETURNING cid
+                    WHERE session_id = ?
                     """,
                     [.text(sessionID)]
                 )
-                guard deletedBlocks.count == stagedBlockCount else {
+                let deletedBlockCount = try await connection.query(
+                    "SELECT changes() AS count"
+                )
+                guard deletedBlockCount.count == 1,
+                      let deletedBlockCountRow = deletedBlockCount.first,
+                      try requiredInteger(deletedBlockCountRow, "count")
+                        == stagedBlockCount else {
                     throw PublicRepositoryImportStagingError.corruptStaging
                 }
                 let deletedSession = try await connection.query(
@@ -1240,6 +1222,214 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
         )
     }
 
+    private func stagedPublicRepositoryProjectionSummary(
+        sessionID: String,
+        verified: VerifiedPublicRepositorySignedCommit,
+        validateBlocks: Bool,
+        now: Int64
+    ) async throws -> StagedPublicRepositoryProjectionSummary {
+        let pageSize = 256
+        let timestamp = try Self.sqliteInteger(now)
+        var digest = VerifiedPublicRepositoryProjectionDigest(verified: verified)
+        var reachableBlockCount = 0
+        var recordCount = 0
+        var commitBlockCount = 0
+        var mstBlockCount = 0
+        var recordBlockCount = 0
+        var containsVerifiedCommit = false
+
+        // The durable key is (session_id, cid), not (session_id, kind, cid).
+        // Walk the three canonical kinds independently so every page can use
+        // the CID keyset without asking SQLite to sort the whole staging
+        // table into a temporary B-tree on every iteration.
+        for expectedKind in ["commit", "mst", "record"] {
+            var lastCID: String?
+            while true {
+                let rows: [SQLiteRow]
+                if let lastCID {
+                    rows = try await connection.query(
+                        """
+                        SELECT cid, kind
+                        FROM public_repository_import_reachable
+                        WHERE session_id = ? AND kind = ? AND EXISTS (
+                            SELECT 1 FROM public_repository_import_sessions
+                            WHERE session_id = ? AND expires_at > ?
+                        ) AND cid > ?
+                        ORDER BY cid
+                        LIMIT ?
+                        """,
+                        [
+                            .text(sessionID), .text(expectedKind),
+                            .text(sessionID), .integer(timestamp),
+                            .text(lastCID), .integer(pageSize),
+                        ]
+                    )
+                } else {
+                    rows = try await connection.query(
+                        """
+                        SELECT cid, kind
+                        FROM public_repository_import_reachable
+                        WHERE session_id = ? AND kind = ? AND EXISTS (
+                            SELECT 1 FROM public_repository_import_sessions
+                            WHERE session_id = ? AND expires_at > ?
+                        )
+                        ORDER BY cid
+                        LIMIT ?
+                        """,
+                        [
+                            .text(sessionID), .text(expectedKind),
+                            .text(sessionID), .integer(timestamp),
+                            .integer(pageSize),
+                        ]
+                    )
+                }
+                if rows.isEmpty { break }
+                for row in rows {
+                    let kind = requiredText(row, "kind")
+                    guard kind == expectedKind else {
+                        throw PublicRepositoryImportStagingError.corruptStaging
+                    }
+                    let cidString = requiredText(row, "cid")
+                    let cid = try parseImportCID(cidString)
+                    switch kind {
+                    case "commit":
+                        commitBlockCount += 1
+                        containsVerifiedCommit = containsVerifiedCommit
+                            || cidString == verified.commitCID.string
+                    case "mst":
+                        mstBlockCount += 1
+                    case "record":
+                        recordBlockCount += 1
+                    default:
+                        throw PublicRepositoryImportStagingError.corruptStaging
+                    }
+                    reachableBlockCount += 1
+                    digest.append(kind)
+                    digest.append(cidString)
+
+                    if validateBlocks {
+                        let bodyRows = try await connection.query(
+                            """
+                            SELECT bytes FROM public_repository_import_blocks
+                            WHERE session_id = ? AND cid = ?
+                            """,
+                            [.text(sessionID), .text(cid.string)]
+                        )
+                        guard bodyRows.count == 1,
+                              let bodyValue = bodyRows.first?.column("bytes"),
+                              let body = Data(sqliteData: bodyValue) else {
+                            throw PublicRepositoryImportStagingError.corruptStaging
+                        }
+                        do {
+                            try PublicRepositoryCID.validate(cid, blockBytes: body)
+                        } catch {
+                            throw PublicRepositoryImportStagingError.corruptStaging
+                        }
+                    }
+                }
+                guard let last = rows.last else { break }
+                let nextCID = requiredText(last, "cid")
+                guard nextCID != lastCID else {
+                    throw PublicRepositoryImportStagingError.corruptStaging
+                }
+                lastCID = nextCID
+                if rows.count < pageSize { break }
+            }
+        }
+
+        let unknownKindRows = try await connection.query(
+            """
+            SELECT kind FROM public_repository_import_reachable
+            WHERE session_id = ? AND kind NOT IN ('commit', 'mst', 'record')
+            LIMIT 1
+            """,
+            [.text(sessionID)]
+        )
+        guard unknownKindRows.isEmpty else {
+            throw PublicRepositoryImportStagingError.corruptStaging
+        }
+
+        var lastCollection: String?
+        var lastRecordKey: String?
+        var lastRecordCID: String?
+        while true {
+            let rows: [SQLiteRow]
+            if let lastCollection, let lastRecordKey, let lastRecordCID {
+                rows = try await connection.query(
+                    """
+                    SELECT collection, rkey, record_cid
+                    FROM public_repository_import_record_index
+                    WHERE session_id = ? AND EXISTS (
+                        SELECT 1 FROM public_repository_import_sessions
+                        WHERE session_id = ? AND expires_at > ?
+                    )
+                      AND (
+                          collection > ?
+                          OR (collection = ? AND rkey > ?)
+                          OR (collection = ? AND rkey = ? AND record_cid > ?)
+                      )
+                    ORDER BY collection, rkey, record_cid
+                    LIMIT ?
+                    """,
+                    [
+                        .text(sessionID), .text(sessionID), .integer(timestamp),
+                        .text(lastCollection),
+                        .text(lastCollection), .text(lastRecordKey),
+                        .text(lastCollection), .text(lastRecordKey),
+                        .text(lastRecordCID), .integer(pageSize),
+                    ]
+                )
+            } else {
+                rows = try await connection.query(
+                    """
+                    SELECT collection, rkey, record_cid
+                    FROM public_repository_import_record_index
+                    WHERE session_id = ? AND EXISTS (
+                        SELECT 1 FROM public_repository_import_sessions
+                        WHERE session_id = ? AND expires_at > ?
+                    )
+                    ORDER BY collection, rkey, record_cid
+                    LIMIT ?
+                    """,
+                    [
+                        .text(sessionID), .text(sessionID), .integer(timestamp),
+                        .integer(pageSize),
+                    ]
+                )
+            }
+            if rows.isEmpty { break }
+            for row in rows {
+                digest.append(requiredText(row, "collection"))
+                digest.append(requiredText(row, "rkey"))
+                digest.append(requiredText(row, "record_cid"))
+                recordCount += 1
+            }
+            guard let last = rows.last else { break }
+            let nextCollection = requiredText(last, "collection")
+            let nextRecordKey = requiredText(last, "rkey")
+            let nextRecordCID = requiredText(last, "record_cid")
+            guard nextCollection != lastCollection
+                    || nextRecordKey != lastRecordKey
+                    || nextRecordCID != lastRecordCID else {
+                throw PublicRepositoryImportStagingError.corruptStaging
+            }
+            lastCollection = nextCollection
+            lastRecordKey = nextRecordKey
+            lastRecordCID = nextRecordCID
+            if rows.count < pageSize { break }
+        }
+
+        return StagedPublicRepositoryProjectionSummary(
+            reachableBlockCount: reachableBlockCount,
+            recordCount: recordCount,
+            commitBlockCount: commitBlockCount,
+            mstBlockCount: mstBlockCount,
+            recordBlockCount: recordBlockCount,
+            containsVerifiedCommit: containsVerifiedCommit,
+            digest: digest.finalize()
+        )
+    }
+
     private func parseImportCID(_ value: String) throws -> CID {
         guard let cid = try? CID.parse(value) else {
             throw PublicRepositoryImportStagingError.corruptStaging
@@ -1321,33 +1511,6 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
         append(Int64(reachableBlockCount))
         append(Int64(recordCount))
         append(consumedAt)
-        return Data(SHA256.hash(data: encoded))
-    }
-
-    private static func verifiedProjectionDigest(
-        verified: VerifiedPublicRepositorySignedCommit,
-        reachableRows: [SQLiteRow],
-        indexRows: [SQLiteRow]
-    ) -> Data {
-        var encoded = Data("swan.public-repository.verified-projection.v1".utf8)
-        func append(_ value: String) {
-            let bytes = Data(value.utf8)
-            var length = UInt64(bytes.count).bigEndian
-            withUnsafeBytes(of: &length) { encoded.append(contentsOf: $0) }
-            encoded.append(bytes)
-        }
-        append(verified.commitCID.string)
-        append(verified.descriptor.dataCID.string)
-        append(verified.descriptor.revision.value)
-        for row in reachableRows {
-            append(row.column("kind")?.string ?? "")
-            append(row.column("cid")?.string ?? "")
-        }
-        for row in indexRows {
-            append(row.column("collection")?.string ?? "")
-            append(row.column("rkey")?.string ?? "")
-            append(row.column("record_cid")?.string ?? "")
-        }
         return Data(SHA256.hash(data: encoded))
     }
 

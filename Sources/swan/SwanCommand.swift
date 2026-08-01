@@ -3527,6 +3527,29 @@ extension SwanCommand {
                     did: canonicalReceiver,
                     openMode: .existingManaged
                 )
+                // The remote CAR is staged and verified before this closure is
+                // invoked. It opens the control plane only for the final,
+                // network-free publication transaction, so deactivation
+                // cannot race the authorization decision used by recovery.
+                let publicationAuthorization:
+                    PermissionedRemoteReplicaRecoveryOrchestrator
+                    .PublicationAuthorization = { operation in
+                        let publicationControl = try await SQLiteControlDatabase(
+                            dataDirectory: dataURL
+                        )
+                        do {
+                            let result = try await publicationControl
+                                .withActiveAccountAuthorization(
+                                    did: canonicalReceiver,
+                                    operation: operation
+                                )
+                            try await publicationControl.close()
+                            return result
+                        } catch {
+                            try? await publicationControl.close()
+                            throw error
+                        }
+                    }
                 let temporaryDirectory = FileManager.default
                     .temporaryDirectory.appending(
                         path: "swan-permissioned-recovery-\(UUID().uuidString)",
@@ -3614,6 +3637,8 @@ extension SwanCommand {
                             temporaryDirectory: temporaryDirectory,
                             spoolAdmission: admission,
                             limits: limits,
+                            publicationAuthorization:
+                                publicationAuthorization,
                             now: { Int64(Date().timeIntervalSince1970) }
                         )
                     if let priorHead, let valid {
@@ -3637,6 +3662,8 @@ extension SwanCommand {
                                 spoolAdmission: admission,
                                 limits: limits,
                                 sourceFault: .corruptLastByte,
+                                publicationAuthorization:
+                                    publicationAuthorization,
                                 now: {
                                     Int64(Date().timeIntervalSince1970)
                                 }

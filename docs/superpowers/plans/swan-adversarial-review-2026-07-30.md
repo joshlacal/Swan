@@ -2155,3 +2155,58 @@ stock pinned TypeScript image, whose value-bearing `listRepoOps`/`getRepo`
 surfaces remain HTTP 500/501, and it does not close the broader
 reverse-authority browser/account lifecycle or cross-host corruption/fault
 matrix.
+
+## Adversarial rereview: Luna storage seams and final publication lease — 2026-08-01
+
+The fresh Luna rereview found no P0 or P1 in the current tree. The earlier
+missing-account-database and whole-export-payload findings are closed: recovery
+opens only `.existingManaged` account databases, and portable export streams
+CAR/blob artifacts while bounding inventory metadata. The rereview did identify
+two residual P2-shaped boundedness seams and one lifecycle race in the new
+changes; all three are now addressed in this working copy.
+
+The public import publication path now computes staged counts and its projection
+digest through 256-row CID keyset pages. It walks the three canonical block
+kinds independently so the `(session_id, cid)` primary key is used directly,
+rejects unknown kinds explicitly, and replaces `RETURNING` row arrays with
+scalar `changes()` counts. `PublicRepositoryImportQueryPlanTests` proves the
+pagination plan has no temporary sort. Portable export now performs a scalar
+blob-reference count before materializing the bounded inventory and rejects a
+count/select mismatch.
+
+The recovery CLI also installs a final, network-free control-plane publication
+lease. `withActiveAccountAuthorization` holds `BEGIN IMMEDIATE` while the
+already-staged account publication commits, so deactivation serializes either
+before the authorization decision or after the recovery mutation. The initial
+preflight remains an existence/lifecycle check; the final lease is the
+authorization fence. `AccountAuthorizationLeaseTests` proves callback lease
+visibility and deactivated-account rejection.
+
+Evidence from the current macOS working copy:
+
+- `AccountAuthorizationLeaseTests`: 1/1;
+- `PublicRepositoryImportQueryPlanTests`: 1/1;
+- `PublicRepositoryImportStagingTests`: 15/15, one intentional opt-in skip;
+- full serialized `SWIFTPM_MAX_CONCURRENT_OPERATIONS=1 swift test --jobs 1`:
+  exit 0, with every XCTest target and the four-test Swift Testing public-wire
+  profile suite passing (opt-in 256 MiB tests remained skipped); and
+- the current-image stock reference-member stateful rerun reaches credential
+  issuance and record write/read (HTTP 200), then reproduces the pinned host's
+  value-bearing `listRepoOps` HTTP 500 and `getRepo` HTTP 501. The sanitized
+  failed artifact is `/private/tmp/swan-adversarial-current-stock-20260801-rerun.json.failed`;
+  `interop/verify-reference.sh` still reports the immutable cache unchanged.
+
+The terminal Codex Security diff fallback also completed for the ten changed
+files against `f80ba7f26043`. Preflight was `ready` with delegated workers
+unavailable (parent-only review); discovery recorded in-scope receipts, found
+no reportable candidate, and finalization succeeded. The generated report is
+`/private/tmp/codex-security-scans/Swan/f80ba7f26043_adversarial_20260801/report.md`.
+This is not formal launcher evidence.
+
+The alpha remains open. The stock pinned-TypeScript value-bearing incremental
+and full-CAR surfaces, broader corrupted/reordered/disconnected/compaction-gap
+traffic, reverse-authority browser/account/OAuth lifecycle coverage,
+non-cooperative custom email-delivery cancellation, and any future native-Linux
+rerun of this exact dirty change still require explicit evidence. The public
+import and export validators outside the changed paths should not be treated as
+covered by this local diff scan.

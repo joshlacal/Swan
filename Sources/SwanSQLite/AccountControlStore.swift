@@ -1995,6 +1995,30 @@ extension SQLiteControlDatabase {
         }
     }
 
+    /// Runs one already-staged, network-free account mutation while holding
+    /// the control-plane write transaction that authorizes the account. A
+    /// lifecycle transition therefore linearizes either before this lease
+    /// (and is observed as non-active) or after the mutation commits. Callers
+    /// must not perform network I/O in `operation`; this is a short final
+    /// publication fence, not a general-purpose transaction wrapper.
+    public func withActiveAccountAuthorization<T: Sendable>(
+        did: String,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        guard AccountControlIdentifiers.isDID(did) else {
+            throw AccountControlStoreError.invalidInput
+        }
+        return try await withConnectionGate {
+            try await transaction {
+                let account = try await requiredAccount(did: did)
+                guard account.status.authorizesAccount else {
+                    throw AccountControlStoreError.invalidTransition
+                }
+                return try await operation()
+            }
+        }
+    }
+
     // MARK: Account email recovery internals
 
     private func insertEmailProofDeliveryLocked(

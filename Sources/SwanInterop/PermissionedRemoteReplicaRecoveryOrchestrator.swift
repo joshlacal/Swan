@@ -82,21 +82,28 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
     public typealias Staging = any SpaceCARRecoveryIndex & SpaceCARRecoveryRecordSink
     public typealias StagingFactory = @Sendable (String) -> Staging
     public typealias Clock = @Sendable () -> Int64
+    public typealias PublicationAuthorization = @Sendable (
+        @escaping @Sendable () async throws
+            -> CommittedPermissionedRemoteReplicaRecovery
+    ) async throws -> CommittedPermissionedRemoteReplicaRecovery
 
     private let store: any PermissionedRemoteReplicaRecoveryStore
     private let stagingFactory: StagingFactory
     private let now: Clock
+    private let publicationAuthorization: PublicationAuthorization?
 
     public init(
         store: any PermissionedRemoteReplicaRecoveryStore,
         stagingFactory: @escaping StagingFactory,
         now: @escaping Clock = {
             Int64(Date().timeIntervalSince1970)
-        }
+        },
+        publicationAuthorization: PublicationAuthorization? = nil
     ) {
         self.store = store
         self.stagingFactory = stagingFactory
         self.now = now
+        self.publicationAuthorization = publicationAuthorization
     }
 
     /// Convenience for the production per-account SQLite store.  The staging
@@ -106,7 +113,8 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
         database: SQLiteAccountDatabase,
         now: @escaping Clock = {
             Int64(Date().timeIntervalSince1970)
-        }
+        },
+        publicationAuthorization: PublicationAuthorization? = nil
     ) {
         self.init(
             store: database,
@@ -117,7 +125,8 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
                     now: now
                 )
             },
-            now: now
+            now: now,
+            publicationAuthorization: publicationAuthorization
         )
     }
 
@@ -260,11 +269,18 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
                 verification: verification,
                 now: verifiedAt
             )
-            return try await store.publishVerifiedPermissionedRemoteReplicaRecovery(
-                sessionID: sessionID,
-                consumedAt: verifiedAt,
-                now: now()
-            )
+            let publish: @Sendable () async throws
+                -> CommittedPermissionedRemoteReplicaRecovery = {
+                    try await store.publishVerifiedPermissionedRemoteReplicaRecovery(
+                        sessionID: sessionID,
+                        consumedAt: verifiedAt,
+                        now: now()
+                    )
+                }
+            if let publicationAuthorization {
+                return try await publicationAuthorization(publish)
+            }
+            return try await publish()
         } catch {
             await source.close()
             await store.poisonPermissionedRemoteReplicaImportSession(

@@ -3330,6 +3330,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     )
                 }
 
+                let blobCountRows = try await connection.query(
+                    "SELECT COUNT(*) AS row_count FROM blob_namespace_references"
+                )
+                guard blobCountRows.count == 1,
+                      case let .integer(blobCount) =
+                          blobCountRows[0].column("row_count"),
+                      (0 ... Self.maximumPortableExportBlobs).contains(blobCount) else {
+                    throw SwanError.unavailable(
+                        "portable export blob inventory exceeds its bound"
+                    )
+                }
                 let blobRows = try await connection.query(
                     """
                     SELECT cid, namespace_kind, space_uri
@@ -3337,9 +3348,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     ORDER BY namespace_kind, space_uri, cid
                     """
                 )
-                guard blobRows.count <= Self.maximumPortableExportBlobs else {
+                guard blobRows.count == blobCount else {
                     throw SwanError.unavailable(
-                        "portable export blob inventory exceeds its bound"
+                        "portable export blob inventory changed during snapshot"
                     )
                 }
                 let blobs = try blobRows.map { row in

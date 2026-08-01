@@ -1096,12 +1096,15 @@ public actor AccountEmailRecoveryService {
         case .invalidToken:
             return .invalidToken
         }
+        let replacement = try await hashExecutor.hash(password)
         guard let credential = try await store.credential(
             did: confirmation.did
         ) else {
+            // Perform the bounded Argon2 work before the account lookup so a
+            // valid proof for a deleted/tombstoned account does not take the
+            // cheap path while a live account takes the expensive path.
             return .invalidToken
         }
-        let replacement = try await hashExecutor.hash(password)
         let request = try AccountPasswordRecoveryRequest(
             confirmation: confirmation,
             expectedVerifier: credential.verifier,

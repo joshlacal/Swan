@@ -1970,6 +1970,9 @@ public enum LiveInteropRunner {
         spoolAdmission: PublicRepositorySpoolAdmission,
         limits: SpaceCARRecoveryLimits = .standard,
         sourceFault: PermissionedRemoteReplicaSourceFault = .none,
+        publicationAuthorization:
+            PermissionedRemoteReplicaRecoveryOrchestrator
+            .PublicationAuthorization? = nil,
         now: @escaping @Sendable () -> Int64 = {
             Int64(Date().timeIntervalSince1970)
         }
@@ -1983,7 +1986,8 @@ public enum LiveInteropRunner {
         )
         let orchestrator = PermissionedRemoteReplicaRecoveryOrchestrator(
             database: receiverDatabase,
-            now: now
+            now: now,
+            publicationAuthorization: publicationAuthorization
         )
         return try await orchestrator.recover(
             target: target,
