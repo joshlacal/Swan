@@ -924,6 +924,7 @@ struct ServePermissionedRuntime {
             publicBlobSpoolAdmission: publicMutationRuntime.map { _ in
                 directory.publicRepositorySpoolAdmission
             },
+            blobStreamAdmission: directory.publicRepositorySpoolAdmission,
             accountEmailXRPC: accountEmailXRPC,
             loginClientIdentityPolicy: loginClientIdentityPolicy
         )

@@ -349,6 +349,8 @@ private struct PublicMutationHandlers {
     }
 }
 
+private let maximumPublicBlobTransferBytes = 256 * 1024 * 1024
+
 func registerPublicRepositoryMutationEndpoints(
     on router: Router<BasicRequestContext>,
     capability: SwanPublicRepositoryMutationCapability
@@ -450,17 +452,31 @@ func registerPublicRepositoryMutationEndpoints(
         guard target.status == .active else {
             return publicBlobLifecycleError(target.status)
         }
+        guard let streamLease = capability.blobStreamAdmission.reserve(
+            accountDID: target.did,
+            maximumBytes: maximumPublicBlobTransferBytes
+        ) else {
+            return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
+        }
         guard let blobStore = target.store as? any StreamingBlobStore else {
+            streamLease.release()
             return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
         }
         let blob: PublicBlob?
         do {
             blob = try await blobStore.publicBlob(cid: parameters.cid)
         } catch {
+            streamLease.release()
             return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
         }
         guard let blob else {
+            streamLease.release()
             return publicMutationError(.notFound, "BlobNotFound")
+        }
+        guard blob.body.contentLength > 0,
+              blob.body.contentLength <= maximumPublicBlobTransferBytes else {
+            streamLease.release()
+            return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
         }
         var headers: HTTPFields = [
             .contentType: safePublicBlobMIMEType(blob.mimeType),
@@ -469,6 +485,7 @@ func registerPublicRepositoryMutationEndpoints(
         headers[.contentLength] = String(blob.body.contentLength)
         headers[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"
         return Response(status: .ok, headers: headers, body: .init { writer in
+            defer { streamLease.release() }
             try await blob.body.streamBody(maximumChunkBytes: 64 * 1_024) { chunk in
                 try await writer.write(ByteBuffer(data: chunk))
             }

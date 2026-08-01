@@ -425,9 +425,10 @@ public struct PublicRepositoryReadPageResult: Sendable, Equatable {
     }
 }
 
-/// Process-wide and per-account admission for disk-backed CAR spools. Each
-/// request reserves its worst-case size before creating a file, bounding both
-/// disk amplification and the number of slow consumers.
+/// Process-wide and per-account admission for disk-backed CAR spools and
+/// descriptor-backed response bodies. Each request reserves its worst-case
+/// size before creating a file or opening/verifying a blob descriptor,
+/// bounding both disk amplification and the number of slow consumers.
 public final class PublicRepositorySpoolAdmission: @unchecked Sendable {
     public struct Snapshot: Sendable, Equatable {
         public let reservedBytes: Int
@@ -447,22 +448,43 @@ public final class PublicRepositorySpoolAdmission: @unchecked Sendable {
 
     private let maximumGlobalBytes: Int
     private let maximumPerAccountBytes: Int
+    private let maximumGlobalLeases: Int
+    private let maximumPerAccountLeases: Int
     private let lock = NSLock()
     private var leases: [UUID: (account: String, bytes: Int)] = [:]
     private var reservedByAccount: [String: Int] = [:]
 
     public init(
         maximumGlobalBytes: Int = 1_024 * 1_024 * 1_024,
-        maximumPerAccountBytes: Int = 512 * 1_024 * 1_024
+        maximumPerAccountBytes: Int = 512 * 1_024 * 1_024,
+        maximumGlobalLeases: Int = 64,
+        maximumPerAccountLeases: Int = 16
     ) throws {
         guard maximumGlobalBytes > 0,
               maximumPerAccountBytes > 0,
-              maximumPerAccountBytes <= maximumGlobalBytes else {
+              maximumPerAccountBytes <= maximumGlobalBytes,
+              maximumGlobalLeases > 0,
+              maximumPerAccountLeases > 0,
+              maximumPerAccountLeases <= maximumGlobalLeases else {
             throw PublicRepositoryReadError.unavailable
         }
         self.maximumGlobalBytes = maximumGlobalBytes
         self.maximumPerAccountBytes = maximumPerAccountBytes
+        self.maximumGlobalLeases = maximumGlobalLeases
+        self.maximumPerAccountLeases = maximumPerAccountLeases
     }
+
+    /// Shared fallback for HTTP servers that are assembled outside the
+    /// preopened SQLite directory. Production `serve` passes the directory's
+    /// admission explicitly; the fallback still keeps standalone/test
+    /// servers bounded instead of silently accepting unlimited streams.
+    public static let shared: PublicRepositorySpoolAdmission = {
+        do {
+            return try PublicRepositorySpoolAdmission()
+        } catch {
+            preconditionFailure("default public transfer admission is invalid")
+        }
+    }()
 
     public func reserve(
         accountDID: String,
@@ -471,9 +493,19 @@ public final class PublicRepositorySpoolAdmission: @unchecked Sendable {
         guard AccountControlIdentifiers.isDID(accountDID),
               maximumBytes > 0 else { return nil }
         return lock.withLock {
-            let global = leases.values.reduce(0) { $0 + $1.bytes }
+            let global = leases.values.reduce(0) { partial, lease in
+                let (next, overflow) = partial.addingReportingOverflow(lease.bytes)
+                return overflow ? Int.max : next
+            }
             let account = reservedByAccount[accountDID, default: 0]
-            guard maximumBytes <= maximumGlobalBytes - global,
+            let accountLeaseCount = leases.values.reduce(into: 0) { count, lease in
+                if lease.account == accountDID { count += 1 }
+            }
+            guard leases.count < maximumGlobalLeases,
+                  accountLeaseCount < maximumPerAccountLeases,
+                  global <= maximumGlobalBytes,
+                  account <= maximumPerAccountBytes,
+                  maximumBytes <= maximumGlobalBytes - global,
                   maximumBytes <= maximumPerAccountBytes - account else {
                 return nil
             }

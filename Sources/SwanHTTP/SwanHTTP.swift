@@ -1,5 +1,6 @@
 import Foundation
 import Hummingbird
+import HummingbirdCore
 import HTTPTypes
 import Logging
 import NIOCore
@@ -62,11 +63,28 @@ public struct SwanHTTPConfiguration: Sendable, Equatable {
     public let host: String
     public let port: Int
     public let publicURL: URL
+    /// Maximum simultaneously accepted TCP connections for the Hummingbird
+    /// listener. This is independent of body-stream admission: a slow reader
+    /// must consume both a connection slot and a bounded transfer lease.
+    public let maximumConnections: Int
+    /// Idle HTTP/1 channels are closed after this interval. Response-stream
+    /// admission remains the primary bound for slow blob/CAR consumers.
+    public let idleTimeoutSeconds: Int
 
-    public init(host: String = "127.0.0.1", port: Int = 3000, publicURL: URL = URL(string: "http://127.0.0.1:3000")!) {
+    public init(
+        host: String = "127.0.0.1",
+        port: Int = 3000,
+        publicURL: URL = URL(string: "http://127.0.0.1:3000")!,
+        maximumConnections: Int = 256,
+        idleTimeoutSeconds: Int = 60
+    ) {
+        precondition(maximumConnections > 0)
+        precondition(idleTimeoutSeconds > 0)
         self.host = host
         self.port = port
         self.publicURL = publicURL
+        self.maximumConnections = maximumConnections
+        self.idleTimeoutSeconds = idleTimeoutSeconds
     }
 }
 
@@ -315,6 +333,10 @@ public struct SwanHTTPServer: Sendable {
     /// capability is nil unless the caller has assembled the proof codec,
     /// control-store adapter, rate limiter, and SMTP worker at startup.
     public let accountEmailXRPC: SwanAccountEmailXRPCServer?
+    /// Shared process-wide/per-account admission for descriptor-backed blob
+    /// responses. The CLI passes the preopened directory's instance so
+    /// public CAR, upload, and blob budgets remain coordinated.
+    public let blobStreamAdmission: PublicRepositorySpoolAdmission
 
     public init(
         profile: ProtocolProfile,
@@ -338,6 +360,7 @@ public struct SwanHTTPServer: Sendable {
         publicRepositoryMutationDirectory: (any PublicRepositoryMutationDirectory)? = nil,
         publicRepositoryMutationSignerProvider: (any PublicRepositoryMutationSignerProvider)? = nil,
         publicBlobSpoolAdmission: PublicRepositorySpoolAdmission? = nil,
+        blobStreamAdmission: PublicRepositorySpoolAdmission? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct
     ) {
@@ -348,6 +371,9 @@ public struct SwanHTTPServer: Sendable {
         self.loginClientIdentityPolicy = loginClientIdentityPolicy
         self.publicRepositoryReadDirectory = publicRepositoryReadDirectory
         self.accountEmailXRPC = accountEmailXRPC
+        self.blobStreamAdmission = blobStreamAdmission
+            ?? publicBlobSpoolAdmission
+            ?? PublicRepositorySpoolAdmission.shared
         if let simpleSpaceCheckUserAccessConfiguration {
             simpleSpaceCheckUserAccess = SwanSimpleSpaceCheckUserAccessCapability(
                 serviceAuthentication: simpleSpaceCheckUserAccessConfiguration.serviceAuthentication,
@@ -416,7 +442,8 @@ public struct SwanHTTPServer: Sendable {
                     authorizer: authorizer,
                     directory: mutationDirectory,
                     signerProvider: signerProvider,
-                    publicBlobSpoolAdmission: publicBlobSpoolAdmission
+                    publicBlobSpoolAdmission: publicBlobSpoolAdmission,
+                    blobStreamAdmission: self.blobStreamAdmission
                 )
             } else {
                 publicRepositoryMutations = nil
@@ -528,7 +555,8 @@ public struct SwanHTTPServer: Sendable {
                 authenticatedSpaceBlobs = SwanAuthenticatedSpaceBlobCapability(
                     authorizer: authorizer,
                     directory: blobDirectory,
-                    credentialAuthorizer: credentialVerifier
+                    credentialAuthorizer: credentialVerifier,
+                    streamAdmission: self.blobStreamAdmission
                 )
             } else {
                 authenticatedSpaceBlobs = nil
@@ -868,9 +896,22 @@ public struct SwanHTTPServer: Sendable {
     }
 
     public func buildApplication(logger: Logger) -> some ApplicationProtocol {
-        Application(
+        let applicationConfiguration = ApplicationConfiguration(
+            address: .hostname(configuration.host, port: configuration.port),
+            serverName: "swan",
+            availableConnectionsDelegate: MaximumAvailableConnections(
+                configuration.maximumConnections,
+                logger: logger
+            )
+        )
+        return Application(
             router: buildRouter(),
-            configuration: .init(address: .hostname(configuration.host, port: configuration.port), serverName: "swan"),
+            server: .http1(
+                configuration: .init(
+                    idleTimeout: .seconds(Int64(configuration.idleTimeoutSeconds))
+                )
+            ),
+            configuration: applicationConfiguration,
             logger: logger
         )
     }

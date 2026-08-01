@@ -183,7 +183,66 @@ final class PublicBlobDIDBindingTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    private func makeFixture() async throws -> Fixture {
+    func testGetBlobFailsClosedWhenAdmissionIsHeldAndReleasesAfterResponse() async throws {
+        let maximumBytes = 256 * 1_024 * 1_024
+        let admission = try PublicRepositorySpoolAdmission(
+            maximumGlobalBytes: maximumBytes,
+            maximumPerAccountBytes: maximumBytes,
+            maximumGlobalLeases: 1,
+            maximumPerAccountLeases: 1
+        )
+        let held = try XCTUnwrap(
+            admission.reserve(
+                accountDID: Self.alice,
+                maximumBytes: maximumBytes
+            )
+        )
+        let fixture = try await makeFixture(blobStreamAdmission: admission)
+        defer {
+            held.release()
+            fixture.scheduleCleanup()
+        }
+
+        let reference = try await fixture.alice.putBlob(
+            Data("admission-boundary".utf8),
+            namespace: .public
+        )
+        let app = fixture.server.buildApplication(
+            logger: Logger(label: "PublicBlobDIDBindingTests.admission")
+        )
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: blobURI(did: Self.alice, cid: reference.cid),
+                method: .get
+            ) { response in
+                XCTAssertEqual(response.status, .serviceUnavailable)
+                XCTAssertEqual(
+                    try self.errorCode(response.body),
+                    "temporarily_unavailable"
+                )
+            }
+        }
+        XCTAssertEqual(admission.snapshot.activeLeases, 1)
+
+        held.release()
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: blobURI(did: Self.alice, cid: reference.cid),
+                method: .get
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertEqual(
+                    Data(buffer: response.body),
+                    Data("admission-boundary".utf8)
+                )
+            }
+        }
+        XCTAssertEqual(admission.snapshot.activeLeases, 0)
+    }
+
+    private func makeFixture(
+        blobStreamAdmission: PublicRepositorySpoolAdmission? = nil
+    ) async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory.appending(
             path: "SwanPublicBlobDIDBindingTests-\(UUID().uuidString)"
         )
@@ -223,7 +282,8 @@ final class PublicBlobDIDBindingTests: XCTestCase, @unchecked Sendable {
                     signer: P256PublicRepositoryCommitSigner(
                         privateKey: signingKey
                     )
-                )
+                ),
+                blobStreamAdmission: blobStreamAdmission
             )
             return Fixture(
                 root: root,

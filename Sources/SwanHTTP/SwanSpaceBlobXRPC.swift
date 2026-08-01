@@ -9,6 +9,8 @@ import SwanSpaces
 import SwanSpacesWire
 import SwanStorage
 
+private let maximumPermissionedBlobTransferBytes = 256 * 1024 * 1024
+
 /// The composed capability for one permissioned blob read.  It contains only
 /// the process-bound DPoP authorizer, a startup-preopened blob directory, and
 /// an optional offline/pinned credential verifier; the route receives neither
@@ -17,15 +19,18 @@ public struct SwanAuthenticatedSpaceBlobCapability: Sendable {
     let authorizer: SwanOAuthResourceAuthorizer
     let directory: any AuthorizedSpaceBlobDirectory
     let credentialAuthorizer: (any SpaceCredentialAuthorizationVerifier)?
+    let streamAdmission: PublicRepositorySpoolAdmission
 
     init(
         authorizer: SwanOAuthResourceAuthorizer,
         directory: any AuthorizedSpaceBlobDirectory,
-        credentialAuthorizer: (any SpaceCredentialAuthorizationVerifier)?
+        credentialAuthorizer: (any SpaceCredentialAuthorizationVerifier)?,
+        streamAdmission: PublicRepositorySpoolAdmission = .shared
     ) {
         self.authorizer = authorizer
         self.directory = directory
         self.credentialAuthorizer = credentialAuthorizer
+        self.streamAdmission = streamAdmission
     }
 }
 
@@ -52,6 +57,7 @@ private struct AuthenticatedGetSpaceBlobHandler:
         let cid: CID
         let mimeType: String
         let blob: AuthorizedSpaceBlob
+        let streamLease: PublicRepositorySpoolLease
     }
 
     let capability: SwanAuthenticatedSpaceBlobCapability
@@ -67,6 +73,17 @@ private struct AuthenticatedGetSpaceBlobHandler:
             expectedSpace: target.space
         )
         try requireBlobReadAuthorization(authorization, author: target.author)
+
+        guard let streamLease = capability.streamAdmission.reserve(
+            accountDID: target.author,
+            maximumBytes: maximumPermissionedBlobTransferBytes
+        ) else {
+            throw AuthenticatedSpaceBlobFailure.unavailable
+        }
+        var handedOff = false
+        defer {
+            if !handedOff { streamLease.release() }
+        }
 
         let blob: AuthorizedSpaceBlob?
         do {
@@ -89,13 +106,16 @@ private struct AuthenticatedGetSpaceBlobHandler:
             throw AuthenticatedSpaceBlobFailure.unavailable
         }
         guard let blob else { throw AuthenticatedSpaceBlobFailure.blobNotFound }
-        guard blob.body.contentLength >= 0 else {
+        guard blob.body.contentLength > 0,
+              blob.body.contentLength <= maximumPermissionedBlobTransferBytes else {
             throw AuthenticatedSpaceBlobFailure.unavailable
         }
+        handedOff = true
         return PreparedResponse(
             cid: target.cid,
             mimeType: safeResponseMIMEType(blob.mimeType),
-            blob: blob
+            blob: blob,
+            streamLease: streamLease
         )
     }
 
@@ -104,7 +124,8 @@ private struct AuthenticatedGetSpaceBlobHandler:
         input _: Void,
         context request: Request
     ) async throws -> ComAtprotoSpaceGetBlob.Output {
-        _ = try await prepare(parameters: parameters, context: request)
+        let prepared = try await prepare(parameters: parameters, context: request)
+        prepared.streamLease.release()
         throw AuthenticatedSpaceBlobFailure.unavailable
     }
 }
@@ -141,6 +162,7 @@ func registerAuthenticatedGetSpaceBlobEndpoint(
                 status: .ok,
                 headers: headers,
                 body: .init { writer in
+                    defer { prepared.streamLease.release() }
                     try await prepared.blob.body.streamBody(
                         maximumChunkBytes: 64 * 1_024
                     ) { chunk in
