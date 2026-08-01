@@ -6,6 +6,41 @@ import SwanSpaces
 import SwanStorage
 import SwanSpacesWire
 
+/// Deterministic laboratory-only mutation applied after a bounded recovery
+/// response has been spooled and before the normal streaming verifier sees it.
+/// Production callers use the default `.none`; acceptance runs use
+/// `.corruptLastByte` to prove a bad CAR cannot replace the durable head.
+public enum PermissionedRemoteReplicaSourceFault: Sendable, Equatable {
+    case none
+    case corruptLastByte
+
+    public func apply(to fileURL: URL) throws {
+        guard self == .corruptLastByte else { return }
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forUpdating: fileURL)
+        } catch {
+            throw InteropHTTPError.fileFailure
+        }
+        defer { try? handle.close() }
+        do {
+            let length = try handle.seekToEnd()
+            guard length > 0 else { throw InteropHTTPError.fileFailure }
+            try handle.seek(toOffset: length - 1)
+            guard let byte = try handle.read(upToCount: 1), byte.count == 1 else {
+                throw InteropHTTPError.fileFailure
+            }
+            try handle.seek(toOffset: length - 1)
+            try handle.write(contentsOf: Data([byte[byte.startIndex] ^ 0x01]))
+            try handle.synchronize()
+        } catch let error as InteropHTTPError {
+            throw error
+        } catch {
+            throw InteropHTTPError.fileFailure
+        }
+    }
+}
+
 /// A live HTTP source for durable permissioned-replica recovery.  The
 /// provider performs the two requests that make a recovery install safe:
 /// first it authenticates the source's current signed commit, then it opens
@@ -19,12 +54,14 @@ public struct PermissionedRemoteReplicaHTTPSourceProvider:
     public let temporaryDirectory: URL
     public let spoolAdmission: PublicRepositorySpoolAdmission
     public let limits: SpaceCARRecoveryLimits
+    public let fault: PermissionedRemoteReplicaSourceFault
 
     public init(
         host: LiveInteropHost,
         temporaryDirectory: URL = FileManager.default.temporaryDirectory,
         spoolAdmission: PublicRepositorySpoolAdmission,
-        limits: SpaceCARRecoveryLimits = .standard
+        limits: SpaceCARRecoveryLimits = .standard,
+        fault: PermissionedRemoteReplicaSourceFault = .none
     ) throws {
         guard let baseComponents = URLComponents(
             url: host.client.http.baseURL,
@@ -44,6 +81,7 @@ public struct PermissionedRemoteReplicaHTTPSourceProvider:
         self.temporaryDirectory = temporaryDirectory
         self.spoolAdmission = spoolAdmission
         self.limits = limits
+        self.fault = fault
         try FileManager.default.createDirectory(
             at: temporaryDirectory,
             withIntermediateDirectories: true,
@@ -133,6 +171,7 @@ public struct PermissionedRemoteReplicaHTTPSourceProvider:
                     .contains("application/vnd.ipld.car") == true else {
                 throw InteropHTTPError.unexpectedStatus(response.status)
             }
+            try fault.apply(to: spoolURL)
             let source = try PermissionedRemoteReplicaFileSource(
                 fileURL: spoolURL
             )

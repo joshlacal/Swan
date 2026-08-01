@@ -70,6 +70,27 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
     }
 
+    func testSpaceOplogRetentionRejectsZeroBeforeCreatingData() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let data = root.appending(path: "data")
+
+        let result = try runServe(
+            data: data,
+            arguments: ["--space-oplog-retention", "0"]
+        )
+
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(result.output.isEmpty)
+        XCTAssertTrue(
+            result.error.contains(
+                "--space-oplog-retention must be from 1 through 1000000"
+            ),
+            result.error
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: data.path))
+    }
+
     func testLocalInteropRejectsCleartextAndMissingNotificationConfigWithoutLeakingPaths() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

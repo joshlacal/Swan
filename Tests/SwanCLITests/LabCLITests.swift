@@ -210,6 +210,87 @@ final class LabCLITests: XCTestCase {
         )
     }
 
+    func testLabRecoverPermissionedRejectsInvalidReceiverBeforeNetwork() throws {
+        let result = try runCLI(
+            command: [
+                "recover-permissioned",
+                "--receiver-did", "not-a-did",
+                "--repository", "did:plc:abcdefghijklmnopqrstuvwx",
+                "--space", "at://did:plc:abcdefghijklmnopqrstuvwx/space/app.bsky.bookmarks/recovery",
+                "--since", "2222222222222",
+                "--data-directory", "/definitely/missing/swan-data",
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0)
+        let combined = String(decoding: result.stdout, as: UTF8.self)
+            + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertTrue(
+            combined.contains("--receiver-did is not a canonical DID"),
+            combined
+        )
+    }
+
+    func testLabRecoverPermissionedRejectsInvalidRepositoryBeforeNetwork() throws {
+        let result = try runCLI(
+            command: [
+                "recover-permissioned",
+                "--receiver-did", "did:plc:abcdefghijklmnopqrstuvwx",
+                "--repository", "not-a-did",
+                "--space", "at://did:plc:abcdefghijklmnopqrstuvwx/space/app.bsky.bookmarks/recovery",
+                "--since", "2222222222222",
+                "--data-directory", "/definitely/missing/swan-data",
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0)
+        let combined = String(decoding: result.stdout, as: UTF8.self)
+            + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertTrue(
+            combined.contains("--repository is not a canonical DID"),
+            combined
+        )
+    }
+
+    func testLabRecoverPermissionedRejectsInvalidSpaceBeforeNetwork() throws {
+        let result = try runCLI(
+            command: [
+                "recover-permissioned",
+                "--receiver-did", "did:plc:abcdefghijklmnopqrstuvwx",
+                "--repository", "did:plc:zyxwvutsrqponmlkjihgfedc",
+                "--space", "not-a-space",
+                "--since", "2222222222222",
+                "--data-directory", "/definitely/missing/swan-data",
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0)
+        let combined = String(decoding: result.stdout, as: UTF8.self)
+            + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertTrue(
+            combined.contains("--space is not a valid space URI"),
+            combined
+        )
+    }
+
+    func testLabRecoverPermissionedRejectsUnauthenticatedSourceBeforeNetwork() throws {
+        let result = try runCLI(
+            command: [
+                "recover-permissioned",
+                "--receiver-did", "did:plc:abcdefghijklmnopqrstuvwx",
+                "--repository", "did:plc:zyxwvutsrqponmlkjihgfedc",
+                "--space", "at://did:plc:abcdefghijklmnopqrstuvwx/space/app.bsky.bookmarks/recovery",
+                "--since", "2222222222222",
+                "--source-auth", "none",
+                "--data-directory", "/definitely/missing/swan-data",
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0)
+        let combined = String(decoding: result.stdout, as: UTF8.self)
+            + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertTrue(
+            combined.contains("--source-auth must be bearer or oauth"),
+            combined
+        )
+    }
+
     func testLabLiveWritesSanitizedFailureArtifactWithoutNetwork() throws {
         let directory = try temporaryDirectory()
         let body = directory.appending(path: "record.json")
@@ -306,6 +387,17 @@ final class LabCLITests: XCTestCase {
     }
 
     private func executableURL() throws -> URL {
+        if let override = ProcessInfo.processInfo.environment[
+            "SWAN_TEST_EXECUTABLE"
+        ], !override.isEmpty {
+            let executable = URL(fileURLWithPath: override)
+            guard FileManager.default.isExecutableFile(
+                atPath: executable.path
+            ) else {
+                throw XCTSkip("SWAN_TEST_EXECUTABLE is not executable")
+            }
+            return executable
+        }
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()

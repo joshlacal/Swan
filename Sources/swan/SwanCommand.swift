@@ -2,6 +2,7 @@ import ArgumentParser
 import Crypto
 import Foundation
 import Logging
+import Petrel
 import SwanAccountExport
 import SwanAccounts
 import SwanHTTP
@@ -1399,6 +1400,12 @@ extension SwanCommand {
         @Option(name: .long, help: "Reserved root for control/account databases and blobs")
         var dataDirectory: String = ".swan-data"
 
+        @Option(
+            name: .customLong("space-oplog-retention"),
+            help: "Retained permissioned-repository operations per account (default: 10000)"
+        )
+        var spaceOplogRetention: Int = 10_000
+
         @Option(name: .long, help: "Enable the separate loopback-only management listener on this port")
         var managementPort: Int?
 
@@ -1523,6 +1530,11 @@ extension SwanCommand {
         var spaceAccountKeyDirectory: String?
 
         func run() async throws {
+            guard (1 ... 1_000_000).contains(spaceOplogRetention) else {
+                throw ValidationError(
+                    "--space-oplog-retention must be from 1 through 1000000"
+                )
+            }
             let loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
             do {
                 loginClientIdentityPolicy = try SwanLoginClientIdentityPolicy(
@@ -1719,6 +1731,7 @@ extension SwanCommand {
                 let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
                     dataDirectory: dataURL,
                     controlStore: controlDatabase,
+                    oplogRetention: spaceOplogRetention,
                     publicIdentityVerifier: SwanPublicPLCGenesisVerifier()
                 )
                 preopenedAccountDirectory = directory
@@ -2181,7 +2194,7 @@ extension SwanCommand {
                 // exits rather than silently serving a public-only process to
                 // an operator who asked for control-plane access.
                 let publicApplication = server.buildApplication(logger: logger)
-                let managementApplication: (any Service)?
+                let managementApplication: (any ServiceLifecycle.Service)?
                 if let managementPort {
                     guard managementPort != port else {
                         throw ValidationError("--management-port must differ from --port")
@@ -2221,7 +2234,7 @@ extension SwanCommand {
                     managementApplication = nil
                 }
                 logger.info("starting Swan", metadata: ["profile": .string(loadedProfile.id), "address": .string("\(host):\(port)")])
-                var services: [any Service] = [publicApplication]
+                var services: [any ServiceLifecycle.Service] = [publicApplication]
                 if permissionedRuntime.notificationConfiguration != nil {
                     logger.info("space notification receiver routes enabled")
                 }
@@ -3191,9 +3204,464 @@ extension SwanCommand {
     struct Lab: ParsableCommand {
         static let configuration = CommandConfiguration(
             abstract: "Validate and record sanitized Compose laboratory scenarios",
-            subcommands: [Validate.self, Matrix.self, Scenario.self, Semantic.self, ImportPublic.self, Live.self],
+            subcommands: [Validate.self, Matrix.self, Scenario.self, Semantic.self, ImportPublic.self, RecoverPermissioned.self, Live.self],
             defaultSubcommand: Validate.self
         )
+
+        struct RecoverPermissioned: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "recover-permissioned",
+                abstract: "Stream, verify, and durably install a permissioned repository recovery CAR"
+            )
+
+            @Option(name: .customLong("receiver-did"), help: "Managed receiver account DID")
+            var receiverDID: String
+
+            @Option(name: .long, help: "Repository DID hosted by the source")
+            var repository: String
+
+            @Option(name: .long, help: "Permissioned space URI")
+            var space: String
+
+            @Option(name: .long, help: "Swan data directory containing the receiver database")
+            var dataDirectory: String
+
+            @Option(name: .long, help: "Scenario identifier used only in the sanitized artifact")
+            var name: String = "permissioned-recovery"
+
+            @Option(name: .customLong("source-url"), help: "Permissioned repository/member host URL")
+            var sourceURL: String = ""
+
+            @Option(name: .customLong("authority-url"), help: "Space authority host URL")
+            var authorityURL: String = ""
+
+            @Option(name: .customLong("source-auth"), help: "Source/member auth: bearer or oauth")
+            var sourceAuth: String = "oauth"
+
+            @Option(name: .customLong("source-token-env"), help: "Environment variable containing the source/member bearer token")
+            var sourceTokenEnvironment: String = "SWAN_LAB_PRODUCER_TOKEN"
+
+            @Option(name: .customLong("source-handle-env"), help: "Source/member OAuth handle environment variable")
+            var sourceHandleEnvironment: String = "SWAN_LAB_PRODUCER_HANDLE"
+
+            @Option(name: .customLong("source-password-env"), help: "Source/member OAuth password environment variable")
+            var sourcePasswordEnvironment: String = "SWAN_LAB_PRODUCER_PASSWORD"
+
+            @Option(name: .customLong("source-client-id"), help: "Source/member OAuth client metadata URL")
+            var sourceClientID: String = ""
+
+            @Option(name: .customLong("source-redirect-uri"), help: "Source/member OAuth redirect URI")
+            var sourceRedirectURI: String = ""
+
+            @Option(name: .long, parsing: .upToNextOption, help: "OAuth scope requested from the source/member; repeatable")
+            var scope: [String] = ["atproto"]
+
+            @Option(name: .long, help: "Retained-operation cursor that must produce full_repo_recovery_required")
+            var since: String
+
+            @Option(
+                name: .customLong("permissioned-commit-key-env"),
+                help: "Environment variable containing ES256:<base64url-x963> or ES256K:<base64url> repository-author public key"
+            )
+            var permissionedCommitKeyEnvironment =
+                "SWAN_LAB_PERMISSIONED_COMMIT_KEY"
+
+            @Option(name: .customLong("request-id"), help: "Optional idempotency key prefix for the valid and corrupted installs")
+            var requestID: String = ""
+
+            @Option(name: .long, help: "Destination for the sanitized recovery artifact")
+            var output: String =
+                "artifacts/live/permissioned-recovery.json"
+
+            @Option(name: .long, help: "Per-request timeout in seconds")
+            var requestTimeoutSeconds: Double = 15
+
+            @Flag(
+                name: .customLong("fail-on-failure"),
+                inversion: .prefixedNo,
+                help: "Return non-zero when recovery acceptance does not pass (default)"
+            )
+            var failOnFailure = true
+
+            func run() async throws {
+                let canonicalReceiver: String
+                do {
+                    canonicalReceiver = try AccountIdentifiers.validateDID(
+                        receiverDID
+                    )
+                } catch {
+                    throw ValidationError("--receiver-did is not a canonical DID")
+                }
+                let canonicalRepository: String
+                do {
+                    canonicalRepository = try AccountIdentifiers.validateDID(
+                        repository
+                    )
+                } catch {
+                    throw ValidationError("--repository is not a canonical DID")
+                }
+                let parsedSpace: SpaceURI
+                do {
+                    parsedSpace = try SpaceURI(space)
+                } catch {
+                    throw ValidationError("--space is not a valid space URI")
+                }
+                let sinceRevision: TID
+                do {
+                    sinceRevision = try TID(tidString: since)
+                } catch {
+                    throw ValidationError("--since is not a canonical TID")
+                }
+                guard !dataDirectory.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ).isEmpty else {
+                    throw ValidationError("--data-directory must not be empty")
+                }
+                let scenario = try LabLiveSupport.identifier(
+                    name,
+                    label: "scenario"
+                )
+                let sourceEndpoint = try LabLiveSupport.url(
+                    explicit: sourceURL,
+                    environment: "SWAN_LAB_PRODUCER_URL",
+                    fallback: "https://pds.test"
+                )
+                let authorityEndpoint = try LabLiveSupport.url(
+                    explicit: authorityURL,
+                    environment: "SWAN_LAB_CONSUMER_URL",
+                    fallback: "https://swan.test"
+                )
+                guard requestTimeoutSeconds > 0,
+                      requestTimeoutSeconds <= 120,
+                      requestTimeoutSeconds.isFinite else {
+                    throw ValidationError(
+                        "--request-timeout-seconds is invalid"
+                    )
+                }
+                let normalizedSourceAuth = sourceAuth.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ).lowercased()
+                guard normalizedSourceAuth == "bearer"
+                    || normalizedSourceAuth == "oauth" else {
+                    throw ValidationError(
+                        "--source-auth must be bearer or oauth"
+                    )
+                }
+                let verificationKey = try LabLiveSupport
+                    .permissionedCommitVerificationKey(
+                        environment: permissionedCommitKeyEnvironment
+                    )
+                let requestPrefix: String
+                if requestID.isEmpty {
+                    requestPrefix = "recover-\(UUID().uuidString.lowercased())"
+                } else {
+                    requestPrefix = try LabLiveSupport.identifier(
+                        requestID,
+                        label: "request ID"
+                    )
+                    guard requestPrefix.utf8.count <= 128 else {
+                        throw ValidationError(
+                            "request ID must not exceed 128 bytes"
+                        )
+                    }
+                }
+                let dataURL = URL(fileURLWithPath: dataDirectory)
+
+                // A recovery CLI must not manufacture an account-local
+                // database for an arbitrary DID. Resolve the receiver through
+                // control.sqlite and require an authorization-capable account
+                // before any OAuth or remote request begins.
+                let control: SQLiteControlDatabase
+                do {
+                    control = try await SQLiteControlDatabase(
+                        dataDirectory: dataURL
+                    )
+                } catch {
+                    throw ValidationError(
+                        "unable to open Swan control database"
+                    )
+                }
+                do {
+                    guard let receiver = try await control.account(
+                        did: canonicalReceiver
+                    ) else {
+                        throw ValidationError(
+                            "receiver account is not managed by this Swan data directory"
+                        )
+                    }
+                    guard receiver.status.authorizesAccount else {
+                        throw ValidationError("receiver account is not active")
+                    }
+                    try await control.close()
+                } catch {
+                    try? await control.close()
+                    throw error
+                }
+
+                let sourceMember = try await LabLiveSupport.host(
+                    label: "member",
+                    url: sourceEndpoint,
+                    auth: normalizedSourceAuth,
+                    tokenEnvironment: sourceTokenEnvironment,
+                    handleEnvironment: sourceHandleEnvironment,
+                    passwordEnvironment: sourcePasswordEnvironment,
+                    clientID: sourceClientID,
+                    redirectURI: sourceRedirectURI,
+                    scopes: scope,
+                    timeout: requestTimeoutSeconds,
+                    permissionedCommitVerificationKey: verificationKey
+                )
+                let authority = try await LabLiveSupport.host(
+                    label: "authority",
+                    url: authorityEndpoint,
+                    auth: "none",
+                    tokenEnvironment: "SWAN_UNUSED",
+                    handleEnvironment: "SWAN_UNUSED",
+                    passwordEnvironment: "SWAN_UNUSED",
+                    clientID: "",
+                    redirectURI: "",
+                    scopes: scope,
+                    timeout: requestTimeoutSeconds,
+                    permissionedCommitVerificationKey: nil
+                )
+                let broker = SpaceCredentialBroker(
+                    member: sourceMember.client,
+                    authority: authority.client
+                )
+
+                let database = try await SQLiteAccountDatabase(
+                    dataDirectory: dataURL,
+                    did: canonicalReceiver
+                )
+                let temporaryDirectory = FileManager.default
+                    .temporaryDirectory.appending(
+                        path: "swan-permissioned-recovery-\(UUID().uuidString)",
+                        directoryHint: .isDirectory
+                    )
+                do {
+                    try FileManager.default.createDirectory(
+                        at: temporaryDirectory,
+                        withIntermediateDirectories: false,
+                        attributes: [.posixPermissions: 0o700]
+                    )
+                } catch {
+                    try? await database.close()
+                    throw ValidationError(
+                        "permissioned recovery staging is unavailable"
+                    )
+                }
+
+                let limits = SpaceCARRecoveryLimits.standard
+                let admission = try PublicRepositorySpoolAdmission(
+                    maximumGlobalBytes: limits.maximumCARBytes,
+                    maximumPerAccountBytes: limits.maximumCARBytes
+                )
+                let target = try PermissionedRemoteReplicaTarget(
+                    receiverDID: canonicalReceiver,
+                    space: parsedSpace,
+                    repositoryDID: canonicalRepository
+                )
+                var gapStatus: Int?
+                var gapErrorCode: String?
+                var priorHead: PermissionedRemoteReplicaHead?
+                var valid: CommittedPermissionedRemoteReplicaRecovery?
+                var corruptErrorCode: String?
+                var finalHead: PermissionedRemoteReplicaHead?
+                var corruptionRejected = false
+                var preserved = false
+                var outcomeError: String?
+
+                do {
+                    let credential = try await broker.exchange(
+                        space: parsedSpace,
+                        memberAuthorization: sourceMember.authorization,
+                        memberAuthorizationProvider:
+                            sourceMember.authorizationProvider
+                    )
+                    let source = LiveInteropHost(
+                        label: "source",
+                        client: sourceMember.client,
+                        authorization: .bearer(token: credential),
+                        permissionedCommitVerificationKey: verificationKey
+                    )
+                    let gap = try await source.client.query(
+                        "com.atproto.space.listRepoOps",
+                        query: [
+                            "space": parsedSpace.rawValue,
+                            "repo": canonicalRepository,
+                            "since": sinceRevision.toString(),
+                            "limit": "1",
+                        ],
+                        authorization: source.authorization
+                    )
+                    gapStatus = gap.status
+                    gapErrorCode = Self.responseError(gap)
+                    guard gap.status == 409,
+                          gapErrorCode ==
+                            "full_repo_recovery_required" else {
+                        throw PermissionedRecoveryCommandError
+                            .retentionGapMissing
+                    }
+
+                    priorHead = try await database
+                        .permissionedRemoteReplicaHead(target: target)
+                    let now = Int64(Date().timeIntervalSince1970)
+                    valid = try await LiveInteropRunner
+                        .recoverPermissionedRepository(
+                            target: target,
+                            requestID: "\(requestPrefix)-valid",
+                            sourceHost: source,
+                            receiverDatabase: database,
+                            expiresAt: now + 300,
+                            temporaryDirectory: temporaryDirectory,
+                            spoolAdmission: admission,
+                            limits: limits,
+                            now: { Int64(Date().timeIntervalSince1970) }
+                        )
+
+                    do {
+                        _ = try await LiveInteropRunner
+                            .recoverPermissionedRepository(
+                                target: target,
+                                requestID: "\(requestPrefix)-corrupt",
+                                sourceHost: source,
+                                receiverDatabase: database,
+                                expiresAt: Int64(
+                                    Date().timeIntervalSince1970
+                                ) + 300,
+                                temporaryDirectory: temporaryDirectory,
+                                spoolAdmission: admission,
+                                limits: limits,
+                                sourceFault: .corruptLastByte,
+                                now: {
+                                    Int64(Date().timeIntervalSince1970)
+                                }
+                            )
+                    } catch {
+                        corruptErrorCode = PermissionedRecoveryFailureCode
+                            .code(for: error)
+                        // A transport, OAuth, timeout, or unrelated storage
+                        // failure is not evidence that the corrupted archive
+                        // reached and was rejected by the CAR verifier. The
+                        // injected final-byte mutation deterministically
+                        // invalidates the containing block's CID.
+                        corruptionRejected = PermissionedRecoveryFailureCode
+                            .isInjectedFinalByteCorruptionRejection(error)
+                    }
+                    finalHead = try await database
+                        .permissionedRemoteReplicaHead(target: target)
+                    preserved = valid?.head == finalHead
+                    guard corruptionRejected, preserved else {
+                        throw PermissionedRecoveryCommandError
+                            .corruptRecoveryAccepted
+                    }
+                } catch {
+                    outcomeError = Self.errorCode(for: error)
+                }
+
+                let passed = outcomeError == nil
+                    && gapStatus == 409
+                    && gapErrorCode == "full_repo_recovery_required"
+                    && valid != nil
+                    && corruptionRejected
+                    && preserved
+                let artifact = PermissionedRecoveryAcceptanceArtifact(
+                    scenario: scenario,
+                    gapStatus: gapStatus,
+                    gapErrorCode: gapErrorCode,
+                    priorHeadPresent: priorHead != nil,
+                    validHeadGeneration: valid?.head.generation,
+                    validHeadRevision: valid?.head.wireRevision.toString(),
+                    validCommitment: valid.map {
+                        Hex.encode($0.head.commitment)
+                    },
+                    validRecordCount: valid?.recordCount,
+                    corruptionRejected: corruptionRejected,
+                    corruptErrorCode: corruptErrorCode,
+                    finalHeadGeneration: finalHead?.generation,
+                    finalHeadRevision: finalHead?.wireRevision.toString(),
+                    finalCommitment: finalHead.map {
+                        Hex.encode($0.commitment)
+                    },
+                    lastValidHeadPreserved: preserved,
+                    status: passed ? "passed" : "failed",
+                    errorCode: outcomeError
+                )
+                let outputURL = URL(fileURLWithPath: output)
+                do {
+                    try FileManager.default.createDirectory(
+                        at: outputURL.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [
+                        .sortedKeys, .withoutEscapingSlashes,
+                    ]
+                    try encoder.encode(artifact).write(
+                        to: outputURL,
+                        options: .atomic
+                    )
+                    try FileManager.default.setAttributes(
+                        [.posixPermissions: 0o600],
+                        ofItemAtPath: outputURL.path
+                    )
+                } catch {
+                    try? await database.close()
+                    try? FileManager.default.removeItem(
+                        at: temporaryDirectory
+                    )
+                    throw ValidationError(
+                        "unable to write sanitized recovery artifact"
+                    )
+                }
+                try? FileManager.default.removeItem(at: temporaryDirectory)
+                do {
+                    try await database.close()
+                } catch {
+                    throw ValidationError(
+                        "unable to close receiver database"
+                    )
+                }
+                print(
+                    "PERMISSIONED RECOVERY ARTIFACT WRITTEN: \(outputURL.path) status=\(artifact.status)"
+                )
+                guard !failOnFailure || passed else {
+                    throw ValidationError(
+                        "permissioned recovery acceptance did not pass; inspect \(outputURL.lastPathComponent)"
+                    )
+                }
+            }
+
+            private enum PermissionedRecoveryCommandError: Error {
+                case retentionGapMissing
+                case corruptRecoveryAccepted
+            }
+
+            private struct ErrorBody: Decodable {
+                let error: String
+            }
+
+            private static func responseError(
+                _ response: InteropHTTPResponse
+            ) -> String? {
+                (try? StrictJSON.decode(
+                    ErrorBody.self,
+                    from: response.body
+                ))?.error
+            }
+
+            private static func errorCode(for error: Error) -> String {
+                if let command = error as? PermissionedRecoveryCommandError {
+                    switch command {
+                    case .retentionGapMissing:
+                        return "RetentionGapMissing"
+                    case .corruptRecoveryAccepted:
+                        return "RecoveryRejected"
+                    }
+                }
+                return PermissionedRecoveryFailureCode.code(for: error)
+            }
+        }
 
         struct Validate: ParsableCommand {
             static let configuration = CommandConfiguration(

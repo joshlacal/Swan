@@ -180,6 +180,7 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Logging", package: "swift-log"),
+                .product(name: "Petrel", package: "Petrel"),
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
             ]
         ),

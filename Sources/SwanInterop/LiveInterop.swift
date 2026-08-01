@@ -1033,6 +1033,139 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
     }
 }
 
+/// Sanitized proof that an incremental retention gap selected full-CAR
+/// recovery, a valid archive became the durable receiver head, and a
+/// deliberately corrupted retry could not replace that head. Repository and
+/// receiver identifiers, space URIs, request IDs, verifier fingerprints, raw
+/// LtHash state, credentials, and record values are deliberately absent.
+public struct PermissionedRecoveryAcceptanceArtifact:
+    Encodable, Sendable, Equatable
+{
+    public let scenario: String
+    public let profileID: String
+    public let gapStatus: Int?
+    public let gapErrorCode: String?
+    public let priorHeadPresent: Bool
+    public let validHeadGeneration: UInt64?
+    public let validHeadRevision: String?
+    public let validCommitment: String?
+    public let validRecordCount: Int?
+    public let corruptionRejected: Bool
+    public let corruptErrorCode: String?
+    public let finalHeadGeneration: UInt64?
+    public let finalHeadRevision: String?
+    public let finalCommitment: String?
+    public let lastValidHeadPreserved: Bool
+    public let status: String
+    public let errorCode: String?
+    public let fixturePolicy: String
+
+    public init(
+        scenario: String,
+        gapStatus: Int?,
+        gapErrorCode: String?,
+        priorHeadPresent: Bool,
+        validHeadGeneration: UInt64?,
+        validHeadRevision: String?,
+        validCommitment: String?,
+        validRecordCount: Int?,
+        corruptionRejected: Bool,
+        corruptErrorCode: String?,
+        finalHeadGeneration: UInt64?,
+        finalHeadRevision: String?,
+        finalCommitment: String?,
+        lastValidHeadPreserved: Bool,
+        status: String,
+        errorCode: String?
+    ) {
+        self.scenario = FixtureSanitizer.safeIdentifier(scenario)
+        profileID = OfflineProtocolProfileVerifier.stableProfileID
+        self.gapStatus = gapStatus.flatMap {
+            (100 ... 599).contains($0) ? $0 : nil
+        }
+        self.gapErrorCode = gapErrorCode.map(FixtureSanitizer.errorCode)
+        self.priorHeadPresent = priorHeadPresent
+        self.validHeadGeneration = validHeadGeneration.flatMap {
+            $0 > 0 && $0 <= UInt64(Int.max) ? $0 : nil
+        }
+        self.validHeadRevision = canonicalInteropTID(validHeadRevision)
+        self.validCommitment = FixtureSanitizer.canonicalSHA256Hex(
+            validCommitment
+        )
+        self.validRecordCount = validRecordCount.flatMap {
+            $0 >= 0 ? $0 : nil
+        }
+        self.corruptionRejected = corruptionRejected
+        self.corruptErrorCode = corruptErrorCode.map(
+            FixtureSanitizer.errorCode
+        )
+        self.finalHeadGeneration = finalHeadGeneration.flatMap {
+            $0 > 0 && $0 <= UInt64(Int.max) ? $0 : nil
+        }
+        self.finalHeadRevision = canonicalInteropTID(finalHeadRevision)
+        self.finalCommitment = FixtureSanitizer.canonicalSHA256Hex(
+            finalCommitment
+        )
+        self.lastValidHeadPreserved = lastValidHeadPreserved
+        self.status = FixtureSanitizer.artifactStatus(status)
+        self.errorCode = errorCode.map(FixtureSanitizer.errorCode)
+        fixturePolicy = "semantic-summary-only; no DIDs, space URIs, paths, request identities, verifier material, credentials, tokens, DPoP proofs, record values, or raw LtHash state"
+    }
+}
+
+/// Stable secret-free error projection for recovery acceptance artifacts. No
+/// arbitrary `Error` description, peer body, selector, URL, or database path
+/// crosses this boundary.
+public enum PermissionedRecoveryFailureCode {
+    public static func code(for error: Error) -> String {
+        switch error {
+        case let recovery as PermissionedRemoteReplicaRecoveryError:
+            switch recovery {
+            case .invalidBinding: return "RecoveryInvalidBinding"
+            case .invalidTimestamp: return "RecoveryInvalidTimestamp"
+            case .receiverMismatch: return "RecoveryReceiverMismatch"
+            case .unknownSession: return "RecoveryUnknownSession"
+            case .expiredSession: return "RecoveryExpiredSession"
+            case .importInProgress: return "RecoveryImportInProgress"
+            case .poisonedSession: return "RecoveryPoisonedSession"
+            case .conflictingRequestReuse:
+                return "RecoveryConflictingRequestReuse"
+            case .bindingMismatch: return "RecoveryBindingMismatch"
+            case .verificationRequired:
+                return "RecoveryVerificationRequired"
+            case .invalidStatus: return "RecoveryInvalidStatus"
+            case .duplicateIndexEntry: return "CARDuplicateIndexEntry"
+            case .duplicateBlockConflict: return "CARBlockCIDMismatch"
+            case .invalidChunk: return "RecoveryInvalidChunk"
+            case .incompleteBlock: return "RecoveryIncompleteBlock"
+            case .corruptStaging: return "RecoveryCorruptStaging"
+            case .corruptReplica: return "RecoveryCorruptReplica"
+            case .targetCASConflict: return "RecoveryCASConflict"
+            case .staleRecovery: return "RecoveryStale"
+            case .equivocation: return "RecoveryEquivocation"
+            case .freshnessMismatch: return "RecoveryFreshnessMismatch"
+            }
+        case let streaming as SpaceCARStreamingError:
+            return spaceCARStreamingErrorCode(streaming)
+        case is InteropHTTPError:
+            return liveErrorCode(error)
+        default:
+            return "RecoveryFailed"
+        }
+    }
+
+    /// The acceptance command injects exactly one mutation after a complete
+    /// download: it flips the final payload byte. Only a local block-CID
+    /// mismatch proves that this mutation reached the verifier. Transport,
+    /// authentication, timeout, and unrelated storage errors must not be
+    /// counted as corruption rejection evidence.
+    public static func isInjectedFinalByteCorruptionRejection(
+        _ error: Error
+    ) -> Bool {
+        code(for: error) == "CARBlockCIDMismatch"
+    }
+}
+
 /// Stateful public-data interop that proves a write response and a subsequent
 /// read response agree on the record CID. It is intentionally separate from
 /// the older endpoint-probe runner: a probe can be useful diagnostically, but
@@ -1673,6 +1806,7 @@ public enum LiveInteropRunner {
         temporaryDirectory: URL = FileManager.default.temporaryDirectory,
         spoolAdmission: PublicRepositorySpoolAdmission,
         limits: SpaceCARRecoveryLimits = .standard,
+        sourceFault: PermissionedRemoteReplicaSourceFault = .none,
         now: @escaping @Sendable () -> Int64 = {
             Int64(Date().timeIntervalSince1970)
         }
@@ -1681,7 +1815,8 @@ public enum LiveInteropRunner {
             host: sourceHost,
             temporaryDirectory: temporaryDirectory,
             spoolAdmission: spoolAdmission,
-            limits: limits
+            limits: limits,
+            fault: sourceFault
         )
         let orchestrator = PermissionedRemoteReplicaRecoveryOrchestrator(
             database: receiverDatabase,

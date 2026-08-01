@@ -1370,3 +1370,60 @@ path, reverse-authority OAuth/browser/lifecycle matrix, live corrupted/
 compaction-gap traffic, stock delegation-key discovery, strict password-reset
 constant-work evidence, non-cooperative third-party email cancellation, and
 the unavailable official Codex Security launcher remain explicit gates.
+
+## Adversarial rereview: Luna-era recovery acceptance — 2026-08-01
+
+The next pass separated the committed Luna-era protocol/storage work from the
+acceptance claims layered over it. The five Task 43 remediations remain sound
+under source review: bounded SQL-backed public CAR traversal, process-wide
+spool admission before file creation, reference-compatible descending record
+pagination, direct strict DAG-CBOR decoding, and fail-closed PLC genesis
+verification. The exact `PublicRepositoryReadHTTPTests` filter now completes
+with 13/13 tests passing when SwiftPM is serialized with
+`SWIFTPM_MAX_CONCURRENT_OPERATIONS=1` and `--jobs 1`; the earlier apparent
+hang was SwiftPM lock/dependency work rather than a route deadlock.
+
+The acceptance layer did contain three material defects:
+
+- **ADV-93 (P1, missing capability):** `swan lab recover-permissioned` was
+  advertised but returned an unconditional usage error. It now performs a
+  credential-authenticated retention-gap probe, bounded two-root CAR recovery,
+  durable publication, a corrupted retry, and a sanitized owner-only result
+  artifact. It refuses unmanaged or inactive receiver accounts before remote
+  authentication or account-database creation.
+- **ADV-94 (P1, false acceptance):** the first corruption harness only proved
+  that a downloaded file byte changed, and the initial CLI remediation counted
+  any retry error as verifier rejection. A timeout, DNS error, or OAuth failure
+  could therefore have produced a false pass. The gate now accepts only the
+  deterministic local `CARBlockCIDMismatch` caused by the injected final-byte
+  mutation and independently requires the durable head to equal the last valid
+  installed head.
+- **ADV-95 (P2, stale test binary):** `LabCLITests` ignored
+  `SWAN_TEST_EXECUTABLE`, allowing a focused test to exercise an older default
+  `.build/debug/swan`. The helper now honors the explicit executable and skips
+  rather than silently substituting another binary when it is unavailable.
+
+The remediation build also exposed two ordinary correctness defects before
+they could be committed: the new command referenced Petrel's `TID` without a
+direct target dependency, and importing Petrel made `Service` ambiguous with
+ServiceLifecycle. The dependency is now explicit and the lifecycle protocol is
+qualified. The command additionally rejects `--source-auth none`; an
+unauthenticated source cannot satisfy the recovery-acceptance contract.
+
+Focused macOS evidence on the current working copy:
+
+- recovery artifact sanitization and failure projection: 3/3;
+- HTTP CAR fault injection: 2/2;
+- recovery CLI pre-network validation: 4/4;
+- authenticated recovery orchestrator: 5/5;
+- public repository read HTTP: 13/13.
+
+This closes the local implementation defects but not the acceptance gate. A
+live low-retention run must still prove an actual 409
+`full_repo_recovery_required`, a valid durable full-CAR replacement, rejection
+of the corrupted CAR, and preservation of the prior valid head. The resulting
+artifact must be checked for mode 0600 and secret/private-value absence.
+Reverse-authority OAuth/browser/lifecycle, password-reset timing and
+non-cooperative email cancellation, final native Linux/current-profile
+acceptance, clean-cache Compose, and formal security-scan completion remain
+open.
