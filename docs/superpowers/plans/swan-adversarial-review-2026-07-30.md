@@ -1725,11 +1725,12 @@ following sanitized failure artifact (0600):
 - the round trip consequently failed the incremental commitment and
   full-CAR assertions.
 
-The artifact is now retained as <requested-output>.failed on an unsuccessful
-dynamic run. It contains only status, endpoint, byte-count, digest, and
-redacted error metadata; the runner still rejects any record value before
-publication. This makes a stock-reference failure reviewable without
-retaining credentials, tokens, DPoP material, request bodies, or selectors.
+The failed run is retained under the owner-only lab output as
+`current-reference-member-stateful.json.failed`. It contains only status,
+endpoint, byte-count, digest, and redacted error metadata; the runner still
+rejects any record value before publication. This makes a stock-reference
+failure reviewable without retaining credentials, tokens, DPoP material,
+request bodies, or selectors.
 The result confirms that the checked-in recovery overlay cannot be described
 as stock-reference interoperability.
 
@@ -1766,6 +1767,17 @@ credential, wrote on Swan, and read from the member repository:
 This is fresh reverse-authority credential/write/read evidence. It still does
 not prove the stock TypeScript value-bearing incremental/full-CAR surfaces or
 the broader lifecycle/fault matrix.
+
+The same current Compose project also reran the TypeScript-member direction
+and the reverse direction directly through
+`Scripts/run-reference-member-dynamic-delegation-acceptance.sh`, with
+`SWAN_DYNAMIC_DELEGATION_NO_BUILD=1` and the project-scoped current image.
+Both non-stateful artifacts passed. A stateful TypeScript-member run was then
+attempted without the overlay and failed exactly at the stock reference
+boundaries: `listRepoOps` returned HTTP 500 when values were requested and
+`getRepo` returned HTTP 501. Credential issuance, create, and read still
+returned HTTP 200 with matching CIDs, so the failure is isolated to the
+incremental/full-recovery surface rather than authorization or record CRUD.
 
 ## Adversarial evidence revalidation: current workspace — 2026-08-01
 
