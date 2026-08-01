@@ -1,5 +1,10 @@
 import Crypto
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import Petrel
 @testable import SwanAccountExport
 import SwanAccounts
@@ -187,6 +192,40 @@ final class SwanPortableExportTests: XCTestCase {
             try SwanPortableExportVerifier.verifyArchive(
                 at: fixture.root,
                 signingPublicKey: fixture.key.publicKey
+            )
+        )
+    }
+
+    func testArchiveInventoryRejectsEntryAndDepthBudgetExhaustion() throws {
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+
+        let smallBudgetDescriptor = try SwanPortableExportFilesystem.openArchiveRoot(
+            fixture.root
+        )
+        defer { _ = close(smallBudgetDescriptor) }
+        XCTAssertThrowsError(
+            try SwanPortableExportFilesystem.entries(
+                root: smallBudgetDescriptor,
+                maximumEntries: 2
+            )
+        )
+
+        var nested = fixture.root
+        for _ in 0 ... 256 {
+            nested.append(path: "d", directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(
+                at: nested,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
+        let descriptor = try SwanPortableExportFilesystem.openArchiveRoot(fixture.root)
+        defer { _ = close(descriptor) }
+        XCTAssertThrowsError(
+            try SwanPortableExportFilesystem.entries(
+                root: descriptor,
+                maximumEntries: 10_000
             )
         )
     }

@@ -525,8 +525,15 @@ public enum SwanOperatorAccountBackupVerifier {
                 manifest: manifest
             )
 
+            let portableExpectedPaths = Set(
+                portable.manifest.files.map(\.path) + ["manifest.json"]
+            )
+            let portableExpectedDirectories = try SwanPortableExportFilesystem
+                .expectedDirectories(for: portableExpectedPaths)
             let portableEntries = try SwanPortableExportFilesystem.entries(
-                root: portableDescriptor
+                root: portableDescriptor,
+                maximumEntries: portableExpectedPaths.count
+                    + portableExpectedDirectories.count
             )
             let expectedFiles = Set([
                 "manifest.json",
@@ -535,7 +542,10 @@ public enum SwanOperatorAccountBackupVerifier {
             let expectedDirectories = try SwanPortableExportFilesystem.expectedDirectories(
                 for: expectedFiles
             )
-            let entries = try SwanPortableExportFilesystem.entries(root: root)
+            let entries = try SwanPortableExportFilesystem.entries(
+                root: root,
+                maximumEntries: expectedFiles.count + expectedDirectories.count
+            )
             guard entries.files == expectedFiles,
                   entries.directories == expectedDirectories else {
                 throw SwanOperatorAccountBackupError.failed

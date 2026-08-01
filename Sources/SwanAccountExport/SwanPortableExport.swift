@@ -49,6 +49,11 @@ public struct SwanPortableExportFile: Codable, Sendable, Equatable {
 public struct SwanPortableExportManifest: Codable, Sendable, Equatable {
     public static let formatValue = "swan-account-export-v2"
     public static let plcHistoryScopeValue = "locally-retained-genesis"
+    // The inventory caps allow at most 100,000 permissioned repositories and
+    // 100,000 blob references, plus the public CAR and PLC history entries.
+    // Keep the manifest itself bounded before JSON decoding can retain an
+    // attacker-controlled file list.
+    static let maximumFileCount = 200_002
 
     public let format: String
     public let profileID: String
@@ -71,6 +76,7 @@ public struct SwanPortableExportManifest: Codable, Sendable, Equatable {
               try AccountIdentifiers.canonicalHandle(canonicalHandle) == canonicalHandle,
               SwanPortableExportTimestamp.isCanonical(createdAt),
               !files.isEmpty,
+              files.count <= Self.maximumFileCount,
               files.map(\.path) == files.map(\.path).sorted(),
               Set(files.map(\.path)).count == files.count else {
             throw SwanPortableExportError.invalidManifest
@@ -234,10 +240,15 @@ public enum SwanPortableExportVerifier {
         )
         let manifest = try SwanPortableExportManifestCodec.decode(manifestData)
         let expectedPaths = Set(manifest.files.map(\.path) + ["manifest.json"])
-        let entries = try SwanPortableExportFilesystem.entries(root: directoryDescriptor)
+        let expectedDirectories = try SwanPortableExportFilesystem.expectedDirectories(
+            for: expectedPaths
+        )
+        let entries = try SwanPortableExportFilesystem.entries(
+            root: directoryDescriptor,
+            maximumEntries: expectedPaths.count + expectedDirectories.count
+        )
         guard entries.files == expectedPaths,
-              entries.directories
-                == (try SwanPortableExportFilesystem.expectedDirectories(for: expectedPaths))
+              entries.directories == expectedDirectories
         else {
             throw SwanPortableExportError.invalidArchive
         }
@@ -310,6 +321,188 @@ public enum SwanPortableExportVerifier {
             expectedSigningDIDKey: P256DIDKey(publicKey: signingPublicKey).value
         )
         return manifest
+    }
+
+    /// Verifies an export without materializing permissioned CARs or blobs.
+    /// The synchronous verifier above remains the small-file restore/test API;
+    /// publication uses this path so a hostile archive can consume at most a
+    /// bounded parser chunk plus the bounded SQLite recovery index.
+    static func verifyArchiveStreaming(
+        directoryDescriptor: Int32,
+        signingPublicKey: P256.Signing.PublicKey
+    ) async throws -> SwanPortableExportManifest {
+        try SwanPortableExportFilesystem.requireOwnerOnlyDirectory(directoryDescriptor)
+        let manifestData = try SwanPortableExportFilesystem.read(
+            path: "manifest.json",
+            root: directoryDescriptor,
+            maximumBytes: 4 * 1_024 * 1_024
+        )
+        let manifest = try SwanPortableExportManifestCodec.decode(manifestData)
+        let expectedPaths = Set(manifest.files.map(\.path) + ["manifest.json"])
+        let expectedDirectories = try SwanPortableExportFilesystem.expectedDirectories(
+            for: expectedPaths
+        )
+        let entries = try SwanPortableExportFilesystem.entries(
+            root: directoryDescriptor,
+            maximumEntries: expectedPaths.count + expectedDirectories.count
+        )
+        guard entries.files == expectedPaths,
+              entries.directories == expectedDirectories
+        else {
+            throw SwanPortableExportError.invalidArchive
+        }
+
+        var verifiedPublicGenesis: PublicRepositoryGenesis?
+        var plcHistory: Data?
+        var totalBytes = manifestData.count
+        for entry in manifest.files {
+            try validatePlacement(entry, manifest: manifest)
+            let maximumBytes = switch entry.type {
+            case .plcHistory:
+                64 * 1_024
+            case .publicCAR:
+                4 * 1_024 * 1_024
+            default:
+                SwanPortableExportFilesystem.maximumArtifactBytes
+            }
+            guard entry.byteCount <= maximumBytes,
+                  totalBytes <= SwanPortableExportFilesystem.maximumArchiveBytes - entry.byteCount
+            else {
+                throw SwanPortableExportError.invalidArchive
+            }
+            totalBytes += entry.byteCount
+
+            switch entry.type {
+            case .publicCAR:
+                let data = try SwanPortableExportFilesystem.read(
+                    path: entry.path,
+                    root: directoryDescriptor,
+                    maximumBytes: maximumBytes
+                )
+                guard data.count == entry.byteCount,
+                      SwanPortableExportDigest.hex(data) == entry.sha256 else {
+                    throw SwanPortableExportError.invalidArchive
+                }
+                let genesis = try PublicRepositoryGenesisCodec.verify(
+                    car: data,
+                    publicKey: signingPublicKey
+                )
+                guard genesis.did == manifest.did else {
+                    throw SwanPortableExportError.invalidArchive
+                }
+                verifiedPublicGenesis = genesis
+            case .spaceCAR:
+                let components = entry.path.split(separator: "/").map(String.init)
+                let space = try SpaceURI(SwanPortableExportPath.decode(components[1]))
+                let author = try SwanPortableExportPath.decode(
+                    String(components[2].dropLast(4))
+                )
+                let source = try SwanPortableExportFileByteSource(
+                    path: entry.path,
+                    root: directoryDescriptor
+                )
+                let index: SQLiteSpaceCARRecoveryIndex
+                do {
+                    index = try await SQLiteSpaceCARRecoveryIndex.create()
+                } catch {
+                    await source.close()
+                    throw SwanPortableExportError.invalidArchive
+                }
+                do {
+                    _ = try await SpaceCARCodec.verifyStreamingRecovery(
+                        from: source,
+                        space: space,
+                        author: author,
+                        contextSignatureVerifier: { envelope in
+                            try SpaceCommitCodec.verifyContextSignature(
+                                envelope,
+                                publicKey: signingPublicKey
+                            )
+                        },
+                        index: index
+                    )
+                    let digest = try await source.finish()
+                    await index.cleanup()
+                    guard digest.byteCount == entry.byteCount,
+                          digest.sha256 == entry.sha256 else {
+                        throw SwanPortableExportError.invalidArchive
+                    }
+                } catch {
+                    await source.close()
+                    await index.cleanup()
+                    throw SwanPortableExportError.invalidArchive
+                }
+            case .publicBlob, .spaceBlob:
+                let source = try SwanPortableExportFileByteSource(
+                    path: entry.path,
+                    root: directoryDescriptor
+                )
+                do {
+                    while try await source.read(
+                        maximumBytes: SpaceCARBodySpool.maximumChunkBytes
+                    ) != nil {}
+                    let digest = try await source.finish()
+                    let cidComponent = entry.path.split(separator: "/").last.map(String.init)!
+                    let cid = try SwanPortableExportPath.decode(cidComponent)
+                    guard digest.byteCount == entry.byteCount,
+                          digest.sha256 == entry.sha256 else {
+                        throw SwanPortableExportError.invalidArchive
+                    }
+                    try verifyStreamingBlobDigest(cid, sha256: digest.sha256)
+                } catch {
+                    await source.close()
+                    throw SwanPortableExportError.invalidArchive
+                }
+            case .plcHistory:
+                let data = try SwanPortableExportFilesystem.read(
+                    path: entry.path,
+                    root: directoryDescriptor,
+                    maximumBytes: maximumBytes
+                )
+                guard data.count == entry.byteCount,
+                      SwanPortableExportDigest.hex(data) == entry.sha256 else {
+                    throw SwanPortableExportError.invalidArchive
+                }
+                plcHistory = data
+            }
+        }
+        guard let verifiedPublicGenesis, let plcHistory else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        try verifyPLCHistory(
+            plcHistory,
+            expectedDID: manifest.did,
+            expectedHandle: manifest.canonicalHandle,
+            expectedRepositoryRevision: verifiedPublicGenesis.revision,
+            expectedPublicGenesisCID: verifiedPublicGenesis.commitCID.string,
+            expectedSigningDIDKey: P256DIDKey(publicKey: signingPublicKey).value
+        )
+        return manifest
+    }
+
+    private static func verifyStreamingBlobDigest(
+        _ cid: String,
+        sha256: String
+    ) throws {
+        if cid.hasPrefix("sha256:") {
+            guard cid == "sha256:\(sha256)" else {
+                throw SwanPortableExportError.invalidArchive
+            }
+            return
+        }
+        let parsed: CID
+        do {
+            parsed = try CID.parse(cid)
+        } catch {
+            throw SwanPortableExportError.invalidArchive
+        }
+        guard parsed.string == cid,
+              parsed.codec == .raw,
+              parsed.multihash.algorithm == Multihash.sha256Code,
+              parsed.multihash.length == Multihash.sha256Length,
+              Hex.encode(parsed.multihash.digest) == sha256 else {
+            throw SwanPortableExportError.invalidArchive
+        }
     }
 
     static func verifySelfContainedArchive(
@@ -653,42 +846,35 @@ public struct SwanPortableAccountExporter: Sendable {
             )
 
             for repository in inventory.repositories {
-                guard let snapshot = try await database.repositorySnapshot(
+                guard let snapshot = try await database.prepareRepositoryCARSnapshot(
                     space: repository.space,
                     author: repository.author
-                ) else {
+                ), let revision = snapshot.state.wireRevision else {
                     throw SwanPortableExportError.missingSource
                 }
-                let records = try verifiedRecords(snapshot)
                 let envelope = try SpaceCommitCodec.createReaderEnvelope(
                     space: repository.space,
                     author: repository.author,
-                    rev: snapshot.state.wireRevision.toString(),
+                    rev: revision,
                     commitment: snapshot.state.commitment,
                     key: privateKey
                 )
-                guard try SpaceCommitCodec.verifyContextSignature(
-                    envelope,
-                    publicKey: privateKey.publicKey
-                ), SpaceCommitCodec.verifyContentBinding(envelope) else {
-                    throw SwanPortableExportError.invalidArchive
+                let prefix = try SpaceCARCodec.recoveryPrefix(
+                    commit: envelope,
+                    indexCID: snapshot.spool.indexCID
+                )
+                let spacePath = "spaces/\(SwanPortableExportPath.encode(repository.space.rawValue))/\(SwanPortableExportPath.encode(repository.author)).car"
+                _ = try await writer.writeStreaming(
+                    path: spacePath,
+                    type: SwanPortableExportFileType.spaceCAR
+                ) { consume in
+                    defer { snapshot.spool.cleanup() }
+                    try await consume(prefix)
+                    try await snapshot.spool.streamBody(consume: consume)
                 }
-                let car = try SpaceCARCodec.encode(commit: envelope, records: records)
-                _ = try SpaceCARCodec.verify(
-                    car.data,
-                    space: repository.space,
-                    author: repository.author,
-                    publicKey: privateKey.publicKey
-                )
-                try writer.write(
-                    path: "spaces/\(SwanPortableExportPath.encode(repository.space.rawValue))/\(SwanPortableExportPath.encode(repository.author)).car",
-                    type: SwanPortableExportFileType.spaceCAR,
-                    data: car.data
-                )
             }
 
             for reference in inventory.blobs {
-                let data = try await database.data(for: reference)
                 let type: SwanPortableExportFileType
                 let path: String
                 switch reference.namespace {
@@ -699,7 +885,17 @@ public struct SwanPortableAccountExporter: Sendable {
                     type = .spaceBlob
                     path = "blobs/space/\(SwanPortableExportPath.encode(space.rawValue))/\(SwanPortableExportPath.encode(reference.cid))"
                 }
-                try writer.write(path: path, type: type, data: data)
+                let written = try await writer.writeStreaming(path: path, type: type) { consume in
+                    try await database.streamBlobData(
+                        for: reference,
+                        maximumBytes: SwanPortableExportFilesystem.maximumArtifactBytes,
+                        consume: consume
+                    )
+                }
+                try verifyStreamingBlobDigest(
+                    reference.cid,
+                    sha256: written.sha256
+                )
             }
             try writer.write(
                 path: "plc/history.json",
@@ -724,7 +920,7 @@ public struct SwanPortableAccountExporter: Sendable {
             guard fsync(stagingDescriptor) == 0 else {
                 throw SwanPortableExportError.publicationFailed
             }
-            _ = try SwanPortableExportVerifier.verifyArchive(
+            _ = try await SwanPortableExportVerifier.verifyArchiveStreaming(
                 directoryDescriptor: stagingDescriptor,
                 signingPublicKey: privateKey.publicKey
             )
@@ -763,31 +959,6 @@ public struct SwanPortableAccountExporter: Sendable {
             }
             throw error
         }
-    }
-
-    private func verifiedRecords(
-        _ snapshot: PersistedRepositorySnapshot
-    ) throws -> [SpaceRecord] {
-        var recomputed = LtHash()
-        let records = try snapshot.records.map { record -> SpaceRecord in
-            guard CID.fromDAGCBOR(record.value).string == record.cid else {
-                throw SwanPortableExportError.invalidArchive
-            }
-            recomputed.add(
-                element: "\(record.uri.collection)/\(record.uri.rkey)/\(record.cid)"
-            )
-            return .init(
-                uri: record.uri,
-                value: record.value,
-                cid: record.cid,
-                revision: record.revision
-            )
-        }
-        guard recomputed.serialized == snapshot.state.ltHash,
-              recomputed.commitment == snapshot.state.commitment else {
-            throw SwanPortableExportError.invalidArchive
-        }
-        return records
     }
 
     private func makePLCHistory(
@@ -834,11 +1005,93 @@ public struct SwanPortableAccountExporter: Sendable {
         )
     }
 
+    private func verifyStreamingBlobDigest(
+        _ cid: String,
+        sha256: String
+    ) throws {
+        if cid.hasPrefix("sha256:") {
+            guard cid == "sha256:\(sha256)" else {
+                throw SwanPortableExportError.invalidArchive
+            }
+            return
+        }
+        let parsed: CID
+        do {
+            parsed = try CID.parse(cid)
+        } catch {
+            throw SwanPortableExportError.invalidArchive
+        }
+        guard parsed.string == cid,
+              parsed.codec == .raw,
+              parsed.multihash.algorithm == Multihash.sha256Code,
+              parsed.multihash.length == Multihash.sha256Length,
+              Hex.encode(parsed.multihash.digest) == sha256 else {
+            throw SwanPortableExportError.invalidArchive
+        }
+    }
+
+    private final class StreamingArtifactAccumulator: @unchecked Sendable {
+        private let writer: SwanPortableExportFilesystem.StreamingWriter
+        private let maximumBytes: Int
+        private let lock = NSLock()
+        private var hasher = SHA256()
+        private var count = 0
+        private var finished = false
+
+        init(
+            writer: SwanPortableExportFilesystem.StreamingWriter,
+            maximumBytes: Int
+        ) {
+            self.writer = writer
+            self.maximumBytes = maximumBytes
+        }
+
+        func append(_ data: Data) throws {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !finished, !data.isEmpty else {
+                if data.isEmpty { return }
+                throw SwanPortableExportError.publicationFailed
+            }
+            let (next, overflow) = count.addingReportingOverflow(data.count)
+            guard !overflow, next <= maximumBytes else {
+                throw SwanPortableExportError.invalidArchive
+            }
+            hasher.update(data: data)
+            try writer.write(data)
+            count = next
+        }
+
+        func finish() throws -> (byteCount: Int, sha256: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !finished else {
+                throw SwanPortableExportError.publicationFailed
+            }
+            try writer.finish()
+            finished = true
+            return (count, Hex.encode(Data(hasher.finalize())))
+        }
+
+        func abort() {
+            lock.lock()
+            guard !finished else {
+                lock.unlock()
+                return
+            }
+            finished = true
+            lock.unlock()
+            writer.abort()
+        }
+    }
+
     private struct StagedArtifactWriter {
+        private static let manifestReserveBytes = 4 * 1_024 * 1_024
         let root: Int32
         let afterWrite: (@Sendable (Int) throws -> Void)?
         private(set) var files: [SwanPortableExportFile] = []
         private var paths = Set<String>()
+        private var artifactBytes = 0
 
         init(
             root: Int32,
@@ -856,7 +1109,13 @@ public struct SwanPortableAccountExporter: Sendable {
             guard paths.insert(path).inserted else {
                 throw SwanPortableExportError.invalidArchive
             }
+            guard data.count <= SwanPortableExportFilesystem.maximumArtifactBytes,
+                  artifactBytes <= SwanPortableExportFilesystem.maximumArchiveBytes
+                    - Self.manifestReserveBytes - data.count else {
+                throw SwanPortableExportError.invalidArchive
+            }
             try SwanPortableExportFilesystem.write(data, path: path, root: root)
+            artifactBytes += data.count
             files.append(
                 try SwanPortableExportFile(
                     path: path,
@@ -866,6 +1125,54 @@ public struct SwanPortableAccountExporter: Sendable {
                 )
             )
             try afterWrite?(files.count)
+        }
+
+        mutating func writeStreaming(
+            path: String,
+            type: SwanPortableExportFileType,
+            source: @escaping @Sendable (
+                @escaping @Sendable (Data) async throws -> Void
+            ) async throws -> Void
+        ) async throws -> (byteCount: Int, sha256: String) {
+            guard paths.insert(path).inserted else {
+                throw SwanPortableExportError.invalidArchive
+            }
+            let remaining = SwanPortableExportFilesystem.maximumArchiveBytes
+                - Self.manifestReserveBytes - artifactBytes
+            guard remaining > 0 else {
+                throw SwanPortableExportError.invalidArchive
+            }
+            let writer = try SwanPortableExportFilesystem.openStreamingWriter(
+                path: path,
+                root: root
+            )
+            let accumulator = StreamingArtifactAccumulator(
+                writer: writer,
+                maximumBytes: min(
+                    SwanPortableExportFilesystem.maximumArtifactBytes,
+                    remaining
+                )
+            )
+            do {
+                try await source { chunk in
+                    try accumulator.append(chunk)
+                }
+                let result = try accumulator.finish()
+                artifactBytes += result.byteCount
+                files.append(
+                    try SwanPortableExportFile(
+                        path: path,
+                        byteCount: result.byteCount,
+                        sha256: result.sha256,
+                        type: type
+                    )
+                )
+                try afterWrite?(files.count)
+                return result
+            } catch {
+                accumulator.abort()
+                throw error
+            }
         }
     }
 }
@@ -895,5 +1202,93 @@ enum SwanPortableExportTimestamp {
         ]
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         return formatter
+    }
+}
+
+/// Descriptor-backed byte source used only by the bounded archive verifier.
+/// It snapshots the file identity/length before parsing, hashes the exact bytes
+/// consumed by the parser, and rejects a file that changes underneath it.
+private actor SwanPortableExportFileByteSource:
+    SpaceCARRecoveryByteSource,
+    PublicRepositoryCARByteSource
+{
+    private let handle: FileHandle
+    private let descriptor: Int32
+    private let device: dev_t
+    private let inode: ino_t
+    private let byteCount: Int
+    private var offset = 0
+    private var digest = SHA256()
+    private var closed = false
+
+    init(path: String, root: Int32) throws {
+        let descriptor = try SwanPortableExportFilesystem.openStreamingReader(
+            path: path,
+            root: root
+        )
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              metadata.st_size >= 0,
+              metadata.st_size <= off_t(Int.max) else {
+            #if canImport(Darwin)
+            _ = Darwin.close(descriptor)
+            #elseif canImport(Glibc)
+            _ = Glibc.close(descriptor)
+            #endif
+            throw SwanPortableExportError.invalidArchive
+        }
+        self.descriptor = descriptor
+        device = metadata.st_dev
+        inode = metadata.st_ino
+        byteCount = Int(metadata.st_size)
+        handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    }
+
+    func read(maximumBytes: Int) async throws -> Data? {
+        guard !closed,
+              (1 ... SpaceCARBodySpool.maximumChunkBytes).contains(maximumBytes)
+        else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        guard offset < byteCount else { return nil }
+        let count = min(maximumBytes, byteCount - offset)
+        guard let chunk = try handle.read(upToCount: count),
+              !chunk.isEmpty,
+              chunk.count <= count else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        offset += chunk.count
+        digest.update(data: chunk)
+        return chunk
+    }
+
+    func finish() throws -> (byteCount: Int, sha256: String) {
+        guard !closed, offset == byteCount else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              metadata.st_dev == device,
+              metadata.st_ino == inode,
+              metadata.st_size == off_t(byteCount),
+              (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_uid == geteuid(),
+              metadata.st_nlink == 1,
+              (metadata.st_mode & 0o777) == 0o600 else {
+            close()
+            throw SwanPortableExportError.invalidArchive
+        }
+        let result = (
+            byteCount,
+            Hex.encode(Data(digest.finalize()))
+        )
+        close()
+        return result
+    }
+
+    func close() {
+        guard !closed else { return }
+        closed = true
+        try? handle.close()
     }
 }

@@ -146,6 +146,7 @@ overstated several gates. The most important adversarial findings were:
 | ADV-78 | P2 | The durable replay result stores only `base_generation`, while the orchestrator's request digest historically omitted the remaining expected-base fields. A direct caller of the storage protocol could reuse a request ID/digest with a forged same-generation base and receive a committed replay instead of a conflicting-reuse error. The production orchestrator obtains the base from the receiver database, so this is a storage-boundary integrity hardening issue rather than an HTTP bypass. | Remediated in migration 8: the result projection stores a domain-separated digest of the complete expected-base binding and replay requires an exact match; legacy rows without the digest fail closed. |
 | ADV-79 | P3 | Three public `sync` read routes force-unwrapped the request-derived `did` query entry. The strict parser currently guarantees the key, but a future parser change or bypass could turn malformed input into a process trap instead of `InvalidRequest`. | Remediated with explicit key guards and one typed `DID` parse per route. `PublicRepositoryReadHTTPTests` passed 12/12; no authorization or privacy bypass was reproduced. |
 | ADV-97 | P1 | Deactivation followed by reactivation updates `control.sqlite` but leaves the preopened public-read generation bound to the old `AccountControlAccount` (including its `updatedAt`). Public reads therefore remain unavailable after lifecycle reactivation. | Remediated with an existing-database-only async generation refresh that revalidates PLC identity, preparation intent, path identity, and the exact active control row before publication. A permanent regression covers status, description, record, and CAR reads after reactivation. |
+| ADV-98 | P2 | Portable archive verification bounded manifest/payload bytes but recursively materialized every filesystem entry into `String`/`Set` collections without a count or depth bound. An untrusted restore archive could exhaust memory or the call stack with extra empty entries before the expected-path mismatch was reported. | Remediated with a manifest file-count ceiling, exact expected-entry admission, bounded per-directory enumeration, and a 256-level recursion ceiling. The new archive-inventory regression passes. |
 
 ### Provenance limitation
 
@@ -1651,10 +1652,16 @@ The earlier storage candidates separate cleanly:
   pre-existing overflow in one transaction; that is a bounded migration-cost
   follow-up, not an unauthenticated sink for new requests.
 - `SwanPortableExport` no longer retains every artifact body in one aggregate
-  array; `StagedArtifactWriter` keeps files on disk and only retains metadata.
-  The export path nevertheless materializes the full inventory, repository
-  snapshots/CARs, and individual blob bodies. Without a hostile large-export
-  RSS gate, aggregate export boundedness is not proven (P2).
+  array; `StagedArtifactWriter` keeps files on disk and only retains bounded
+  inventory/manifest metadata. The repository CAR path now uses the SQLite
+  spool and the streaming two-root verifier, while CAS blob bodies are copied
+  and hashed in 64 KiB chunks. Inventory cardinality, per-artifact bytes, and
+  aggregate archive bytes are rejected before publication. The focused
+  `SwanPortableExportTests` selection passes 13/13 after this remediation.
+  Legacy SQLite blob rows remain a compatibility seam because SQLiteNIO still
+  selects that historical payload as one row before chunking; managed opens
+  migrate those rows on ordinary reads, but a hostile legacy-only RSS gate is
+  not claimed here.
 - The email timeout uses a structured task group. A deliberately
   non-cooperative `AccountEmailDelivery` can keep that group from returning
   after the timeout task wins. The durable five-minute send fence eventually
@@ -1792,3 +1799,57 @@ reverse-authority OAuth/browser/lifecycle matrix, corrupted-operation traffic,
 strict password-reset work-shape proof, non-cooperative email cancellation,
 aggregate export boundedness, and unavailable formal Codex Security launcher
 remain open. This review is not an alpha-completion sign-off.
+
+## Portable export boundedness remediation — 2026-08-01
+
+The export path was then hardened against the remaining aggregate-artifact
+finding. `prepareRepositoryCARSnapshot` supplies an owner-only SQLite spool;
+publication writes the reader envelope prefix and spool suffix directly to a
+descriptor-backed file. CAS blobs use the verified file body stream, and an
+incremental SHA-256 is recorded without retaining the payload. The staged
+archive verifier now parses permissioned CARs through
+`SpaceCARCodec.verifyStreamingRecovery` with a disposable SQLite recovery
+index, and streams blob verification through the same 64 KiB source. A
+descriptor identity/length check rejects replacement or growth during
+verification. A first implementation accidentally hashed the blob digest a
+second time; the focused test exposed it, and the corrected implementation is
+now green.
+
+Evidence:
+
+- `SWIFTPM_MAX_CONCURRENT_OPERATIONS=1 swift test --jobs 1 --scratch-path /tmp/swan-export-stream-20260801 --filter SwanPortableExportTests`: 13/13;
+- the focused exporter test exercises two permissioned CARs and public/space
+  blob namespace collisions through the new streaming verifier; and
+- no export staging or recovery scratch process remains after the run.
+
+This closes the current managed-CAS aggregate export seam. It does not close
+the separate legacy SQLite-row compatibility limitation, native-Linux RSS
+evidence, or the stock pinned-TypeScript and lifecycle gates listed above.
+
+## Adversarial rereview: portable archive inventory bounds — 2026-08-01
+
+The bounded-artifact remediation still left a filesystem-side admission gap.
+SwanPortableExportFilesystem.entries first collected every name in a
+directory and recursively descended every directory before the verifier
+compared the result with the manifest. Payload and archive byte limits did not
+bound this metadata work: a hostile restore tree could contain many empty
+files, or a deep chain of empty directories, and force unbounded String/Set
+growth or stack consumption without any CAR/blob bytes.
+
+The verifier now derives the exact expected file and directory count from the
+canonical manifest and passes that count into the inventory walk. Per-directory
+readdir is capped by the remaining budget, the manifest is capped at 200,002
+artifact entries (the current repository/blob inventory ceiling), and recursive
+descent rejects depth greater than 256. Operator-backup verification uses the
+same exact-count admission for both its portable subtree and outer tree.
+
+The focused regression creates an entry-budget overflow and a 257-level
+directory chain; both are rejected. The serialized export/restore/backup
+selection passes 29 tests after the change. A final serialized full-suite
+rerun also passed; the export target reported 42 tests with zero failures.
+This closes the archive metadata boundedness finding locally. Native-Linux RSS
+evidence, the legacy
+SQLite-row compatibility seam, stock pinned-TypeScript value-bearing
+incremental/full-CAR behavior, reverse-authority lifecycle/browser coverage,
+strict password-reset work-shape proof, non-cooperative email cancellation,
+and the formal security launcher remain open.

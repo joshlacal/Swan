@@ -436,6 +436,188 @@ enum SwanPortableExportFilesystem {
         }
     }
 
+    /// Opens a new owner-only regular file below `root` without exposing a
+    /// pathname to the caller.  The returned writer is intentionally
+    /// descriptor-backed so a portable export can copy arbitrarily large CAR
+    /// and blob bodies in bounded chunks instead of first assembling `Data`.
+    static func openStreamingWriter(
+        path: String,
+        root: Int32
+    ) throws -> StreamingWriter {
+        let components = try pathComponents(path)
+        var openedDirectories: [Int32] = []
+        var createdDirectoryParents: [Int32] = []
+        var current = root
+        do {
+            for component in components.dropLast() {
+                let created = component.withCString { mkdirat(current, $0, 0o700) }
+                guard created == 0 || errno == EEXIST else {
+                    throw SwanPortableExportError.publicationFailed
+                }
+                let child = try openDirectory(parent: current, name: component)
+                if created == 0 { createdDirectoryParents.append(current) }
+                openedDirectories.append(child)
+                current = child
+            }
+            let filename = components.last!
+            let descriptor = filename.withCString {
+                openat(
+                    current,
+                    $0,
+                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                    0o600
+                )
+            }
+            guard descriptor >= 0 else {
+                throw SwanPortableExportError.publicationFailed
+            }
+            var metadata = stat()
+            guard fchmod(descriptor, 0o600) == 0,
+                  fstat(descriptor, &metadata) == 0,
+                  (metadata.st_mode & S_IFMT) == S_IFREG,
+                  metadata.st_uid == geteuid(),
+                  metadata.st_nlink == 1,
+                  (metadata.st_mode & 0o777) == 0o600 else {
+                _ = close(descriptor)
+                _ = filename.withCString { unlinkat(current, $0, 0) }
+                throw SwanPortableExportError.publicationFailed
+            }
+            return StreamingWriter(
+                descriptor: descriptor,
+                parentDescriptor: current,
+                filename: filename,
+                openedDirectories: openedDirectories,
+                createdDirectoryParents: createdDirectoryParents
+            )
+        } catch {
+            for descriptor in openedDirectories.reversed() { _ = close(descriptor) }
+            throw error
+        }
+    }
+
+    /// Opens an existing owner-only regular file for bounded streaming reads.
+    static func openStreamingReader(path: String, root: Int32) throws -> Int32 {
+        let components = try pathComponents(path)
+        var openedDirectories: [Int32] = []
+        var current = root
+        do {
+            for component in components.dropLast() {
+                let child = try openDirectory(parent: current, name: component)
+                openedDirectories.append(child)
+                current = child
+            }
+            let descriptor = components.last!.withCString {
+                openat(current, $0, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+            }
+            guard descriptor >= 0 else {
+                throw SwanPortableExportError.invalidArchive
+            }
+            var metadata = stat()
+            guard fstat(descriptor, &metadata) == 0,
+                  (metadata.st_mode & S_IFMT) == S_IFREG,
+                  metadata.st_uid == geteuid(),
+                  metadata.st_nlink == 1,
+                  (metadata.st_mode & 0o777) == 0o600 else {
+                _ = close(descriptor)
+                throw SwanPortableExportError.invalidArchive
+            }
+            for directory in openedDirectories.reversed() { _ = close(directory) }
+            return descriptor
+        } catch {
+            for descriptor in openedDirectories.reversed() { _ = close(descriptor) }
+            throw error
+        }
+    }
+
+    /// A descriptor-backed export file.  It owns the descriptor and removes a
+    /// partial file if the producer fails or is cancelled.
+    final class StreamingWriter: @unchecked Sendable {
+        private let descriptor: Int32
+        private let parentDescriptor: Int32
+        private let filename: String
+        private let openedDirectories: [Int32]
+        private let createdDirectoryParents: [Int32]
+        private var finished = false
+        private var descriptorClosed = false
+        private var directoriesClosed = false
+
+        init(
+            descriptor: Int32,
+            parentDescriptor: Int32,
+            filename: String,
+            openedDirectories: [Int32],
+            createdDirectoryParents: [Int32]
+        ) {
+            self.descriptor = descriptor
+            self.parentDescriptor = parentDescriptor
+            self.filename = filename
+            self.openedDirectories = openedDirectories
+            self.createdDirectoryParents = createdDirectoryParents
+        }
+
+        deinit {
+            if !finished { abort() }
+        }
+
+        func write(_ data: Data) throws {
+            guard !finished else { throw SwanPortableExportError.publicationFailed }
+            try data.withUnsafeBytes { bytes in
+                var offset = 0
+                while offset < bytes.count {
+                    let count = systemWrite(
+                        descriptor,
+                        bytes.baseAddress!.advanced(by: offset),
+                        bytes.count - offset
+                    )
+                    if count < 0, errno == EINTR { continue }
+                    guard count > 0 else {
+                        throw SwanPortableExportError.publicationFailed
+                    }
+                    offset += count
+                }
+            }
+        }
+
+        func finish() throws {
+            guard !finished else { return }
+            guard fsync(descriptor) == 0 else {
+                throw SwanPortableExportError.publicationFailed
+            }
+            guard close(descriptor) == 0 else {
+                throw SwanPortableExportError.publicationFailed
+            }
+            descriptorClosed = true
+            guard fsync(parentDescriptor) == 0 else {
+                throw SwanPortableExportError.publicationFailed
+            }
+            for directory in createdDirectoryParents.reversed() {
+                try Self.synchronizeParent(directory)
+            }
+            finished = true
+            closeOpenedDirectories()
+        }
+
+        func abort() {
+            guard !finished else { return }
+            finished = true
+            if !descriptorClosed { _ = close(descriptor) }
+            _ = filename.withCString { unlinkat(parentDescriptor, $0, 0) }
+            closeOpenedDirectories()
+        }
+
+        private func closeOpenedDirectories() {
+            guard !directoriesClosed else { return }
+            directoriesClosed = true
+            for directory in openedDirectories.reversed() { _ = close(directory) }
+        }
+
+        private static func synchronizeParent(_ descriptor: Int32) throws {
+            guard fsync(descriptor) == 0 else {
+                throw SwanPortableExportError.publicationFailed
+            }
+        }
+    }
+
     static func read(
         path: String,
         root: Int32,
@@ -501,9 +683,21 @@ enum SwanPortableExportFilesystem {
         return data
     }
 
-    static func entries(root: Int32) throws -> Entries {
+    static func entries(
+        root: Int32,
+        maximumEntries: Int = SwanPortableExportManifest.maximumFileCount + 8
+    ) throws -> Entries {
+        guard maximumEntries >= 0 else {
+            throw SwanPortableExportError.invalidArchive
+        }
         var entries = Entries()
-        try collectEntries(root: root, prefix: "", entries: &entries)
+        try collectEntries(
+            root: root,
+            prefix: "",
+            entries: &entries,
+            maximumEntries: maximumEntries,
+            depth: 0
+        )
         return entries
     }
 
@@ -837,9 +1031,23 @@ enum SwanPortableExportFilesystem {
     private static func collectEntries(
         root: Int32,
         prefix: String,
-        entries: inout Entries
+        entries: inout Entries,
+        maximumEntries: Int,
+        depth: Int
     ) throws {
-        for name in try directoryEntryNames(root) {
+        // Generated archives are only a few levels deep. Reject a hostile
+        // tree before recursive descent can consume the process stack.
+        guard depth <= 256 else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        let remaining = maximumEntries - entries.files.count - entries.directories.count
+        guard remaining >= 0 else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        for name in try directoryEntryNames(root, maximumCount: remaining) {
+            guard entries.files.count + entries.directories.count < maximumEntries else {
+                throw SwanPortableExportError.invalidArchive
+            }
             let path = prefix.isEmpty ? name : "\(prefix)/\(name)"
             var metadata = stat()
             guard name.withCString({
@@ -853,7 +1061,13 @@ enum SwanPortableExportFilesystem {
                 let child = try openDirectory(parent: root, name: name)
                 defer { _ = close(child) }
                 entries.directories.insert(path)
-                try collectEntries(root: child, prefix: path, entries: &entries)
+                try collectEntries(
+                    root: child,
+                    prefix: path,
+                    entries: &entries,
+                    maximumEntries: maximumEntries,
+                    depth: depth + 1
+                )
             case S_IFREG:
                 guard metadata.st_nlink == 1,
                       (metadata.st_mode & 0o777) == 0o600 else {
@@ -866,7 +1080,10 @@ enum SwanPortableExportFilesystem {
         }
     }
 
-    private static func directoryEntryNames(_ descriptor: Int32) throws -> [String] {
+    private static func directoryEntryNames(
+        _ descriptor: Int32,
+        maximumCount: Int? = nil
+    ) throws -> [String] {
         let inventoryDescriptor = openat(
             descriptor,
             ".",
@@ -896,6 +1113,9 @@ enum SwanPortableExportFilesystem {
             }
             if name != ".", name != ".." {
                 guard isSafeComponent(name) else {
+                    throw SwanPortableExportError.invalidArchive
+                }
+                if let maximumCount, names.count >= maximumCount {
                     throw SwanPortableExportError.invalidArchive
                 }
                 names.append(name)

@@ -1523,6 +1523,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     static let maximumSimpleSpaceManagingAppDecisions =
         SimpleSpaceLimits.maximumManagingAppDecisionsPerSpace
 
+    /// Portable export is an operator action, but its inventory must still be
+    /// bounded before any repository/blob payload is opened. These ceilings
+    /// are deliberately below the CAR/index admission limits and make the
+    /// metadata arrays returned by the legacy inventory API a fixed-size
+    /// projection rather than an attacker-controlled allocation.
+    public static let maximumPortableExportRepositories = 100_000
+    public static let maximumPortableExportBlobs = 100_000
+
     let connection: SQLiteConnection
     let connectionGate = SQLiteConnectionGate()
     let dataDirectory: URL
@@ -3286,6 +3294,18 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     public func portableExportInventory() async throws -> SQLitePortableExportInventory {
         try await withConnectionGate {
             try await readTransaction {
+                let repositoryCountRows = try await connection.query(
+                    "SELECT COUNT(*) AS row_count FROM permissioned_repository_state"
+                )
+                guard repositoryCountRows.count == 1,
+                      case let .integer(repositoryCount) =
+                          repositoryCountRows[0].column("row_count"),
+                      (0 ... Self.maximumPortableExportRepositories)
+                          .contains(repositoryCount) else {
+                    throw SwanError.unavailable(
+                        "portable export repository inventory exceeds its bound"
+                    )
+                }
                 let repositoryRows = try await connection.query(
                     """
                     SELECT space_uri, author_did
@@ -3323,6 +3343,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     ORDER BY namespace_kind, space_uri, cid
                     """
                 )
+                guard blobRows.count <= Self.maximumPortableExportBlobs else {
+                    throw SwanError.unavailable(
+                        "portable export blob inventory exceeds its bound"
+                    )
+                }
                 let blobs = try blobRows.map { row in
                     let cid = try requiredText(row, "cid")
                     let kind = try requiredText(row, "namespace_kind")
@@ -6188,6 +6213,57 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             spaceURI: columns.spaceURI
         )
         return try await materializeBlobData(stored)
+    }
+
+    /// Streams one already-reachable blob without turning the export path
+    /// into a whole-payload `Data` allocation. CAS-v1 blobs use the same
+    /// descriptor-backed body as HTTP. Legacy SQLite rows are still selected
+    /// by SQLite as one row (they are migrated by normal write opens), but are
+    /// delivered to the caller in fixed-size chunks and remain subject to the
+    /// caller's aggregate byte bound.
+    public func streamBlobData(
+        for reference: BlobReference,
+        maximumBytes: Int,
+        consume: @escaping @Sendable (Data) async throws -> Void
+    ) async throws {
+        guard maximumBytes >= 0 else {
+            throw SwanError.malformed("blob export limit is invalid")
+        }
+        let columns = blobNamespaceColumns(reference.namespace)
+        let stored = try await blobPayload(
+            cid: reference.cid,
+            namespaceKind: columns.kind,
+            spaceURI: columns.spaceURI
+        )
+        guard stored.byteCount <= maximumBytes else {
+            throw SwanError.unavailable("blob exceeds export limits")
+        }
+        switch stored.storageKind {
+        case .legacySQLite:
+            guard let payload = stored.legacyPayload,
+                  payload.count == stored.byteCount,
+                  legacyBlobCID(payload) == stored.cid else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "invalid legacy blob payload"
+                )
+            }
+            var offset = 0
+            while offset < payload.count {
+                try Task.checkCancellation()
+                let end = min(
+                    offset + SpaceCARBodySpool.maximumChunkBytes,
+                    payload.count
+                )
+                try await consume(Data(payload[offset ..< end]))
+                offset = end
+            }
+        case .casV1:
+            let body = try await fileBackedBlobBody(stored)
+            try await body.streamBody(
+                maximumChunkBytes: SpaceCARBodySpool.maximumChunkBytes,
+                consume: consume
+            )
+        }
     }
 
     public func publicBlobData(cid: String) async throws -> Data? {
