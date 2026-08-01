@@ -2346,7 +2346,8 @@ extension SwanCommand {
             abstract: "Inspect or manage a provisioned Swan account",
             subcommands: [
                 InstallLocal.self, PreparePLC.self, ActivatePLC.self, RotatePLC.self, Show.self,
-                Deactivate.self, Reactivate.self, DeclareExport.self, Delete.self,
+                RecoveryCommitKey.self, Deactivate.self, Reactivate.self, DeclareExport.self,
+                Delete.self,
             ]
         )
 
@@ -2972,6 +2973,92 @@ extension SwanCommand {
                     try await service.show(lookup)
                 }
                 try AccountCommandSupport.write(view)
+            }
+        }
+
+        /// Exposes only the public P-256 verification bytes that the
+        /// permissioned recovery laboratory needs to authenticate a member's
+        /// repository commits. The key is not read from an unauthenticated PLC
+        /// endpoint: it is derived from the account's durable, signed PLC
+        /// history after validating the DID-derived controller, canonical CID
+        /// chain, rotation signatures, and exact `atproto` signing-method
+        /// binding. Account key envelopes and private signing material are
+        /// intentionally never opened by this read-only command.
+        struct RecoveryCommitKey: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "recovery-commit-key",
+                abstract: "Print the verified public ES256 repository commit key for one active account"
+            )
+
+            @Option(name: .long, help: "Required Swan data directory containing control.sqlite")
+            var dataDirectory: String
+
+            @Option(name: .long, help: "Active managed account DID")
+            var did: String
+
+            func run() async throws {
+                guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw ValidationError("--data-directory must not be empty")
+                }
+                let canonicalDID: String
+                do {
+                    canonicalDID = try AccountIdentifiers.validateDID(did)
+                } catch {
+                    throw ValidationError("--did is not a canonical DID")
+                }
+                let dataURL = URL(fileURLWithPath: dataDirectory)
+                let control: SQLiteControlDatabase
+                do {
+                    control = try await SQLiteControlDatabase(dataDirectory: dataURL)
+                } catch {
+                    throw ValidationError("unable to open Swan control database")
+                }
+                do {
+                    guard let account = try await control.account(did: canonicalDID) else {
+                        throw ValidationError("account is not managed by this Swan data directory")
+                    }
+                    guard account.status.authorizesAccount else {
+                        throw ValidationError("account is not active")
+                    }
+                    try await control.close()
+                } catch {
+                    try? await control.close()
+                    throw error
+                }
+
+                let database: SQLiteAccountDatabase
+                do {
+                    database = try await SQLiteAccountDatabase(
+                        dataDirectory: dataURL,
+                        did: canonicalDID,
+                        openMode: .existingPortableExportSource
+                    )
+                } catch {
+                    throw ValidationError("unable to open managed account identity history")
+                }
+                do {
+                    let history = try await database.publicPLCOperationHistory()
+                    let identity = try SwanPublicPLCGenesisVerifier().verifyIdentityHistory(
+                        history,
+                        expectedDID: canonicalDID
+                    )
+                    guard case let .p256(publicKey) = try PLCDIDKeyCodec.decode(
+                        identity.signingDIDKey
+                    ) else {
+                        throw ValidationError("verified atproto signing method is not ES256")
+                    }
+                    try await database.close()
+                    // This is deliberately a bare public value, rather than a
+                    // JSON account projection: the caller receives no DID,
+                    // handle, key generation, path, or private-key metadata.
+                    print("ES256:" + publicKey.x963Representation.base64URLEncodedString())
+                } catch let error as ValidationError {
+                    try? await database.close()
+                    throw error
+                } catch {
+                    try? await database.close()
+                    throw ValidationError("verified account PLC identity is unavailable")
+                }
             }
         }
 

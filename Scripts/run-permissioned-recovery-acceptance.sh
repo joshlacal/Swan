@@ -19,6 +19,9 @@ image_tag=""
 normal_swan_id=""
 normal_stopped=0
 recovery_container=""
+runner_container=""
+runner_pid=""
+operation_deadline=0
 temporary_directory=""
 data_volume=""
 runtime_secrets_volume=""
@@ -82,7 +85,7 @@ mount_name() {
 wait_for_loopback_health() {
   local container="$1"
   local label="$2"
-  local deadline=$((SECONDS + wait_timeout))
+  local deadline="${3:-$((SECONDS + wait_timeout))}"
   while ((SECONDS < deadline)); do
     if docker exec "$container" \
       curl --fail --silent --show-error --max-time 2 \
@@ -104,7 +107,7 @@ wait_for_loopback_health() {
 
 wait_for_caddy_health() {
   local label="$1"
-  local deadline=$((SECONDS + wait_timeout))
+  local deadline="${2:-$((SECONDS + wait_timeout))}"
   while ((SECONDS < deadline)); do
     if docker run --rm \
       --network "$network_name" \
@@ -126,6 +129,15 @@ wait_for_caddy_health() {
 }
 
 restore_normal_swan() {
+  local restore_deadline=$((SECONDS + wait_timeout))
+  if [[ -n "$runner_container" ]]; then
+    docker rm --force "$runner_container" >/dev/null 2>&1 || true
+    if [[ -n "$runner_pid" ]]; then
+      wait "$runner_pid" >/dev/null 2>&1 || true
+      runner_pid=""
+    fi
+    runner_container=""
+  fi
   if [[ -n "$recovery_container" ]]; then
     docker rm --force "$recovery_container" >/dev/null 2>&1 || true
     recovery_container=""
@@ -136,15 +148,18 @@ restore_normal_swan() {
     docker start "$normal_swan_id" >/dev/null
   fi
   normal_stopped=0
-  wait_for_loopback_health "$normal_swan_id" "restored normal Swan"
-  wait_for_caddy_health "restored normal Swan"
+  wait_for_loopback_health "$normal_swan_id" "restored normal Swan" "$restore_deadline"
+  wait_for_caddy_health "restored normal Swan" "$restore_deadline"
 }
 
 cleanup() {
   local result=$?
-  trap - EXIT INT TERM HUP
+  # Once cleanup begins, follow-on termination signals must not interrupt the
+  # restoration of the exact original Swan container.
+  trap - EXIT
+  trap '' INT TERM HUP
   set +e
-  if [[ -n "$recovery_container" || $normal_stopped -eq 1 ]]; then
+  if [[ -n "$runner_container" || -n "$recovery_container" || $normal_stopped -eq 1 ]]; then
     if ! restore_normal_swan; then
       echo "failed to restore the exact normal Swan container ${normal_swan_id}" >&2
       result=1
@@ -258,6 +273,11 @@ chmod 700 "$temporary_directory"
 runner_artifact="${temporary_directory}/artifact.json"
 printf '%s\n' 'temporary-server-starting' > "${temporary_directory}/stage.txt"
 recovery_container="${project_name}-permissioned-recovery-${PPID}-$$"
+runner_container="${project_name}-permissioned-recovery-runner-${PPID}-$$"
+# This deadline covers the disruptive replacement and the named runner. It is
+# derived directly from the user-bounded 1...600 second timeout; cleanup gets
+# its own equally bounded restoration window after the runner is stopped.
+operation_deadline=$((SECONDS + wait_timeout))
 
 # No host port is published. Reusing the exact former Swan IP makes Caddy's
 # already-resolved upstream target deterministic while the normal container is
@@ -302,15 +322,16 @@ docker run --detach \
   --email-smtp-host mailpit \
   --email-smtp-port 1025 \
   >/dev/null
-wait_for_loopback_health "$recovery_container" "retention-2 Swan"
-wait_for_caddy_health "retention-2 Swan"
+wait_for_loopback_health "$recovery_container" "retention-2 Swan" "$operation_deadline"
+wait_for_caddy_health "retention-2 Swan" "$operation_deadline"
 printf '%s\n' 'temporary-server-healthy' > "${temporary_directory}/stage.txt"
 echo "permissioned recovery acceptance: temporary retention-2 Swan is healthy"
 
-# The runner derives the repository author's public P-256 key from the live
-# PLC DID document. It checks base58btc canonicality and the exact uncompressed
-# X9.63 shape before exposing a base64url public verification key only to the
-# recovery CLI environment. No account-key envelope or private scalar is read.
+# The runner obtains the repository author's public P-256 key from Swan's
+# durable signed PLC history through `account recovery-commit-key`. That narrow
+# command verifies the DID/controller, CID chain, rotations, and exact atproto
+# method binding before it prints public verification bytes; it never opens an
+# account-key envelope or exposes private signing material.
 # A fresh bounded key makes a retained Compose volume repeatable without
 # retaining a selector in the artifact or diagnostic marker. The authority
 # DID remains derived from account show; only this non-secret selector varies.
@@ -322,7 +343,7 @@ space_uri="at://${authority_did}/space/app.bsky.bookmarks/${space_skey}"
 collection="app.bsky.feed.post"
 client_id="http://localhost?scope=atproto%20space%3Aapp.bsky.bookmarks%3Fauthority%3D${authority_did}%26skey%3D${space_skey}%26action%3Dread%20space%3Aapp.bsky.bookmarks%3Fauthority%3D${authority_did}%26skey%3D${space_skey}%26action%3Dcreate%26collection%3D${collection}&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"
 
-docker run --rm -i \
+docker run --name "$runner_container" -i \
   --network "$network_name" \
   --read-only \
   --tmpfs /tmp:size=64m,mode=1777 \
@@ -334,7 +355,7 @@ docker run --rm -i \
   "$image_tag" \
   -s -- \
   "$space_uri" "$member_did" "$collection" "$client_id" \
-  "$member_handle" "$authority_handle" "$authority_did" "$space_skey" <<'RUNNER'
+  "$member_handle" "$authority_handle" "$authority_did" "$space_skey" <<'RUNNER' &
 set -euo pipefail
 umask 077
 export HOME=/tmp
@@ -367,61 +388,8 @@ diagnostic_code() {
   esac
 }
 stage key-derivation-start
-
-curl --fail --silent --show-error --max-time 10 \
-  "http://reference-plc:2582/${member_did}" >/tmp/member-plc.json
-SWAN_LAB_PERMISSIONED_COMMIT_KEY="$(swift - <<'SWIFT'
-import Foundation
-
-let alphabet = Array("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".utf8)
-let index = Dictionary(uniqueKeysWithValues: alphabet.enumerated().map { ($0.element, $0.offset) })
-func decode(_ text: String) -> [UInt8]? {
-    var bytes: [UInt8] = []
-    let leadingZeroes = text.utf8.prefix { $0 == alphabet[0] }.count
-    for scalar in text.utf8 {
-        guard let value = index[scalar] else { return nil }
-        var carry = value
-        for offset in bytes.indices.reversed() {
-            let combined = Int(bytes[offset]) * 58 + carry
-            bytes[offset] = UInt8(combined & 0xff)
-            carry = combined >> 8
-        }
-        while carry > 0 { bytes.insert(UInt8(carry & 0xff), at: 0); carry >>= 8 }
-    }
-    bytes.insert(contentsOf: repeatElement(0, count: leadingZeroes), at: 0)
-    return bytes
-}
-func encode(_ input: [UInt8]) -> String {
-    var value = input
-    var output: [UInt8] = []
-    var start = 0
-    while start < value.count && value[start] == 0 { start += 1 }
-    let zeroes = start
-    while start < value.count {
-        var remainder = 0
-        for offset in start..<value.count {
-            let combined = remainder * 256 + Int(value[offset])
-            value[offset] = UInt8(combined / 58)
-            remainder = combined % 58
-        }
-        output.append(alphabet[remainder])
-        while start < value.count && value[start] == 0 { start += 1 }
-    }
-    output.append(contentsOf: repeatElement(alphabet[0], count: zeroes))
-    return String(bytes: output.reversed(), encoding: .utf8)!
-}
-let root = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: "/tmp/member-plc.json")))
-guard let object = root as? [String: Any],
-      let methods = object["verificationMethod"] as? [[String: Any]],
-      let encoded = methods.first?["publicKeyMultibase"] as? String,
-      encoded.first == "z",
-      let bytes = decode(String(encoded.dropFirst())),
-      bytes.count == 65, bytes.first == 0x04,
-      encode(bytes) == String(encoded.dropFirst()) else { exit(1) }
-let b64 = Data(bytes).base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
-print("ES256:" + b64)
-SWIFT
- )"
+SWAN_LAB_PERMISSIONED_COMMIT_KEY="$(/usr/local/bin/swan account recovery-commit-key \
+  --data-directory /var/lib/swan/data --did "$member_did")"
 case "$SWAN_LAB_PERMISSIONED_COMMIT_KEY" in ES256:*) ;; *) exit 1;; esac
 export SWAN_LAB_PERMISSIONED_COMMIT_KEY
 stage key-derived
@@ -536,60 +504,39 @@ PY
 unset earliest_tid SWAN_LAB_PERMISSIONED_COMMIT_KEY SWAN_LAB_PRODUCER_PASSWORD SWAN_LAB_CONSUMER_PASSWORD
 RUNNER
 
-if ! artifact_validation="$(python3 - "$runner_artifact" <<'PY'
-import json
-import os
-import re
-import stat
-import sys
-
-path = sys.argv[1]
-def fail(code):
-    print(code)
-    raise SystemExit(1)
-
-if stat.S_IMODE(os.stat(path).st_mode) != 0o600:
-    fail("mode")
-with open(path, encoding="utf-8") as source:
-    artifact = json.load(source)
-expected = {
-    "scenario", "profileID", "gapStatus", "gapErrorCode", "priorHeadPresent",
-    "validHeadGeneration", "validHeadRevision", "validCommitment", "validRecordCount",
-    "corruptionRejected", "corruptErrorCode", "finalHeadGeneration", "finalHeadRevision",
-    "finalCommitment", "lastValidHeadPreserved", "status", "errorCode", "fixturePolicy",
+runner_pid=$!
+wait_for_runner() {
+  while kill -0 "$runner_pid" >/dev/null 2>&1; do
+    if ((SECONDS >= operation_deadline)); then
+      printf '%s\n' 'runner-timeout' > "${temporary_directory}/stage.txt"
+      docker rm --force "$runner_container" >/dev/null 2>&1 || true
+      wait "$runner_pid" >/dev/null 2>&1 || true
+      runner_pid=""
+      runner_container=""
+      return 124
+    fi
+    sleep 1
+  done
+  if ! wait "$runner_pid"; then
+    docker rm --force "$runner_container" >/dev/null 2>&1 || true
+    runner_pid=""
+    runner_container=""
+    return 1
+  fi
+  docker rm "$runner_container" >/dev/null 2>&1 || true
+  runner_pid=""
+  runner_container=""
 }
-required = {
-    "scenario", "profileID", "priorHeadPresent", "corruptionRejected",
-    "lastValidHeadPreserved", "status", "fixturePolicy",
-}
-if not set(artifact).issubset(expected) or not required.issubset(artifact):
-    fail("fields")
-if artifact["status"] != "passed" or artifact["gapStatus"] != 409:
-    fail("status")
-if artifact["gapErrorCode"] != "full_repo_recovery_required":
-    fail("gap")
-if artifact["corruptErrorCode"] != "CARBlockCIDMismatch" or not artifact["corruptionRejected"]:
-    fail("corruption")
-if not artifact["lastValidHeadPreserved"]:
-    fail("preserved")
-if artifact["validHeadGeneration"] != artifact["finalHeadGeneration"] \
-        or artifact["validHeadRevision"] != artifact["finalHeadRevision"] \
-        or artifact["validCommitment"] != artifact["finalCommitment"]:
-    fail("head")
-if not isinstance(artifact["validRecordCount"], int) or artifact["validRecordCount"] < 1:
-    fail("records")
-if not re.fullmatch(r"[0-9a-f]{64}", artifact["validCommitment"] or ""):
-    fail("commitment")
-if not re.fullmatch(r"[a-z2-7]{13}", artifact["validHeadRevision"] or ""):
-    fail("revision")
-if artifact.get("errorCode") is not None:
-    fail("error")
-if artifact["fixturePolicy"] != "semantic-summary-only; no DIDs, space URIs, paths, request identities, verifier material, credentials, tokens, DPoP proofs, record values, or raw LtHash state":
-    fail("policy")
-PY
- )"; then
+
+if ! wait_for_runner; then
+  [[ -f "${temporary_directory}/stage.txt" ]] || \
+    printf '%s\n' 'runner-failed-pre-artifact' > "${temporary_directory}/stage.txt"
+  exit 1
+fi
+
+if ! artifact_validation="$(python3 "$root/Scripts/validate-permissioned-recovery-artifact.py" "$runner_artifact")"; then
   case "$artifact_validation" in
-    mode|fields|status|gap|corruption|preserved|head|records|commitment|revision|error|policy)
+    mode|fields|scenario|profile|status|gap|corruption|preserved|head|records|commitment|revision|error|policy)
       printf 'host-artifact-validation-%s\n' "$artifact_validation" > "${temporary_directory}/stage.txt"
       ;;
     *)
