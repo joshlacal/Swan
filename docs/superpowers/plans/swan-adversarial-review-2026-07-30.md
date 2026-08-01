@@ -2023,9 +2023,10 @@ Evidence:
 
 This closes the remaining public-admission whole-MST retention seam locally.
 The separate non-admission compatibility validators and the explicitly
-bounded public CAR writer remain unchanged. Native-Linux execution of this
-new source revision, full Linux/RSS receipts, stock pinned-TypeScript
-value-bearing incremental/full-CAR behavior, reverse-authority
+bounded public CAR writer remain unchanged. A full Linux XCTest receipt still
+remains open; the focused current-source and opt-in bounded-transfer Linux
+receipts are recorded below. Stock pinned-TypeScript value-bearing
+incremental/full-CAR behavior, reverse-authority
 browser/lifecycle coverage, corrupted-operation and compaction-gap traffic,
 strict password-reset work-shape proof, and the unavailable formal security
 launcher remain release gates.
@@ -2041,3 +2042,22 @@ The XCTest platform remained `aarch64-unknown-linux-gnu`. The repeated
 `cd` diagnostics from `limactl shell` refer only to the host working-directory
 forwarding and did not affect the VM command; the source rsync and both test
 invocations completed successfully.
+
+The remaining native-Linux opt-in transfer gates were then run serially from
+that same warmed SwiftPM scratch path. All passed on `aarch64-unknown-linux-gnu`:
+
+- public CAR spool RSS: 1/1, 270,049,433 bytes streamed, RSS delta
+  56,385,536 bytes;
+- public production-directory getRepo: 1/1 in 10.811 seconds;
+- staged 256 MiB CAR import: 1/1 in 6.584 seconds;
+- permissioned near-256 MiB getRepo: 1/1, CAR 267,396,722 bytes, 65,536-byte
+  maximum chunks, integrity and over-limit rejection verified, peak RSS
+  increase 62,320,640 bytes;
+- permissioned maximum-cardinality recovery index: 1/1, logical 6,600,000
+  bytes and 20,770,816 bytes scratch, RSS delta 55,218,176 bytes;
+- private CAR spool stress: 1/1; and
+- private CAS blob streaming: 1/1 in 0.332 seconds.
+
+These close the current native-Linux bounded-transfer receipt for the tested
+selectors. They do not constitute a full Linux XCTest run or close the live
+stock-reference semantic/recovery and lifecycle gates.
