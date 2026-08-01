@@ -59,6 +59,87 @@ if rg -n 'docker[[:space:]]+compose[[:space:]]+(up|down|stop|restart|rm|build)' 
   exit 1
 fi
 
+extract_function() {
+  local function_name="$1"
+  awk -v function_name="$function_name" '
+    $0 ~ "^" function_name "\\(\\)" { printing = 1 }
+    printing { print }
+    printing && /^}/ { exit }
+  ' "$runner"
+}
+
+capture_function="$(extract_function capture_runner_id)"
+matcher_function="$(extract_function runner_id_matches_cleanup_nonce)"
+[[ -n "$capture_function" && -n "$matcher_function" ]] || {
+  echo "runner ID capture functions were not found" >&2
+  exit 1
+}
+mock_docker_directory="${temporary_directory}/mock-docker"
+mkdir -p "$mock_docker_directory"
+python3 - "${mock_docker_directory}/docker" <<'PY'
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.write_text("""#!/usr/bin/env bash
+set -euo pipefail
+case \"$1\" in
+  inspect)
+    printf '%s /%s %s\\n' \"${MOCK_ID}\" \"${RUNNER_CONTAINER}\" \"${MOCK_LABEL}\"
+    ;;
+  *) exit 64 ;;
+esac
+""", encoding="utf-8")
+os.chmod(path, 0o700)
+PY
+
+assert_lost_stdout_capture() {
+  local observed_label="$1"
+  local expected_status="$2"
+  local nonce="0123456789abcdef0123456789abcdef"
+  local candidate="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  local result
+  if result="$(
+    MOCK_LABEL="$observed_label" \
+    MOCK_ID="$candidate" \
+    RUNNER_CAPTURE_FUNCTION="$capture_function" \
+    RUNNER_MATCHER_FUNCTION="$matcher_function" \
+    PATH="${mock_docker_directory}:$PATH" \
+    bash -c '
+      set -euo pipefail
+      eval "$RUNNER_MATCHER_FUNCTION"
+      eval "$RUNNER_CAPTURE_FUNCTION"
+      runner_id=""
+      runner_id_file="$1"
+      runner_container="task45-lost-stdout-runner"
+      runner_cleanup_nonce="$2"
+      export RUNNER_CONTAINER="$runner_container"
+      if capture_runner_id; then
+        printf "%s" "$runner_id"
+      else
+        exit 1
+      fi
+    ' bash "${temporary_directory}/missing-runner.id" "$nonce"
+  )"; then
+    [[ "$expected_status" == accepted && "$result" == "$candidate" ]] || {
+      echo "lost-stdout capture accepted an unexpected lifecycle object" >&2
+      exit 1
+    }
+  else
+    [[ "$expected_status" == rejected ]] || {
+      echo "lost-stdout capture rejected its exact matching lifecycle object" >&2
+      exit 1
+    }
+  fi
+}
+
+# Exercise the real capture functions with a missing stdout-ID file. The exact
+# name plus matching label is accepted; a label mismatch fails closed. Docker
+# container names are unique, so an exact-name inspect cannot be ambiguous.
+assert_lost_stdout_capture 0123456789abcdef0123456789abcdef accepted
+assert_lost_stdout_capture ffffffffffffffffffffffffffffffff rejected
+
 good_artifact="${temporary_directory}/good.json"
 python3 - "$good_artifact" <<'PY'
 import json

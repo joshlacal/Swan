@@ -22,6 +22,7 @@ recovery_container=""
 runner_container=""
 runner_id=""
 runner_id_file=""
+runner_cleanup_nonce=""
 runner_cleanup_armed=0
 runner_pid=""
 operation_deadline=0
@@ -133,13 +134,47 @@ wait_for_caddy_health() {
 
 capture_runner_id() {
   local candidate
-  if [[ -n "$runner_id" ]]; then
+  local identity
+  local count
+  if [[ -n "$runner_id" ]] && runner_id_matches_cleanup_nonce "$runner_id"; then
     return 0
   fi
-  [[ -n "$runner_id_file" && -f "$runner_id_file" ]] || return 1
-  candidate="$(tr -d '\r\n' < "$runner_id_file")"
-  [[ "$candidate" =~ ^[a-f0-9]{64}$ ]] || return 1
+  if [[ -n "$runner_id_file" && -f "$runner_id_file" ]]; then
+    candidate="$(tr -d '\r\n' < "$runner_id_file")"
+    if runner_id_matches_cleanup_nonce "$candidate"; then
+      runner_id="$candidate"
+      return 0
+    fi
+  fi
+
+  # A daemon can create the object but the attached client can be interrupted
+  # before stdout reaches runner.id. Recover only the exact precomputed name,
+  # and only if its fresh non-secret nonce label matches this process.
+  identity="$(docker inspect \
+    --format '{{.Id}} {{.Name}} {{index .Config.Labels "com.swan.task45.cleanup-nonce"}}' \
+    "$runner_container" 2>/dev/null || true)"
+  count="$(printf '%s\n' "$identity" | awk 'NF { count += 1 } END { print count + 0 }')"
+  [[ "$count" == 1 ]] || return 1
+  candidate="$(printf '%s\n' "$identity" | awk 'NF { print $1; exit }')"
+  runner_id_matches_cleanup_nonce "$candidate" || return 1
   runner_id="$candidate"
+}
+
+runner_id_matches_cleanup_nonce() {
+  local candidate="$1"
+  local identity
+  local actual_id
+  local actual_name
+  local actual_nonce
+  [[ "$candidate" =~ ^[a-f0-9]{64}$ ]] || return 1
+  [[ "$runner_cleanup_nonce" =~ ^[a-f0-9]{32}$ ]] || return 1
+  identity="$(docker inspect \
+    --format '{{.Id}} {{.Name}} {{index .Config.Labels "com.swan.task45.cleanup-nonce"}}' \
+    "$candidate" 2>/dev/null || true)"
+  read -r actual_id actual_name actual_nonce <<< "$identity"
+  [[ "$actual_id" == "$candidate" ]] \
+    && [[ "$actual_name" == "/${runner_container}" ]] \
+    && [[ "$actual_nonce" == "$runner_cleanup_nonce" ]]
 }
 
 remove_runner() {
@@ -386,9 +421,15 @@ wait_for_runner() {
 # signal lands between `docker create` and shell assignment/start.
 runner_script="${temporary_directory}/runner.sh"
 runner_id_file="${temporary_directory}/runner.id"
+runner_cleanup_nonce="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+[[ "$runner_cleanup_nonce" =~ ^[a-f0-9]{32}$ ]] || {
+  echo "runner cleanup nonce generation failed" >&2
+  exit 1
+}
 install -m 0700 "$root/Scripts/permissioned-recovery-runner.sh" "$runner_script"
 runner_cleanup_armed=1
 docker create --name "$runner_container" -i \
+  --label "com.swan.task45.cleanup-nonce=${runner_cleanup_nonce}" \
   --network "$network_name" \
   --read-only \
   --tmpfs /tmp:size=64m,mode=1777 \
