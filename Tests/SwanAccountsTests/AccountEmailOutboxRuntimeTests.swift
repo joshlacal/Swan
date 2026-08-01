@@ -204,6 +204,28 @@ final class AccountEmailOutboxRuntimeTests: XCTestCase {
         }
     }
 
+    func testRecoveryRejectsUnverifiedDeliveryCancellationContract() async throws {
+        let fixture = try await RuntimeFixture(testCase: self)
+        addTeardownBlock { try? await fixture.database.close(); fixture.cleanup() }
+        let codec = AccountEmailProofCodec(
+            key: try AccountEmailProofKey(Data(repeating: 0x58, count: 32))
+        )
+        let replacementVerifier = self.replacementVerifier
+        XCTAssertThrowsError(
+            try AccountEmailRecoveryService(
+                store: fixture.database,
+                delivery: UnverifiedDelivery(),
+                proofCodec: codec,
+                hashExecutor: try Argon2idHashExecutor(
+                    maximumConcurrentHashes: 1
+                ) { _ in replacementVerifier },
+                tokenLifetime: 600
+            )
+        ) { error in
+            XCTAssertEqual(error as? AccountControlStoreError, .invalidInput)
+        }
+    }
+
     func testPasswordResetRequestIsOpaqueAndCompletionUsesBoundedHasher() async throws {
         let fixture = try await RuntimeFixture(testCase: self)
         addTeardownBlock { try? await fixture.database.close(); fixture.cleanup() }
@@ -305,6 +327,9 @@ final class AccountEmailOutboxRuntimeTests: XCTestCase {
 }
 
 private actor RecordingDelivery: AccountEmailDelivery {
+    nonisolated var cancellationContract:
+        AccountEmailDeliveryCancellationContract { .bounded }
+
     struct Message: Sendable {
         let to: AccountEmailAddress
         let subject: String
@@ -331,12 +356,33 @@ private actor RecordingDelivery: AccountEmailDelivery {
 }
 
 private actor SlowCancellableDelivery: AccountEmailDelivery {
+    nonisolated var cancellationContract:
+        AccountEmailDeliveryCancellationContract { .bounded }
+
     func deliver(
         to _: AccountEmailAddress,
         subject _: String,
         body _: String
     ) async throws {
         try await Task.sleep(for: .seconds(1))
+    }
+}
+
+private actor UnverifiedDelivery: AccountEmailDelivery {
+    nonisolated var cancellationContract:
+        AccountEmailDeliveryCancellationContract { .unverified }
+
+    func deliver(
+        to _: AccountEmailAddress,
+        subject _: String,
+        body _: String
+    ) async throws {
+        // This deliberately ignores cancellation. The recovery service must
+        // reject it at construction rather than allowing a task-group timeout
+        // to leave SMTP work running beyond the durable send fence.
+        while true {
+            try? await Task.sleep(for: .seconds(1))
+        }
     }
 }
 

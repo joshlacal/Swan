@@ -1853,3 +1853,28 @@ SQLite-row compatibility seam, stock pinned-TypeScript value-bearing
 incremental/full-CAR behavior, reverse-authority lifecycle/browser coverage,
 strict password-reset work-shape proof, non-cooperative email cancellation,
 and the formal security launcher remain open.
+
+## Adversarial rereview: email-delivery cancellation contract — 2026-08-01
+
+The recovery worker's timeout uses a structured task group. That is safe only
+when the delivery implementation actually stops after cancellation: Swift
+structured concurrency waits for every child before returning, so an
+implementation that ignores cancellation could otherwise keep `deliverNext`
+blocked while the five-minute durable send fence eventually became
+reclaimable.
+
+`AccountEmailDelivery` now requires an explicit, nonisolated cancellation
+contract. The production `MailpitSMTPDelivery` declares `.bounded`, while an
+`.unverified` implementation is rejected by `AccountEmailRecoveryService`
+before it can claim or send any durable delivery. A deliberately
+non-cooperative delivery regression passes and proves fail-closed construction
+instead of exercising the hanging path. This closes the supported alpha
+integration risk; an implementation that falsely declares `.bounded` violates
+the protocol contract and remains outside the supported boundary.
+
+The focused `AccountEmailOutboxRuntimeTests` selection passes 7/7. The
+remaining release gates are native-Linux/current-profile evidence, stock
+pinned-TypeScript value-bearing incremental/full-CAR behavior,
+reverse-authority lifecycle/browser coverage, strict password-reset
+work-shape evidence, the legacy SQLite blob-row compatibility seam, and the
+formal security launcher.

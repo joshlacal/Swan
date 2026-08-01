@@ -5,11 +5,27 @@ import NIOCore
 import NIOPosix
 import SwanStorage
 
-public protocol AccountEmailDelivery: Sendable {
-    /// Implementations must promptly honor task cancellation. The durable
-    /// account outbox uses a bounded pre-network fence; allowing a cancelled
-    /// delivery to continue past that fence could race lease reclamation or
+public enum AccountEmailDeliveryCancellationContract: Sendable, Equatable {
+    /// The implementation has a bounded cancellation path. Once the caller
+    /// cancels `deliver`, it must stop before the durable outbox fence can be
+    /// reclaimed. This is an explicit capability rather than an assumption
+    /// made from the protocol's `async` shape.
+    case bounded
+
+    /// The implementation cannot prove that cancellation stops network work.
+    /// Swan refuses to attach such a delivery to the durable recovery worker:
+    /// a late SMTP completion could otherwise race lease reclamation or
     /// permanent account deletion.
+    case unverified
+}
+
+public protocol AccountEmailDelivery: Sendable {
+    /// Implementations must explicitly declare their cancellation contract.
+    /// The value is nonisolated so the recovery service can reject an
+    /// unverified implementation before it claims any durable delivery.
+    nonisolated var cancellationContract:
+        AccountEmailDeliveryCancellationContract { get }
+
     func deliver(to: AccountEmailAddress, subject: String, body: String) async throws
 }
 
@@ -30,6 +46,9 @@ public enum MailpitSMTPDeliveryError: Error, Sendable, Equatable {
 /// drains admitted deliveries (which have bounded connect/command deadlines),
 /// and then closes the shared group.
 public actor MailpitSMTPDelivery: AccountEmailDelivery {
+    public nonisolated var cancellationContract:
+        AccountEmailDeliveryCancellationContract { .bounded }
+
     private let host: String
     private let port: Int
     private let sender: AccountEmailAddress
@@ -877,7 +896,8 @@ public actor AccountEmailRecoveryService {
               (1 ... 300).contains(deliveryLeaseDuration),
               deliveryAttemptTimeout.isFinite,
               (0.01 ... Self.maximumDeliveryAttemptTimeout)
-                .contains(deliveryAttemptTimeout) else {
+                .contains(deliveryAttemptTimeout),
+              delivery.cancellationContract == .bounded else {
             throw AccountControlStoreError.invalidInput
         }
         self.store = store
