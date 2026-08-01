@@ -3356,6 +3356,12 @@ extension SwanCommand {
             @Option(name: .customLong("request-id"), help: "Optional idempotency key prefix for the valid and corrupted installs")
             var requestID: String = ""
 
+            @Flag(
+                name: .customLong("require-prior-head"),
+                help: "Require an existing durable receiver head and prove a generation-advancing CAS replacement"
+            )
+            var requirePriorHead = false
+
             @Option(name: .long, help: "Destination for the sanitized recovery artifact")
             var output: String =
                 "artifacts/live/permissioned-recovery.json"
@@ -3518,7 +3524,8 @@ extension SwanCommand {
 
                 let database = try await SQLiteAccountDatabase(
                     dataDirectory: dataURL,
-                    did: canonicalReceiver
+                    did: canonicalReceiver,
+                    openMode: .existingManaged
                 )
                 let temporaryDirectory = FileManager.default
                     .temporaryDirectory.appending(
@@ -3552,6 +3559,7 @@ extension SwanCommand {
                 var gapErrorCode: String?
                 var priorHead: PermissionedRemoteReplicaHead?
                 var valid: CommittedPermissionedRemoteReplicaRecovery?
+                var replacementCASAdvanced = false
                 var corruptErrorCode: String?
                 var finalHead: PermissionedRemoteReplicaHead?
                 var corruptionRejected = false
@@ -3592,6 +3600,9 @@ extension SwanCommand {
 
                     priorHead = try await database
                         .permissionedRemoteReplicaHead(target: target)
+                    if requirePriorHead, priorHead == nil {
+                        throw PermissionedRecoveryCommandError.priorHeadRequired
+                    }
                     let now = Int64(Date().timeIntervalSince1970)
                     valid = try await LiveInteropRunner
                         .recoverPermissionedRepository(
@@ -3605,6 +3616,12 @@ extension SwanCommand {
                             limits: limits,
                             now: { Int64(Date().timeIntervalSince1970) }
                         )
+                    if let priorHead, let valid {
+                        replacementCASAdvanced = valid.head.generation
+                            == priorHead.generation + 1
+                            && valid.head.wireRevision != priorHead.wireRevision
+                            && valid.head.commitment != priorHead.commitment
+                    }
 
                     do {
                         _ = try await LiveInteropRunner
@@ -3638,7 +3655,8 @@ extension SwanCommand {
                     finalHead = try await database
                         .permissionedRemoteReplicaHead(target: target)
                     preserved = valid?.head == finalHead
-                    guard corruptionRejected, preserved else {
+                    guard corruptionRejected, preserved,
+                          !requirePriorHead || replacementCASAdvanced else {
                         throw PermissionedRecoveryCommandError
                             .corruptRecoveryAccepted
                     }
@@ -3652,17 +3670,23 @@ extension SwanCommand {
                     && valid != nil
                     && corruptionRejected
                     && preserved
+                    && (!requirePriorHead || replacementCASAdvanced)
                 let artifact = PermissionedRecoveryAcceptanceArtifact(
                     scenario: scenario,
                     gapStatus: gapStatus,
                     gapErrorCode: gapErrorCode,
-                    priorHeadPresent: priorHead != nil,
-                    validHeadGeneration: valid?.head.generation,
-                    validHeadRevision: valid?.head.wireRevision.toString(),
-                    validCommitment: valid.map {
+                    priorHeadGeneration: priorHead?.generation,
+                    priorHeadRevision: priorHead?.wireRevision.toString(),
+                    priorCommitment: priorHead.map {
+                        Hex.encode($0.commitment)
+                    },
+                    replacementHeadGeneration: valid?.head.generation,
+                    replacementHeadRevision: valid?.head.wireRevision.toString(),
+                    replacementCommitment: valid.map {
                         Hex.encode($0.head.commitment)
                     },
-                    validRecordCount: valid?.recordCount,
+                    replacementRecordCount: valid?.recordCount,
+                    replacementCASAdvanced: replacementCASAdvanced,
                     corruptionRejected: corruptionRejected,
                     corruptErrorCode: corruptErrorCode,
                     finalHeadGeneration: finalHead?.generation,
@@ -3721,6 +3745,7 @@ extension SwanCommand {
 
             private enum PermissionedRecoveryCommandError: Error {
                 case retentionGapMissing
+                case priorHeadRequired
                 case corruptRecoveryAccepted
             }
 
@@ -3742,6 +3767,8 @@ extension SwanCommand {
                     switch command {
                     case .retentionGapMissing:
                         return "RetentionGapMissing"
+                    case .priorHeadRequired:
+                        return "PriorHeadRequired"
                     case .corruptRecoveryAccepted:
                         return "RecoveryRejected"
                     }
@@ -4276,6 +4303,12 @@ extension SwanCommand {
             )
             var permissionedStatefulMatrix = false
 
+            @Flag(
+                name: .customLong("permissioned-write-only-apply-writes"),
+                help: "Opt in to one member OAuth/DPoP applyWrites batch plus a metadata-only signed terminal-revision witness"
+            )
+            var permissionedWriteOnlyApplyWrites = false
+
             @Option(
                 name: .customLong("permissioned-commit-key-env"),
                 help: "Environment variable containing ES256:<base64url-x963> or ES256K:<base64url> repository-author public key (untagged is legacy ES256K)"
@@ -4315,6 +4348,98 @@ extension SwanCommand {
                     throw ValidationError(
                         "--permissioned-stateful-matrix requires value-bearing listRepoOps; remove --permissioned-list-ops-exclude-values"
                     )
+                }
+                if permissionedWriteOnlyApplyWrites {
+                    guard normalizedMode == "permissioned" else {
+                        throw ValidationError(
+                            "--permissioned-write-only-apply-writes requires --mode permissioned"
+                        )
+                    }
+                    guard !provisionSpace,
+                          !permissionedListOps,
+                          !permissionedListOpsExcludeValues,
+                          !permissionedGetRepo,
+                          !permissionedStatefulMatrix,
+                          readQuery.isEmpty,
+                          blobFile == nil else {
+                        throw ValidationError(
+                            "--permissioned-write-only-apply-writes is incompatible with read, provision, listRepoOps, full-CAR, stateful, or blob flags"
+                        )
+                    }
+                    guard !space.isEmpty else {
+                        throw ValidationError(
+                            "permissioned write-only applyWrites requires --space"
+                        )
+                    }
+                    let parsedSpace: SpaceURI
+                    do {
+                        parsedSpace = try SpaceURI(space)
+                    } catch {
+                        throw ValidationError("--space is not a valid space URI")
+                    }
+                    let canonicalRepository: String
+                    do {
+                        canonicalRepository = try AccountIdentifiers.validateDID(repository)
+                    } catch {
+                        throw ValidationError(
+                            "permissioned write-only applyWrites requires canonical --repository member DID"
+                        )
+                    }
+                    let normalizedScenario = try LabLiveSupport.identifier(name, label: "scenario")
+                    let body = try LabLiveSupport.body(at: URL(fileURLWithPath: bodyFile))
+                    guard LiveInteropRunner.pinnedApplyWritesOperationCount(
+                        body,
+                        space: parsedSpace,
+                        repository: canonicalRepository
+                    ) != nil else {
+                        throw ValidationError(
+                            "--permissioned-write-only-apply-writes requires the pinned com.atproto.space.applyWrites create-only body shape"
+                        )
+                    }
+                    let producerURL = try LabLiveSupport.url(
+                        explicit: producerURL,
+                        environment: "SWAN_LAB_PRODUCER_URL",
+                        fallback: "https://swan.test"
+                    )
+                    let permissionedCommitKey = try LabLiveSupport
+                        .permissionedCommitVerificationKey(
+                            environment: permissionedCommitKeyEnvironment
+                        )
+                    let producer = try await LabLiveSupport.host(
+                        label: "member",
+                        url: producerURL,
+                        auth: producerAuth,
+                        tokenEnvironment: producerTokenEnv,
+                        handleEnvironment: producerHandleEnv,
+                        passwordEnvironment: producerPasswordEnv,
+                        clientID: producerClientID,
+                        redirectURI: producerRedirectURI,
+                        scopes: scope,
+                        timeout: requestTimeoutSeconds,
+                        permissionedCommitVerificationKey: permissionedCommitKey
+                    )
+                    let result = await LiveInteropRunner.permissionedWriteOnlyApplyWrites(
+                        scenario: normalizedScenario,
+                        member: producer,
+                        space: parsedSpace,
+                        repository: canonicalRepository,
+                        body: body
+                    )
+                    let outputURL = URL(fileURLWithPath: output)
+                    try FileManager.default.createDirectory(
+                        at: outputURL.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                    try encoder.encode(result).write(to: outputURL, options: .atomic)
+                    print("LIVE INTEROP ARTIFACT WRITTEN: \(outputURL.path) status=\(result.status)")
+                    guard !failOnFailure || result.status == "passed" else {
+                        throw ValidationError(
+                            "live interoperability did not pass; inspect \(outputURL.lastPathComponent)"
+                        )
+                    }
+                    return
                 }
                 let normalizedScenario = try LabLiveSupport.identifier(name, label: "scenario")
                 let producerURL = try LabLiveSupport.url(

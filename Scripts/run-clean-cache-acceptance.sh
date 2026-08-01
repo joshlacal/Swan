@@ -18,6 +18,16 @@ mode=""
 scratch_path=""
 wait_timeout="240"
 
+# Docker Compose accepts several ambient variables that can silently redirect
+# a run to a caller-selected file, project, or profile. This gate owns its
+# topology and cleanup, so any such routing input is a hard failure.
+for compose_variable in COMPOSE_FILE COMPOSE_PROJECT_NAME COMPOSE_PROFILES COMPOSE_PATH_SEPARATOR; do
+  if [[ -n "${!compose_variable:-}" ]]; then
+    echo "${compose_variable} must be unset for clean-cache acceptance" >&2
+    exit 64
+  fi
+done
+
 usage() {
   cat >&2 <<'EOF'
 usage: Scripts/run-clean-cache-acceptance.sh [--mode macos|linux] [--scratch-path <directory>] [--wait-timeout <seconds>]
@@ -200,8 +210,6 @@ prepare_compose_network_override() {
   # disposable lab project is still running. In that case generate an
   # untracked Compose override for this run only. The source Compose file and
   # its static invariants are never mutated.
-  [[ -z "${COMPOSE_FILE:-}" ]] || return 0
-
   local network_ids
   network_ids="$(docker network ls -q)"
   local configured_subnets=""
@@ -357,8 +365,17 @@ networks:
       config:
         - subnet: ${network_prefix}.0/24
 EOF
-  export COMPOSE_FILE="docker-compose.yml:$override"
+  compose_override="$override"
   echo "CLEAN-CACHE COMPOSE OVERRIDE: subnet=${network_prefix}.0/24 caddy=127.0.0.1:${published_port}" >&2
+}
+
+compose_override=""
+compose() {
+  local compose_files=(--file "$source_root/docker-compose.yml")
+  if [[ -n "$compose_override" ]]; then
+    compose_files+=(--file "$compose_override")
+  fi
+  ./interop/compose.sh "${compose_files[@]}" "$@"
 }
 
 (
@@ -373,18 +390,24 @@ print(secrets.token_hex(12))
 PY
 )"
   echo "CLEAN-CACHE COMPOSE PROJECT: $project_name"
+  if [[ -n "$(docker ps --all --filter "label=com.docker.compose.project=${project_name}" --quiet)" ]] \
+    || [[ -n "$(docker network ls --filter "label=com.docker.compose.project=${project_name}" --quiet)" ]] \
+    || [[ -n "$(docker volume ls --filter "label=com.docker.compose.project=${project_name}" --quiet)" ]]; then
+    echo "clean acceptance project name unexpectedly already owns Docker resources" >&2
+    exit 1
+  fi
   # shellcheck disable=SC2329 # Invoked indirectly by the EXIT trap below.
   cleanup() {
-    ./interop/compose.sh --project-name "$project_name" down --volumes --remove-orphans >/dev/null 2>&1 || true
+    compose --project-name "$project_name" down --volumes --remove-orphans >/dev/null 2>&1 || true
   }
   trap cleanup EXIT
-  ./interop/compose.sh --project-name "$project_name" build --no-cache
-  if ! ./interop/compose.sh --project-name "$project_name" up --detach --wait --wait-timeout "$wait_timeout"; then
+  compose --project-name "$project_name" build --no-cache
+  if ! compose --project-name "$project_name" up --detach --wait --wait-timeout "$wait_timeout"; then
     # Compose v2 reports a successful one-shot service as an error from
     # `up --wait` once all long-running healthchecks are ready. Accept that
     # known lifecycle result only after inspecting every service explicitly;
     # a real startup or health failure remains fatal.
-    status_lines="$(./interop/compose.sh \
+    status_lines="$(compose \
       --project-name "$project_name" \
       ps --all --format '{{.Service}} {{.State}} {{.ExitCode}} {{.Health}}' \
       | awk '$1 != "REFERENCE" { print }')"

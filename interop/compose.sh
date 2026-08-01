@@ -19,4 +19,23 @@ if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>
   exit 1
 fi
 
-exec docker compose "$@"
+for compose_variable in COMPOSE_FILE COMPOSE_PROJECT_NAME COMPOSE_PROFILES COMPOSE_PATH_SEPARATOR; do
+  if [[ -n "${!compose_variable:-}" ]]; then
+    echo "${compose_variable} must be unset; pass Compose topology explicitly" >&2
+    exit 64
+  fi
+done
+
+has_explicit_file=0
+for argument in "$@"; do
+  if [[ "$argument" == "--file" || "$argument" == "-f" \
+    || "$argument" == --file=* || "$argument" == -f* ]]; then
+    has_explicit_file=1
+  fi
+done
+
+if ((has_explicit_file)); then
+  exec docker compose "$@"
+else
+  exec docker compose --file "$root/docker-compose.yml" "$@"
+fi

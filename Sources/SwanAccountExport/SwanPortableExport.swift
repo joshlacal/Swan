@@ -613,108 +613,156 @@ public struct SwanPortableAccountExporter: Sendable {
         let privateKey = try P256.Signing.PrivateKey(
             rawRepresentation: await keyStore.key(for: keyReference)
         )
-        guard let publicGenesis = try await database.loadPublicRepositoryGenesis(
-            did: account.did,
-            signingPublicKey: privateKey.publicKey
-        ), publicGenesis.genesis.commitCID.string == expectedGenesisCID else {
-            throw SwanPortableExportError.missingSource
-        }
-        let inventory = try await database.portableExportInventory()
-        let journal = try await database.plcAccountPreparationJournal()
-        let plcHistory = try makePLCHistory(
-            journal: journal,
-            did: account.did,
-            expectedGenesisCID: expectedGenesisCID,
-            signingPublicKey: privateKey.publicKey
+        let stagingName = ".swan-export-\(UUID().uuidString.lowercased())"
+        let stagingDescriptor = try SwanPortableExportFilesystem.createStagingDirectory(
+            parent: destination.parentDescriptor,
+            name: stagingName
         )
-
-        var artifacts = [Artifact(
-            path: "public/repository.car",
-            type: .publicCAR,
-            data: publicGenesis.genesis.car
-        )]
-        for repository in inventory.repositories {
-            guard let snapshot = try await database.repositorySnapshot(
-                space: repository.space,
-                author: repository.author
-            ) else {
-                throw SwanPortableExportError.missingSource
-            }
-            let records = try verifiedRecords(snapshot)
-            let envelope = try SpaceCommitCodec.createReaderEnvelope(
-                space: repository.space,
-                author: repository.author,
-                rev: snapshot.state.wireRevision.toString(),
-                commitment: snapshot.state.commitment,
-                key: privateKey
+        var stagingClosed = false
+        var published = false
+        do {
+            var writer = StagedArtifactWriter(
+                root: stagingDescriptor,
+                afterWrite: afterArtifactWrite
             )
-            guard try SpaceCommitCodec.verifyContextSignature(
-                envelope,
-                publicKey: privateKey.publicKey
-            ), SpaceCommitCodec.verifyContentBinding(envelope) else {
-                throw SwanPortableExportError.invalidArchive
-            }
-            let car = try SpaceCARCodec.encode(commit: envelope, records: records)
-            _ = try SpaceCARCodec.verify(
-                car.data,
-                space: repository.space,
-                author: repository.author,
-                publicKey: privateKey.publicKey
-            )
-            artifacts.append(.init(
-                path: "spaces/\(SwanPortableExportPath.encode(repository.space.rawValue))/\(SwanPortableExportPath.encode(repository.author)).car",
-                type: .spaceCAR,
-                data: car.data
-            ))
-        }
-        for reference in inventory.blobs {
-            let data = try await database.data(for: reference)
-            let type: SwanPortableExportFileType
-            let path: String
-            switch reference.namespace {
-            case .public:
-                type = .publicBlob
-                path = "blobs/public/\(SwanPortableExportPath.encode(reference.cid))"
-            case let .space(space):
-                type = .spaceBlob
-                path = "blobs/space/\(SwanPortableExportPath.encode(space.rawValue))/\(SwanPortableExportPath.encode(reference.cid))"
-            }
-            artifacts.append(.init(path: path, type: type, data: data))
-        }
-        artifacts.append(.init(path: "plc/history.json", type: .plcHistory, data: plcHistory))
-        artifacts.sort { $0.path < $1.path }
-        guard Set(artifacts.map(\.path)).count == artifacts.count else {
-            throw SwanPortableExportError.invalidArchive
-        }
 
-        let manifest = try SwanPortableExportManifest(
-            profileID: profileID,
-            did: account.did,
-            canonicalHandle: account.canonicalHandle,
-            createdAt: SwanPortableExportTimestamp.render(now()),
-            files: try artifacts.map {
-                try SwanPortableExportFile(
-                    path: $0.path,
-                    byteCount: $0.data.count,
-                    sha256: SwanPortableExportDigest.hex($0.data),
-                    type: $0.type
+            // Keep the public genesis CAR scoped to this block. The writer
+            // records only its digest and size, so an export never retains
+            // previously emitted artifacts in an aggregate [Data] array.
+            do {
+                guard let publicGenesis = try await database.loadPublicRepositoryGenesis(
+                    did: account.did,
+                    signingPublicKey: privateKey.publicKey
+                ), publicGenesis.genesis.commitCID.string == expectedGenesisCID else {
+                    throw SwanPortableExportError.missingSource
+                }
+                try writer.write(
+                    path: "public/repository.car",
+                    type: SwanPortableExportFileType.publicCAR,
+                    data: publicGenesis.genesis.car
                 )
             }
-        )
-        let manifestData = try SwanPortableExportManifestCodec.encode(manifest)
-        try publish(
-            artifacts: artifacts,
-            manifest: manifestData,
-            destination: destination,
-            signingPublicKey: privateKey.publicKey
-        )
-        return SwanPortableExportResult(
-            did: account.did,
-            outputDirectory: destination.url.path,
-            manifestSHA256: "sha256:\(SwanPortableExportDigest.hex(manifestData))",
-            fileCount: artifacts.count,
-            includesPrivateKeys: false
-        )
+
+            let inventory = try await database.portableExportInventory()
+            let journal = try await database.plcAccountPreparationJournal()
+            let plcHistory = try makePLCHistory(
+                journal: journal,
+                did: account.did,
+                expectedGenesisCID: expectedGenesisCID,
+                signingPublicKey: privateKey.publicKey
+            )
+
+            for repository in inventory.repositories {
+                guard let snapshot = try await database.repositorySnapshot(
+                    space: repository.space,
+                    author: repository.author
+                ) else {
+                    throw SwanPortableExportError.missingSource
+                }
+                let records = try verifiedRecords(snapshot)
+                let envelope = try SpaceCommitCodec.createReaderEnvelope(
+                    space: repository.space,
+                    author: repository.author,
+                    rev: snapshot.state.wireRevision.toString(),
+                    commitment: snapshot.state.commitment,
+                    key: privateKey
+                )
+                guard try SpaceCommitCodec.verifyContextSignature(
+                    envelope,
+                    publicKey: privateKey.publicKey
+                ), SpaceCommitCodec.verifyContentBinding(envelope) else {
+                    throw SwanPortableExportError.invalidArchive
+                }
+                let car = try SpaceCARCodec.encode(commit: envelope, records: records)
+                _ = try SpaceCARCodec.verify(
+                    car.data,
+                    space: repository.space,
+                    author: repository.author,
+                    publicKey: privateKey.publicKey
+                )
+                try writer.write(
+                    path: "spaces/\(SwanPortableExportPath.encode(repository.space.rawValue))/\(SwanPortableExportPath.encode(repository.author)).car",
+                    type: SwanPortableExportFileType.spaceCAR,
+                    data: car.data
+                )
+            }
+
+            for reference in inventory.blobs {
+                let data = try await database.data(for: reference)
+                let type: SwanPortableExportFileType
+                let path: String
+                switch reference.namespace {
+                case .public:
+                    type = .publicBlob
+                    path = "blobs/public/\(SwanPortableExportPath.encode(reference.cid))"
+                case let .space(space):
+                    type = .spaceBlob
+                    path = "blobs/space/\(SwanPortableExportPath.encode(space.rawValue))/\(SwanPortableExportPath.encode(reference.cid))"
+                }
+                try writer.write(path: path, type: type, data: data)
+            }
+            try writer.write(
+                path: "plc/history.json",
+                type: SwanPortableExportFileType.plcHistory,
+                data: plcHistory
+            )
+
+            let files = writer.files.sorted { $0.path < $1.path }
+            let manifest = try SwanPortableExportManifest(
+                profileID: profileID,
+                did: account.did,
+                canonicalHandle: account.canonicalHandle,
+                createdAt: SwanPortableExportTimestamp.render(now()),
+                files: files
+            )
+            let manifestData = try SwanPortableExportManifestCodec.encode(manifest)
+            try SwanPortableExportFilesystem.write(
+                manifestData,
+                path: "manifest.json",
+                root: stagingDescriptor
+            )
+            guard fsync(stagingDescriptor) == 0 else {
+                throw SwanPortableExportError.publicationFailed
+            }
+            _ = try SwanPortableExportVerifier.verifyArchive(
+                directoryDescriptor: stagingDescriptor,
+                signingPublicKey: privateKey.publicKey
+            )
+            try destination.requireCurrentParentAndAbsentTarget()
+            try SwanPortableExportFilesystem.renameExclusively(
+                parent: destination.parentDescriptor,
+                source: stagingName,
+                destination: destination.outputName
+            )
+            published = true
+            try afterRenameBeforeParentSync?()
+            try SwanPortableExportFilesystem.synchronizeParent(
+                destination.parentDescriptor
+            )
+            try destination.requireCurrentParentAndInstalledTarget()
+            _ = close(stagingDescriptor)
+            stagingClosed = true
+            return SwanPortableExportResult(
+                did: account.did,
+                outputDirectory: destination.url.path,
+                manifestSHA256: "sha256:\(SwanPortableExportDigest.hex(manifestData))",
+                fileCount: files.count,
+                includesPrivateKeys: false
+            )
+        } catch {
+            if !stagingClosed {
+                _ = close(stagingDescriptor)
+            }
+            do {
+                try SwanPortableExportFilesystem.removeTree(
+                    parent: destination.parentDescriptor,
+                    name: published ? destination.outputName : stagingName
+                )
+            } catch {
+                throw SwanPortableExportError.publicationFailed
+            }
+            throw error
+        }
     }
 
     private func verifiedRecords(
@@ -786,73 +834,39 @@ public struct SwanPortableAccountExporter: Sendable {
         )
     }
 
-    private func publish(
-        artifacts: [Artifact],
-        manifest: Data,
-        destination: SwanPortableExportDestination,
-        signingPublicKey: P256.Signing.PublicKey
-    ) throws {
-        let stagingName = ".swan-export-\(UUID().uuidString.lowercased())"
-        let stagingDescriptor = try SwanPortableExportFilesystem.createStagingDirectory(
-            parent: destination.parentDescriptor,
-            name: stagingName
-        )
-        var published = false
-        do {
-            for (index, artifact) in artifacts.enumerated() {
-                try SwanPortableExportFilesystem.write(
-                    artifact.data,
-                    path: artifact.path,
-                    root: stagingDescriptor
-                )
-                try afterArtifactWrite?(index + 1)
-            }
-            try SwanPortableExportFilesystem.write(
-                manifest,
-                path: "manifest.json",
-                root: stagingDescriptor
-            )
-            guard fsync(stagingDescriptor) == 0 else {
-                throw SwanPortableExportError.publicationFailed
-            }
-            _ = try SwanPortableExportVerifier.verifyArchive(
-                directoryDescriptor: stagingDescriptor,
-                signingPublicKey: signingPublicKey
-            )
-            try destination.requireCurrentParentAndAbsentTarget()
-            try SwanPortableExportFilesystem.renameExclusively(
-                parent: destination.parentDescriptor,
-                source: stagingName,
-                destination: destination.outputName
-            )
-            // `rename` is the publication linearization point. Record the
-            // installed state before any later operation can fail so cleanup
-            // never targets the now-missing staging name.
-            published = true
-            try afterRenameBeforeParentSync?()
-            try SwanPortableExportFilesystem.synchronizeParent(
-                destination.parentDescriptor
-            )
-            try destination.requireCurrentParentAndInstalledTarget()
-            _ = close(stagingDescriptor)
-        } catch {
-            _ = close(stagingDescriptor)
-            do {
-                try SwanPortableExportFilesystem.removeTree(
-                    parent: destination.parentDescriptor,
-                    name: published ? destination.outputName : stagingName
-                )
-            } catch {
-                throw SwanPortableExportError.publicationFailed
-            }
-            throw error
-        }
-    }
+    private struct StagedArtifactWriter {
+        let root: Int32
+        let afterWrite: (@Sendable (Int) throws -> Void)?
+        private(set) var files: [SwanPortableExportFile] = []
+        private var paths = Set<String>()
 
-    private struct Artifact: Sendable {
-        let path: String
-        let type: SwanPortableExportFileType
-        let data: Data
+        init(
+            root: Int32,
+            afterWrite: (@Sendable (Int) throws -> Void)?
+        ) {
+            self.root = root
+            self.afterWrite = afterWrite
+        }
+
+        mutating func write(
+            path: String,
+            type: SwanPortableExportFileType,
+            data: Data
+        ) throws {
+            guard paths.insert(path).inserted else {
+                throw SwanPortableExportError.invalidArchive
+            }
+            try SwanPortableExportFilesystem.write(data, path: path, root: root)
+            files.append(
+                try SwanPortableExportFile(
+                    path: path,
+                    byteCount: data.count,
+                    sha256: SwanPortableExportDigest.hex(data),
+                    type: type
+                )
+            )
+            try afterWrite?(files.count)
+        }
     }
 }
 

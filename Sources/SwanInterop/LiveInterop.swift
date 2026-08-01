@@ -81,6 +81,14 @@ public typealias InteropAuthorizationProvider = @Sendable (
     InteropHTTPMethod, URL, Data?
 ) async throws -> InteropAuthorization
 
+/// A bounded request seam for deterministic interop tests. Production callers
+/// use AsyncHTTPClient; tests can provide a transport that records the exact
+/// target, headers, and body while returning pinned wire responses without
+/// opening a socket.
+public typealias InteropHTTPExecuteHandler = @Sendable (
+    InteropHTTPMethod, URL, [String: String], Data?, Int
+) async throws -> InteropHTTPResponse
+
 /// A small AsyncHTTPClient adapter with strict bounds and no redirect
 /// following.  It is deliberately independent of the Hummingbird server so
 /// the same client can drive Swan, the pinned TypeScript PDS, or a faultable
@@ -94,13 +102,15 @@ public final class InteropHTTPClient: @unchecked Sendable {
     public let maximumStreamingResponseBytes: Int
 
     private let client: HTTPClient
+    private let executeHandler: InteropHTTPExecuteHandler?
 
     public init(
         baseURL: URL,
         timeout: TimeInterval = 15,
         maximumResponseBytes: Int = 2 * 1024 * 1024,
         maximumStreamingResponseBytes: Int = 512 * 1024 * 1024,
-        additionalTrustRootFile: URL? = nil
+        additionalTrustRootFile: URL? = nil,
+        executeHandler: InteropHTTPExecuteHandler? = nil
     ) throws {
         guard Self.validBaseURL(baseURL),
               timeout > 0, timeout <= 120, timeout.isFinite,
@@ -112,6 +122,7 @@ public final class InteropHTTPClient: @unchecked Sendable {
         self.timeout = timeout
         self.maximumResponseBytes = maximumResponseBytes
         self.maximumStreamingResponseBytes = maximumStreamingResponseBytes
+        self.executeHandler = executeHandler
         var configuration = HTTPClient.Configuration(
             redirectConfiguration: .disallow,
             timeout: .init(
@@ -152,6 +163,16 @@ public final class InteropHTTPClient: @unchecked Sendable {
         let limit = maximumResponseBytes ?? self.maximumResponseBytes
         guard (1 ... 256 * 1024 * 1024).contains(limit) else {
             throw SwanError.malformed("interop response bound is invalid")
+        }
+        if let executeHandler {
+            let response = try await executeHandler(method, url, headers, body, limit)
+            guard response.body.count <= limit else {
+                throw InteropHTTPError.responseTooLarge
+            }
+            guard response.redirectCount == 0 else {
+                throw InteropHTTPError.unexpectedRedirect
+            }
+            return response
         }
         var request = HTTPClientRequest(url: url.absoluteString)
         request.method = nioMethod(method)
@@ -1033,9 +1054,48 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
     }
 }
 
+/// The deliberately narrow artifact for a member-authorized, write-only
+/// `space.applyWrites` advancement.  It contains no record material or peer
+/// identity: the signed terminal revision is the only durable witness needed
+/// by the recovery acceptance harness.
+public struct PermissionedWriteOnlyApplyWritesArtifact: Codable, Sendable, Equatable {
+    public let scenario: String
+    public let profileID: String
+    public let fixturePolicy: String
+    public let applyStatus: Int?
+    public let witnessStatus: Int?
+    public let terminalRevision: String?
+    public let operationCount: Int?
+    public let responseDigest: String?
+    public let status: String
+    public let errorCode: String?
+
+    public init(
+        scenario: String,
+        applyStatus: Int?,
+        witnessStatus: Int?,
+        terminalRevision: String?,
+        operationCount: Int?,
+        responseDigest: String?,
+        status: String,
+        errorCode: String?
+    ) {
+        self.scenario = FixtureSanitizer.safeIdentifier(scenario)
+        self.profileID = OfflineProtocolProfileVerifier.stableProfileID
+        self.fixturePolicy = "summary-only-digests-and-signed-terminal-revision"
+        self.applyStatus = applyStatus.flatMap { (100 ... 599).contains($0) ? $0 : nil }
+        self.witnessStatus = witnessStatus.flatMap { (100 ... 599).contains($0) ? $0 : nil }
+        self.terminalRevision = canonicalInteropTID(terminalRevision)
+        self.operationCount = operationCount.flatMap { (1 ... 100).contains($0) ? $0 : nil }
+        self.responseDigest = FixtureSanitizer.canonicalSHA256Hex(responseDigest)
+        self.status = FixtureSanitizer.artifactStatus(status)
+        self.errorCode = errorCode.map(FixtureSanitizer.errorCode)
+    }
+}
+
 /// Sanitized proof that an incremental retention gap selected full-CAR
-/// recovery, a valid archive became the durable receiver head, and a
-/// deliberately corrupted retry could not replace that head. Repository and
+/// recovery, an existing durable receiver head was CAS-replaced by a newer
+/// archive, and a deliberately corrupted retry could not replace that head. Repository and
 /// receiver identifiers, space URIs, request IDs, verifier fingerprints, raw
 /// LtHash state, credentials, and record values are deliberately absent.
 public struct PermissionedRecoveryAcceptanceArtifact:
@@ -1045,11 +1105,14 @@ public struct PermissionedRecoveryAcceptanceArtifact:
     public let profileID: String
     public let gapStatus: Int?
     public let gapErrorCode: String?
-    public let priorHeadPresent: Bool
-    public let validHeadGeneration: UInt64?
-    public let validHeadRevision: String?
-    public let validCommitment: String?
-    public let validRecordCount: Int?
+    public let priorHeadGeneration: UInt64?
+    public let priorHeadRevision: String?
+    public let priorCommitment: String?
+    public let replacementHeadGeneration: UInt64?
+    public let replacementHeadRevision: String?
+    public let replacementCommitment: String?
+    public let replacementRecordCount: Int?
+    public let replacementCASAdvanced: Bool
     public let corruptionRejected: Bool
     public let corruptErrorCode: String?
     public let finalHeadGeneration: UInt64?
@@ -1064,11 +1127,14 @@ public struct PermissionedRecoveryAcceptanceArtifact:
         scenario: String,
         gapStatus: Int?,
         gapErrorCode: String?,
-        priorHeadPresent: Bool,
-        validHeadGeneration: UInt64?,
-        validHeadRevision: String?,
-        validCommitment: String?,
-        validRecordCount: Int?,
+        priorHeadGeneration: UInt64?,
+        priorHeadRevision: String?,
+        priorCommitment: String?,
+        replacementHeadGeneration: UInt64?,
+        replacementHeadRevision: String?,
+        replacementCommitment: String?,
+        replacementRecordCount: Int?,
+        replacementCASAdvanced: Bool,
         corruptionRejected: Bool,
         corruptErrorCode: String?,
         finalHeadGeneration: UInt64?,
@@ -1084,17 +1150,24 @@ public struct PermissionedRecoveryAcceptanceArtifact:
             (100 ... 599).contains($0) ? $0 : nil
         }
         self.gapErrorCode = gapErrorCode.map(FixtureSanitizer.errorCode)
-        self.priorHeadPresent = priorHeadPresent
-        self.validHeadGeneration = validHeadGeneration.flatMap {
+        self.priorHeadGeneration = priorHeadGeneration.flatMap {
             $0 > 0 && $0 <= UInt64(Int.max) ? $0 : nil
         }
-        self.validHeadRevision = canonicalInteropTID(validHeadRevision)
-        self.validCommitment = FixtureSanitizer.canonicalSHA256Hex(
-            validCommitment
+        self.priorHeadRevision = canonicalInteropTID(priorHeadRevision)
+        self.priorCommitment = FixtureSanitizer.canonicalSHA256Hex(
+            priorCommitment
         )
-        self.validRecordCount = validRecordCount.flatMap {
+        self.replacementHeadGeneration = replacementHeadGeneration.flatMap {
+            $0 > 0 && $0 <= UInt64(Int.max) ? $0 : nil
+        }
+        self.replacementHeadRevision = canonicalInteropTID(replacementHeadRevision)
+        self.replacementCommitment = FixtureSanitizer.canonicalSHA256Hex(
+            replacementCommitment
+        )
+        self.replacementRecordCount = replacementRecordCount.flatMap {
             $0 >= 0 ? $0 : nil
         }
+        self.replacementCASAdvanced = replacementCASAdvanced
         self.corruptionRejected = corruptionRejected
         self.corruptErrorCode = corruptErrorCode.map(
             FixtureSanitizer.errorCode
@@ -1583,6 +1656,96 @@ public enum LiveInteropRunner {
         return (count, Hex.encode(Data(digest.finalize())))
     }
 
+    /// Advances a member repository using exactly the pinned applyWrites
+    /// request shape. This intentionally does not construct an authority host,
+    /// mint a space credential, or read a record: recovery needs a source-side
+    /// advancement while the receiver remains stale. A metadata-only query uses
+    /// the same member OAuth/DPoP session for a signed terminal witness.
+    public static func permissionedWriteOnlyApplyWrites(
+        scenario: String,
+        member: LiveInteropHost,
+        space: SpaceURI,
+        repository: String,
+        body: Data,
+        recorder: InteropFixtureRecorder? = nil
+    ) async -> PermissionedWriteOnlyApplyWritesArtifact {
+        let recorder = recorder ?? InteropFixtureRecorder()
+        guard let operationCount = pinnedApplyWritesOperationCount(
+            body,
+            space: space,
+            repository: repository
+        ) else {
+            return PermissionedWriteOnlyApplyWritesArtifact(
+                scenario: scenario, applyStatus: nil, witnessStatus: nil, terminalRevision: nil,
+                operationCount: nil, responseDigest: nil, status: "failed",
+                errorCode: "InvalidRequest"
+            )
+        }
+
+        let writePath = "/xrpc/com.atproto.space.applyWrites"
+        do {
+            let writeAuthorization = try await authorization(
+                for: member, method: .post, path: writePath, body: body
+            )
+            let write = try await member.client.procedure(
+                "com.atproto.space.applyWrites",
+                body: body,
+                authorization: writeAuthorization
+            )
+            let digest = responseDigest(write)
+            await recorder.record(
+                host: member.label, method: "POST", path: writePath,
+                requestBody: body, response: write
+            )
+            guard (200 ... 299).contains(write.status) else {
+                return PermissionedWriteOnlyApplyWritesArtifact(
+                    scenario: scenario, applyStatus: write.status, witnessStatus: nil,
+                    terminalRevision: nil, operationCount: operationCount,
+                    responseDigest: digest, status: "failed",
+                    errorCode: responseErrorCode(write) ?? "HTTP\(write.status)"
+                )
+            }
+            let output = try StrictJSON.decode(
+                ComAtprotoSpaceApplyWrites.Output.self,
+                from: write.body
+            )
+            guard let expectedURIs = pinnedApplyWritesExpectedURIs(
+                      body, space: space, repository: repository
+                  ),
+                  let resultCIDs = applyWritesResultCIDs(
+                      output, expectedURIs: expectedURIs
+                  ),
+                  resultCIDs.count == operationCount else {
+                return PermissionedWriteOnlyApplyWritesArtifact(
+                    scenario: scenario, applyStatus: write.status, witnessStatus: nil,
+                    terminalRevision: nil, operationCount: operationCount,
+                    responseDigest: digest, status: "failed",
+                    errorCode: "InvalidResponse"
+                )
+            }
+            let witness = await verifyTerminalApplyWritesWitness(
+                member: member,
+                space: space,
+                repository: repository,
+                expectedResultCIDs: resultCIDs,
+                recorder: recorder
+            )
+            return PermissionedWriteOnlyApplyWritesArtifact(
+                scenario: scenario, applyStatus: write.status, witnessStatus: witness.status,
+                terminalRevision: witness.revision,
+                operationCount: operationCount, responseDigest: digest,
+                status: witness.verified ? "passed" : "failed",
+                errorCode: witness.errorCode
+            )
+        } catch {
+            return PermissionedWriteOnlyApplyWritesArtifact(
+                scenario: scenario, applyStatus: nil, witnessStatus: nil, terminalRevision: nil,
+                operationCount: operationCount, responseDigest: nil,
+                status: "failed", errorCode: liveErrorCode(error)
+            )
+        }
+    }
+
     /// Exercises the permissioned cross-host sequence without baking a
     /// particular authority placement into the runner: the member writes its
     /// repository with member OAuth/DPoP, mints a delegation, the authority
@@ -1830,6 +1993,219 @@ public enum LiveInteropRunner {
             expiresAt: expiresAt,
             limits: limits
         )
+    }
+
+    private struct TerminalApplyWritesWitness: Sendable {
+        let status: Int?
+        let revision: String?
+        let verified: Bool
+        let errorCode: String?
+    }
+
+    /// Verifies the terminal context only. A retention-bounded listRepoOps
+    /// response is deliberately not a complete LtHash witness, so this never
+    /// recomputes a commitment from its truncated operation page.
+    private static func verifyTerminalApplyWritesWitness(
+        member: LiveInteropHost,
+        space: SpaceURI,
+        repository: String,
+        expectedResultCIDs: [String],
+        recorder: InteropFixtureRecorder
+    ) async -> TerminalApplyWritesWitness {
+        guard (try? DID(didString: repository)) != nil,
+              !expectedResultCIDs.isEmpty,
+              expectedResultCIDs.allSatisfy({ canonicalInteropCID($0, codec: .dagCBOR) != nil })
+        else {
+            return TerminalApplyWritesWitness(
+                status: nil, revision: nil, verified: false,
+                errorCode: "InvalidRequest"
+            )
+        }
+        let query = [
+            "excludeValues": "true",
+            "limit": "100",
+            "repo": repository,
+            "space": space.rawValue,
+        ]
+        do {
+            let path = try member.client.xrpcPath(
+                "com.atproto.space.listRepoOps", query: query
+            )
+            let authorization = try await authorization(
+                for: member, method: .get, path: path, body: nil
+            )
+            let response = try await member.client.query(
+                "com.atproto.space.listRepoOps", query: query,
+                authorization: authorization
+            )
+            await recorder.record(
+                host: member.label, method: "GET",
+                path: "/xrpc/com.atproto.space.listRepoOps", response: response
+            )
+            guard (200 ... 299).contains(response.status) else {
+                return TerminalApplyWritesWitness(
+                    status: response.status, revision: nil, verified: false,
+                    errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
+                )
+            }
+            let output = try StrictJSON.decode(
+                ComAtprotoSpaceListRepoOps.Output.self,
+                from: response.body
+            )
+            guard !output.ops.isEmpty,
+                  output.ops.allSatisfy({ $0.value == nil }),
+                  let commit = output.commit,
+                  commit.ver == 1,
+                  commit.rev == output.ops.last?.rev,
+                  canonicalInteropTID(commit.rev) != nil,
+                  commit.hash.data.count == 32,
+                  commit.ikm.data.count == 32,
+                  commit.sig.data.count == 64,
+                  commit.mac.data.count == 32 else {
+                return TerminalApplyWritesWitness(
+                    status: response.status, revision: nil, verified: false,
+                    errorCode: "InvalidCommit"
+                )
+            }
+            // Retention can discard the first create in a three-write batch.
+            // The final two result CIDs must remain visible, which identifies
+            // this terminal batch without claiming the page reconstructs state.
+            let retainedResultCIDs = Set(expectedResultCIDs.suffix(2))
+            let visibleCIDs = Set(output.ops.compactMap { $0.cid?.string })
+            guard retainedResultCIDs.isSubset(of: visibleCIDs) else {
+                return TerminalApplyWritesWitness(
+                    status: response.status, revision: commit.rev, verified: false,
+                    errorCode: "OperationMismatch"
+                )
+            }
+            let context = try SpaceCommitContext(
+                space: space, author: repository, rev: commit.rev, ikm: commit.ikm.data
+            )
+            let envelope = SpaceCommitEnvelope(
+                ver: commit.ver, context: context, contextSignature: commit.sig.data,
+                contentBinding: commit.mac.data, commitment: commit.hash.data
+            )
+            guard SpaceCommitCodec.verifyContentBinding(envelope) else {
+                return TerminalApplyWritesWitness(
+                    status: response.status, revision: commit.rev, verified: false,
+                    errorCode: "ContentBindingMismatch"
+                )
+            }
+            guard let key = member.permissionedCommitVerificationKey else {
+                return TerminalApplyWritesWitness(
+                    status: response.status, revision: commit.rev, verified: false,
+                    errorCode: "MissingCommitKey"
+                )
+            }
+            let algorithm: String = switch key {
+            case .p256: "ES256"
+            case .secp256k1PublicKey: "ES256K"
+            }
+            guard try key.verify(
+                signature: commit.sig.data,
+                signingInput: try SpaceCommitCodec.contextSigningBytes(context),
+                algorithm: algorithm
+            ) else {
+                return TerminalApplyWritesWitness(
+                    status: response.status, revision: commit.rev, verified: false,
+                    errorCode: "ContextSignatureMismatch"
+                )
+            }
+            return TerminalApplyWritesWitness(
+                status: response.status, revision: commit.rev, verified: true,
+                errorCode: nil
+            )
+        } catch {
+            return TerminalApplyWritesWitness(
+                status: nil, revision: nil, verified: false,
+                errorCode: liveErrorCode(error)
+            )
+        }
+    }
+
+    private static func applyWritesResultCIDs(
+        _ output: ComAtprotoSpaceApplyWrites.Output,
+        expectedURIs: [String]
+    ) -> [String]? {
+        guard let results = output.results else { return nil }
+        guard results.count == expectedURIs.count else { return nil }
+        let cids = zip(results, expectedURIs).compactMap { result, expectedURI -> String? in
+            switch result {
+            case let .comAtprotoSpaceApplyWritesCreateResult(value):
+                guard value.uri.uriString() == expectedURI else { return nil }
+                return value.cid.string
+            case .comAtprotoSpaceApplyWritesUpdateResult,
+                 .comAtprotoSpaceApplyWritesDeleteResult:
+                return nil
+            case .unexpected:
+                return nil
+            }
+        }
+        guard cids.count == results.count,
+              cids.allSatisfy({ canonicalInteropCID($0, codec: .dagCBOR) != nil }) else {
+            return nil
+        }
+        return cids
+    }
+
+    private static func pinnedApplyWritesExpectedURIs(
+        _ body: Data,
+        space: SpaceURI,
+        repository: String
+    ) -> [String]? {
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let writes = object["writes"] as? [[String: Any]],
+              writes.allSatisfy({
+                  ($0["collection"] as? String) != nil && ($0["rkey"] as? String) != nil
+              }) else {
+            return nil
+        }
+        return writes.compactMap { write in
+            guard let collection = write["collection"] as? String,
+                  let rkey = write["rkey"] as? String else { return nil }
+            return "\(space.rawValue)/\(repository)/\(collection)/\(rkey)"
+        }
+    }
+
+    /// Pure admission check shared by the CLI and live runner. StrictJSON
+    /// rejects duplicate keys and hostile nesting before any OAuth secret is
+    /// read; generated Input decoding pins the wire contract.
+    public static func pinnedApplyWritesOperationCount(
+        _ body: Data,
+        space: SpaceURI,
+        repository: String
+    ) -> Int? {
+        guard (1 ... 2 * 1024 * 1024).contains(body.count),
+              (try? DID(didString: repository)) != nil,
+              let decoded = try? StrictJSON.decode(
+                  ComAtprotoSpaceApplyWrites.Input.self,
+                  from: body
+              ),
+              decoded.space.uriString() == space.rawValue,
+              decoded.repo.didString() == repository,
+              decoded.writes.allSatisfy({
+                  if case .comAtprotoSpaceApplyWritesCreate = $0 { return true }
+                  return false
+              }),
+              let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              Set(object.keys) == ["space", "repo", "writes"],
+              object["space"] as? String == space.rawValue,
+              object["repo"] as? String == repository,
+              let writes = object["writes"] as? [[String: Any]],
+              (1 ... 100).contains(writes.count) else {
+            return nil
+        }
+        let requiredWriteKeys: Set<String> = ["$type", "collection", "rkey", "value"]
+        guard writes.allSatisfy({ write in
+            Set(write.keys) == requiredWriteKeys
+                && write["$type"] as? String == "com.atproto.space.applyWrites#create"
+                && (try? NSID(nsidString: write["collection"] as? String ?? "")) != nil
+                && (try? RecordKey(keyString: write["rkey"] as? String ?? "")) != nil
+                && write["value"] is [String: Any]
+        }) else {
+            return nil
+        }
+        return writes.count
     }
 
     private static func verifyPermissionedListRepoOps(

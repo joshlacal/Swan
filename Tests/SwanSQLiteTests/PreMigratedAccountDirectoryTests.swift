@@ -104,6 +104,43 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
         try await control.close()
     }
 
+    func testExistingManagedOpenFailsClosedWithoutCreatingAccountStorage() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        _ = try await control.createAccount(
+            registration(did: alice, handle: "alice.example.com")
+        )
+
+        do {
+            _ = try await SQLiteAccountDatabase(
+                dataDirectory: root,
+                did: alice,
+                openMode: .existingManaged
+            )
+            XCTFail("existingManaged must not manufacture an account database")
+        } catch let error as SwanError {
+            guard case .unavailable = error else {
+                XCTFail("expected unavailable, got \(error)")
+                return
+            }
+        }
+        assertNoAccountDatabase(root: root, did: alice)
+
+        // Once durable account storage exists, the same mode is writable and
+        // can be used by recovery without changing its fail-closed admission.
+        let created = try await SQLiteAccountDatabase(dataDirectory: root, did: alice)
+        try await created.close()
+        let existing = try await SQLiteAccountDatabase(
+            dataDirectory: root,
+            did: alice,
+            openMode: .existingManaged
+        )
+        _ = try await existing.portableExportInventory()
+        try await existing.close()
+        try await control.close()
+    }
+
     func testUnknownForeignAndReactivatedAuthoritiesNeverOpenDatabasesAfterBootstrap() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

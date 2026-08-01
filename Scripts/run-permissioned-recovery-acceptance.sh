@@ -151,7 +151,7 @@ capture_runner_id() {
   # before stdout reaches runner.id. Recover only the exact precomputed name,
   # and only if its fresh non-secret nonce label matches this process.
   identity="$(docker inspect \
-    --format '{{.Id}} {{.Name}} {{index .Config.Labels "com.swan.task45.cleanup-nonce"}}' \
+    --format '{{.Id}} {{.Name}} {{index .Config.Labels "com.swan.task47.cleanup-nonce"}}' \
     "$runner_container" 2>/dev/null || true)"
   count="$(printf '%s\n' "$identity" | awk 'NF { count += 1 } END { print count + 0 }')"
   [[ "$count" == 1 ]] || return 1
@@ -169,7 +169,7 @@ runner_id_matches_cleanup_nonce() {
   [[ "$candidate" =~ ^[a-f0-9]{64}$ ]] || return 1
   [[ "$runner_cleanup_nonce" =~ ^[a-f0-9]{32}$ ]] || return 1
   identity="$(docker inspect \
-    --format '{{.Id}} {{.Name}} {{index .Config.Labels "com.swan.task45.cleanup-nonce"}}' \
+    --format '{{.Id}} {{.Name}} {{index .Config.Labels "com.swan.task47.cleanup-nonce"}}' \
     "$candidate" 2>/dev/null || true)"
   read -r actual_id actual_name actual_nonce <<< "$identity"
   [[ "$actual_id" == "$candidate" ]] \
@@ -268,6 +268,13 @@ print(value)
 ' "$field"
 }
 
+generate_run_selector() {
+  python3 -c '
+import secrets
+print("".join(secrets.choice("abcdefghijklmnopqrstuvwxyz234567") for _ in range(16)))
+'
+}
+
 authority_handle="$(read_lab_value authority.handle)"
 member_handle="$(read_lab_value member.handle)"
 authority_metadata="$(docker exec "$normal_swan_id" /usr/local/bin/swan account show \
@@ -311,7 +318,7 @@ done
 # Keep this image name project-scoped without using Compose lifecycle/build
 # commands. The fast path is deliberately strict: a missing current tag is a
 # configuration error, not an excuse to silently run the normal service image.
-image_tag="${project_name}-swan:task45-recovery"
+image_tag="${project_name}-swan:task47-recovery"
 if [[ "${SWAN_PERMISSIONED_RECOVERY_NO_BUILD:-0}" == "1" ]]; then
   docker image inspect "$image_tag" >/dev/null 2>&1 || {
     echo "SWAN_PERMISSIONED_RECOVERY_NO_BUILD=1 requires ${image_tag}" >&2
@@ -395,6 +402,11 @@ space_skey="permissioned-recovery-$(python3 -c '
 import secrets
 print("".join(secrets.choice("abcdefghijklmnopqrstuvwxyz234567") for _ in range(16)))
 ')"
+run_selector="$(generate_run_selector)"
+[[ "$run_selector" =~ ^[a-z2-7]{16}$ ]] || {
+  echo "permissioned recovery run selector generation failed" >&2
+  exit 1
+}
 space_uri="at://${authority_did}/space/app.bsky.bookmarks/${space_skey}"
 collection="app.bsky.feed.post"
 client_id="http://localhost?scope=atproto%20space%3Aapp.bsky.bookmarks%3Fauthority%3D${authority_did}%26skey%3D${space_skey}%26action%3Dread%20space%3Aapp.bsky.bookmarks%3Fauthority%3D${authority_did}%26skey%3D${space_skey}%26action%3Dcreate%26collection%3D${collection}&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"
@@ -420,6 +432,7 @@ wait_for_runner() {
 # to an owner-only file, so cleanup can remove the exact object even if a
 # signal lands between `docker create` and shell assignment/start.
 runner_script="${temporary_directory}/runner.sh"
+runner_error_extractor="${temporary_directory}/extract-permissioned-recovery-error-code.py"
 runner_id_file="${temporary_directory}/runner.id"
 runner_cleanup_nonce="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 [[ "$runner_cleanup_nonce" =~ ^[a-f0-9]{32}$ ]] || {
@@ -427,9 +440,10 @@ runner_cleanup_nonce="$(python3 -c 'import secrets; print(secrets.token_hex(16))
   exit 1
 }
 install -m 0700 "$root/Scripts/permissioned-recovery-runner.sh" "$runner_script"
+install -m 0700 "$root/Scripts/extract-permissioned-recovery-error-code.py" "$runner_error_extractor"
 runner_cleanup_armed=1
 docker create --name "$runner_container" -i \
-  --label "com.swan.task45.cleanup-nonce=${runner_cleanup_nonce}" \
+  --label "com.swan.task47.cleanup-nonce=${runner_cleanup_nonce}" \
   --network "$network_name" \
   --read-only \
   --tmpfs /tmp:size=64m,mode=1777 \
@@ -441,7 +455,7 @@ docker create --name "$runner_container" -i \
   "$image_tag" \
   /run/acceptance/runner.sh \
   "$space_uri" "$member_did" "$collection" "$client_id" \
-  "$member_handle" "$authority_handle" "$authority_did" "$space_skey" \
+  "$member_handle" "$authority_handle" "$authority_did" "$space_skey" "$run_selector" \
   > "$runner_id_file"
 capture_runner_id || {
   echo "Docker did not return a canonical runner ID" >&2

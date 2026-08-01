@@ -5,6 +5,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 runner="${root}/Scripts/run-permissioned-recovery-acceptance.sh"
 runner_body="${root}/Scripts/permissioned-recovery-runner.sh"
 validator="${root}/Scripts/validate-permissioned-recovery-artifact.py"
+error_extractor="${root}/Scripts/extract-permissioned-recovery-error-code.py"
 temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/permissioned-recovery-harness.XXXXXX")"
 trap 'rm -rf "$temporary_directory"' EXIT
 
@@ -17,10 +18,37 @@ import sys
 
 ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 PY
+python3 - "${temporary_directory}/formatted-error.json" <<'PY'
+import json
+import pathlib
+import sys
+
+artifact = {"status": "failed", "errorCode": "OperationMismatch"}
+path = pathlib.Path(sys.argv[1])
+path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+PY
+[[ "$(python3 "$error_extractor" "${temporary_directory}/formatted-error.json")" == OperationMismatch ]] || {
+  echo "formatted artifact error code was not extracted" >&2
+  exit 1
+}
 rg -q 'SWAN_PERMISSIONED_RECOVERY_PROJECT' "$runner"
 rg -q 'SWAN_INTEROP_SECRETS_DIR' "$runner"
 rg -q 'verify-secret-source\.sh' "$runner"
 rg -q -- '--space-oplog-retention 2' "$runner"
+rg -q -- '--require-prior-head' "$runner_body"
+rg -q -- '--permissioned-write-only-apply-writes' "$runner_body"
+rg -q -- 'com.atproto.space.applyWrites#create' "$runner_body"
+rg -q -- 'seed_gap_tid="2222222222222"' "$runner_body"
+rg -Fq 'seed_terminal_tid="$(wire_tid /tmp/seed-advance.json)"' "$runner_body"
+if rg -Fq '${index}' "$runner_body"; then
+  echo "write-batch failure handling must not reference the removed per-write index" >&2
+  exit 1
+fi
+rg -Fq 'stage "${phase}-advance-failed-pre-artifact"' "$runner_body"
+rg -q -- 'run_recovery seed' "$runner_body"
+rg -q -- 'run_recovery acceptance' "$runner_body"
+rg -q -- 'run_selector' "$runner_body"
+rg -q -- 'generate_run_selector' "$runner"
 rg -q 'recover-permissioned' "$runner_body"
 rg -q 'account recovery-commit-key' "$runner_body"
 if rg -q 'reference-plc|member-plc\.json|verificationMethod|publicKeyMultibase|swift -' "$runner" "$runner_body"; then
@@ -70,8 +98,32 @@ extract_function() {
 
 capture_function="$(extract_function capture_runner_id)"
 matcher_function="$(extract_function runner_id_matches_cleanup_nonce)"
-[[ -n "$capture_function" && -n "$matcher_function" ]] || {
+selector_function="$(extract_function generate_run_selector)"
+[[ -n "$capture_function" && -n "$matcher_function" && -n "$selector_function" ]] || {
   echo "runner ID capture functions were not found" >&2
+  exit 1
+}
+
+# The host selector makes every live run's replay keys and rkeys fresh without
+# placing that selector in the sanitized artifact. Exercise the generator
+# directly, and reject malformed input before the runner can read any secret.
+generated_selectors="$(bash -c "$selector_function; generate_run_selector; generate_run_selector")"
+selector_one="$(printf '%s\n' "$generated_selectors" | sed -n '1p')"
+selector_two="$(printf '%s\n' "$generated_selectors" | sed -n '2p')"
+selector_extra="$(printf '%s\n' "$generated_selectors" | sed -n '3p')"
+[[ -z "$selector_extra" ]] \
+  && [[ "$selector_one" =~ ^[a-z2-7]{16}$ ]] \
+  && [[ "$selector_two" =~ ^[a-z2-7]{16}$ ]] \
+  && [[ "$selector_one" != "$selector_two" ]] || {
+  echo "run selector generation was not canonical and unique" >&2
+  exit 1
+}
+if invalid_selector_output="$(bash "$runner_body" x x x x x x x x invalid 2>&1)"; then
+  echo "runner accepted a malformed run selector" >&2
+  exit 1
+fi
+[[ "$invalid_selector_output" == *"run selector is invalid"* ]] || {
+  echo "runner did not reject malformed selector before secret access" >&2
   exit 1
 }
 mock_docker_directory="${temporary_directory}/mock-docker"
@@ -112,7 +164,7 @@ assert_lost_stdout_capture() {
       eval "$RUNNER_CAPTURE_FUNCTION"
       runner_id=""
       runner_id_file="$1"
-      runner_container="task45-lost-stdout-runner"
+      runner_container="task47-lost-stdout-runner"
       runner_cleanup_nonce="$2"
       export RUNNER_CONTAINER="$runner_container"
       if capture_runner_id; then
@@ -151,16 +203,19 @@ artifact = {
     "profileID": "permissioned-data-0016-2026-07-30",
     "gapStatus": 409,
     "gapErrorCode": "full_repo_recovery_required",
-    "priorHeadPresent": False,
-    "validHeadGeneration": 1,
-    "validHeadRevision": "3mrzdwwyosz22",
-    "validCommitment": "a" * 64,
-    "validRecordCount": 3,
+    "priorHeadGeneration": 1,
+    "priorHeadRevision": "3mrzdwwyosz22",
+    "priorCommitment": "a" * 64,
+    "replacementHeadGeneration": 2,
+    "replacementHeadRevision": "3mrzdwwyosz23",
+    "replacementCommitment": "b" * 64,
+    "replacementRecordCount": 3,
+    "replacementCASAdvanced": True,
     "corruptionRejected": True,
     "corruptErrorCode": "CARBlockCIDMismatch",
-    "finalHeadGeneration": 1,
-    "finalHeadRevision": "3mrzdwwyosz22",
-    "finalCommitment": "a" * 64,
+    "finalHeadGeneration": 2,
+    "finalHeadRevision": "3mrzdwwyosz23",
+    "finalCommitment": "b" * 64,
     "lastValidHeadPreserved": True,
     "status": "passed",
     "errorCode": None,
@@ -203,8 +258,43 @@ PY
 reject_mutation scenario '"alternate-scenario"' scenario
 reject_mutation profileID '"alternate-profile"' profile
 reject_mutation gapStatus 200 status
-reject_mutation priorHeadPresent '"false"' prior
-reject_mutation validHeadGeneration 0 generation
+reject_mutation priorHeadGeneration 0 generation
+reject_mutation replacementHeadGeneration 1 head
+reject_mutation replacementCASAdvanced false replacement
 reject_mutation finalHeadGeneration true generation
+
+reject_coordinated_replacement_mutation() {
+  local field="$1"
+  local value_json="$2"
+  local mutated="${temporary_directory}/replacement-${field}.json"
+  python3 - "$good_artifact" "$mutated" "$field" "$value_json" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    artifact = json.load(source)
+field = sys.argv[3]
+value = json.loads(sys.argv[4])
+artifact[f"replacement{field}"] = value
+artifact[f"final{field}"] = value
+with open(sys.argv[2], "w", encoding="utf-8") as output:
+    json.dump(artifact, output, sort_keys=True)
+os.chmod(sys.argv[2], 0o600)
+PY
+  local output
+  if output="$("$validator" "$mutated")"; then
+    echo "validator accepted a non-advancing replacement ${field}" >&2
+    exit 1
+  fi
+  [[ "$output" == replacement ]] || {
+    echo "validator reported ${output} instead of replacement" >&2
+    exit 1
+  }
+}
+
+reject_coordinated_replacement_mutation HeadGeneration 1
+reject_coordinated_replacement_mutation HeadRevision '"3mrzdwwyosz22"'
+reject_coordinated_replacement_mutation Commitment '"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
 
 echo "permissioned recovery acceptance harness checks passed"

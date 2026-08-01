@@ -268,9 +268,13 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 declaration: .init(),
                 now: Date()
             )
+            // Deactivation revokes the entire OAuth family. Reactivation
+            // therefore requires a fresh authorization grant before the
+            // request can reach the preopened-database availability check.
+            let reactivated = try await issueToken(fixture.runtime, subject: Self.alice, scopes: ["atproto"])
             try FileManager.default.removeItem(at: SQLiteLayout.accountDatabase(in: fixture.root, did: Self.alice))
             try await app.test(.router) { client in
-                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "missing-db"), body: ByteBuffer(string: create)) { response in
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(reactivated, fixture: fixture, path: Self.createPath, jti: "missing-db"), body: ByteBuffer(string: create)) { response in
                     XCTAssertEqual(response.status, .serviceUnavailable)
                     XCTAssertFalse(FileManager.default.fileExists(atPath: SQLiteLayout.accountDatabase(in: fixture.root, did: Self.alice).path))
                 }

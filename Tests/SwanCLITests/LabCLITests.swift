@@ -210,6 +210,49 @@ final class LabCLITests: XCTestCase {
         )
     }
 
+    func testLabLiveRejectsWriteOnlyApplyWritesReadFlagsBeforeBodyOrOAuth() throws {
+        let result = try runCLI(
+            command: [
+                "live",
+                "--mode", "permissioned",
+                "--permissioned-write-only-apply-writes",
+                "--permissioned-list-ops",
+                "--body-file", "/definitely/missing/live-body.json",
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0)
+        let combined = String(decoding: result.stdout, as: UTF8.self)
+            + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertTrue(
+            combined.contains("write-only-apply-writes is incompatible"),
+            combined
+        )
+        XCTAssertFalse(combined.contains("missing/live-body"), combined)
+        XCTAssertFalse(combined.contains("OAuth"), combined)
+    }
+
+    func testLabLiveRejectsMalformedWriteOnlyBodyBeforeOAuth() throws {
+        let body = try temporaryDirectory().appending(path: "malformed-apply-writes.json")
+        defer { try? FileManager.default.removeItem(at: body) }
+        try Data(
+            #"{"space":"at://did:plc:abcdefghijklmnopqrstuvwx/space/app.bsky.bookmarks/a","repo":"did:plc:abcdefghijklmnopqrstuvwx","writes":[]}"#.utf8
+        ).write(to: body)
+        let result = try runCLI(
+            command: [
+                "live", "--mode", "permissioned",
+                "--permissioned-write-only-apply-writes",
+                "--space", "at://did:plc:abcdefghijklmnopqrstuvwx/space/app.bsky.bookmarks/a",
+                "--repository", "did:plc:abcdefghijklmnopqrstuvwx",
+                "--body-file", body.path,
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0)
+        let combined = String(decoding: result.stdout, as: UTF8.self)
+            + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertTrue(combined.contains("pinned com.atproto.space.applyWrites"), combined)
+        XCTAssertFalse(combined.contains("OAuth"), combined)
+    }
+
     func testLabRecoverPermissionedRejectsInvalidReceiverBeforeNetwork() throws {
         let result = try runCLI(
             command: [

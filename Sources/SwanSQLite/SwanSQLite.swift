@@ -1486,6 +1486,11 @@ private struct LoadedSimpleSpaceAuthority: Sendable {
 /// process later opens the same file.
 public enum SQLiteAccountDatabaseOpenMode: Sendable, Equatable {
     case managed
+    /// Open an existing writable account database without creating the
+    /// account directory or database file. This is used by recovery and
+    /// other operator workflows where a control-plane row is not sufficient
+    /// evidence that repository storage exists.
+    case existingManaged
     case existingPortableExportSource
     @_spi(PortableRestore) case descriptorBackedOperatorRestore(rootDescriptor: Int32)
     @_spi(PortableRestore) case descriptorBackedOperatorRestoreSource(rootDescriptor: Int32)
@@ -1551,7 +1556,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let rootDescriptor = switch openMode {
         case .managed:
             try SQLiteProtectedPaths.openRoot(dataDirectory)
-        case .existingPortableExportSource:
+        case .existingManaged, .existingPortableExportSource:
             try SQLiteProtectedPaths.openExistingRoot(dataDirectory)
         case let .descriptorBackedOperatorRestore(descriptor),
              let .descriptorBackedOperatorRestoreSource(descriptor):
@@ -1565,7 +1570,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     rootDescriptor: rootDescriptor,
                     did: did
                 )
-            case .existingPortableExportSource:
+            case .existingManaged, .existingPortableExportSource:
                 try SQLiteProtectedPaths.openExistingAccountDirectory(
                     rootDescriptor: rootDescriptor,
                     did: did
@@ -1617,7 +1622,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     create: true
                 )
                 databasePath = path
-            case .existingPortableExportSource:
+            case .existingManaged, .existingPortableExportSource:
                 heldDatabaseDescriptor = try SQLiteProtectedPaths.openDatabaseFileDescriptor(
                     parentDescriptor: accountDescriptor,
                     name: name,
@@ -1655,7 +1660,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let readOnly: Bool
         let descriptorBacked: Bool
         switch openMode {
-        case .managed:
+        case .managed, .existingManaged:
             readOnly = false
             descriptorBacked = false
         case .existingPortableExportSource:

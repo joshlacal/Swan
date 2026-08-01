@@ -1465,3 +1465,109 @@ value-bearing incremental/full-recovery behavior, reverse-authority
 OAuth/browser/account lifecycle, strict password-reset constant-work and
 non-cooperative delivery cancellation, native Linux, final clean-cache/current-
 profile acceptance, and formal security review remain open.
+
+## Adversarial rereview remediation closure — 2026-08-01
+
+The rereview found that the retained Task 45 artifact was a first install
+(`priorHeadPresent: false`, generation 1), so it could not support the claimed
+stale-replica replacement. The Task 47 runner now performs two independent
+phases: it installs a seed head, advances the source with write-only
+`com.atproto.space.applyWrites`, then requires an existing receiver head before
+the retention-gap recovery. The sanitized artifact requires generation N to
+be replaced by N+1, changed revision and commitment, a deterministic
+`CARBlockCIDMismatch` on the corrupted retry, and preservation of the new
+valid head.
+
+Fresh live evidence was rerun against the retained Compose project after
+rebuilding the current Linux release image. The result was independently
+validated with `Scripts/validate-permissioned-recovery-artifact.py` and had
+mode 0600:
+
+- `priorHeadGeneration: 1` → `replacementHeadGeneration: 2`;
+- `replacementCASAdvanced: true` and `replacementRecordCount: 7`;
+- `gapStatus: 409`, `gapErrorCode: full_repo_recovery_required`;
+- `corruptErrorCode: CARBlockCIDMismatch` and `lastValidHeadPreserved: true`.
+
+The first rebuild also exposed a Swift 6.1/Linux-only release failure in the
+bounded portable-export staging writer; its explicit initializer and file-type
+annotations are now checked by the Docker release build. The new mocked
+transport test exercises the write-only POST and signed metadata-only
+`listRepoOps` witness without a socket, and verifies that request values and
+bearer material never enter the fixture recorder. The serialized focused gates
+now pass: 6 recovery-artifact tests, 9 pre-migrated-storage tests, 13 public
+repository read HTTP tests, and the shell acceptance/verifier suites.
+
+The live artifact remains under the ignored `artifacts/` policy; the exact
+reproduction command was:
+
+```text
+SWAN_PERMISSIONED_RECOVERY_PROJECT=swan-clean-cache-5df6895d450ef2a830ca506d \
+SWAN_PERMISSIONED_RECOVERY_NO_BUILD=1 \
+SWAN_INTEROP_SECRETS_DIR=<owner-only-lab-secret-directory> \
+SWAN_PERMISSIONED_RECOVERY_OUTPUT=<owner-only-output>/permissioned-recovery.json \
+./Scripts/run-permissioned-recovery-acceptance.sh
+```
+
+This closes the false-positive recovery finding, but does not close the alpha:
+stock pinned-TypeScript value-bearing incremental/full recovery, reverse
+authority OAuth/browser/account lifecycle, native-Linux host evidence,
+current-profile clean-cache Compose, password-recovery timing and
+non-cooperative delivery cancellation, and a formal security scan remain
+required.
+
+## Adversarial rereview closure: clean-cache and notification restart — 2026-08-01
+
+The fresh macOS clean-cache gate was rerun from a new scratch directory after
+updating the lifecycle test to obtain a new OAuth grant after deactivation.
+The earlier 401 was the expected family revocation, not a missing-database
+availability result. The rerun completed profile verification, static Compose
+mutation checks, dependency resolution, a serialized fresh SwiftPM build, and
+the complete test suite with no failures. In particular,
+`PublicRepositoryReadHTTPTests` completed 13/13; the apparent hang remains
+SwiftPM resolution/lock contention when multiple processes share a build
+directory, not an HTTP route deadlock.
+
+The restart acceptance then found and closed two Compose-isolation defects:
+the runner now generates an unused per-run `172.x.0.0/24` subnet and rewrites
+the trusted Caddy peer consistently, and it removes the host Caddy port
+publication because the scenario uses only the internal TLS network. Static
+verification still inspects the checked-in fixed topology; the generated
+override is untracked, owned by the run, and removed by the bounded cleanup.
+ShellCheck and syntax checks pass. Fresh live evidence passed:
+
+- `Scripts/run-clean-cache-acceptance.sh --mode macos`: clean build/test gate
+  green; and
+- `Scripts/run-notification-restart-acceptance.sh`: two successful forwards,
+  one dropped acknowledgement, one request digest, and one durable receiver
+  effect after restart.
+
+These local gates are closed. The alpha still requires a real pinned
+TypeScript value-bearing incremental/full-recovery matrix, reverse-authority
+OAuth/browser/account lifecycle, native-Linux host evidence, strict
+password-reset timing and non-cooperative delivery cancellation, and a formal
+security scan before release-ready status.
+
+## Adversarial cross-host witness: pinned TypeScript member — 2026-08-01
+
+The disposable Compose project was restored after a live reference-member run.
+The pinned TypeScript PDS supplied the member account and delegation key; Swan
+discovered that key through the allowlisted PLC resolver, issued the authority
+credential, and completed create/read on the reference-hosted permissioned
+repository. The sanitized mode-0600 artifact reports the same write/read CID,
+four successful cross-host events, and no request bodies, record values,
+tokens, passwords, DPoP proofs, or DIDs.
+
+This closes the reference-member delegation/write/read witness for the
+Swan-authority direction. It does not yet prove the separate incremental
+oplog/full-CAR recovery matrix against the pinned TypeScript implementation,
+reverse authority placement, or the native-Linux and formal-security gates.
+
+## Formal security launcher status — 2026-08-01
+
+The mandated Codex Security diff-scan launcher was invoked against the reviewed
+working copy and did not start: its Python 3 helper failed before producing a
+scan workspace or findings artifact, reporting that the Codex installation
+must be reinstalled or updated (or `PYTHON` configured) and restarted. No
+security result is inferred from that failure, and no substitute scan artifact
+is fabricated. The formal security gate therefore remains open until the
+launcher is available and a fresh scan covers this diff.

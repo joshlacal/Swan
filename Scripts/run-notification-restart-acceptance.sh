@@ -2,6 +2,8 @@
 set -euo pipefail
 
 # Live, disposable Compose acceptance for the durable permissioned outbox.
+# Each invocation creates a fresh, internally owned Compose project; callers
+# cannot redirect cleanup to an existing project or volume set.
 # The seed Swan process commits one write with delivery disabled, then receives
 # SIGKILL. A recovery-enabled Swan process then starts only after a
 # loopback-only proxy is ready. The proxy loses the first successful
@@ -14,6 +16,11 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
+
+if [[ -n "${SWAN_NOTIFICATION_RESTART_PROJECT:-}" ]]; then
+  echo "SWAN_NOTIFICATION_RESTART_PROJECT is not accepted; the runner owns its disposable project" >&2
+  exit 64
+fi
 
 wait_timeout="${SWAN_NOTIFICATION_RESTART_TIMEOUT:-180}"
 if [[ ! "$wait_timeout" =~ ^[1-9][0-9]*$ ]] \
@@ -61,7 +68,12 @@ member_did=""
 space_uri=""
 collection="app.bsky.feed.post"
 rkey="restart-outbox"
-project_name="${SWAN_NOTIFICATION_RESTART_PROJECT:-swan-notification-restart-${PPID}-$$}"
+ownership_nonce="$(python3 -c 'import secrets; print(secrets.token_hex(12))')"
+[[ "$ownership_nonce" =~ ^[a-f0-9]{24}$ ]] || {
+  echo "notification acceptance could not generate an ownership nonce" >&2
+  exit 1
+}
+project_name="swan-notification-restart-${ownership_nonce}"
 temporary_root="${SWAN_NOTIFICATION_RESTART_TMPDIR:-/tmp}"
 [[ "$temporary_root" = /* ]] || {
   echo "SWAN_NOTIFICATION_RESTART_TMPDIR must be an absolute directory" >&2
@@ -82,6 +94,136 @@ proxy_container="${project_name}-ack-proxy"
 recovery_container="${project_name}-recovery"
 proxy_id=""
 recovery_id=""
+
+# The checked-in Compose file deliberately reserves a fixed subnet and peer
+# addresses for the static lab verifier. A restart acceptance may run while a
+# clean-cache or another disposable project is still alive, so select an
+# unused /24 and keep the trusted Caddy peer relationship intact in an
+# untracked per-run override. Never mutate docker-compose.yml or accept a
+# caller-provided topology override.
+network_ids="$(docker network ls -q)"
+configured_subnets=""
+if [[ -n "$network_ids" ]]; then
+  configured_subnets="$(
+    printf '%s\n' "$network_ids" \
+      | xargs docker network inspect \
+          --format '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' \
+          2>/dev/null || true
+  )"
+fi
+network_prefix="$(python3 - "$configured_subnets" <<'PY'
+import ipaddress
+import sys
+
+configured = []
+for raw in sys.argv[1].splitlines():
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        configured.append(ipaddress.ip_network(raw, strict=False))
+    except ValueError:
+        pass
+
+for third_octet in [30, *range(31, 255)]:
+    candidate = ipaddress.ip_network(f"172.{third_octet}.0.0/24")
+    if any(candidate.overlaps(existing) for existing in configured):
+        continue
+    print(f"172.{third_octet}.0")
+    break
+else:
+    raise SystemExit("no unused 172.x.0.0/24 subnet is available")
+PY
+)"
+[[ "$network_prefix" =~ ^172\.[0-9]+\.0$ ]] || {
+  echo "notification acceptance could not choose an isolated Compose subnet" >&2
+  exit 1
+}
+compose_override="${temporary_directory}/compose-network-override.yml"
+cat > "$compose_override" <<EOF
+services:
+  swan-bootstrap:
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.6
+  swan:
+    command:
+      - serve
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "3000"
+      - --public-url
+      - "https://swan.test"
+      - --profile
+      - /usr/local/share/swan/Profiles/permissioned-data-0016-2026-07-30.json
+      - --data-directory
+      - /var/lib/swan/data
+      - --enable-local-space-interop
+      - --space-account-kek-file
+      - /run/secrets/swan-runtime/account-kek
+      - --space-account-kek-id
+      - primary
+      - --enable-public-repository-mutations
+      - --public-account-kek-file
+      - /run/secrets/swan-runtime/account-kek
+      - --public-account-kek-id
+      - primary
+      - --oauth-server-key-file
+      - /run/secrets/swan-runtime/oauth-server-key
+      - --enable-oauth-authorization-server
+      - --oauth-allow-localhost-development-client
+      - --login-trusted-proxy-peer
+      - "${network_prefix}.2"
+      - --notification-config
+      - /etc/swan/interop/notification-config.json
+      - --enable-notification-delivery
+      - --managing-service-audience
+      - did:web:interop-swan-managing-service
+      - --enable-email-recovery
+      - --email-proof-key-file
+      - /run/secrets/swan-runtime/email-proof-key
+      - --email-sender
+      - no-reply@swan.local
+      - --email-smtp-host
+      - mailpit
+      - --email-smtp-port
+      - "1025"
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.5
+  reference-pds:
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.4
+  reference-plc:
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.3
+  caddy:
+    ports: !override []
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.2
+  mailpit:
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.7
+  toxiproxy:
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.8
+  toxiproxy-setup:
+    networks:
+      swan:
+        ipv4_address: ${network_prefix}.9
+networks:
+  swan:
+    ipam:
+      config:
+        - subnet: ${network_prefix}.0/24
+EOF
+echo "NOTIFICATION RESTART COMPOSE OVERRIDE: subnet=${network_prefix}.0/24" >&2
 
 compose() {
   if [[ "${SWAN_NOTIFICATION_RESTART_NO_BUILD:-0}" == "1" && "${1:-}" == "up" ]]; then
@@ -106,12 +248,40 @@ compose() {
     done
     if ((images_available)); then
       shift
-      ./interop/compose.sh --project-name "$project_name" up --no-build "$@"
+      ./interop/compose.sh \
+        --file "$root/docker-compose.yml" \
+        --file "$compose_override" \
+        --project-name "$project_name" up --no-build "$@"
       return
     fi
     echo "notification acceptance: project-scoped images unavailable; building pinned services" >&2
   fi
-  ./interop/compose.sh --project-name "$project_name" "$@"
+  ./interop/compose.sh \
+    --file "$root/docker-compose.yml" \
+    --file "$compose_override" \
+    --project-name "$project_name" "$@"
+}
+
+assert_project_unowned() {
+  if [[ -n "$(docker ps --all --filter "label=com.docker.compose.project=${project_name}" --quiet)" ]] \
+    || [[ -n "$(docker network ls --filter "label=com.docker.compose.project=${project_name}" --quiet)" ]] \
+    || [[ -n "$(docker volume ls --filter "label=com.docker.compose.project=${project_name}" --quiet)" ]] \
+    || [[ -n "$(docker ps --all --filter "name=^/${seed_container}$" --quiet)" ]] \
+    || [[ -n "$(docker ps --all --filter "name=^/${proxy_container}$" --quiet)" ]] \
+    || [[ -n "$(docker ps --all --filter "name=^/${recovery_container}$" --quiet)" ]]; then
+    echo "notification acceptance ownership nonce unexpectedly already exists" >&2
+    exit 1
+  fi
+}
+
+assert_project_owned() {
+  local container
+  while IFS= read -r container; do
+    [[ -z "$container" ]] && continue
+    local project
+    project="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}' "$container" 2>/dev/null || true)"
+    [[ "$project" == "$project_name" ]] || return 1
+  done < <(docker ps --all --filter "label=com.docker.compose.project=${project_name}" --quiet)
 }
 
 bounded_cleanup_command() {
@@ -147,13 +317,19 @@ cleanup() {
     bounded_cleanup_command docker rm --force "$proxy_id"
   fi
   bounded_cleanup_command docker rm --force "$seed_container"
-  bounded_cleanup_command compose down --volumes --remove-orphans
+  if assert_project_owned; then
+    bounded_cleanup_command compose down --volumes --remove-orphans
+  else
+    echo "refusing notification cleanup because project ownership could not be revalidated" >&2
+  fi
   rm -rf "$temporary_directory"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
+
+assert_project_unowned
 
 container_id() {
   local service="$1"

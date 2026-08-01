@@ -194,6 +194,29 @@ require_acceptance_preflight_rejection \
       --mode linux \
       --scratch-path "$secret_fixture/already-present"
 
+require_acceptance_preflight_rejection \
+  ambient-compose-file \
+  'COMPOSE_FILE must be unset for clean-cache acceptance' \
+  env COMPOSE_FILE=/tmp/untrusted-compose.yml \
+    ./Scripts/run-clean-cache-acceptance.sh --mode macos
+
+require_acceptance_preflight_rejection \
+  caller-selected-notification-project \
+  'SWAN_NOTIFICATION_RESTART_PROJECT is not accepted' \
+  env SWAN_NOTIFICATION_RESTART_PROJECT=existing-lab \
+    ./Scripts/run-notification-restart-acceptance.sh
+
+# The restart runner may coexist with another lab project. Its topology
+# override must be generated from Docker's live subnet inventory, must carry
+# the same trusted Caddy peer relationship, and must not publish the host 443
+# port that belongs to another disposable project.
+notification_runner="Scripts/run-notification-restart-acceptance.sh"
+rg -Fq 'docker network inspect' "$notification_runner"
+rg -Fq 'compose_override="${temporary_directory}/compose-network-override.yml"' "$notification_runner"
+rg -Fq '      - "${network_prefix}.2"' "$notification_runner"
+rg -Fq '    ports: !override []' "$notification_runner"
+rg -Fq -- '--file "$compose_override"' "$notification_runner"
+
 mutate_and_require_rejection \
   root-swan-runtime \
   $'  swan:\n    build:' \
