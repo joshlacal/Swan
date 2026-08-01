@@ -145,7 +145,7 @@ overstated several gates. The most important adversarial findings were:
 | ADV-77 | P2 | `PermissionedRemoteReplicaSourceSession` allowed callers to omit cleanup, and the orchestrator invoked a caller-supplied cleanup closure from multiple terminal paths without enforcing idempotence. A custom file-backed source could leak a descriptor/spool or double-release an external lease. | Remediated in the working copy: cleanup is now mandatory at session construction and an actor-backed close gate executes it exactly once. Verification-failure and preflight-rejection regressions pass; the HTTP provider remains the owner of the file/lease callback. |
 | ADV-78 | P2 | The durable replay result stores only `base_generation`, while the orchestrator's request digest historically omitted the remaining expected-base fields. A direct caller of the storage protocol could reuse a request ID/digest with a forged same-generation base and receive a committed replay instead of a conflicting-reuse error. The production orchestrator obtains the base from the receiver database, so this is a storage-boundary integrity hardening issue rather than an HTTP bypass. | Remediated in migration 8: the result projection stores a domain-separated digest of the complete expected-base binding and replay requires an exact match; legacy rows without the digest fail closed. |
 | ADV-79 | P3 | Three public `sync` read routes force-unwrapped the request-derived `did` query entry. The strict parser currently guarantees the key, but a future parser change or bypass could turn malformed input into a process trap instead of `InvalidRequest`. | Remediated with explicit key guards and one typed `DID` parse per route. `PublicRepositoryReadHTTPTests` passed 12/12; no authorization or privacy bypass was reproduced. |
-| ADV-97 | P1 | Deactivation followed by reactivation updates `control.sqlite` but leaves the preopened public-read generation bound to the old `AccountControlAccount` (including its `updatedAt`). Public reads therefore remain unavailable after lifecycle reactivation. | Open. Request-time generation refresh or an equivalent lifecycle invalidation path is required; permissioned authority reads and the current focused public-read suite do not cover this transition. |
+| ADV-97 | P1 | Deactivation followed by reactivation updates `control.sqlite` but leaves the preopened public-read generation bound to the old `AccountControlAccount` (including its `updatedAt`). Public reads therefore remain unavailable after lifecycle reactivation. | Remediated with an existing-database-only async generation refresh that revalidates PLC identity, preparation intent, path identity, and the exact active control row before publication. A permanent regression covers status, description, record, and CAR reads after reactivation. |
 
 ### Provenance limitation
 
@@ -1680,26 +1680,27 @@ not already admitted and `refreshPublicReadGenerationAfterMutation` runs only
 after a public repository mutation. Permissioned space authorization can still
 work, which makes this an easy split-brain lifecycle failure to miss.
 
-The safest remediation is a request-time, async generation refresh for an
-active account whose retained generation is missing or stale: re-admit the
-existing database with the production identity verifier, verify the PLC
-preparation intent, re-read the control row, require an exact active match, and
-publish the new generation before serving the public request. The refresh must
-remain existing-database-only and fail closed for deactivated, deleted,
-missing, or tampered accounts.
+The remediation is now implemented as a request-time, async generation refresh
+for an active account whose retained generation is missing or stale. It
+re-admits the existing database with the production identity verifier, verifies
+the PLC preparation intent, rechecks the database path and exact active control
+row before and after admission, and publishes the new generation only after
+all checks pass. It remains existing-database-only and fails closed for
+deactivated, deleted, missing, or tampered accounts.
 
 Fresh serialized evidence for the surrounding claims is green:
 
 - `PublicRepositoryReadHTTPTests`: 13/13;
+- `PublicRepositoryReadDirectoryTests`: 16/16 with one explicit opt-in RSS
+  skip, including the permanent reactivation regression;
+- lifecycle, activation, preparation, OAuth revocation, simple-space, and
+  public-admission selections: 43/43;
 - `Scripts/verify-interop-lab.sh`, its mutation suite, and the reference
   overlay qualification: all pass; and
 - no Swift, Docker, interop, or Caddy test process remains after cleanup.
 
-Those results do not close ADV-97. Until the reactivation generation is
-refreshed and a permanent regression covers public description, record, and
-CAR reads after deactivation/reactivation, Swan is not ready for the stated
-public-plus-permissioned lifecycle acceptance. The other open release gates
-remain the stock pinned-TypeScript value-bearing incremental/full-CAR matrix,
+ADV-97 is closed locally. The other open release gates remain the stock
+pinned-TypeScript value-bearing incremental/full-CAR matrix,
 reverse-authority OAuth/browser/account lifecycle, native Linux evidence,
 strict password-reset timing, non-cooperative delivery cancellation, export
 boundedness, and the formal security scan.

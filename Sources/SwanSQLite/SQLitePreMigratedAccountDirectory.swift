@@ -1051,7 +1051,7 @@ public actor SQLitePreMigratedAccountDirectory:
                 did: account.did, status: account.status, revision: nil
             )
         }
-        let (database, generation) = try activePublicReadContext(account)
+        let (database, generation) = try await activePublicReadContext(account)
         do {
             _ = try await database.readPublicRepositoryDescription(
                 generation: generation
@@ -1093,7 +1093,7 @@ public actor SQLitePreMigratedAccountDirectory:
                 revision: nil
             ))
         }
-        let (database, generation) = try activePublicReadContext(account)
+        let (database, generation) = try await activePublicReadContext(account)
         let description: PublicRepositoryReadDescription
         do {
             description = try await database.readPublicRepositoryDescription(
@@ -1165,7 +1165,7 @@ public actor SQLitePreMigratedAccountDirectory:
                 revision: nil
             ))
         }
-        let (database, generation) = try activePublicReadContext(account)
+        let (database, generation) = try await activePublicReadContext(account)
         let read: SQLitePublicRepositoryRecordRead
         do {
             read = try await database.readPublicRepositoryRecord(
@@ -1222,7 +1222,7 @@ public actor SQLitePreMigratedAccountDirectory:
                 revision: nil
             ))
         }
-        let (database, generation) = try activePublicReadContext(account)
+        let (database, generation) = try await activePublicReadContext(account)
         let read: SQLitePublicRepositoryPageRead
         do {
             read = try await database.readPublicRepositoryRecords(
@@ -1269,7 +1269,7 @@ public actor SQLitePreMigratedAccountDirectory:
                 revision: nil
             ))
         }
-        let (database, generation) = try activePublicReadContext(account)
+        let (database, generation) = try await activePublicReadContext(account)
         guard let lease = publicRepositorySpoolAdmission.reserve(
             accountDID: account.did,
             maximumBytes: PublicRepositoryLimits.standard.maximumCARBytes
@@ -1299,34 +1299,13 @@ public actor SQLitePreMigratedAccountDirectory:
         did: String,
         database: SQLiteAccountDatabase
     ) async throws {
-        guard !isClosed,
-              databases[did] === database,
-              let identityVerifier = publicIdentityVerifier,
-              let account = try await controlStore.account(did: did),
-              account.status == .active else {
+        guard let account = try await controlStore.account(did: did) else {
             throw PublicRepositoryReadError.unavailable
         }
-        let generation: SQLiteVerifiedPublicRepositoryGeneration
-        do {
-            generation = try await database.admitPublicRepositoryGeneration(
-                account: account,
-                identityVerifier: identityVerifier
-            )
-            try await Self.verifyPublicIdentityIntent(
-                generation.description,
-                controlStore: controlStore
-            )
-        } catch {
-            throw PublicRepositoryReadError.unavailable
-        }
-        guard !isClosed,
-              databases[did] === database,
-              let current = try await controlStore.account(did: did),
-              current == account,
-              current.status == .active else {
-            throw PublicRepositoryReadError.unavailable
-        }
-        publicReadGenerations[did] = generation
+        _ = try await refreshPublicReadGeneration(
+            account: account,
+            database: database
+        )
     }
 
     private func resolvePublicAccount(
@@ -1376,19 +1355,78 @@ public actor SQLitePreMigratedAccountDirectory:
 
     private func activePublicReadContext(
         _ account: AccountControlAccount
-    ) throws -> (
+    ) async throws -> (
         database: SQLiteAccountDatabase,
         generation: SQLiteVerifiedPublicRepositoryGeneration
     ) {
-        guard account.status == .active,
-              let generation = publicReadGenerations[account.did],
-              generation.controlAccount == account else {
+        guard account.status == .active else {
             throw PublicRepositoryReadError.unavailable
         }
+        let database = try preopenedPublicRepositoryDatabase(account.did)
+        if let generation = publicReadGenerations[account.did],
+           generation.controlAccount == account {
+            return (database, generation)
+        }
+        let generation = try await refreshPublicReadGeneration(
+            account: account,
+            database: database
+        )
         return (
-            try preopenedPublicRepositoryDatabase(account.did),
+            database,
             generation
         )
+    }
+
+    /// Re-admits the existing account database when the control row changed
+    /// after bootstrap (for example, deactivation followed by reactivation).
+    /// This is deliberately request-time refresh only: it never opens,
+    /// creates, or migrates a database, and it publishes a generation only
+    /// after PLC identity, preparation intent, path, and the exact active
+    /// control row have been checked on both sides of the admission.
+    private func refreshPublicReadGeneration(
+        account: AccountControlAccount,
+        database: SQLiteAccountDatabase
+    ) async throws -> SQLiteVerifiedPublicRepositoryGeneration {
+        guard !isClosed,
+              account.status == .active,
+              databases[account.did] === database,
+              let identityVerifier = publicIdentityVerifier else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        do {
+            try Self.requireExistingRegularDatabase(
+                SQLiteLayout.accountDatabase(in: dataDirectory, did: account.did)
+            )
+            guard let current = try await controlStore.account(did: account.did),
+                  current == account,
+                  current.status == .active else {
+                throw PublicRepositoryReadError.unavailable
+            }
+            let generation = try await database.admitPublicRepositoryGeneration(
+                account: account,
+                identityVerifier: identityVerifier
+            )
+            try await Self.verifyPublicIdentityIntent(
+                generation.description,
+                controlStore: controlStore
+            )
+            guard !isClosed,
+                  databases[account.did] === database,
+                  let current = try await controlStore.account(did: account.did),
+                  current == account,
+                  current.status == .active else {
+                throw PublicRepositoryReadError.unavailable
+            }
+            try Self.requireExistingRegularDatabase(
+                SQLiteLayout.accountDatabase(in: dataDirectory, did: account.did)
+            )
+            publicReadGenerations[account.did] = generation
+            return generation
+        } catch let error as PublicRepositoryReadError {
+            throw error
+        } catch {
+            throw PublicRepositoryReadError.unavailable
+        }
     }
 
     private func recheckPublicAccount(

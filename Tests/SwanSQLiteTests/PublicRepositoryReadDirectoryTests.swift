@@ -869,6 +869,79 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
         try await fixture.control.close()
     }
 
+    func testReactivationRefreshesPublicReadGenerationBeforeServingPublicData() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        _ = try await fixture.control.transitionStatus(
+            did: did,
+            to: .deactivated,
+            declaration: .init(),
+            now: Date(timeIntervalSince1970: 1_750_000_030)
+        )
+        let maybeInactive = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        let inactive = try XCTUnwrap(maybeInactive)
+        XCTAssertEqual(inactive.status, .deactivated)
+        XCTAssertNil(inactive.revision)
+
+        _ = try await fixture.control.transitionStatus(
+            did: did,
+            to: .active,
+            declaration: .init(),
+            now: Date(timeIntervalSince1970: 1_750_000_031)
+        )
+
+        // Reactivation changes the control-row revision/updatedAt while the
+        // SQLite actor stays preopened. The first public request must
+        // re-admit that existing database and publish a new generation.
+        let maybeStatus = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        let status = try XCTUnwrap(maybeStatus)
+        XCTAssertEqual(status.status, .active)
+        XCTAssertEqual(status.revision, fixture.state.revision)
+
+        let maybeDescription = try await fixture.directory
+            .describePublicRepository(selector: did)
+        let description = try XCTUnwrap(maybeDescription)
+        XCTAssertEqual(description.state, fixture.state)
+
+        let path = try PublicRepositoryPath(
+            collection: collection,
+            recordKey: "one"
+        )
+        let maybeRecord = try await fixture.directory.publicRepositoryRecord(
+            selector: did,
+            path: path,
+            expectedCID: nil
+        )
+        let record = try XCTUnwrap(maybeRecord)
+        XCTAssertEqual(record.path, path)
+
+        let maybeCAR = try await fixture.directory.publicRepositoryCAR(
+            selector: did
+        )
+        let car = try XCTUnwrap(maybeCAR)
+        let collector = PublicReadCARCollector()
+        try await car.spool.stream { chunk in
+            await collector.append(chunk)
+        }
+        XCTAssertTrue(car.spool.isCleanedUp)
+        let carBytes = await collector.data
+        let imported = try await PublicRepositoryCAR.importRepository(
+            from: PublicReadCARSource(carBytes),
+            verifier: P256PublicRepositoryCommitVerifier(
+                publicKey: fixture.key.publicKey
+            )
+        )
+        XCTAssertEqual(imported.state, fixture.state)
+
+        try await fixture.directory.close()
+        try await fixture.control.close()
+    }
+
     private func makeFixture(
         admission: PublicRepositorySpoolAdmission? = nil,
         tamperJournalSignature: Bool = false,
