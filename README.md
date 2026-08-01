@@ -123,12 +123,11 @@ the CAR commit is durable and reports only `promotedBlobCount` in the
 sanitized artifact.
 
 The cross-host TypeScript permissioned smoke uses the pinned reference PDS as
-the member repository and Swan as the authority. Swan's fail-closed remote key
-policy requires an operator-supplied static delegation public-key pin for that
-run (via the server's `--notification-config`); the pin contains verification
-material only and must remain outside the repository. This proves credential
-issuance and repository-host verification, but is not a substitute for the
-full TypeScript semantic matrix or dynamic DID/PLC/JWKS discovery.
+the member repository and Swan as the authority. It can use either an
+operator-supplied static delegation public-key pin or the bounded, explicitly
+allowlisted laboratory PLC resolver below. The static-pin run proves credential
+issuance and repository-host verification, but is not by itself evidence of
+dynamic DID/PLC discovery.
 
 An operator may instead configure delegation-key discovery explicitly in a
 notification configuration, without making the request path choose an
@@ -152,6 +151,24 @@ local account keys and explicit pins always win, and a failed remote lookup is
 opaque and fail-closed. The checked-in Compose notification file deliberately
 does not enable this optional field; production origins must be HTTPS and
 laboratory HTTP is restricted to the configured host allowlist.
+
+To exercise the dynamic path against an already-running disposable Compose
+project, use the acceptance harness. It creates a fresh reference-PDS account,
+rebuilds the project-scoped Swan image, temporarily replaces only Swan with an
+ephemeral resolver configuration, runs the permissioned write/credential/read
+flow, restores the original container, and retains only a sanitized artifact:
+
+```sh
+export SWAN_INTEROP_SECRETS_DIR=/absolute/path/to/owner-only-lab-secrets
+export SWAN_DYNAMIC_DELEGATION_PROJECT=disposable-compose-project
+export SWAN_DYNAMIC_DELEGATION_OUTPUT=/absolute/path/to/sanitized-result.json
+Scripts/run-reference-member-dynamic-delegation-acceptance.sh
+```
+
+Set `SWAN_DYNAMIC_DELEGATION_NO_BUILD=1` only when the project-scoped image is
+already known to represent the current checkout. The harness never changes the
+checked-in notification configuration and restores the Compose-managed Swan
+container on success, failure, or interruption.
 
 ## Disposable Compose interoperability lab
 

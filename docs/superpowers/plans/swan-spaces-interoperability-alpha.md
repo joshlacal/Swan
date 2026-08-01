@@ -397,6 +397,34 @@ but not the full alpha: dynamic discovery against a TypeScript member,
 reverse-authority OAuth/browser/lifecycle coverage, corrupted-operation and
 compaction-gap recovery, and a native Linux-host run remain required.
 
+## 2026-08-01 TypeScript-member dynamic delegation-key checkpoint
+
+The dynamic PLC resolver was subsequently exercised against a fresh account on
+the pinned TypeScript PDS, again with no static delegation-key pin. The
+repeatable
+`Scripts/run-reference-member-dynamic-delegation-acceptance.sh` harness created
+the reference account, restricted `delegationKeyPLC.allowedIssuers` to its DID,
+and ran Swan as the authority on the existing disposable Compose network. The
+TypeScript member wrote a permissioned record, Swan resolved and authenticated
+the member's `#atproto` key from the pinned laboratory PLC, issued the bound
+space credential, and the TypeScript repository host accepted that credential
+for the read. The sanitized artifact reported `status: passed`,
+`credentialIssued: true`, `converged: true`, and matching write/read CIDs; its
+mode was `0600` and it retained no permissioned record value.
+
+The harness controls the existing Swan container directly during the temporary
+replacement. This avoids letting a caller's missing historical Compose subnet
+environment recreate or detach the running project network, and the
+success/failure trap restores the original container by ID. Static shell
+validation and ShellCheck pass, and the normal Swan service was healthy through
+Caddy after the live run.
+
+This closes dynamic delegation-key discovery against a pinned TypeScript
+member. It does not close stock value-bearing TypeScript `listRepoOps`/`getRepo`,
+reverse-authority OAuth/browser/lifecycle coverage, live corrupted-operation or
+compaction-gap recovery, strict password-reset contention/cancellation gates,
+or native Linux-host acceptance.
+
 ## 2026-07-31 notification crash/restart acceptance
 
 The disposable Compose notification acceptance completed against the pinned
