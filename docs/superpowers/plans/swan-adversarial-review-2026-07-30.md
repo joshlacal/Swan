@@ -1967,3 +1967,27 @@ passed:
 
 The blob stream harness also passed:
 `SWAN_BLOB_STRESS=1 ... SwanSQLiteTests.testPrivateCASStreams256MiBInBoundedChunksWhenOptedIn`: 1/1 in 0.331 seconds. These results are macOS evidence only; they do not substitute for a native Linux run or for the open stock-reference and live cross-host semantic gates.
+
+## Adversarial rereview: fresh native-Linux receipt — 2026-08-01
+
+The earlier virtiofs resource-copy failure was not treated as a product
+failure. The current Swan source was copied into the disposable ext4-backed
+Ubuntu 26.04 ARM64 VM workspace `/tmp/swan-linux-work-20260801/Swan`, with
+Swift 6.2.3 and one SwiftPM job. The warmed current-profile build then ran
+the two selectors that had been blocked by the apparent test hang and the
+legacy-row portability concern:
+
+- `SwanSQLiteTests.testStreamLegacySQLiteBlobUsesBoundedSQLiteSlices`: 1/1,
+  0.149 seconds;
+- `PublicRepositoryReadHTTPTests`: 13/13, 0.384 seconds.
+
+The target platform reported by XCTest was
+`aarch64-unknown-linux-gnu`; the build completed in 342.43 seconds and the
+tests completed without failures. This is current native-Linux execution
+evidence for the focused selectors, not a claim that the entire Linux
+acceptance matrix has run. The full Linux suite and Linux opt-in 256 MiB/RSS
+selections still require a bounded, retained receipt before the platform
+gate can be called complete. The stock pinned-TypeScript value-bearing
+incremental/full-CAR limitation, reverse-authority browser/lifecycle matrix,
+corrupted-operation and compaction-gap traffic, strict password-reset
+work-shape proof, and unavailable formal security launcher remain open.
