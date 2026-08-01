@@ -1571,3 +1571,30 @@ must be reinstalled or updated (or `PYTHON` configured) and restarted. No
 security result is inferred from that failure, and no substitute scan artifact
 is fabricated. The formal security gate therefore remains open until the
 launcher is available and a fresh scan covers this diff.
+
+## Adversarial rereview: recovery qualification binding and test-run hygiene — 2026-08-01
+
+The recovery-variant work added a second Compose file and a stateful dynamic
+delegation mode. A verifier review found that the existing lab verifier did
+not inspect those new inputs, so a future edit could have changed the recovery
+image, archive, or patch while leaving the normal static gate green.
+
+**ADV-96 (P2, acceptance provenance):** the recovery qualification topology
+and overlay provenance were not part of the static interop verifier. The
+verifier now requires the recovery Compose file, wrapper, Dockerfile, overlay
+profile, patch, and integrity tests; binds the overlay commit/archive/patch
+checksum to the active immutable profile; rejects network source fetches in
+the recovery Dockerfile; and has a clean-cache mutation test for unsupported
+reference variants. The source-overlay integrity test and verifier mutation
+suite pass.
+
+The exact serialized public-read filter was also rerun with
+`SWIFTPM_MAX_CONCURRENT_OPERATIONS=1` and `--jobs 1`: the fresh build completed
+and `PublicRepositoryReadHTTPTests` executed 13/13 tests in 0.206 seconds.
+During cleanup, an older dynamic-delegation process was found still blocked in
+an 18-minute `docker compose build swan` child after its earlier evidence had
+already completed. Only that identified process tree and its disposable
+Compose project were stopped/removed. This is harness/process hygiene evidence,
+not a Swan HTTP deadlock; future runs should use the bounded no-build mode only
+after verifying the project-scoped image and should keep the serialized SwiftPM
+settings.

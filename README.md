@@ -170,6 +170,24 @@ already known to represent the current checkout. The harness never changes the
 checked-in notification configuration and restores the Compose-managed Swan
 container on success, failure, or interruption.
 
+To include value-bearing incremental sync and two-root full-CAR recovery in
+that cross-host witness, first start the disposable project with the
+checksum-pinned recovery overlay, then set `SWAN_DYNAMIC_DELEGATION_STATEFUL=1`:
+
+```sh
+SWAN_INTEROP_SECRETS_DIR=/absolute/path/to/owner-only-lab-secrets \
+SWAN_DYNAMIC_DELEGATION_PROJECT=disposable-recovery-project \
+SWAN_DYNAMIC_DELEGATION_STATEFUL=1 \
+SWAN_DYNAMIC_DELEGATION_NO_BUILD=1 \
+Scripts/run-reference-member-dynamic-delegation-acceptance.sh
+```
+
+This derives only the reference account's public `did:key` verification
+material from the lab PLC audit and keeps the resulting artifact sanitized and
+owner-only. It is qualified evidence for the disposable overlay; the default
+stock TypeScript image remains immutable and its known value-bearing
+`listRepoOps`/`getRepo` limitations are not hidden.
+
 ## Disposable Compose interoperability lab
 
 The lab accepts no secret values through Compose environment interpolation.
@@ -328,6 +346,11 @@ the end; the scratch directory is retained for inspection.
 export SWAN_INTEROP_SECRETS_DIR=/absolute/path/outside/this/repository
 Scripts/run-clean-cache-acceptance.sh --mode linux --wait-timeout 240
 ```
+
+To qualify the value-bearing reference recovery overlay during the same
+disposable Compose build, add `--reference-variant recovery`. The default
+`pinned` variant remains the byte-for-byte upstream image, and both variants
+report build/health evidence only; run the live semantic harness separately.
 
 To retain the exact scratch location in CI, supply a path that does not yet
 exist:

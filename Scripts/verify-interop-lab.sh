@@ -33,6 +33,13 @@ caddyfile="${SWAN_INTEROP_CADDYFILE:-interop/Caddyfile}"
 swan_dockerignore="${SWAN_INTEROP_SWAN_DOCKERIGNORE:-Dockerfile.dockerignore}"
 reference_pds_dockerignore="${SWAN_INTEROP_REFERENCE_PDS_DOCKERIGNORE:-interop/Dockerfile.reference-pds.dockerignore}"
 reference_plc_dockerignore="${SWAN_INTEROP_REFERENCE_PLC_DOCKERIGNORE:-interop/Dockerfile.reference-plc.dockerignore}"
+recovery_compose_file="interop/docker-compose.reference-recovery.yml"
+recovery_compose_script="interop/compose-recovery.sh"
+recovery_pds_dockerfile="interop/Dockerfile.reference-pds-recovery"
+recovery_overlay_profile="interop/reference-pds-overlay/profile.json"
+recovery_overlay_patch="interop/reference-pds-overlay/reference-pds-recovery.patch"
+recovery_overlay_apply="interop/reference-pds-overlay/apply-reference-pds-overlay.sh"
+recovery_overlay_test="interop/reference-pds-overlay/test-reference-pds-overlay.sh"
 
 for required_file in \
   "$compose_file" \
@@ -43,7 +50,14 @@ for required_file in \
   "$caddyfile" \
   "$swan_dockerignore" \
   "$reference_pds_dockerignore" \
-  "$reference_plc_dockerignore"
+  "$reference_plc_dockerignore" \
+  "$recovery_compose_file" \
+  "$recovery_compose_script" \
+  "$recovery_pds_dockerfile" \
+  "$recovery_overlay_profile" \
+  "$recovery_overlay_patch" \
+  "$recovery_overlay_apply" \
+  "$recovery_overlay_test"
 do
   if [[ ! -f "$required_file" ]]; then
     echo "interop verifier input is missing: ${required_file}" >&2
@@ -58,6 +72,62 @@ if [[ ! -x "Scripts/test-bootstrap-local-space.sh" ]]; then
   echo "bootstrap fail-closed regression must be executable" >&2
   exit 1
 fi
+for recovery_script in \
+  "$recovery_compose_script" \
+  "$recovery_overlay_apply" \
+  "$recovery_overlay_test"
+do
+  if [[ ! -x "$recovery_script" ]]; then
+    echo "recovery overlay script must be executable: ${recovery_script}" >&2
+    exit 1
+  fi
+done
+
+# The recovery image is a qualified disposable variant, not an unpinned fork.
+# Bind its Compose entry, source archive, and patch to the active immutable
+# profile so a green stateful run cannot silently drift to another source.
+python3 - \
+  "$recovery_overlay_profile" \
+  "Profiles/permissioned-data-0016-2026-07-30.json" \
+  "$recovery_overlay_patch" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+overlay_path, active_path, patch_path = map(pathlib.Path, sys.argv[1:])
+with overlay_path.open(encoding="utf-8") as handle:
+    overlay = json.load(handle)
+with active_path.open(encoding="utf-8") as handle:
+    active = json.load(handle)
+
+for key in ("referenceImplementationCommit", "referenceArchiveSHA256"):
+    if overlay.get(key) != active.get(key):
+        raise SystemExit(f"recovery overlay profile is not bound to active profile: {key}")
+if overlay.get("overlayPatch") != patch_path.name:
+    raise SystemExit("recovery overlay profile points to the wrong patch")
+actual = hashlib.sha256(patch_path.read_bytes()).hexdigest()
+if overlay.get("overlayPatchSHA256") != actual:
+    raise SystemExit("recovery overlay patch checksum does not match its profile")
+PY
+rg -q '^  reference-pds:$' "$recovery_compose_file"
+rg -q '^      context: \.\.$' "$recovery_compose_file"
+rg -q '^      dockerfile: Swan/interop/Dockerfile\.reference-pds-recovery$' \
+  "$recovery_compose_file"
+rg -q -- 'docker-compose.reference-recovery.yml' "$recovery_compose_script"
+rg -q -- './interop/verify-reference.sh' "$recovery_compose_script"
+rg -q '^COPY Swan/\.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354\.tar\.gz /tmp/reference\.tar\.gz$' \
+  "$recovery_pds_dockerfile"
+rg -q '^COPY Swan/interop/reference-pds-overlay/reference-pds-recovery\.patch /tmp/reference-pds-recovery\.patch$' \
+  "$recovery_pds_dockerfile"
+rg -q '^RUN apk add --no-cache patch' "$recovery_pds_dockerfile"
+rg -q 'patch --batch --forward -p1' "$recovery_pds_dockerfile"
+if rg -n '^[[:space:]]*RUN .*(curl|git clone|git fetch)' "$recovery_pds_dockerfile"; then
+  echo "recovery reference image Dockerfile must not fetch source from the network" >&2
+  exit 1
+fi
+rg -q 'overlay patch checksum mismatch' "$recovery_overlay_apply"
+rg -q 'pinned reference checkout' "$recovery_overlay_test"
 
 ./interop/verify-reference.sh
 

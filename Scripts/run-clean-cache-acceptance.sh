@@ -17,6 +17,7 @@ host_kernel="$(uname -s)"
 mode=""
 scratch_path=""
 wait_timeout="240"
+reference_variant="pinned"
 
 # Docker Compose accepts several ambient variables that can silently redirect
 # a run to a caller-selected file, project, or profile. This gate owns its
@@ -30,12 +31,14 @@ done
 
 usage() {
   cat >&2 <<'EOF'
-usage: Scripts/run-clean-cache-acceptance.sh [--mode macos|linux] [--scratch-path <directory>] [--wait-timeout <seconds>]
+usage: Scripts/run-clean-cache-acceptance.sh [--mode macos|linux] [--scratch-path <directory>] [--wait-timeout <seconds>] [--reference-variant pinned|recovery]
 
 macos: run static verification and swift test with a fresh --scratch-path.
 linux: additionally use a copied disposable source tree, fetch its pinned
        reference archive, then build Linux containers and run Compose health
        gates. This is Linux-host evidence only when the host itself is Linux.
+reference-variant recovery: apply the checked-in recovery overlay only to the
+       disposable reference image; the pinned cache remains immutable.
 EOF
   exit 64
 }
@@ -57,6 +60,11 @@ while [[ $# -gt 0 ]]; do
       wait_timeout="$2"
       shift 2
       ;;
+    --reference-variant)
+      [[ $# -ge 2 ]] || usage
+      reference_variant="$2"
+      shift 2
+      ;;
     *) usage ;;
   esac
 done
@@ -70,6 +78,7 @@ if [[ -z "$mode" ]]; then
 fi
 case "$mode" in macos|linux) ;; *) usage ;; esac
 [[ "$wait_timeout" =~ ^[1-9][0-9]*$ ]] || usage
+case "$reference_variant" in pinned|recovery) ;; *) usage ;; esac
 
 canonical_path() {
   python3 - "$1" <<'PY'
@@ -281,6 +290,10 @@ PY
   }
 
   local override="$scratch_path/compose-network-override.yml"
+  local reference_build_block=""
+  if [[ "$reference_variant" == "recovery" ]]; then
+    reference_build_block=$'    build:\n      context: ..\n      dockerfile: Swan/interop/Dockerfile.reference-pds-recovery'
+  fi
   cat > "$override" <<EOF
 services:
   swan-bootstrap:
@@ -334,6 +347,7 @@ services:
       swan:
         ipv4_address: ${network_prefix}.5
   reference-pds:
+${reference_build_block}
     networks:
       swan:
         ipv4_address: ${network_prefix}.4
@@ -366,7 +380,7 @@ networks:
         - subnet: ${network_prefix}.0/24
 EOF
   compose_override="$override"
-  echo "CLEAN-CACHE COMPOSE OVERRIDE: subnet=${network_prefix}.0/24 caddy=127.0.0.1:${published_port}" >&2
+  echo "CLEAN-CACHE COMPOSE OVERRIDE: subnet=${network_prefix}.0/24 caddy=127.0.0.1:${published_port} reference=${reference_variant}" >&2
 }
 
 compose_override=""
@@ -440,4 +454,4 @@ else
   echo "CLEAN-CACHE DOCKER-LINUX COMPOSE BUILD/HEALTH GATE OK ON ${host_kernel}: $scratch_path"
   echo "THIS IS NOT LINUX-HOST EVIDENCE"
 fi
-echo "LIVE CROSS-HOST SEMANTIC MATRIX NOT RUN; ALPHA INTEROP ACCEPTANCE REMAINS OPEN"
+echo "LIVE CROSS-HOST SEMANTIC MATRIX NOT RUN; ALPHA INTEROP ACCEPTANCE REMAINS OPEN (reference=${reference_variant})"

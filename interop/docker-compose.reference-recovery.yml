@@ -1,0 +1,9 @@
+# Explicit qualification topology for the immutable pinned TypeScript source.
+# This file is never merged into the default Compose service: callers must
+# pass it as a second -f file when they intentionally need the checked-in,
+# checksum-verified recovery overlay.
+services:
+  reference-pds:
+    build:
+      context: ..
+      dockerfile: Swan/interop/Dockerfile.reference-pds-recovery

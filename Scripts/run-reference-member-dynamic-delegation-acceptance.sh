@@ -19,6 +19,7 @@ cd "$root"
 project_name="${SWAN_DYNAMIC_DELEGATION_PROJECT:-}"
 output_path="${SWAN_DYNAMIC_DELEGATION_OUTPUT:-${root}/artifacts/live/reference-member-dynamic-delegation.json}"
 wait_timeout="${SWAN_DYNAMIC_DELEGATION_TIMEOUT:-180}"
+stateful_mode="${SWAN_DYNAMIC_DELEGATION_STATEFUL:-0}"
 
 [[ "$project_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$ ]] || {
   echo "SWAN_DYNAMIC_DELEGATION_PROJECT must name a running disposable Compose project" >&2
@@ -34,6 +35,10 @@ then
   echo "SWAN_DYNAMIC_DELEGATION_TIMEOUT must be an integer from 1 through 600" >&2
   exit 64
 fi
+case "$stateful_mode" in
+  0|1) ;;
+  *) echo "SWAN_DYNAMIC_DELEGATION_STATEFUL must be 0 or 1" >&2; exit 64 ;;
+esac
 [[ -n "${SWAN_INTEROP_SECRETS_DIR:-}" ]] || {
   echo "SWAN_INTEROP_SECRETS_DIR is required" >&2
   exit 64
@@ -236,7 +241,7 @@ main().catch((error) => {
   process.stderr.write(`reference account provisioning failed: ${error.message}\n`)
   process.exit(1)
 })
-' 
+'
 })" || exit 1
 unset SWAN_REFERENCE_HANDLE SWAN_REFERENCE_EMAIL SWAN_REFERENCE_PASSWORD
 reference_did="$(printf '%s' "$reference_account" | json_field did)" || {
@@ -248,6 +253,66 @@ reference_access_token="$(printf '%s' "$reference_account" | json_field accessJw
   exit 1
 }
 unset reference_account reference_password reference_email
+
+reference_commit_key=""
+if [[ "$stateful_mode" == "1" ]]; then
+  # The pinned PLC audit endpoint exposes the canonical did:key used by the
+  # reference repository signer. Decode its secp256k1 multicodec payload
+  # inside the reference Node image and pass only public verification material
+  # to the Swift runner.
+  reference_commit_key="$({
+    docker exec \
+      --env SWAN_REFERENCE_DID="$reference_did" \
+      "$reference_pds_id" \
+      node -e '
+const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+function decode(value) {
+  const bytes = Buffer.from(value, "utf8")
+  let digits = [0]
+  for (const byte of bytes) {
+    const index = alphabet.indexOf(String.fromCharCode(byte))
+    if (index < 0) throw new Error("invalid base58")
+    let carry = index
+    for (let i = 0; i < digits.length; i += 1) {
+      carry += digits[i] * 58
+      digits[i] = carry & 255
+      carry >>= 8
+    }
+    while (carry > 0) {
+      digits.push(carry & 255)
+      carry >>= 8
+    }
+  }
+  let leading = 0
+  while (leading < bytes.length && bytes[leading] === 49) leading += 1
+  return Buffer.concat([Buffer.alloc(leading), Buffer.from(digits.reverse())])
+}
+async function main() {
+  const did = process.env.SWAN_REFERENCE_DID
+  const response = await fetch(`http://reference-plc:2582/${did}/log/audit`)
+  if (!response.ok) throw new Error(`PLC audit status ${response.status}`)
+  const audit = await response.json()
+  const encoded = audit.at(-1)?.operation?.verificationMethods?.atproto
+  if (!Array.isArray(audit) || audit.length === 0 || typeof encoded !== "string" || !encoded.startsWith("did:key:z")) {
+    throw new Error("PLC atproto key is not canonical did:key")
+  }
+  const decoded = decode(encoded.slice("did:key:z".length))
+  if (decoded.length !== 35 || decoded[0] !== 0xe7 || decoded[1] !== 0x01) {
+    throw new Error("PLC atproto key is not secp256k1")
+  }
+  process.stdout.write(`ES256K:${decoded.subarray(2).toString("base64url")}\n`)
+}
+main().catch((error) => { process.stderr.write(`${error.message}\n`); process.exit(1) })
+ ' # end PLC audit script
+  })" || {
+    echo "the reference PLC did not expose a canonical member signing key" >&2
+    exit 1
+  }
+  [[ "$reference_commit_key" =~ ^ES256K:[A-Za-z0-9_-]{44}$ ]] || {
+    echo "the reference member signing key did not decode to a compressed secp256k1 point" >&2
+    exit 1
+  }
+fi
 
 data_volume="$(mount_name "$normal_swan_id" /var/lib/swan)"
 runtime_secrets_volume="$(mount_name "$normal_swan_id" /run/secrets/swan-runtime)"
@@ -397,6 +462,8 @@ docker run --rm \
   --mount "type=volume,src=${caddy_trust_volume},dst=/etc/ssl/certs,readonly" \
   --mount "type=bind,src=${temporary_directory},dst=/run/acceptance" \
   --env SWAN_LAB_PRODUCER_TOKEN \
+  --env SWAN_DYNAMIC_DELEGATION_STATEFUL="$stateful_mode" \
+  --env SWAN_LAB_PERMISSIONED_COMMIT_KEY="$reference_commit_key" \
   --entrypoint /bin/sh \
   "$swan_image" \
   -ec '
@@ -410,6 +477,12 @@ docker run --rm \
     export SWAN_LAB_CONSUMER_HANDLE="$5"
     SWAN_LAB_CONSUMER_PASSWORD="$(tr -d "\r\n" < /run/secrets/swan-bootstrap/authority.password)"
     export SWAN_LAB_CONSUMER_PASSWORD
+    if [ "${SWAN_DYNAMIC_DELEGATION_STATEFUL:-0}" = "1" ]; then
+      export SWAN_LAB_PERMISSIONED_COMMIT_KEY
+      stateful_flags="--permissioned-list-ops --permissioned-get-repo --permissioned-stateful-matrix"
+    else
+      stateful_flags=""
+    fi
     client_id="http://localhost?scope=atproto&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback"
     if ! /usr/local/bin/swan lab live \
       --mode permissioned \
@@ -430,6 +503,7 @@ docker run --rm \
         "repo=$2" \
         "collection=$3" \
         "rkey=$4" \
+      $stateful_flags \
       --output /tmp/sanitized-artifact.json \
       >/tmp/live-interop.log 2>&1
     then
@@ -447,7 +521,7 @@ docker run --rm \
   ' _ \
   "$space_uri" "$reference_did" "$collection" "$rkey" "$authority_handle"
 
-unset SWAN_LAB_PRODUCER_TOKEN reference_access_token
+unset SWAN_LAB_PRODUCER_TOKEN reference_access_token reference_commit_key
 mkdir -p "$(dirname "$output_path")"
 install -m 0600 "$runner_output_path" "$output_path"
 

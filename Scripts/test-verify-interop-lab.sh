@@ -201,6 +201,16 @@ require_acceptance_preflight_rejection \
     ./Scripts/run-clean-cache-acceptance.sh --mode macos
 
 require_acceptance_preflight_rejection \
+  invalid-reference-variant \
+  'usage: Scripts/run-clean-cache-acceptance.sh' \
+  ./Scripts/run-clean-cache-acceptance.sh \
+    --mode macos \
+    --reference-variant unsupported
+
+rg -Fq -- '--reference-variant pinned|recovery' Scripts/run-clean-cache-acceptance.sh
+rg -Fq -- 'reference-pds-recovery' Scripts/run-clean-cache-acceptance.sh
+
+require_acceptance_preflight_rejection \
   caller-selected-notification-project \
   'SWAN_NOTIFICATION_RESTART_PROJECT is not accepted' \
   env SWAN_NOTIFICATION_RESTART_PROJECT=existing-lab \
