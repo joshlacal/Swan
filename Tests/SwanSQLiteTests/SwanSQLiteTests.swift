@@ -3786,7 +3786,11 @@ private extension SwanSQLiteTests {
                 [.posixPermissions: NSNumber(value: 0o700)],
                 ofItemAtPath: directory.path
             )
-            if directory == root { break }
+            // Foundation's Linux URL equality can retain distinct file URL
+            // metadata even when the standardized paths are identical.
+            // Compare the validated paths so this owner-only permission walk
+            // terminates at the requested data root on every platform.
+            if directory.path == root.path { break }
             let parent = directory.deletingLastPathComponent().standardizedFileURL
             guard parent.path.hasPrefix(root.path) else {
                 throw SwanError.unavailable("test database escaped its root")

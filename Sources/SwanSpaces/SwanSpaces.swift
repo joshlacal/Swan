@@ -1650,6 +1650,11 @@ public enum SimpleSpaceAppAccess: Sendable, Codable, Equatable {
 /// laboratory authority, rejects state that would otherwise require
 /// materializing an unbounded member, client, or decision set.
 public enum SimpleSpaceLimits {
+    /// Maximum number of space records retained by the process-local
+    /// laboratory authority.  Durable authorities enforce equivalent
+    /// per-space bounds in SQLite; this cap prevents the in-memory test and
+    /// development coordinator from becoming an unbounded dictionary sink.
+    public static let maximumSpacesPerAuthority = 10_000
     /// Maximum number of member DIDs in one space, including its owner.
     public static let maximumMembersPerSpace = 10_000
     /// Maximum number of client metadata URLs in an allow-list policy.
@@ -1855,6 +1860,9 @@ public actor SimpleSpaceAuthority {
     public func create(space: SpaceURI, owner: String, configuration: SimpleSpaceConfiguration) throws -> SimpleSpace {
         guard owner == space.authority else { throw SwanError.unauthorized("only the authority DID may create this simple space") }
         guard spaces[space] == nil else { throw SwanError.conflict(expected: 0, actual: 1) }
+        guard spaces.count < SimpleSpaceLimits.maximumSpacesPerAuthority else {
+            throw SwanError.unavailable("simple-space authority capacity exhausted")
+        }
         let state = MutableSimpleSpace(uri: space, owner: owner, configuration: configuration, members: [owner], isDeleted: false)
         spaces[space] = state
         return state.snapshot
@@ -1906,6 +1914,10 @@ public actor SimpleSpaceAuthority {
         try requireOwner(state, subject: subject)
         state.isDeleted = true
         spaces[space] = state
+        // Deleted-space tombstones remain addressable, but their managing-app
+        // decisions no longer have any authorization meaning. Release that
+        // auxiliary set so deletion cannot retain stale policy state forever.
+        managingAppDecisions.removeValue(forKey: space)
     }
 
     /// A managing app can publish the result of its application-level access

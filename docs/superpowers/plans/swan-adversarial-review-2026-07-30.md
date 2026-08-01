@@ -1223,10 +1223,11 @@ Verification completed on the current macOS checkout:
   peak RSS increase for a 267,396,722-byte CAR and rejected the over-limit
   record before creating a spool.
 
-The following findings remain deliberately open rather than being hidden by
-the green local suite: the process-local `SimpleSpaceActor` retains an
-unbounded dictionary of spaces and managing-app decisions (a bounded durable
-SQLite path exists, but no total in-memory space cap); native Linux execution;
+At that checkpoint, the following findings remained deliberately open rather
+than being hidden by the green local suite: the process-local
+`SimpleSpaceActor` retained an unbounded dictionary of spaces and
+managing-app decisions (a bounded durable SQLite path existed, but no total
+in-memory space cap); native Linux execution;
 live cross-host interop with the unmodified pinned TypeScript value-bearing
 incremental/recovery paths; reverse-authority OAuth/browser/lifecycle flows;
 corrupted-operation and compaction-gap traffic; stock TypeScript delegation
@@ -1234,3 +1235,63 @@ key pin/dynamic discovery; strict password-reset constant-work evidence; the
 non-cooperative third-party email-delivery cancellation contract; and the
 official Codex Security launcher. These are release-gate items, not claims
 that the alpha is complete.
+
+## Adversarial rereview: native Linux and process-lifecycle follow-up — 2026-08-01
+
+The native Linux run was deliberately repeated in a disposable Ubuntu
+26.04/Swift 6.2.3 ARM64 VM with one SwiftPM process and --jobs 1. This
+separated a real test/runtime failure from the earlier apparent
+PublicRepositoryReadHTTPTests hang, which was SwiftPM dependency
+resolution/lock contention rather than a route deadlock.
+
+Four portability/lifecycle defects were found and remediated:
+
+- **ADV-86 (P2, test portability):** Swift 6.2's Glibc importer exposes
+  RUSAGE_SELF as an enum while getrusage expects its underlying Int32; the
+  256 MiB RSS helper now bridges that value only on Linux. Linux also
+  rejected await in defer bodies, so asynchronous fixture cleanup uses
+  XCTest teardown blocks.
+- **ADV-87 (P2, test isolation):** Foundation URL equality on Linux compared
+  filesystem metadata in the SQLite-root guard and falsely reported a
+  database escape. The guard now compares canonical paths.
+- **ADV-88 (P1, availability):** the concurrent account-provisioning
+  regression reliably hit a Swift 6.2 Linux async-let deallocation crash
+  while one child unwound. Explicit Task handles collect both outcomes
+  without weakening the race itself; the targeted test passes on both
+  platforms.
+- **ADV-89 (P1, availability):** a TLS/HTTP pipeline failure could remove the
+  NIO response handler without channelInactive, leaking its unresolved
+  promise. Connect failures, request failures, and handlerRemoved now fail
+  the promise idempotently before channel shutdown. The wrong-hostname
+  regression that exposed the leak passes on macOS and Linux.
+
+The process-local laboratory authority also had a residual bounded-state gap:
+per-space members, clients, and decisions were capped, but the actor retained
+an unbounded number of space/tombstone dictionaries. **ADV-90 (P2,
+availability)** adds a 10,000-space authority cap and releases managing-app
+decisions when a space is deleted. The cap regression passes on macOS and
+Linux; the durable SQLite authority already has its own schema and per-space
+limits.
+
+Current cross-platform evidence:
+
+- Native Linux full suite: 904 XCTest cases, 8 intentional skips, 0 failures,
+  plus the four-test Swift Testing profile suite.
+- Native Linux PublicRepositoryReadHTTPTests: 13/13 in 0.401 seconds.
+- Native Linux opt-in bounded-transfer gates: public production getRepo,
+  staged 256 MiB CAR import, public CAR-spool RSS
+  (270,049,433 bytes streamed; 65,536-byte chunks), permissioned
+  near-256 MiB CAR (267,396,722 bytes; 65,536-byte chunks), private CAR
+  spool, and private CAS blob streaming all pass.
+- Host macOS full suite after the lifecycle fixes: every XCTest target passed
+  with zero failures; the Swift Testing profile suite passed all four tests.
+
+These fixes close the Linux/build-harness and process-local bounded-state
+findings. They do not turn the remaining release gates into proof: the
+unmodified pinned TypeScript value-bearing incremental/recovery paths,
+reverse-authority OAuth/browser/lifecycle coverage, corrupted-operation and
+compaction-gap traffic, stock TypeScript delegation-key discovery, strict
+password-reset constant-work measurement, non-cooperative third-party email
+cancellation, and the official Codex Security launcher remain open. The
+checked-in recovery overlay is qualification evidence only and must not be
+described as stock-reference interoperability.

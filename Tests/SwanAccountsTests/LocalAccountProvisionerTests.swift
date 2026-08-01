@@ -192,21 +192,32 @@ final class LocalAccountProvisionerTests: XCTestCase {
                 keyProvisioner: AccountKeyProvisioner(keyStore: fixture.keyStore),
                 keyStore: fixture.keyStore
             )
-            async let firstResult = first.install(
-                did: did,
-                handle: handle,
-                password: password,
-                revision: revision,
-                now: installedAt
-            )
-            async let secondResult = second.install(
-                did: did,
-                handle: handle,
-                password: password,
-                revision: revision,
-                now: installedAt.addingTimeInterval(1)
-            )
-            let results = try await (firstResult, secondResult)
+            // Keep both child tasks alive until both outcomes have been
+            // collected. Swift 6.2's Linux concurrency runtime can corrupt
+            // an `async let` record when one child completes while the other
+            // is still unwinding; explicit tasks preserve the same race
+            // while making cleanup and failure collection deterministic.
+            let firstTask = Task {
+                try await first.install(
+                    did: did,
+                    handle: handle,
+                    password: password,
+                    revision: revision,
+                    now: installedAt
+                )
+            }
+            let secondTask = Task {
+                try await second.install(
+                    did: did,
+                    handle: handle,
+                    password: password,
+                    revision: revision,
+                    now: installedAt.addingTimeInterval(1)
+                )
+            }
+            let firstOutcome = await firstTask.result
+            let secondOutcome = await secondTask.result
+            let results = try (firstOutcome.get(), secondOutcome.get())
             XCTAssertEqual(results.0.account.did, did)
             XCTAssertEqual(results.1.account.did, did)
             XCTAssertEqual(

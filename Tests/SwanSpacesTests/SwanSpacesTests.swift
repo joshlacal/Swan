@@ -414,6 +414,42 @@ final class SwanSpacesTests: XCTestCase {
         )
     }
 
+    func testProcessLocalSimpleSpaceAuthorityBoundsTotalSpaceState() async throws {
+        let authority = SimpleSpaceAuthority(credentialSecret: Data(repeating: 9, count: 32))
+        let owner = "did:plc:alice"
+        let configuration = try SimpleSpaceConfiguration(policy: .public)
+        for index in 0 ..< SimpleSpaceLimits.maximumSpacesPerAuthority {
+            let space = try SpaceURI(
+                authority: owner,
+                spaceType: "app.bsky.bookmarks",
+                skey: "bounded-\(index)"
+            )
+            _ = try await authority.create(
+                space: space,
+                owner: owner,
+                configuration: configuration
+            )
+        }
+
+        let overflow = try SpaceURI(
+            authority: owner,
+            spaceType: "app.bsky.bookmarks",
+            skey: "bounded-overflow"
+        )
+        do {
+            _ = try await authority.create(
+                space: overflow,
+                owner: owner,
+                configuration: configuration
+            )
+            XCTFail("expected bounded process-local authority capacity")
+        } catch let error as SwanError {
+            guard case .unavailable = error else {
+                return XCTFail("expected bounded process-local authority capacity")
+            }
+        }
+    }
+
     func testTwoRootCARAuthenticatesIndexAndRecordBlocks() async throws {
         let space = try SpaceURI(authority: "did:plc:alice", spaceType: "app.bsky.bookmarks", skey: "shared")
         let uri = try SpaceRecordURI(space: space, author: "did:plc:alice", collection: "app.bsky.feed.post", rkey: "one")

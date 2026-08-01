@@ -38,7 +38,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
 
     func testExchangeAndSyncOnlyCredentialCompositionLeavesRecordAndBlobOAuthOnly() async throws {
         let fixture = try await Fixture.make()
-        defer { try? await fixture.close() }
+        addTeardownBlock { try? await fixture.close() }
 
         let server = try makeExchangeAndSyncOnlyServer(fixture)
 
@@ -109,7 +109,7 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
 
     func testActualLocalServeRuntimeMountsKeysForDelegationExchangeAndSyncOnly() async throws {
         let fixture = try await Fixture.make()
-        defer { try? await fixture.close() }
+        addTeardownBlock { try? await fixture.close() }
         let mountedKEK = fixture.root.appending(path: "mounted-space-kek")
         let mountedKEKText = Data(repeating: 0x45, count: 32).base64URLEncodedString()
         try mountedKEKText.data(using: .utf8)!

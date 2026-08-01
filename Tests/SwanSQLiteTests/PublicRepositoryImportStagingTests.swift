@@ -1663,7 +1663,17 @@ private actor ExactSizedCARBlockStream: PublicRepositoryCARBlockStream {
 
 private func peakResidentBytes() -> Int {
     var usage = rusage()
-    guard getrusage(RUSAGE_SELF, &usage) == 0 else { return 0 }
+    // Glibc exposes `RUSAGE_SELF` as an enum while Swift 6.2's Linux
+    // importer exposes `getrusage`'s first argument as the underlying
+    // `Int32` typedef.  Keep the Darwin call unchanged and bridge the
+    // Linux enum explicitly so the bounded-memory regression test remains
+    // portable across the supported toolchains.
+    #if os(Linux)
+    let processSelector = __rusage_who_t(RUSAGE_SELF.rawValue)
+    #else
+    let processSelector = RUSAGE_SELF
+    #endif
+    guard getrusage(processSelector, &usage) == 0 else { return 0 }
     #if os(Linux)
     return Int(usage.ru_maxrss) * 1_024
     #else

@@ -127,10 +127,20 @@ public struct NIOPeerPinnedATHandleHTTPTransport: ATHandleHTTPFetching {
                 }
             }
 
-        let channel = try await bootstrap.connect(
-            host: peer.description,
-            port: port
-        ).get()
+        let channel: Channel
+        do {
+            channel = try await bootstrap.connect(
+                host: peer.description,
+                port: port
+            ).get()
+        } catch {
+            // The response handler is not guaranteed to be installed when
+            // connect/initialization fails. Resolve the request promise here
+            // as well, otherwise SwiftNIO reports a leaked promise during
+            // event-loop shutdown on Linux.
+            promise.fail(ATHandleVerificationError.unavailable)
+            throw error
+        }
         do {
             guard atHandleSocketPeer(channel.remoteAddress) == peer else {
                 throw ATHandleVerificationError.verificationFailed
@@ -163,6 +173,10 @@ public struct NIOPeerPinnedATHandleHTTPTransport: ATHandleHTTPFetching {
             try? await channel.close().get()
             return response
         } catch {
+            // Covers failures before the response handler observes
+            // channelInactive (for example a write failure during TLS
+            // teardown). `EventLoopPromise` ignores duplicate completion.
+            promise.fail(ATHandleVerificationError.unavailable)
             try? await channel.close().get()
             throw error
         }
@@ -263,6 +277,17 @@ private final class ATHandleResponseHandler:
 
     func channelInactive(context: ChannelHandlerContext) {
         if !completed { fail(context) }
+    }
+
+    func handlerRemoved(context _: ChannelHandlerContext) {
+        // A TLS/HTTP pipeline can be removed without delivering
+        // channelInactive to every downstream handler. Complete the promise
+        // before deinitialization so the event-loop leak detector cannot
+        // mistake an expected connection failure for an orphaned request.
+        guard !completed else { return }
+        completed = true
+        timeoutTask?.cancel()
+        promise.fail(ATHandleVerificationError.unavailable)
     }
 
     private func fail(_ context: ChannelHandlerContext) {
