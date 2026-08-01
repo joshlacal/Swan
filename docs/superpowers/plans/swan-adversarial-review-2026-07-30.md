@@ -1759,3 +1759,36 @@ credential, wrote on Swan, and read from the member repository:
 This is fresh reverse-authority credential/write/read evidence. It still does
 not prove the stock TypeScript value-bearing incremental/full-CAR surfaces or
 the broader lifecycle/fault matrix.
+
+## Adversarial evidence revalidation: current workspace — 2026-08-01
+
+The current checkout was reread after the Luna-era lifecycle and recovery
+changes, and the focused boundary tests were rerun with one serialized SwiftPM
+process:
+
+- `PublicRepositoryReadHTTPTests`: 13/13;
+- the permanent reactivation public-read regression: 1/1;
+- OAuth family revocation after deactivation/reactivation: 1/1;
+- account-email XRPC/outbox/runtime selections: 31/31;
+- permissioned repository sync and private-blob isolation: 3/3.
+
+No new authorization or public/private data-exposure defect was reproduced in
+this pass. The attribution remains a surface/time boundary: the repository
+does not preserve per-agent authorship, so these results do not assign or
+exonerate a particular Luna agent.
+
+The platform evidence needs a provenance correction before release approval.
+`/private/tmp/swan-clean-linux-20260801.log` identifies its host as `Darwin`
+and ends with `swan-secrets-init` exit 1; it is a failed macOS Docker/Compose
+attempt, not native-Linux evidence. `/private/tmp/swan-full-linux.log` likewise
+reports an Apple macOS target platform. The earlier native-Linux result recorded
+above is therefore historical evidence, not independently revalidated by a
+retained log in this workspace. A fresh Ubuntu/Swift 6.2.3 host run must be
+captured against the current profile and current checkout, including the opt-in
+256 MiB transfer gates, before the Linux gate can be called current.
+
+The stock pinned-TypeScript value-bearing `listRepoOps`/`getRepo` gap, broader
+reverse-authority OAuth/browser/lifecycle matrix, corrupted-operation traffic,
+strict password-reset work-shape proof, non-cooperative email cancellation,
+aggregate export boundedness, and unavailable formal Codex Security launcher
+remain open. This review is not an alpha-completion sign-off.
