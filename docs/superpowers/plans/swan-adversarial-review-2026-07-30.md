@@ -993,3 +993,42 @@ JSON/read coverage passed 12/12 after a serialized clean-scratch build
 (`SWIFTPM_MAX_CONCURRENT_OPERATIONS=1`, `--jobs 1`). No new P1 authorization,
 public/private-isolation, CAR-integrity, credential, or recovery bypass was
 reproduced.
+
+## Stream-admission rereview: 2026-07-31
+
+An additional independent pass focused on the Luna-era public/private blob
+response paths. The byte budget alone did not bound the number of concurrent
+descriptor-backed responses, and public or permissioned `getBlob` could open
+and verify a blob before acquiring the shared transfer budget. A slow-reader
+burst could therefore consume more descriptors and connection work than the
+CAR spool budget intended.
+
+The remediation is committed as `bb825ad2` (`security: bound public and
+private blob streams`):
+
+- `PublicRepositorySpoolAdmission` now enforces process-wide and per-account
+  byte and lease ceilings, with overflow-safe accounting and idempotent
+  release.
+- Public and permissioned blob routes reserve before opening the blob, reject
+  empty or over-256 MiB bodies, and retain the lease until the streaming body
+  drains or fails.
+- Hummingbird now applies an explicit connection ceiling and HTTP/1 idle
+  timeout; the CLI passes the preopened directory's admission instance to all
+  relevant routes.
+- A regression holds the only lease and proves public `getBlob` fails closed
+  before opening bytes, then succeeds and releases after the lease is freed.
+
+Focused public-read, public-mutation, private-sync, and blob-binding tests
+passed. The complete serialized macOS suite passed with a freshly built
+`swan` executable and `SWAN_TEST_EXECUTABLE` explicitly pinned. The
+clean-cache macOS acceptance wrapper also passed from a fresh dependency
+build. Direct `swift test` remains unsafe as standalone evidence when a stale
+`.build-task*` executable is present; use the explicit override or
+`Scripts/run-clean-cache-acceptance.sh`.
+
+No new authorization, credential, public/private-isolation, CAR-integrity, or
+recovery bypass was reproduced. This closes a local availability boundary but
+does not change the release boundary: native Linux, unmodified pinned
+TypeScript semantic/recovery interoperability, reverse-authority OAuth and
+lifecycle coverage, corrupted-operation/compaction-gap traffic, and the
+official security launcher remain open.
