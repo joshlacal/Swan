@@ -1878,3 +1878,47 @@ pinned-TypeScript value-bearing incremental/full-CAR behavior,
 reverse-authority lifecycle/browser coverage, strict password-reset
 work-shape evidence, the legacy SQLite blob-row compatibility seam, and the
 formal security launcher.
+
+## Adversarial rereview: portable-export SQLite read-only mode — 2026-08-01
+
+The first clean-cache run found a reproducibility defect that the normal
+cached build masked. The portable-export CLI opened the account database with
+SQLite's mode=ro URI and PRAGMA query_only=ON. The exporter then attempted to
+create its bounded connection-local CAR index table, and SQLite correctly
+rejected that TEMP write as "attempt to write a readonly database".
+
+The account source mode now relies on the mode=ro URI for durable-file
+immutability while allowing only connection-local TEMP index tables. Durable
+CREATE TABLE attempts still fail, and a regression explicitly proves the
+TEMP create/drop path required by CAR export. The control database keeps its
+query-only pragma because it does not need temporary write state.
+
+Evidence:
+
+- testPortableExportDatabaseModesRejectDurableWrites: 1/1;
+- SwanAccountExportTests: 42/42;
+- SWAN_INTEROP_SECRETS_DIR="" ./Scripts/run-clean-cache-acceptance.sh --mode macos --scratch-path /private/tmp/swan-clean-cache-20260801-readonly-fix: clean build and all targets passed, with the expected opt-in 256 MiB tests skipped; and
+- the runner retained the explicit boundary LIVE CROSS-HOST SEMANTIC MATRIX NOT RUN; ALPHA INTEROP ACCEPTANCE REMAINS OPEN.
+
+This closes the clean-cache portable-export launch defect locally. It does
+not provide native-Linux evidence, stock pinned-TypeScript value-bearing
+incremental/full-CAR interoperability, reverse-authority lifecycle/browser
+coverage, strict password-reset work-shape evidence, legacy SQLite blob-row
+RSS proof, or the formal security launcher.
+
+## Adversarial rereview: opt-in transfer and RSS gates — 2026-08-01
+
+After the clean-cache correction, the opt-in large-transfer gates were run
+serially with `swift test --jobs 1` so that SwiftPM resolution and RSS samples
+were not contaminated by concurrent test processes. All six macOS selections
+passed:
+
+- `SWAN_CAR_256M_STRESS=1 ... SwanSpacesTests.testPrivateCARSpool256MiBStressWhenExplicitlyEnabled`: 1/1;
+- `SWAN_RUN_256MIB_PUBLIC_CAR_SPOOL_RSS=1 ... PublicRepositoryCARSpoolRSSRegressionTests.testOptInFreshProcess256MiBPublicCARSpoolDrainHasBoundedRSS`: 1/1, streamed 270,049,433 bytes, peak RSS delta 17,039,360 bytes;
+- `SWAN_RUN_100K_PERMISSIONED_CAR_INDEX=1 ... PermissionedRepositoryCARStreamingTests.testOptInMaximumCardinalityRecoveryIndexBoundsRSSAndScratchDisk`: 1/1, logical 6,600,000 bytes, scratch 20,770,816 bytes, peak RSS delta 12,369,920 bytes;
+- `SWAN_RUN_256MIB_PERMISSIONED_GET_REPO=1 ... PermissionedRepositoryCARStreamingTests.testOptInProductionSQLiteNear256MiBCARHasBoundedRSSAndRejectsOneMoreRecord`: 1/1, CAR 267,396,722 bytes, maximum chunk 65,536 bytes, integrity verified, over-limit request rejected without spool, peak RSS increase 21,708,800 bytes;
+- `SWAN_RUN_256MIB_PUBLIC_GET_REPO=1 ... PublicRepositoryReadDirectoryTests.testOptIn256MiBProductionDirectoryGetRepoHasBoundedRSS`: 1/1 in 7.215 seconds; and
+- `SWAN_RUN_256MIB_CAR_STAGING=1 ... PublicRepositoryImportStagingTests.testOptIn256MiBStagedCAR`: 1/1 in 12.432 seconds.
+
+The blob stream harness also passed:
+`SWAN_BLOB_STRESS=1 ... SwanSQLiteTests.testPrivateCASStreams256MiBInBoundedChunksWhenOptedIn`: 1/1 in 0.331 seconds. These results are macOS evidence only; they do not substitute for a native Linux run or for the open stock-reference and live cross-host semantic gates.

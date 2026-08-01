@@ -337,7 +337,7 @@ final class SwanSQLiteTests: XCTestCase {
         try await database.close()
     }
 
-    func testPortableExportDatabaseModesAreActuallyQueryOnly() async throws {
+    func testPortableExportDatabaseModesRejectDurableWrites() async throws {
         let fixture = try Fixture()
         let managedAccount = try await fixture.open()
         try await managedAccount.close()
@@ -355,6 +355,14 @@ final class SwanSQLiteTests: XCTestCase {
             )
             XCTFail("portable export account connection accepted a write")
         } catch {}
+        // CAR export uses a connection-local index to keep durable repository
+        // writes impossible without preventing its bounded snapshot path.
+        _ = try await account.connection.query(
+            "CREATE TEMP TABLE portable_export_temp_index(value INTEGER)"
+        )
+        _ = try await account.connection.query(
+            "DROP TABLE portable_export_temp_index"
+        )
         try await account.close()
 
         let control = try await SQLiteControlDatabase(

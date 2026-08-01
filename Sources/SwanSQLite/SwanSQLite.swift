@@ -1735,17 +1735,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 throw error
             }
         } else {
-            do {
-                _ = try await openedConnection.query("PRAGMA query_only=ON")
-            } catch {
-                try? await openedConnection.close()
-                SQLiteProtectedPaths.closeDirectory(heldDatabaseDescriptor)
-                SQLiteProtectedPaths.closeAccountLifecycleLock(
-                    lifecycleLockDescriptor
-                )
-                SQLiteProtectedPaths.closeDirectory(accountDescriptor)
-                throw error
-            }
+            // The mode=ro URI above makes the durable account database
+            // immutable while still allowing CAR export to create/drop
+            // connection-local TEMP index tables. SQLite's query_only pragma
+            // also rejects TEMP writes, which are required by the bounded
+            // repository snapshot path.
         }
     }
 
