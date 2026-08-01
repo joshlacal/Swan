@@ -1742,3 +1742,20 @@ remaining release gates are the stock pinned-TypeScript matrix,
 reverse-authority OAuth/browser/account lifecycle, strict password-reset
 timing, non-cooperative delivery cancellation, export boundedness, and the
 formal security scan.
+
+## Fresh reverse-authority rerun — 2026-08-01
+
+The disposable reverse placement was rerun against the current image with the
+TypeScript host as authority and Swan as member. The automated OAuth/DPoP
+member path obtained a delegation token, exchanged the cross-host space
+credential, wrote on Swan, and read from the member repository:
+
+- delegation token, credential exchange, create, and read all returned HTTP
+  200;
+- the write and read CIDs matched; and
+- the sanitized artifact reported `credentialIssued: true`,
+  `converged: true`, and `status: passed`.
+
+This is fresh reverse-authority credential/write/read evidence. It still does
+not prove the stock TypeScript value-bearing incremental/full-CAR surfaces or
+the broader lifecycle/fault matrix.
