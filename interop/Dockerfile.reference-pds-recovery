@@ -1,7 +1,7 @@
 # The recovery-qualified lab image is built from the same immutable pinned
 # source archive as the default reference image. The patch is applied only to
 # this disposable image and never to Swan/.interop-cache.
-FROM node:24.15-alpine3.23 AS build
+FROM node:24.15-alpine3.23@sha256:d1b3b4da11eefd5941e7f0b9cf17783fc99d9c6fc34884a665f40a06dbdfc94f AS build
 
 WORKDIR /app
 COPY Swan/.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354.tar.gz /tmp/reference.tar.gz
@@ -14,12 +14,16 @@ RUN apk add --no-cache patch \
     && test -f /app/services/pds/Dockerfile \
     && test -f /app/pnpm-lock.yaml
 
-RUN npm install --global pnpm@11.5.2
+RUN (cd /tmp && npm pack pnpm@11.5.2 --pack-destination /tmp) \
+    && echo "71c631e382066efc25625d5cf029075de07b61b37f6e27350fbd84b1bda5864c8c1967adc280776b45c30a715c0359a3be08fef42d5bb09e2b99029979692916  /tmp/pnpm-11.5.2.tgz" | sha512sum -c - \
+    && npm install --global /tmp/pnpm-11.5.2.tgz \
+    && rm /tmp/pnpm-11.5.2.tgz \
+    && test "$(pnpm --version)" = "11.5.2"
 RUN PUPPETEER_SKIP_DOWNLOAD=true pnpm install --frozen-lockfile --prefer-offline \
     && pnpm run --recursive --stream --filter '@atproto/pds...' build \
     && pnpm install --prod --shamefully-hoist --frozen-lockfile --prefer-offline --config.confirmModulesPurge=false
 
-FROM node:24.15-alpine3.23
+FROM node:24.15-alpine3.23@sha256:d1b3b4da11eefd5941e7f0b9cf17783fc99d9c6fc34884a665f40a06dbdfc94f
 RUN apk add --no-cache dumb-init
 ENTRYPOINT ["dumb-init", "--"]
 COPY --from=build /app /app

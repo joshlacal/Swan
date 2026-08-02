@@ -423,6 +423,22 @@ mutate_file_and_require_rejection \
   'reference image Dockerfiles must not accept an archive checksum build argument'
 
 mutate_file_and_require_rejection \
+  mutable-reference-node-image \
+  interop/Dockerfile.reference-pds \
+  'FROM node:24.15-alpine3.23@sha256:d1b3b4da11eefd5941e7f0b9cf17783fc99d9c6fc34884a665f40a06dbdfc94f AS build' \
+  'FROM node:24.15-alpine3.23 AS build' \
+  SWAN_INTEROP_REFERENCE_PDS_DOCKERFILE \
+  'reference image Dockerfiles must use the exact pinned Node digest in both stages'
+
+mutate_file_and_require_rejection \
+  altered-pnpm-bootstrap-digest \
+  interop/Dockerfile.reference-pds \
+  '71c631e382066efc25625d5cf029075de07b61b37f6e27350fbd84b1bda5864c8c1967adc280776b45c30a715c0359a3be08fef42d5bb09e2b99029979692916' \
+  '81c631e382066efc25625d5cf029075de07b61b37f6e27350fbd84b1bda5864c8c1967adc280776b45c30a715c0359a3be08fef42d5bb09e2b99029979692916' \
+  SWAN_INTEROP_REFERENCE_PDS_DOCKERFILE \
+  'reference image Dockerfiles must verify the pinned pnpm bootstrap'
+
+mutate_file_and_require_rejection \
   swan-reference-cache-exception \
   Dockerfile.dockerignore \
   $'Swan/.interop-cache/**\n' \

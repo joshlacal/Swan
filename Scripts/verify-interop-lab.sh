@@ -430,6 +430,28 @@ rg -q 'COPY Swan/interop/prepare-interop-secrets\.sh /usr/local/bin/swan-interop
 rg -q 'COPY Swan/interop/prepare-caddy-trust\.sh /usr/local/bin/swan-interop-caddy-trust' Dockerfile
 rg -q 'COPY Swan/interop/run-reference-pds\.sh /usr/local/bin/reference-pds-with-file-secrets' "$reference_pds_dockerfile"
 rg -q '^CMD \["/usr/local/bin/reference-pds-with-file-secrets",' "$reference_pds_dockerfile"
+node_image='node:24.15-alpine3.23@sha256:d1b3b4da11eefd5941e7f0b9cf17783fc99d9c6fc34884a665f40a06dbdfc94f'
+pnpm_sha512='71c631e382066efc25625d5cf029075de07b61b37f6e27350fbd84b1bda5864c8c1967adc280776b45c30a715c0359a3be08fef42d5bb09e2b99029979692916'
+for reference_dockerfile in \
+  "$reference_pds_dockerfile" \
+  "$reference_plc_dockerfile" \
+  "$recovery_pds_dockerfile"; do
+  node_from_count="$(rg -c "^FROM ${node_image}( AS build)?$" "$reference_dockerfile" || true)"
+  if [[ "$node_from_count" != "2" ]]; then
+    echo "reference image Dockerfiles must use the exact pinned Node digest in both stages" >&2
+    exit 1
+  fi
+  if rg -q '^FROM node:[^@[:space:]]+( AS build)?$' "$reference_dockerfile"; then
+    echo "reference image Dockerfiles must pin Node by digest" >&2
+    exit 1
+  fi
+  if ! rg -q "${pnpm_sha512}  /tmp/pnpm-11\\.5\\.2\\.tgz" "$reference_dockerfile" \
+      || ! rg -q 'npm install --global /tmp/pnpm-11\.5\.2\.tgz' "$reference_dockerfile" \
+      || ! rg -q 'test "\$\(pnpm --version\)" = "11\.5\.2"' "$reference_dockerfile"; then
+    echo "reference image Dockerfiles must verify the pinned pnpm bootstrap" >&2
+    exit 1
+  fi
+done
 rg -q 'account show' interop/bootstrap-local-space.sh
 rg -q 'account not found' interop/bootstrap-local-space.sh
 rg -q 'could not inspect existing account' interop/bootstrap-local-space.sh
