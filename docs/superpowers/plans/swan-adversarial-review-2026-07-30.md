@@ -2570,3 +2570,18 @@ and the reverse authority/member roles are explicit in the artifact. This is
 current dynamic credential/write/read evidence; it does not claim stock
 value-bearing incremental/full-CAR support or the broader reverse lifecycle and
 fault matrix.
+
+## Adversarial rereview: current post-restart public round trip — 2026-08-02
+
+After the recovery and reverse-authority harnesses restored the normal Compose
+container, an isolated runner performed an OAuth-authenticated public
+`com.atproto.repo.putRecord` on Swan and an unauthenticated public
+`com.atproto.repo.getRecord` through the same Caddy route. Both endpoint events
+returned HTTP 200, the record CIDs matched, and the sanitized artifact reports
+`status: passed` and `converged: true` at
+`.interop-live/public-current-20260802/artifact.json` (mode 0600). The
+artifact contains only response digests, byte counts, statuses, and the
+declared semantic-summary policy. This is current public-surface runtime
+evidence alongside the strict permissioned recovery receipt; it does not close
+the stock TypeScript recovery gap or the remaining cross-host fault/lifecycle
+gates.
