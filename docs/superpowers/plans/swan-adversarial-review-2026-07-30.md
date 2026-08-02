@@ -2518,3 +2518,38 @@ Evidence after the repair:
   passed; and
 - the only shell failure encountered while capturing the first focused result
   was the zsh special variable name `status`, not SwiftPM or test execution.
+
+## Adversarial rereview: current strict retention recovery and resolver boundary — 2026-08-02
+
+The live strict recovery harness was first run with an old project-scoped
+recovery image and correctly failed host artifact validation because that image
+emitted a pre-successor artifact shape. The normal Compose Swan container was
+restored healthy. The current project image was then retagged without changing
+source or data, and the exact harness was rerun against the existing external
+data volume.
+
+The current run passed `Scripts/validate-permissioned-recovery-artifact.py` and
+left the normal Swan container restored. Its mode-0600 sanitized artifact is
+`/private/tmp/swan-live-recovery-current-20260802-rerun.json`; it records:
+
+- HTTP 409 `full_repo_recovery_required` with no fallback;
+- a generation-advancing replacement from one to two with revision/CAS and
+  commitment agreement;
+- seven recovered records in the replacement CAR;
+- deterministic `CARBlockCIDMismatch` rejection; and
+- preservation of the last valid head after corruption.
+
+The artifact's declared fixture policy contains no DIDs, space URIs, paths,
+request identities, verifier material, credentials, tokens, DPoP proofs,
+record values, or raw LtHash state. Caddy, Swan, the pinned reference PDS/PLC,
+Mailpit, and Toxiproxy were healthy after restoration. This closes the strict
+Swan-host retention/full-CAR/corruption gate for the current profile; it does
+not upgrade the stock TypeScript `listRepoOps`/`getRepo` gap or prove the
+cross-host semantic matrix.
+
+A fresh clean-cache macOS run was also attempted with one SwiftPM worker. It
+resolved the pinned dependencies but remained for more than ten minutes in
+the Xcode 27 beta `swift-crypto` manifest compiler with no progress. The
+exact child compiler and scratch directory were cleaned up; the prior
+serialized current-commit graph remains the authoritative green macOS test
+receipt. This is a toolchain-resolution limitation, not a Swift test failure.
