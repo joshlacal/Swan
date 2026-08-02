@@ -112,7 +112,8 @@ final class PermissionedBlobRepositoryReachabilityTests: XCTestCase {
             let payload = Data("promoted permissioned blob".utf8)
             let publicReference = try await database.putBlob(
                 payload,
-                namespace: .public
+                namespace: .public,
+                mimeType: "application/octet-stream"
             )
             let blobCID = try CID.parse(publicReference.cid)
             let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
@@ -169,7 +170,8 @@ final class PermissionedBlobRepositoryReachabilityTests: XCTestCase {
             let payload = Data("shared public and permissioned blob".utf8)
             let publicReference = try await database.putBlob(
                 payload,
-                namespace: .public
+                namespace: .public,
+                mimeType: "application/octet-stream"
             )
             let blobCID = try CID.parse(publicReference.cid)
             let signingKey = P256.Signing.PrivateKey()

@@ -2501,3 +2501,20 @@ This closes the two local blob integrity/isolation findings. It does not
 upgrade the stock pinned TypeScript value-bearing `listRepoOps`/`getRepo`
 surfaces, and it does not close the broader native-Linux/current-profile,
 fault/compaction, reverse-lifecycle, password-reset, or formal-security gates.
+
+## Adversarial rereview: current full-suite regression and repair — 2026-08-02
+
+The first full current-commit run caught one fixture regression introduced by
+the strict typed-blob metadata fence: a storage test created a public blob
+without MIME metadata and then asserted a typed `application/octet-stream`
+record. The production path correctly rejected that mismatch. The fixture now
+stores the declared MIME metadata explicitly.
+
+Evidence after the repair:
+
+- `PermissionedBlobRepositoryReachabilityTests`: 5/5, 0 failures;
+- the complete serialized macOS `swift test --skip-build --jobs 1`: exit 0;
+- every XCTest product passed, and all four Swift Testing public-wire cases
+  passed; and
+- the only shell failure encountered while capturing the first focused result
+  was the zsh special variable name `status`, not SwiftPM or test execution.
