@@ -13,7 +13,23 @@ if [[ "$target" != /* || "$target" == *$'\n'* || "$target" == *:* ]]; then
   echo "secret directory must be an absolute, mount-safe path" >&2
   exit 1
 fi
-if [[ -e "$target" ]]; then
+target_parent="${target%/*}"
+target_name="${target##*/}"
+if [[ -z "$target_name" || "$target_name" == "." || "$target_name" == ".." ]]; then
+  echo "secret directory must name a new child directory" >&2
+  exit 1
+fi
+if ! physical_parent="$(cd "$target_parent" 2>/dev/null && pwd -P)"; then
+  echo "secret directory parent must already exist" >&2
+  exit 1
+fi
+physical_target="${physical_parent}/${target_name}"
+if [[ "$physical_target" != "$target" ]]; then
+  echo "secret directory path must not traverse symlinked or non-canonical ancestors" >&2
+  exit 1
+fi
+target="$physical_target"
+if [[ -e "$target" || -L "$target" ]]; then
   echo "refusing to overwrite an existing secret directory" >&2
   exit 1
 fi
