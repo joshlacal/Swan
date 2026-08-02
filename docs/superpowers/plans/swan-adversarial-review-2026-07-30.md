@@ -2257,3 +2257,27 @@ Compose restart was refused because its generated file required a no-longer
 exported secret-directory variable. Swan, the reference PDS, reference PLC,
 Caddy, Mailpit, and Toxiproxy are healthy again. This does not change the
 separate Lima VM descriptor-pressure incident.
+
+## Adversarial rereview: restart-safe Toxiproxy topology — 2026-08-01
+
+A direct restart exposed an operational seam in the lab itself: Toxiproxy's
+proxy definitions are process memory, while `toxiproxy-setup` is a successful
+one-shot dependency. Restarting only the long-running containers therefore
+left `pds.test` returning Caddy 502 until the setup request was replayed.
+
+The topology is now checked into the pinned Toxiproxy image rather than a host
+bind or an assumed rerun of the setup container. `interop/Dockerfile.toxiproxy`
+uses the pinned `2.12.0` digest and copies the exact single `reference-pds`
+proxy from `interop/toxiproxy.json`; Compose starts it with the file-backed
+configuration and keeps the setup service as an idempotent first-boot check.
+This preserves the no-untrusted-host-bind invariant and makes direct restarts
+reconstruct the proxy before Caddy accepts traffic.
+
+Verification:
+
+- the Toxiproxy image built successfully from the pinned base and its startup
+  log reported `Populated proxies from file`;
+- `./Scripts/verify-interop-lab.sh` passed effective and static invariants;
+- `./Scripts/test-verify-interop-lab.sh` passed the mutation suite; and
+- the restarted lab returned HTTP 200 for both `swan.test` and `pds.test`
+  `com.atproto.server.describeServer` routes after the proxy was restored.

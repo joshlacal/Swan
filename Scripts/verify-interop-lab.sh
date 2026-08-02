@@ -29,6 +29,8 @@ notification_config_file="${SWAN_INTEROP_NOTIFICATION_CONFIG_FILE:-interop/notif
 notification_restart_scenario="${SWAN_INTEROP_NOTIFICATION_RESTART_SCENARIO:-Scripts/run-notification-restart-acceptance.sh}"
 reference_pds_dockerfile="${SWAN_INTEROP_REFERENCE_PDS_DOCKERFILE:-interop/Dockerfile.reference-pds}"
 reference_plc_dockerfile="${SWAN_INTEROP_REFERENCE_PLC_DOCKERFILE:-interop/Dockerfile.reference-plc}"
+toxiproxy_dockerfile="interop/Dockerfile.toxiproxy"
+toxiproxy_config="interop/toxiproxy.json"
 caddyfile="${SWAN_INTEROP_CADDYFILE:-interop/Caddyfile}"
 swan_dockerignore="${SWAN_INTEROP_SWAN_DOCKERIGNORE:-Dockerfile.dockerignore}"
 reference_pds_dockerignore="${SWAN_INTEROP_REFERENCE_PDS_DOCKERIGNORE:-interop/Dockerfile.reference-pds.dockerignore}"
@@ -47,6 +49,8 @@ for required_file in \
   "$notification_restart_scenario" \
   "$reference_pds_dockerfile" \
   "$reference_plc_dockerfile" \
+  "$toxiproxy_dockerfile" \
+  "$toxiproxy_config" \
   "$caddyfile" \
   "$swan_dockerignore" \
   "$reference_pds_dockerignore" \
@@ -317,6 +321,8 @@ require_contains "$caddy_block" 'test -s /data/caddy/pki/authorities/local/root.
 require_contains "$caddy_block" 'aliases:' "Caddy TLS aliases are missing"
 require_contains "$caddy_block" 'ipv4_address: 172.30.0.2' "Caddy must have the fixed login-proxy peer address"
 require_contains "$toxiproxy_block" 'ipv4_address: 172.30.0.8' "Toxiproxy must reserve an address distinct from Caddy"
+require_contains "$toxiproxy_block" 'dockerfile: Swan/interop/Dockerfile.toxiproxy' "Toxiproxy must use the pinned checked-in config image"
+require_contains "$toxiproxy_block" '-config=/etc/toxiproxy/config.json' "Toxiproxy must load its restart-safe proxy configuration"
 require_contains "$caddy_block" 'dockerfile: Swan/interop/Dockerfile.caddy' "Caddy must use the pinned checked-in config image"
 reject_contains "$caddy_block" './interop/Caddyfile:' "Caddy must not use a host file bind"
 require_contains "$caddy_block" 'swan.test' "Caddy must own the swan.test network alias"
@@ -385,6 +391,32 @@ if [[ "${set_client_header_count:-0}" -ne 1 ]]; then
 fi
 rg -q '^FROM caddy:2\.10\.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d$' interop/Dockerfile.caddy
 rg -q '^COPY Swan/interop/Caddyfile /etc/caddy/Caddyfile$' interop/Dockerfile.caddy
+rg -q '^FROM ghcr\.io/shopify/toxiproxy:2\.12\.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e$' "$toxiproxy_dockerfile"
+rg -q '^COPY Swan/interop/toxiproxy\.json /etc/toxiproxy/config\.json$' "$toxiproxy_dockerfile"
+if rg -n '^[[:space:]]*RUN .*(curl|wget|git clone|git fetch)' "$toxiproxy_dockerfile"; then
+  echo "Toxiproxy image Dockerfile must not fetch source from the network" >&2
+  exit 1
+fi
+python3 - "$toxiproxy_config" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+configuration = json.loads(path.read_text(encoding="utf-8"))
+if not isinstance(configuration, list) or len(configuration) != 1:
+    raise SystemExit("Toxiproxy config must contain exactly one proxy")
+proxy = configuration[0]
+if not isinstance(proxy, dict) or set(proxy) != {"name", "listen", "upstream", "enabled"}:
+    raise SystemExit("Toxiproxy config must contain only the reference-pds proxy")
+if proxy != {
+    "name": "reference-pds",
+    "listen": "0.0.0.0:8666",
+    "upstream": "reference-pds:3000",
+    "enabled": True,
+}:
+    raise SystemExit("Toxiproxy reference-pds proxy is not the pinned topology")
+PY
 
 rg -qx 'FROM swift:6\.1-jammy@sha256:12be34a341945adb64914405ed7b568fcb2d35edbd63a3755007e47dce59456e AS build' Dockerfile
 rg -q 'libsodium-dev pkg-config' Dockerfile
