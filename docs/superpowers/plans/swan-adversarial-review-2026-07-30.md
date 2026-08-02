@@ -2585,3 +2585,49 @@ declared semantic-summary policy. This is current public-surface runtime
 evidence alongside the strict permissioned recovery receipt; it does not close
 the stock TypeScript recovery gap or the remaining cross-host fault/lifecycle
 gates.
+
+## Adversarial rereview: current post-restart typed public blob round trip — 2026-08-02
+
+After the container restart, an isolated CA-trusted runner exercised the
+modern typed public-blob path against the current Swan image. It uploaded the
+fixture through OAuth, inserted the returned CID in a typed `blob` record,
+read that record anonymously, and streamed the blob back through
+`com.atproto.sync.getBlob`. Every endpoint returned HTTP 200, the write/read
+record CIDs matched, and the downloaded bytes matched the upload. The
+sanitized mode-0600 artifact is
+`.interop-live/public-current-20260802/typed-blob-artifact.json`; it contains
+only statuses, digests, byte counts, and the declared fixture policy.
+
+This is current Swan public typed-blob evidence, including the metadata and
+commit-time public/private reachability fences. It does not upgrade the stock
+TypeScript value-bearing incremental/full-CAR limitation or prove the broader
+cross-host fault and lifecycle matrix.
+
+## Adversarial rereview: Xcode-toolchain clean-cache acceptance — 2026-08-02
+
+The earlier clean-cache attempt used the shell's Swift 6.2.3 executable and
+stalled in the Xcode 27 beta `swift-crypto` manifest compiler. The exact
+acceptance was rerun with the installed Xcode Swift 6.4 toolchain first in
+`PATH`, one SwiftPM worker, and a fresh scratch root
+`/private/tmp/swan-clean-cache-current-xcode64-20260802-1`.
+
+The run completed the isolated product build in 375.36 seconds, then built
+and executed the full test graph. The script exited 0 with
+`CLEAN-CACHE MACOS BUILD/TEST GATE OK`; every XCTest product passed with the
+normal eight opt-in skips, and all four Swift Testing public-wire cases
+passed. The only diagnostics were existing Swift 6.4 Sendable/deprecation and
+local libsodium deployment-target warnings. The runner correctly reported
+that it did not execute the live cross-host semantic matrix.
+
+This closes the macOS clean-cache reproducibility gate when the Xcode 27
+toolchain is selected explicitly. It does not substitute for native-Linux
+host evidence, stock TypeScript value-bearing/recovery semantics, or the
+remaining cross-host lifecycle/fault matrix.
+
+The same isolated Xcode build then ran all six opt-in 256 MiB selectors
+serially. All six passed: private CAR spool stress, permissioned near-256 MiB
+CAR RSS/integrity/overflow rejection, public CAR spool RSS, staged public CAR
+import, public production-directory `getRepo` RSS, and private CAS bounded
+streaming. The permissioned CAR report streamed 267,396,722 bytes with
+65,536-byte maximum chunks and a 22,233,088-byte peak RSS increase; the public
+spool report streamed 270,049,433 bytes with a 15,433,728-byte RSS delta.

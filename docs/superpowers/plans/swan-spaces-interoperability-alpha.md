@@ -600,3 +600,27 @@ compaction-gap semantics. The Docker artifact volume was removed afterward;
 the active Swan data volumes were not touched. Caddy routes for `swan.test`
 and `pds.test` returned HTTP 200 afterward and every Compose service remained
 healthy.
+
+## 2026-08-02 Xcode-toolchain clean-cache receipt
+
+The clean-cache acceptance was rerun with the installed Xcode Swift 6.4
+toolchain explicitly first in `PATH`, one SwiftPM worker, and a fresh scratch
+root at `/private/tmp/swan-clean-cache-current-xcode64-20260802-1`. The
+isolated product build completed in 375.36 seconds; the subsequent full test
+graph exited 0 with every XCTest product passing, the normal eight opt-in
+skips, and all four Swift Testing public-wire cases passing. Profile,
+Compose-static, bootstrap fail-closed, and verifier-mutation preflights also
+passed. The runner explicitly reported that it did not execute the live
+cross-host semantic matrix.
+
+This closes macOS clean-cache reproducibility with the Xcode toolchain
+selected explicitly. It does not claim native-Linux host evidence or stock
+TypeScript value-bearing/recovery semantics.
+
+The same isolated build then ran all six opt-in 256 MiB selectors serially:
+private CAR spool stress, permissioned near-256 MiB CAR RSS/integrity and
+overflow rejection, public CAR spool RSS, staged public CAR import, public
+production-directory `getRepo` RSS, and private CAS bounded streaming. All six
+passed. The permissioned CAR report streamed 267,396,722 bytes in 65,536-byte
+maximum chunks with a 22,233,088-byte peak RSS increase; the public spool
+report streamed 270,049,433 bytes with a 15,433,728-byte RSS delta.
