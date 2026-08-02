@@ -378,7 +378,9 @@ func registerPublicRepositoryMutationEndpoints(
     router.post(putPath) { request, _ async -> Response in
         do {
             let (input, digest) = try await publicMutationInput(
-                request, as: SwanPublicWire.ComAtprotoRepoPutRecord.Input.self
+                request,
+                as: SwanPublicWire.ComAtprotoRepoPutRecord.Input.self,
+                admission: capability.jsonWriteAdmission
             )
             return publicMutationJSON(.ok, try await handlers.put(input, bodyDigest: digest, request: request))
         } catch let failure as PublicMutationFailure {
@@ -392,7 +394,9 @@ func registerPublicRepositoryMutationEndpoints(
     router.post(createPath) { request, _ async -> Response in
         do {
             let (input, digest) = try await publicMutationInput(
-                request, as: SwanPublicWire.ComAtprotoRepoCreateRecord.Input.self
+                request,
+                as: SwanPublicWire.ComAtprotoRepoCreateRecord.Input.self,
+                admission: capability.jsonWriteAdmission
             )
             return publicMutationJSON(.ok, try await handlers.create(input, bodyDigest: digest, request: request))
         } catch let failure as PublicMutationFailure {
@@ -405,7 +409,11 @@ func registerPublicRepositoryMutationEndpoints(
     }
     router.post(applyPath) { request, _ async -> Response in
         do {
-            let (input, digest) = try await publicMutationInput(request, as: SwanPublicWire.ComAtprotoRepoApplyWrites.Input.self)
+            let (input, digest) = try await publicMutationInput(
+                request,
+                as: SwanPublicWire.ComAtprotoRepoApplyWrites.Input.self,
+                admission: capability.jsonWriteAdmission
+            )
             return publicMutationJSON(.ok, try await handlers.applyWrites(input, bodyDigest: digest, request: request))
         } catch let failure as PublicMutationFailure { return publicMutationResponse(failure, authorizer: capability.authorizer) }
         catch let failure as PublicRepositoryMutationCoordinatorError { return publicMutationResponse(failure) }
@@ -425,7 +433,9 @@ func registerPublicRepositoryMutationEndpoints(
     router.post(deletePath) { request, _ async -> Response in
         do {
             let (input, digest) = try await publicMutationInput(
-                request, as: SwanPublicWire.ComAtprotoRepoDeleteRecord.Input.self
+                request,
+                as: SwanPublicWire.ComAtprotoRepoDeleteRecord.Input.self,
+                admission: capability.jsonWriteAdmission
             )
             return publicMutationJSON(.ok, try await handlers.delete(input, bodyDigest: digest, request: request))
         } catch let failure as PublicMutationFailure {
@@ -565,13 +575,19 @@ private func publicBlobLifecycleError(_ status: AccountControlStatus) -> Respons
 }
 
 private func publicMutationInput<Value: Decodable>(
-    _ request: Request, as type: Value.Type
+    _ request: Request,
+    as type: Value.Type,
+    admission: PublicRepositoryJSONWriteAdmission
 ) async throws -> (Value, Data) {
     let contentTypes = request.headers[values: .contentType]
     guard contentTypes.count == 1,
           contentTypes[0].split(separator: ";", maxSplits: 1).first?.lowercased() == "application/json" else {
         throw PublicMutationFailure.invalidRequest
     }
+    guard let lease = admission.reserve(maximumRequestBytes: 1_000_000) else {
+        throw PublicMutationFailure.unavailable
+    }
+    defer { lease.release() }
     let body = try await request.body.collect(upTo: 1_000_000)
     guard let bytes = body.getBytes(at: body.readerIndex, length: body.readableBytes) else {
         throw PublicMutationFailure.invalidRequest

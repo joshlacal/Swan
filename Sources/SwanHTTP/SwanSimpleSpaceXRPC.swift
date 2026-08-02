@@ -17,14 +17,17 @@ public struct SwanAuthenticatedSimpleSpaceLifecycleCapability: Sendable {
     let authorizer: SwanOAuthResourceAuthorizer
     let directory: any AuthorizedSimpleSpaceLifecycleDirectory
     let tidAllocator: SwanPermissionedTIDAllocator
+    let jsonWriteAdmission: PublicRepositoryJSONWriteAdmission
 
     init(
         authorizer: SwanOAuthResourceAuthorizer,
-        directory: any AuthorizedSimpleSpaceLifecycleDirectory
+        directory: any AuthorizedSimpleSpaceLifecycleDirectory,
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .processShared
     ) {
         self.authorizer = authorizer
         self.directory = directory
         tidAllocator = SwanPermissionedTIDAllocator()
+        self.jsonWriteAdmission = jsonWriteAdmission
     }
 }
 
@@ -268,6 +271,7 @@ private func registerSimpleSpaceCreate(
         do {
             let input: ComAtprotoSimplespaceCreateSpace.Input = try await decodeSimpleSpaceInput(
                 request,
+                admission: capability.jsonWriteAdmission,
                 required: ["did", "type"],
                 allowed: ["did", "type", "skey", "config"]
             )
@@ -294,6 +298,7 @@ private func registerSimpleSpaceUpdate(
         do {
             let input: ComAtprotoSimplespaceUpdateSpace.Input = try await decodeSimpleSpaceInput(
                 request,
+                admission: capability.jsonWriteAdmission,
                 required: ["space"],
                 allowed: ["space", "policy", "managingApp", "appAccess"]
             )
@@ -318,6 +323,7 @@ private func registerSimpleSpaceDelete(
         do {
             let input: ComAtprotoSimplespaceDeleteSpace.Input = try await decodeSimpleSpaceInput(
                 request,
+                admission: capability.jsonWriteAdmission,
                 required: ["space"],
                 allowed: ["space"]
             )
@@ -342,6 +348,7 @@ private func registerSimpleSpaceAddMember(
         do {
             let input: ComAtprotoSimplespaceAddMember.Input = try await decodeSimpleSpaceInput(
                 request,
+                admission: capability.jsonWriteAdmission,
                 required: ["space", "did"],
                 allowed: ["space", "did"]
             )
@@ -366,6 +373,7 @@ private func registerSimpleSpaceRemoveMember(
         do {
             let input: ComAtprotoSimplespaceRemoveMember.Input = try await decodeSimpleSpaceInput(
                 request,
+                admission: capability.jsonWriteAdmission,
                 required: ["space", "did"],
                 allowed: ["space", "did"]
             )
@@ -526,6 +534,7 @@ private func simpleSpaceAppAccess(
 
 private func decodeSimpleSpaceInput<Value: Decodable>(
     _ request: Request,
+    admission: PublicRepositoryJSONWriteAdmission,
     required: Set<String>,
     allowed: Set<String>
 ) async throws -> Value {
@@ -538,6 +547,12 @@ private func decodeSimpleSpaceInput<Value: Decodable>(
     guard lengths.count <= 1,
           lengths.first.flatMap(Int.init).map({ (0 ... authenticatedSpaceWriteMaximumJSONBytes).contains($0) }) ?? true
     else { throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest }
+    guard let lease = admission.reserve(
+        maximumRequestBytes: authenticatedSpaceWriteMaximumJSONBytes
+    ) else {
+        throw AuthenticatedSimpleSpaceLifecycleFailure.unavailable
+    }
+    defer { lease.release() }
     let body: ByteBuffer
     do {
         body = try await request.body.collect(upTo: authenticatedSpaceWriteMaximumJSONBytes)

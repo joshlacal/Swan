@@ -24,6 +24,67 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
     private static let applyPath = "/xrpc/com.atproto.repo.applyWrites"
     private static let uploadPath = "/xrpc/com.atproto.repo.uploadBlob"
 
+    func testJSONMutationAdmissionRejectsBeforeDecodeAndReleasesAfterFailure() async throws {
+        let maximum = 1_000_000
+        let admission = try PublicRepositoryJSONWriteAdmission(
+            maximumConcurrentWrites: 1,
+            maximumReservedRequestBytes: maximum
+        )
+        let fixture = try await makeFixture(jsonWriteAdmission: admission)
+        XCTAssertTrue(fixture.server.jsonWriteAdmission === admission)
+        XCTAssertTrue(
+            fixture.server.publicRepositoryMutations?.jsonWriteAdmission
+                === admission
+        )
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let held = try XCTUnwrap(
+            admission.reserve(maximumRequestBytes: maximum)
+        )
+
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.json-write-admission")
+        ).test(.router) { client in
+            let unavailable = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "write-admission-full",
+                    method: "POST",
+                    path: Self.mutationPath
+                ),
+                body: ByteBuffer(string: "{}")
+            )
+            XCTAssertEqual(unavailable.status, .serviceUnavailable)
+            XCTAssertEqual(
+                try self.jsonObject(unavailable.body)["error"] as? String,
+                "temporarily_unavailable"
+            )
+
+            held.release()
+            let invalid = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "write-admission-release",
+                    method: "POST",
+                    path: Self.mutationPath
+                ),
+                body: ByteBuffer(string: "{}")
+            )
+            XCTAssertEqual(invalid.status, .badRequest)
+        }
+        XCTAssertEqual(admission.snapshot, .init(
+            activeLeases: 0,
+            reservedRequestBytes: 0
+        ))
+    }
+
     func testUploadBlobUsesSharedSpoolAdmissionAndReleasesLease() async throws {
         let fixture = try await makeFixture()
         defer {
@@ -428,7 +489,8 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
     }
 
     private func makeFixture(
-        includePublicBlobSpoolAdmission: Bool = true
+        includePublicBlobSpoolAdmission: Bool = true,
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil
     ) async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "SwanPublicRepositoryMutationHTTPTests-" + UUID().uuidString)
@@ -469,7 +531,8 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
                 signer: P256PublicRepositoryCommitSigner(privateKey: signingKey),
                 publicBlobSpoolAdmission: includePublicBlobSpoolAdmission
                     ? publicBlobSpoolAdmission
-                    : nil
+                    : nil,
+                jsonWriteAdmission: jsonWriteAdmission
             )
             return Fixture(
                 root: root,
@@ -494,7 +557,8 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         control: SQLiteControlDatabase,
         directory: TestMutationDirectory,
         signer: any PublicRepositoryCommitSigner,
-        publicBlobSpoolAdmission: PublicRepositorySpoolAdmission?
+        publicBlobSpoolAdmission: PublicRepositorySpoolAdmission?,
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission?
     ) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
             from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-30.json")
@@ -507,7 +571,8 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
             accountControlStore: control,
             publicRepositoryMutationDirectory: directory,
             publicRepositoryMutationSignerProvider: TestSignerProvider(signer: signer),
-            publicBlobSpoolAdmission: publicBlobSpoolAdmission
+            publicBlobSpoolAdmission: publicBlobSpoolAdmission,
+            jsonWriteAdmission: jsonWriteAdmission
         )
     }
 

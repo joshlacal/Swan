@@ -342,6 +342,9 @@ public struct SwanHTTPServer: Sendable {
     /// instance; otherwise a caller-provided test/production budget can be
     /// silently replaced by the global default during router construction.
     public let jsonReadAdmission: PublicRepositoryJSONReadAdmission
+    /// Shared aggregate bound for buffered public and permissioned JSON
+    /// command bodies.
+    public let jsonWriteAdmission: PublicRepositoryJSONWriteAdmission
 
     public init(
         profile: ProtocolProfile,
@@ -368,7 +371,8 @@ public struct SwanHTTPServer: Sendable {
         blobStreamAdmission: PublicRepositorySpoolAdmission? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
-        jsonReadAdmission: PublicRepositoryJSONReadAdmission? = nil
+        jsonReadAdmission: PublicRepositoryJSONReadAdmission? = nil,
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -380,6 +384,9 @@ public struct SwanHTTPServer: Sendable {
         let resolvedJSONReadAdmission = jsonReadAdmission
             ?? PublicRepositoryJSONReadAdmission.processShared
         self.jsonReadAdmission = resolvedJSONReadAdmission
+        let resolvedJSONWriteAdmission = jsonWriteAdmission
+            ?? PublicRepositoryJSONWriteAdmission.processShared
+        self.jsonWriteAdmission = resolvedJSONWriteAdmission
         self.blobStreamAdmission = blobStreamAdmission
             ?? publicBlobSpoolAdmission
             ?? PublicRepositorySpoolAdmission.shared
@@ -452,7 +459,8 @@ public struct SwanHTTPServer: Sendable {
                     directory: mutationDirectory,
                     signerProvider: signerProvider,
                     publicBlobSpoolAdmission: publicBlobSpoolAdmission,
-                    blobStreamAdmission: self.blobStreamAdmission
+                    blobStreamAdmission: self.blobStreamAdmission,
+                    jsonWriteAdmission: resolvedJSONWriteAdmission
                 )
             } else {
                 publicRepositoryMutations = nil
@@ -471,7 +479,8 @@ public struct SwanHTTPServer: Sendable {
                     authorizer: authorizer,
                     directory: repositoryDirectory,
                     credentialAuthorizer: credentialVerifier,
-                    jsonReadAdmission: resolvedJSONReadAdmission
+                    jsonReadAdmission: resolvedJSONReadAdmission,
+                    jsonWriteAdmission: resolvedJSONWriteAdmission
                 )
             } else {
                 authenticatedSpaceRecords = nil
@@ -489,7 +498,8 @@ public struct SwanHTTPServer: Sendable {
                 as? any AuthorizedSimpleSpaceLifecycleDirectory {
                 authenticatedSimpleSpaceLifecycle = SwanAuthenticatedSimpleSpaceLifecycleCapability(
                     authorizer: authorizer,
-                    directory: lifecycleDirectory
+                    directory: lifecycleDirectory,
+                    jsonWriteAdmission: resolvedJSONWriteAdmission
                 )
             } else {
                 authenticatedSimpleSpaceLifecycle = nil

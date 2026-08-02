@@ -340,18 +340,21 @@ public struct SwanAuthenticatedSpaceRecordsCapability: Sendable {
     /// Shared with anonymous public JSON reads so authenticated permissioned
     /// pages cannot multiply the same allocation-heavy response buffers.
     let jsonReadAdmission: PublicRepositoryJSONReadAdmission
+    let jsonWriteAdmission: PublicRepositoryJSONWriteAdmission
 
     init(
         authorizer: SwanOAuthResourceAuthorizer,
         directory: any AuthorizedSpaceRepositoryDirectory,
         credentialAuthorizer: (any SpaceCredentialAuthorizationVerifier)? = nil,
-        jsonReadAdmission: PublicRepositoryJSONReadAdmission = .processShared
+        jsonReadAdmission: PublicRepositoryJSONReadAdmission = .processShared,
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .processShared
     ) {
         self.authorizer = authorizer
         self.directory = directory
         self.credentialAuthorizer = credentialAuthorizer
         tidAllocator = SwanPermissionedTIDAllocator()
         self.jsonReadAdmission = jsonReadAdmission
+        self.jsonWriteAdmission = jsonWriteAdmission
     }
 }
 
@@ -961,7 +964,11 @@ func registerAuthenticatedCreateRecordEndpoint(
     let path: RouterPath = "/xrpc/com.atproto.space.createRecord"
     router.post(path) { request, _ async -> Response in
         do {
-            let input: ComAtprotoSpaceCreateRecord.Input = try await decodeAuthenticatedSpaceWriteInput(request)
+            let input: ComAtprotoSpaceCreateRecord.Input = try await
+                decodeAuthenticatedSpaceWriteInput(
+                    request,
+                    admission: capability.jsonWriteAdmission
+                )
             return authenticatedSpaceWriteJSON(.ok, try await handler.handle(parameters: (), input: input, context: request))
         } catch let failure as AuthenticatedSpaceWriteFailure {
             return authenticatedSpaceWriteResponse(for: failure, capability: capability)
@@ -980,7 +987,11 @@ func registerAuthenticatedPutRecordEndpoint(
     let path: RouterPath = "/xrpc/com.atproto.space.putRecord"
     router.post(path) { request, _ async -> Response in
         do {
-            let input: ComAtprotoSpacePutRecord.Input = try await decodeAuthenticatedSpaceWriteInput(request)
+            let input: ComAtprotoSpacePutRecord.Input = try await
+                decodeAuthenticatedSpaceWriteInput(
+                    request,
+                    admission: capability.jsonWriteAdmission
+                )
             return authenticatedSpaceWriteJSON(.ok, try await handler.handle(parameters: (), input: input, context: request))
         } catch let failure as AuthenticatedSpaceWriteFailure {
             return authenticatedSpaceWriteResponse(for: failure, capability: capability)
@@ -999,7 +1010,11 @@ func registerAuthenticatedDeleteRecordEndpoint(
     let path: RouterPath = "/xrpc/com.atproto.space.deleteRecord"
     router.post(path) { request, _ async -> Response in
         do {
-            let input: ComAtprotoSpaceDeleteRecord.Input = try await decodeAuthenticatedSpaceWriteInput(request)
+            let input: ComAtprotoSpaceDeleteRecord.Input = try await
+                decodeAuthenticatedSpaceWriteInput(
+                    request,
+                    admission: capability.jsonWriteAdmission
+                )
             return authenticatedSpaceWriteJSON(.ok, try await handler.handle(parameters: (), input: input, context: request))
         } catch let failure as AuthenticatedSpaceWriteFailure {
             return authenticatedSpaceWriteResponse(for: failure, capability: capability)
@@ -1018,7 +1033,11 @@ func registerAuthenticatedApplyWritesEndpoint(
     let path: RouterPath = "/xrpc/com.atproto.space.applyWrites"
     router.post(path) { request, _ async -> Response in
         do {
-            let input: ComAtprotoSpaceApplyWrites.Input = try await decodeAuthenticatedSpaceWriteInput(request)
+            let input: ComAtprotoSpaceApplyWrites.Input = try await
+                decodeAuthenticatedSpaceWriteInput(
+                    request,
+                    admission: capability.jsonWriteAdmission
+                )
             return authenticatedSpaceWriteJSON(.ok, try await handler.handle(parameters: (), input: input, context: request))
         } catch let failure as AuthenticatedSpaceWriteFailure {
             return authenticatedSpaceWriteResponse(for: failure, capability: capability)
@@ -1030,7 +1049,8 @@ func registerAuthenticatedApplyWritesEndpoint(
 }
 
 private func decodeAuthenticatedSpaceWriteInput<Value: Decodable>(
-    _ request: Request
+    _ request: Request,
+    admission: PublicRepositoryJSONWriteAdmission
 ) async throws -> Value {
     let contentTypes = request.headers[values: .contentType]
     guard contentTypes.count == 1,
@@ -1041,6 +1061,12 @@ private func decodeAuthenticatedSpaceWriteInput<Value: Decodable>(
     guard lengths.count <= 1,
           lengths.first.flatMap(Int.init).map({ (0...authenticatedSpaceWriteMaximumJSONBytes).contains($0) }) ?? true
     else { throw AuthenticatedSpaceWriteFailure.invalidRequest }
+    guard let lease = admission.reserve(
+        maximumRequestBytes: authenticatedSpaceWriteMaximumJSONBytes
+    ) else {
+        throw AuthenticatedSpaceWriteFailure.unavailable
+    }
+    defer { lease.release() }
     let body: ByteBuffer
     do {
         body = try await request.body.collect(upTo: authenticatedSpaceWriteMaximumJSONBytes)

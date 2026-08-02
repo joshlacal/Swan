@@ -632,6 +632,12 @@ private struct RepositoryRecordBlockValidator {
         case 4:
             guard depth < maximumDepth else { throw RepositoryMSTValidationError.invalidRecordBlock }
             let count = try readLength(major: 4)
+            // Every definite-length array element consumes at least one byte.
+            // Reject impossible hostile counts before reserveCapacity can turn
+            // an authenticated-but-untrusted block into a huge allocation.
+            guard count <= bytes.count - offset else {
+                throw RepositoryMSTValidationError.invalidRecordBlock
+            }
             var values: [ATProtocolValueContainer] = []
             values.reserveCapacity(count)
             for _ in 0 ..< count {
@@ -690,6 +696,12 @@ private struct RepositoryRecordBlockValidator {
         captureType: Bool
     ) throws -> [String: ATProtocolValueContainer] {
         let count = try readLength(major: 5)
+        // A map pair consumes at least one byte for its key and one for its
+        // value. This is a necessary lower bound, checked before allocating;
+        // the ordinary parser remains responsible for all stronger validity.
+        guard count <= (bytes.count - offset) / 2 else {
+            throw RepositoryMSTValidationError.invalidRecordBlock
+        }
         var previousKey: Data?
         var sawType = false
         var values: [String: ATProtocolValueContainer] = [:]

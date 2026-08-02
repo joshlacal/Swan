@@ -26,6 +26,59 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
     private static let removePath = "/xrpc/com.atproto.simplespace.removeMember"
     private static let listPath = "/xrpc/com.atproto.simplespace.listMembers"
 
+    func testLifecycleWriteAdmissionReturnsTemporaryUnavailableBeforeDecode() async throws {
+        let maximum = authenticatedSpaceWriteMaximumJSONBytes
+        let admission = try PublicRepositoryJSONWriteAdmission(
+            maximumConcurrentWrites: 1,
+            maximumReservedRequestBytes: maximum
+        )
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let server = try makeServer(
+                fixture,
+                jsonWriteAdmission: admission
+            )
+            XCTAssertTrue(server.jsonWriteAdmission === admission)
+            XCTAssertTrue(
+                server.authenticatedSimpleSpaceLifecycle?.jsonWriteAdmission
+                    === admission
+            )
+            let held = try XCTUnwrap(
+                admission.reserve(maximumRequestBytes: maximum)
+            )
+            let app = server.buildApplication(
+                logger: Logger(label: "SimpleSpaceLifecycleWriteAdmissionTests")
+            )
+            try await app.test(.router) { client in
+                let response = try await client.execute(
+                    uri: Self.createPath,
+                    method: .post,
+                    headers: try self.postHeaders(
+                        fixture,
+                        path: Self.createPath,
+                        jti: "lifecycle-write-admission"
+                    ),
+                    body: ByteBuffer(string: "{}")
+                )
+                XCTAssertEqual(response.status, .serviceUnavailable)
+                XCTAssertEqual(
+                    try self.errorCode(response.body),
+                    "temporarily_unavailable"
+                )
+            }
+            held.release()
+            XCTAssertEqual(admission.snapshot, .init(
+                activeLeases: 0,
+                reservedRequestBytes: 0
+            ))
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
     func testLifecycleMembershipPaginationAndNonDestructiveConfigPatch() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -316,13 +369,17 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    private func makeServer(_ fixture: SimpleSpaceFixture) throws -> SwanHTTPServer {
+    private func makeServer(
+        _ fixture: SimpleSpaceFixture,
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil
+    ) throws -> SwanHTTPServer {
         SwanHTTPServer(
             profile: try ProtocolProfile.load(from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")),
             configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: Self.publicURL),
             oauthRuntime: fixture.runtime,
             authenticatedGetSpaceDirectory: fixture.directory,
-            accountControlStore: fixture.control
+            accountControlStore: fixture.control,
+            jsonWriteAdmission: jsonWriteAdmission
         )
     }
 

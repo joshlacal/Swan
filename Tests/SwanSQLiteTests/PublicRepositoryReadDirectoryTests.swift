@@ -175,6 +175,42 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
         XCTAssertEqual(admission.snapshot.activeLeases, 0)
     }
 
+    func testJSONWriteAdmissionBoundsAggregateReservationsAndReleasesIdempotently() throws {
+        let mebibyte = 1_024 * 1_024
+        let admission = try PublicRepositoryJSONWriteAdmission(
+            maximumConcurrentWrites: 2,
+            maximumReservedRequestBytes: 2 * mebibyte
+        )
+        let first = try XCTUnwrap(
+            admission.reserve(maximumRequestBytes: mebibyte)
+        )
+        let second = try XCTUnwrap(
+            admission.reserve(maximumRequestBytes: mebibyte)
+        )
+        XCTAssertNil(admission.reserve(maximumRequestBytes: 1))
+        XCTAssertEqual(
+            admission.snapshot,
+            .init(
+                activeLeases: 2,
+                reservedRequestBytes: 2 * mebibyte
+            )
+        )
+
+        first.release()
+        first.release()
+        XCTAssertEqual(admission.snapshot.activeLeases, 1)
+        XCTAssertEqual(admission.snapshot.reservedRequestBytes, mebibyte)
+        let replacement = try XCTUnwrap(
+            admission.reserve(maximumRequestBytes: mebibyte)
+        )
+        second.release()
+        replacement.release()
+        XCTAssertEqual(admission.snapshot, .init(
+            activeLeases: 0,
+            reservedRequestBytes: 0
+        ))
+    }
+
     func testDirectoryRejectsSecondSlowConsumerAndReleasesOnCleanup() async throws {
         let maximum = PublicRepositoryLimits.standard.maximumCARBytes
         let admission = try PublicRepositorySpoolAdmission(

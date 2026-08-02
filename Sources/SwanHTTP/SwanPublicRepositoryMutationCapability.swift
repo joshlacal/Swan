@@ -60,6 +60,10 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
     /// blob responses. A GET reserves before the store opens and verifies the
     /// payload, and holds the lease until the response writer finishes.
     let blobStreamAdmission: PublicRepositorySpoolAdmission
+    /// Shared with permissioned JSON commands. Every buffered mutation body
+    /// reserves before collection so anonymous callers cannot multiply the
+    /// per-request limit by the listener's connection budget.
+    let jsonWriteAdmission: PublicRepositoryJSONWriteAdmission
 
     public init(
         authorizer: SwanOAuthResourceAuthorizer,
@@ -67,7 +71,8 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
         signerProvider: any PublicRepositoryMutationSignerProvider,
         blobStore: (any BlobStore)? = nil,
         publicBlobSpoolAdmission: PublicRepositorySpoolAdmission? = nil,
-        blobStreamAdmission: PublicRepositorySpoolAdmission = .shared
+        blobStreamAdmission: PublicRepositorySpoolAdmission = .shared,
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .processShared
     ) {
         self.authorizer = authorizer
         self.directory = directory
@@ -75,5 +80,6 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
         self.blobStore = blobStore
         self.publicBlobSpoolAdmission = publicBlobSpoolAdmission
         self.blobStreamAdmission = blobStreamAdmission
+        self.jsonWriteAdmission = jsonWriteAdmission
     }
 }

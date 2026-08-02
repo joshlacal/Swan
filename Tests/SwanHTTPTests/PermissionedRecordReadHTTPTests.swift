@@ -24,6 +24,60 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
     private static let putPath = "/xrpc/com.atproto.space.putRecord"
     private static let deletePath = "/xrpc/com.atproto.space.deleteRecord"
     private static let applyPath = "/xrpc/com.atproto.space.applyWrites"
+
+    func testPermissionedWriteAdmissionReturnsTemporaryUnavailableBeforeDecode() async throws {
+        let maximum = authenticatedSpaceWriteMaximumJSONBytes
+        let admission = try PublicRepositoryJSONWriteAdmission(
+            maximumConcurrentWrites: 1,
+            maximumReservedRequestBytes: maximum
+        )
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let server = try makeServer(
+                fixture,
+                jsonWriteAdmission: admission
+            )
+            XCTAssertTrue(server.jsonWriteAdmission === admission)
+            XCTAssertTrue(
+                server.authenticatedSpaceRecords?.jsonWriteAdmission
+                    === admission
+            )
+            let held = try XCTUnwrap(
+                admission.reserve(maximumRequestBytes: maximum)
+            )
+            let app = server.buildApplication(
+                logger: Logger(label: "PermissionedRecordWriteAdmissionTests")
+            )
+            let body = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","collection":"\#(Self.collection)","record":{"$type":"app.bsky.feed.post"}}"#
+            try await app.test(.router) { client in
+                let response = try await client.execute(
+                    uri: Self.createPath,
+                    method: .post,
+                    headers: try writeHeaders(
+                        fixture,
+                        path: Self.createPath,
+                        jti: "permissioned-write-admission"
+                    ),
+                    body: ByteBuffer(string: body)
+                )
+                XCTAssertEqual(response.status, .serviceUnavailable)
+                XCTAssertEqual(
+                    try self.jsonObject(response.body)["error"] as? String,
+                    "temporarily_unavailable"
+                )
+            }
+            held.release()
+            XCTAssertEqual(admission.snapshot, .init(
+                activeLeases: 0,
+                reservedRequestBytes: 0
+            ))
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
     private static let collection = "app.bsky.feed.post"
     private static let otherCollection = "app.example.records.item"
 
@@ -1132,16 +1186,25 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         try await database.close()
     }
 
-    private func makeServer(_ fixture: Fixture) throws -> SwanHTTPServer {
+    private func makeServer(
+        _ fixture: Fixture,
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil
+    ) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
             from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-30.json")
         )
+        let resolvedWriteAdmission = try jsonWriteAdmission
+            ?? PublicRepositoryJSONWriteAdmission(
+                maximumConcurrentWrites: 64,
+                maximumReservedRequestBytes: 64 * 1_024 * 1_024
+            )
         return SwanHTTPServer(
             profile: profile,
             configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: Self.publicURL),
             oauthRuntime: fixture.runtime,
             authenticatedGetSpaceDirectory: fixture.directory,
-            accountControlStore: fixture.control
+            accountControlStore: fixture.control,
+            jsonWriteAdmission: resolvedWriteAdmission
         )
     }
 

@@ -406,6 +406,98 @@ public final class PublicRepositoryJSONReadLease: @unchecked Sendable {
     }
 }
 
+/// Process-wide admission for allocation-heavy JSON command bodies. A write
+/// route reserves its declared maximum body size before collecting any bytes
+/// and holds the lease through strict parsing and typed decoding. Sharing one
+/// instance across public and permissioned routes bounds aggregate anonymous
+/// pre-authorization memory independently of the listener connection limit.
+public final class PublicRepositoryJSONWriteAdmission: @unchecked Sendable {
+    public struct Snapshot: Sendable, Equatable {
+        public let activeLeases: Int
+        public let reservedRequestBytes: Int
+
+        public init(activeLeases: Int, reservedRequestBytes: Int) {
+            self.activeLeases = activeLeases
+            self.reservedRequestBytes = reservedRequestBytes
+        }
+    }
+
+    public static let processShared = try! PublicRepositoryJSONWriteAdmission()
+
+    private let maximumConcurrentWrites: Int
+    private let maximumReservedRequestBytes: Int
+    private let lock = NSLock()
+    private var leases: [UUID: Int] = [:]
+
+    public init(
+        maximumConcurrentWrites: Int = 8,
+        maximumReservedRequestBytes: Int = 8 * 1_024 * 1_024
+    ) throws {
+        guard maximumConcurrentWrites > 0,
+              maximumReservedRequestBytes > 0 else {
+            throw PublicRepositoryReadError.unavailable
+        }
+        self.maximumConcurrentWrites = maximumConcurrentWrites
+        self.maximumReservedRequestBytes = maximumReservedRequestBytes
+    }
+
+    public func reserve(
+        maximumRequestBytes: Int
+    ) -> PublicRepositoryJSONWriteLease? {
+        guard maximumRequestBytes > 0 else { return nil }
+        return lock.withLock {
+            let reserved = leases.values.reduce(0, +)
+            guard leases.count < maximumConcurrentWrites,
+                  maximumRequestBytes <= maximumReservedRequestBytes - reserved else {
+                return nil
+            }
+            let id = UUID()
+            leases[id] = maximumRequestBytes
+            return PublicRepositoryJSONWriteLease(admission: self, id: id)
+        }
+    }
+
+    public var snapshot: Snapshot {
+        lock.withLock {
+            Snapshot(
+                activeLeases: leases.count,
+                reservedRequestBytes: leases.values.reduce(0, +)
+            )
+        }
+    }
+
+    fileprivate func releaseWrite(_ id: UUID) {
+        lock.withLock {
+            _ = leases.removeValue(forKey: id)
+        }
+    }
+}
+
+public final class PublicRepositoryJSONWriteLease: @unchecked Sendable {
+    private weak var admission: PublicRepositoryJSONWriteAdmission?
+    private let id: UUID
+    private let lock = NSLock()
+    private var released = false
+
+    fileprivate init(admission: PublicRepositoryJSONWriteAdmission, id: UUID) {
+        self.admission = admission
+        self.id = id
+    }
+
+    deinit { release() }
+
+    public func release() {
+        let target = lock.withLock {
+            guard !released else {
+                return nil as PublicRepositoryJSONWriteAdmission?
+            }
+            released = true
+            return admission
+        }
+        target?.releaseWrite(id)
+    }
+}
+
 /// One selector resolution and lifecycle decision for a public endpoint.
 /// Keeping these facts in the same result prevents HTTP adapters from making
 /// a second directory call against a different control/repository snapshot.

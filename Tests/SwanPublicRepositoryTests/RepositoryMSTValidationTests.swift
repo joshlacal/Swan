@@ -77,6 +77,50 @@ final class RepositoryMSTValidationTests: XCTestCase {
         )
     }
 
+    func testDirectRecordDecoderRejectsImpossibleContainerCountsBeforeAllocation() throws {
+        let path = try PublicRepositoryPath(
+            collection: "app.bsky.feed.post", recordKey: "hostile-count"
+        )
+
+        // A definite-length map claiming Int.max pairs with no payload must
+        // fail before Dictionary.reserveCapacity sees the declared count.
+        let impossibleMap = Data([
+            0xbb, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        ])
+        XCTAssertThrowsError(
+            try RepositoryMSTValidation.decodeRecordBlock(
+                impossibleMap, for: path
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? RepositoryMSTValidationError,
+                .invalidRecordBlock
+            )
+        }
+
+        // The top-level map is plausible, but its nested array declares the
+        // same impossible count with no elements.
+        var impossibleArray = Data([0xa2, 0x65])
+        impossibleArray.append(Data("$type".utf8))
+        impossibleArray.append(0x72)
+        impossibleArray.append(Data(path.collection.utf8))
+        impossibleArray.append(0x65)
+        impossibleArray.append(Data("array".utf8))
+        impossibleArray.append(contentsOf: [
+            0x9b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        ])
+        XCTAssertThrowsError(
+            try RepositoryMSTValidation.decodeRecordBlock(
+                impossibleArray, for: path
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? RepositoryMSTValidationError,
+                .invalidRecordBlock
+            )
+        }
+    }
+
     func testValidatesCanonicalEmptyRepository() async throws {
         let bytes = PublicRepositoryGenesisCodec.canonicalEmptyMST
         let cid = CID.fromDAGCBOR(bytes)
