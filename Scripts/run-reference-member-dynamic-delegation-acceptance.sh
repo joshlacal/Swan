@@ -20,6 +20,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
 project_name="${SWAN_DYNAMIC_DELEGATION_PROJECT:-}"
+compose_file="${SWAN_DYNAMIC_DELEGATION_COMPOSE_FILE:-}"
 output_path="${SWAN_DYNAMIC_DELEGATION_OUTPUT:-${root}/artifacts/live/reference-member-dynamic-delegation.json}"
 wait_timeout="${SWAN_DYNAMIC_DELEGATION_TIMEOUT:-180}"
 stateful_mode="${SWAN_DYNAMIC_DELEGATION_STATEFUL:-0}"
@@ -29,6 +30,12 @@ direction="${SWAN_DYNAMIC_DELEGATION_DIRECTION:-member}"
   echo "SWAN_DYNAMIC_DELEGATION_PROJECT must name a running disposable Compose project" >&2
   exit 64
 }
+if [[ -n "$compose_file" ]]; then
+  [[ "$compose_file" = /* && -f "$compose_file" ]] || {
+    echo "SWAN_DYNAMIC_DELEGATION_COMPOSE_FILE must be an absolute Compose file" >&2
+    exit 64
+  }
+fi
 [[ "$output_path" = /* ]] || {
   echo "SWAN_DYNAMIC_DELEGATION_OUTPUT must be an absolute path" >&2
   exit 64
@@ -63,7 +70,11 @@ SWAN_INTEROP_SECRETS_DIR="$({
 export SWAN_INTEROP_SECRETS_DIR
 
 compose() {
-  ./interop/compose.sh --project-name "$project_name" "$@"
+  if [[ -n "$compose_file" ]]; then
+    ./interop/compose.sh --file "$compose_file" --project-name "$project_name" "$@"
+  else
+    ./interop/compose.sh --project-name "$project_name" "$@"
+  fi
 }
 
 container_id() {

@@ -6,12 +6,28 @@ readonly overlay="${root}/interop/reference-pds-overlay/apply-reference-pds-over
 readonly commit="3f6c96d5d2d25438bd40fa89d6ecc37865f8e354"
 readonly pinned="${root}/.interop-cache/atproto-${commit}"
 
-before="$(find "${pinned}" -type f -exec shasum -a 256 {} + | shasum -a 256 | awk '{print $1}')"
+source_digest() {
+  # The pinned cache contains a pnpm hard-link farm under node_modules. A
+  # recursive descriptor walk there is both unnecessary and capable of
+  # exhausting the host while this otherwise read-only source test runs.
+  # Hash exactly the files touched by the checked-in overlay instead.
+  local relative
+  for relative in \
+    packages/pds/src/actor-store/space/reader.ts \
+    packages/repo/src/car.ts \
+    packages/pds/src/api/com/atproto/space/getRepo.ts \
+    packages/pds/tests/spaces.test.ts
+  do
+    shasum -a 256 -- "${pinned}/${relative}"
+  done | shasum -a 256 | awk '{print $1}'
+}
+
+before="$(source_digest)"
 workspace="$(mktemp -d "${TMPDIR:-/tmp}/swan-reference-pds-overlay-test.XXXXXX")"
 trap 'rm -rf "${workspace}"' EXIT
 
 "${overlay}" "${workspace}/atproto" >/dev/null
-after="$(find "${pinned}" -type f -exec shasum -a 256 {} + | shasum -a 256 | awk '{print $1}')"
+after="$(source_digest)"
 [[ "${before}" == "${after}" ]] || {
   echo "overlay test changed the pinned reference checkout" >&2
   exit 1

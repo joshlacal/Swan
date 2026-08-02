@@ -1,0 +1,10 @@
+{
+  "repo": "{{REPOSITORY_DID}}",
+  "collection": "app.bsky.feed.post",
+  "rkey": "3jzfcwq7jrs2a",
+  "record": {
+    "$type": "app.bsky.feed.post",
+    "text": "Swan reference OAuth interoperability fixture",
+    "createdAt": "2026-08-01T22:00:00.000Z"
+  }
+}

@@ -2281,3 +2281,69 @@ Verification:
 - `./Scripts/test-verify-interop-lab.sh` passed the mutation suite; and
 - the restarted lab returned HTTP 200 for both `swan.test` and `pds.test`
   `com.atproto.server.describeServer` routes after the proxy was restored.
+
+## Adversarial rereview: pinned TypeScript OAuth browser hop and public round trip — 2026-08-01
+
+The reference-PDS OAuth provider does not return the client redirect directly
+from its JSON consent API. It returns an issuer-local
+`/oauth/authorize/redirect` URL; a browser GET with the same-origin navigation
+headers and authorize-page referrer then receives one 303 to the registered
+client URI. The Swift lab client now models that exact sequence. It retains a
+bounded cookie jar, sends the provider's CSRF token and ephemeral bearer only
+to the two same-origin JSON endpoints, validates the issuer/path/query/state
+binding, and follows exactly one redirect hop with AsyncHTTPClient redirect
+following disabled. External issuers, unexpected paths, fragments, modes, and
+redirect targets fail closed.
+
+The new regression test
+`SwanInteropTests.testReferenceOAuthProviderUsesSameOriginJSONCSRFAndEphemeralBearer`
+passes in the serialized macOS interop selection (91 tests, 0 failures) and
+asserts the JSON bodies, CSRF/referrer headers, ephemeral bearer, navigation
+headers, cookie, and 303 location.
+
+A fresh account on the pinned TypeScript PDS then exercised the current Swan
+release image through the Caddy/Toxiproxy network. The first probe correctly
+rejected an `atproto`-only token at the PDS's collection authorization layer;
+the corrected probe requested `atproto` plus
+`repo:app.bsky.feed.post?action=create&action=update` and used a valid TID
+record key. The sanitized artifact
+`.interop-live/reference-oauth-public.SMYhmU/artifact.json` reports:
+
+- OAuth authorization code, PKCE, DPoP, JSON sign-in, CSRF, consent, and 303
+  redirect completion;
+- reference `com.atproto.repo.putRecord`: HTTP 200;
+- reference `com.atproto.repo.getRecord`: HTTP 200;
+- matching canonical record CID and `converged: true`; and
+- no account handle, password, bearer token, DPoP proof, or record value.
+
+The tracked public fixture uses the valid TID `3jzfcwq7jrs2a`. This closes the
+reference OAuth browser/provider and public write/read witness for the current
+profile. It does not close the stock value-bearing `listRepoOps`/`getRepo`
+upstream gap, cross-host corrupted/compaction fault matrix, reverse-authority
+account/browser lifecycle, password-reset contention, or native-Linux live
+profile evidence.
+
+## Adversarial rereview: restart image identity and descriptor-safe overlay check — 2026-08-01
+
+The restarted `swan-alpha-current-20260801` project initially retained a
+recovery-qualified reference image under the default service tag. The image
+identity was checked inside the container rather than inferred from its tag:
+the running image contained the overlay `getRepo` implementation, while the
+stock image contained the pinned branch's `MethodNotImplementedError` handler.
+The stock image was restored under the project service tag and only the
+`reference-pds` container was recreated, preserving its named data volume.
+The recreated container is healthy, its source marker is the stock pinned
+implementation, and the public `pds.test` describe-server route returns HTTP
+200 through Caddy/Toxiproxy.
+
+The source-only overlay qualification also exposed a local resource hazard:
+its integrity check recursively hashed the pinned checkout's pnpm
+`node_modules` hard-link farm. That could open enough files to reproduce the
+host's descriptor-pressure failure. The check now hashes only the four files
+touched by the checked-in patch, while the overlay copier already excludes
+`node_modules`; `interop/reference-pds-overlay/test-reference-pds-overlay.sh`
+passes without a recursive dependency-tree walk.
+
+This closes the lab image-identity and overlay-test resource seams. It does
+not turn the stock pinned value-bearing endpoints into an implementation, and
+does not close the broader cross-host fault or lifecycle gates.

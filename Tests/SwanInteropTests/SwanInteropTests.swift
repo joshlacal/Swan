@@ -760,6 +760,139 @@ final class SwanInteropTests: XCTestCase {
         )
     }
 
+    func testReferenceOAuthProviderUsesSameOriginJSONCSRFAndEphemeralBearer() async throws {
+        let requests = ReferenceOAuthMockRequests()
+        let issuer = URL(string: "https://reference.example")!
+        let clientID = URL(string: "http://localhost?scope=atproto&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback")!
+        let redirectURI = URL(string: "http://127.0.0.1/callback")!
+        let csrf = "0123456789abcdef01234567"
+        let state = "reference-state"
+        let handler: InteropHTTPExecuteHandler = { method, url, headers, body, _ in
+            await requests.append(.init(method: method, url: url, headers: headers, body: body))
+            switch (method, url.path) {
+            case (.post, "/oauth/par") where headers["DPoP"] == nil:
+                return .init(
+                    status: 401,
+                    headers: ["dpop-nonce": "par-nonce"],
+                    body: Data(),
+                    finalURL: url,
+                    redirectCount: 0
+                )
+            case (.post, "/oauth/par"):
+                return .init(
+                    status: 201,
+                    headers: [:],
+                    body: Data(#"{"request_uri":"urn:ietf:params:oauth:request_uri:fixture"}"#.utf8),
+                    finalURL: url,
+                    redirectCount: 0
+                )
+            case (.get, "/oauth/authorize"):
+                return .init(
+                    status: 200,
+                    headers: ["set-cookie": "csrf-token=\(csrf); Path=/; Secure"],
+                    body: Data("<html><body>client-side provider</body></html>".utf8),
+                    finalURL: url,
+                    redirectCount: 0
+                )
+            case (.post, "/@atproto/oauth-provider/~api/sign-in"):
+                let json = try XCTUnwrap(body).jsonObject()
+                XCTAssertEqual(json["locale"] as? String, "en")
+                XCTAssertEqual(json["username"] as? String, "member.example")
+                XCTAssertEqual(json["password"] as? String, "correct horse battery staple")
+                XCTAssertEqual(json["remember"] as? Bool, false)
+                return .init(
+                    status: 200,
+                    headers: ["set-cookie": "csrf-token=\(csrf); Path=/; Secure"],
+                    body: Data(#"{"account":{"did":"did:plc:reference-member"},"ephemeralToken":"ephemeral-token"}"#.utf8),
+                    finalURL: url,
+                    redirectCount: 0
+                )
+            case (.post, "/@atproto/oauth-provider/~api/consent"):
+                XCTAssertEqual(headers["Authorization"], "Bearer ephemeral-token")
+                XCTAssertEqual(headers["X-CSRF-Token"], csrf)
+                XCTAssertEqual(headers["Origin"], "https://reference.example")
+                XCTAssertEqual(headers["Sec-Fetch-Mode"], "same-origin")
+                XCTAssertEqual(headers["Sec-Fetch-Site"], "same-origin")
+                let referer = try XCTUnwrap(headers["Referer"])
+                let refererURL = try XCTUnwrap(URL(string: referer))
+                XCTAssertEqual(refererURL.path, "/oauth/authorize")
+                XCTAssertEqual(
+                    URLComponents(url: refererURL, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "request_uri" })?.value,
+                    "urn:ietf:params:oauth:request_uri:fixture"
+                )
+                let json = try XCTUnwrap(body).jsonObject()
+                XCTAssertEqual(json["did"] as? String, "did:plc:reference-member")
+                XCTAssertEqual(json["scope"] as? String, "atproto")
+                return .init(
+                    status: 200,
+                    headers: [:],
+                    body: Data("{\"url\":\"https://reference.example/oauth/authorize/redirect?redirect_mode=query&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback&iss=https%3A%2F%2Freference.example&code=reference-code&state=\(state)\"}".utf8),
+                    finalURL: url,
+                    redirectCount: 0
+                )
+            case (.get, "/oauth/authorize/redirect"):
+                XCTAssertEqual(headers["Accept"], "text/html")
+                XCTAssertEqual(headers["Sec-Fetch-Mode"], "navigate")
+                XCTAssertEqual(headers["Sec-Fetch-Site"], "same-origin")
+                XCTAssertEqual(headers["Sec-Fetch-Dest"], "document")
+                XCTAssertEqual(headers["Cookie"], "csrf-token=\(csrf)")
+                let referer = try XCTUnwrap(headers["Referer"])
+                let refererURL = try XCTUnwrap(URL(string: referer))
+                XCTAssertEqual(refererURL.path, "/oauth/authorize")
+                XCTAssertEqual(
+                    URLComponents(url: refererURL, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "request_uri" })?.value,
+                    "urn:ietf:params:oauth:request_uri:fixture"
+                )
+                return .init(
+                    status: 303,
+                    headers: ["location": "http://127.0.0.1/callback?code=reference-code&state=\(state)&iss=https%3A%2F%2Freference.example"],
+                    body: Data(),
+                    finalURL: url,
+                    redirectCount: 0
+                )
+            case (.post, "/oauth/token") where headers["DPoP"] == nil:
+                return .init(
+                    status: 401,
+                    headers: ["dpop-nonce": "token-nonce"],
+                    body: Data(),
+                    finalURL: url,
+                    redirectCount: 0
+                )
+            case (.post, "/oauth/token"):
+                return .init(
+                    status: 200,
+                    headers: [:],
+                    body: Data(#"{"access_token":"access-token","refresh_token":"refresh-token","scope":"atproto","sub":"did:plc:reference-member","expires_in":300}"#.utf8),
+                    finalURL: url,
+                    redirectCount: 0
+                )
+            default:
+                XCTFail("unexpected reference OAuth request: \(method.rawValue) \(url.path)")
+                return .init(status: 500, headers: [:], body: Data(), finalURL: url, redirectCount: 0)
+            }
+        }
+
+        let client = try SwanOAuthLabClient(
+            issuer: issuer,
+            clientID: clientID,
+            redirectURI: redirectURI,
+            executeHandler: handler
+        )
+        let token = try await client.authorizationCode(
+            handle: "member.example",
+            password: "correct horse battery staple",
+            scopes: ["atproto"],
+            state: state
+        )
+        XCTAssertEqual(token.accessToken, "access-token")
+        XCTAssertEqual(token.subject, "did:plc:reference-member")
+
+        let recorded = await requests.snapshot()
+        XCTAssertEqual(recorded.filter { $0.url.path == "/@atproto/oauth-provider/~api/sign-in" }.count, 1)
+        XCTAssertEqual(recorded.filter { $0.url.path == "/@atproto/oauth-provider/~api/consent" }.count, 1)
+        XCTAssertEqual(recorded.filter { $0.url.path == "/oauth/authorize/redirect" }.count, 1)
+    }
+
     func testLiveFixtureRecordingStripsSelectorsAndKeepsOnlyResponseDigests() async throws {
         let recorder = InteropFixtureRecorder()
         let response = InteropHTTPResponse(
@@ -1324,6 +1457,31 @@ private func recoveryStagingDirectories(in root: URL) throws -> [URL] {
         includingPropertiesForKeys: nil
     ).filter {
         $0.lastPathComponent.hasPrefix("swan-space-recovery-")
+    }
+}
+
+private struct ReferenceOAuthMockRequest: Sendable {
+    let method: InteropHTTPMethod
+    let url: URL
+    let headers: [String: String]
+    let body: Data?
+}
+
+private actor ReferenceOAuthMockRequests {
+    private var values: [ReferenceOAuthMockRequest] = []
+
+    func append(_ value: ReferenceOAuthMockRequest) {
+        values.append(value)
+    }
+
+    func snapshot() -> [ReferenceOAuthMockRequest] {
+        values
+    }
+}
+
+private extension Data {
+    func jsonObject() throws -> [String: Any] {
+        try XCTUnwrap(JSONSerialization.jsonObject(with: self) as? [String: Any])
     }
 }
 

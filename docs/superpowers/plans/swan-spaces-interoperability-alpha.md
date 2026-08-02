@@ -466,3 +466,40 @@ still reports the live cross-host semantic matrix as not run; native Linux,
 stock pinned TypeScript recovery/value interoperability, reverse-authority
 OAuth/browser/lifecycle coverage, and the corruption/compaction fault matrix
 remain required before calling the alpha complete.
+
+## 2026-08-01 reference OAuth provider and public write/read witness
+
+`SwanOAuthLabClient` now supports the pinned TypeScript provider's
+same-origin JSON sign-in/consent contract, including its CSRF cookie, ephemeral
+session bearer, and issuer-local `/oauth/authorize/redirect` browser hop. The
+hop is bounded to one GET and one 303, with strict issuer/path/query/referrer
+validation and redirect following disabled. The focused adapter test and the
+serialized `SwanInteropTests` selection pass with zero failures.
+
+A disposable account on the pinned TypeScript PDS completed a live OAuth/PKCE/
+DPoP public round trip through the current Caddy/Toxiproxy Compose network.
+With `atproto` plus collection-specific create/update repository scope, the
+reference host accepted `com.atproto.repo.putRecord` (HTTP 200) and
+`com.atproto.repo.getRecord` (HTTP 200) returned the same CID. The sanitized
+ignored artifact is
+`.interop-live/reference-oauth-public.SMYhmU/artifact.json`; it contains only
+statuses, endpoint labels, byte counts, and digests. The public fixture's
+record key is the valid TID `3jzfcwq7jrs2a`.
+
+This closes the reference OAuth/public write-read witness, but not the
+remaining stock TypeScript incremental/full-CAR gap, cross-host corruption and
+compaction recovery, reverse-authority browser/account lifecycle, strict
+password-reset race, or native-Linux current-profile live gates.
+
+## 2026-08-01 lab restart image and descriptor-pressure correction
+
+After the lab restart, the active reference-PDS service was checked by its
+container contents, not its Compose tag. It was initially recovery-qualified;
+the disposable current project was restored to the stock pinned image and
+only `reference-pds` was recreated with its existing data volume. The stock
+source marker and the Caddy/Toxiproxy HTTPS route were then verified.
+
+The recovery overlay source test was also hardened to hash only its four
+patched files. Recursive hashing of the pinned checkout's pnpm dependency
+farm was unnecessary and could trigger the host descriptor-pressure failure.
+The overlay source qualification passes after the bounded check.

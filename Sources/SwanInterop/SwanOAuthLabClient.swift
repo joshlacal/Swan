@@ -130,7 +130,7 @@ public actor SwanOAuthLabClient {
 
     private let http: InteropHTTPClient
     private var nonce: String?
-    private var cookie: String?
+    private var cookies: [String: String] = [:]
 
     public init(
         issuer: URL,
@@ -138,7 +138,8 @@ public actor SwanOAuthLabClient {
         redirectURI: URL,
         timeout: TimeInterval = 15,
         dpopKey: InteropDPoPKey = .init(),
-        additionalTrustRootFile: URL? = nil
+        additionalTrustRootFile: URL? = nil,
+        executeHandler: InteropHTTPExecuteHandler? = nil
     ) throws {
         self.issuer = issuer
         self.clientID = clientID
@@ -147,7 +148,8 @@ public actor SwanOAuthLabClient {
         http = try InteropHTTPClient(
             baseURL: issuer,
             timeout: timeout,
-            additionalTrustRootFile: additionalTrustRootFile
+            additionalTrustRootFile: additionalTrustRootFile,
+            executeHandler: executeHandler
         )
     }
 
@@ -174,9 +176,35 @@ public actor SwanOAuthLabClient {
         let loginPage = try await http.execute(
             method: .get,
             path: authorizePath,
-            headers: ["Accept": "text/html"]
+            headers: [
+                "Accept": "text/html",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-Dest": "document",
+            ]
         )
-        captureCookie(loginPage)
+        captureCookies(loginPage)
+
+        // Swan renders a conventional HTML form. The pinned TypeScript
+        // provider renders a client-side page and exposes the same flow as
+        // same-origin JSON APIs instead. Keep the two protocols explicit so
+        // a missing HTML field cannot silently weaken the reference provider's
+        // CSRF/referrer/session checks.
+        guard let loginHTML = String(data: loginPage.body, encoding: .utf8) else {
+            throw InteropHTTPError.unexpectedContentType
+        }
+        guard loginHTML.contains("name=\"csrf\"") else {
+            return try await referenceAuthorizationCode(
+                authorizePath: authorizePath,
+                requestURI: par.requestURI,
+                handle: handle,
+                password: password,
+                scopes: scopes,
+                verifier: verifier,
+                state: state
+            )
+        }
+
         let loginCSRF = try hiddenFormValue(named: "csrf", in: loginPage.body)
         let loginBody = formEncode([
             ("csrf", loginCSRF), ("handle", handle), ("password", password),
@@ -187,7 +215,7 @@ public actor SwanOAuthLabClient {
             headers: browserHeaders(contentType: "application/x-www-form-urlencoded"),
             body: loginBody
         )
-        captureCookie(consentPage)
+        captureCookies(consentPage)
         let consentCSRF = try hiddenFormValue(named: "csrf", in: consentPage.body)
         let redirect = try await http.execute(
             method: .post,
@@ -199,7 +227,9 @@ public actor SwanOAuthLabClient {
               let location = redirect.header("location"),
               let locationURL = URL(string: location),
               let components = URLComponents(url: locationURL, resolvingAgainstBaseURL: false),
-              let code = components.queryItems?.first(where: { $0.name == "code" })?.value else {
+              let code = components.queryItems?.first(where: { $0.name == "code" })?.value,
+              components.queryItems?.first(where: { $0.name == "state" })?.value == state,
+              sameRedirectTarget(locationURL, expected: redirectURI) else {
             throw InteropHTTPError.unexpectedStatus(redirect.status)
         }
         return try await redeemAuthorizationCode(
@@ -330,6 +360,140 @@ public actor SwanOAuthLabClient {
         }
     }
 
+    private struct ReferenceSignInResponse: Decodable {
+        struct Account: Decodable {
+            let did: String
+        }
+
+        let account: Account
+        let ephemeralToken: String?
+    }
+
+    private struct ReferenceConsentResponse: Decodable {
+        let url: String
+    }
+
+    private func referenceAuthorizationCode(
+        authorizePath: String,
+        requestURI: String,
+        handle: String,
+        password: String,
+        scopes: Set<String>,
+        verifier: String,
+        state: String
+    ) async throws -> InteropOAuthToken {
+        let authorizeURL = try absoluteURL(for: authorizePath)
+        guard let csrf = cookies["csrf-token"], csrf.utf8.count == 24 else {
+            throw SwanError.malformed("reference OAuth page did not set a CSRF cookie")
+        }
+
+        let signIn = try await http.execute(
+            method: .post,
+            path: "/@atproto/oauth-provider/~api/sign-in",
+            headers: referenceAPIHeaders(
+                authorizeURL: authorizeURL,
+                csrf: csrf,
+                authorization: nil
+            ),
+            body: try JSONEncoder().encode(
+                ReferenceSignInRequest(
+                    locale: "en",
+                    username: handle,
+                    password: password,
+                    remember: false
+                )
+            )
+        )
+        guard (200 ... 299).contains(signIn.status) else {
+            throw InteropHTTPError.unexpectedStatus(signIn.status)
+        }
+        captureCookies(signIn)
+        let signedIn = try StrictJSON.decode(ReferenceSignInResponse.self, from: signIn.body)
+        guard !signedIn.account.did.isEmpty,
+              let ephemeralToken = signedIn.ephemeralToken,
+              !ephemeralToken.isEmpty else {
+            throw SwanError.malformed("reference OAuth sign-in did not return a bounded session")
+        }
+
+        guard let refreshedCSRF = cookies["csrf-token"], refreshedCSRF.utf8.count == 24 else {
+            throw SwanError.malformed("reference OAuth sign-in lost its CSRF cookie")
+        }
+        let consent = try await http.execute(
+            method: .post,
+            path: "/@atproto/oauth-provider/~api/consent",
+            headers: referenceAPIHeaders(
+                authorizeURL: authorizeURL,
+                csrf: refreshedCSRF,
+                authorization: "Bearer \(ephemeralToken)"
+            ),
+            body: try JSONEncoder().encode(
+                ReferenceConsentRequest(
+                    did: signedIn.account.did,
+                    scope: scopes.sorted().joined(separator: " ")
+                )
+            )
+        )
+        guard (200 ... 299).contains(consent.status) else {
+            throw InteropHTTPError.unexpectedStatus(consent.status)
+        }
+        let consentResult = try StrictJSON.decode(ReferenceConsentResponse.self, from: consent.body)
+        guard let redirectURL = URL(string: consentResult.url, relativeTo: issuer)?.absoluteURL,
+              let redirectComponents = URLComponents(url: redirectURL, resolvingAgainstBaseURL: false),
+              redirectComponents.path == "/oauth/authorize/redirect",
+              redirectComponents.fragment == nil,
+              redirectComponents.queryItems?.first(where: { $0.name == "redirect_mode" })?.value == "query",
+              redirectComponents.queryItems?.first(where: { $0.name == "redirect_uri" })?.value == redirectURI.absoluteString,
+              redirectComponents.queryItems?.first(where: { $0.name == "iss" })?.value == issuer.absoluteString,
+              redirectComponents.queryItems?.first(where: { $0.name == "state" })?.value == state,
+              let code = redirectComponents.queryItems?.first(where: { $0.name == "code" })?.value,
+              !code.isEmpty,
+              URLComponents(url: authorizeURL, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "request_uri" })?.value == requestURI else {
+            throw SwanError.malformed("reference OAuth consent returned an invalid redirect")
+        }
+
+        // The pinned provider deliberately returns an issuer-local browser
+        // URL from the JSON consent API. A browser navigates to that URL and
+        // receives one 303 to the registered client redirect. Follow exactly
+        // that one hop ourselves; never let AsyncHTTPClient follow an
+        // unvalidated redirect or treat the API response as the final code.
+        let redirectPath = try issuerRelativePath(
+            redirectURL,
+            expectedPath: "/oauth/authorize/redirect"
+        )
+        let redirectResponse = try await http.execute(
+            method: .get,
+            path: redirectPath,
+            headers: referenceNavigationHeaders(authorizeURL: authorizeURL)
+        )
+        guard redirectResponse.status == 303,
+              let location = redirectResponse.header("location"),
+              let locationURL = URL(string: location, relativeTo: issuer)?.absoluteURL,
+              let locationComponents = URLComponents(url: locationURL, resolvingAgainstBaseURL: false),
+              let finalCode = locationComponents.queryItems?.first(where: { $0.name == "code" })?.value,
+              !finalCode.isEmpty,
+              locationComponents.queryItems?.first(where: { $0.name == "state" })?.value == state,
+              sameRedirectTarget(locationURL, expected: redirectURI) else {
+            throw SwanError.malformed("reference OAuth redirect hop was invalid")
+        }
+        return try await redeemAuthorizationCode(
+            code: finalCode,
+            verifier: verifier,
+            state: state
+        )
+    }
+
+    private struct ReferenceConsentRequest: Encodable {
+        let did: String
+        let scope: String
+    }
+
+    private struct ReferenceSignInRequest: Encodable {
+        let locale: String
+        let username: String
+        let password: String
+        let remember: Bool
+    }
+
     private func pushAuthorizationRequest(
         scopes: Set<String>,
         state: String,
@@ -427,15 +591,119 @@ public actor SwanOAuthLabClient {
 
     private func browserHeaders(contentType: String) -> [String: String] {
         var headers = ["Content-Type": contentType, "Accept": "text/html"]
-        if let cookie { headers["Cookie"] = cookie }
+        if let cookieHeader { headers["Cookie"] = cookieHeader }
         return headers
     }
 
-    private func captureCookie(_ response: InteropHTTPResponse) {
-        guard let value = response.header("set-cookie"),
-              let first = value.split(separator: ";", maxSplits: 1).first,
-              !first.isEmpty else { return }
-        cookie = String(first)
+    private var cookieHeader: String? {
+        guard !cookies.isEmpty else { return nil }
+        return cookies.keys.sorted().compactMap { name in
+            guard let value = cookies[name] else { return nil }
+            return "\(name)=\(value)"
+        }.joined(separator: "; ")
+    }
+
+    private func captureCookies(_ response: InteropHTTPResponse) {
+        guard let value = response.header("set-cookie") else { return }
+        // InteropHTTPClient combines repeated headers with commas. The
+        // reference provider's cookie values are bounded hex/JWT strings and
+        // never contain commas, so splitting each Set-Cookie segment is safe
+        // and avoids retaining attributes or secret response metadata.
+        for segment in value.split(separator: ",") {
+            guard let assignment = segment.split(separator: ";", maxSplits: 1).first,
+                  let separator = assignment.firstIndex(of: "=") else { continue }
+            let name = String(assignment[..<separator])
+                .trimmingCharacters(in: .whitespaces)
+            let cookieValue = String(assignment[assignment.index(after: separator)...])
+                .trimmingCharacters(in: .whitespaces)
+            guard !name.isEmpty else { continue }
+            if cookieValue.isEmpty {
+                cookies.removeValue(forKey: name)
+            } else {
+                cookies[name] = cookieValue
+            }
+        }
+    }
+
+    private func referenceAPIHeaders(
+        authorizeURL: URL,
+        csrf: String,
+        authorization: String?
+    ) -> [String: String] {
+        var headers = [
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Origin": issuerOrigin,
+            "Referer": authorizeURL.absoluteString,
+            "Sec-Fetch-Mode": "same-origin",
+            "Sec-Fetch-Site": "same-origin",
+            "X-CSRF-Token": csrf,
+        ]
+        if let cookieHeader { headers["Cookie"] = cookieHeader }
+        if let authorization { headers["Authorization"] = authorization }
+        return headers
+    }
+
+    private func referenceNavigationHeaders(authorizeURL: URL) -> [String: String] {
+        var headers = [
+            "Accept": "text/html",
+            "Referer": authorizeURL.absoluteString,
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Dest": "document",
+        ]
+        if let cookieHeader { headers["Cookie"] = cookieHeader }
+        return headers
+    }
+
+    private var issuerOrigin: String {
+        var components = URLComponents()
+        components.scheme = issuer.scheme
+        components.host = issuer.host
+        components.port = issuer.port
+        return components.string ?? issuer.absoluteString
+    }
+
+    private func absoluteURL(for path: String) throws -> URL {
+        guard path.first == "/", !path.hasPrefix("//"),
+              let url = URL(string: path, relativeTo: issuer)?.absoluteURL,
+              url.scheme?.lowercased() == issuer.scheme?.lowercased(),
+              url.host?.lowercased() == issuer.host?.lowercased(),
+              url.port == issuer.port else {
+            throw SwanError.malformed("OAuth path escaped its issuer")
+        }
+        return url
+    }
+
+    private func issuerRelativePath(_ target: URL, expectedPath: String) throws -> String {
+        guard let components = URLComponents(url: target, resolvingAgainstBaseURL: false),
+              components.scheme?.lowercased() == issuer.scheme?.lowercased(),
+              components.host?.lowercased() == issuer.host?.lowercased(),
+              components.port == issuer.port,
+              components.user == nil,
+              components.password == nil,
+              components.fragment == nil,
+              components.path == expectedPath else {
+            throw SwanError.malformed("OAuth redirect escaped its issuer")
+        }
+        return components.percentEncodedPath
+            + (components.percentEncodedQuery.map { "?\($0)" } ?? "")
+    }
+
+    private func sameRedirectTarget(_ actual: URL, expected: URL) -> Bool {
+        guard let actualComponents = URLComponents(url: actual, resolvingAgainstBaseURL: false),
+              let expectedComponents = URLComponents(url: expected, resolvingAgainstBaseURL: false) else {
+            return false
+        }
+        let expectedQueryMatches = expectedComponents.queryItems?.allSatisfy { expectedItem in
+            actualComponents.queryItems?.contains(expectedItem) == true
+        } ?? true
+        return actualComponents.scheme?.lowercased() == expectedComponents.scheme?.lowercased()
+            && actualComponents.host?.lowercased() == expectedComponents.host?.lowercased()
+            && actualComponents.port == expectedComponents.port
+            && actualComponents.percentEncodedPath == expectedComponents.percentEncodedPath
+            && actualComponents.percentEncodedFragment == expectedComponents.percentEncodedFragment
+            && expectedQueryMatches
     }
 
     private func resourcePath(_ target: URL) throws -> String {
