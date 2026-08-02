@@ -624,3 +624,32 @@ production-directory `getRepo` RSS, and private CAS bounded streaming. All six
 passed. The permissioned CAR report streamed 267,396,722 bytes in 65,536-byte
 maximum chunks with a 22,233,088-byte peak RSS increase; the public spool
 report streamed 270,049,433 bytes with a 15,433,728-byte RSS delta.
+
+## 2026-08-02 Docker-on-Darwin clean rebuild and service recovery receipt
+
+The disposable `--mode linux --reference-variant recovery` clean-cache run
+used `/private/tmp/swan-clean-cache-linux-current-xcode64-20260802-2`. Static
+profile/Compose/bootstrap/verifier preflights passed, the Swift product build
+completed in 359.24 seconds, and the no-cache Docker build completed all
+Swan/reference images. Startup initially failed because the Colima overlay
+filesystem was full (`98G` total, `0` available), producing SQLite
+`database or disk is full` during bootstrap. This was an environment capacity
+failure, not an application assertion.
+
+The recovery was bounded to reclaimable BuildKit cache (`9.941GB`); no active
+Swan data volume or normal lab resource was removed. The already-built
+disposable Compose project was then started without rebuilding. The final
+status was: Swan, reference PDS, reference PLC, Caddy, and Mailpit
+`running 0 healthy`; Toxiproxy `running 0`; and `swan-secrets-init`,
+`swan-data-init`, `swan-bootstrap`, `toxiproxy-setup`, and `caddy-ca-ready`
+exited `0`. Caddy-routed `/health` returned `OK`, and the protected-resource
+metadata endpoint returned `https://swan.test` with Swan as authorization
+server.
+
+This closes a current Docker-on-Darwin image/build/service-health witness for
+the recovery-qualified topology. It is not native-Linux-host evidence, and
+the clean-cache script itself remains recorded as capacity-failed rather than
+silently promoted to a clean-script pass. Stock TypeScript value-bearing
+incremental/full-CAR semantics, stateful cross-host fault/compaction,
+reverse lifecycle, strict password-reset contention, and formal security
+scan gates remain open.

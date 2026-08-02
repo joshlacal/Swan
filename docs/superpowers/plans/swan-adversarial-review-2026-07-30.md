@@ -2631,3 +2631,30 @@ import, public production-directory `getRepo` RSS, and private CAS bounded
 streaming. The permissioned CAR report streamed 267,396,722 bytes with
 65,536-byte maximum chunks and a 22,233,088-byte peak RSS increase; the public
 spool report streamed 270,049,433 bytes with a 15,433,728-byte RSS delta.
+
+## Adversarial rereview: disposable Docker-Linux rebuild and capacity recovery — 2026-08-02
+
+The clean-cache container workload copied only the pinned Swift/Compose inputs
+to `/private/tmp/swan-clean-cache-linux-current-xcode64-20260802-2`, fetched the
+reference cache at `3f6c96d5d2d25438bd40fa89d6ecc37865f8e354`, and completed the
+isolated Swift product build in 359.24 seconds. The no-cache Docker build then
+completed all Swan, Caddy, PLC, and reference-PDS images, including a release
+link of the `swan` executable. Its first fresh startup was correctly rejected
+when the Colima overlay filesystem reached 100% (`98G` total, `0` available),
+which surfaced as SQLite `database or disk is full` during bootstrap rather
+than a misleading account failure.
+
+Only reclaimable BuildKit cache was pruned (`9.941GB`); the active
+`swan-alpha-current-20260801_swan-data-v2` volume and all normal lab resources
+were preserved. With `7.9G` free in the Docker overlay, the already-built
+disposable project was started without rebuilding. Every required service was
+healthy or a successful one-shot: Swan, reference PDS, reference PLC, Caddy,
+and Mailpit were `running 0 healthy`; Toxiproxy was `running 0`; and all init
+services exited `0`. The Caddy-routed Swan `/health` endpoint returned `OK`, and
+protected-resource metadata returned the expected `https://swan.test` resource
+and authorization server.
+
+This is a current Docker-on-Darwin container build/health receipt, not native
+Linux-host evidence and not a successful clean-cache script exit. It also does
+not upgrade the stock TypeScript value-bearing recovery gap or the remaining
+stateful cross-host, lifecycle, password-reset, and formal-security gates.
