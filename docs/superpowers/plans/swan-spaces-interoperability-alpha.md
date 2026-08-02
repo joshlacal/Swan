@@ -724,3 +724,32 @@ local notification crash/restart gate. It does not close stock pinned-
 TypeScript value-bearing incremental/full-CAR behavior, the broader
 cross-host lifecycle/fault matrix, strict password-reset contention,
 non-cooperative email cancellation, or the formal security scan.
+
+## 2026-08-02 asynchronous password-recovery work-shape hardening and lab restart
+
+Password-recovery enqueueing now performs one bounded, account-free SQLite
+queue write for both known and unknown canonical mailboxes. The storage request
+contains no plaintext mailbox or DID: it carries keyed lookup/proof digests and
+an AES-GCM envelope authenticated with the owner-only email-proof key. A
+durable worker claims that row after the HTTP response, authenticates the
+envelope, and either materializes the active verified account’s token/outbox row
+or discards unknown/inactive work. Invalid envelopes are discarded without
+reflection; transient storage failures propagate so a valid lease can expire
+and requeue.
+
+The focused macOS gates pass after this change: 16
+`AccountEmailOutboxSQLiteTests` and 7 `AccountEmailOutboxRuntimeTests`,
+including envelope round-trip/tamper and restart-before-materialization
+coverage. The request-time storage-shape gap is closed, but strict constant-
+time behavior under arbitrary SQLite contention, non-cooperative delivery
+cancellation, browser reset/revocation, and the broader cross-host semantic
+matrix remain open.
+
+The rebuilt Swan image was restarted in normal
+`swan-alpha-current-20260801`. The first recreation against default
+`swan-data` correctly failed closed because encrypted account-key envelopes
+belong to a different secret lineage; no data was deleted. The documented
+external-volume override selected matching
+`swan-alpha-current-20260801_swan-data-v2`, leaving the old volume untouched.
+Final Swan `/health` through Caddy was HTTP 200; reference PDS/PLC, Mailpit,
+and Toxiproxy were healthy; profile and Compose verifiers pass.

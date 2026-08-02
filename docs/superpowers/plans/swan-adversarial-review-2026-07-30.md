@@ -115,7 +115,7 @@ overstated several gates. The most important adversarial findings were:
 | ADV-47 | P1 | `OAuthBoundedJSONPoster` validates DNS before a notification but does not pass that approved peer set into the POST transport. A stale or misconfigured static pin can therefore receive the service JWT and body before the post-response DNS comparison rejects it. | Remediated and green in the serialized macOS suite: the approved peer set is passed into the POST transport and checked before connect/write; the postflight DNS intersection remains, with a zero-accept/no-body regression. |
 | ADV-48 | P1 | A malicious interop peer can reflect a bearer or space credential as an arbitrary `cid`; failed artifacts persist that peer-controlled string, and matching reflected values can appear converged. | Remediated in source and focused `InteropArtifactBoundaryTests` are green: canonical CID validation and recursive artifact-boundary checks reject reflected opaque material. Live cross-host artifact recording remains part of ADV-56/interop closure. |
 | ADV-49 | P1 | Password-recovery rate limits use only the accepted socket peer. Once routed through Caddy, one attacker can consume the shared 15/hour proxy bucket and deny recovery to every user. | Standalone trusted-proxy policy and focused HTTP tests are green. Through-Caddy recovery/rate-limit behavior is composed in source but not exercised live; that runtime gate remains tracked by ADV-56. |
-| ADV-50 | P2 | Known password-reset mailboxes perform token/outbox writes while unknown mailboxes return early; known-only storage failures can also produce a distinct error response. | Partially remediated in source and focused tests: every canonical request now records a keyed, account-free blind-work marker; request-dependent storage/delivery failures collapse to the no-store empty success; and a 50 ms response floor bounds the direct timing signal. The known-account path still performs additional token/outbox writes, so strict constant-work equivalence under arbitrary SQLite contention remains an explicit follow-up. |
+| ADV-50 | P2 | Known password-reset mailboxes perform token/outbox writes while unknown mailboxes return early; known-only storage failures can also produce a distinct error response. | Request-time storage shape is remediated and focused tests are green: every canonical request performs one bounded, account-free queue write containing only keyed lookup/proof digests and an authenticated opaque mailbox envelope. A durable worker decrypts and validates the envelope after the HTTP response, then materializes the active verified account’s token/outbox row or discards unknown/inactive work. Storage failures remain retryable through lease expiry; request-dependent failures still collapse to the no-store empty success and the 50 ms floor bounds direct timing. Strict constant-work equivalence under arbitrary SQLite contention is not claimed. |
 | ADV-51 | P2 | New 256 MiB RSS helpers inherit the entire parent environment and relay unbounded child output into XCTest failures. | Remediated in source and focused helper tests are green: child environment is allowlisted and diagnostics are bounded/redacted. |
 | ADV-52 | P2 | Password-reset tests assert access-token revocation but discard the seeded refresh digest, so refresh-family regressions could pass unnoticed. | Remediated and focused refresh-family tests are green: the target family is revoked while an unrelated subject can still rotate. |
 | ADV-53 | P2 | Permanent-deletion outbox coverage is vacuous because the fixture asserts an empty outbox without ever seeding one. | Remediated and focused deletion-outbox tests are green with retained target rows and exact scoped-purge assertions. |
@@ -2733,3 +2733,31 @@ closes the live local outbox crash/restart gate; stock pinned-TypeScript
 value-bearing/recovery behavior, the broader cross-host lifecycle/fault
 matrix, strict password-reset contention, non-cooperative email cancellation,
 and the formal security launcher remain open.
+
+## 2026-08-02 asynchronous password-recovery work-shape hardening and lab restart
+
+Password-recovery enqueueing now performs one bounded, account-free SQLite
+queue write for both known and unknown canonical mailboxes. The storage request
+contains no plaintext mailbox or DID: it carries keyed lookup/proof digests and
+an AES-GCM envelope authenticated with the owner-only email-proof key. A
+durable worker claims that row after the HTTP response, authenticates the
+envelope, and either materializes the active verified account’s token/outbox row
+or discards unknown/inactive work. Invalid envelopes are discarded without
+reflection; transient storage failures propagate so a valid lease can expire
+and requeue.
+
+The focused macOS gates pass after this change: 16
+`AccountEmailOutboxSQLiteTests` and 7 `AccountEmailOutboxRuntimeTests`,
+including envelope round-trip/tamper and restart-before-materialization
+coverage. This closes the request-time storage-shape gap in ADV-50. It is not
+a claim of strict constant-time behavior under arbitrary SQLite contention;
+non-cooperative delivery cancellation and browser reset/revocation remain open.
+
+The rebuilt Swan image was restarted in normal
+`swan-alpha-current-20260801`. The first recreation against default
+`swan-data` correctly failed closed because encrypted account-key envelopes
+belong to a different secret lineage; no data was deleted. The documented
+external-volume override selected matching
+`swan-alpha-current-20260801_swan-data-v2`, leaving the old volume untouched.
+Final Swan `/health` through Caddy was HTTP 200; reference PDS/PLC, Mailpit,
+and Toxiproxy were healthy; profile and Compose verifiers pass.

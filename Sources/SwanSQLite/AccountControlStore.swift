@@ -331,14 +331,67 @@ extension SQLiteControlDatabase {
             CREATE TABLE IF NOT EXISTS account_password_recovery_work (
                 lookup_digest BLOB PRIMARY KEY CHECK(length(lookup_digest) = 32),
                 expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
-                created_at INTEGER NOT NULL CHECK(created_at >= 0)
+                created_at INTEGER NOT NULL CHECK(created_at >= 0),
+                delivery_id TEXT,
+                proof_digest BLOB,
+                email_envelope BLOB,
+                lease_owner TEXT,
+                lease_expires_at INTEGER,
+                attempts INTEGER NOT NULL DEFAULT 0
             ) WITHOUT ROWID
+            """
+        )
+        // Older alpha databases had only the three marker columns. Add the
+        // asynchronous queue fields without attempting to infer or revive
+        // legacy requests whose bearer material was never persisted.
+        try await addColumnIfMissing(
+            table: "account_password_recovery_work",
+            column: "delivery_id",
+            definition: "TEXT"
+        )
+        try await addColumnIfMissing(
+            table: "account_password_recovery_work",
+            column: "proof_digest",
+            definition: "BLOB"
+        )
+        try await addColumnIfMissing(
+            table: "account_password_recovery_work",
+            column: "email_envelope",
+            definition: "BLOB"
+        )
+        try await addColumnIfMissing(
+            table: "account_password_recovery_work",
+            column: "lease_owner",
+            definition: "TEXT"
+        )
+        try await addColumnIfMissing(
+            table: "account_password_recovery_work",
+            column: "lease_expires_at",
+            definition: "INTEGER"
+        )
+        try await addColumnIfMissing(
+            table: "account_password_recovery_work",
+            column: "attempts",
+            definition: "INTEGER NOT NULL DEFAULT 0"
+        )
+        _ = try await connection.query(
+            """
+            DELETE FROM account_password_recovery_work
+            WHERE delivery_id IS NULL
+               OR proof_digest IS NULL
+               OR email_envelope IS NULL
             """
         )
         _ = try await connection.query(
             """
             CREATE INDEX IF NOT EXISTS account_password_recovery_work_expiry
             ON account_password_recovery_work(expires_at, lookup_digest)
+            """
+        )
+        _ = try await connection.query(
+            """
+            CREATE INDEX IF NOT EXISTS account_password_recovery_work_lease
+            ON account_password_recovery_work(lease_expires_at, created_at)
             """
         )
         try await trimPasswordRecoveryWorkOverflowLocked()
@@ -741,9 +794,9 @@ extension SQLiteControlDatabase {
     public func enqueuePasswordRecoveryDelivery(
         _ request: AccountPasswordRecoveryDeliveryRequest
     ) async throws {
-        guard (try? AccountEmailAddress(request.email.value)) == request.email,
-              request.proofDigest.count == 32,
-              request.lookupDigest.count == 32 else {
+        guard request.proofDigest.count == 32,
+              request.lookupDigest.count == 32,
+              (28 ... 4_096).contains(request.emailEnvelope.count) else {
             throw AccountControlStoreError.invalidInput
         }
         let expiry = try controlTimestamp(request.expiresAt)
@@ -812,22 +865,208 @@ extension SQLiteControlDatabase {
                 _ = try await connection.query(
                     """
                     INSERT INTO account_password_recovery_work(
-                        lookup_digest, expires_at, created_at
-                    ) VALUES (?, ?, ?)
+                        lookup_digest, expires_at, created_at,
+                        delivery_id, proof_digest, email_envelope,
+                        lease_owner, lease_expires_at, attempts
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0)
                     ON CONFLICT(lookup_digest) DO UPDATE SET
                         expires_at = excluded.expires_at,
-                        created_at = excluded.created_at
+                        created_at = excluded.created_at,
+                        delivery_id = excluded.delivery_id,
+                        proof_digest = excluded.proof_digest,
+                        email_envelope = excluded.email_envelope,
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        attempts = 0
                     """,
                     [
                         blob(request.lookupDigest),
                         .integer(expiry),
                         .integer(created),
+                        .text(request.deliveryID.rawValue),
+                        blob(request.proofDigest),
+                        blob(request.emailEnvelope),
                     ]
                 )
+            }
+        }
+    }
 
-                // This exact query and the intentionally empty return value
-                // make the request surface enumeration resistant.
+    public func claimNextPasswordRecoveryWork(
+        workerID: String,
+        now: Date,
+        leaseDuration: TimeInterval
+    ) async throws -> AccountPasswordRecoveryWorkLease? {
+        guard AccountEmailStorageValidation.isWorkerID(workerID),
+              leaseDuration.isFinite,
+              (0.1 ... 300).contains(leaseDuration) else {
+            throw AccountControlStoreError.invalidInput
+        }
+        let timestamp = try controlTimestamp(now)
+        let leaseExpiry = try controlTimestamp(
+            now.addingTimeInterval(leaseDuration)
+        )
+        return try await withConnectionGate {
+            try await transaction {
+                try await purgeExpiredEmailRecoveryStateLocked(
+                    timestamp: timestamp
+                )
+                _ = try await connection.query(
+                    """
+                    UPDATE account_password_recovery_work
+                    SET lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        attempts = 0
+                    WHERE lease_expires_at IS NOT NULL
+                      AND lease_expires_at <= ?
+                    """,
+                    [.integer(timestamp)]
+                )
+                let candidates = try await connection.query(
+                    """
+                    SELECT lookup_digest
+                    FROM account_password_recovery_work
+                    WHERE expires_at > ?
+                      AND lease_owner IS NULL
+                      AND attempts < 64
+                    ORDER BY created_at, lookup_digest
+                    LIMIT 1
+                    """,
+                    [.integer(timestamp)]
+                )
+                guard let candidate = candidates.first else { return nil }
+                guard case let .blob(lookupDigest) =
+                          candidate.column("lookup_digest"),
+                      lookupDigest.readableBytes == 32 else {
+                    throw AccountControlStoreError.malformedRecord
+                }
                 let rows = try await connection.query(
+                    """
+                    UPDATE account_password_recovery_work
+                    SET lease_owner = ?,
+                        lease_expires_at = ?,
+                        attempts = attempts + 1
+                    WHERE lookup_digest = ?
+                      AND expires_at > ?
+                      AND lease_owner IS NULL
+                      AND attempts < 64
+                    RETURNING lookup_digest, delivery_id, proof_digest,
+                              email_envelope, expires_at, created_at, attempts
+                    """,
+                    [
+                        .text(workerID), .integer(leaseExpiry),
+                        blob(Data(lookupDigest.readableBytesView)),
+                        .integer(timestamp),
+                    ]
+                )
+                guard rows.count <= 1 else {
+                    throw AccountControlStoreError.malformedRecord
+                }
+                guard let row = rows.first else { return nil }
+                guard case let .blob(returnedLookup) =
+                          row.column("lookup_digest"),
+                      case let .blob(proofDigest) =
+                          row.column("proof_digest"),
+                      case let .blob(emailEnvelope) =
+                          row.column("email_envelope"),
+                      returnedLookup.readableBytes == 32,
+                      proofDigest.readableBytes == 32,
+                      (28 ... 4_096).contains(emailEnvelope.readableBytes),
+                      case let .integer(expiresAt) =
+                          row.column("expires_at"),
+                      case let .integer(createdAt) =
+                          row.column("created_at"),
+                      case let .integer(attempts) =
+                          row.column("attempts"),
+                      expiresAt > createdAt,
+                      (1 ... 64).contains(attempts) else {
+                    throw AccountControlStoreError.malformedRecord
+                }
+                let deliveryID: String
+                do {
+                    deliveryID = try requiredText(row, "delivery_id")
+                } catch {
+                    throw AccountControlStoreError.malformedRecord
+                }
+                do {
+                    return try AccountPasswordRecoveryWorkLease(
+                        deliveryID: AccountEmailDeliveryID(
+                            rawValue: deliveryID
+                        ),
+                        lookupDigest: Data(returnedLookup.readableBytesView),
+                        proofDigest: Data(proofDigest.readableBytesView),
+                        emailEnvelope: Data(emailEnvelope.readableBytesView),
+                        expiresAt: Date(
+                            timeIntervalSince1970: Double(expiresAt) / 1_000_000
+                        ),
+                        createdAt: Date(
+                            timeIntervalSince1970: Double(createdAt) / 1_000_000
+                        ),
+                        attempts: attempts
+                    )
+                } catch {
+                    throw AccountControlStoreError.malformedRecord
+                }
+            }
+        }
+    }
+
+    public func materializePasswordRecoveryWork(
+        _ work: AccountPasswordRecoveryWorkLease,
+        email: AccountEmailAddress,
+        workerID: String,
+        now: Date
+    ) async throws -> AccountPasswordRecoveryWorkMaterialization {
+        guard AccountEmailStorageValidation.isWorkerID(workerID),
+              (try? AccountEmailAddress(email.value)) == email else {
+            throw AccountControlStoreError.invalidInput
+        }
+        let timestamp = try controlTimestamp(now)
+        let expiry = try controlTimestamp(work.expiresAt)
+        let created = try controlTimestamp(work.createdAt)
+        return try await withConnectionGate {
+            try await transaction {
+                let rows = try await connection.query(
+                    """
+                    SELECT delivery_id, proof_digest, email_envelope,
+                           expires_at, created_at
+                    FROM account_password_recovery_work
+                    WHERE lookup_digest = ?
+                      AND lease_owner = ?
+                      AND lease_expires_at > ?
+                      AND expires_at > ?
+                    """,
+                    [
+                        blob(work.lookupDigest),
+                        .text(workerID),
+                        .integer(timestamp),
+                        .integer(timestamp),
+                    ]
+                )
+                guard rows.count <= 1 else {
+                    throw AccountControlStoreError.malformedRecord
+                }
+                guard let row = rows.first,
+                      case let .integer(rowExpiry) =
+                          row.column("expires_at"),
+                      case let .integer(rowCreated) =
+                          row.column("created_at"),
+                      rowExpiry == expiry,
+                      rowCreated == created,
+                      case let .blob(proofDigest) =
+                          row.column("proof_digest"),
+                      case let .blob(emailEnvelope) =
+                          row.column("email_envelope"),
+                      proofDigest.readableBytes == 32,
+                      (28 ... 4_096).contains(emailEnvelope.readableBytes) else {
+                    return .discarded
+                }
+                guard (try? requiredText(row, "delivery_id"))
+                    == work.deliveryID.rawValue else {
+                    return .discarded
+                }
+
+                let accountRows = try await connection.query(
                     """
                     SELECT a.did, e.updated_at
                     FROM account_emails AS e
@@ -836,28 +1075,74 @@ extension SQLiteControlDatabase {
                       AND e.verified_at IS NOT NULL
                       AND a.status = 'active'
                     """,
-                    [.text(request.email.value)]
+                    [.text(email.value)]
                 )
-                guard rows.count <= 1 else {
+                guard accountRows.count <= 1 else {
                     throw AccountControlStoreError.malformedRecord
                 }
-                guard let row = rows.first else { return }
-                let did = try requiredText(row, "did")
-                guard AccountControlIdentifiers.isDID(did),
-                      case let .integer(generation) =
-                          row.column("updated_at"),
-                      generation > 0 else {
-                    throw AccountControlStoreError.malformedRecord
+                if let accountRow = accountRows.first {
+                    let did = try requiredText(accountRow, "did")
+                    guard AccountControlIdentifiers.isDID(did),
+                          case let .integer(generation) =
+                              accountRow.column("updated_at"),
+                          generation > 0 else {
+                        throw AccountControlStoreError.malformedRecord
+                    }
+                    try await insertEmailProofDeliveryLocked(
+                        deliveryID: work.deliveryID,
+                        did: did,
+                        email: email,
+                        emailGeneration: generation,
+                        purpose: .passwordRecovery,
+                        proofDigest: Data(proofDigest.readableBytesView),
+                        expiresAt: expiry,
+                        createdAt: created
+                    )
+                    _ = try await connection.query(
+                        """
+                        DELETE FROM account_password_recovery_work
+                        WHERE lookup_digest = ? AND lease_owner = ?
+                        """,
+                        [blob(work.lookupDigest), .text(workerID)]
+                    )
+                    return .enqueued
                 }
-                try await insertEmailProofDeliveryLocked(
-                    deliveryID: request.deliveryID,
-                    did: did,
-                    email: request.email,
-                    emailGeneration: generation,
-                    purpose: .passwordRecovery,
-                    proofDigest: request.proofDigest,
-                    expiresAt: expiry,
-                    createdAt: created
+
+                _ = try await connection.query(
+                    """
+                    DELETE FROM account_password_recovery_work
+                    WHERE lookup_digest = ? AND lease_owner = ?
+                    """,
+                    [blob(work.lookupDigest), .text(workerID)]
+                )
+                return .discarded
+            }
+        }
+    }
+
+    public func discardPasswordRecoveryWork(
+        _ work: AccountPasswordRecoveryWorkLease,
+        workerID: String,
+        now: Date
+    ) async throws {
+        guard AccountEmailStorageValidation.isWorkerID(workerID) else {
+            throw AccountControlStoreError.invalidInput
+        }
+        let timestamp = try controlTimestamp(now)
+        try await withConnectionGate {
+            try await transaction {
+                _ = try await connection.query(
+                    """
+                    DELETE FROM account_password_recovery_work
+                    WHERE lookup_digest = ?
+                      AND lease_owner = ?
+                      AND lease_expires_at > ?
+                    """,
+                    [
+                        blob(work.lookupDigest),
+                        .text(workerID),
+                        .integer(timestamp),
+                    ]
                 )
             }
         }

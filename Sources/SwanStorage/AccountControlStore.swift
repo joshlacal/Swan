@@ -876,41 +876,44 @@ public struct AccountEmailProofDeliveryRequest: Sendable, Equatable {
 }
 
 /// Enumeration-resistant password-recovery enqueue input. It deliberately has
-/// no caller-supplied DID; the transaction resolves the exact verified active
-/// account by canonical email. Every canonical request also records a keyed,
-/// account-free work marker so unknown and known addresses take a durable
-/// write path without retaining a plaintext address for an unknown account.
+/// no caller-supplied DID or plaintext mailbox. The request transaction stores
+/// only a keyed marker
+/// and an opaque, authenticated address envelope; a durable worker resolves
+/// the envelope after the HTTP request has completed. This keeps known and
+/// unknown addresses on the same request-time write path without retaining a
+/// plaintext address in the marker table.
 public struct AccountPasswordRecoveryDeliveryRequest: Sendable, Equatable {
     public let deliveryID: AccountEmailDeliveryID
-    public let email: AccountEmailAddress
     public let proofDigest: Data
     /// HMAC-derived canonical-address marker used only for blind recovery
     /// admission. It is not a bearer proof and is never exposed to callers.
     public let lookupDigest: Data
+    /// Authenticated envelope for the canonical address. The storage layer
+    /// treats this as opaque bytes and never attempts to decrypt it.
+    public let emailEnvelope: Data
     public let expiresAt: Date
     public let createdAt: Date
 
     public init(
         deliveryID: AccountEmailDeliveryID,
-        email: AccountEmailAddress,
         proofDigest: Data,
-        lookupDigest: Data? = nil,
+        lookupDigest: Data,
+        emailEnvelope: Data,
         expiresAt: Date,
         now: Date
     ) throws {
-        let effectiveLookupDigest = lookupDigest ?? proofDigest
-        guard (try? AccountEmailAddress(email.value)) == email,
-              proofDigest.count == 32,
-              effectiveLookupDigest.count == 32,
+        guard proofDigest.count == 32,
+              lookupDigest.count == 32,
+              (28 ... 4_096).contains(emailEnvelope.count),
               AccountControlMetadata.isControlDate(expiresAt),
               AccountControlMetadata.isControlDate(now),
               expiresAt > now else {
             throw AccountControlStoreError.invalidInput
         }
         self.deliveryID = deliveryID
-        self.email = email
         self.proofDigest = proofDigest
-        self.lookupDigest = effectiveLookupDigest
+        self.lookupDigest = lookupDigest
+        self.emailEnvelope = emailEnvelope
         self.expiresAt = expiresAt
         createdAt = now
     }
@@ -955,6 +958,51 @@ public struct AccountEmailDeliveryLease: Sendable, Equatable {
         self.expiresAt = expiresAt
         self.attempts = attempts
     }
+}
+
+/// A leased, account-free password-recovery request. The worker decrypts and
+/// authenticates `emailEnvelope` before asking storage to materialize a real
+/// account token/outbox row. Lease state is durable so a crash requeues work.
+public struct AccountPasswordRecoveryWorkLease: Sendable, Equatable {
+    public let deliveryID: AccountEmailDeliveryID
+    public let lookupDigest: Data
+    public let proofDigest: Data
+    public let emailEnvelope: Data
+    public let expiresAt: Date
+    public let createdAt: Date
+    public let attempts: Int
+
+    public init(
+        deliveryID: AccountEmailDeliveryID,
+        lookupDigest: Data,
+        proofDigest: Data,
+        emailEnvelope: Data,
+        expiresAt: Date,
+        createdAt: Date,
+        attempts: Int
+    ) throws {
+        guard lookupDigest.count == 32,
+              proofDigest.count == 32,
+              (28 ... 4_096).contains(emailEnvelope.count),
+              AccountControlMetadata.isControlDate(expiresAt),
+              AccountControlMetadata.isControlDate(createdAt),
+              expiresAt > createdAt,
+              (1 ... 64).contains(attempts) else {
+            throw AccountControlStoreError.invalidInput
+        }
+        self.deliveryID = deliveryID
+        self.lookupDigest = lookupDigest
+        self.proofDigest = proofDigest
+        self.emailEnvelope = emailEnvelope
+        self.expiresAt = expiresAt
+        self.createdAt = createdAt
+        self.attempts = attempts
+    }
+}
+
+public enum AccountPasswordRecoveryWorkMaterialization: Sendable, Equatable {
+    case enqueued
+    case discarded
 }
 
 public struct AccountEmailRetryPolicy: Sendable, Equatable {
@@ -1205,6 +1253,29 @@ public protocol AccountControlStore: Sendable {
     func enqueuePasswordRecoveryDelivery(
         _ request: AccountPasswordRecoveryDeliveryRequest
     ) async throws
+    /// Claims one account-free password-recovery request under a durable lease.
+    /// The caller must authenticate/decrypt the envelope before materializing it.
+    func claimNextPasswordRecoveryWork(
+        workerID: String,
+        now: Date,
+        leaseDuration: TimeInterval
+    ) async throws -> AccountPasswordRecoveryWorkLease?
+    /// Resolves one leased request to an account-specific token/outbox row, or
+    /// discards it when the address is unknown/inactive. The transaction does
+    /// not perform network I/O.
+    func materializePasswordRecoveryWork(
+        _ work: AccountPasswordRecoveryWorkLease,
+        email: AccountEmailAddress,
+        workerID: String,
+        now: Date
+    ) async throws -> AccountPasswordRecoveryWorkMaterialization
+    /// Deletes malformed or otherwise unprocessable leased work without
+    /// exposing its address or retrying an authenticated-invalid envelope.
+    func discardPasswordRecoveryWork(
+        _ work: AccountPasswordRecoveryWorkLease,
+        workerID: String,
+        now: Date
+    ) async throws
     /// Claims one due delivery under a bounded lease. Expired leases are
     /// reclaimable after restart; SMTP happens outside this transaction. Once
     /// `beginEmailDeliveryAttempt` succeeds, the storage implementation keeps
@@ -1323,6 +1394,28 @@ public extension AccountControlStore {
     }
     func enqueuePasswordRecoveryDelivery(
         _ request: AccountPasswordRecoveryDeliveryRequest
+    ) async throws {
+        throw AccountControlStoreError.unavailable
+    }
+    func claimNextPasswordRecoveryWork(
+        workerID: String,
+        now: Date,
+        leaseDuration: TimeInterval
+    ) async throws -> AccountPasswordRecoveryWorkLease? {
+        throw AccountControlStoreError.unavailable
+    }
+    func materializePasswordRecoveryWork(
+        _ work: AccountPasswordRecoveryWorkLease,
+        email: AccountEmailAddress,
+        workerID: String,
+        now: Date
+    ) async throws -> AccountPasswordRecoveryWorkMaterialization {
+        throw AccountControlStoreError.unavailable
+    }
+    func discardPasswordRecoveryWork(
+        _ work: AccountPasswordRecoveryWorkLease,
+        workerID: String,
+        now: Date
     ) async throws {
         throw AccountControlStoreError.unavailable
     }

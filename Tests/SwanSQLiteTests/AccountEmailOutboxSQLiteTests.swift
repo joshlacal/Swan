@@ -86,7 +86,11 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
         }
         XCTAssertEqual(
             blindColumnNames,
-            ["lookup_digest", "expires_at", "created_at"]
+            [
+                "lookup_digest", "expires_at", "created_at",
+                "delivery_id", "proof_digest", "email_envelope",
+                "lease_owner", "lease_expires_at", "attempts",
+            ]
         )
         let unknownLease = try await fixture.database.claimNextEmailDelivery(
             workerID: "worker-a",
@@ -123,6 +127,44 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
             "SELECT lookup_digest FROM account_password_recovery_work"
         )
         XCTAssertEqual(knownAndUnknownWork.count, 2)
+        let discardedWorkResult =
+            try await fixture.database.claimNextPasswordRecoveryWork(
+                workerID: "worker-a",
+                now: now.addingTimeInterval(2),
+                leaseDuration: 30
+            )
+        let discardedWork = try XCTUnwrap(
+            discardedWorkResult
+        )
+        let discardedOutcome =
+            try await fixture.database.materializePasswordRecoveryWork(
+                discardedWork,
+                email: try AccountEmailAddress("unknown@example.com"),
+                workerID: "worker-a",
+                now: now.addingTimeInterval(2)
+            )
+        XCTAssertEqual(discardedOutcome,
+            .discarded
+        )
+        let knownWorkResult =
+            try await fixture.database.claimNextPasswordRecoveryWork(
+                workerID: "worker-a",
+                now: now.addingTimeInterval(2),
+                leaseDuration: 30
+            )
+        let knownWork = try XCTUnwrap(
+            knownWorkResult
+        )
+        let knownOutcome =
+            try await fixture.database.materializePasswordRecoveryWork(
+                knownWork,
+                email: email,
+                workerID: "worker-a",
+                now: now.addingTimeInterval(2)
+            )
+        XCTAssertEqual(knownOutcome,
+            .enqueued
+        )
         let leaseResult = try await fixture.database.claimNextEmailDelivery(
             workerID: "worker-a",
             now: now.addingTimeInterval(2),
@@ -358,6 +400,91 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
             leaseDuration: 2
         )
         XCTAssertNil(expiredLease)
+    }
+
+    func testPasswordRecoveryWorkLeaseRequeuesAfterRestartBeforeMaterialization()
+        async throws
+    {
+        let fixture = try await Fixture(testCase: self)
+        addTeardownBlock {
+            try? await fixture.database.close()
+            fixture.cleanup()
+        }
+        let now = fixture.now
+        _ = try await fixture.database.createAccount(try registration())
+        try await fixture.database.associateEmail(did: did, email: email, now: now)
+
+        let verification = try deliveryRequest(
+            purpose: .verifyEmail,
+            deliveryByte: 0x31,
+            proofByte: 0x41,
+            now: now
+        )
+        _ = try await fixture.database.enqueueEmailProofDelivery(verification)
+        let confirmation = try await fixture.database.confirmEmailProof(
+            try AccountEmailConfirmationRequest(
+                did: did,
+                email: email,
+                proofDigest: verification.proofDigest
+            ),
+            now: now.addingTimeInterval(1)
+        )
+        XCTAssertEqual(confirmation,
+            .confirmed
+        )
+
+        let request = try passwordRecoveryRequest(
+            email: email,
+            deliveryByte: 0x32,
+            proofByte: 0x42,
+            now: now.addingTimeInterval(2)
+        )
+        try await fixture.database.enqueuePasswordRecoveryDelivery(request)
+        let firstResult =
+            try await fixture.database.claimNextPasswordRecoveryWork(
+                workerID: "crashed-worker",
+                now: now.addingTimeInterval(2),
+                leaseDuration: 2
+            )
+        let first = try XCTUnwrap(
+            firstResult
+        )
+        try await fixture.database.close()
+
+        let reopened = try await SQLiteControlDatabase(dataDirectory: fixture.root)
+        fixture.database = reopened
+        let heldWork = try await reopened.claimNextPasswordRecoveryWork(
+            workerID: "replacement",
+            now: now.addingTimeInterval(3),
+            leaseDuration: 2
+        )
+        XCTAssertNil(heldWork)
+        let reclaimedResult =
+            try await reopened.claimNextPasswordRecoveryWork(
+                workerID: "replacement",
+                now: now.addingTimeInterval(5),
+                leaseDuration: 2
+            )
+        let reclaimed = try XCTUnwrap(
+            reclaimedResult
+        )
+        XCTAssertEqual(reclaimed.deliveryID, first.deliveryID)
+        let materialization =
+            try await reopened.materializePasswordRecoveryWork(
+                reclaimed,
+                email: email,
+                workerID: "replacement",
+                now: now.addingTimeInterval(5)
+            )
+        XCTAssertEqual(materialization,
+            .enqueued
+        )
+        let deliveryLease = try await reopened.claimNextEmailDelivery(
+            workerID: "replacement",
+            now: now.addingTimeInterval(5),
+            leaseDuration: 30
+        )
+        XCTAssertNotNil(deliveryLease)
     }
 
     func testDeletionCannotScrubAfterEmailWorkerCrossesNetworkFence() async throws {
@@ -810,9 +937,9 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
             deliveryID: AccountEmailDeliveryID(
                 rawValue: Self.base64URL(Data(repeating: deliveryByte, count: 32))
             ),
-            email: email,
             proofDigest: Data(repeating: proofByte, count: 32),
-            lookupDigest: lookupDigest,
+            lookupDigest: lookupDigest ?? Data(repeating: proofByte, count: 32),
+            emailEnvelope: Data(repeating: 0x5a, count: 32),
             expiresAt: now.addingTimeInterval(lifetime),
             now: now
         )

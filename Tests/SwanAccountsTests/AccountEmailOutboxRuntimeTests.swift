@@ -62,6 +62,30 @@ final class AccountEmailOutboxRuntimeTests: XCTestCase {
             try AccountEmailProofKey(Data(repeating: 0x41, count: 31))
         )
         XCTAssertThrowsError(try codec.digest(proof: "not base64url!"))
+
+        let mailbox = try AccountEmailAddress("Person@Example.COM")
+        let envelope = try codec.recoveryEmailEnvelope(for: mailbox)
+        XCTAssertEqual(
+            try codec.email(
+                fromRecoveryEnvelope: envelope,
+                expectedLookupDigest: codec.lookupDigest(email: mailbox)
+            ),
+            mailbox
+        )
+        var tampered = envelope
+        tampered[tampered.startIndex] ^= 0x01
+        XCTAssertThrowsError(
+            try codec.email(
+                fromRecoveryEnvelope: tampered,
+                expectedLookupDigest: codec.lookupDigest(email: mailbox)
+            )
+        )
+        XCTAssertThrowsError(
+            try codec.email(
+                fromRecoveryEnvelope: envelope,
+                expectedLookupDigest: Data(repeating: 0, count: 32)
+            )
+        )
     }
 
     func testHashExecutorBoundsBlockingArgon2idWorkAndRejectsOverflow() async throws {

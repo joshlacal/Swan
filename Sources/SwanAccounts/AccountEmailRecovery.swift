@@ -620,6 +620,8 @@ public struct AccountEmailProofCodec: Sendable {
         Data("swan.account-email.proof-digest.v1\u{0}".utf8)
     private static let lookupDomain =
         Data("swan.account-email.lookup.v1\u{0}".utf8)
+    private static let envelopeDomain =
+        Data("swan.account-email.recovery-envelope.v1\u{0}".utf8)
     private static let rateDomain =
         Data("swan.account-email.rate-limit.v1\u{0}".utf8)
 
@@ -649,6 +651,69 @@ public struct AccountEmailProofCodec: Sendable {
     /// storing or exposing their plaintext mailbox value.
     public func lookupDigest(email: AccountEmailAddress) -> Data {
         authenticate(Self.lookupDomain + Data(email.value.utf8))
+    }
+
+    /// Seals the canonical mailbox for the asynchronous recovery queue. The
+    /// queue stores this envelope even for unknown addresses, so the HTTP
+    /// request performs the same bounded write regardless of account existence.
+    /// The lookup digest is authenticated as associated data and is checked
+    /// again when the worker opens the envelope.
+    public func recoveryEmailEnvelope(
+        for email: AccountEmailAddress
+    ) throws -> Data {
+        let lookup = lookupDigest(email: email)
+        let authenticatedData = Self.envelopeDomain + lookup
+        let sealed = try AES.GCM.seal(
+            Data(email.value.utf8),
+            using: SymmetricKey(data: key.bytes),
+            authenticating: authenticatedData
+        )
+        guard let combined = sealed.combined,
+              (28 ... 4_096).contains(combined.count) else {
+            throw AccountEmailRecoveryError.invalidProof
+        }
+        return combined
+    }
+
+    /// Opens and validates a recovery queue envelope. A tampered envelope or
+    /// a digest/address mismatch is intentionally mapped to the same opaque
+    /// invalid-proof error used for malformed bearer proofs.
+    public func email(
+        fromRecoveryEnvelope envelope: Data,
+        expectedLookupDigest: Data
+    ) throws -> AccountEmailAddress {
+        guard expectedLookupDigest.count == 32,
+              (28 ... 4_096).contains(envelope.count) else {
+            throw AccountEmailRecoveryError.invalidProof
+        }
+        let sealed: AES.GCM.SealedBox
+        do {
+            sealed = try AES.GCM.SealedBox(combined: envelope)
+        } catch {
+            throw AccountEmailRecoveryError.invalidProof
+        }
+        let opened: Data
+        do {
+            opened = try AES.GCM.open(
+                sealed,
+                using: SymmetricKey(data: key.bytes),
+                authenticating: Self.envelopeDomain + expectedLookupDigest
+            )
+        } catch {
+            throw AccountEmailRecoveryError.invalidProof
+        }
+        let address: AccountEmailAddress
+        do {
+            address = try AccountEmailAddress(
+                String(decoding: opened, as: UTF8.self)
+            )
+        } catch {
+            throw AccountEmailRecoveryError.invalidProof
+        }
+        guard lookupDigest(email: address) == expectedLookupDigest else {
+            throw AccountEmailRecoveryError.invalidProof
+        }
+        return address
     }
 
     public func rateLimitKey(
@@ -944,12 +1009,13 @@ public actor AccountEmailRecoveryService {
     ) async throws {
         let deliveryID = try proofCodec.newDeliveryID()
         let proof = proofCodec.proof(for: deliveryID)
+        let emailEnvelope = try proofCodec.recoveryEmailEnvelope(for: email)
         try await store.enqueuePasswordRecoveryDelivery(
             AccountPasswordRecoveryDeliveryRequest(
                 deliveryID: deliveryID,
-                email: email,
                 proofDigest: proofCodec.digest(proof: proof),
                 lookupDigest: proofCodec.lookupDigest(email: email),
+                emailEnvelope: emailEnvelope,
                 expiresAt: now.addingTimeInterval(tokenLifetime),
                 now: now
             )
@@ -960,6 +1026,14 @@ public actor AccountEmailRecoveryService {
         workerID: String,
         now: Date = Date()
     ) async throws -> AccountEmailDeliveryRunResult {
+        // Resolve at most one account-free request before claiming SMTP work.
+        // This keeps account lookup, token replacement, and outbox insertion
+        // outside the user-visible password-reset transaction while retaining
+        // durable restart/retry behavior.
+        try await materializeNextPasswordRecovery(
+            workerID: workerID,
+            now: now
+        )
         guard let lease = try await store.claimNextEmailDelivery(
             workerID: workerID,
             now: now,
@@ -1013,6 +1087,46 @@ public actor AccountEmailRecoveryService {
                 return .expired(lease.deliveryID)
             }
         }
+    }
+
+    private func materializeNextPasswordRecovery(
+        workerID: String,
+        now: Date
+    ) async throws {
+        guard let work = try await store.claimNextPasswordRecoveryWork(
+            workerID: workerID,
+            now: now,
+            leaseDuration: deliveryLeaseDuration
+        ) else {
+            return
+        }
+
+        let email: AccountEmailAddress
+        do {
+            email = try proofCodec.email(
+                fromRecoveryEnvelope: work.emailEnvelope,
+                expectedLookupDigest: work.lookupDigest
+            )
+        } catch {
+            // Authenticated-invalid work cannot become a bearer token. Drop
+            // only this leased row; never log or reflect its contents.
+            try? await store.discardPasswordRecoveryWork(
+                work,
+                workerID: workerID,
+                now: now
+            )
+            return
+        }
+
+        // Storage failures are deliberately not treated as bad envelopes.
+        // Let the durable lease expire and requeue the work rather than
+        // discarding a valid reset request during a transient SQLite error.
+        _ = try await store.materializePasswordRecoveryWork(
+            work,
+            email: email,
+            workerID: workerID,
+            now: now
+        )
     }
 
     private func deliverWithDeadline(
