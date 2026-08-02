@@ -2702,3 +2702,34 @@ bounded-transfer gates. It does not close stock pinned-TypeScript
 value-bearing/recovery behavior, the remaining cross-host lifecycle/fault
 matrix, strict password-reset work-shape proof, non-cooperative email
 cancellation, or the formal security launcher.
+
+## Adversarial rereview: durable notification outbox crash/restart acceptance — 2026-08-02
+
+The live notification-restart acceptance was first attempted against a fresh
+disposable Compose project. The release image build completed, but Docker
+Desktop's overlay filesystem exhausted its capacity while unpacking the image;
+the resulting Compose dependency summary said `swan-bootstrap` failed even
+though the underlying error was `no space left on device`. No normal-lab data
+volume was affected. The stale disposable Swan projects, stopped containers,
+volumes, and image tags were removed by exact `swan-*` project prefixes while
+the active `swan-alpha-current-20260801` resources were retained.
+
+After that bounded capacity recovery, the same acceptance was rerun with the
+current checkout, pinned reference cache, owner-only lab secrets, and a fresh
+isolated subnet. The disposable release image built and all required services
+became healthy. The real OAuth permissioned write committed one pending
+notification, the delivery-disabled seed process was killed, and a
+loopback-only acknowledgement-loss proxy observed the same request twice.
+The recovery-enabled Swan process then delivered exactly two successful,
+byte-identical forwards, dropped the first acknowledgement, returned the
+second, and produced exactly one receiver effect. The command exited 0 with:
+
+`NOTIFICATION RESTART OUTBOX CONVERGENCE OK: successful_forwards=2 receiver_effects=1`
+
+The disposable project was cleaned up afterward and the normal lab remained
+healthy. The runner keeps request bodies, values, credentials, and proofs in
+container tmpfs and emits no host-side permissioned payload artifact. This
+closes the live local outbox crash/restart gate; stock pinned-TypeScript
+value-bearing/recovery behavior, the broader cross-host lifecycle/fault
+matrix, strict password-reset contention, non-cooperative email cancellation,
+and the formal security launcher remain open.

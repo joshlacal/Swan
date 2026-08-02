@@ -693,3 +693,34 @@ failures. Other products reported zero matching tests, not hangs. The
 remaining operational rule is to serialize dependency resolution/builds and
 give every investigation a unique scratch path; descriptor or Docker-VM
 pressure must be diagnosed separately from the test target.
+
+## 2026-08-02 durable notification outbox crash/restart receipt
+
+The live notification-restart acceptance was first attempted against a fresh
+disposable Compose project. The release image build completed, but Docker
+Desktop's overlay filesystem exhausted its capacity while unpacking the image;
+the Compose dependency summary reported a bootstrap failure while the actual
+error was `no space left on device`. The active normal lab and its data volume
+were preserved. Exact stale Swan test projects, stopped containers, disposable
+volumes, and image tags were reclaimed before retrying.
+
+The retry used the current checkout, the pinned reference cache, owner-only lab
+secrets, and a fresh isolated subnet. It built the release image, started the
+full disposable topology, exercised a real OAuth permissioned write with
+notification delivery disabled, killed the seed process, then started the
+recovery-enabled Swan process behind a loopback acknowledgement-loss proxy.
+The proxy observed exactly two successful, byte-identical forwards: the first
+acknowledgement was dropped and the second returned. Read-only database
+assertions observed one receiver effect and an empty sender outbox. The
+command exited 0 and printed:
+
+`NOTIFICATION RESTART OUTBOX CONVERGENCE OK: successful_forwards=2 receiver_effects=1`
+
+The disposable project was removed afterward and the normal
+`swan-alpha-current-20260801` services remained healthy. The runner keeps
+request bodies, permissioned values, credentials, and proofs in container
+tmpfs and does not create a host-side payload artifact. This closes the live
+local notification crash/restart gate. It does not close stock pinned-
+TypeScript value-bearing incremental/full-CAR behavior, the broader
+cross-host lifecycle/fault matrix, strict password-reset contention,
+non-cooperative email cancellation, or the formal security scan.
