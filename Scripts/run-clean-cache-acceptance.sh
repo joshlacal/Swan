@@ -142,6 +142,7 @@ run_static_and_swift() {
     ./Scripts/verify-profile.sh
     ./Scripts/verify-interop-lab.sh
     ./Scripts/test-verify-interop-lab.sh
+    ./Scripts/test-live-interop-artifact-status.sh
     # CLI subprocess tests intentionally clear their inherited environment.
     # Always build the executable from this same isolated scratch tree and
     # pass its absolute path explicitly so a stale .build/debug/swan can

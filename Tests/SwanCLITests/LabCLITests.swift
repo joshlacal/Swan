@@ -112,6 +112,82 @@ final class LabCLITests: XCTestCase {
         }
     }
 
+    func testLabStatefulFaultMatrixValidatesAndSanitizesWitnesses() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = directory.appending(path: "witnesses.json")
+        let output = directory.appending(path: "matrix.json")
+        let before: [String: Any] = [
+            "generation": 1,
+            "revision": "222222222222a",
+            "commitment": String(repeating: "a", count: 64),
+        ]
+        let intended: [String: Any] = [
+            "generation": 1,
+            "revision": "222222222222b",
+            "commitment": String(repeating: "b", count: 64),
+        ]
+        let failureModes = Set(["offline", "disconnected", "reordered", "corrupted"])
+        let rejectingModes = Set(["duplicated", "reordered", "corrupted"])
+        let cells = [
+            "normal", "offline", "disconnected", "delayed",
+            "duplicated", "reordered", "corrupted",
+        ].map { mode -> [String: Any] in
+            [
+                "mode": mode,
+                "before": before,
+                "intended": intended,
+                "afterFault": failureModes.contains(mode) ? before : intended,
+                "afterHeal": intended,
+                "faultObserved": mode != "normal",
+                "invalidDeliveryRejected": rejectingModes.contains(mode),
+            ]
+        }
+        try JSONSerialization.data(
+            withJSONObject: ["scenario": "cli-stateful-fault", "cells": cells],
+            options: [.sortedKeys]
+        ).write(to: input, options: .atomic)
+
+        let result = try runCLI(command: [
+            "stateful-fault-matrix",
+            "--input", input.path,
+            "--output", output.path,
+        ])
+        XCTAssertEqual(result.status, 0, String(decoding: result.stderr, as: UTF8.self))
+        let artifact = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: output))
+                as? [String: Any]
+        )
+        XCTAssertEqual(artifact["status"] as? String, "passed")
+        XCTAssertEqual(artifact["kind"] as? String, "stateful-cross-host-fault-matrix")
+        XCTAssertEqual((artifact["cells"] as? [[String: Any]])?.count, 7)
+        let permissions = try FileManager.default.attributesOfItem(
+            atPath: output.path
+        )[.posixPermissions] as? NSNumber
+        XCTAssertEqual(permissions?.intValue, 0o600)
+    }
+
+    func testLabStatefulFaultMatrixFailsClosedOnInvalidWitness() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let input = directory.appending(path: "invalid.json")
+        try Data(#"{"scenario":"invalid","cells":[]}"#.utf8).write(
+            to: input,
+            options: .atomic
+        )
+        let result = try runCLI(command: [
+            "stateful-fault-matrix",
+            "--input", input.path,
+            "--output", directory.appending(path: "matrix.json").path,
+        ])
+        XCTAssertNotEqual(result.status, 0)
+        XCTAssertTrue(
+            (String(decoding: result.stdout, as: UTF8.self)
+                + String(decoding: result.stderr, as: UTF8.self))
+                .contains("stateful fault matrix did not pass")
+        )
+    }
+
     func testLabMatrixCommandWritesOneArtifactPerMode() throws {
         let outputDirectory = try temporaryDirectory().appending(path: "artifacts")
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
@@ -269,6 +345,58 @@ final class LabCLITests: XCTestCase {
             + String(decoding: result.stderr, as: UTF8.self)
         XCTAssertTrue(
             combined.contains("--receiver-did is not a canonical DID"),
+            combined
+        )
+    }
+
+    func testLabSyncPermissionedRejectsInvalidReceiverBeforeNetwork() throws {
+        let result = try runCLI(
+            command: [
+                "sync-permissioned",
+                "--receiver-did", "not-a-did",
+                "--repository", "did:plc:abcdefghijklmnopqrstuvwx",
+                "--space", "at://did:plc:abcdefghijklmnopqrstuvwx/space/app.bsky.bookmarks/sync",
+                "--data-directory", "/definitely/missing/swan-data",
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0)
+        let combined = String(decoding: result.stdout, as: UTF8.self)
+            + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertTrue(
+            combined.contains("--receiver-did is not a canonical DID"),
+            combined
+        )
+        XCTAssertFalse(combined.contains("OAuth"), combined)
+    }
+
+    func testLabSyncPermissionedRejectsZeroSequenceBeforeNetwork() throws {
+        let result = try runCLI(
+            command: [
+                "sync-permissioned",
+                "--receiver-did", "did:plc:abcdefghijklmnopqrstuvwx",
+                "--repository", "did:plc:zyxwvutsrqponmlkjihgfedc",
+                "--space", "at://did:plc:abcdefghijklmnopqrstuvwx/space/app.bsky.bookmarks/sync",
+                "--data-directory", "/definitely/missing/swan-data",
+                "--request-sequence", "0",
+            ]
+        )
+        XCTAssertNotEqual(result.status, 0)
+        let combined = String(decoding: result.stdout, as: UTF8.self)
+            + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertTrue(
+            combined.contains("--request-sequence must be positive"),
+            combined
+        )
+        XCTAssertFalse(combined.contains("OAuth"), combined)
+    }
+
+    func testLabSyncPermissionedExposesExactDuplicateReplayProofMode() throws {
+        let result = try runCLI(command: ["sync-permissioned", "--help"])
+        let combined = String(decoding: result.stdout, as: UTF8.self)
+            + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertEqual(result.status, 0, combined)
+        XCTAssertTrue(
+            combined.contains("--verify-exact-duplicate-replay"),
             combined
         )
     }
@@ -440,6 +568,19 @@ final class LabCLITests: XCTestCase {
                 throw XCTSkip("SWAN_TEST_EXECUTABLE is not executable")
             }
             return executable
+        }
+        // SwiftPM may place a scratch build under an arbitrary directory while
+        // an older default `.build` product is still present.  Resolve the
+        // product built beside this test bundle before considering that legacy
+        // fallback so the suite cannot silently exercise stale CLI code.
+        let coBuiltExecutable = Bundle(for: LabCLITests.self)
+            .bundleURL
+            .deletingLastPathComponent()
+            .appending(path: "swan")
+        if FileManager.default.isExecutableFile(
+            atPath: coBuiltExecutable.path
+        ) {
+            return coBuiltExecutable
         }
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

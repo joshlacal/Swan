@@ -85,6 +85,24 @@ public struct PublicRepositoryLimits: Sendable, Equatable {
     public static let maximumPermittedMSTNodes = 500_000
     public static let maximumPermittedMSTEntriesPerNode = 4_096
     public static let maximumPermittedCBORNestingDepth = 64
+
+    /// A conservative encoded ceiling for one canonical repository MST node.
+    /// Each entry can carry at most one complete 1,024-byte key suffix plus
+    /// two fixed-width CID links and canonical map/integer framing. The small
+    /// node allowance covers the outer map, entry array, and left-tree link.
+    public static let maximumCanonicalMSTBlockBytes =
+        64 + maximumPermittedMSTEntriesPerNode
+            * (PublicRepositoryPath.maximumMSTKeyBytes + 128)
+
+    /// No authenticated repository block can legitimately exceed this value:
+    /// records have their own smaller limit, locally/imported relevant blocks
+    /// obey the pinned aggregate budget, and canonical MST nodes obey the
+    /// structural bound above. SQLite uses this before materializing a BLOB.
+    public static let maximumPersistedBlockBytes = max(
+        maximumPermittedRecordBlockBytes,
+        pinnedMaximumRelevantBlockBytes,
+        maximumCanonicalMSTBlockBytes
+    )
 }
 
 public enum PublicRepositoryLimitError: Error, Sendable, Equatable {

@@ -49,13 +49,34 @@ public struct SwanManagementHTTPConfiguration: Sendable, Equatable {
 public struct SwanManagementRequestContext: RequestContext, RemoteAddressRequestContext {
     public var coreContext: CoreRequestContextStorage
     public let remoteAddress: SocketAddress?
+    private let requestChannel: any Channel
+    private let bodyTerminationState: SwanJSONWriteBodyTerminationState
 
     public init(source: ApplicationRequestContextSource) {
         coreContext = .init(source: source)
         remoteAddress = source.channel.remoteAddress
+        requestChannel = source.channel
+        bodyTerminationState = SwanJSONWriteBodyTerminationState()
     }
 
     public var maxUploadSize: Int { SwanManagementHTTPServer.maximumJSONBytes }
+
+    var requestBodyTermination: SwanJSONWriteBodyTerminationHandle {
+        SwanJSONWriteBodyTerminationHandle({
+            bodyTerminationState.markTerminated()
+            requestChannel.pipeline.context(handlerType: SwanJSONWriteBodyDrainHandler.self)
+                .whenComplete { result in
+                    switch result {
+                    case .success:
+                        requestChannel.pipeline.fireUserInboundEventTriggered(
+                            SwanJSONWriteBodyDrainEvent()
+                        )
+                    case .failure:
+                        requestChannel.close(mode: .input, promise: nil)
+                    }
+                }
+        }, state: { bodyTerminationState.value })
+    }
 }
 
 /// Defense-in-depth peer verification for an already loopback-bound listener.
@@ -80,6 +101,7 @@ public struct SwanManagementHTTPServer: Sendable {
     private let accounts: AccountOperatorService
     private let operatorSecretVerifier: OperatorSecretVerifier
     private let plcProvisioning: (any SwanManagementPLCProvisioning)?
+    private let requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 
     public init(
         configuration: SwanManagementHTTPConfiguration,
@@ -87,7 +109,9 @@ public struct SwanManagementHTTPServer: Sendable {
         operatorSecretVerifier: OperatorSecretVerifier,
         plcProvisioning: (any SwanManagementPLCProvisioning)? = nil,
         permanentDeletionCoordinator:
-            (any AccountPermanentDeletionCoordinating)? = nil
+            (any AccountPermanentDeletionCoordinating)? = nil,
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .managementProcessShared,
+        jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy = .productionDefault
     ) {
         self.configuration = configuration
         accounts = AccountOperatorService(
@@ -97,6 +121,10 @@ public struct SwanManagementHTTPServer: Sendable {
         )
         self.operatorSecretVerifier = operatorSecretVerifier
         self.plcProvisioning = plcProvisioning
+        requestBodyAdmission = .init(
+            admission: jsonWriteAdmission,
+            policy: jsonWriteBodyPolicy
+        )
     }
 
     /// The management router has its own request context and is never merged
@@ -106,6 +134,7 @@ public struct SwanManagementHTTPServer: Sendable {
         let accounts = accounts
         let verifier = operatorSecretVerifier
         let plcProvisioning = plcProvisioning
+        let requestBodyAdmission = requestBodyAdmission
 
         router.get("/v1/accounts") { request, context async -> Response in
             guard authorize(request: request, context: context, verifier: verifier) != nil else {
@@ -121,10 +150,16 @@ public struct SwanManagementHTTPServer: Sendable {
 
         router.post("/v1/accounts/deactivate") { request, context async -> Response in
             guard let authorization = authorize(request: request, context: context, verifier: verifier) else {
+                if let failure = await drainManagementRejectedBody(
+                    request, context: context,
+                    requestBodyAdmission: requestBodyAdmission
+                ) { return failure }
                 return managementError(.unauthorized)
             }
             do {
-                let input: ManagementDIDRequest = try await decodeManagementJSON(from: request)
+                let input: ManagementDIDRequest = try await decodeManagementJSON(
+                    from: request, context: context,
+                    requestBodyAdmission: requestBodyAdmission)
                 let view = try await accounts.deactivate(did: input.did, authorization: authorization)
                 return managementJSON(.ok, view)
             } catch {
@@ -134,10 +169,16 @@ public struct SwanManagementHTTPServer: Sendable {
 
         router.post("/v1/accounts/reactivate") { request, context async -> Response in
             guard let authorization = authorize(request: request, context: context, verifier: verifier) else {
+                if let failure = await drainManagementRejectedBody(
+                    request, context: context,
+                    requestBodyAdmission: requestBodyAdmission
+                ) { return failure }
                 return managementError(.unauthorized)
             }
             do {
-                let input: ManagementDIDRequest = try await decodeManagementJSON(from: request)
+                let input: ManagementDIDRequest = try await decodeManagementJSON(
+                    from: request, context: context,
+                    requestBodyAdmission: requestBodyAdmission)
                 let view = try await accounts.reactivate(did: input.did, authorization: authorization)
                 return managementJSON(.ok, view)
             } catch {
@@ -147,10 +188,16 @@ public struct SwanManagementHTTPServer: Sendable {
 
         router.post("/v1/accounts/delete") { request, context async -> Response in
             guard let authorization = authorize(request: request, context: context, verifier: verifier) else {
+                if let failure = await drainManagementRejectedBody(
+                    request, context: context,
+                    requestBodyAdmission: requestBodyAdmission
+                ) { return failure }
                 return managementError(.unauthorized)
             }
             do {
-                let input: ManagementDeleteRequest = try await decodeManagementJSON(from: request)
+                let input: ManagementDeleteRequest = try await decodeManagementJSON(
+                    from: request, context: context,
+                    requestBodyAdmission: requestBodyAdmission)
                 let view = try await accounts.delete(
                     did: input.did,
                     tombstoneReason: input.tombstoneReason,
@@ -166,11 +213,17 @@ public struct SwanManagementHTTPServer: Sendable {
         if let plcProvisioning {
             router.post("/v1/accounts/plc/prepare") { request, context async -> Response in
                 guard authorize(request: request, context: context, verifier: verifier) != nil else {
+                    if let failure = await drainManagementRejectedBody(
+                        request, context: context,
+                        requestBodyAdmission: requestBodyAdmission
+                    ) { return failure }
                     return managementError(.unauthorized)
                 }
                 do {
                     let requestBody: ManagementPLCPrepareRequest =
-                        try await decodeManagementJSON(from: request)
+                        try await decodeManagementJSON(
+                            from: request, context: context,
+                            requestBodyAdmission: requestBodyAdmission)
                     let input = try requestBody.validatedInput()
                     let result = try await plcProvisioning.prepare(input)
                     return managementJSON(.ok, result)
@@ -181,11 +234,17 @@ public struct SwanManagementHTTPServer: Sendable {
 
             router.post("/v1/accounts/plc/activate") { request, context async -> Response in
                 guard authorize(request: request, context: context, verifier: verifier) != nil else {
+                    if let failure = await drainManagementRejectedBody(
+                        request, context: context,
+                        requestBodyAdmission: requestBodyAdmission
+                    ) { return failure }
                     return managementError(.unauthorized)
                 }
                     do {
                         let requestBody: ManagementPLCActivateRequest =
-                            try await decodeManagementJSON(from: request)
+                            try await decodeManagementJSON(
+                                from: request, context: context,
+                                requestBodyAdmission: requestBodyAdmission)
                         let input = try requestBody.validatedInput()
                         let result = try await plcProvisioning.activate(input)
                         return managementJSON(.ok, result)
@@ -215,6 +274,13 @@ public struct SwanManagementHTTPServer: Sendable {
     public func buildApplication(logger: Logger) -> some ApplicationProtocol {
         Application(
             router: buildRouter(),
+            server: .http1(
+                configuration: .init(
+                    additionalChannelHandlers: [SwanJSONWriteBodyDrainHandler(
+                        timeout: requestBodyAdmission.policy.totalBodyTimeout + .milliseconds(50)
+                    )]
+                )
+            ),
             configuration: .init(
                 address: .hostname(configuration.bindAddress.rawValue, port: configuration.port),
                 serverName: "swan-management"
@@ -515,27 +581,34 @@ private func accountLookup(from request: Request) throws -> AccountOperatorLooku
     }
 }
 
-private func decodeManagementJSON<Value: Decodable>(from request: Request) async throws -> Value {
-    guard let contentType = request.headers[.contentType],
-          contentType.split(separator: ";", maxSplits: 1).first?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "application/json" else {
-        throw ManagementRequestError.malformed
-    }
-    let contentLengths = request.headers[values: .contentLength]
-    guard contentLengths.count <= 1 else { throw ManagementRequestError.malformed }
-    if let declaredLength = contentLengths.first {
-        guard let value = Int(declaredLength), value >= 0 else { throw ManagementRequestError.malformed }
-        guard value <= SwanManagementHTTPServer.maximumJSONBytes else {
-            throw ManagementRequestError.payloadTooLarge
-        }
-    }
-    let buffer: ByteBuffer
+private func decodeManagementJSON<Value: Decodable>(
+    from request: Request,
+    context: SwanManagementRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> Value {
+    let buffer: SwanAdmittedRequestBody
     do {
-        buffer = try await request.body.collect(upTo: SwanManagementHTTPServer.maximumJSONBytes)
-    } catch is NIOTooManyBytesError {
-        throw ManagementRequestError.payloadTooLarge
+        buffer = try await collectAdmittedRequestBody(
+            request,
+            mediaType: .json,
+            admission: requestBodyAdmission.admission,
+            policy: requestBodyAdmission.policy,
+            maximumBytes: SwanManagementHTTPServer.maximumJSONBytes,
+            termination: context.requestBodyTermination
+        )
+    } catch let failure as SwanRequestBodyCollectionFailure {
+        switch failure {
+        case .invalidRequest:
+            throw ManagementRequestError.malformed
+        case .payloadTooLarge:
+            throw ManagementRequestError.payloadTooLarge
+        case .unavailable:
+            throw SwanError.unavailable("request body unavailable")
+        }
     } catch {
         throw ManagementRequestError.malformed
     }
+    defer { withExtendedLifetime(buffer) {} }
     guard buffer.readableBytes > 0,
           let bytes = buffer.getBytes(at: buffer.readerIndex, length: buffer.readableBytes) else {
         throw ManagementRequestError.malformed
@@ -546,6 +619,24 @@ private func decodeManagementJSON<Value: Decodable>(from request: Request) async
         throw error
     } catch {
         throw ManagementRequestError.malformed
+    }
+}
+
+private func drainManagementRejectedBody(
+    _ request: Request,
+    context: SwanManagementRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async -> Response? {
+    do {
+        try await drainRejectedRequestBody(
+            request,
+            admission: requestBodyAdmission.admission,
+            policy: requestBodyAdmission.policy,
+            termination: context.requestBodyTermination
+        )
+        return nil
+    } catch {
+        return managementError(.serviceUnavailable)
     }
 }
 

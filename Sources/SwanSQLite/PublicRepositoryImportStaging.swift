@@ -1108,19 +1108,14 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
         guard requiredData(row, "integrity_digest") == expectedIntegrity else {
             throw PublicRepositoryImportStagingError.corruptStaging
         }
-        let commitRows = try await connection.query(
-            "SELECT bytes FROM public_repository_blocks WHERE cid = ?",
-            [.text(commitCID.string)]
+        let commitRead = try await boundedPublicRepositoryBlock(
+            connection: connection, cid: commitCID
         )
-        let dataRows = try await connection.query(
-            "SELECT bytes FROM public_repository_blocks WHERE cid = ?",
-            [.text(dataCID.string)]
+        let dataRead = try await boundedPublicRepositoryBlock(
+            connection: connection, cid: dataCID
         )
-        guard commitRows.count == 1, dataRows.count == 1,
-              let commitValue = commitRows.first?.column("bytes"),
-              let commitBytes = Data(sqliteData: commitValue),
-              let dataValue = dataRows.first?.column("bytes"),
-              let dataBytes = Data(sqliteData: dataValue) else {
+        guard case let .bytes(commitBytes) = commitRead,
+              case let .bytes(dataBytes) = dataRead else {
             throw PublicRepositoryImportStagingError.corruptRepository
         }
         do {

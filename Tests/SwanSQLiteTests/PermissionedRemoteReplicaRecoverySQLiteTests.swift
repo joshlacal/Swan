@@ -84,7 +84,8 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
         database: database,
         archive: initial,
         expectedBase: nil,
-        requestID: "authenticated-bootstrap"
+        requestID: "authenticated-bootstrap",
+        publicationAuthorization: fixture.publicationAuthorization
       )
       XCTAssertEqual(installedInitial.result.head.generation, 1)
       let initialRead = try await database.permissionedRemoteReplicaRecord(
@@ -104,7 +105,8 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
         database: database,
         archive: replacement,
         expectedBase: installedInitial.result.head,
-        requestID: "authenticated-replacement"
+        requestID: "authenticated-replacement",
+        publicationAuthorization: fixture.publicationAuthorization
       )
       XCTAssertEqual(installedReplacement.result.head.generation, 2)
       try await assertRemoteReplicaGenerationRows(
@@ -162,6 +164,153 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
     }
   }
 
+  func testDeactivatedControlAccountRejectsDirectSQLitePublication()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(
+      name: "deactivated-publication"
+    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let control = try await SQLiteControlDatabase(
+      dataDirectory: fixture.root
+    )
+    defer { Task { try? await control.close() } }
+    _ = try await control.createAccount(
+      AccountControlRegistration(
+        did: fixture.receiverDID,
+        canonicalHandle: "remote-replica-receiver.example.com",
+        passwordVerifier:
+          "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+        signingKey: .init(purpose: .signing, generation: 1),
+        rotationKey: .init(purpose: .rotation, generation: 1),
+        createdAt: Date(timeIntervalSince1970: 100)
+      )
+    )
+    let database = try await fixture.open()
+    defer { Task { try? await database.close() } }
+    let archive = try fixture.archive(
+      revision: "222222222222a",
+      values: ["must remain unpublished"],
+      ikmByte: 0x1a
+    )
+    let staged = try await fixture.stage(
+      database: database,
+      archive: archive,
+      expectedBase: nil,
+      requestID: "deactivated-direct-sqlite",
+      freshnessWitness: fixture.witness(for: archive)
+    )
+    try await database.markPermissionedRemoteReplicaImportVerified(
+      sessionID: staged.session.id,
+      verification: staged.verification,
+      now: RemoteReplicaSQLiteFixture.operationNow
+    )
+    _ = try await control.transitionStatus(
+      did: fixture.receiverDID,
+      to: .deactivated,
+      declaration: .init(),
+      now: Date(timeIntervalSince1970: 102)
+    )
+
+    do {
+      _ = try await database
+        .publishVerifiedPermissionedRemoteReplicaRecovery(
+          sessionID: staged.session.id,
+          consumedAt: RemoteReplicaSQLiteFixture.operationNow + 1,
+          now: RemoteReplicaSQLiteFixture.operationNow,
+          publicationAuthorization: { operation in
+            try await control.withActiveAccountAuthorization(
+              did: fixture.receiverDID,
+              operation: operation
+            )
+          }
+        )
+      XCTFail("deactivated account must not publish a remote replica")
+    } catch let error as AccountControlStoreError {
+      XCTAssertEqual(error, .invalidTransition)
+    }
+
+    let head = try await database.permissionedRemoteReplicaHead(
+      target: fixture.target
+    )
+    XCTAssertNil(head)
+    try await assertNoRemoteReplicaLiveRows(
+      in: database,
+      target: fixture.target
+    )
+  }
+
+  func testFinalHeadSwapRemainsInsideActiveAccountAuthorization()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(
+      name: "active-publication-enclosure"
+    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let control = try await SQLiteControlDatabase(
+      dataDirectory: fixture.root
+    )
+    defer { Task { try? await control.close() } }
+    _ = try await control.createAccount(
+      AccountControlRegistration(
+        did: fixture.receiverDID,
+        canonicalHandle: "remote-replica-receiver.example.com",
+        passwordVerifier:
+          "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+        signingKey: .init(purpose: .signing, generation: 1),
+        rotationKey: .init(purpose: .rotation, generation: 1),
+        createdAt: Date(timeIntervalSince1970: 100)
+      )
+    )
+    let database = try await fixture.open()
+    defer { Task { try? await database.close() } }
+    let archive = try fixture.archive(
+      revision: "222222222222a",
+      values: ["publication remains fenced"],
+      ikmByte: 0x1b
+    )
+    let staged = try await fixture.stage(
+      database: database,
+      archive: archive,
+      expectedBase: nil,
+      requestID: "active-publication-enclosure",
+      freshnessWitness: fixture.witness(for: archive)
+    )
+    try await database.markPermissionedRemoteReplicaImportVerified(
+      sessionID: staged.session.id,
+      verification: staged.verification,
+      now: RemoteReplicaSQLiteFixture.operationNow
+    )
+    let publicationFence = RemoteReplicaPublicationFence()
+    await database.installTestingHooks(SQLiteTestingHooks(
+      afterRemoteReplicaMutatingSQL: { index in
+        if index == 4 {
+          try await publicationFence.requireOperationActive()
+        }
+      }
+    ))
+
+    let result = try await database
+      .publishVerifiedPermissionedRemoteReplicaRecovery(
+        sessionID: staged.session.id,
+        consumedAt: RemoteReplicaSQLiteFixture.operationNow + 1,
+        now: RemoteReplicaSQLiteFixture.operationNow,
+        publicationAuthorization: { operation in
+          try await control.withActiveAccountAuthorization(
+            did: fixture.receiverDID
+          ) {
+            try await publicationFence.authorize(operation)
+          }
+        }
+      )
+
+    XCTAssertEqual(result.head.wireRevision, archive.wireRevision)
+    let authorizationAttempted = await publicationFence.authorizationAttempted
+    let operationActive = await publicationFence.operationActive
+    XCTAssertTrue(authorizationAttempted)
+    XCTAssertFalse(operationActive)
+  }
+
   func testWrongFreshnessAndTamperedStagingLeaveLastGoodReplicaUnchanged()
     async throws
   {
@@ -180,7 +329,8 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
         database: database,
         archive: initial,
         expectedBase: nil,
-        requestID: "last-good"
+        requestID: "last-good",
+        publicationAuthorization: fixture.publicationAuthorization
       )
       let replacement = try fixture.archive(
         revision: "222222222222b",
@@ -264,7 +414,8 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
           .publishVerifiedPermissionedRemoteReplicaRecovery(
             sessionID: tampered.session.id,
             consumedAt: RemoteReplicaSQLiteFixture.operationNow + 1,
-            now: RemoteReplicaSQLiteFixture.operationNow
+            now: RemoteReplicaSQLiteFixture.operationNow,
+            publicationAuthorization: fixture.publicationAuthorization
           )
       }
       let verifiedAfterTamper =
@@ -332,7 +483,8 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
         database: database,
         archive: initial,
         expectedBase: nil,
-        requestID: "installed-before-corruption"
+        requestID: "installed-before-corruption",
+        publicationAuthorization: fixture.publicationAuthorization
       )
       let installedRecord = try XCTUnwrap(initial.records.first)
       let corrupted = try await database.connection.query(
@@ -375,7 +527,8 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
         try await database.publishVerifiedPermissionedRemoteReplicaRecovery(
           sessionID: staged.session.id,
           consumedAt: RemoteReplicaSQLiteFixture.operationNow + 1,
-          now: RemoteReplicaSQLiteFixture.operationNow
+          now: RemoteReplicaSQLiteFixture.operationNow,
+          publicationAuthorization: fixture.publicationAuthorization
         )
       }
 
@@ -425,7 +578,8 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
         database: database,
         archive: initial,
         expectedBase: nil,
-        requestID: "same-tid-base"
+        requestID: "same-tid-base",
+        publicationAuthorization: fixture.publicationAuthorization
       )
       let equivalent = try fixture.archive(
         revision: "222222222222a",
@@ -441,7 +595,7 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
         requestID: "same-tid-equivalent",
         publicationAuthorization: { operation in
           await publicationCounter.increment()
-          return try await operation()
+          return try await fixture.publicationAuthorization(operation)
         }
       )
       XCTAssertEqual(idempotent.result.head, installed.result.head)
@@ -523,7 +677,8 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
         try await database.publishVerifiedPermissionedRemoteReplicaRecovery(
           sessionID: equivocation.session.id,
           consumedAt: RemoteReplicaSQLiteFixture.operationNow + 1,
-          now: RemoteReplicaSQLiteFixture.operationNow
+          now: RemoteReplicaSQLiteFixture.operationNow,
+          publicationAuthorization: fixture.publicationAuthorization
         )
       }
       let headAfterEquivocation =
@@ -557,6 +712,221 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
       try? await database.close()
       throw error
     }
+  }
+
+  func testCommittedReplayRejectsChangedLogicalRestoreLimitAfterRestart()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "logical-limit-replay")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    let archive = try fixture.archive(
+      revision: "222222222222a", values: ["logical limit"], ikmByte: 0x44
+    )
+    let installed = try await fixture.install(
+      database: database, archive: archive, expectedBase: nil,
+      requestID: "logical-limit-replay",
+      publicationAuthorization: fixture.publicationAuthorization
+    )
+    try await database.close()
+
+    let reopened = try await fixture.open()
+    defer { Task { try? await reopened.close() } }
+    let original = installed.binding
+    let stricterLimits = try SpaceCARRecoveryLimits(
+      maximumCARBytes: original.limits.maximumCARBytes,
+      maximumRecordBytes: original.limits.maximumRecordBytes,
+      maximumIndexEntries: original.limits.maximumIndexEntries,
+      maximumUniqueBlocks: original.limits.maximumUniqueBlocks,
+      maximumLogicalRestoredBytes:
+        original.limits.maximumLogicalRestoredBytes - 1
+    )
+    let source = try PermissionedRemoteReplicaSourceIdentity(
+      persistedOrigin: original.sourceOrigin,
+      repositoryDID: original.target.repositoryDID,
+      verifierIdentity: original.verifierIdentity
+    )
+    let changed = try PermissionedRemoteReplicaImportBinding(
+      requestID: original.requestID,
+      requestDigest: original.requestDigest,
+      source: source,
+      target: original.target,
+      expectedBase: original.expectedBase,
+      freshnessWitness: original.freshnessWitness,
+      profileID: original.profileID,
+      limits: stricterLimits
+    )
+    let beforeHead = try await reopened.permissionedRemoteReplicaHead(
+      target: fixture.target
+    )
+    await assertRemoteReplicaError(.conflictingRequestReuse) {
+      try await reopened.createPermissionedRemoteReplicaImportSession(
+        binding: changed,
+        createdAt: RemoteReplicaSQLiteFixture.createdAt,
+        expiresAt: RemoteReplicaSQLiteFixture.expiresAt,
+        now: RemoteReplicaSQLiteFixture.operationNow
+      )
+    }
+    let afterHead = try await reopened.permissionedRemoteReplicaHead(
+      target: fixture.target
+    )
+    let resultCount = try await reopened.connection.query(
+      "SELECT COUNT(*) AS count FROM permissioned_remote_replica_import_results"
+    ).first?.column("count")?.integer
+    XCTAssertEqual(afterHead, beforeHead)
+    XCTAssertEqual(resultCount, 1)
+  }
+
+  func testImportSessionRestoresLogicalByteLimitAfterRestart() async throws {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "logical-limit-session")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    let base = try fixture.archive(
+      revision: "222222222222a", values: ["session limit"], ikmByte: 0x45
+    )
+    let logicalLimit = base.car.count + 17
+    let archive = RemoteReplicaArchive(
+      wireRevision: base.wireRevision,
+      commitment: base.commitment,
+      commitRootCID: base.commitRootCID,
+      car: base.car,
+      records: base.records,
+      limits: try SpaceCARRecoveryLimits(
+        maximumCARBytes: base.limits.maximumCARBytes,
+        maximumRecordBytes: base.limits.maximumRecordBytes,
+        maximumIndexEntries: base.limits.maximumIndexEntries,
+        maximumUniqueBlocks: base.limits.maximumUniqueBlocks,
+        maximumLogicalRestoredBytes: logicalLimit
+      )
+    )
+    let binding = try fixture.binding(
+      archive: archive, expectedBase: nil,
+      requestID: "logical-limit-session",
+      freshnessWitness: fixture.witness(for: archive)
+    )
+    let now = Int64(Date().timeIntervalSince1970)
+    let outcome = try await database.createPermissionedRemoteReplicaImportSession(
+      binding: binding, createdAt: now, expiresAt: now + 3_600, now: now
+    )
+    guard case let .staged(started) = outcome else {
+      throw RemoteReplicaSQLiteTestError.unexpectedStartOutcome
+    }
+    try await database.close()
+
+    let reopened = try await fixture.open()
+    defer { Task { try? await reopened.close() } }
+    let restored = try await reopened.permissionedRemoteReplicaImportSession(
+      id: started.id
+    )
+    XCTAssertEqual(
+      restored.binding.limits.maximumLogicalRestoredBytes,
+      logicalLimit
+    )
+    XCTAssertEqual(restored.binding, binding)
+  }
+
+  func testTamperedCommittedLogicalLimitFailsClosedAfterRestart() async throws {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "logical-limit-tamper")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    let archive = try fixture.archive(
+      revision: "222222222222a", values: ["tamper limit"], ikmByte: 0x46
+    )
+    let installed = try await fixture.install(
+      database: database, archive: archive, expectedBase: nil,
+      requestID: "logical-limit-tamper",
+      publicationAuthorization: fixture.publicationAuthorization
+    )
+    _ = try await database.connection.query(
+      """
+      UPDATE permissioned_remote_replica_import_results
+      SET maximum_logical_restored_bytes = ?
+      WHERE request_id = ?
+      """,
+      [
+        .integer(
+          installed.binding.limits.maximumLogicalRestoredBytes - 1
+        ),
+        .text(installed.binding.requestID),
+      ]
+    )
+    try await database.close()
+
+    let reopened = try await fixture.open()
+    defer { Task { try? await reopened.close() } }
+    let beforeHead = try await reopened.permissionedRemoteReplicaHead(
+      target: fixture.target
+    )
+    await assertRemoteReplicaError(.conflictingRequestReuse) {
+      try await reopened.createPermissionedRemoteReplicaImportSession(
+        binding: installed.binding,
+        createdAt: RemoteReplicaSQLiteFixture.createdAt,
+        expiresAt: RemoteReplicaSQLiteFixture.expiresAt,
+        now: RemoteReplicaSQLiteFixture.operationNow
+      )
+    }
+    let afterHead = try await reopened.permissionedRemoteReplicaHead(
+      target: fixture.target
+    )
+    XCTAssertEqual(afterHead, beforeHead)
+  }
+
+  func testLogicalLimitMigrationRejectsNonemptyLegacyResults() async throws {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "logical-limit-legacy-full")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    let archive = try fixture.archive(
+      revision: "222222222222a", values: ["legacy result"], ikmByte: 0x47
+    )
+    _ = try await fixture.install(
+      database: database, archive: archive, expectedBase: nil,
+      requestID: "logical-limit-legacy-full",
+      publicationAuthorization: fixture.publicationAuthorization
+    )
+    try await removeLogicalLimitColumnsForMigrationTest(database: database)
+    try await database.close()
+
+    do {
+      let unexpectedlyOpened = try await fixture.open()
+      try await unexpectedlyOpened.close()
+      XCTFail("nonempty legacy logical-limit rows were accepted")
+    } catch let SQLiteRepositoryError.corruptDatabase(message) {
+      XCTAssertTrue(message.contains("logical-limit bindings"))
+    }
+  }
+
+  func testLogicalLimitMigrationUpgradesEmptyLegacyTables() async throws {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "logical-limit-legacy-empty")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    _ = try await database.connection.query(
+      "INSERT INTO public_records(uri, value, revision) VALUES (?, ?, ?)",
+      [
+        .text("at://did:plc:unrelated/app.test.record/logical-limit"),
+        .blob(.init(bytes: [0xa0])), .integer(9),
+      ]
+    )
+    try await removeLogicalLimitColumnsForMigrationTest(database: database)
+    try await database.close()
+
+    let reopened = try await fixture.open()
+    defer { Task { try? await reopened.close() } }
+    for table in [
+      "permissioned_remote_replica_import_sessions",
+      "permissioned_remote_replica_import_results",
+    ] {
+      let columns = try await reopened.connection.query(
+        "PRAGMA table_info(\(table))"
+      )
+      XCTAssertTrue(columns.contains {
+        $0.column("name")?.string == "maximum_logical_restored_bytes"
+      })
+    }
+    let unrelated = try await reopened.connection.query(
+      "SELECT revision FROM public_records WHERE uri = ?",
+      [.text("at://did:plc:unrelated/app.test.record/logical-limit")]
+    )
+    XCTAssertEqual(unrelated.first?.column("revision")?.integer, 9)
   }
 
   func testEveryPublishFailpointReopensAndCleansCrashResidue()
@@ -597,7 +967,8 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
           .publishVerifiedPermissionedRemoteReplicaRecovery(
             sessionID: staged.session.id,
             consumedAt: RemoteReplicaSQLiteFixture.operationNow + 1,
-            now: RemoteReplicaSQLiteFixture.operationNow
+            now: RemoteReplicaSQLiteFixture.operationNow,
+            publicationAuthorization: fixture.publicationAuthorization
           )
         XCTFail("publish failpoint \(failpoint) did not fire")
       } catch {
@@ -645,7 +1016,8 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
           database: reopened,
           archive: archive,
           expectedBase: nil,
-          requestID: "retry-after-failpoint-\(failpoint)"
+          requestID: "retry-after-failpoint-\(failpoint)",
+          publicationAuthorization: fixture.publicationAuthorization
         )
         XCTAssertEqual(retry.result.head.generation, 1)
         try await assertNoRemoteReplicaStaging(in: reopened)
@@ -674,7 +1046,8 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
       database: database,
       archive: initial,
       expectedBase: nil,
-      requestID: "preparing-crash-base"
+      requestID: "preparing-crash-base",
+      publicationAuthorization: fixture.publicationAuthorization
     )
     let replacement = try fixture.archive(
       revision: "222222222222b",
@@ -813,7 +1186,8 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
         .publishVerifiedPermissionedRemoteReplicaRecovery(
           sessionID: firstStaged.session.id,
           consumedAt: RemoteReplicaSQLiteFixture.operationNow + 1,
-          now: RemoteReplicaSQLiteFixture.operationNow
+          now: RemoteReplicaSQLiteFixture.operationNow,
+          publicationAuthorization: fixture.publicationAuthorization
         )
       XCTAssertEqual(firstResult.head.generation, 1)
       let firstCounts = await firstProbe.snapshot()
@@ -849,7 +1223,8 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
         .publishVerifiedPermissionedRemoteReplicaRecovery(
           sessionID: secondStaged.session.id,
           consumedAt: RemoteReplicaSQLiteFixture.operationNow + 2,
-          now: RemoteReplicaSQLiteFixture.operationNow
+          now: RemoteReplicaSQLiteFixture.operationNow,
+          publicationAuthorization: fixture.publicationAuthorization
         )
       XCTAssertEqual(secondResult.head.generation, 2)
       let secondCounts = await secondProbe.snapshot()
@@ -889,6 +1264,1244 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
       throw error
     }
   }
+
+  func testVerifiedIncrementalBatchAppliesCreateUpdateDeleteDurably()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "incremental-crud")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    do {
+      let initial = try fixture.archive(
+        revision: "222222222222a",
+        values: ["update me", "delete me"],
+        ikmByte: 0x71
+      )
+      let installed = try await fixture.install(
+        database: database,
+        archive: initial,
+        expectedBase: nil,
+        requestID: "incremental-crud-bootstrap",
+        publicationAuthorization: fixture.publicationAuthorization
+      )
+      let base = installed.result.head
+      let revision = try TID(tidString: "222222222222b")
+      let updatedValue = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+        (key: "text", value: "updated"),
+      ]))
+      let createdValue = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+        (key: "text", value: "created"),
+      ]))
+      let updatedCID = CID.fromDAGCBOR(updatedValue)
+      let createdCID = CID.fromDAGCBOR(createdValue)
+      let createdURI = try SpaceRecordURI(
+        space: fixture.space, author: fixture.repositoryDID,
+        collection: initial.records[0].collection, rkey: "created"
+      )
+      let updatedURI = try SpaceRecordURI(
+        space: fixture.space, author: fixture.repositoryDID,
+        collection: initial.records[0].collection,
+        rkey: initial.records[0].rkey
+      )
+      let deletedURI = try SpaceRecordURI(
+        space: fixture.space, author: fixture.repositoryDID,
+        collection: initial.records[1].collection,
+        rkey: initial.records[1].rkey
+      )
+      var terminalHash = try LtHash(serialized: base.ltHash)
+      terminalHash.add(element: "\(createdURI.collection)/\(createdURI.rkey)/\(createdCID.string)")
+      terminalHash.remove(element: "\(updatedURI.collection)/\(updatedURI.rkey)/\(initial.records[0].cid.string)")
+      terminalHash.add(element: "\(updatedURI.collection)/\(updatedURI.rkey)/\(updatedCID.string)")
+      terminalHash.remove(element: "\(deletedURI.collection)/\(deletedURI.rkey)/\(initial.records[1].cid.string)")
+      let operations: [VerifiedPermissionedRemoteReplicaOperation] = [
+          .init(
+            operationIndex: 0, wireRevision: revision,
+            action: .create, uri: createdURI,
+            cid: createdCID, previousCID: nil, value: createdValue
+          ),
+          .init(
+            operationIndex: 1, wireRevision: revision,
+            action: .update, uri: updatedURI,
+            cid: updatedCID, previousCID: initial.records[0].cid,
+            value: updatedValue
+          ),
+          .init(
+            operationIndex: 2, wireRevision: revision,
+            action: .delete, uri: deletedURI,
+            cid: nil, previousCID: initial.records[1].cid, value: nil
+          ),
+        ]
+      let terminal = try PermissionedRemoteReplicaIncrementalTerminalHead(
+        wireRevision: revision,
+        ltHash: terminalHash.serialized,
+        commitment: terminalHash.commitment,
+        recordCount: 2,
+        operationCount: operations.count,
+        operationDigest:
+          PermissionedRemoteReplicaIncrementalOperationWitness
+            .digest(operations)
+      )
+      let digest = PermissionedRemoteReplicaIncrementalBatch.canonicalDigest(
+        target: fixture.target, expectedHead: base,
+        terminalHead: terminal, operations: operations, requestSequence: 1
+      )
+      let batch = try PermissionedRemoteReplicaIncrementalBatch(
+        target: fixture.target,
+        expectedHead: base,
+        terminalHead: terminal,
+        operations: operations,
+        requestID: "incremental-crud",
+        requestSequence: 1,
+        requestDigest: digest
+      )
+
+      let outcome = try await database
+        .applyVerifiedPermissionedRemoteReplicaBatch(batch, appliedAt: 301)
+      guard case let .applied(result) = outcome else {
+        return XCTFail("expected applied incremental result, got \(outcome)")
+      }
+      XCTAssertEqual(result.head.generation, base.generation)
+      XCTAssertEqual(result.head.wireRevision, revision)
+      XCTAssertEqual(result.recordCount, 2)
+      let durableCreated = try await database.permissionedRemoteReplicaRecord(
+        target: fixture.target, collection: createdURI.collection,
+        rkey: createdURI.rkey
+      )
+      let durableUpdated = try await database.permissionedRemoteReplicaRecord(
+        target: fixture.target, collection: updatedURI.collection,
+        rkey: updatedURI.rkey
+      )
+      let durableDeleted = try await database.permissionedRemoteReplicaRecord(
+        target: fixture.target, collection: deletedURI.collection,
+        rkey: deletedURI.rkey
+      )
+      XCTAssertEqual(durableCreated, createdValue)
+      XCTAssertEqual(durableUpdated, updatedValue)
+      XCTAssertNil(durableDeleted)
+      try await database.close()
+    } catch {
+      try? await database.close()
+      throw error
+    }
+  }
+
+  func testVerifiedIncrementalBatchAppliesOrderedMultipleWireRevisions()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(
+      name: "incremental-multiple-revisions"
+    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    defer { Task { try? await database.close() } }
+    let initial = try fixture.archive(
+      revision: "222222222222a", values: ["base"], ikmByte: 0x72
+    )
+    let base = try await fixture.install(
+      database: database, archive: initial, expectedBase: nil,
+      requestID: "incremental-multiple-revisions-bootstrap",
+      publicationAuthorization: fixture.publicationAuthorization
+    ).result.head
+    let firstRevision = try TID(tidString: "222222222222b")
+    let terminalRevision = try TID(tidString: "222222222222c")
+    let updatedValue = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+      (key: "text", value: "updated at b"),
+    ]))
+    let createdValue = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+      (key: "text", value: "created at c"),
+    ]))
+    let updatedCID = CID.fromDAGCBOR(updatedValue)
+    let createdCID = CID.fromDAGCBOR(createdValue)
+    let updatedURI = try SpaceRecordURI(
+      space: fixture.space, author: fixture.repositoryDID,
+      collection: initial.records[0].collection,
+      rkey: initial.records[0].rkey
+    )
+    let createdURI = try SpaceRecordURI(
+      space: fixture.space, author: fixture.repositoryDID,
+      collection: initial.records[0].collection, rkey: "created-at-c"
+    )
+    let operations: [VerifiedPermissionedRemoteReplicaOperation] = [
+      .init(
+        operationIndex: 0, wireRevision: firstRevision, action: .update,
+        uri: updatedURI, cid: updatedCID,
+        previousCID: initial.records[0].cid, value: updatedValue
+      ),
+      .init(
+        operationIndex: 1, wireRevision: terminalRevision, action: .create,
+        uri: createdURI, cid: createdCID, previousCID: nil,
+        value: createdValue
+      ),
+    ]
+    var terminalHash = try LtHash(serialized: base.ltHash)
+    terminalHash.remove(
+      element:
+        "\(updatedURI.collection)/\(updatedURI.rkey)/\(initial.records[0].cid.string)"
+    )
+    terminalHash.add(
+      element: "\(updatedURI.collection)/\(updatedURI.rkey)/\(updatedCID.string)"
+    )
+    terminalHash.add(
+      element: "\(createdURI.collection)/\(createdURI.rkey)/\(createdCID.string)"
+    )
+    let batch = try makeIncrementalBatch(
+      target: fixture.target, expectedHead: base,
+      terminalRevision: terminalRevision, terminalHash: terminalHash,
+      recordCount: 2, operations: operations,
+      requestID: "incremental-multiple-revisions"
+    )
+
+    let outcome = try await database.applyVerifiedPermissionedRemoteReplicaBatch(
+      batch, appliedAt: 351
+    )
+    guard case let .applied(result) = outcome else {
+      return XCTFail("expected applied incremental result, got \(outcome)")
+    }
+    XCTAssertEqual(result.head.wireRevision, terminalRevision)
+    XCTAssertEqual(result.recordCount, 2)
+    let durableUpdated = try await database.permissionedRemoteReplicaRecord(
+      target: fixture.target, collection: updatedURI.collection,
+      rkey: updatedURI.rkey
+    )
+    let durableCreated = try await database.permissionedRemoteReplicaRecord(
+      target: fixture.target, collection: createdURI.collection,
+      rkey: createdURI.rkey
+    )
+    XCTAssertEqual(durableUpdated, updatedValue)
+    XCTAssertEqual(durableCreated, createdValue)
+  }
+
+  func testIncrementalLateOperationAndTerminalMismatchRollbackEveryWrite()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "incremental-rollback")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    let initial = try fixture.archive(
+      revision: "222222222222a", values: ["last good"], ikmByte: 0x73
+    )
+    let base = try await fixture.install(
+      database: database, archive: initial, expectedBase: nil,
+      requestID: "incremental-rollback-bootstrap",
+      publicationAuthorization: fixture.publicationAuthorization
+    ).result.head
+    let before = try await incrementalReplicaWitness(
+      database: database, target: fixture.target
+    )
+    let revision = try TID(tidString: "222222222222b")
+    let createdValue = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+      (key: "text", value: "must roll back"),
+    ]))
+    let createdCID = CID.fromDAGCBOR(createdValue)
+    let createdURI = try SpaceRecordURI(
+      space: fixture.space, author: fixture.repositoryDID,
+      collection: initial.records[0].collection, rkey: "late-failure"
+    )
+    let existingURI = try SpaceRecordURI(
+      space: fixture.space, author: fixture.repositoryDID,
+      collection: initial.records[0].collection,
+      rkey: initial.records[0].rkey
+    )
+    var afterCreateHash = try LtHash(serialized: base.ltHash)
+    afterCreateHash.add(
+      element: "\(createdURI.collection)/\(createdURI.rkey)/\(createdCID.string)"
+    )
+    let wrongPrevious = CID.fromDAGCBOR(Data([0xa0]))
+    let lateFailureOperations: [VerifiedPermissionedRemoteReplicaOperation] = [
+      .init(
+        operationIndex: 0, wireRevision: revision, action: .create,
+        uri: createdURI, cid: createdCID, previousCID: nil,
+        value: createdValue
+      ),
+      .init(
+        operationIndex: 1, wireRevision: revision, action: .delete,
+        uri: existingURI, cid: nil, previousCID: wrongPrevious, value: nil
+      ),
+    ]
+    let lateFailure = try makeIncrementalBatch(
+      target: fixture.target, expectedHead: base,
+      terminalRevision: revision, terminalHash: afterCreateHash,
+      recordCount: 1, operations: lateFailureOperations,
+      requestID: "incremental-late-failure"
+    )
+    let lateFailureOutcome = try await database
+      .applyVerifiedPermissionedRemoteReplicaBatch(lateFailure, appliedAt: 401)
+    try await database.close()
+    let afterLateFailureDatabase = try await fixture.open()
+    let afterLateFailure = try await incrementalReplicaWitness(
+      database: afterLateFailureDatabase, target: fixture.target
+    )
+    try await afterLateFailureDatabase.close()
+    XCTAssertEqual(lateFailureOutcome, .integrityFailure)
+    XCTAssertEqual(afterLateFailure, before)
+
+    let terminalMismatchOperations = [lateFailureOperations[0]]
+    let terminalMismatch = try makeIncrementalBatch(
+      target: fixture.target, expectedHead: base,
+      terminalRevision: revision,
+      terminalHash: try LtHash(serialized: base.ltHash),
+      recordCount: 1, operations: terminalMismatchOperations,
+      requestID: "incremental-terminal-mismatch"
+    )
+    let terminalMismatchDatabase = try await fixture.open()
+    let terminalMismatchOutcome = try await terminalMismatchDatabase
+      .applyVerifiedPermissionedRemoteReplicaBatch(
+        terminalMismatch, appliedAt: 402
+      )
+    try await terminalMismatchDatabase.close()
+    let afterTerminalMismatchDatabase = try await fixture.open()
+    let afterTerminalMismatch = try await incrementalReplicaWitness(
+      database: afterTerminalMismatchDatabase, target: fixture.target
+    )
+    try await afterTerminalMismatchDatabase.close()
+    XCTAssertEqual(terminalMismatchOutcome, .integrityFailure)
+    XCTAssertEqual(afterTerminalMismatch, before)
+  }
+
+  func testIncrementalReplayPersistsAcrossRestartAndConflictsFailClosed()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "incremental-replay")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    let initial = try fixture.archive(
+      revision: "222222222222a", values: ["before"], ikmByte: 0x74
+    )
+    let base = try await fixture.install(
+      database: database, archive: initial, expectedBase: nil,
+      requestID: "incremental-replay-bootstrap",
+      publicationAuthorization: fixture.publicationAuthorization
+    ).result.head
+    let revision = try TID(tidString: "222222222222b")
+    let uri = try SpaceRecordURI(
+      space: fixture.space, author: fixture.repositoryDID,
+      collection: initial.records[0].collection, rkey: initial.records[0].rkey
+    )
+    let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+      (key: "text", value: "after"),
+    ]))
+    let cid = CID.fromDAGCBOR(value)
+    let operation = VerifiedPermissionedRemoteReplicaOperation(
+      operationIndex: 0, wireRevision: revision, action: .update,
+      uri: uri, cid: cid, previousCID: initial.records[0].cid, value: value
+    )
+    var terminalHash = try LtHash(serialized: base.ltHash)
+    terminalHash.remove(
+      element: "\(uri.collection)/\(uri.rkey)/\(initial.records[0].cid.string)"
+    )
+    terminalHash.add(element: "\(uri.collection)/\(uri.rkey)/\(cid.string)")
+    let batch = try makeIncrementalBatch(
+      target: fixture.target, expectedHead: base,
+      terminalRevision: revision, terminalHash: terminalHash,
+      recordCount: 1, operations: [operation], requestID: "durable-replay"
+    )
+    guard case let .applied(applied) = try await database
+      .applyVerifiedPermissionedRemoteReplicaBatch(batch, appliedAt: 501)
+    else { return XCTFail("initial incremental application did not apply") }
+    try await database.close()
+    let reopened = try await fixture.open()
+    defer { Task { try? await reopened.close() } }
+    let duplicate = try await reopened
+      .applyVerifiedPermissionedRemoteReplicaBatch(batch, appliedAt: 999)
+    XCTAssertEqual(duplicate, .exactDuplicate(applied))
+
+    let conflictingValue = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+      (key: "text", value: "different replay"),
+    ]))
+    let conflictingCID = CID.fromDAGCBOR(conflictingValue)
+    let conflictingOperation = VerifiedPermissionedRemoteReplicaOperation(
+      operationIndex: 0, wireRevision: revision, action: .update,
+      uri: uri, cid: conflictingCID,
+      previousCID: initial.records[0].cid, value: conflictingValue
+    )
+    var conflictingHash = try LtHash(serialized: base.ltHash)
+    conflictingHash.remove(
+      element: "\(uri.collection)/\(uri.rkey)/\(initial.records[0].cid.string)"
+    )
+    conflictingHash.add(
+      element: "\(uri.collection)/\(uri.rkey)/\(conflictingCID.string)"
+    )
+    let conflicting = try makeIncrementalBatch(
+      target: fixture.target, expectedHead: base,
+      terminalRevision: revision, terminalHash: conflictingHash,
+      recordCount: 1, operations: [conflictingOperation],
+      requestID: "durable-replay"
+    )
+    let beforeConflict = try await incrementalReplicaWitness(
+      database: reopened, target: fixture.target
+    )
+    let conflict = try await reopened
+      .applyVerifiedPermissionedRemoteReplicaBatch(conflicting, appliedAt: 502)
+    let afterConflict = try await incrementalReplicaWitness(
+      database: reopened, target: fixture.target
+    )
+    XCTAssertEqual(conflict, .conflictingReplay)
+    XCTAssertEqual(afterConflict, beforeConflict)
+  }
+
+  func testIncrementalReplayFloorRejectsEvictedSequenceAfterRestart()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "incremental-floor")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    var openedDatabases = [database]
+    defer {
+      let databases = openedDatabases
+      Task { for database in databases { try? await database.close() } }
+    }
+    await database.installTestingHooks(SQLiteTestingHooks(
+      incrementalReplayRetentionOperationLimit: 3
+    ))
+    let initial = try fixture.archive(
+      revision: "222222222222a", values: ["floor base"], ikmByte: 0x78
+    )
+    var head = try await fixture.install(
+      database: database, archive: initial, expectedBase: nil,
+      requestID: "incremental-floor-bootstrap",
+      publicationAuthorization: fixture.publicationAuthorization
+    ).result.head
+    let uri = try SpaceRecordURI(
+      space: fixture.space, author: fixture.repositoryDID,
+      collection: initial.records[0].collection, rkey: initial.records[0].rkey
+    )
+    var currentCID = initial.records[0].cid
+
+    let first = try makeChainedIncrementalBatch(
+      target: fixture.target, expectedHead: head, uri: uri,
+      startingCID: currentCID, terminalRevision: "222222222222b",
+      requestID: "evicted-request", requestSequence: 1,
+      operationCount: 1, valuePrefix: "evicted"
+    )
+    guard case let .applied(firstResult) = try await database
+      .applyVerifiedPermissionedRemoteReplicaBatch(first.batch, appliedAt: 901)
+    else { return XCTFail("first incremental batch did not apply") }
+    head = firstResult.head
+    currentCID = first.terminalCID
+
+    for (sequence, revision, operationCount) in [
+      (UInt64(2), "222222222222c", 1),
+      (UInt64(3), "222222222222d", 1),
+      (UInt64(4), "222222222222e", 1),
+    ] {
+      let retained = try makeChainedIncrementalBatch(
+        target: fixture.target, expectedHead: head, uri: uri,
+        startingCID: currentCID, terminalRevision: revision,
+        requestID: "retained-\(sequence)", requestSequence: sequence,
+        operationCount: operationCount, valuePrefix: "retained-\(sequence)"
+      )
+      guard case let .applied(result) = try await database
+        .applyVerifiedPermissionedRemoteReplicaBatch(
+          retained.batch, appliedAt: Int64(900 + sequence)
+        )
+      else { return XCTFail("retained batch \(sequence) did not apply") }
+      head = result.head
+      currentCID = retained.terminalCID
+    }
+
+    let evictedRows = try await database.connection.query(
+      """
+      SELECT request_id
+      FROM permissioned_remote_replica_incremental_results
+      WHERE receiver_did = ? AND space_uri = ? AND repository_did = ?
+        AND request_id = ?
+      """,
+      [
+        .text(fixture.target.receiverDID), .text(fixture.target.space.rawValue),
+        .text(fixture.target.repositoryDID), .text("evicted-request"),
+      ]
+    )
+    XCTAssertTrue(evictedRows.isEmpty, "old replay detail was not evicted")
+    try await database.close()
+
+    let reopened = try await fixture.open()
+    openedDatabases.append(reopened)
+    let beforeRejectedRetries = try await incrementalReplicaWitness(
+      database: reopened, target: fixture.target
+    )
+    let exactEvictedRetry = try await reopened
+      .applyVerifiedPermissionedRemoteReplicaBatch(first.batch, appliedAt: 999)
+    XCTAssertEqual(exactEvictedRetry, .staleOrReordered)
+    let afterExactEvictedRetry = try await incrementalReplicaWitness(
+      database: reopened, target: fixture.target
+    )
+    XCTAssertEqual(
+      afterExactEvictedRetry,
+      beforeRejectedRetries
+    )
+
+    let reused = try makeChainedIncrementalBatch(
+      target: fixture.target, expectedHead: head, uri: uri,
+      startingCID: currentCID, terminalRevision: "222222222222f",
+      requestID: "evicted-request", requestSequence: 1,
+      operationCount: 1, valuePrefix: "different-reuse"
+    )
+    let conflictingOldSequence = try await reopened
+      .applyVerifiedPermissionedRemoteReplicaBatch(reused.batch, appliedAt: 1_000)
+    XCTAssertEqual(conflictingOldSequence, .staleOrReordered)
+    let afterConflictingOldSequence = try await incrementalReplicaWitness(
+      database: reopened, target: fixture.target
+    )
+    XCTAssertEqual(
+      afterConflictingOldSequence,
+      beforeRejectedRetries
+    )
+
+    let next = try makeChainedIncrementalBatch(
+      target: fixture.target, expectedHead: head, uri: uri,
+      startingCID: currentCID, terminalRevision: "222222222222g",
+      requestID: "post-floor-next", requestSequence: 5,
+      operationCount: 1, valuePrefix: "post-floor"
+    )
+    guard case let .applied(nextResult) = try await reopened
+      .applyVerifiedPermissionedRemoteReplicaBatch(next.batch, appliedAt: 1_001)
+    else { return XCTFail("next sequence after replay floor did not apply") }
+    XCTAssertEqual(nextResult.head.wireRevision, next.batch.terminalHead.wireRevision)
+    try await reopened.close()
+  }
+
+  func testIncrementalMissingRetainedMiddleSequenceFailsCorruptAfterRestart()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "incremental-gap")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    let history = try await installIncrementalHistory(
+      fixture: fixture, database: database, requestPrefix: "gap"
+    )
+    _ = try await database.connection.query(
+      """
+      DELETE FROM permissioned_remote_replica_incremental_results
+      WHERE receiver_did = ? AND space_uri = ? AND repository_did = ?
+        AND request_sequence = ?
+      """,
+      [
+        .text(fixture.target.receiverDID), .text(fixture.target.space.rawValue),
+        .text(fixture.target.repositoryDID), incrementalSequenceSQLiteData(2),
+      ]
+    )
+    try await database.close()
+
+    let reopened = try await fixture.open()
+    defer { Task { try? await reopened.close() } }
+    let before = try await incrementalReplicaWitness(
+      database: reopened, target: fixture.target
+    )
+    let candidate = try makeChainedIncrementalBatch(
+      target: fixture.target, expectedHead: history.head, uri: history.uri,
+      startingCID: history.terminalCID, terminalRevision: "222222222222e",
+      requestID: "gap-next", requestSequence: 4,
+      operationCount: 1, valuePrefix: "gap-next"
+    )
+    var caught: PermissionedRemoteReplicaRecoveryError?
+    do {
+      _ = try await reopened.applyVerifiedPermissionedRemoteReplicaBatch(
+        candidate.batch, appliedAt: 1_100
+      )
+    } catch let error as PermissionedRemoteReplicaRecoveryError {
+      caught = error
+    }
+    XCTAssertEqual(caught, .corruptReplica)
+    let after = try await incrementalReplicaWitness(
+      database: reopened, target: fixture.target
+    )
+    XCTAssertEqual(after, before)
+  }
+
+  func testIncrementalForgedHighWatermarkFailsCorruptAfterRestart()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "incremental-high")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    let history = try await installIncrementalHistory(
+      fixture: fixture, database: database, requestPrefix: "high"
+    )
+    _ = try await database.connection.query(
+      """
+      UPDATE permissioned_remote_replica_incremental_progress
+      SET high_watermark = ?
+      WHERE receiver_did = ? AND space_uri = ? AND repository_did = ?
+      """,
+      [
+        incrementalSequenceSQLiteData(4), .text(fixture.target.receiverDID),
+        .text(fixture.target.space.rawValue),
+        .text(fixture.target.repositoryDID),
+      ]
+    )
+    try await database.close()
+
+    let reopened = try await fixture.open()
+    defer { Task { try? await reopened.close() } }
+    let before = try await incrementalReplicaWitness(
+      database: reopened, target: fixture.target
+    )
+    let candidate = try makeChainedIncrementalBatch(
+      target: fixture.target, expectedHead: history.head, uri: history.uri,
+      startingCID: history.terminalCID, terminalRevision: "222222222222e",
+      requestID: "high-next", requestSequence: 5,
+      operationCount: 1, valuePrefix: "high-next"
+    )
+    var caught: PermissionedRemoteReplicaRecoveryError?
+    do {
+      _ = try await reopened.applyVerifiedPermissionedRemoteReplicaBatch(
+        candidate.batch, appliedAt: 1_101
+      )
+    } catch let error as PermissionedRemoteReplicaRecoveryError {
+      caught = error
+    }
+    XCTAssertEqual(caught, .corruptReplica)
+    let after = try await incrementalReplicaWitness(
+      database: reopened, target: fixture.target
+    )
+    XCTAssertEqual(after, before)
+  }
+
+  func testIncrementalSequenceMigrationRejectsNonemptyLegacyReplayTable()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "incremental-legacy-full")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    try await replaceIncrementalResultsWithLegacyTable(
+      database: database, insertRow: true
+    )
+    try await database.close()
+
+    do {
+      let unexpectedlyOpened = try await fixture.open()
+      try await unexpectedlyOpened.close()
+      XCTFail("nonempty legacy incremental replay table was accepted")
+    } catch let SQLiteRepositoryError.corruptDatabase(message) {
+      XCTAssertTrue(message.contains("legacy incremental replay rows"))
+    }
+  }
+
+  func testIncrementalSequenceMigrationUpgradesEmptyLegacyReplayTable()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "incremental-legacy-empty")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    try await replaceIncrementalResultsWithLegacyTable(
+      database: database, insertRow: false
+    )
+    _ = try await database.connection.query(
+      "INSERT INTO public_records(uri, value, revision) VALUES (?, ?, ?)",
+      [.text("at://did:plc:unrelated/app.test.record/1"), .blob(.init(bytes: [0xa0])), .integer(7)]
+    )
+    try await database.close()
+
+    let reopened = try await fixture.open()
+    let columns = try await reopened.connection.query(
+      "PRAGMA table_info(permissioned_remote_replica_incremental_results)"
+    )
+    XCTAssertTrue(columns.contains {
+      $0.column("name")?.string == "request_sequence"
+    })
+    let progressTable = try await reopened.connection.query(
+      """
+      SELECT name FROM sqlite_master
+      WHERE type = 'table'
+        AND name = 'permissioned_remote_replica_incremental_progress'
+      """
+    )
+    XCTAssertEqual(progressTable.count, 1)
+    let unrelated = try await reopened.connection.query(
+      "SELECT value, revision FROM public_records WHERE uri = ?",
+      [.text("at://did:plc:unrelated/app.test.record/1")]
+    )
+    XCTAssertEqual(unrelated.count, 1)
+    XCTAssertEqual(unrelated.first?.column("revision")?.integer, 7)
+    XCTAssertEqual(
+      unrelated.first?.column("value"), .blob(.init(bytes: [0xa0]))
+    )
+    try await reopened.close()
+  }
+
+  func testIncrementalExpectedHeadRaceHasOneWinnerAndOneCASConflict()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "incremental-cas-race")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let firstDatabase = try await fixture.open()
+    let initial = try fixture.archive(
+      revision: "222222222222a", values: ["race base"], ikmByte: 0x75
+    )
+    let base = try await fixture.install(
+      database: firstDatabase, archive: initial, expectedBase: nil,
+      requestID: "incremental-race-bootstrap",
+      publicationAuthorization: fixture.publicationAuthorization
+    ).result.head
+    let secondDatabase = try await fixture.open()
+    defer {
+      Task {
+        try? await firstDatabase.close()
+        try? await secondDatabase.close()
+      }
+    }
+    let uri = try SpaceRecordURI(
+      space: fixture.space, author: fixture.repositoryDID,
+      collection: initial.records[0].collection, rkey: initial.records[0].rkey
+    )
+    func contender(
+      revisionRaw: String, text: String, requestID: String
+    ) throws -> PermissionedRemoteReplicaIncrementalBatch {
+      let revision = try TID(tidString: revisionRaw)
+      let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+        (key: "text", value: text),
+      ]))
+      let cid = CID.fromDAGCBOR(value)
+      let operation = VerifiedPermissionedRemoteReplicaOperation(
+        operationIndex: 0, wireRevision: revision, action: .update,
+        uri: uri, cid: cid, previousCID: initial.records[0].cid,
+        value: value
+      )
+      var hash = try LtHash(serialized: base.ltHash)
+      hash.remove(
+        element: "\(uri.collection)/\(uri.rkey)/\(initial.records[0].cid.string)"
+      )
+      hash.add(element: "\(uri.collection)/\(uri.rkey)/\(cid.string)")
+      return try makeIncrementalBatch(
+        target: fixture.target, expectedHead: base,
+        terminalRevision: revision, terminalHash: hash, recordCount: 1,
+        operations: [operation], requestID: requestID
+      )
+    }
+    let leftBatch = try contender(
+      revisionRaw: "222222222222b", text: "left", requestID: "race-left"
+    )
+    let rightBatch = try contender(
+      revisionRaw: "222222222222c", text: "right", requestID: "race-right"
+    )
+    async let left = firstDatabase.applyVerifiedPermissionedRemoteReplicaBatch(
+      leftBatch, appliedAt: 601
+    )
+    async let right = secondDatabase.applyVerifiedPermissionedRemoteReplicaBatch(
+      rightBatch, appliedAt: 602
+    )
+    let outcomes = try await [left, right]
+    XCTAssertEqual(outcomes.filter {
+      if case .applied = $0 { return true }
+      return false
+    }.count, 1)
+    XCTAssertEqual(outcomes.filter { $0 == .casConflict }.count, 1)
+  }
+
+  func testIncrementalRejectsInvalidTransitionsWithoutChangingLastGoodState()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "incremental-invalid")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    defer { Task { try? await database.close() } }
+    let initial = try fixture.archive(
+      revision: "222222222222a", values: ["valid base"], ikmByte: 0x76
+    )
+    let base = try await fixture.install(
+      database: database, archive: initial, expectedBase: nil,
+      requestID: "incremental-invalid-bootstrap",
+      publicationAuthorization: fixture.publicationAuthorization
+    ).result.head
+    let before = try await incrementalReplicaWitness(
+      database: database, target: fixture.target
+    )
+    let revision = try TID(tidString: "222222222222b")
+    let existingURI = try SpaceRecordURI(
+      space: fixture.space, author: fixture.repositoryDID,
+      collection: initial.records[0].collection, rkey: initial.records[0].rkey
+    )
+    let missingURI = try SpaceRecordURI(
+      space: fixture.space, author: fixture.repositoryDID,
+      collection: initial.records[0].collection, rkey: "missing"
+    )
+    let wrongSpace = try SpaceURI(
+      authority: "did:plc:wrong-incremental-space",
+      spaceType: "app.swan.remote-replica", skey: "wrong"
+    )
+    let wrongURI = try SpaceRecordURI(
+      space: wrongSpace, author: fixture.repositoryDID,
+      collection: initial.records[0].collection, rkey: "wrong"
+    )
+    let canonical = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+      (key: "text", value: "candidate"),
+    ]))
+    let canonicalCID = CID.fromDAGCBOR(canonical)
+    let otherCID = CID.fromDAGCBOR(Data([0xa0]))
+    let noncanonical = Data([0x18, 0x00])
+    let cases: [VerifiedPermissionedRemoteReplicaOperation] = [
+      .init(
+        operationIndex: 0, wireRevision: revision, action: .create,
+        uri: existingURI, cid: canonicalCID, previousCID: nil,
+        value: canonical
+      ),
+      .init(
+        operationIndex: 0, wireRevision: revision, action: .create,
+        uri: missingURI, cid: canonicalCID, previousCID: nil, value: nil
+      ),
+      .init(
+        operationIndex: 0, wireRevision: revision, action: .delete,
+        uri: existingURI, cid: canonicalCID,
+        previousCID: initial.records[0].cid, value: canonical
+      ),
+      .init(
+        operationIndex: 0, wireRevision: revision, action: .update,
+        uri: existingURI, cid: canonicalCID, previousCID: otherCID,
+        value: canonical
+      ),
+      .init(
+        operationIndex: 0, wireRevision: revision, action: .create,
+        uri: missingURI, cid: otherCID, previousCID: nil, value: canonical
+      ),
+      .init(
+        operationIndex: 0, wireRevision: revision, action: .create,
+        uri: missingURI, cid: CID.fromDAGCBOR(noncanonical),
+        previousCID: nil, value: noncanonical
+      ),
+      .init(
+        operationIndex: 0, wireRevision: revision, action: .create,
+        uri: wrongURI, cid: canonicalCID, previousCID: nil, value: canonical
+      ),
+    ]
+    for (index, operation) in cases.enumerated() {
+      let batch = try makeIncrementalBatch(
+        target: fixture.target, expectedHead: base,
+        terminalRevision: revision,
+        terminalHash: try LtHash(serialized: base.ltHash),
+        recordCount: 1, operations: [operation],
+        requestID: "incremental-invalid-\(index)"
+      )
+      let outcome = try await database
+        .applyVerifiedPermissionedRemoteReplicaBatch(
+          batch, appliedAt: Int64(700 + index)
+        )
+      let after = try await incrementalReplicaWitness(
+        database: database, target: fixture.target
+      )
+      XCTAssertEqual(
+        outcome, .integrityFailure,
+        "invalid case \(index) was accepted"
+      )
+      XCTAssertEqual(
+        after, before,
+        "invalid case \(index) changed last-good state"
+      )
+    }
+  }
+
+  func testIncrementalDistinguishesStaleEquivocationAndFullRecovery()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(name: "incremental-outcomes")
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    defer { Task { try? await database.close() } }
+    let initial = try fixture.archive(
+      revision: "222222222222a", values: ["outcome base"], ikmByte: 0x77
+    )
+    let base = try await fixture.install(
+      database: database, archive: initial, expectedBase: nil,
+      requestID: "incremental-outcomes-bootstrap",
+      publicationAuthorization: fixture.publicationAuthorization
+    ).result.head
+    let uri = try SpaceRecordURI(
+      space: fixture.space, author: fixture.repositoryDID,
+      collection: initial.records[0].collection, rkey: "new"
+    )
+    let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+      (key: "text", value: "new"),
+    ]))
+    let cid = CID.fromDAGCBOR(value)
+    let staleOperation = VerifiedPermissionedRemoteReplicaOperation(
+      operationIndex: 0, wireRevision: base.wireRevision, action: .create,
+      uri: uri, cid: cid, previousCID: nil, value: value
+    )
+    let stale = try makeIncrementalBatch(
+      target: fixture.target, expectedHead: base,
+      terminalRevision: base.wireRevision,
+      terminalHash: try LtHash(serialized: base.ltHash),
+      recordCount: 1, operations: [staleOperation],
+      requestID: "incremental-stale"
+    )
+    let staleOutcome = try await database
+      .applyVerifiedPermissionedRemoteReplicaBatch(stale, appliedAt: 801)
+    XCTAssertEqual(staleOutcome, .staleOrReordered)
+
+    let operationDigest =
+      PermissionedRemoteReplicaIncrementalOperationWitness
+        .digest([staleOperation])
+    let equivocalTerminal = try PermissionedRemoteReplicaIncrementalTerminalHead(
+      wireRevision: base.wireRevision,
+      ltHash: base.ltHash,
+      commitment: Data(repeating: 0xe1, count: 32),
+      recordCount: 1,
+      operationCount: 1,
+      operationDigest: operationDigest
+    )
+    let equivocalDigest = PermissionedRemoteReplicaIncrementalBatch
+      .canonicalDigest(
+        target: fixture.target, expectedHead: base,
+        terminalHead: equivocalTerminal, operations: [staleOperation],
+        requestSequence: 1
+      )
+    let equivocal = try PermissionedRemoteReplicaIncrementalBatch(
+      target: fixture.target, expectedHead: base,
+      terminalHead: equivocalTerminal, operations: [staleOperation],
+      requestID: "incremental-equivocation",
+      requestSequence: 1,
+      requestDigest: equivocalDigest
+    )
+    let equivocalOutcome = try await database
+      .applyVerifiedPermissionedRemoteReplicaBatch(equivocal, appliedAt: 802)
+    XCTAssertEqual(equivocalOutcome, .integrityFailure)
+
+    let missingSpace = try SpaceURI(
+      authority: "did:plc:missing-replica-authority",
+      spaceType: "app.swan.remote-replica", skey: "missing"
+    )
+    let missingTarget = try PermissionedRemoteReplicaTarget(
+      receiverDID: fixture.receiverDID,
+      space: missingSpace,
+      repositoryDID: fixture.repositoryDID
+    )
+    let emptyHash = LtHash()
+    let missingBase = try PermissionedRemoteReplicaHead(
+      target: missingTarget, generation: 1,
+      wireRevision: try TID(tidString: "222222222222a"),
+      historyFloorWireRevision: try TID(tidString: "222222222222a"),
+      ltHash: emptyHash.serialized, commitment: emptyHash.commitment,
+      stateMarker: Data([0x01])
+    )
+    let missingURI = try SpaceRecordURI(
+      space: missingSpace, author: fixture.repositoryDID,
+      collection: initial.records[0].collection, rkey: "missing"
+    )
+    let missingRevision = try TID(tidString: "222222222222b")
+    let missingOperation = VerifiedPermissionedRemoteReplicaOperation(
+      operationIndex: 0, wireRevision: missingRevision, action: .create,
+      uri: missingURI, cid: cid, previousCID: nil, value: value
+    )
+    var missingTerminalHash = emptyHash
+    missingTerminalHash.add(
+      element: "\(missingURI.collection)/\(missingURI.rkey)/\(cid.string)"
+    )
+    let missing = try makeIncrementalBatch(
+      target: missingTarget, expectedHead: missingBase,
+      terminalRevision: missingRevision, terminalHash: missingTerminalHash,
+      recordCount: 1, operations: [missingOperation],
+      requestID: "incremental-full-recovery"
+    )
+    let missingOutcome = try await database
+      .applyVerifiedPermissionedRemoteReplicaBatch(missing, appliedAt: 803)
+    let retainedHead = try await database.permissionedRemoteReplicaHead(
+      target: fixture.target
+    )
+    XCTAssertEqual(missingOutcome, .fullCARRecoveryRequired)
+    XCTAssertEqual(retainedHead, base)
+  }
+}
+
+private struct IncrementalReplicaWitness: Equatable {
+  let head: PermissionedRemoteReplicaHead?
+  let records: [[SQLiteData]]
+  let blocks: [[SQLiteData]]
+  let chunks: [[SQLiteData]]
+  let replays: [[SQLiteData]]
+  let progress: [[SQLiteData]]
+}
+
+private func incrementalReplicaWitness(
+  database: SQLiteAccountDatabase,
+  target: PermissionedRemoteReplicaTarget
+) async throws -> IncrementalReplicaWitness {
+  let head = try await database.permissionedRemoteReplicaHead(target: target)
+  let generation = Int(head?.generation ?? 0)
+  let records = try await database.connection.query(
+    """
+    SELECT collection, rkey, cid
+    FROM permissioned_remote_replica_records
+    WHERE space_uri = ? AND repository_did = ? AND generation = ?
+    ORDER BY collection, rkey
+    """,
+    [
+      .text(target.space.rawValue), .text(target.repositoryDID),
+      .integer(generation),
+    ]
+  )
+  let blocks = try await database.connection.query(
+    """
+    SELECT cid, byte_count, chunk_count
+    FROM permissioned_remote_replica_blocks
+    WHERE space_uri = ? AND repository_did = ? AND generation = ?
+    ORDER BY cid
+    """,
+    [
+      .text(target.space.rawValue), .text(target.repositoryDID),
+      .integer(generation),
+    ]
+  )
+  let chunks = try await database.connection.query(
+    """
+    SELECT cid, chunk_index, bytes
+    FROM permissioned_remote_replica_block_chunks
+    WHERE space_uri = ? AND repository_did = ? AND generation = ?
+    ORDER BY cid, chunk_index
+    """,
+    [
+      .text(target.space.rawValue), .text(target.repositoryDID),
+      .integer(generation),
+    ]
+  )
+  let replays = try await database.connection.query(
+    """
+    SELECT * FROM permissioned_remote_replica_incremental_results
+    WHERE receiver_did = ? AND space_uri = ? AND repository_did = ?
+    ORDER BY request_sequence
+    """,
+    [
+      .text(target.receiverDID), .text(target.space.rawValue),
+      .text(target.repositoryDID),
+    ]
+  )
+  let progress = try await database.connection.query(
+    """
+    SELECT * FROM permissioned_remote_replica_incremental_progress
+    WHERE receiver_did = ? AND space_uri = ? AND repository_did = ?
+    """,
+    [
+      .text(target.receiverDID), .text(target.space.rawValue),
+      .text(target.repositoryDID),
+    ]
+  )
+  let replayColumns = [
+    "request_id", "request_sequence", "request_digest", "batch_digest",
+    "receiver_did", "space_uri", "repository_did", "expected_generation",
+    "expected_wire_revision", "expected_commitment", "expected_marker",
+    "installed_generation", "installed_wire_revision",
+    "installed_history_floor", "installed_lthash", "installed_commitment",
+    "installed_marker", "record_count", "operation_count", "applied_at",
+    "integrity_digest",
+  ]
+  let progressColumns = [
+    "receiver_did", "space_uri", "repository_did", "replay_floor",
+    "high_watermark",
+  ]
+  return IncrementalReplicaWitness(
+    head: head,
+    records: records.map {
+      [$0.column("collection")!, $0.column("rkey")!, $0.column("cid")!]
+    },
+    blocks: blocks.map {
+      [$0.column("cid")!, $0.column("byte_count")!, $0.column("chunk_count")!]
+    },
+    chunks: chunks.map {
+      [$0.column("cid")!, $0.column("chunk_index")!, $0.column("bytes")!]
+    },
+    replays: replays.map { row in replayColumns.map { row.column($0)! } },
+    progress: progress.map { row in progressColumns.map { row.column($0)! } }
+  )
+}
+
+private func replaceIncrementalResultsWithLegacyTable(
+  database: SQLiteAccountDatabase,
+  insertRow: Bool
+) async throws {
+  _ = try await database.connection.query(
+    "DELETE FROM permissioned_repository_migrations WHERE version = 11"
+  )
+  _ = try await database.connection.query(
+    "DROP TABLE permissioned_remote_replica_incremental_results"
+  )
+  _ = try await database.connection.query(
+    """
+    CREATE TABLE permissioned_remote_replica_incremental_results (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT NOT NULL UNIQUE,
+      receiver_did TEXT NOT NULL,
+      space_uri TEXT NOT NULL,
+      repository_did TEXT NOT NULL
+    )
+    """
+  )
+  _ = try await database.connection.query(
+    """
+    CREATE INDEX permissioned_remote_replica_incremental_results_retention
+    ON permissioned_remote_replica_incremental_results(
+      receiver_did, space_uri, repository_did, sequence
+    )
+    """
+  )
+  if insertRow {
+    _ = try await database.connection.query(
+      """
+      INSERT INTO permissioned_remote_replica_incremental_results(
+        request_id, receiver_did, space_uri, repository_did
+      ) VALUES ('legacy', 'did:plc:legacy', 'at://did:plc:legacy/x/y',
+                'did:plc:legacy')
+      """
+    )
+  }
+}
+
+private func removeLogicalLimitColumnsForMigrationTest(
+  database: SQLiteAccountDatabase
+) async throws {
+  _ = try await database.connection.query(
+    "DELETE FROM permissioned_repository_migrations WHERE version = 12"
+  )
+  _ = try await database.connection.query(
+    """
+    ALTER TABLE permissioned_remote_replica_import_sessions
+    DROP COLUMN maximum_logical_restored_bytes
+    """
+  )
+  _ = try await database.connection.query(
+    """
+    ALTER TABLE permissioned_remote_replica_import_results
+    DROP COLUMN maximum_logical_restored_bytes
+    """
+  )
+}
+
+private func makeIncrementalBatch(
+  target: PermissionedRemoteReplicaTarget,
+  expectedHead: PermissionedRemoteReplicaHead,
+  terminalRevision: TID,
+  terminalHash: LtHash,
+  recordCount: Int,
+  operations: [VerifiedPermissionedRemoteReplicaOperation],
+  requestID: String,
+  requestSequence: UInt64 = 1
+) throws -> PermissionedRemoteReplicaIncrementalBatch {
+  let terminal = try PermissionedRemoteReplicaIncrementalTerminalHead(
+    wireRevision: terminalRevision,
+    ltHash: terminalHash.serialized,
+    commitment: terminalHash.commitment,
+    recordCount: recordCount,
+    operationCount: operations.count,
+    operationDigest:
+      PermissionedRemoteReplicaIncrementalOperationWitness.digest(operations)
+  )
+  let digest = PermissionedRemoteReplicaIncrementalBatch.canonicalDigest(
+    target: target,
+    expectedHead: expectedHead,
+    terminalHead: terminal,
+    operations: operations,
+    requestSequence: requestSequence
+  )
+  return try PermissionedRemoteReplicaIncrementalBatch(
+    target: target,
+    expectedHead: expectedHead,
+    terminalHead: terminal,
+    operations: operations,
+    requestID: requestID,
+    requestSequence: requestSequence,
+    requestDigest: digest
+  )
+}
+
+private struct ChainedIncrementalBatchFixture {
+  let batch: PermissionedRemoteReplicaIncrementalBatch
+  let terminalCID: CID
+}
+
+private struct IncrementalHistoryFixture {
+  let head: PermissionedRemoteReplicaHead
+  let uri: SpaceRecordURI
+  let terminalCID: CID
+}
+
+private func installIncrementalHistory(
+  fixture: RemoteReplicaSQLiteFixture,
+  database: SQLiteAccountDatabase,
+  requestPrefix: String
+) async throws -> IncrementalHistoryFixture {
+  let initial = try fixture.archive(
+    revision: "222222222222a", values: ["history base"], ikmByte: 0x79
+  )
+  var head = try await fixture.install(
+    database: database, archive: initial, expectedBase: nil,
+    requestID: "\(requestPrefix)-bootstrap",
+    publicationAuthorization: fixture.publicationAuthorization
+  ).result.head
+  let uri = try SpaceRecordURI(
+    space: fixture.space, author: fixture.repositoryDID,
+    collection: initial.records[0].collection, rkey: initial.records[0].rkey
+  )
+  var currentCID = initial.records[0].cid
+  for (sequence, revision) in [
+    (UInt64(1), "222222222222b"),
+    (UInt64(2), "222222222222c"),
+    (UInt64(3), "222222222222d"),
+  ] {
+    let next = try makeChainedIncrementalBatch(
+      target: fixture.target, expectedHead: head, uri: uri,
+      startingCID: currentCID, terminalRevision: revision,
+      requestID: "\(requestPrefix)-\(sequence)",
+      requestSequence: sequence, operationCount: 1,
+      valuePrefix: "\(requestPrefix)-\(sequence)"
+    )
+    guard case let .applied(result) = try await database
+      .applyVerifiedPermissionedRemoteReplicaBatch(
+        next.batch, appliedAt: Int64(1_050 + sequence)
+      ) else {
+      throw RemoteReplicaSQLiteTestError.unexpectedOutcome
+    }
+    head = result.head
+    currentCID = next.terminalCID
+  }
+  return IncrementalHistoryFixture(
+    head: head, uri: uri, terminalCID: currentCID
+  )
+}
+
+private func incrementalSequenceSQLiteData(_ value: UInt64) -> SQLiteData {
+  var bigEndian = value.bigEndian
+  return withUnsafeBytes(of: &bigEndian) {
+    .blob(.init(bytes: $0))
+  }
+}
+
+private func makeChainedIncrementalBatch(
+  target: PermissionedRemoteReplicaTarget,
+  expectedHead: PermissionedRemoteReplicaHead,
+  uri: SpaceRecordURI,
+  startingCID: CID,
+  terminalRevision: String,
+  requestID: String,
+  requestSequence: UInt64,
+  operationCount: Int,
+  valuePrefix: String
+) throws -> ChainedIncrementalBatchFixture {
+  let revision = try TID(tidString: terminalRevision)
+  var previousCID = startingCID
+  var terminalHash = try LtHash(serialized: expectedHead.ltHash)
+  var operations: [VerifiedPermissionedRemoteReplicaOperation] = []
+  operations.reserveCapacity(operationCount)
+  for index in 0 ..< operationCount {
+    let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+      (key: "text", value: "\(valuePrefix)-\(index)"),
+    ]))
+    let cid = CID.fromDAGCBOR(value)
+    operations.append(VerifiedPermissionedRemoteReplicaOperation(
+      operationIndex: index, wireRevision: revision, action: .update,
+      uri: uri, cid: cid, previousCID: previousCID, value: value
+    ))
+    terminalHash.remove(
+      element: "\(uri.collection)/\(uri.rkey)/\(previousCID.string)"
+    )
+    terminalHash.add(element: "\(uri.collection)/\(uri.rkey)/\(cid.string)")
+    previousCID = cid
+  }
+  return try ChainedIncrementalBatchFixture(
+    batch: makeIncrementalBatch(
+      target: target, expectedHead: expectedHead,
+      terminalRevision: revision, terminalHash: terminalHash,
+      recordCount: 1, operations: operations, requestID: requestID,
+      requestSequence: requestSequence
+    ),
+    terminalCID: previousCID
+  )
 }
 
 private struct RemoteReplicaSQLiteFixture {
@@ -897,11 +2510,20 @@ private struct RemoteReplicaSQLiteFixture {
   static let expiresAt: Int64 = 200
 
   let root: URL
-  let receiverDID = "did:plc:remote-replica-receiver"
+  let receiverDID = "did:plc:abcdefghijklmnopqrstuvwx"
   let repositoryDID = "did:plc:remote-replica-writer"
   let space: SpaceURI
   let target: PermissionedRemoteReplicaTarget
   let signingKey = P256.Signing.PrivateKey()
+  let publicationFence = RemoteReplicaPublicationFence()
+
+  var publicationAuthorization:
+    PermissionedRemoteReplicaPublicationAuthorization
+  {
+    { operation in
+      try await publicationFence.authorize(operation)
+    }
+  }
 
   init(name: String) throws {
     root = FileManager.default.temporaryDirectory.appending(
@@ -1115,7 +2737,7 @@ private struct RemoteReplicaSQLiteFixture {
     expectedBase: PermissionedRemoteReplicaHead?,
     requestID: String,
     publicationAuthorization:
-      PermissionedRemoteReplicaPublicationAuthorization? = nil
+      @escaping PermissionedRemoteReplicaPublicationAuthorization
   ) async throws -> RemoteReplicaInstalledImport {
     let staged = try await stage(
       database: database,
@@ -1129,23 +2751,13 @@ private struct RemoteReplicaSQLiteFixture {
       verification: staged.verification,
       now: Self.operationNow
     )
-    let result: CommittedPermissionedRemoteReplicaRecovery
-    if let publicationAuthorization {
-      result = try await database
-        .publishVerifiedPermissionedRemoteReplicaRecovery(
-          sessionID: staged.session.id,
-          consumedAt: Self.operationNow + 1,
-          now: Self.operationNow,
-          publicationAuthorization: publicationAuthorization
-        )
-    } else {
-      result = try await database
-        .publishVerifiedPermissionedRemoteReplicaRecovery(
-          sessionID: staged.session.id,
-          consumedAt: Self.operationNow + 1,
-          now: Self.operationNow
-        )
-    }
+    let result = try await database
+      .publishVerifiedPermissionedRemoteReplicaRecovery(
+        sessionID: staged.session.id,
+        consumedAt: Self.operationNow + 1,
+        now: Self.operationNow,
+        publicationAuthorization: publicationAuthorization
+      )
     return RemoteReplicaInstalledImport(
       binding: staged.binding,
       result: result
@@ -1246,6 +2858,40 @@ private actor RemoteReplicaPublicationCounter {
   }
 }
 
+private enum RemoteReplicaPublicationFenceError: Error, Equatable {
+  case inactive
+  case operationEscapedAuthorization
+}
+
+private actor RemoteReplicaPublicationFence {
+  private var active = true
+  private(set) var authorizationAttempted = false
+  private(set) var operationActive = false
+
+  func deactivate() {
+    active = false
+  }
+
+  func authorize(
+    _ operation: @escaping @Sendable () async throws
+      -> CommittedPermissionedRemoteReplicaRecovery
+  ) async throws -> CommittedPermissionedRemoteReplicaRecovery {
+    authorizationAttempted = true
+    guard active else {
+      throw RemoteReplicaPublicationFenceError.inactive
+    }
+    operationActive = true
+    defer { operationActive = false }
+    return try await operation()
+  }
+
+  func requireOperationActive() throws {
+    guard operationActive else {
+      throw RemoteReplicaPublicationFenceError.operationEscapedAuthorization
+    }
+  }
+}
+
 private actor RemoteReplicaCARDataSource: SpaceCARRecoveryByteSource {
   private let bytes: Data
   private var offset = 0
@@ -1287,6 +2933,7 @@ private enum RemoteReplicaInjectedFailure: Error, Equatable {
 private enum RemoteReplicaSQLiteTestError: Error {
   case emptyFixture
   case unexpectedStartOutcome
+  case unexpectedOutcome
 }
 
 private func assertRemoteReplicaError<T>(

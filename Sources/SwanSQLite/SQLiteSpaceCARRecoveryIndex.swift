@@ -60,8 +60,9 @@ private final class SQLiteSpaceCARRecoveryLease: @unchecked Sendable {
 }
 
 /// Disposable, owner-only staging for a streaming permissioned CAR recovery.
-/// It stores only DRISL paths, CIDs, and consumption state; record values are
-/// verified one at a time and never enter SQLite.
+/// It stores DRISL paths/CIDs plus one chunked copy of each unique record body.
+/// Publication reads one bounded value at a time; shared CIDs do not duplicate
+/// bodies in scratch storage, and the verifier separately bounds logical writes.
 public actor SQLiteSpaceCARRecoveryIndex: SpaceCARRecoveryIndex {
     private let connection: SQLiteConnection
     private let directoryURL: URL
@@ -155,6 +156,28 @@ public actor SQLiteSpaceCARRecoveryIndex: SpaceCARRecoveryIndex {
                 ) WITHOUT ROWID
                 """
             )
+            _ = try await opened.query(
+                """
+                CREATE TABLE recovery_records (
+                    cid BLOB PRIMARY KEY NOT NULL,
+                    byte_count INTEGER NOT NULL CHECK(byte_count >= 0),
+                    chunk_count INTEGER,
+                    complete INTEGER NOT NULL DEFAULT 0
+                        CHECK(complete IN (0, 1))
+                ) WITHOUT ROWID
+                """
+            )
+            _ = try await opened.query(
+                """
+                CREATE TABLE recovery_record_chunks (
+                    cid BLOB NOT NULL,
+                    chunk_index INTEGER NOT NULL CHECK(chunk_index >= 0),
+                    bytes BLOB NOT NULL,
+                    PRIMARY KEY(cid, chunk_index),
+                    FOREIGN KEY(cid) REFERENCES recovery_records(cid)
+                ) WITHOUT ROWID
+                """
+            )
             // The scratch database is private to this one verifier. Keep its
             // entire short lifetime in one transaction so a hostile 100k-entry
             // DRISL cannot force 100k durable autocommit cycles. Reads and
@@ -186,6 +209,7 @@ public actor SQLiteSpaceCARRecoveryIndex: SpaceCARRecoveryIndex {
     }
 
     public func insert(_ entry: SpaceCARRecoveryIndexEntry) async throws {
+        try Task.checkCancellation()
         try requireOpen()
         do {
             let path = Data(entry.path.utf8)
@@ -211,6 +235,7 @@ public actor SQLiteSpaceCARRecoveryIndex: SpaceCARRecoveryIndex {
     public func nextUnconsumedLexicographicEntry() async throws
         -> SpaceCARRecoveryIndexEntry?
     {
+        try Task.checkCancellation()
         try requireOpen()
         do {
             let rows = try await connection.query(
@@ -232,6 +257,7 @@ public actor SQLiteSpaceCARRecoveryIndex: SpaceCARRecoveryIndex {
     }
 
     public func consumeEntries(forCID cid: CID) async throws -> Int {
+        try Task.checkCancellation()
         try requireOpen()
         do {
             let countRows = try await connection.query(
@@ -263,6 +289,178 @@ public actor SQLiteSpaceCARRecoveryIndex: SpaceCARRecoveryIndex {
                 [cid.bytes.sqliteData!]
             )
             return Int(changed)
+        } catch let error as SpaceCARStreamingError {
+            throw error
+        } catch {
+            throw SpaceCARStreamingError.stagingUnavailable
+        }
+    }
+
+    public func receiveRoots(commit: CID, index: CID) async throws {
+        try requireOpen()
+        guard commit != index else {
+            throw SpaceCARStreamingError.invalidRootCount
+        }
+    }
+
+    public func receiveCommit(cid: CID, body: Data) async throws {
+        try requireOpen()
+        guard !body.isEmpty,
+              body.count <= SpaceCARRecoveryLimits.absoluteMaximumCommitBytes
+        else {
+            throw SpaceCARStreamingError.commitBodyLimitExceeded
+        }
+    }
+
+    public func beginRecord(cid: CID, byteCount: Int) async throws {
+        try requireOpen()
+        guard (0 ... SpaceCARRecoveryLimits.absoluteMaximumRecordBytes)
+            .contains(byteCount) else {
+            throw SpaceCARStreamingError.recordBodyLimitExceeded
+        }
+        do {
+            let rows = try await connection.query(
+                """
+                INSERT INTO recovery_records(cid, byte_count, complete)
+                VALUES (?, ?, 0)
+                ON CONFLICT(cid) DO NOTHING
+                RETURNING complete
+                """,
+                [cid.bytes.sqliteData!, .integer(byteCount)]
+            )
+            guard rows.count == 1 else {
+                throw SpaceCARStreamingError.invalidRecordOrder
+            }
+        } catch let error as SpaceCARStreamingError {
+            throw error
+        } catch {
+            throw SpaceCARStreamingError.stagingUnavailable
+        }
+    }
+
+    public func appendRecordChunk(
+        cid: CID,
+        chunkIndex: Int,
+        bytes: Data
+    ) async throws {
+        try Task.checkCancellation()
+        try requireOpen()
+        guard chunkIndex >= 0,
+              !bytes.isEmpty,
+              bytes.count <= SpaceCARRecoveryLimits.maximumChunkBytes else {
+            throw SpaceCARStreamingError.invalidRecordValue
+        }
+        do {
+            _ = try await connection.query(
+                """
+                INSERT INTO recovery_record_chunks(cid, chunk_index, bytes)
+                VALUES (?, ?, ?)
+                """,
+                [cid.bytes.sqliteData!, .integer(chunkIndex), bytes.sqliteData!]
+            )
+        } catch {
+            throw SpaceCARStreamingError.stagingUnavailable
+        }
+    }
+
+    public func completeRecord(
+        cid: CID,
+        byteCount: Int,
+        chunkCount: Int
+    ) async throws {
+        try requireOpen()
+        guard byteCount >= 0, chunkCount >= 0 else {
+            throw SpaceCARStreamingError.invalidRecordValue
+        }
+        do {
+            let rows = try await connection.query(
+                """
+                UPDATE recovery_records
+                SET chunk_count = ?, complete = 1
+                WHERE cid = ?
+                  AND byte_count = ?
+                  AND complete = 0
+                  AND (SELECT COUNT(*) FROM recovery_record_chunks WHERE cid = ?) = ?
+                  AND (SELECT COALESCE(SUM(length(bytes)), 0)
+                       FROM recovery_record_chunks WHERE cid = ?) = ?
+                RETURNING complete
+                """,
+                [
+                    .integer(chunkCount), cid.bytes.sqliteData!,
+                    .integer(byteCount), cid.bytes.sqliteData!,
+                    .integer(chunkCount), cid.bytes.sqliteData!,
+                    .integer(byteCount),
+                ]
+            )
+            guard rows.count == 1 else {
+                throw SpaceCARStreamingError.invalidRecordValue
+            }
+        } catch let error as SpaceCARStreamingError {
+            throw error
+        } catch {
+            throw SpaceCARStreamingError.stagingUnavailable
+        }
+    }
+
+    public func nextStagedRecord(
+        afterPath: String?
+    ) async throws -> SQLiteSpaceCARStagedRecord? {
+        try Task.checkCancellation()
+        try requireOpen()
+        do {
+            let rows: [SQLiteRow]
+            if let afterPath {
+                rows = try await connection.query(
+                    """
+                    SELECT recovery_index.path, recovery_index.cid
+                    FROM recovery_index
+                    JOIN recovery_records USING(cid)
+                    WHERE recovery_index.path > ? AND recovery_records.complete = 1
+                    ORDER BY recovery_index.path ASC
+                    LIMIT 1
+                    """,
+                    [Data(afterPath.utf8).sqliteData!]
+                )
+            } else {
+                rows = try await connection.query(
+                    """
+                    SELECT recovery_index.path, recovery_index.cid
+                    FROM recovery_index
+                    JOIN recovery_records USING(cid)
+                    WHERE recovery_records.complete = 1
+                    ORDER BY recovery_index.path ASC
+                    LIMIT 1
+                    """
+                )
+            }
+            guard let row = rows.first else { return nil }
+            let entry = try decodeEntry(row)
+            let chunks = try await connection.query(
+                """
+                SELECT bytes
+                FROM recovery_record_chunks
+                WHERE cid = ?
+                ORDER BY chunk_index ASC
+                """,
+                [entry.cid.bytes.sqliteData!]
+            )
+            var value = Data()
+            for chunk in chunks {
+                try Task.checkCancellation()
+                guard let bytesValue = chunk.column("bytes"),
+                      let bytes = Data(sqliteData: bytesValue),
+                      value.count
+                        <= SpaceCARRecoveryLimits.absoluteMaximumRecordBytes
+                            - bytes.count else {
+                    throw SpaceCARStreamingError.stagingUnavailable
+                }
+                value.append(bytes)
+            }
+            return SQLiteSpaceCARStagedRecord(
+                path: entry.path,
+                cid: entry.cid,
+                value: value
+            )
         } catch let error as SpaceCARStreamingError {
             throw error
         } catch {
@@ -354,4 +552,12 @@ public actor SQLiteSpaceCARRecoveryIndex: SpaceCARRecoveryIndex {
         }
         return SpaceCARRecoveryIndexEntry(path: path, cid: cid)
     }
+}
+
+extension SQLiteSpaceCARRecoveryIndex: SpaceCARRecoveryRecordSink {}
+
+public struct SQLiteSpaceCARStagedRecord: Sendable {
+    public let path: String
+    public let cid: CID
+    public let value: Data
 }

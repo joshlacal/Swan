@@ -10,6 +10,7 @@ import XCTest
 @testable import SwanCore
 @testable import SwanHTTP
 @testable import SwanOAuth
+import SwanPublicRepository
 import SwanSQLite
 import SwanSpaces
 import SwanStorage
@@ -31,17 +32,24 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
             maximumConcurrentWrites: 1,
             maximumReservedRequestBytes: maximum
         )
+        let policy = try SwanJSONWriteBodyPolicy(totalBodyTimeout: .seconds(5))
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         do {
             let server = try makeServer(
                 fixture,
-                jsonWriteAdmission: admission
+                jsonWriteAdmission: admission,
+                jsonWriteBodyPolicy: policy
             )
             XCTAssertTrue(server.jsonWriteAdmission === admission)
+            XCTAssertTrue(server.jsonWriteBodyPolicy === policy)
             XCTAssertTrue(
                 server.authenticatedSpaceRecords?.jsonWriteAdmission
                     === admission
+            )
+            XCTAssertTrue(
+                server.authenticatedSpaceRecords?.jsonWriteBodyPolicy
+                    === policy
             )
             let held = try XCTUnwrap(
                 admission.reserve(maximumRequestBytes: maximum)
@@ -72,6 +80,200 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                 activeLeases: 0,
                 reservedRequestBytes: 0
             ))
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
+    func testPermissionedContentLengthDeclarationPolicyRejectsBeforeAdmission() {
+        let maximum = authenticatedSpaceWriteMaximumJSONBytes
+        for (name, values) in contentLengthRejectionCases(maximum: maximum) {
+            XCTAssertFalse(acceptsAuthenticatedSpaceWriteContentLength(values), name)
+        }
+        XCTAssertTrue(acceptsAuthenticatedSpaceWriteContentLength([]), "missing")
+        XCTAssertTrue(acceptsAuthenticatedSpaceWriteContentLength(["1"]), "valid")
+        XCTAssertTrue(acceptsAuthenticatedSpaceWriteContentLength([String(maximum)]), "boundary")
+    }
+
+    func testPermissionedOversizedDeclarationRejectsBeforeAuthorizationAndDomain() async throws {
+        let maximum = authenticatedSpaceWriteMaximumJSONBytes
+        let admission = try PublicRepositoryJSONWriteAdmission(
+            maximumConcurrentWrites: 1,
+            maximumReservedRequestBytes: maximum
+        )
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let directory = FailingPermissionedWriteDirectory(
+            barrier: PermissionedCanonicalWriteBarrier()
+        )
+        do {
+            let server = try makeServer(
+                fixture,
+                jsonWriteAdmission: admission,
+                authenticatedDirectory: directory
+            )
+            let held = try XCTUnwrap(admission.reserve(maximumRequestBytes: maximum))
+            let replayCount = try await oauthDPoPReplayCount(in: fixture.root)
+            do {
+                try await server.buildApplication(
+                    logger: Logger(label: "PermissionedRecordWriteAdmissionTests.oversized-socket")
+                ).test(.live) { client in
+                    let response = try await executeRealSocketIncompleteHTTPBody(
+                        port: try XCTUnwrap(client.port),
+                        path: Self.createPath,
+                        headers: try self.writeHeaders(
+                            fixture,
+                            path: Self.createPath,
+                            jti: "permissioned-oversized-socket"
+                        ),
+                        declaredBodyBytes: maximum + 1,
+                        emittedBody: "{"
+                    )
+                    XCTAssertEqual(response.statusCode, 400)
+                    XCTAssertEqual(
+                        try self.jsonObject(response.body)["error"] as? String,
+                        "InvalidRequest"
+                    )
+                    XCTAssertEqual(response.emittedBodyBytes, 1)
+                    XCTAssertEqual(
+                        admission.snapshot,
+                        .init(activeLeases: 1, reservedRequestBytes: maximum)
+                    )
+                    let finalReplayCount = try await oauthDPoPReplayCount(in: fixture.root)
+                    let domainCallCount = await directory.domainCallCount
+                    XCTAssertEqual(finalReplayCount, replayCount)
+                    XCTAssertEqual(domainCallCount, 0)
+                }
+                held.release()
+            } catch {
+                held.release()
+                throw error
+            }
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
+    func testServerSharesAdmissionAndDeadlineAcrossEveryJSONWriteCapability() async throws {
+        let admission = try PublicRepositoryJSONWriteAdmission(
+            maximumConcurrentWrites: 1,
+            maximumReservedRequestBytes: authenticatedSpaceWriteMaximumJSONBytes
+        )
+        let policy = try SwanJSONWriteBodyPolicy(totalBodyTimeout: .seconds(7))
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let server = SwanHTTPServer(
+                profile: try ProtocolProfile.load(
+                    from: packageRoot().appending(
+                        path: "Profiles/permissioned-data-0016-2026-07-30.json"
+                    )
+                ),
+                configuration: .init(
+                    host: "127.0.0.1",
+                    port: 3_000,
+                    publicURL: Self.publicURL
+                ),
+                oauthRuntime: fixture.runtime,
+                authenticatedGetSpaceDirectory: fixture.directory,
+                accountControlStore: fixture.control,
+                publicRepositoryMutationDirectory: EmptyPublicMutationDirectory(),
+                publicRepositoryMutationSignerProvider: UnavailableMutationSignerProvider(),
+                jsonWriteAdmission: admission,
+                jsonWriteBodyPolicy: policy
+            )
+
+            XCTAssertTrue(server.jsonWriteAdmission === admission)
+            XCTAssertTrue(server.jsonWriteBodyPolicy === policy)
+            XCTAssertTrue(server.publicRepositoryMutations?.jsonWriteAdmission === admission)
+            XCTAssertTrue(server.publicRepositoryMutations?.jsonWriteBodyPolicy === policy)
+            XCTAssertTrue(server.authenticatedSpaceRecords?.jsonWriteAdmission === admission)
+            XCTAssertTrue(server.authenticatedSpaceRecords?.jsonWriteBodyPolicy === policy)
+            XCTAssertTrue(server.authenticatedSimpleSpaceLifecycle?.jsonWriteAdmission === admission)
+            XCTAssertTrue(server.authenticatedSimpleSpaceLifecycle?.jsonWriteBodyPolicy === policy)
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
+    func testPermissionedCanonicalLeaseReleasesAfterAuthorizationAndHandlerFailures() async throws {
+        let maximum = authenticatedSpaceWriteMaximumJSONBytes
+        let admission = try PublicRepositoryJSONWriteAdmission(
+            maximumConcurrentWrites: 1,
+            maximumReservedRequestBytes: maximum
+        )
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let barrier = PermissionedCanonicalWriteBarrier()
+            let directory = FailingPermissionedWriteDirectory(barrier: barrier)
+            let server = try makeServer(
+                fixture,
+                jsonWriteAdmission: admission,
+                authenticatedDirectory: directory
+            )
+            let app = server.buildApplication(
+                logger: Logger(label: "PermissionedRecordWriteAdmissionTests.canonical")
+            )
+            let body = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","collection":"\#(Self.collection)","rkey":"lease-held","record":{"$type":"app.bsky.feed.post","text":"canonical"}}"#
+
+            try await app.test(.router) { client in
+                let blocked = Task {
+                    try await client.execute(
+                        uri: Self.putPath,
+                        method: .post,
+                        headers: try self.writeHeaders(
+                            fixture,
+                            path: Self.putPath,
+                            jti: "canonical-handler-failure"
+                        ),
+                        body: ByteBuffer(string: body)
+                    )
+                }
+                try await barrier.waitUntilEntered()
+                let canonicalByteCount = await barrier.canonicalByteCount
+                XCTAssertGreaterThan(canonicalByteCount, 0)
+                XCTAssertEqual(
+                    admission.snapshot,
+                    .init(activeLeases: 1, reservedRequestBytes: maximum)
+                )
+                await barrier.release()
+                let failed = try await blocked.value
+                XCTAssertEqual(failed.status, .serviceUnavailable)
+                XCTAssertEqual(
+                    admission.snapshot,
+                    .init(activeLeases: 0, reservedRequestBytes: 0)
+                )
+
+                let fakeToken = "opaque-token-that-does-not-exist"
+                var deniedHeaders = try self.signedHeaders(
+                    token: fakeToken,
+                    key: fixture.aliceKey,
+                    jwk: fixture.aliceJWK,
+                    path: Self.putPath,
+                    nonce: fixture.runtime.dpopNonceService.issue(),
+                    jti: "canonical-authorization-failure",
+                    method: "POST"
+                )
+                deniedHeaders[.contentType] = "application/json"
+                let denied = try await client.execute(
+                    uri: Self.putPath,
+                    method: .post,
+                    headers: deniedHeaders,
+                    body: ByteBuffer(string: body)
+                )
+                XCTAssertEqual(denied.status, .unauthorized)
+                XCTAssertEqual(
+                    admission.snapshot,
+                    .init(activeLeases: 0, reservedRequestBytes: 0)
+                )
+            }
             try await close(fixture)
         } catch {
             try? await close(fixture)
@@ -1188,7 +1390,9 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
 
     private func makeServer(
         _ fixture: Fixture,
-        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
+        jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil,
+        authenticatedDirectory: (any AuthorizedSimpleSpaceDirectory)? = nil
     ) throws -> SwanHTTPServer {
         let profile = try ProtocolProfile.load(
             from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-30.json")
@@ -1198,13 +1402,16 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                 maximumConcurrentWrites: 64,
                 maximumReservedRequestBytes: 64 * 1_024 * 1_024
             )
+        let resolvedDirectory: any AuthorizedSimpleSpaceDirectory =
+            authenticatedDirectory ?? fixture.directory
         return SwanHTTPServer(
             profile: profile,
             configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: Self.publicURL),
             oauthRuntime: fixture.runtime,
-            authenticatedGetSpaceDirectory: fixture.directory,
+            authenticatedGetSpaceDirectory: resolvedDirectory,
             accountControlStore: fixture.control,
-            jsonWriteAdmission: resolvedWriteAdmission
+            jsonWriteAdmission: resolvedWriteAdmission,
+            jsonWriteBodyPolicy: jsonWriteBodyPolicy
         )
     }
 
@@ -1408,6 +1615,136 @@ private struct TokenMaterial: Sendable {
 private struct ConcurrentWriteOutcome: Sendable {
     let status: Int
     let uri: String?
+}
+
+private actor PermissionedCanonicalWriteBarrier {
+    private var entered = false
+    private var released = false
+    private(set) var canonicalByteCount = 0
+
+    func arriveAndWait(canonicalByteCount: Int) async throws {
+        self.canonicalByteCount = canonicalByteCount
+        entered = true
+        while !released {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(2))
+        }
+    }
+
+    func waitUntilEntered() async throws {
+        let deadline = ContinuousClock().now.advanced(by: .seconds(5))
+        while !entered {
+            guard ContinuousClock().now < deadline else {
+                throw PermissionedCanonicalWriteBarrierTimeout()
+            }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+    }
+
+    func release() {
+        released = true
+    }
+}
+
+private struct PermissionedCanonicalWriteBarrierTimeout: Error {}
+
+private actor FailingPermissionedWriteDirectory:
+    AuthorizedSimpleSpaceDirectory,
+    AuthorizedSpaceRepositoryDirectory
+{
+    let barrier: PermissionedCanonicalWriteBarrier
+    private(set) var domainCallCount = 0
+
+    init(barrier: PermissionedCanonicalWriteBarrier) {
+        self.barrier = barrier
+    }
+
+    func space(
+        _ space: SpaceURI,
+        authorization: AuthorizationContext
+    ) async throws -> AuthenticatedSimpleSpaceDescription? { nil }
+
+    func close() async throws {}
+
+    func record(
+        _ uri: SpaceRecordURI,
+        authorization: AuthorizationContext
+    ) async throws -> SpaceRecord? { nil }
+
+    func records(
+        space: SpaceURI,
+        author: String,
+        collection: String?,
+        limit: Int,
+        cursor: String?,
+        reverse: Bool,
+        authorization: AuthorizationContext
+    ) async throws -> [SpaceRecord] { [] }
+
+    func repositoryCommitState(
+        space: SpaceURI,
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositoryCommitState {
+        throw SwanError.unavailable("test handler failure")
+    }
+
+    func repositoryOplog(
+        space: SpaceURI,
+        author: String,
+        since: String?,
+        limit: Int,
+        includeValues: Bool,
+        maximumAggregateValueBytes: Int,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositoryOplogRead {
+        throw SwanError.unavailable("test handler failure")
+    }
+
+    func repositoryCARSnapshot(
+        space: SpaceURI,
+        author: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceRepositoryCARSnapshot? {
+        throw SwanError.unavailable("test handler failure")
+    }
+
+    func apply(
+        space: SpaceURI,
+        author: String,
+        writes: [AuthorizedSpaceRepositoryWrite],
+        requestID: UUID,
+        wireRevision: String,
+        authorization: AuthorizationContext
+    ) async throws -> [AuthorizedSpaceRepositoryWriteResult] {
+        domainCallCount += 1
+        var byteCount = 0
+        for write in writes {
+            switch write {
+            case let .create(_, value), let .put(_, value), let .update(_, value):
+                _ = try CARRepository.decodeRecordCBOR(value)
+                byteCount += value.count
+            case .delete:
+                break
+            }
+        }
+        try await barrier.arriveAndWait(canonicalByteCount: byteCount)
+        throw SwanError.unavailable("test handler failure")
+    }
+}
+
+private struct EmptyPublicMutationDirectory: PublicRepositoryMutationDirectory {
+    func publicRepositoryMutationTarget(
+        selector: String
+    ) async throws -> PublicRepositoryMutationTarget? { nil }
+}
+
+private struct UnavailableMutationSignerProvider: PublicRepositoryMutationSignerProvider {
+    func signer(
+        for did: String
+    ) async throws -> any PublicRepositoryCommitSigner {
+        throw SwanError.unavailable("test signer unavailable")
+    }
 }
 
 private struct Fixture: Sendable {

@@ -69,6 +69,65 @@ final class MailpitSMTPDeliveryTests: XCTestCase {
         }
     }
 
+    func testShutdownClosesActiveChannelBeforeWaitingForDeliveryDrain() async throws {
+        try await withSMTPServer(
+            mode: .stallAfterEHLO,
+            commandTimeout: 30,
+            maximumConcurrentDeliveries: 1,
+            maximumPendingDeliveries: 0
+        ) { delivery, server in
+            let deliveryFinished = expectation(description: "delivery finished")
+            let shutdownFinished = expectation(description: "shutdown finished")
+            let deliveryTask = Task<Result<Void, Error>, Never> {
+                defer { deliveryFinished.fulfill() }
+                do {
+                    try await delivery.deliver(
+                        to: try AccountEmailAddress("reader@example.test"),
+                        subject: "Swan proof",
+                        body: "proof"
+                    )
+                    return .success(())
+                } catch {
+                    return .failure(error)
+                }
+            }
+            try await server.waitUntilEHLO()
+            let shutdownTask = Task<Result<Void, Error>, Never> {
+                defer { shutdownFinished.fulfill() }
+                do {
+                    try await delivery.shutdown()
+                    return .success(())
+                } catch {
+                    return .failure(error)
+                }
+            }
+
+            let result = await XCTWaiter.fulfillment(
+                of: [deliveryFinished, shutdownFinished],
+                timeout: 0.5
+            )
+            if result != .completed {
+                await server.closeActiveConnections()
+            }
+            XCTAssertEqual(result, .completed)
+            switch await deliveryTask.value {
+            case .success:
+                XCTFail("stalled delivery unexpectedly succeeded")
+            case let .failure(error):
+                XCTAssertEqual(
+                    error as? MailpitSMTPDeliveryError,
+                    .unavailable
+                )
+            }
+            switch await shutdownTask.value {
+            case .success:
+                break
+            case let .failure(error):
+                XCTFail("shutdown failed: \(error)")
+            }
+        }
+    }
+
     func testBoundsRepliesAndRejectsUnsafeMessageFields() async throws {
         try await withSMTPServer(mode: .oversizedEHLOReply) {
             delivery,
@@ -194,6 +253,7 @@ private final class LocalSMTPReceipt: @unchecked Sendable {
     private var commands: [String] = []
     private var dataLines: [String] = []
     private var didObserveEHLO = false
+    private var activeConnections: [ObjectIdentifier: Channel] = [:]
 
     init(ehloPromise: EventLoopPromise<Void>) {
         self.ehloPromise = ehloPromise
@@ -212,6 +272,25 @@ private final class LocalSMTPReceipt: @unchecked Sendable {
         lock.lock()
         dataLines.append(line)
         lock.unlock()
+    }
+
+    func addConnection(_ channel: Channel) {
+        lock.lock()
+        activeConnections[ObjectIdentifier(channel)] = channel
+        lock.unlock()
+    }
+
+    func removeConnection(_ channel: Channel) {
+        lock.lock()
+        activeConnections.removeValue(forKey: ObjectIdentifier(channel))
+        lock.unlock()
+    }
+
+    func closeActiveConnections() async {
+        let channels = lock.withLock { Array(activeConnections.values) }
+        for channel in channels {
+            try? await channel.close().get()
+        }
     }
 
     func snapshot() -> LocalSMTPTranscript {
@@ -293,6 +372,10 @@ private final class LocalSMTPServer: @unchecked Sendable {
         try await receipt.waitUntilEHLO()
     }
 
+    func closeActiveConnections() async {
+        await receipt.closeActiveConnections()
+    }
+
     func close() async {
         receipt.failIfPending()
         try? await channel.close().get()
@@ -319,7 +402,12 @@ private final class LocalSMTPHandler:
     }
 
     func channelActive(context: ChannelHandlerContext) {
+        receipt.addConnection(context.channel)
         reply("220 mailpit ready\r\n", context: context)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        receipt.removeConnection(context.channel)
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {

@@ -424,6 +424,12 @@ public final class PublicRepositoryJSONWriteAdmission: @unchecked Sendable {
 
     public static let processShared = try! PublicRepositoryJSONWriteAdmission()
 
+    /// Reserved process-wide capacity for the loopback-only operator listener.
+    /// Public routes must never receive this instance: keeping it distinct from
+    /// ``processShared`` prevents anonymous writes from starving emergency
+    /// suspension, account lifecycle, and other authenticated operator work.
+    public static let managementProcessShared = try! PublicRepositoryJSONWriteAdmission()
+
     private let maximumConcurrentWrites: Int
     private let maximumReservedRequestBytes: Int
     private let lock = NSLock()

@@ -43,8 +43,8 @@ public enum MailpitSMTPDeliveryError: Error, Sendable, Equatable {
 ///
 /// One instance owns and reuses its event-loop group. Its lifecycle owner must
 /// call `shutdown()` during service teardown; shutdown rejects queued/new work,
-/// drains admitted deliveries (which have bounded connect/command deadlines),
-/// and then closes the shared group.
+/// closes every active SMTP channel, drains admitted deliveries, and then
+/// closes the shared group.
 public actor MailpitSMTPDelivery: AccountEmailDelivery {
     public nonisolated var cancellationContract:
         AccountEmailDeliveryCancellationContract { .bounded }
@@ -67,6 +67,7 @@ public actor MailpitSMTPDelivery: AccountEmailDelivery {
     private var admissionWaiters: [AdmissionWaiter] = []
     private var drainWaiters: [CheckedContinuation<Void, Never>] = []
     private var shutdownWaiters: [CheckedContinuation<Void, Error>] = []
+    private var activeChannels: [ObjectIdentifier: Channel] = [:]
     private var shutdownStarted = false
     private var shutdownResult: Result<Void, MailpitSMTPDeliveryError>?
 
@@ -136,6 +137,10 @@ public actor MailpitSMTPDelivery: AccountEmailDelivery {
             $0.continuation.resume(
                 throwing: MailpitSMTPDeliveryError.shutDown
             )
+        }
+        let channels = Array(activeChannels.values)
+        for channel in channels {
+            channel.close(promise: nil)
         }
         if activeDeliveries > 0 {
             await withCheckedContinuation { drainWaiters.append($0) }
@@ -249,6 +254,13 @@ public actor MailpitSMTPDelivery: AccountEmailDelivery {
         } catch {
             throw MailpitSMTPDeliveryError.unavailable
         }
+        guard !shutdownStarted else {
+            try? await channel.close().get()
+            throw MailpitSMTPDeliveryError.shutDown
+        }
+        let channelID = ObjectIdentifier(channel)
+        activeChannels[channelID] = channel
+        defer { activeChannels.removeValue(forKey: channelID) }
         do {
             try await withTaskCancellationHandler {
                 try await completion.futureResult.get()
@@ -1014,6 +1026,7 @@ public actor AccountEmailRecoveryService {
             AccountPasswordRecoveryDeliveryRequest(
                 deliveryID: deliveryID,
                 proofDigest: proofCodec.digest(proof: proof),
+                email: email,
                 lookupDigest: proofCodec.lookupDigest(email: email),
                 emailEnvelope: emailEnvelope,
                 expiresAt: now.addingTimeInterval(tokenLifetime),

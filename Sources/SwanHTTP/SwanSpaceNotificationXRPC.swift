@@ -17,17 +17,20 @@ public struct SwanAuthenticatedSpaceNotificationsCapability: Sendable {
     let credentialAuthorizer: any SpaceCredentialAuthorizationVerifier
     let serviceAuthentication: any SpaceServiceAuthenticationVerifier
     let recipientBindings: SwanSpaceNotificationRecipientBindings
+    let notificationJSONDecodeObserver: (@Sendable () async -> Void)?
 
     init(
         directory: any AuthorizedSpaceNotificationDirectory,
         credentialAuthorizer: any SpaceCredentialAuthorizationVerifier,
         serviceAuthentication: any SpaceServiceAuthenticationVerifier,
-        recipientBindings: SwanSpaceNotificationRecipientBindings
+        recipientBindings: SwanSpaceNotificationRecipientBindings,
+        notificationJSONDecodeObserver: (@Sendable () async -> Void)? = nil
     ) {
         self.directory = directory
         self.credentialAuthorizer = credentialAuthorizer
         self.serviceAuthentication = serviceAuthentication
         self.recipientBindings = recipientBindings
+        self.notificationJSONDecodeObserver = notificationJSONDecodeObserver
     }
 }
 
@@ -250,17 +253,24 @@ func registerAuthenticatedListSpaceReposEndpoint(
 
 func registerAuthenticatedRegisterSpaceNotifyEndpoint(
     on router: Router<BasicRequestContext>,
-    capability: SwanAuthenticatedSpaceNotificationsCapability
+    capability: SwanAuthenticatedSpaceNotificationsCapability,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
     let handler = AuthenticatedRegisterSpaceNotifyHandler(capability: capability)
     let path: RouterPath = "/xrpc/com.atproto.space.registerNotify"
-    router.post(path) { request, _ async -> Response in
+    router.post(path) { request, context async -> Response in
         do {
-            let input = try await decodeRegisterSpaceNotifyInput(request)
+            let input = try await decodeRegisterSpaceNotifyInput(
+                request, context: context, requestBodyAdmission: requestBodyAdmission,
+                decodeObserver: capability.notificationJSONDecodeObserver)
             let output = try await handler.handle(parameters: (), input: input, context: request)
             return authenticatedGetSpaceJSON(.ok, output)
         } catch let failure as AuthenticatedSpaceNotificationFailure {
             return authenticatedSpaceNotificationResponse(for: failure)
+        } catch let failure as SwanRequestBodyCollectionFailure {
+            return authenticatedSpaceNotificationResponse(
+                for: failure == .unavailable ? .unavailable : .invalidRequest
+            )
         } catch {
             return authenticatedSpaceNotificationError(.badRequest, code: "InvalidRequest")
         }
@@ -270,17 +280,24 @@ func registerAuthenticatedRegisterSpaceNotifyEndpoint(
 
 func registerAuthenticatedNotifySpaceWriteEndpoint(
     on router: Router<BasicRequestContext>,
-    capability: SwanAuthenticatedSpaceNotificationsCapability
+    capability: SwanAuthenticatedSpaceNotificationsCapability,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
     let handler = AuthenticatedNotifySpaceWriteHandler(capability: capability)
     let path: RouterPath = "/xrpc/com.atproto.space.notifyWrite"
-    router.post(path) { request, _ async -> Response in
+    router.post(path) { request, context async -> Response in
         do {
-            let input = try await decodeNotifySpaceWriteInput(request)
+            let input = try await decodeNotifySpaceWriteInput(
+                request, context: context, requestBodyAdmission: requestBodyAdmission,
+                decodeObserver: capability.notificationJSONDecodeObserver)
             try await handler.handle(parameters: (), input: input, context: request)
             return Response(status: .ok, headers: [.cacheControl: "no-store"])
         } catch let failure as AuthenticatedSpaceNotificationFailure {
             return authenticatedSpaceNotificationResponse(for: failure)
+        } catch let failure as SwanRequestBodyCollectionFailure {
+            return authenticatedSpaceNotificationResponse(
+                for: failure == .unavailable ? .unavailable : .invalidRequest
+            )
         } catch {
             return authenticatedSpaceNotificationError(.badRequest, code: "InvalidRequest")
         }
@@ -290,17 +307,24 @@ func registerAuthenticatedNotifySpaceWriteEndpoint(
 
 func registerAuthenticatedNotifySpaceDeletedEndpoint(
     on router: Router<BasicRequestContext>,
-    capability: SwanAuthenticatedSpaceNotificationsCapability
+    capability: SwanAuthenticatedSpaceNotificationsCapability,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
     let handler = AuthenticatedNotifySpaceDeletedHandler(capability: capability)
     let path: RouterPath = "/xrpc/com.atproto.space.notifySpaceDeleted"
-    router.post(path) { request, _ async -> Response in
+    router.post(path) { request, context async -> Response in
         do {
-            let input = try await decodeNotifySpaceDeletedInput(request)
+            let input = try await decodeNotifySpaceDeletedInput(
+                request, context: context, requestBodyAdmission: requestBodyAdmission,
+                decodeObserver: capability.notificationJSONDecodeObserver)
             try await handler.handle(parameters: (), input: input, context: request)
             return Response(status: .ok, headers: [.cacheControl: "no-store"])
         } catch let failure as AuthenticatedSpaceNotificationFailure {
             return authenticatedSpaceNotificationResponse(for: failure)
+        } catch let failure as SwanRequestBodyCollectionFailure {
+            return authenticatedSpaceNotificationResponse(
+                for: failure == .unavailable ? .unavailable : .invalidRequest
+            )
         } catch {
             return authenticatedSpaceNotificationError(.badRequest, code: "InvalidRequest")
         }
@@ -359,9 +383,16 @@ private func parseListSpaceReposParameters(
 }
 
 private func decodeRegisterSpaceNotifyInput(
-    _ request: Request
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
+    decodeObserver: (@Sendable () async -> Void)?
 ) async throws -> ComAtprotoSpaceRegisterNotify.Input {
-    let data = try await notificationJSONBody(request)
+    let admitted = try await notificationJSONBody(
+        request, context: context, requestBodyAdmission: requestBodyAdmission)
+    defer { withExtendedLifetime(admitted.body) {} }
+    let data = admitted.data
+    await decodeObserver?()
     try notificationJSONObject(
         data,
         allowedKeys: ["space", "repo", "endpoint"],
@@ -385,9 +416,16 @@ private func decodeRegisterSpaceNotifyInput(
 }
 
 private func decodeNotifySpaceWriteInput(
-    _ request: Request
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
+    decodeObserver: (@Sendable () async -> Void)?
 ) async throws -> ComAtprotoSpaceNotifyWrite.Input {
-    let data = try await notificationJSONBody(request)
+    let admitted = try await notificationJSONBody(
+        request, context: context, requestBodyAdmission: requestBodyAdmission)
+    defer { withExtendedLifetime(admitted.body) {} }
+    let data = admitted.data
+    await decodeObserver?()
     try notificationJSONObject(
         data,
         allowedKeys: ["space", "repo", "rev", "hash"],
@@ -410,9 +448,16 @@ private func decodeNotifySpaceWriteInput(
 }
 
 private func decodeNotifySpaceDeletedInput(
-    _ request: Request
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
+    decodeObserver: (@Sendable () async -> Void)?
 ) async throws -> ComAtprotoSpaceNotifySpaceDeleted.Input {
-    let data = try await notificationJSONBody(request)
+    let admitted = try await notificationJSONBody(
+        request, context: context, requestBodyAdmission: requestBodyAdmission)
+    defer { withExtendedLifetime(admitted.body) {} }
+    let data = admitted.data
+    await decodeObserver?()
     try notificationJSONObject(data, allowedKeys: ["space"], requiredKeys: ["space"])
     do {
         let input = try JSONDecoder().decode(ComAtprotoSpaceNotifySpaceDeleted.Input.self, from: data)
@@ -423,33 +468,31 @@ private func decodeNotifySpaceDeletedInput(
     }
 }
 
-private func notificationJSONBody(_ request: Request) async throws -> Data {
-    let contentTypes = request.headers[values: .contentType]
-    guard contentTypes.count == 1,
-          contentTypes[0]
-            .split(separator: ";", maxSplits: 1).first?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased() == "application/json" else {
-        throw AuthenticatedSpaceNotificationFailure.invalidRequest
-    }
-    let lengths = request.headers[values: .contentLength]
-    guard lengths.count <= 1,
-          lengths.first.flatMap(Int.init).map({
-              (1 ... SwanSpaceNotificationHTTP.maximumJSONBytes).contains($0)
-          }) ?? true else {
-        throw AuthenticatedSpaceNotificationFailure.invalidRequest
-    }
-    let body: ByteBuffer
-    do {
-        body = try await request.body.collect(upTo: SwanSpaceNotificationHTTP.maximumJSONBytes)
-    } catch {
-        throw AuthenticatedSpaceNotificationFailure.invalidRequest
-    }
+private func notificationJSONBody(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> SwanAdmittedNotificationJSON {
+    let body = try await collectAdmittedRequestBody(
+        request,
+        mediaType: .json,
+        admission: requestBodyAdmission.admission,
+        policy: requestBodyAdmission.policy,
+        maximumBytes: SwanSpaceNotificationHTTP.maximumJSONBytes,
+        termination: context.jsonWriteBodyTermination
+    )
     guard body.readableBytes > 0,
           let bytes = body.getBytes(at: body.readerIndex, length: body.readableBytes) else {
         throw AuthenticatedSpaceNotificationFailure.invalidRequest
     }
-    return Data(bytes)
+    return SwanAdmittedNotificationJSON(body: body, data: Data(bytes))
+}
+
+private struct SwanAdmittedNotificationJSON {
+    // Retaining this wrapper keeps aggregate admission held through the
+    // caller's strict object validation and generated-model decode.
+    let body: SwanAdmittedRequestBody
+    let data: Data
 }
 
 private func notificationJSONObject(

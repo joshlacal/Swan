@@ -62,6 +62,8 @@ public struct SwanOperatorAccountRestorer: Sendable {
     private let afterStagingBeforeValidation: (@Sendable () throws -> Void)?
     private let afterRenameBeforeParentSync: (@Sendable () throws -> Void)?
     private let afterCleanupEntryResolvedBeforeRemoval: (@Sendable (String) throws -> Void)?
+    private let afterQuarantineMoveBeforeValidation: (@Sendable () throws -> Void)?
+    private let maximumLogicalRestoredBytes: Int
 
     public init() {
         afterStagingBeforeInstall = nil
@@ -69,6 +71,9 @@ public struct SwanOperatorAccountRestorer: Sendable {
         afterStagingBeforeValidation = nil
         afterRenameBeforeParentSync = nil
         afterCleanupEntryResolvedBeforeRemoval = nil
+        afterQuarantineMoveBeforeValidation = nil
+        maximumLogicalRestoredBytes =
+            SwanPortableExportFilesystem.maximumArchiveBytes
     }
 
     init(
@@ -76,8 +81,12 @@ public struct SwanOperatorAccountRestorer: Sendable {
         afterStagingPathValidatedBeforeStorageOpen: (@Sendable () throws -> Void)? = nil,
         afterStagingBeforeValidation: (@Sendable () throws -> Void)? = nil,
         afterRenameBeforeParentSync: (@Sendable () throws -> Void)? = nil,
-        afterCleanupEntryResolvedBeforeRemoval: (@Sendable (String) throws -> Void)? = nil
+        afterCleanupEntryResolvedBeforeRemoval: (@Sendable (String) throws -> Void)? = nil,
+        afterQuarantineMoveBeforeValidation: (@Sendable () throws -> Void)? = nil,
+        maximumLogicalRestoredBytes: Int =
+            SwanPortableExportFilesystem.maximumArchiveBytes
     ) {
+        precondition(maximumLogicalRestoredBytes > 0)
         self.afterStagingBeforeInstall = afterStagingBeforeInstall
         self.afterStagingPathValidatedBeforeStorageOpen =
             afterStagingPathValidatedBeforeStorageOpen
@@ -85,6 +94,9 @@ public struct SwanOperatorAccountRestorer: Sendable {
         self.afterRenameBeforeParentSync = afterRenameBeforeParentSync
         self.afterCleanupEntryResolvedBeforeRemoval =
             afterCleanupEntryResolvedBeforeRemoval
+        self.afterQuarantineMoveBeforeValidation =
+            afterQuarantineMoveBeforeValidation
+        self.maximumLogicalRestoredBytes = maximumLogicalRestoredBytes
     }
 
     public func restore(
@@ -120,7 +132,8 @@ public struct SwanOperatorAccountRestorer: Sendable {
         // remains entirely unprobed.
         let sourceRoot = try SwanPortableExportFilesystem.openArchiveRoot(source)
         defer { _ = close(sourceRoot) }
-        let payload = try SwanOperatorAccountBackupVerifier.verifiedPayload(
+        let payload = try await SwanOperatorAccountBackupVerifier
+            .verifiedPayloadStreaming(
             directoryDescriptor: sourceRoot,
             using: backupKey
         )
@@ -132,7 +145,8 @@ public struct SwanOperatorAccountRestorer: Sendable {
             name: "portable"
         )
         defer { _ = close(portableRoot) }
-        let repeatedPortable = try SwanPortableExportVerifier.verifySelfContainedArchive(
+        let repeatedPortable = try await SwanPortableExportVerifier
+            .verifySelfContainedArchiveStreaming(
             directoryDescriptor: portableRoot
         )
         guard repeatedPortable.manifestSHA256 == payload.portable.manifestSHA256,
@@ -202,6 +216,8 @@ public struct SwanOperatorAccountRestorer: Sendable {
                     rootDescriptor: stagingDescriptor
                 )
             )
+            var installedRepositories: [SQLitePortableRestoreRepositoryMetadata] = []
+            var installedLogicalRestoredBytes = 0
             do {
                 _ = try await database.installPublicRepositoryGenesis(
                     artifacts.publicGenesis,
@@ -243,19 +259,42 @@ public struct SwanOperatorAccountRestorer: Sendable {
                 _ = try await database.installPublicPLCOperation(
                     artifacts.plcHistoryEntry
                 )
-                try await database.restorePortableRepositories(artifacts.repositories)
+                for repository in artifacts.repositories {
+                    try Task.checkCancellation()
+                    let metadata = try await installRepository(
+                        repository,
+                        portableRoot: portableRoot,
+                        signingPublicKey: payload.portable.signingPublicKey,
+                        database: database,
+                        maximumLogicalRestoredBytes:
+                            maximumLogicalRestoredBytes
+                                - installedLogicalRestoredBytes
+                    )
+                    let (nextLogicalRestoredBytes, overflow) =
+                        installedLogicalRestoredBytes.addingReportingOverflow(
+                            metadata.logicalRestoredByteCount
+                        )
+                    guard !overflow,
+                          nextLogicalRestoredBytes
+                            <= maximumLogicalRestoredBytes else {
+                        throw SwanOperatorAccountRestoreError.failed
+                    }
+                    installedLogicalRestoredBytes = nextLogicalRestoredBytes
+                    installedRepositories.append(metadata)
+                }
                 for blob in artifacts.blobs {
-                    _ = try await database.restorePortableBlob(
-                        blob.data,
-                        expectedCID: blob.reference.cid,
-                        namespace: blob.reference.namespace
+                    try Task.checkCancellation()
+                    try await installBlob(
+                        blob,
+                        portableRoot: portableRoot,
+                        database: database
                     )
                 }
-                try await database.validatePortableRestore(
-                    repositories: artifacts.repositories
+                try await database.validatePortableRestoreStreaming(
+                    repositories: installedRepositories
                 )
                 let inventory = try await database.portableExportInventory()
-                guard inventory.repositories == artifacts.repositories.map({
+                guard inventory.repositories == installedRepositories.map({
                     .init(space: $0.space, author: $0.author)
                 }),
                 inventory.blobs == artifacts.blobs.map(\.reference) else {
@@ -329,12 +368,14 @@ public struct SwanOperatorAccountRestorer: Sendable {
                 displayURL: destination.url,
                 payload: payload,
                 artifacts: artifacts,
+                installedRepositories: installedRepositories,
                 configuration: configuration,
                 expectedSigningPublicKey: signingPrivateKey.publicKey,
                 expectedRotationPublicKey: rotationPrivateKey.publicKey
             )
             try SwanPortableExportFilesystem.synchronizeTree(root: stagingDescriptor)
             try destination.requireCurrentParentAndAbsentTarget()
+            try Task.checkCancellation()
             try SwanPortableExportFilesystem.renameExclusively(
                 parent: destination.parentDescriptor,
                 source: stagingName,
@@ -352,6 +393,17 @@ public struct SwanOperatorAccountRestorer: Sendable {
             ) else {
                 throw SwanOperatorAccountRestoreError.failed
             }
+            try await validateReopenedStaging(
+                rootDescriptor: stagingDescriptor,
+                keyDirectoryDescriptor: keysDirectory,
+                displayURL: destination.url,
+                payload: payload,
+                artifacts: artifacts,
+                installedRepositories: installedRepositories,
+                configuration: configuration,
+                expectedSigningPublicKey: signingPrivateKey.publicKey,
+                expectedRotationPublicKey: rotationPrivateKey.publicKey
+            )
             _ = close(stagingDescriptor)
             return SwanOperatorAccountRestoreResult(
                 canonicalHandle: payload.verification.canonicalHandle,
@@ -368,7 +420,9 @@ public struct SwanOperatorAccountRestorer: Sendable {
                     parent: destination.parentDescriptor,
                     matching: stagingDescriptor,
                     afterEntryResolvedBeforeRemoval:
-                        afterCleanupEntryResolvedBeforeRemoval
+                        afterCleanupEntryResolvedBeforeRemoval,
+                    afterQuarantineMoveBeforeValidation:
+                        afterQuarantineMoveBeforeValidation
                 )
                 try SwanPortableExportFilesystem.synchronizeParent(
                     destination.parentDescriptor
@@ -383,13 +437,19 @@ public struct SwanOperatorAccountRestorer: Sendable {
     }
 
     private struct RestoredBlob: Sendable {
+        let entry: SwanPortableExportFile
         let reference: BlobReference
-        let data: Data
+    }
+
+    private struct RestoredRepository: Sendable {
+        let entry: SwanPortableExportFile
+        let space: SpaceURI
+        let author: String
     }
 
     private struct Artifacts: Sendable {
         let publicGenesis: PublicRepositoryGenesis
-        let repositories: [SQLitePortableRestoreRepository]
+        let repositories: [RestoredRepository]
         let blobs: [RestoredBlob]
         let createdAt: Date
         let preparationJournal: PLCAccountPreparationJournal
@@ -466,9 +526,10 @@ public struct SwanOperatorAccountRestorer: Sendable {
             throw error
         }
 
-        var repositories: [SQLitePortableRestoreRepository] = []
+        var repositories: [RestoredRepository] = []
         var blobs: [RestoredBlob] = []
         for entry in manifest.files {
+            try Task.checkCancellation()
             switch entry.type {
             case .spaceCAR:
                 let components = entry.path.split(separator: "/").map(String.init)
@@ -478,17 +539,11 @@ public struct SwanOperatorAccountRestorer: Sendable {
                 let author = try SwanPortableExportPath.decode(
                     String(components[2].dropLast(4))
                 )
-                let recovery = try SpaceCARCodec.verifyRecovery(
-                    read(entry: entry, root: portableRoot),
-                    space: space,
-                    author: author,
-                    publicKey: payload.portable.signingPublicKey
-                )
                 repositories.append(
-                    SQLitePortableRestoreRepository(
+                    RestoredRepository(
+                        entry: entry,
                         space: space,
-                        author: author,
-                        recovery: recovery
+                        author: author
                     )
                 )
             case .publicBlob:
@@ -496,8 +551,8 @@ public struct SwanOperatorAccountRestorer: Sendable {
                 let cid = try SwanPortableExportPath.decode(components[2])
                 blobs.append(
                     RestoredBlob(
-                        reference: BlobReference(cid: cid, namespace: .public),
-                        data: try read(entry: entry, root: portableRoot)
+                        entry: entry,
+                        reference: BlobReference(cid: cid, namespace: .public)
                     )
                 )
             case .spaceBlob:
@@ -508,11 +563,11 @@ public struct SwanOperatorAccountRestorer: Sendable {
                 let cid = try SwanPortableExportPath.decode(components[3])
                 blobs.append(
                     RestoredBlob(
+                        entry: entry,
                         reference: BlobReference(
                             cid: cid,
                             namespace: .space(space)
-                        ),
-                        data: try read(entry: entry, root: portableRoot)
+                        )
                     )
                 )
             case .publicCAR, .plcHistory:
@@ -534,6 +589,99 @@ public struct SwanOperatorAccountRestorer: Sendable {
             preparationIntent: preparationIntent,
             plcHistoryEntry: identity.historyEntry
         )
+    }
+
+    private func installRepository(
+        _ repository: RestoredRepository,
+        portableRoot: Int32,
+        signingPublicKey: P256.Signing.PublicKey,
+        database: SQLiteAccountDatabase,
+        maximumLogicalRestoredBytes: Int
+    ) async throws -> SQLitePortableRestoreRepositoryMetadata {
+        let source = try SwanPortableExportFileByteSource(
+            path: repository.entry.path,
+            root: portableRoot
+        )
+        let staging: SQLiteSpaceCARRecoveryIndex
+        do {
+            staging = try await SQLiteSpaceCARRecoveryIndex.create()
+        } catch {
+            await source.close()
+            throw error
+        }
+        do {
+            let verified = try await SpaceCARCodec.verifyStreamingRecovery(
+                from: source,
+                space: repository.space,
+                author: repository.author,
+                contextSignatureVerifier: { envelope in
+                    try SpaceCommitCodec.verifyContextSignature(
+                        envelope,
+                        publicKey: signingPublicKey
+                    )
+                },
+                index: staging,
+                recordSink: staging
+            )
+            let digest = try await source.finish()
+            guard digest.byteCount == repository.entry.byteCount,
+                  digest.sha256 == repository.entry.sha256 else {
+                throw SwanOperatorAccountRestoreError.failed
+            }
+            let metadata = SQLitePortableRestoreRepositoryMetadata(
+                space: repository.space,
+                author: repository.author,
+                verification: verified
+            )
+            guard metadata.logicalRestoredByteCount
+                    <= maximumLogicalRestoredBytes else {
+                throw SwanOperatorAccountRestoreError.failed
+            }
+            try await database.restorePortableRepositoryStreaming(
+                metadata,
+                staging: staging
+            )
+            try Task.checkCancellation()
+            await staging.cleanup()
+            return metadata
+        } catch {
+            await source.close()
+            await staging.cleanup()
+            throw error
+        }
+    }
+
+    private func installBlob(
+        _ blob: RestoredBlob,
+        portableRoot: Int32,
+        database: SQLiteAccountDatabase
+    ) async throws {
+        let source = try SwanPortableExportFileByteSource(
+            path: blob.entry.path,
+            root: portableRoot
+        )
+        do {
+            _ = try await database.restorePortableBlobStreaming(
+                expectedCID: blob.reference.cid,
+                expectedByteCount: blob.entry.byteCount,
+                namespace: blob.reference.namespace
+            ) { consume in
+                while let chunk = try await source.read(
+                    maximumBytes: SpaceCARRecoveryLimits.maximumChunkBytes
+                ) {
+                    try Task.checkCancellation()
+                    try await consume(chunk)
+                }
+                let digest = try await source.finish()
+                guard digest.byteCount == blob.entry.byteCount,
+                      digest.sha256 == blob.entry.sha256 else {
+                    throw SwanOperatorAccountRestoreError.failed
+                }
+            }
+        } catch {
+            await source.close()
+            throw error
+        }
     }
 
     private struct PLCIdentity: Sendable {
@@ -667,6 +815,7 @@ public struct SwanOperatorAccountRestorer: Sendable {
         displayURL: URL,
         payload: SwanOperatorVerifiedBackupPayload,
         artifacts: Artifacts,
+        installedRepositories: [SQLitePortableRestoreRepositoryMetadata],
         configuration: AccountKeyEncryptionConfiguration,
         expectedSigningPublicKey: P256.Signing.PublicKey,
         expectedRotationPublicKey: P256.Signing.PublicKey
@@ -751,20 +900,21 @@ public struct SwanOperatorAccountRestorer: Sendable {
                     == [artifacts.plcHistoryEntry] else {
                 throw SwanOperatorAccountRestoreError.failed
             }
-            try await database.validatePortableRestore(
-                repositories: artifacts.repositories
+            try await database.validatePortableRestoreStreaming(
+                repositories: installedRepositories
             )
             let inventory = try await database.portableExportInventory()
-            guard inventory.repositories == artifacts.repositories.map({
+            guard inventory.repositories == installedRepositories.map({
                 .init(space: $0.space, author: $0.author)
             }),
             inventory.blobs == artifacts.blobs.map(\.reference) else {
                 throw SwanOperatorAccountRestoreError.failed
             }
             for blob in artifacts.blobs {
-                guard try await database.data(for: blob.reference) == blob.data else {
-                    throw SwanOperatorAccountRestoreError.failed
-                }
+                try await database.validatePortableBlob(
+                    blob.reference,
+                    expectedByteCount: blob.entry.byteCount
+                )
             }
             try await database.close()
         } catch {

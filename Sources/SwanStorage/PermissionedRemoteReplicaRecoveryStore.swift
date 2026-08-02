@@ -333,12 +333,6 @@ public enum PermissionedRemoteReplicaRecoveryError:
     case staleRecovery
     case equivocation
     case freshnessMismatch
-    /// A caller requested account-lifecycle authorization, but the selected
-    /// recovery store does not expose the narrow final-publication boundary
-    /// required to enforce it.  Silently falling back to an unauthorised
-    /// whole-method publish would turn a lifecycle check into a best-effort
-    /// hint, so the orchestrator fails closed instead.
-    case publicationAuthorizationUnavailable
 }
 
 /// Authorization around the short, network-free account-database transaction
@@ -433,7 +427,9 @@ public protocol PermissionedRemoteReplicaRecoveryStore: Sendable {
     func publishVerifiedPermissionedRemoteReplicaRecovery(
         sessionID: String,
         consumedAt: Int64,
-        now: Int64
+        now: Int64,
+        publicationAuthorization:
+            @escaping PermissionedRemoteReplicaPublicationAuthorization
     ) async throws -> CommittedPermissionedRemoteReplicaRecovery
 
     func poisonPermissionedRemoteReplicaImportSession(id: String) async
@@ -443,18 +439,10 @@ public protocol PermissionedRemoteReplicaRecoveryStore: Sendable {
     ) async throws -> Int
 }
 
-/// Optional capability for stores that can enforce account lifecycle state at
-/// the final publication linearization point.  The base protocol remains
-/// usable by pure protocol fixtures; production stores that receive an
-/// authorization callback must conform to this capability or fail closed.
+/// Compatibility name for stores that enforce account lifecycle state at the
+/// final publication linearization point. The base recovery-store protocol now
+/// requires this capability so no protocol implementation can publish through
+/// an unauthorizing fallback.
 public protocol PermissionedRemoteReplicaPublicationAuthorizingStore:
     PermissionedRemoteReplicaRecoveryStore
-{
-    func publishVerifiedPermissionedRemoteReplicaRecovery(
-        sessionID: String,
-        consumedAt: Int64,
-        now: Int64,
-        publicationAuthorization:
-            @escaping PermissionedRemoteReplicaPublicationAuthorization
-    ) async throws -> CommittedPermissionedRemoteReplicaRecovery
-}
+{}

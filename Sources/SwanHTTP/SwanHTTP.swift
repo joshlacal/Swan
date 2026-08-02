@@ -21,10 +21,35 @@ public struct SwanHTTPRequestContext:
 {
     public var coreContext: CoreRequestContextStorage
     public let remoteAddress: SocketAddress?
+    private let requestChannel: any Channel
+    private let bodyTerminationState: SwanJSONWriteBodyTerminationState
 
     public init(source: ApplicationRequestContextSource) {
         coreContext = .init(source: source)
         remoteAddress = source.channel.remoteAddress
+        requestChannel = source.channel
+        bodyTerminationState = SwanJSONWriteBodyTerminationState()
+    }
+
+    /// Stops an admitted inbound body at an absolute deadline. Production
+    /// HTTP/1 channels finish only Hummingbird's application stream, then keep
+    /// reading and discarding the remainder while the response is written.
+    /// The fallback is retained for direct test channels without that gate.
+    var jsonWriteBodyTermination: SwanJSONWriteBodyTerminationHandle {
+        SwanJSONWriteBodyTerminationHandle({
+            bodyTerminationState.markTerminated()
+            requestChannel.pipeline.context(handlerType: SwanJSONWriteBodyDrainHandler.self)
+                .whenComplete { result in
+                    switch result {
+                    case .success:
+                        requestChannel.pipeline.fireUserInboundEventTriggered(
+                            SwanJSONWriteBodyDrainEvent()
+                        )
+                    case .failure:
+                        requestChannel.close(mode: .input, promise: nil)
+                    }
+                }
+        }, state: { bodyTerminationState.value })
     }
 }
 
@@ -224,6 +249,7 @@ public struct SwanSpaceRepositorySyncHTTPConfiguration: Sendable {
 public struct SwanSpaceNotificationHTTPConfiguration: Sendable {
     public let serviceAuthentication: any SpaceServiceAuthenticationVerifier
     let recipientBindings: SwanSpaceNotificationRecipientBindings
+    let notificationJSONDecodeObserver: (@Sendable () async -> Void)?
 
     public init(
         serviceAuthentication: any SpaceServiceAuthenticationVerifier,
@@ -231,6 +257,17 @@ public struct SwanSpaceNotificationHTTPConfiguration: Sendable {
     ) {
         self.serviceAuthentication = serviceAuthentication
         self.recipientBindings = recipientBindings
+        notificationJSONDecodeObserver = nil
+    }
+
+    init(
+        serviceAuthentication: any SpaceServiceAuthenticationVerifier,
+        recipientBindings: SwanSpaceNotificationRecipientBindings = .empty,
+        notificationJSONDecodeObserver: @escaping @Sendable () async -> Void
+    ) {
+        self.serviceAuthentication = serviceAuthentication
+        self.recipientBindings = recipientBindings
+        self.notificationJSONDecodeObserver = notificationJSONDecodeObserver
     }
 }
 
@@ -345,6 +382,9 @@ public struct SwanHTTPServer: Sendable {
     /// Shared aggregate bound for buffered public and permissioned JSON
     /// command bodies.
     public let jsonWriteAdmission: PublicRepositoryJSONWriteAdmission
+    /// Shared finite total elapsed-time policy for admitted JSON command
+    /// bodies. This is distinct from the listener's resettable idle timeout.
+    public let jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy
 
     public init(
         profile: ProtocolProfile,
@@ -372,7 +412,8 @@ public struct SwanHTTPServer: Sendable {
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         jsonReadAdmission: PublicRepositoryJSONReadAdmission? = nil,
-        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
+        jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -387,6 +428,9 @@ public struct SwanHTTPServer: Sendable {
         let resolvedJSONWriteAdmission = jsonWriteAdmission
             ?? PublicRepositoryJSONWriteAdmission.processShared
         self.jsonWriteAdmission = resolvedJSONWriteAdmission
+        let resolvedJSONWriteBodyPolicy = jsonWriteBodyPolicy
+            ?? SwanJSONWriteBodyPolicy.productionDefault
+        self.jsonWriteBodyPolicy = resolvedJSONWriteBodyPolicy
         self.blobStreamAdmission = blobStreamAdmission
             ?? publicBlobSpoolAdmission
             ?? PublicRepositorySpoolAdmission.shared
@@ -460,7 +504,8 @@ public struct SwanHTTPServer: Sendable {
                     signerProvider: signerProvider,
                     publicBlobSpoolAdmission: publicBlobSpoolAdmission,
                     blobStreamAdmission: self.blobStreamAdmission,
-                    jsonWriteAdmission: resolvedJSONWriteAdmission
+                    jsonWriteAdmission: resolvedJSONWriteAdmission,
+                    jsonWriteBodyPolicy: resolvedJSONWriteBodyPolicy
                 )
             } else {
                 publicRepositoryMutations = nil
@@ -480,7 +525,8 @@ public struct SwanHTTPServer: Sendable {
                     directory: repositoryDirectory,
                     credentialAuthorizer: credentialVerifier,
                     jsonReadAdmission: resolvedJSONReadAdmission,
-                    jsonWriteAdmission: resolvedJSONWriteAdmission
+                    jsonWriteAdmission: resolvedJSONWriteAdmission,
+                    jsonWriteBodyPolicy: resolvedJSONWriteBodyPolicy
                 )
             } else {
                 authenticatedSpaceRecords = nil
@@ -499,7 +545,8 @@ public struct SwanHTTPServer: Sendable {
                 authenticatedSimpleSpaceLifecycle = SwanAuthenticatedSimpleSpaceLifecycleCapability(
                     authorizer: authorizer,
                     directory: lifecycleDirectory,
-                    jsonWriteAdmission: resolvedJSONWriteAdmission
+                    jsonWriteAdmission: resolvedJSONWriteAdmission,
+                    jsonWriteBodyPolicy: resolvedJSONWriteBodyPolicy
                 )
             } else {
                 authenticatedSimpleSpaceLifecycle = nil
@@ -592,7 +639,9 @@ public struct SwanHTTPServer: Sendable {
                         publicKeys: spaceCredentialConfiguration.credentialPublicKeys
                     ),
                     serviceAuthentication: spaceNotificationConfiguration.serviceAuthentication,
-                    recipientBindings: spaceNotificationConfiguration.recipientBindings
+                    recipientBindings: spaceNotificationConfiguration.recipientBindings,
+                    notificationJSONDecodeObserver:
+                        spaceNotificationConfiguration.notificationJSONDecodeObserver
                 )
             } else {
                 authenticatedSpaceNotifications = nil
@@ -636,6 +685,10 @@ public struct SwanHTTPServer: Sendable {
     /// supported server assembly boundary.
     public func buildRouter() -> Router<SwanHTTPRequestContext> {
         let router = Router(context: SwanHTTPRequestContext.self)
+        let requestBodyAdmission = SwanRequestBodyAdmissionConfiguration(
+            admission: jsonWriteAdmission,
+            policy: jsonWriteBodyPolicy
+        )
         router.get("/health") { _, _ in "OK" }
 
         let publicURL = configuration.publicURL
@@ -671,19 +724,22 @@ public struct SwanHTTPServer: Sendable {
                 on: router,
                 configuration: authorizationServerConfiguration,
                 runtime: oauthRuntime,
-                loginClientIdentityPolicy: loginClientIdentityPolicy
+                loginClientIdentityPolicy: loginClientIdentityPolicy,
+                requestBodyAdmission: requestBodyAdmission
             )
             registerOAuthAuthorizationServerPAREndpoint(
                 on: router,
                 configuration: authorizationServerConfiguration,
-                runtime: oauthRuntime
+                runtime: oauthRuntime,
+                requestBodyAdmission: requestBodyAdmission
             )
         } else if let localhostOAuthConfiguration {
             registerLocalhostOAuthEndpoints(
                 on: router,
                 configuration: localhostOAuthConfiguration,
                 runtime: oauthRuntime,
-                loginClientIdentityPolicy: loginClientIdentityPolicy
+                loginClientIdentityPolicy: loginClientIdentityPolicy,
+                requestBodyAdmission: requestBodyAdmission
             )
         } else {
             router.get("/oauth/authorize") { _, _ -> Response in
@@ -700,13 +756,15 @@ public struct SwanHTTPServer: Sendable {
             registerLocalhostPAREndpoint(
                 on: router,
                 issuer: localhostOAuthConfiguration.issuer,
-                runtime: oauthRuntime
+                runtime: oauthRuntime,
+                requestBodyAdmission: requestBodyAdmission
             )
         } else if let localhostPARConfiguration {
             registerLocalhostPAREndpoint(
                 on: router,
                 configuration: localhostPARConfiguration,
-                runtime: oauthRuntime
+                runtime: oauthRuntime,
+                requestBodyAdmission: requestBodyAdmission
             )
         }
 
@@ -739,7 +797,8 @@ public struct SwanHTTPServer: Sendable {
                       let authenticatedSpaceCredentialExchange {
                 registerAuthenticatedGetSpaceCredentialEndpoint(
                     on: router,
-                    capability: authenticatedSpaceCredentialExchange
+                    capability: authenticatedSpaceCredentialExchange,
+                    requestBodyAdmission: requestBodyAdmission
                 )
             } else if descriptor.nsid == ComAtprotoSpaceGetRecord.typeIdentifier,
                       let authenticatedSpaceRecords {
@@ -796,19 +855,22 @@ public struct SwanHTTPServer: Sendable {
                       let authenticatedSpaceNotifications {
                 registerAuthenticatedRegisterSpaceNotifyEndpoint(
                     on: router,
-                    capability: authenticatedSpaceNotifications
+                    capability: authenticatedSpaceNotifications,
+                    requestBodyAdmission: requestBodyAdmission
                 )
             } else if descriptor.nsid == ComAtprotoSpaceNotifyWrite.typeIdentifier,
                       let authenticatedSpaceNotifications {
                 registerAuthenticatedNotifySpaceWriteEndpoint(
                     on: router,
-                    capability: authenticatedSpaceNotifications
+                    capability: authenticatedSpaceNotifications,
+                    requestBodyAdmission: requestBodyAdmission
                 )
             } else if descriptor.nsid == ComAtprotoSpaceNotifySpaceDeleted.typeIdentifier,
                       let authenticatedSpaceNotifications {
                 registerAuthenticatedNotifySpaceDeletedEndpoint(
                     on: router,
-                    capability: authenticatedSpaceNotifications
+                    capability: authenticatedSpaceNotifications,
+                    requestBodyAdmission: requestBodyAdmission
                 )
             } else if descriptor.nsid == ComAtprotoSimplespaceCheckUserAccess.typeIdentifier,
                       let simpleSpaceCheckUserAccess {
@@ -875,7 +937,10 @@ public struct SwanHTTPServer: Sendable {
             }
             registerUnavailablePublicEndpoint(descriptor, on: router)
         }
-        accountEmailXRPC?.register(on: router)
+        accountEmailXRPC?.register(
+            on: router,
+            requestBodyAdmission: requestBodyAdmission
+        )
         registerUnknownPublicEndpointGuards(on: router)
 
         return router
@@ -930,6 +995,9 @@ public struct SwanHTTPServer: Sendable {
             router: buildRouter(),
             server: .http1(
                 configuration: .init(
+                    additionalChannelHandlers: [SwanJSONWriteBodyDrainHandler(
+                        timeout: jsonWriteBodyPolicy.totalBodyTimeout + .milliseconds(50)
+                    )],
                     idleTimeout: .seconds(Int64(configuration.idleTimeoutSeconds))
                 )
             ),

@@ -346,13 +346,27 @@ public struct SwanAccountEmailXRPCServer: Sendable {
     /// Hummingbird `Application`; adding routes after application construction
     /// is intentionally unsupported by Hummingbird.
     public func register(on router: Router<SwanHTTPRequestContext>) {
+        register(
+            on: router,
+            requestBodyAdmission: .init(
+                admission: .processShared,
+                policy: .productionDefault
+            )
+        )
+    }
+
+    func register(
+        on router: Router<SwanHTTPRequestContext>,
+        requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+    ) {
         let handlers = SwanAccountEmailXRPCHandlers(
             authorizer: authorizer,
             recovery: recovery,
             rateLimiter: rateLimiter,
             loginClientIdentityPolicy: loginClientIdentityPolicy,
             minimumPasswordRecoveryResponseDuration:
-                minimumPasswordRecoveryResponseDuration
+                minimumPasswordRecoveryResponseDuration,
+            requestBodyAdmission: requestBodyAdmission
         )
         let requestConfirmationPath = Self.path(
             ComAtprotoServerRequestEmailConfirmation.endpointDescriptor.nsid
@@ -379,14 +393,19 @@ public struct SwanAccountEmailXRPCServer: Sendable {
         router.post(confirmationPath) { request, context async -> Response in
             await handlers.confirmEmail(request, context: context)
         }
-        router.post(requestUpdatePath) { request, _ async -> Response in
+        router.post(requestUpdatePath) { request, context async -> Response in
             await handlers.rejectRequestEmailUpdate(
                 request,
+                context: context,
                 path: requestUpdatePathString
             )
         }
-        router.post(updatePath) { request, _ async -> Response in
-            await handlers.rejectUpdateEmail(request, path: updatePathString)
+        router.post(updatePath) { request, context async -> Response in
+            await handlers.rejectUpdateEmail(
+                request,
+                context: context,
+                path: updatePathString
+            )
         }
         router.post(requestResetPath) { request, context async -> Response in
             await handlers.requestPasswordReset(request, context: context)
@@ -450,6 +469,7 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
     let rateLimiter: any SwanAccountEmailXRPCRateLimiting
     let loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
     let minimumPasswordRecoveryResponseDuration: Duration
+    let requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 
     func requestEmailConfirmation(
         _ request: Request,
@@ -460,8 +480,14 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
         do {
             // Validate before DPoP authorization so a malformed request cannot
             // consume the proof's durable replay reservation.
-            try requireNoQuery(request)
-            try await requireEmptyBody(request)
+            try await requireNoQuery(
+                request, context: context,
+                requestBodyAdmission: requestBodyAdmission)
+            try await requireEmptyBody(
+                request,
+                context: context,
+                requestBodyAdmission: requestBodyAdmission
+            )
             let subject = try await authorizedSubject(
                 request,
                 path: path,
@@ -492,10 +518,14 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
         let path = "/xrpc/\(ComAtprotoServerConfirmEmail.endpointDescriptor.nsid)"
         let now = Date()
         do {
-            try requireNoQuery(request)
+            try await requireNoQuery(
+                request, context: context,
+                requestBodyAdmission: requestBodyAdmission)
             let input: ComAtprotoServerConfirmEmail.Input =
                 try await decodeExactJSON(
                     request,
+                    context: context,
+                    requestBodyAdmission: requestBodyAdmission,
                     required: ["email", "token"],
                     optional: []
                 )
@@ -545,12 +575,19 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
 
     func rejectRequestEmailUpdate(
         _ request: Request,
+        context: SwanHTTPRequestContext,
         path: String
     ) async -> Response {
         let now = Date()
         do {
-            try requireNoQuery(request)
-            try await requireEmptyBody(request)
+            try await requireNoQuery(
+                request, context: context,
+                requestBodyAdmission: requestBodyAdmission)
+            try await requireEmptyBody(
+                request,
+                context: context,
+                requestBodyAdmission: requestBodyAdmission
+            )
             _ = try await authorizedSubject(request, path: path, now: now)
             return accountEmailError(.forbidden, "Forbidden")
         } catch {
@@ -560,14 +597,19 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
 
     func rejectUpdateEmail(
         _ request: Request,
+        context: SwanHTTPRequestContext,
         path: String
     ) async -> Response {
         let now = Date()
         do {
-            try requireNoQuery(request)
+            try await requireNoQuery(
+                request, context: context,
+                requestBodyAdmission: requestBodyAdmission)
             let input: ComAtprotoServerUpdateEmail.Input =
                 try await decodeExactJSON(
                     request,
+                    context: context,
+                    requestBodyAdmission: requestBodyAdmission,
                     required: ["email"],
                     optional: ["emailAuthFactor", "token"]
                 )
@@ -588,10 +630,14 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
     ) async -> Response {
         let now = Date()
         do {
-            try requireNoQuery(request)
+            try await requireNoQuery(
+                request, context: context,
+                requestBodyAdmission: requestBodyAdmission)
             let input: ComAtprotoServerRequestPasswordReset.Input =
                 try await decodeExactJSON(
                     request,
+                    context: context,
+                    requestBodyAdmission: requestBodyAdmission,
                     required: ["email"],
                     optional: []
                 )
@@ -665,10 +711,14 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
         let now = Date()
         let started = ContinuousClock().now
         do {
-            try requireNoQuery(request)
+            try await requireNoQuery(
+                request, context: context,
+                requestBodyAdmission: requestBodyAdmission)
             let input: ComAtprotoServerResetPassword.Input =
                 try await decodeExactJSON(
                     request,
+                    context: context,
+                    requestBodyAdmission: requestBodyAdmission,
                     required: ["token", "password"],
                     optional: []
                 )
@@ -859,41 +909,34 @@ private struct SwanAccountEmailXRPCHandlers: Sendable {
 
 private func decodeExactJSON<Value: Decodable>(
     _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
     required: Set<String>,
     optional: Set<String>
 ) async throws -> Value {
-    let contentTypes = request.headers[values: .contentType]
-    guard contentTypes.count == 1,
-          contentTypes[0]
-            .split(separator: ";", maxSplits: 1)
-            .first?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased() == "application/json" else {
-        throw AccountEmailXRPCFailure.invalidRequest
-    }
-    let contentLengths = request.headers[values: .contentLength]
-    guard contentLengths.count <= 1 else {
-        throw AccountEmailXRPCFailure.invalidRequest
-    }
-    if let declaredLength = contentLengths.first {
-        guard let length = Int(declaredLength), length >= 0 else {
-            throw AccountEmailXRPCFailure.invalidRequest
-        }
-        guard length <= SwanAccountEmailXRPCServer.maximumJSONBytes else {
-            throw AccountEmailXRPCFailure.payloadTooLarge
-        }
-    }
-
-    let buffer: ByteBuffer
+    let buffer: SwanAdmittedRequestBody
     do {
-        buffer = try await request.body.collect(
-            upTo: SwanAccountEmailXRPCServer.maximumJSONBytes
+        buffer = try await collectAdmittedRequestBody(
+            request,
+            mediaType: .json,
+            admission: requestBodyAdmission.admission,
+            policy: requestBodyAdmission.policy,
+            maximumBytes: SwanAccountEmailXRPCServer.maximumJSONBytes,
+            termination: context.jsonWriteBodyTermination
         )
-    } catch is NIOTooManyBytesError {
-        throw AccountEmailXRPCFailure.payloadTooLarge
+    } catch let failure as SwanRequestBodyCollectionFailure {
+        switch failure {
+        case .invalidRequest:
+            throw AccountEmailXRPCFailure.invalidRequest
+        case .payloadTooLarge:
+            throw AccountEmailXRPCFailure.payloadTooLarge
+        case .unavailable:
+            throw AccountEmailXRPCFailure.unavailable
+        }
     } catch {
         throw AccountEmailXRPCFailure.invalidRequest
     }
+    defer { withExtendedLifetime(buffer) {} }
     guard buffer.readableBytes > 0,
           let bytes = buffer.getBytes(
               at: buffer.readerIndex,
@@ -924,28 +967,48 @@ private func decodeExactJSON<Value: Decodable>(
     }
 }
 
-private func requireNoQuery(_ request: Request) throws {
+private func requireNoQuery(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws {
     guard request.uri.query?.isEmpty ?? true else {
+        do {
+            try await drainRejectedRequestBody(
+                request,
+                admission: requestBodyAdmission.admission,
+                policy: requestBodyAdmission.policy,
+                termination: context.jsonWriteBodyTermination
+            )
+        } catch {
+            throw AccountEmailXRPCFailure.unavailable
+        }
         throw AccountEmailXRPCFailure.invalidRequest
     }
 }
 
-private func requireEmptyBody(_ request: Request) async throws {
-    let lengths = request.headers[values: .contentLength]
-    guard lengths.count <= 1 else {
-        throw AccountEmailXRPCFailure.invalidRequest
-    }
-    if let declared = lengths.first {
-        guard let length = Int(declared), length == 0 else {
-            throw AccountEmailXRPCFailure.invalidRequest
-        }
-    }
+private func requireEmptyBody(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws {
     do {
-        let body = try await request.body.collect(upTo: 1)
+        let body = try await collectAdmittedRequestBody(
+            request,
+            mediaType: .unspecified,
+            admission: requestBodyAdmission.admission,
+            policy: requestBodyAdmission.policy,
+            maximumBytes: 1,
+            termination: context.jsonWriteBodyTermination
+        )
+        defer { withExtendedLifetime(body) {} }
         guard body.readableBytes == 0 else {
             throw AccountEmailXRPCFailure.invalidRequest
         }
-    } catch is NIOTooManyBytesError {
+    } catch let failure as SwanRequestBodyCollectionFailure {
+        if failure == .unavailable {
+            throw AccountEmailXRPCFailure.unavailable
+        }
         throw AccountEmailXRPCFailure.invalidRequest
     }
 }

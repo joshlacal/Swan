@@ -196,7 +196,14 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
     /// internal rather than configurable per request: callers must not be able
     /// to trade the enumeration-resistant write shape for unbounded storage.
     static let maximumPasswordRecoveryWorkMarkers = 4_096
-    static let passwordRecoveryWorkPurgeBatchSize = 256
+    /// Unknown-address churn cannot consume this tail of the global marker
+    /// budget. Active accounts with verified email may use it after the same
+    /// indexed classification query is performed for every canonical request.
+    static let passwordRecoveryKnownAccountReserve = 256
+    /// One reserved partition (256 rows) plus the incoming request slot. This
+    /// lets a full table of expired anonymous markers admit the request that
+    /// performed cleanup while retaining a fixed transaction bound.
+    static let passwordRecoveryWorkPurgeBatchSize = 257
 
     let connection: SQLiteConnection
     let connectionGate = ControlSQLiteConnectionGate()

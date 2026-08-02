@@ -373,6 +373,42 @@ final class SwanHTTPTests: XCTestCase {
         }
     }
 
+    func testDefaultManagementAdmissionIsIsolatedFromPublicWriteSaturation() async throws {
+        var publicLeases: [PublicRepositoryJSONWriteLease] = []
+        while let lease = PublicRepositoryJSONWriteAdmission.processShared.reserve(
+            maximumRequestBytes: 1_024 * 1_024
+        ) {
+            publicLeases.append(lease)
+        }
+        defer { publicLeases.forEach { $0.release() } }
+        XCTAssertFalse(publicLeases.isEmpty, "the public pool must be saturated by this test")
+
+        let fixture = try await makeManagementServer()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let app = fixture.server.buildApplication(
+                logger: Logger(label: "SwanManagementAdmissionIsolationTests")
+            )
+            try await app.test(.live) { client in
+                try await client.execute(
+                    uri: "/v1/accounts/deactivate",
+                    method: .post,
+                    headers: Self.jsonBearerHeaders("operator-secret"),
+                    body: ByteBuffer(
+                        string: #"{"did":"did:plc:abcdefghijklmnopqrstuvwx"}"#
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(try Self.status(from: response.body), "deactivated")
+                }
+            }
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
     func testManagementDeleteUsesInjectedPermanentDeletionCoordinator() async throws {
         let coordinator = TestPermanentDeletionCoordinator()
         let fixture = try await makeManagementServer(

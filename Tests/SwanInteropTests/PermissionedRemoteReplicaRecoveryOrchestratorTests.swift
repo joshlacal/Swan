@@ -145,7 +145,10 @@ final class PermissionedRemoteReplicaRecoveryOrchestratorTests: XCTestCase {
         )
         let orchestrator = PermissionedRemoteReplicaRecoveryOrchestrator(
             database: database,
-            now: { 100 }
+            now: { 100 },
+            publicationAuthorization: { operation in
+                try await operation()
+            }
         )
 
         do {
@@ -203,7 +206,10 @@ final class PermissionedRemoteReplicaRecoveryOrchestratorTests: XCTestCase {
         let target = try makeTarget()
         let orchestrator = PermissionedRemoteReplicaRecoveryOrchestrator(
             database: database,
-            now: { 1_750_000_000 }
+            now: { 1_750_000_000 },
+            publicationAuthorization: { operation in
+                try await operation()
+            }
         )
 
         do {
@@ -223,6 +229,71 @@ final class PermissionedRemoteReplicaRecoveryOrchestratorTests: XCTestCase {
 
         let closeCount = await closeCounter.value
         XCTAssertEqual(closeCount, 1)
+        let head = try await database.permissionedRemoteReplicaHead(
+            target: target
+        )
+        XCTAssertNil(head)
+    }
+
+    func testDeactivationAfterConstructionBlocksFinalPublication() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(
+            path: "SwanRemoteRecoveryDeactivated-" + UUID().uuidString
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteAccountDatabase(
+            dataDirectory: root,
+            did: receiver
+        )
+        defer { Task { try? await database.close() } }
+
+        let fixture = try makeCAR()
+        let verificationKey = PermissionedDataJWTVerificationKey.p256(
+            fixture.key.publicKey
+        )
+        let source = try PermissionedRemoteReplicaSourceSession(
+            identity: PermissionedRemoteReplicaSourceIdentity(
+                origin: URL(string: "https://writer.example")!,
+                repositoryDID: repository,
+                verifierIdentity: verificationKey.recoveryVerifierIdentity
+            ),
+            verificationKey: verificationKey,
+            freshnessWitness: .init(
+                wireRevision: fixture.revision,
+                commitment: fixture.commitment
+            ),
+            source: TestRecoveryByteSource(bytes: fixture.car),
+            closeSource: {}
+        )
+        let target = try makeTarget()
+        let publicationFence = RecoveryPublicationFence()
+        let orchestrator = PermissionedRemoteReplicaRecoveryOrchestrator(
+            database: database,
+            now: { 1_750_000_000 },
+            publicationAuthorization: { operation in
+                try await publicationFence.authorize(operation)
+            }
+        )
+
+        await publicationFence.deactivate()
+
+        do {
+            _ = try await orchestrator.recover(
+                target: target,
+                requestID: "deactivated-before-publication",
+                source: source,
+                profileID: "permissioned-data-0016-test",
+                expiresAt: 1_750_000_600,
+                limits: try SpaceCARRecoveryLimits(
+                    maximumCARBytes: fixture.car.count
+                )
+            )
+            XCTFail("deactivated account must not publish recovery")
+        } catch {
+            XCTAssertEqual(error as? RecoveryPublicationFenceError, .inactive)
+        }
+
+        let authorizationAttempts = await publicationFence.authorizationAttempts
+        XCTAssertEqual(authorizationAttempts, 1)
         let head = try await database.permissionedRemoteReplicaHead(
             target: target
         )
@@ -375,6 +446,40 @@ private actor RecoveryCloseCounter {
 
     func increment() {
         value += 1
+    }
+}
+
+private enum RecoveryPublicationFenceError: Error, Equatable {
+    case inactive
+    case operationEscapedAuthorization
+}
+
+private actor RecoveryPublicationFence {
+    private var active = true
+    private(set) var operationActive = false
+    private(set) var authorizationAttempts = 0
+
+    func deactivate() {
+        active = false
+    }
+
+    func authorize(
+        _ operation: @escaping @Sendable () async throws
+            -> CommittedPermissionedRemoteReplicaRecovery
+    ) async throws -> CommittedPermissionedRemoteReplicaRecovery {
+        authorizationAttempts += 1
+        guard active else {
+            throw RecoveryPublicationFenceError.inactive
+        }
+        operationActive = true
+        defer { operationActive = false }
+        return try await operation()
+    }
+
+    func requireOperationActive() throws {
+        guard operationActive else {
+            throw RecoveryPublicationFenceError.operationEscapedAuthorization
+        }
     }
 }
 

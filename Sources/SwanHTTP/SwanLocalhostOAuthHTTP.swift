@@ -98,7 +98,8 @@ func registerLocalhostOAuthEndpoints(
     on router: Router<BasicRequestContext>,
     configuration: SwanLocalhostOAuthConfiguration,
     runtime: SwanOAuthRuntime,
-    loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
+    loginClientIdentityPolicy: SwanLoginClientIdentityPolicy,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
     router.get("/oauth/authorize") { request, _ async -> Response in
         await beginLocalhostAuthorization(
@@ -113,28 +114,35 @@ func registerLocalhostOAuthEndpoints(
             context: context,
             configuration: configuration,
             runtime: runtime,
-            loginClientIdentityPolicy: loginClientIdentityPolicy
+            loginClientIdentityPolicy: loginClientIdentityPolicy,
+            requestBodyAdmission: requestBodyAdmission
         )
     }
-    router.post("/oauth/authorize/consent") { request, _ async -> Response in
+    router.post("/oauth/authorize/consent") { request, context async -> Response in
         await consentLocalhostAuthorization(
             request: request,
+            context: context,
             configuration: configuration,
-            runtime: runtime
+            runtime: runtime,
+            requestBodyAdmission: requestBodyAdmission
         )
     }
-    router.post("/oauth/token") { request, _ async -> Response in
+    router.post("/oauth/token") { request, context async -> Response in
         await exchangeLocalhostToken(
             request: request,
+            context: context,
             configuration: configuration,
-            runtime: runtime
+            runtime: runtime,
+            requestBodyAdmission: requestBodyAdmission
         )
     }
-    router.post("/oauth/revoke") { request, _ async -> Response in
+    router.post("/oauth/revoke") { request, context async -> Response in
         await revokeLocalhostToken(
             request: request,
+            context: context,
             configuration: configuration,
-            runtime: runtime
+            runtime: runtime,
+            requestBodyAdmission: requestBodyAdmission
         )
     }
 }
@@ -176,10 +184,12 @@ private func loginLocalhostAuthorization(
     context: SwanHTTPRequestContext,
     configuration: SwanLocalhostOAuthConfiguration,
     runtime: SwanOAuthRuntime,
-    loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
+    loginClientIdentityPolicy: SwanLoginClientIdentityPolicy,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
     do {
-        let form = try await parseLoginForm(request)
+        let form = try await parseLoginForm(
+            request, context: context, requestBodyAdmission: requestBodyAdmission)
         let session = try browserSession(from: request, runtime: runtime)
         guard session.subject == nil,
               form.csrf == session.csrfToken,
@@ -232,6 +242,10 @@ private func loginLocalhostAuthorization(
         return localhostAuthorizationError(.serviceUnavailable)
     } catch is SwanLoginClientIdentityError {
         return localhostAuthorizationError(.serviceUnavailable)
+    } catch let failure as SwanRequestBodyCollectionFailure {
+        return localhostAuthorizationError(
+            failure == .unavailable ? .serviceUnavailable : .badRequest
+        )
     } catch {
         return localhostAuthorizationError(.badRequest)
     }
@@ -239,12 +253,15 @@ private func loginLocalhostAuthorization(
 
 private func consentLocalhostAuthorization(
     request: Request,
+    context: SwanHTTPRequestContext,
     configuration: SwanLocalhostOAuthConfiguration,
-    runtime: SwanOAuthRuntime
+    runtime: SwanOAuthRuntime,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
     let fallback: Response = localhostAuthorizationError(.badRequest, clearCookie: true)
     do {
-        let form = try await parseConsentForm(request)
+        let form = try await parseConsentForm(
+            request, context: context, requestBodyAdmission: requestBodyAdmission)
         let session = try browserSession(from: request, runtime: runtime)
         guard let subject = session.subject,
               let subjectRevision = session.subjectRevisionMicroseconds,
@@ -293,6 +310,10 @@ private func consentLocalhostAuthorization(
             )
         }
         return localhostRedirect(destination, clearCookie: true)
+    } catch let failure as SwanRequestBodyCollectionFailure {
+        return failure == .unavailable
+            ? localhostAuthorizationError(.serviceUnavailable, clearCookie: true)
+            : fallback
     } catch {
         return fallback
     }
@@ -300,12 +321,17 @@ private func consentLocalhostAuthorization(
 
 private func exchangeLocalhostToken(
     request: Request,
+    context: SwanHTTPRequestContext,
     configuration: SwanLocalhostOAuthConfiguration,
-    runtime: SwanOAuthRuntime
+    runtime: SwanOAuthRuntime,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
     let form: LocalhostTokenForm
     do {
-        form = try await parseTokenForm(request)
+        form = try await parseTokenForm(
+            request, context: context, requestBodyAdmission: requestBodyAdmission)
+    } catch let failure as SwanRequestBodyCollectionFailure {
+        return localhostBodyFailure(failure)
     } catch let error as LocalhostOAuthRequestError {
         return switch error {
         case .payloadTooLarge: localhostTokenError(.contentTooLarge)
@@ -402,12 +428,17 @@ private func exchangeLocalhostToken(
 
 private func revokeLocalhostToken(
     request: Request,
+    context: SwanHTTPRequestContext,
     configuration: SwanLocalhostOAuthConfiguration,
-    runtime: SwanOAuthRuntime
+    runtime: SwanOAuthRuntime,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
     let form: LocalhostRevocationForm
     do {
-        form = try await parseRevocationForm(request)
+        form = try await parseRevocationForm(
+            request, context: context, requestBodyAdmission: requestBodyAdmission)
+    } catch let failure as SwanRequestBodyCollectionFailure {
+        return localhostBodyFailure(failure)
     } catch let error as LocalhostOAuthRequestError {
         return switch error {
         case .payloadTooLarge: localhostTokenError(.contentTooLarge)
@@ -494,8 +525,13 @@ private func parseAuthorizeQuery(_ request: Request) throws -> LocalhostAuthoriz
     return LocalhostAuthorizeQuery(clientID: clientID, requestURI: requestURI)
 }
 
-private func parseLoginForm(_ request: Request) async throws -> LocalhostLoginForm {
-    let fields = try await strictForm(request)
+private func parseLoginForm(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> LocalhostLoginForm {
+    let fields = try await strictForm(
+        request, context: context, requestBodyAdmission: requestBodyAdmission)
     guard Set(fields.keys) == ["csrf", "handle", "password"],
           let csrf = fields["csrf"], let handle = fields["handle"], let password = fields["password"],
           validBrowserOpaqueValue(csrf),
@@ -507,8 +543,13 @@ private func parseLoginForm(_ request: Request) async throws -> LocalhostLoginFo
     return LocalhostLoginForm(csrf: csrf, handle: handle, password: password)
 }
 
-private func parseConsentForm(_ request: Request) async throws -> LocalhostConsentForm {
-    let fields = try await strictForm(request)
+private func parseConsentForm(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> LocalhostConsentForm {
+    let fields = try await strictForm(
+        request, context: context, requestBodyAdmission: requestBodyAdmission)
     guard Set(fields.keys) == ["csrf", "decision"],
           let csrf = fields["csrf"], let decisionText = fields["decision"],
           validBrowserOpaqueValue(csrf), let decision = LocalhostConsentDecision(rawValue: decisionText) else {
@@ -517,8 +558,13 @@ private func parseConsentForm(_ request: Request) async throws -> LocalhostConse
     return LocalhostConsentForm(csrf: csrf, decision: decision)
 }
 
-private func parseTokenForm(_ request: Request) async throws -> LocalhostTokenForm {
-    let fields = try await strictForm(request)
+private func parseTokenForm(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> LocalhostTokenForm {
+    let fields = try await strictForm(
+        request, context: context, requestBodyAdmission: requestBodyAdmission)
     guard let grant = fields["grant_type"].flatMap(LocalhostTokenGrant.init(rawValue:)),
           let clientIDText = fields["client_id"],
           clientIDText.utf8.count <= 4_096,
@@ -554,8 +600,13 @@ private func parseTokenForm(_ request: Request) async throws -> LocalhostTokenFo
     }
 }
 
-private func parseRevocationForm(_ request: Request) async throws -> LocalhostRevocationForm {
-    let fields = try await strictForm(request)
+private func parseRevocationForm(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> LocalhostRevocationForm {
+    let fields = try await strictForm(
+        request, context: context, requestBodyAdmission: requestBodyAdmission)
     guard Set(fields.keys) == ["token", "client_id"] || Set(fields.keys) == ["token", "client_id", "token_type_hint"],
           let token = fields["token"], validOpaqueToken(token),
           let clientIDText = fields["client_id"], clientIDText.utf8.count <= 4_096,
@@ -573,24 +624,20 @@ private func parseRevocationForm(_ request: Request) async throws -> LocalhostRe
     return LocalhostRevocationForm(token: token, clientID: clientID, requestedKind: kind)
 }
 
-private func strictForm(_ request: Request) async throws -> [String: String] {
-    guard isFormContentType(request.headers) else { throw LocalhostOAuthRequestError.malformed }
-    let lengths = request.headers[values: .contentLength]
-    guard lengths.count <= 1 else { throw LocalhostOAuthRequestError.malformed }
-    if let value = lengths.first {
-        guard let length = Int(value), length >= 0 else { throw LocalhostOAuthRequestError.malformed }
-        guard length <= SwanLocalhostOAuthHTTP.maximumFormBytes else {
-            throw LocalhostOAuthRequestError.payloadTooLarge
-        }
-    }
-    let body: ByteBuffer
-    do {
-        body = try await request.body.collect(upTo: SwanLocalhostOAuthHTTP.maximumFormBytes)
-    } catch is NIOTooManyBytesError {
-        throw LocalhostOAuthRequestError.payloadTooLarge
-    } catch {
-        throw LocalhostOAuthRequestError.malformed
-    }
+private func strictForm(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> [String: String] {
+    let body = try await collectAdmittedRequestBody(
+        request,
+        mediaType: .formURLEncoded,
+        admission: requestBodyAdmission.admission,
+        policy: requestBodyAdmission.policy,
+        maximumBytes: SwanLocalhostOAuthHTTP.maximumFormBytes,
+        termination: context.jsonWriteBodyTermination
+    )
+    defer { withExtendedLifetime(body) {} }
     guard body.readableBytes > 0,
           let bytes = body.getBytes(at: body.readerIndex, length: body.readableBytes) else {
         throw LocalhostOAuthRequestError.malformed
@@ -828,6 +875,19 @@ private func localhostTokenError(
     error: String = "invalid_request"
 ) -> Response {
     localhostTokenJSON(status, LocalhostOAuthError(error: error))
+}
+
+private func localhostBodyFailure(
+    _ failure: SwanRequestBodyCollectionFailure
+) -> Response {
+    switch failure {
+    case .invalidRequest:
+        localhostTokenError(.badRequest)
+    case .payloadTooLarge:
+        localhostTokenError(.contentTooLarge)
+    case .unavailable:
+        localhostTokenError(.serviceUnavailable, error: "temporarily_unavailable")
+    }
 }
 
 private func localhostTokenJSON(_ status: HTTPResponse.Status, _ body: some Encodable) -> Response {

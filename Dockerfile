@@ -26,10 +26,12 @@ COPY Swan/Profiles /usr/local/share/swan/Profiles
 COPY Swan/interop/bootstrap-local-space.sh /usr/local/bin/swan-interop-bootstrap
 COPY Swan/interop/prepare-interop-secrets.sh /usr/local/bin/swan-interop-prepare-secrets
 COPY Swan/interop/prepare-caddy-trust.sh /usr/local/bin/swan-interop-caddy-trust
+COPY Swan/Scripts/validate-live-interop-artifact.py /usr/local/bin/swan-validate-live-interop-artifact
 RUN chmod +x \
     /usr/local/bin/swan-interop-bootstrap \
     /usr/local/bin/swan-interop-prepare-secrets \
-    /usr/local/bin/swan-interop-caddy-trust
+    /usr/local/bin/swan-interop-caddy-trust \
+    /usr/local/bin/swan-validate-live-interop-artifact
 USER swan
 WORKDIR /var/lib/swan
 EXPOSE 3000

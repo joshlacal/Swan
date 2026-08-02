@@ -35,7 +35,8 @@ public final class SwanPortableExportDestination: @unchecked Sendable {
         let output = outputURL.standardizedFileURL
         let name = output.lastPathComponent
         guard output.path != "/",
-              SwanPortableExportFilesystem.isSafeComponent(name) else {
+              SwanPortableExportFilesystem.isSafeComponent(name),
+              name != SwanPortableExportFilesystem.cleanupQuarantineName else {
             throw SwanPortableExportError.invalidPlacement
         }
         let parent = output.deletingLastPathComponent()
@@ -131,6 +132,11 @@ struct SwanPortableExportPublicationFile: Sendable {
 }
 
 enum SwanPortableExportFilesystem {
+    /// Online cleanup cannot portably unlink an open inode atomically on both
+    /// Darwin and Linux. A scrubbed tree is therefore moved into this single
+    /// reserved slot and retained for quiesced operator recovery.
+    static let cleanupQuarantineName = ".swan-cleanup-quarantine"
+    static let cleanupQuarantinedTreeName = "tree"
     static let maximumArtifactBytes = 512 * 1_024 * 1_024
     static let maximumArchiveBytes = 1_024 * 1_024 * 1_024
 
@@ -294,12 +300,7 @@ enum SwanPortableExportFilesystem {
             throw SwanPortableExportError.invalidPlacement
         }
         if name.withCString({ mkdirat(parent, $0, 0o700) }) == 0 {
-            do {
-                return (try openDirectory(parent: parent, name: name), true)
-            } catch {
-                _ = name.withCString { unlinkat(parent, $0, AT_REMOVEDIR) }
-                throw error
-            }
+            return (try openDirectory(parent: parent, name: name), true)
         }
         guard errno == EEXIST else {
             throw SwanPortableExportError.publicationFailed
@@ -323,25 +324,17 @@ enum SwanPortableExportFilesystem {
         return false
     }
 
-    static func removeEmptyDirectory(parent: Int32, name: String) throws {
-        guard isSafeComponent(name),
-              name.withCString({ unlinkat(parent, $0, AT_REMOVEDIR) }) == 0 else {
-            throw SwanPortableExportError.publicationFailed
-        }
-        try requireAbsent(parent: parent, name: name)
-    }
-
     static func createStagingDirectory(parent: Int32, name: String) throws -> Int32 {
         guard isSafeComponent(name),
+              flock(parent, LOCK_EX | LOCK_NB) == 0,
+              try !entryExists(parent: parent, name: cleanupQuarantineName),
               name.withCString({ mkdirat(parent, $0, 0o700) }) == 0 else {
             throw SwanPortableExportError.publicationFailed
         }
-        do {
-            return try openDirectory(parent: parent, name: name)
-        } catch {
-            _ = name.withCString { unlinkat(parent, $0, AT_REMOVEDIR) }
-            throw error
-        }
+        // Do not unlink by name if opening fails: a same-UID actor could swap
+        // the freshly created path before cleanup. An empty residue is safer
+        // than deleting an unrelated replacement.
+        return try openDirectory(parent: parent, name: name)
     }
 
     static func write(
@@ -442,7 +435,11 @@ enum SwanPortableExportFilesystem {
     /// and blob bodies in bounded chunks instead of first assembling `Data`.
     static func openStreamingWriter(
         path: String,
-        root: Int32
+        root: Int32,
+        synchronizeCreatedDirectoryParent:
+            @escaping @Sendable (Int32) throws -> Void = {
+                try SwanPortableExportFilesystem.synchronizeParent($0)
+            }
     ) throws -> StreamingWriter {
         let components = try pathComponents(path)
         var openedDirectories: [Int32] = []
@@ -478,8 +475,9 @@ enum SwanPortableExportFilesystem {
                   metadata.st_uid == geteuid(),
                   metadata.st_nlink == 1,
                   (metadata.st_mode & 0o777) == 0o600 else {
+                _ = ftruncate(descriptor, 0)
+                _ = fsync(descriptor)
                 _ = close(descriptor)
-                _ = filename.withCString { unlinkat(current, $0, 0) }
                 throw SwanPortableExportError.publicationFailed
             }
             return StreamingWriter(
@@ -487,7 +485,9 @@ enum SwanPortableExportFilesystem {
                 parentDescriptor: current,
                 filename: filename,
                 openedDirectories: openedDirectories,
-                createdDirectoryParents: createdDirectoryParents
+                createdDirectoryParents: createdDirectoryParents,
+                synchronizeCreatedDirectoryParent:
+                    synchronizeCreatedDirectoryParent
             )
         } catch {
             for descriptor in openedDirectories.reversed() { _ = close(descriptor) }
@@ -529,6 +529,92 @@ enum SwanPortableExportFilesystem {
         }
     }
 
+    static func fileByteCount(
+        path: String,
+        root: Int32,
+        maximumBytes: Int
+    ) throws -> Int {
+        guard maximumBytes >= 0 else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        let descriptor = try openStreamingReader(path: path, root: root)
+        defer { _ = close(descriptor) }
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              metadata.st_size >= 0,
+              metadata.st_size <= off_t(maximumBytes) else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        return Int(metadata.st_size)
+    }
+
+    /// Copies one descriptor-confined regular file with a fixed 64 KiB
+    /// resident window. Source identity and length are rechecked after EOF;
+    /// the destination writer removes a partial file on every failure.
+    static func copyStreaming(
+        path: String,
+        sourceRoot: Int32,
+        destinationRoot: Int32,
+        expectedByteCount: Int,
+        maximumBytes: Int,
+        synchronizeCreatedDirectoryParent:
+            @escaping @Sendable (Int32) throws -> Void = {
+                try SwanPortableExportFilesystem.synchronizeParent($0)
+            }
+    ) throws {
+        guard expectedByteCount >= 0,
+              expectedByteCount <= maximumBytes else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        let source = try openStreamingReader(path: path, root: sourceRoot)
+        defer { _ = close(source) }
+        var initial = stat()
+        guard fstat(source, &initial) == 0,
+              initial.st_size == off_t(expectedByteCount) else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        let writer = try openStreamingWriter(
+            path: path,
+            root: destinationRoot,
+            synchronizeCreatedDirectoryParent:
+                synchronizeCreatedDirectoryParent
+        )
+        do {
+            var remaining = expectedByteCount
+            while remaining > 0 {
+                try Task.checkCancellation()
+                var chunk = Data(count: min(64 * 1_024, remaining))
+                let count = try chunk.withUnsafeMutableBytes { bytes -> Int in
+                    while true {
+                        let result = systemRead(source, bytes.baseAddress!, bytes.count)
+                        if result < 0, errno == EINTR { continue }
+                        guard result > 0 else {
+                            throw SwanPortableExportError.invalidArchive
+                        }
+                        return result
+                    }
+                }
+                chunk.count = count
+                try writer.write(chunk)
+                remaining -= count
+            }
+            var extra: UInt8 = 0
+            let extraCount = withUnsafeMutablePointer(to: &extra) {
+                systemRead(source, $0, 1)
+            }
+            var final = stat()
+            guard extraCount == 0,
+                  fstat(source, &final) == 0,
+                  stableRegularFile(initial: initial, final: final) else {
+                throw SwanPortableExportError.invalidArchive
+            }
+            try writer.finish()
+        } catch {
+            writer.abort()
+            throw error
+        }
+    }
+
     /// A descriptor-backed export file.  It owns the descriptor and removes a
     /// partial file if the producer fails or is cancelled.
     final class StreamingWriter: @unchecked Sendable {
@@ -537,6 +623,8 @@ enum SwanPortableExportFilesystem {
         private let filename: String
         private let openedDirectories: [Int32]
         private let createdDirectoryParents: [Int32]
+        private let synchronizeCreatedDirectoryParent:
+            @Sendable (Int32) throws -> Void
         private var finished = false
         private var descriptorClosed = false
         private var directoriesClosed = false
@@ -546,13 +634,17 @@ enum SwanPortableExportFilesystem {
             parentDescriptor: Int32,
             filename: String,
             openedDirectories: [Int32],
-            createdDirectoryParents: [Int32]
+            createdDirectoryParents: [Int32],
+            synchronizeCreatedDirectoryParent:
+                @escaping @Sendable (Int32) throws -> Void
         ) {
             self.descriptor = descriptor
             self.parentDescriptor = parentDescriptor
             self.filename = filename
             self.openedDirectories = openedDirectories
             self.createdDirectoryParents = createdDirectoryParents
+            self.synchronizeCreatedDirectoryParent =
+                synchronizeCreatedDirectoryParent
         }
 
         deinit {
@@ -591,7 +683,7 @@ enum SwanPortableExportFilesystem {
                 throw SwanPortableExportError.publicationFailed
             }
             for directory in createdDirectoryParents.reversed() {
-                try Self.synchronizeParent(directory)
+                try synchronizeCreatedDirectoryParent(directory)
             }
             finished = true
             closeOpenedDirectories()
@@ -600,8 +692,11 @@ enum SwanPortableExportFilesystem {
         func abort() {
             guard !finished else { return }
             finished = true
-            if !descriptorClosed { _ = close(descriptor) }
-            _ = filename.withCString { unlinkat(parentDescriptor, $0, 0) }
+            if !descriptorClosed {
+                _ = ftruncate(descriptor, 0)
+                _ = fsync(descriptor)
+                _ = close(descriptor)
+            }
             closeOpenedDirectories()
         }
 
@@ -611,17 +706,13 @@ enum SwanPortableExportFilesystem {
             for directory in openedDirectories.reversed() { _ = close(directory) }
         }
 
-        private static func synchronizeParent(_ descriptor: Int32) throws {
-            guard fsync(descriptor) == 0 else {
-                throw SwanPortableExportError.publicationFailed
-            }
-        }
     }
 
     static func read(
         path: String,
         root: Int32,
-        maximumBytes: Int
+        maximumBytes: Int,
+        afterReadBeforeFinalValidation: (@Sendable () throws -> Void)? = nil
     ) throws -> Data {
         guard maximumBytes >= 0 else {
             throw SwanPortableExportError.invalidArchive
@@ -673,11 +764,26 @@ enum SwanPortableExportFilesystem {
                 offset += count
             }
         }
+        try afterReadBeforeFinalValidation?()
+        guard descriptorPrefixMatches(
+            descriptor: descriptor,
+            expected: data
+        ) else {
+            throw SwanPortableExportError.invalidArchive
+        }
         var extra: UInt8 = 0
         let extraCount = withUnsafeMutablePointer(to: &extra) {
-            systemRead(descriptor, $0, 1)
+            systemPread(
+                descriptor,
+                $0,
+                1,
+                off_t(expectedCount)
+            )
         }
-        guard extraCount == 0 else {
+        var final = stat()
+        guard extraCount == 0,
+              fstat(descriptor, &final) == 0,
+              stableRegularFile(initial: metadata, final: final) else {
             throw SwanPortableExportError.invalidArchive
         }
         return data
@@ -701,67 +807,37 @@ enum SwanPortableExportFilesystem {
         return entries
     }
 
-    static func removeTree(parent: Int32, name: String) throws {
-        guard isSafeComponent(name) else {
-            throw SwanPortableExportError.invalidPlacement
-        }
-        var rootMetadata = stat()
-        if name.withCString({
-            fstatat(parent, $0, &rootMetadata, AT_SYMLINK_NOFOLLOW)
-        }) != 0 {
-            guard errno == ENOENT else {
-                throw SwanPortableExportError.publicationFailed
-            }
-            return
-        }
-        guard (rootMetadata.st_mode & S_IFMT) == S_IFDIR,
-              rootMetadata.st_uid == geteuid() else {
-            throw SwanPortableExportError.publicationFailed
-        }
-        let descriptor = name.withCString {
-            openat(parent, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
-        }
-        guard descriptor >= 0 else {
-            throw SwanPortableExportError.publicationFailed
-        }
-        defer { _ = close(descriptor) }
-        try requireOwnerOnlyDirectory(descriptor)
-        for child in try directoryEntryNames(descriptor) {
-            var metadata = stat()
-            guard child.withCString({
-                fstatat(descriptor, $0, &metadata, AT_SYMLINK_NOFOLLOW)
-            }) == 0,
-            metadata.st_uid == geteuid() else {
-                throw SwanPortableExportError.publicationFailed
-            }
-            if (metadata.st_mode & S_IFMT) == S_IFDIR {
-                try removeTree(parent: descriptor, name: child)
-            } else {
-                guard child.withCString({ unlinkat(descriptor, $0, 0) }) == 0 else {
-                    throw SwanPortableExportError.publicationFailed
-                }
-                try requireAbsent(parent: descriptor, name: child)
-            }
-        }
-        guard name.withCString({ unlinkat(parent, $0, AT_REMOVEDIR) }) == 0 else {
-            throw SwanPortableExportError.publicationFailed
-        }
-        try requireAbsent(parent: parent, name: name)
-    }
-
-    /// Scrubs the pinned tree through its descriptor and moves its active name
-    /// to a random inert tombstone. POSIX has no conditional rmdir-by-inode;
-    /// retaining an empty tombstone is the only way to ensure a same-UID
-    /// replacement is never unlinked after a name check.
+    /// Scrubs the pinned tree through descriptors and moves one directory entry
+    /// into a fixed quarantine slot. There is deliberately no online unlink:
+    /// Darwin and unprivileged Linux have no portable atomic unlink-by-open-FD,
+    /// so a pathname unlink could delete a same-UID replacement after an inode
+    /// check. A populated or mismatched quarantine poisons this parent until a
+    /// trusted operator recovers it while the service is quiesced.
     static func removeTree(
         parent: Int32,
         matching expectedDescriptor: Int32,
-        afterEntryResolvedBeforeRemoval: (@Sendable (String) throws -> Void)? = nil
+        afterEntryResolvedBeforeRemoval: (@Sendable (String) throws -> Void)? = nil,
+        afterQuarantineMoveBeforeValidation: (@Sendable () throws -> Void)? = nil
     ) throws {
         var expected = stat()
         guard fstat(expectedDescriptor, &expected) == 0,
               (expected.st_mode & S_IFMT) == S_IFDIR,
               expected.st_uid == geteuid() else {
+            throw SwanPortableExportError.publicationFailed
+        }
+        guard try !entryExists(parent: parent, name: cleanupQuarantineName),
+              cleanupQuarantineName.withCString({ mkdirat(parent, $0, 0o700) }) == 0
+        else {
+            // An existing durable marker already blocks this parent. Do not
+            // mutate it or attempt any online recovery.
+            throw SwanPortableExportError.publicationFailed
+        }
+        let quarantine = try openDirectory(
+            parent: parent,
+            name: cleanupQuarantineName
+        )
+        defer { _ = close(quarantine) }
+        guard fsync(quarantine) == 0, fsync(parent) == 0 else {
             throw SwanPortableExportError.publicationFailed
         }
         try scrubTree(root: expectedDescriptor)
@@ -781,10 +857,9 @@ enum SwanPortableExportFilesystem {
         guard matchingNames.count == 1 else {
             throw SwanPortableExportError.publicationFailed
         }
-        try afterEntryResolvedBeforeRemoval?(matchingNames[0])
-
-        // Re-resolve after the adversarial interval. The exact pinned inode,
-        // not the previously observed name, is the only cleanup target.
+        // Resolve once more before the final adversarial interval. The callback
+        // exists only for proving that the subsequent no-replace move preserves
+        // (at worst relocates) a raced replacement rather than unlinking it.
         matchingNames.removeAll(keepingCapacity: true)
         for name in try directoryEntryNames(parent) {
             var current = stat()
@@ -802,23 +877,38 @@ enum SwanPortableExportFilesystem {
             throw SwanPortableExportError.publicationFailed
         }
         let sourceName = matchingNames[0]
-        let tombstoneName = ".swan-scrubbed-restore-\(UUID().uuidString.lowercased())"
+        try afterEntryResolvedBeforeRemoval?(sourceName)
         try renameExclusively(
-            parent: parent,
+            sourceParent: parent,
             source: sourceName,
-            destination: tombstoneName
+            destinationParent: quarantine,
+            destination: cleanupQuarantinedTreeName
         )
+        try afterQuarantineMoveBeforeValidation?()
         guard try currentChildDirectoryMatches(
-            parent: parent,
-            name: tombstoneName,
+            parent: quarantine,
+            name: cleanupQuarantinedTreeName,
             expectedDescriptor: expectedDescriptor
         ) else {
             throw SwanPortableExportError.publicationFailed
         }
+        guard fsync(expectedDescriptor) == 0,
+              fsync(quarantine) == 0,
+              fsync(parent) == 0 else {
+            throw SwanPortableExportError.publicationFailed
+        }
     }
 
+    /// Removes payload bytes without pathname deletion. Directory/file names and
+    /// extended attributes are intentionally retained as sensitive metadata in
+    /// the owner-only quarantine; online code must neither inspect nor reclaim
+    /// them. Quiesced operator recovery owns their eventual removal.
     private static func scrubTree(root: Int32) throws {
         try requireOwnerOnlyDirectory(root)
+        var rootMetadata = stat()
+        guard fstat(root, &rootMetadata) == 0 else {
+            throw SwanPortableExportError.publicationFailed
+        }
         for name in try directoryEntryNames(root) {
             var metadata = stat()
             guard name.withCString({
@@ -832,6 +922,16 @@ enum SwanPortableExportFilesystem {
                     openat(root, $0, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
                 }
                 guard child >= 0 else {
+                    throw SwanPortableExportError.publicationFailed
+                }
+                var opened = stat()
+                guard fstat(child, &opened) == 0,
+                      opened.st_dev == rootMetadata.st_dev,
+                      opened.st_dev == metadata.st_dev,
+                      opened.st_ino == metadata.st_ino,
+                      (opened.st_mode & S_IFMT) == S_IFDIR,
+                      opened.st_uid == geteuid() else {
+                    _ = close(child)
                     throw SwanPortableExportError.publicationFailed
                 }
                 do {
@@ -853,6 +953,9 @@ enum SwanPortableExportFilesystem {
                 }
                 var opened = stat()
                 guard fstat(file, &opened) == 0,
+                      opened.st_dev == rootMetadata.st_dev,
+                      opened.st_dev == metadata.st_dev,
+                      opened.st_ino == metadata.st_ino,
                       (opened.st_mode & S_IFMT) == S_IFREG,
                       opened.st_uid == geteuid(),
                       opened.st_nlink == 1,
@@ -874,21 +977,41 @@ enum SwanPortableExportFilesystem {
         source: String,
         destination: String
     ) throws {
+        guard try !entryExists(
+            parent: parent,
+            name: cleanupQuarantineName
+        ) else {
+            throw SwanPortableExportError.publicationFailed
+        }
+        try renameExclusively(
+            sourceParent: parent,
+            source: source,
+            destinationParent: parent,
+            destination: destination
+        )
+    }
+
+    private static func renameExclusively(
+        sourceParent: Int32,
+        source: String,
+        destinationParent: Int32,
+        destination: String
+    ) throws {
         let result = source.withCString { sourcePath in
             destination.withCString { destinationPath in
                 #if canImport(Darwin)
                 renameatx_np(
-                    parent,
+                    sourceParent,
                     sourcePath,
-                    parent,
+                    destinationParent,
                     destinationPath,
                     UInt32(RENAME_EXCL)
                 )
                 #else
                 swanRenameAt2(
-                    parent,
+                    sourceParent,
                     sourcePath,
-                    parent,
+                    destinationParent,
                     destinationPath,
                     swanRenameNoReplace
                 )
@@ -971,6 +1094,14 @@ enum SwanPortableExportFilesystem {
         var output = Set<String>()
         for path in files {
             let components = try pathComponents(path)
+            // The frozen portable layout has at most four components, and an
+            // operator backup adds the `portable/` container. Keep a little
+            // explicit format headroom while validating depth before joining
+            // prefixes so a small manifest cannot amplify into quadratic,
+            // multi-gigabyte cumulative strings.
+            guard components.count <= 8 else {
+                throw SwanPortableExportError.invalidManifest
+            }
             guard components.count > 1 else { continue }
             for end in 1 ..< components.count {
                 output.insert(components[..<end].joined(separator: "/"))
@@ -1007,6 +1138,79 @@ enum SwanPortableExportFilesystem {
             throw SwanPortableExportError.invalidManifest
         }
         return components
+    }
+
+    /// Same-inode writes are not detected by identity/length alone. Compare
+    /// nanosecond mtime and ctime as well; an attacker can restore mtime, but
+    /// cannot restore ctime after writing or changing timestamps.
+    private static func stableRegularFile(initial: stat, final: stat) -> Bool {
+        guard final.st_dev == initial.st_dev,
+              final.st_ino == initial.st_ino,
+              final.st_size == initial.st_size,
+              final.st_mode == initial.st_mode,
+              final.st_uid == initial.st_uid,
+              final.st_gid == initial.st_gid,
+              final.st_nlink == initial.st_nlink,
+              (final.st_mode & S_IFMT) == S_IFREG,
+              final.st_uid == geteuid(),
+              final.st_nlink == 1,
+              (final.st_mode & 0o777) == 0o600 else {
+            return false
+        }
+#if canImport(Darwin)
+        return final.st_mtimespec.tv_sec == initial.st_mtimespec.tv_sec
+            && final.st_mtimespec.tv_nsec == initial.st_mtimespec.tv_nsec
+            && final.st_ctimespec.tv_sec == initial.st_ctimespec.tv_sec
+            && final.st_ctimespec.tv_nsec == initial.st_ctimespec.tv_nsec
+#else
+        return final.st_mtim.tv_sec == initial.st_mtim.tv_sec
+            && final.st_mtim.tv_nsec == initial.st_mtim.tv_nsec
+            && final.st_ctim.tv_sec == initial.st_ctim.tv_sec
+            && final.st_ctim.tv_nsec == initial.st_ctim.tv_nsec
+#endif
+    }
+
+    /// Revalidates the exact bytes already consumed through the same pinned
+    /// descriptor. Some Linux filesystems do not expose a same-size rewrite
+    /// through timestamp metadata soon enough for an immediate final `fstat`.
+    /// Keep the second pass bounded and compare against the resident result
+    /// instead of trusting metadata as a content-integrity signal.
+    private static func descriptorPrefixMatches(
+        descriptor: Int32,
+        expected: Data
+    ) -> Bool {
+        guard !expected.isEmpty else { return true }
+        var scratch = Data(count: min(64 * 1_024, expected.count))
+        return expected.withUnsafeBytes { expectedBytes in
+            var offset = 0
+            while offset < expected.count {
+                let requested = min(scratch.count, expected.count - offset)
+                let count = scratch.withUnsafeMutableBytes { scratchBytes in
+                    while true {
+                        let result = systemPread(
+                            descriptor,
+                            scratchBytes.baseAddress!,
+                            requested,
+                            off_t(offset)
+                        )
+                        if result < 0, errno == EINTR { continue }
+                        return result
+                    }
+                }
+                let matches = scratch.withUnsafeBytes { scratchBytes in
+                    memcmp(
+                        scratchBytes.baseAddress!,
+                        expectedBytes.baseAddress!.advanced(by: offset),
+                        requested
+                    ) == 0
+                }
+                guard count == requested, matches else {
+                    return false
+                }
+                offset += requested
+            }
+            return true
+        }
     }
 
     private static func openDirectory(parent: Int32, name: String) throws -> Int32 {
@@ -1133,6 +1337,19 @@ enum SwanPortableExportFilesystem {
         Darwin.read(descriptor, buffer, count)
         #else
         Glibc.read(descriptor, buffer, count)
+        #endif
+    }
+
+    private static func systemPread(
+        _ descriptor: Int32,
+        _ buffer: UnsafeMutableRawPointer,
+        _ count: Int,
+        _ offset: off_t
+    ) -> Int {
+        #if canImport(Darwin)
+        Darwin.pread(descriptor, buffer, count, offset)
+        #else
+        Glibc.pread(descriptor, buffer, count, offset)
         #endif
     }
 

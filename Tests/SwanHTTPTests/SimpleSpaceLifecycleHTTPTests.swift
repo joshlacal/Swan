@@ -32,17 +32,24 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
             maximumConcurrentWrites: 1,
             maximumReservedRequestBytes: maximum
         )
+        let policy = try SwanJSONWriteBodyPolicy(totalBodyTimeout: .seconds(5))
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         do {
             let server = try makeServer(
                 fixture,
-                jsonWriteAdmission: admission
+                jsonWriteAdmission: admission,
+                jsonWriteBodyPolicy: policy
             )
             XCTAssertTrue(server.jsonWriteAdmission === admission)
+            XCTAssertTrue(server.jsonWriteBodyPolicy === policy)
             XCTAssertTrue(
                 server.authenticatedSimpleSpaceLifecycle?.jsonWriteAdmission
                     === admission
+            )
+            XCTAssertTrue(
+                server.authenticatedSimpleSpaceLifecycle?.jsonWriteBodyPolicy
+                    === policy
             )
             let held = try XCTUnwrap(
                 admission.reserve(maximumRequestBytes: maximum)
@@ -72,6 +79,72 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 activeLeases: 0,
                 reservedRequestBytes: 0
             ))
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
+    func testLifecycleContentLengthDeclarationPolicyRejectsBeforeAdmission() {
+        let maximum = authenticatedSpaceWriteMaximumJSONBytes
+        for (name, values) in contentLengthRejectionCases(maximum: maximum) {
+            XCTAssertFalse(acceptsSimpleSpaceWriteContentLength(values), name)
+        }
+        XCTAssertTrue(acceptsSimpleSpaceWriteContentLength([]), "missing")
+        XCTAssertTrue(acceptsSimpleSpaceWriteContentLength(["1"]), "valid")
+        XCTAssertTrue(acceptsSimpleSpaceWriteContentLength([String(maximum)]), "boundary")
+    }
+
+    func testLifecycleOversizedDeclarationRejectsBeforeAuthorizationAndDomain() async throws {
+        let maximum = authenticatedSpaceWriteMaximumJSONBytes
+        let admission = try PublicRepositoryJSONWriteAdmission(
+            maximumConcurrentWrites: 1,
+            maximumReservedRequestBytes: maximum
+        )
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let directory = CountingSimpleSpaceDirectory(base: fixture.directory)
+        do {
+            let server = try makeServer(
+                fixture,
+                jsonWriteAdmission: admission,
+                authenticatedDirectory: directory
+            )
+            let held = try XCTUnwrap(admission.reserve(maximumRequestBytes: maximum))
+            let replayCount = try await oauthDPoPReplayCount(in: fixture.root)
+            do {
+                try await server.buildApplication(
+                    logger: Logger(label: "SimpleSpaceLifecycleWriteAdmissionTests.oversized-socket")
+                ).test(.live) { client in
+                    let response = try await executeRealSocketIncompleteHTTPBody(
+                        port: try XCTUnwrap(client.port),
+                        path: Self.createPath,
+                        headers: try self.postHeaders(
+                            fixture,
+                            path: Self.createPath,
+                            jti: "lifecycle-oversized-socket"
+                        ),
+                        declaredBodyBytes: maximum + 1,
+                        emittedBody: "{"
+                    )
+                    XCTAssertEqual(response.statusCode, 400)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                    XCTAssertEqual(response.emittedBodyBytes, 1)
+                    XCTAssertEqual(
+                        admission.snapshot,
+                        .init(activeLeases: 1, reservedRequestBytes: maximum)
+                    )
+                    let finalReplayCount = try await oauthDPoPReplayCount(in: fixture.root)
+                    let domainCallCount = await directory.domainCallCount
+                    XCTAssertEqual(finalReplayCount, replayCount)
+                    XCTAssertEqual(domainCallCount, 0)
+                }
+                held.release()
+            } catch {
+                held.release()
+                throw error
+            }
             try await close(fixture)
         } catch {
             try? await close(fixture)
@@ -371,15 +444,18 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
 
     private func makeServer(
         _ fixture: SimpleSpaceFixture,
-        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
+        jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil,
+        authenticatedDirectory: (any AuthorizedSimpleSpaceDirectory)? = nil
     ) throws -> SwanHTTPServer {
         SwanHTTPServer(
             profile: try ProtocolProfile.load(from: packageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")),
             configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: Self.publicURL),
             oauthRuntime: fixture.runtime,
-            authenticatedGetSpaceDirectory: fixture.directory,
+            authenticatedGetSpaceDirectory: authenticatedDirectory ?? fixture.directory,
             accountControlStore: fixture.control,
-            jsonWriteAdmission: jsonWriteAdmission
+            jsonWriteAdmission: jsonWriteAdmission,
+            jsonWriteBodyPolicy: jsonWriteBodyPolicy
         )
     }
 
@@ -457,3 +533,43 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
 
 private struct SimpleSpaceTokenMaterial: Sendable { let token: String; let key: P256.Signing.PrivateKey; let jwk: OAuthJSONWebKey }
 private struct SimpleSpaceFixture: Sendable { let root: URL; let control: SQLiteControlDatabase; let directory: SQLitePreMigratedAccountDirectory; let runtime: SwanOAuthRuntime; let alice: SimpleSpaceTokenMaterial; let bob: SimpleSpaceTokenMaterial }
+
+private actor CountingSimpleSpaceDirectory:
+    AuthorizedSimpleSpaceDirectory,
+    AuthorizedSimpleSpaceLifecycleDirectory
+{
+    let base: SQLitePreMigratedAccountDirectory
+    private(set) var domainCallCount = 0
+
+    init(base: SQLitePreMigratedAccountDirectory) { self.base = base }
+
+    func space(_ space: SpaceURI, authorization: AuthorizationContext) async throws -> AuthenticatedSimpleSpaceDescription? {
+        domainCallCount += 1
+        return try await base.space(space, authorization: authorization)
+    }
+    func close() async throws {}
+    func createSimpleSpace(_ space: SpaceURI, configuration: SimpleSpaceConfiguration, authorization: AuthorizationContext) async throws {
+        domainCallCount += 1
+        try await base.createSimpleSpace(space, configuration: configuration, authorization: authorization)
+    }
+    func updateSimpleSpace(_ space: SpaceURI, patch: SimpleSpaceConfigurationPatch, authorization: AuthorizationContext) async throws {
+        domainCallCount += 1
+        try await base.updateSimpleSpace(space, patch: patch, authorization: authorization)
+    }
+    func deleteSimpleSpace(_ space: SpaceURI, authorization: AuthorizationContext) async throws {
+        domainCallCount += 1
+        try await base.deleteSimpleSpace(space, authorization: authorization)
+    }
+    func addSimpleSpaceMember(_ member: String, to space: SpaceURI, authorization: AuthorizationContext) async throws {
+        domainCallCount += 1
+        try await base.addSimpleSpaceMember(member, to: space, authorization: authorization)
+    }
+    func removeSimpleSpaceMember(_ member: String, from space: SpaceURI, authorization: AuthorizationContext) async throws {
+        domainCallCount += 1
+        try await base.removeSimpleSpaceMember(member, from: space, authorization: authorization)
+    }
+    func simpleSpaceMembers(_ space: SpaceURI, limit: Int, cursor: String?, authorization: AuthorizationContext) async throws -> AuthorizedSimpleSpaceMemberPage {
+        domainCallCount += 1
+        return try await base.simpleSpaceMembers(space, limit: limit, cursor: cursor, authorization: authorization)
+    }
+}

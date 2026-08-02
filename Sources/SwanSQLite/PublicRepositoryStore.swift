@@ -9,25 +9,65 @@ struct SQLitePublicRepositoryBlockSource: PublicRepositoryBlockSource {
     let connection: SQLiteConnection
 
     func block(for cid: CID) async throws -> Data? {
-        let rows = try await connection.query(
-            "SELECT bytes FROM public_repository_blocks WHERE cid = ?",
-            [.text(cid.string)]
-        )
-        guard rows.count <= 1 else {
-            throw PublicRepositoryMutationStoreError.corruptRepository
-        }
-        guard let row = rows.first,
-              let value = row.column("bytes"),
-              let bytes = Data(sqliteData: value) else {
+        switch try await boundedPublicRepositoryBlock(connection: connection, cid: cid) {
+        case .missing:
             return nil
-        }
-        do {
-            try PublicRepositoryCID.validate(cid, blockBytes: bytes)
-        } catch {
+        case .oversized:
             throw PublicRepositoryMutationStoreError.corruptRepository
+        case let .bytes(bytes):
+            do {
+                try PublicRepositoryCID.validate(cid, blockBytes: bytes)
+            } catch {
+                throw PublicRepositoryMutationStoreError.corruptRepository
+            }
+            return bytes
         }
-        return bytes
     }
+}
+
+enum BoundedPublicRepositoryBlockRead {
+    case missing
+    case oversized
+    case bytes(Data)
+}
+
+/// `CASE` is deliberate: SQLite can answer `length(BLOB)` from the record
+/// header and does not return the BLOB value at all when it exceeds the bound.
+/// Keeping the size check and value projection in one statement also avoids a
+/// check/use race with another connection.
+func boundedPublicRepositoryBlock(
+    connection: SQLiteConnection,
+    cid: CID
+) async throws -> BoundedPublicRepositoryBlockRead {
+    let rows = try await connection.query(
+        """
+        SELECT length(bytes) AS byte_count,
+               CASE WHEN length(bytes) <= ? THEN bytes ELSE NULL END AS bounded_bytes
+        FROM public_repository_blocks
+        WHERE cid = ?
+        """,
+        [
+            .integer(PublicRepositoryLimits.maximumPersistedBlockBytes),
+            .text(cid.string),
+        ]
+    )
+    guard rows.count <= 1 else {
+        throw PublicRepositoryMutationStoreError.corruptRepository
+    }
+    guard let row = rows.first else { return .missing }
+    guard case let .integer(byteCount) = row.column("byte_count"),
+          byteCount >= 0 else {
+        throw PublicRepositoryMutationStoreError.corruptRepository
+    }
+    guard byteCount <= PublicRepositoryLimits.maximumPersistedBlockBytes else {
+        return .oversized
+    }
+    guard let value = row.column("bounded_bytes"),
+          let bytes = Data(sqliteData: value),
+          bytes.count == byteCount else {
+        throw PublicRepositoryMutationStoreError.corruptRepository
+    }
+    return .bytes(bytes)
 }
 
 /// Admission only needs to prove that the durable index is exactly the
@@ -91,23 +131,19 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
             throw PublicRepositoryMutationStoreError.corruptRepository
         }
         return try await withConnectionGate {
-            let rows = try await connection.query(
-                "SELECT bytes FROM public_repository_blocks WHERE cid = ?",
-                [.text(cid.string)]
-            )
-            guard rows.count <= 1 else {
+            switch try await boundedPublicRepositoryBlock(connection: connection, cid: cid) {
+            case .missing:
+                return nil
+            case .oversized:
                 throw PublicRepositoryMutationStoreError.corruptRepository
+            case let .bytes(bytes):
+                do {
+                    try PublicRepositoryCID.validate(cid, blockBytes: bytes)
+                } catch {
+                    throw PublicRepositoryMutationStoreError.corruptRepository
+                }
+                return bytes
             }
-            guard let row = rows.first,
-                  let value = row.column("bytes"),
-                  let bytes = Data(sqliteData: value)
-            else { return nil }
-            do {
-                try PublicRepositoryCID.validate(cid, blockBytes: bytes)
-            } catch {
-                throw PublicRepositoryMutationStoreError.corruptRepository
-            }
-            return bytes
         }
     }
 
@@ -337,21 +373,21 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                         throw PublicRepositoryMutationStoreError.preparedMutationMismatch
                     }
                     try PublicRepositoryCID.validate(cid, blockBytes: bytes)
-                    let existing = try await connection.query(
-                        "SELECT bytes FROM public_repository_blocks WHERE cid = ?",
-                        [.text(cid.string)]
-                    )
-                    if let row = existing.first {
-                        guard let value = row.column("bytes"),
-                              Data(sqliteData: value) == bytes else {
-                            throw PublicRepositoryMutationStoreError.corruptRepository
-                        }
-                    } else {
+                    switch try await boundedPublicRepositoryBlock(
+                        connection: connection, cid: cid
+                    ) {
+                    case .missing:
                         _ = try await connection.query(
                             "INSERT INTO public_repository_blocks(cid, bytes) VALUES (?, ?)",
                             [.text(cid.string), bytes.sqliteData!]
                         )
                         try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
+                    case .oversized:
+                        throw PublicRepositoryMutationStoreError.corruptRepository
+                    case let .bytes(existingBytes):
+                        guard existingBytes == bytes else {
+                            throw PublicRepositoryMutationStoreError.corruptRepository
+                        }
                     }
                 }
 
@@ -795,14 +831,12 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
     }
 
     func blockBytesWithoutGate(_ cid: CID) async throws -> Data {
-        let rows = try await connection.query(
-            "SELECT bytes FROM public_repository_blocks WHERE cid = ?",
-            [.text(cid.string)]
-        )
-        guard rows.count == 1,
-              let value = rows[0].column("bytes"),
-              let bytes = Data(sqliteData: value) else {
+        let bytes: Data
+        switch try await boundedPublicRepositoryBlock(connection: connection, cid: cid) {
+        case .missing, .oversized:
             throw PublicRepositoryMutationStoreError.corruptRepository
+        case let .bytes(value):
+            bytes = value
         }
         do {
             try PublicRepositoryCID.validate(cid, blockBytes: bytes)

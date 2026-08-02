@@ -155,7 +155,7 @@ final class OAuthPeerPinnedNIOClientResources: @unchecked Sendable {
     }
 }
 
-private final class OAuthDocumentResponseHandler: ChannelInboundHandler, @unchecked Sendable {
+final class OAuthDocumentResponseHandler: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
     typealias InboundIn = HTTPClientResponsePart
 
     private let responsePromise: EventLoopPromise<OAuthRemoteHTTPResponse>
@@ -183,10 +183,11 @@ private final class OAuthDocumentResponseHandler: ChannelInboundHandler, @unchec
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
+        let channel = context.channel
         timeoutTask = context.eventLoop.scheduleTask(
             in: .milliseconds(Int64(timeout * 1_000))
-        ) { [weak self] in
-            self?.timeout(context: context)
+        ) { [weak self, channel] in
+            self?.timeout(channel: channel)
         }
     }
 
@@ -242,6 +243,12 @@ private final class OAuthDocumentResponseHandler: ChannelInboundHandler, @unchec
         }
     }
 
+    func handlerRemoved(context: ChannelHandlerContext) {
+        if !completed {
+            fail(context: context, error: SwanError.unavailable("OAuth document response handler was removed before response"))
+        }
+    }
+
     private func fail(context: ChannelHandlerContext, error: Error) {
         guard !completed else { return }
         completed = true
@@ -251,12 +258,12 @@ private final class OAuthDocumentResponseHandler: ChannelInboundHandler, @unchec
         context.close(promise: nil)
     }
 
-    private func timeout(context: ChannelHandlerContext) {
+    private func timeout(channel: Channel) {
         guard !completed else { return }
         completed = true
         timeoutTask = nil
         responsePromise.fail(SwanError.unavailable("OAuth document request timed out"))
-        context.close(promise: nil)
+        channel.close(promise: nil)
     }
 
     private func succeed(_ response: OAuthRemoteHTTPResponse) {

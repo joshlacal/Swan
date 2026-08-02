@@ -58,28 +58,34 @@ public struct SpaceCARRecoveryLimits: Sendable, Equatable {
     public static let absoluteMaximumCARBytes = 256 * 1_024 * 1_024
     public static let absoluteMaximumIndexEntries = 100_000
     public static let absoluteMaximumUniqueBlocks = 100_000
+    public static let absoluteMaximumLogicalRestoredBytes = 256 * 1_024 * 1_024
 
     public let maximumCARBytes: Int
     public let maximumRecordBytes: Int
     public let maximumIndexEntries: Int
     public let maximumUniqueBlocks: Int
+    public let maximumLogicalRestoredBytes: Int
     public static let standard = Self(
         validatedMaximumCARBytes: Self.absoluteMaximumCARBytes,
         maximumRecordBytes: Self.absoluteMaximumRecordBytes,
         maximumIndexEntries: Self.absoluteMaximumIndexEntries,
-        maximumUniqueBlocks: Self.absoluteMaximumUniqueBlocks
+        maximumUniqueBlocks: Self.absoluteMaximumUniqueBlocks,
+        maximumLogicalRestoredBytes: Self.absoluteMaximumLogicalRestoredBytes
     )
 
     public init(
         maximumCARBytes: Int = Self.absoluteMaximumCARBytes,
         maximumRecordBytes: Int = Self.absoluteMaximumRecordBytes,
         maximumIndexEntries: Int = Self.absoluteMaximumIndexEntries,
-        maximumUniqueBlocks: Int = Self.absoluteMaximumUniqueBlocks
+        maximumUniqueBlocks: Int = Self.absoluteMaximumUniqueBlocks,
+        maximumLogicalRestoredBytes: Int = Self.absoluteMaximumLogicalRestoredBytes
     ) throws {
         guard (1 ... Self.absoluteMaximumCARBytes).contains(maximumCARBytes),
               (1 ... Self.absoluteMaximumRecordBytes).contains(maximumRecordBytes),
               (1 ... Self.absoluteMaximumIndexEntries).contains(maximumIndexEntries),
               (1 ... Self.absoluteMaximumUniqueBlocks).contains(maximumUniqueBlocks),
+              (1 ... Self.absoluteMaximumLogicalRestoredBytes)
+                .contains(maximumLogicalRestoredBytes),
               maximumUniqueBlocks <= maximumIndexEntries
         else {
             throw SpaceCARStreamingError.invalidLimits
@@ -88,18 +94,21 @@ public struct SpaceCARRecoveryLimits: Sendable, Equatable {
         self.maximumRecordBytes = maximumRecordBytes
         self.maximumIndexEntries = maximumIndexEntries
         self.maximumUniqueBlocks = maximumUniqueBlocks
+        self.maximumLogicalRestoredBytes = maximumLogicalRestoredBytes
     }
 
     private init(
         validatedMaximumCARBytes: Int,
         maximumRecordBytes: Int,
         maximumIndexEntries: Int,
-        maximumUniqueBlocks: Int
+        maximumUniqueBlocks: Int,
+        maximumLogicalRestoredBytes: Int
     ) {
         self.maximumCARBytes = validatedMaximumCARBytes
         self.maximumRecordBytes = maximumRecordBytes
         self.maximumIndexEntries = maximumIndexEntries
         self.maximumUniqueBlocks = maximumUniqueBlocks
+        self.maximumLogicalRestoredBytes = maximumLogicalRestoredBytes
     }
 }
 
@@ -117,6 +126,10 @@ public struct VerifiedStreamingSpaceCARRecovery: Sendable, Equatable {
     public let commitment: Data
     public let commitBodyDigest: Data
     public let receivedByteCount: Int
+    /// Sum of each verified record body multiplied by the number of DRISL
+    /// paths that reference its CID. This is the maximum SQLite value payload
+    /// the publication transaction is allowed to write.
+    public let logicalRestoredByteCount: Int
 
     public init(
         commitRootCID: CID,
@@ -128,7 +141,8 @@ public struct VerifiedStreamingSpaceCARRecovery: Sendable, Equatable {
         ltHash: Data,
         commitment: Data,
         commitBodyDigest: Data,
-        receivedByteCount: Int
+        receivedByteCount: Int,
+        logicalRestoredByteCount: Int
     ) {
         self.commitRootCID = commitRootCID
         self.indexRootCID = indexRootCID
@@ -140,6 +154,7 @@ public struct VerifiedStreamingSpaceCARRecovery: Sendable, Equatable {
         self.commitment = commitment
         self.commitBodyDigest = commitBodyDigest
         self.receivedByteCount = receivedByteCount
+        self.logicalRestoredByteCount = logicalRestoredByteCount
     }
 }
 
@@ -351,6 +366,7 @@ extension SpaceCARCodec {
 
         var consumedPathCount = 0
         var uniqueBlockCount = 0
+        var logicalRestoredByteCount = 0
         while let frameLength = try await reader.readCanonicalVarintOrEOF() {
             try Task.checkCancellation()
             let (nextUniqueBlockCount, uniqueCountOverflow) =
@@ -404,7 +420,20 @@ extension SpaceCARCodec {
             guard consumedForCID > 0, !overflow, nextCount <= indexedCount else {
                 throw SpaceCARStreamingError.unindexedBlocks
             }
+            let (logicalBytesForCID, productOverflow) =
+                bodyLength.multipliedReportingOverflow(by: consumedForCID)
+            let (nextLogicalRestoredByteCount, sumOverflow) =
+                logicalRestoredByteCount.addingReportingOverflow(
+                    logicalBytesForCID
+                )
+            guard !productOverflow,
+                  !sumOverflow,
+                  nextLogicalRestoredByteCount
+                    <= limits.maximumLogicalRestoredBytes else {
+                throw SpaceCARStreamingError.byteLimitExceeded
+            }
             consumedPathCount = nextCount
+            logicalRestoredByteCount = nextLogicalRestoredByteCount
             let chunkCount = try await recordFrame.finishRecordStaging()
             try await recordSink?.completeRecord(
                 cid: cid,
@@ -427,7 +456,8 @@ extension SpaceCARCodec {
             ltHash: ltHash.serialized,
             commitment: ltHash.commitment,
             commitBodyDigest: Data(SHA256.hash(data: commitFrame.body)),
-            receivedByteCount: reader.receivedByteCount
+            receivedByteCount: reader.receivedByteCount,
+            logicalRestoredByteCount: logicalRestoredByteCount
         )
     }
 

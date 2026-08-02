@@ -544,6 +544,81 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
         try await fixture.control.close()
     }
 
+    func testRepositoryTraversalRejectsOversizedMSTBlobBeforeMaterialization()
+        async throws
+    {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let store = await fixture.directory.preopenedPublicMutationStore(did: did)
+        let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
+        let loadedAccount = try await fixture.control.account(did: did)
+        let account = try XCTUnwrap(loadedAccount)
+        let generation = try await database.admitPublicRepositoryGeneration(
+            account: account,
+            identityVerifier: TestPublicPLCGenesisVerifier(
+                operationCID: fixture.genesisOperationCID
+            )
+        )
+        _ = try await database.connection.query(
+            """
+            UPDATE public_repository_blocks
+            SET bytes = zeroblob(?)
+            WHERE cid = ?
+            """,
+            [
+                .integer(PublicRepositoryLimits.maximumPersistedBlockBytes + 1),
+                .text(fixture.state.dataCID.string),
+            ]
+        )
+
+        await XCTAssertThrowsCorruptPublicRepository(
+            try await database.readPublicRepositoryRecords(
+                collection: collection,
+                limit: 1,
+                cursor: nil,
+                reverse: false,
+                generation: generation
+            )
+        )
+
+        try await fixture.directory.close()
+        try await fixture.control.close()
+    }
+
+    func testGenerationAdmissionRejectsOversizedCommitBlobBeforeMaterialization()
+        async throws
+    {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let store = await fixture.directory.preopenedPublicMutationStore(did: did)
+        let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
+        let loadedAccount = try await fixture.control.account(did: did)
+        let account = try XCTUnwrap(loadedAccount)
+        _ = try await database.connection.query(
+            """
+            UPDATE public_repository_blocks
+            SET bytes = zeroblob(?)
+            WHERE cid = ?
+            """,
+            [
+                .integer(PublicRepositoryLimits.maximumPersistedBlockBytes + 1),
+                .text(fixture.state.commitCID.string),
+            ]
+        )
+
+        await XCTAssertThrowsCorruptPublicRepository(
+            try await database.admitPublicRepositoryGeneration(
+                account: account,
+                identityVerifier: TestPublicPLCGenesisVerifier(
+                    operationCID: fixture.genesisOperationCID
+                )
+            )
+        )
+
+        try await fixture.directory.close()
+        try await fixture.control.close()
+    }
+
     func testDescribeRepoFailsClosedForTamperedGenesisAndIntentCID() async throws {
         // Startup admission authenticates both the signed PLC genesis facts
         // and the durable preparation intent before publishing a directory.
@@ -1471,6 +1546,25 @@ private func XCTAssertThrowsSwanUnavailable<T>(
     } catch {
         XCTFail(
             "expected SwanError.unavailable, got \(error)",
+            file: file,
+            line: line
+        )
+    }
+}
+
+private func XCTAssertThrowsCorruptPublicRepository<T>(
+    _ expression: @autoclosure () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async {
+    do {
+        _ = try await expression()
+        XCTFail("expected corrupt repository", file: file, line: line)
+    } catch let error as PublicRepositoryMutationStoreError {
+        XCTAssertEqual(error, .corruptRepository, file: file, line: line)
+    } catch {
+        XCTFail(
+            "expected corrupt repository, got \(error)",
             file: file,
             line: line
         )

@@ -167,13 +167,18 @@ private struct AuthenticatedGetSpaceCredentialHandler:
 
 func registerAuthenticatedGetSpaceCredentialEndpoint(
     on router: Router<BasicRequestContext>,
-    capability: SwanSpaceCredentialExchangeCapability
+    capability: SwanSpaceCredentialExchangeCapability,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
     let handler = AuthenticatedGetSpaceCredentialHandler(capability: capability)
     let path: RouterPath = "/xrpc/com.atproto.space.getSpaceCredential"
-    router.post(path) { request, _ async -> Response in
+    router.post(path) { request, context async -> Response in
         do {
-            let input = try await decodeGetSpaceCredentialInput(request)
+            let input = try await decodeGetSpaceCredentialInput(
+                request,
+                context: context,
+                requestBodyAdmission: requestBodyAdmission
+            )
             let output = try await handler.handle(
                 parameters: (), input: input, context: request
             )
@@ -183,6 +188,10 @@ func registerAuthenticatedGetSpaceCredentialEndpoint(
             )
         } catch let failure as SpaceCredentialExchangeFailure {
             return getSpaceCredentialResponse(for: failure)
+        } catch let failure as SwanRequestBodyCollectionFailure {
+            return getSpaceCredentialResponse(
+                for: failure == .unavailable ? .unavailable : .invalidRequest
+            )
         } catch {
             return getSpaceCredentialError(.badRequest, code: "InvalidRequest")
         }
@@ -200,34 +209,19 @@ func registerAuthenticatedGetSpaceCredentialEndpoint(
 }
 
 private func decodeGetSpaceCredentialInput(
-    _ request: Request
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async throws -> ComAtprotoSpaceGetSpaceCredential.Input {
-    let contentTypes = request.headers[values: .contentType]
-    guard contentTypes.count == 1,
-          contentTypes[0]
-            .split(separator: ";", maxSplits: 1).first?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased() == "application/json" else {
-        throw SpaceCredentialExchangeFailure.invalidRequest
-    }
-    let lengths = request.headers[values: .contentLength]
-    guard lengths.count <= 1,
-          lengths.first.flatMap(Int.init).map({
-              (0 ... SwanSpaceCredentialHTTP.maximumJSONBytes).contains($0)
-          }) ?? true else {
-        throw SpaceCredentialExchangeFailure.invalidRequest
-    }
-
-    let body: ByteBuffer
-    do {
-        body = try await request.body.collect(
-            upTo: SwanSpaceCredentialHTTP.maximumJSONBytes
-        )
-    } catch is NIOTooManyBytesError {
-        throw SpaceCredentialExchangeFailure.invalidRequest
-    } catch {
-        throw SpaceCredentialExchangeFailure.invalidRequest
-    }
+    let body = try await collectAdmittedRequestBody(
+        request,
+        mediaType: .json,
+        admission: requestBodyAdmission.admission,
+        policy: requestBodyAdmission.policy,
+        maximumBytes: SwanSpaceCredentialHTTP.maximumJSONBytes,
+        termination: context.jsonWriteBodyTermination
+    )
+    defer { withExtendedLifetime(body) {} }
     guard body.readableBytes > 0,
           let bytes = body.getBytes(
               at: body.readerIndex,

@@ -52,9 +52,15 @@ private struct UntrustedDPoPNonce: Decodable {
 func registerLocalhostPAREndpoint(
     on router: Router<BasicRequestContext>,
     configuration: SwanLocalhostPARConfiguration,
-    runtime: SwanOAuthRuntime
+    runtime: SwanOAuthRuntime,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
-    registerLocalhostPAREndpoint(on: router, issuer: configuration.issuer, runtime: runtime)
+    registerLocalhostPAREndpoint(
+        on: router,
+        issuer: configuration.issuer,
+        runtime: runtime,
+        requestBodyAdmission: requestBodyAdmission
+    )
 }
 
 /// Internal overload used by the complete localhost browser bridge. Its
@@ -63,25 +69,41 @@ func registerLocalhostPAREndpoint(
 func registerLocalhostPAREndpoint(
     on router: Router<BasicRequestContext>,
     issuer: URL,
-    runtime: SwanOAuthRuntime
+    runtime: SwanOAuthRuntime,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
-    router.post("/oauth/par") { request, _ async -> Response in
+    router.post("/oauth/par") { request, context async -> Response in
         await handleLocalhostPAR(
             request: request,
+            context: context,
             issuer: issuer,
-            runtime: runtime
+            runtime: runtime,
+            requestBodyAdmission: requestBodyAdmission
         )
     }
 }
 
 private func handleLocalhostPAR(
     request: Request,
+    context: SwanHTTPRequestContext,
     issuer: URL,
-    runtime: SwanOAuthRuntime
+    runtime: SwanOAuthRuntime,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
     let form: LocalhostPARForm
     do {
-        form = try await parseLocalhostPARForm(from: request)
+        form = try await parseLocalhostPARForm(
+            from: request,
+            context: context,
+            requestBodyAdmission: requestBodyAdmission
+        )
+    } catch let failure as SwanRequestBodyCollectionFailure {
+        return switch failure {
+        case .invalidRequest: localhostPARError(.badRequest)
+        case .payloadTooLarge: localhostPARError(.contentTooLarge)
+        case .unavailable:
+            localhostPARError(.serviceUnavailable, error: "temporarily_unavailable")
+        }
     } catch let error as LocalhostPARRequestError {
         return switch error {
         case .malformed:
@@ -161,28 +183,20 @@ private func handleLocalhostPAR(
     }
 }
 
-private func parseLocalhostPARForm(from request: Request) async throws -> LocalhostPARForm {
-    guard isFormURLEncoded(request.headers) else {
-        throw LocalhostPARRequestError.malformed
-    }
-    let lengths = request.headers[values: .contentLength]
-    guard lengths.count <= 1 else { throw LocalhostPARRequestError.malformed }
-    if let length = lengths.first {
-        guard let value = Int(length), value >= 0 else {
-            throw LocalhostPARRequestError.malformed
-        }
-        guard value <= SwanLocalhostPARHTTP.maximumFormBytes else {
-            throw LocalhostPARRequestError.payloadTooLarge
-        }
-    }
-    let body: ByteBuffer
-    do {
-        body = try await request.body.collect(upTo: SwanLocalhostPARHTTP.maximumFormBytes)
-    } catch is NIOTooManyBytesError {
-        throw LocalhostPARRequestError.payloadTooLarge
-    } catch {
-        throw LocalhostPARRequestError.malformed
-    }
+private func parseLocalhostPARForm(
+    from request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> LocalhostPARForm {
+    let body = try await collectAdmittedRequestBody(
+        request,
+        mediaType: .formURLEncoded,
+        admission: requestBodyAdmission.admission,
+        policy: requestBodyAdmission.policy,
+        maximumBytes: SwanLocalhostPARHTTP.maximumFormBytes,
+        termination: context.jsonWriteBodyTermination
+    )
+    defer { withExtendedLifetime(body) {} }
     guard body.readableBytes > 0,
           let bytes = body.getBytes(at: body.readerIndex, length: body.readableBytes) else {
         throw LocalhostPARRequestError.malformed

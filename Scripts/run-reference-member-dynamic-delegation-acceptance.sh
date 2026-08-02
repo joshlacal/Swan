@@ -26,6 +26,7 @@ wait_timeout="${SWAN_DYNAMIC_DELEGATION_TIMEOUT:-180}"
 stateful_mode="${SWAN_DYNAMIC_DELEGATION_STATEFUL:-0}"
 direction="${SWAN_DYNAMIC_DELEGATION_DIRECTION:-member}"
 recovery_mode="${SWAN_DYNAMIC_DELEGATION_RECOVERY:-0}"
+fault_mode="${SWAN_DYNAMIC_DELEGATION_FAULT_MODE:-}"
 
 [[ "$project_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$ ]] || {
   echo "SWAN_DYNAMIC_DELEGATION_PROJECT must name a running disposable Compose project" >&2
@@ -63,6 +64,14 @@ if [[ "$recovery_mode" == "1" && "$direction" != "member" ]]; then
   echo "SWAN_DYNAMIC_DELEGATION_RECOVERY currently requires member direction" >&2
   exit 64
 fi
+case "$fault_mode" in
+  ""|normal|offline|disconnected|delayed|duplicated|reordered|corrupted) ;;
+  *) echo "SWAN_DYNAMIC_DELEGATION_FAULT_MODE is invalid" >&2; exit 64 ;;
+esac
+if [[ -n "$fault_mode" && ( "$direction" != "member" || "$stateful_mode" != "1" ) ]]; then
+  echo "SWAN_DYNAMIC_DELEGATION_FAULT_MODE requires member direction and stateful mode" >&2
+  exit 64
+fi
 [[ -n "${SWAN_INTEROP_SECRETS_DIR:-}" ]] || {
   echo "SWAN_INTEROP_SECRETS_DIR is required" >&2
   exit 64
@@ -80,7 +89,10 @@ export SWAN_INTEROP_SECRETS_DIR
 
 compose() {
   if [[ -n "$compose_file" ]]; then
-    ./interop/compose.sh --file "$compose_file" --project-name "$project_name" "$@"
+    ./interop/compose.sh \
+      --file "$root/docker-compose.yml" \
+      --file "$compose_file" \
+      --project-name "$project_name" "$@"
   else
     ./interop/compose.sh --project-name "$project_name" "$@"
   fi
@@ -144,6 +156,28 @@ wait_for_swan_http() {
   exit 1
 }
 
+wait_for_swan_tls_route() {
+  local label="$1"
+  local deadline=$((SECONDS + wait_timeout))
+  while ((SECONDS < deadline)); do
+    if docker run --rm \
+      --network "$network_name" \
+      --user 999:999 \
+      --read-only \
+      --mount "type=volume,src=${caddy_trust_volume},dst=/etc/ssl/certs,readonly" \
+      curlimages/curl:8.13.0@sha256:d43bdb28bae0be0998f3be83199bfb2b81e0a30b034b6d7586ce7e05de34c3fd \
+      --fail --silent --show-error --max-time 2 \
+      --cacert /etc/ssl/certs/caddy-local-root.crt \
+      https://swan.test/health >/dev/null 2>&1
+    then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "$label did not become reachable through Caddy TLS" >&2
+  exit 1
+}
+
 json_field() {
   local field="$1"
   python3 -c '
@@ -167,9 +201,10 @@ bootstrap_id="$(container_id swan-bootstrap)"
 reference_pds_id="$(container_id reference-pds)"
 caddy_id="$(container_id caddy)"
 caddy_trust_id="$(container_id caddy-ca-ready)"
+toxiproxy_id="$(container_id toxiproxy)"
 for required_id in \
   "$normal_swan_id" "$bootstrap_id" "$reference_pds_id" "$caddy_id" \
-  "$caddy_trust_id"
+  "$caddy_trust_id" "$toxiproxy_id"
 do
   [[ -n "$required_id" ]] || {
     echo "the Compose project is missing a required service" >&2
@@ -432,6 +467,19 @@ cleanup() {
     mv -f "$failed_temporary" "$failed_output"
   fi
   docker rm --force "$dynamic_container" >/dev/null 2>&1 || true
+  if [[ -n "$fault_mode" ]]; then
+    docker restart "$toxiproxy_id" >/dev/null 2>&1 || true
+    for _ in $(seq 1 "$wait_timeout"); do
+      if docker exec "$reference_pds_id" node -e '
+fetch("http://toxiproxy:8474/proxies/reference-pds")
+  .then((response) => process.exit(response.ok ? 0 : 1))
+  .catch(() => process.exit(1))
+' >/dev/null 2>&1; then
+        break
+      fi
+      sleep 1
+    done
+  fi
   if ((normal_stopped)); then
     docker start "$normal_swan_id" >/dev/null 2>&1 || true
   fi
@@ -515,6 +563,7 @@ docker run --detach \
   --managing-service-audience did:web:interop-swan-managing-service \
   >/dev/null
 wait_for_swan_http "$dynamic_container" "dynamic-key Swan"
+wait_for_swan_tls_route "dynamic-key Swan"
 
 space_uri="at://${space_authority_did}/space/app.bsky.bookmarks/dynamic-${suffix}"
 space_scope="space:app.bsky.bookmarks?authority=${space_authority_did}&skey=dynamic-${suffix}&action=read"
@@ -550,6 +599,7 @@ docker run --rm \
   --env SWAN_DYNAMIC_DELEGATION_DIRECTION="$direction" \
   --env SWAN_DYNAMIC_DELEGATION_STATEFUL="$stateful_mode" \
   --env SWAN_DYNAMIC_DELEGATION_RECOVERY="$recovery_mode" \
+  --env SWAN_DYNAMIC_DELEGATION_FAULT_MODE="$fault_mode" \
   --env SWAN_DYNAMIC_DELEGATION_SPACE_SCOPE="$space_scope" \
   --env SWAN_DYNAMIC_DELEGATION_WRITE_SCOPE="$write_scope" \
   --env SWAN_DYNAMIC_DELEGATION_SCOPE_CLIENT_ID="$space_scope_client_id" \
@@ -622,6 +672,284 @@ docker run --rm \
       tail -n 40 /tmp/live-interop.log >&2 || true
       exit 1
     fi
+    if [ -n "${SWAN_DYNAMIC_DELEGATION_FAULT_MODE:-}" ]; then
+      fault_mode="${SWAN_DYNAMIC_DELEGATION_FAULT_MODE}"
+      # A full-CAR bootstrap does not consume an incremental sequence. Every
+      # fresh target therefore starts its contiguous delivery stream at 1.
+      sequence_base=1
+      next_sequence=1
+      newest_sequence=2
+      snapshot_head() {
+        /usr/local/bin/swan lab permissioned-replica-head \
+          --receiver-did "$6" --repository "$2" --space "$1" \
+          --data-directory /var/lib/swan/data --output "$7" \
+          >/tmp/permissioned-head.log 2>&1
+      }
+      sync_replica() {
+        sync_sequence="$7"
+        sync_request_id="$8"
+        sync_output="$9"
+        sync_replay_flag="${10:-}"
+        /usr/local/bin/swan lab sync-permissioned \
+          --receiver-did "$6" --repository "$2" --space "$1" \
+          --data-directory /var/lib/swan/data \
+          --source-url https://pds.test --authority-url https://swan.test \
+          --source-auth bearer --source-token-env SWAN_LAB_PRODUCER_TOKEN \
+          --scope atproto \
+          --permissioned-commit-key-env SWAN_LAB_PERMISSIONED_COMMIT_KEY \
+          --request-id "$sync_request_id" \
+          --request-sequence "$sync_sequence" \
+          $sync_replay_flag \
+          --output "$sync_output" --no-fail-on-failure
+      }
+      toxiproxy_post() {
+        toxic_path="$7"
+        toxic_body="$8"
+        curl --fail --silent --show-error --max-time 4 \
+          -X POST -H "content-type: application/json" \
+          --data "$toxic_body" \
+          "http://toxiproxy:8474/${toxic_path}" >/dev/null
+      }
+      toxiproxy_delete() {
+        curl --fail --silent --show-error --max-time 4 \
+          -X DELETE "http://toxiproxy:8474/$7" >/dev/null 2>&1 || true
+      }
+
+      # Establish a durable last-good receiver head before injecting a fault.
+      if ! sync_replica "$1" "$2" "$3" "$4" "$5" "$6" "$sequence_base" "${4}-baseline" /tmp/baseline-sync.json \
+        >/tmp/baseline-sync.log 2>&1
+      then
+        tail -n 60 /tmp/baseline-sync.log >&2 || true
+        exit 1
+      fi
+      snapshot_head "$1" "$2" "$3" "$4" "$5" "$6" /tmp/before-head.json
+
+      # Add one fresh source revision. The live verifier supplies the intended
+      # signed revision and commitment without publishing it to the receiver.
+      next_private_value="$(od -An -N32 -tx1 /dev/urandom | tr -d " \n")"
+      next_rkey="${4}-next"
+      printf \
+        '"'"'{"space":"%s","repo":"%s","collection":"%s","rkey":"%s","record":{"$type":"app.bsky.feed.post","text":"%s"}}\n'"'"' \
+        "$1" "$2" "$3" "$next_rkey" "$next_private_value" \
+        >/tmp/permissioned-next-record.json
+      if ! /usr/local/bin/swan lab live \
+        --mode permissioned --name "${scenario_name}-fault-source" \
+        --producer-url "$producer_url" --consumer-url "$consumer_url" \
+        $producer_auth_args $consumer_auth_args $scope_args \
+        --space "$1" --permissioned-read-host "$read_host" \
+        --body-file /tmp/permissioned-next-record.json \
+        --read-query "space=$1" "repo=$2" "collection=$3" "rkey=$next_rkey" \
+        $stateful_flags --output /tmp/fault-source-artifact.json \
+        >/tmp/fault-source.log 2>&1
+      then
+        tail -n 60 /tmp/fault-source.log >&2 || true
+        exit 1
+      fi
+      python3 - /tmp/before-head.json /tmp/fault-source-artifact.json /tmp/intended-head.json <<'PY'
+import json
+import sys
+
+before_path, source_path, output_path = sys.argv[1:]
+with open(before_path, encoding="utf-8") as handle:
+    before = json.load(handle).get("head")
+with open(source_path, encoding="utf-8") as handle:
+    source = json.load(handle).get("roundTrip", {})
+if not isinstance(before, dict):
+    raise SystemExit("baseline head missing")
+revision = source.get("syncCommitRevision")
+commitment = source.get("syncCommitment")
+if not isinstance(revision, str) or not isinstance(commitment, str):
+    raise SystemExit("intended signed head missing")
+intended = {
+    "generation": before["generation"],
+    "revision": revision,
+    "commitment": commitment,
+}
+with open(output_path, "x", encoding="utf-8") as handle:
+    json.dump({"head": intended}, handle, sort_keys=True, separators=(",", ":"))
+    handle.write("\n")
+PY
+
+      fault_observed=false
+      invalid_delivery_rejected=false
+      case "$fault_mode" in
+        normal)
+          sync_replica "$1" "$2" "$3" "$4" "$5" "$6" "$next_sequence" "${4}-normal" /tmp/fault-sync.json \
+            >/tmp/fault-sync.log 2>&1
+          snapshot_head "$1" "$2" "$3" "$4" "$5" "$6" /tmp/after-fault-head.json
+          cp /tmp/after-fault-head.json /tmp/after-heal-head.json
+          ;;
+        delayed)
+          toxiproxy_post "$1" "$2" "$3" "$4" "$5" "$6" \
+            proxies/reference-pds/toxics \
+            '"'"'{"name":"stateful-delay-upstream","type":"latency","stream":"upstream","toxicity":1.0,"attributes":{"latency":250,"jitter":25}}'"'"'
+          toxiproxy_post "$1" "$2" "$3" "$4" "$5" "$6" \
+            proxies/reference-pds/toxics \
+            '"'"'{"name":"stateful-delay-downstream","type":"latency","stream":"downstream","toxicity":1.0,"attributes":{"latency":250,"jitter":25}}'"'"'
+          fault_observed=true
+          sync_replica "$1" "$2" "$3" "$4" "$5" "$6" "$next_sequence" "${4}-delayed" /tmp/fault-sync.json \
+            >/tmp/fault-sync.log 2>&1
+          toxiproxy_delete "$1" "$2" "$3" "$4" "$5" "$6" proxies/reference-pds/toxics/stateful-delay-upstream
+          toxiproxy_delete "$1" "$2" "$3" "$4" "$5" "$6" proxies/reference-pds/toxics/stateful-delay-downstream
+          snapshot_head "$1" "$2" "$3" "$4" "$5" "$6" /tmp/after-fault-head.json
+          cp /tmp/after-fault-head.json /tmp/after-heal-head.json
+          ;;
+        offline)
+          toxiproxy_post "$1" "$2" "$3" "$4" "$5" "$6" \
+            proxies/reference-pds '"'"'{"enabled":false}'"'"'
+          fault_observed=true
+          if sync_replica "$1" "$2" "$3" "$4" "$5" "$6" "$next_sequence" "${4}-offline" /tmp/fault-sync.json \
+            >/tmp/fault-sync.log 2>&1
+          then
+            echo "offline sync unexpectedly succeeded" >&2
+            exit 1
+          fi
+          snapshot_head "$1" "$2" "$3" "$4" "$5" "$6" /tmp/after-fault-head.json
+          toxiproxy_post "$1" "$2" "$3" "$4" "$5" "$6" \
+            proxies/reference-pds '"'"'{"enabled":true}'"'"'
+          sync_replica "$1" "$2" "$3" "$4" "$5" "$6" "$next_sequence" "${4}-offline-heal" /tmp/heal-sync.json \
+            >/tmp/heal-sync.log 2>&1
+          snapshot_head "$1" "$2" "$3" "$4" "$5" "$6" /tmp/after-heal-head.json
+          ;;
+        disconnected)
+          toxiproxy_post "$1" "$2" "$3" "$4" "$5" "$6" \
+            proxies/reference-pds/toxics \
+            '"'"'{"name":"stateful-disconnect","type":"reset_peer","stream":"downstream","toxicity":1.0,"attributes":{"timeout":0}}'"'"'
+          fault_observed=true
+          if sync_replica "$1" "$2" "$3" "$4" "$5" "$6" "$next_sequence" "${4}-disconnected" /tmp/fault-sync.json \
+            >/tmp/fault-sync.log 2>&1
+          then
+            echo "disconnected sync unexpectedly succeeded" >&2
+            exit 1
+          fi
+          snapshot_head "$1" "$2" "$3" "$4" "$5" "$6" /tmp/after-fault-head.json
+          toxiproxy_delete "$1" "$2" "$3" "$4" "$5" "$6" proxies/reference-pds/toxics/stateful-disconnect
+          sync_replica "$1" "$2" "$3" "$4" "$5" "$6" "$next_sequence" "${4}-disconnected-heal" /tmp/heal-sync.json \
+            >/tmp/heal-sync.log 2>&1
+          snapshot_head "$1" "$2" "$3" "$4" "$5" "$6" /tmp/after-heal-head.json
+          ;;
+        duplicated)
+          sync_replica "$1" "$2" "$3" "$4" "$5" "$6" "$next_sequence" "${4}-duplicate" /tmp/fault-sync-second.json --verify-exact-duplicate-replay \
+            >/tmp/fault-sync-second.log 2>&1
+          snapshot_head "$1" "$2" "$3" "$4" "$5" "$6" /tmp/after-fault-head.json
+          cp /tmp/after-fault-head.json /tmp/after-heal-head.json
+          if python3 - /tmp/fault-sync-second.json <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    artifact = json.load(handle)
+witness = artifact.get("exactDuplicateReplay")
+if (
+    artifact.get("outcome") != "exact_duplicate"
+    or not isinstance(witness, dict)
+    or witness.get("applyAttempts") != 2
+    or witness.get("firstOutcome") != "applied"
+    or witness.get("secondOutcome") != "exact_duplicate"
+    or not isinstance(witness.get("requestDigest"), str)
+    or len(witness["requestDigest"]) != 64
+):
+    raise SystemExit(1)
+PY
+          then invalid_delivery_rejected=true; fi
+          fault_observed=true
+          ;;
+        reordered)
+          sync_replica "$1" "$2" "$3" "$4" "$5" "$6" "$newest_sequence" "${4}-newest-first" /tmp/fault-sync-newest.json \
+            >/tmp/fault-sync-newest.log 2>&1 || true
+          snapshot_head "$1" "$2" "$3" "$4" "$5" "$6" /tmp/after-fault-head.json
+          if python3 - /tmp/fault-sync-newest.json /tmp/before-head.json /tmp/after-fault-head.json <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    outcome = json.load(handle).get("outcome")
+with open(sys.argv[2], encoding="utf-8") as handle:
+    before = json.load(handle).get("head")
+with open(sys.argv[3], encoding="utf-8") as handle:
+    after = json.load(handle).get("head")
+if outcome != "stale_or_reordered" or before != after:
+    raise SystemExit(1)
+PY
+          then invalid_delivery_rejected=true; fi
+          sync_replica "$1" "$2" "$3" "$4" "$5" "$6" "$next_sequence" "${4}-ordered-heal" /tmp/heal-sync.json \
+            >/tmp/heal-sync.log 2>&1
+          snapshot_head "$1" "$2" "$3" "$4" "$5" "$6" /tmp/after-heal-head.json
+          fault_observed=true
+          ;;
+        corrupted)
+          /usr/local/bin/swan lab recover-permissioned \
+            --name "${scenario_name}-corrupted" \
+            --receiver-did "$6" --repository "$2" --space "$1" \
+            --data-directory /var/lib/swan/data \
+            --source-url https://pds.test --authority-url https://swan.test \
+            --source-auth bearer --source-token-env SWAN_LAB_PRODUCER_TOKEN \
+            --scope atproto --since 2222222222222 \
+            --allow-full-car-fallback --require-prior-head \
+            --permissioned-commit-key-env SWAN_LAB_PERMISSIONED_COMMIT_KEY \
+            --output /tmp/corruption-recovery.json \
+            >/tmp/corruption-recovery.log 2>&1
+          snapshot_head "$1" "$2" "$3" "$4" "$5" "$6" /tmp/after-fault-head.json
+          cp /tmp/after-fault-head.json /tmp/after-heal-head.json
+          cp /tmp/after-fault-head.json /tmp/intended-head.json
+          cp /tmp/after-fault-head.json /tmp/before-head.json
+          if python3 - /tmp/corruption-recovery.json <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    artifact = json.load(handle)
+if artifact.get("status") != "passed" or artifact.get("corruptionRejected") is not True or artifact.get("lastValidHeadPreserved") is not True:
+    raise SystemExit(1)
+PY
+          then invalid_delivery_rejected=true; fi
+          fault_observed=true
+          ;;
+      esac
+      python3 - "$fault_mode" /tmp/before-head.json /tmp/intended-head.json /tmp/after-fault-head.json /tmp/after-heal-head.json "$fault_observed" "$invalid_delivery_rejected" /tmp/fault-cell.json <<'PY'
+import json
+import sys
+
+mode, before_path, intended_path, fault_path, heal_path, observed, rejected, output_path = sys.argv[1:]
+def head(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle).get("head")
+cell = {
+    "mode": mode,
+    "before": head(before_path),
+    "intended": head(intended_path),
+    "afterFault": head(fault_path),
+    "afterHeal": head(heal_path),
+    "faultObserved": observed == "true",
+    "invalidDeliveryRejected": rejected == "true",
+}
+with open(output_path, "x", encoding="utf-8") as handle:
+    json.dump(cell, handle, sort_keys=True, separators=(",", ":"))
+    handle.write("\n")
+PY
+      python3 - /tmp/sanitized-artifact.json /tmp/fault-cell.json <<'PY'
+import json
+import sys
+live_path, cell_path = sys.argv[1:]
+with open(live_path, encoding="utf-8") as handle:
+    live = json.load(handle)
+with open(cell_path, encoding="utf-8") as handle:
+    live["faultWitness"] = json.load(handle)
+diagnostics = []
+for path in [
+    "/tmp/fault-sync.json", "/tmp/fault-sync-first.json",
+    "/tmp/fault-sync-second.json", "/tmp/fault-sync-newest.json",
+    "/tmp/fault-sync-stale.json", "/tmp/heal-sync.json",
+]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError):
+        continue
+    diagnostics.append({key: value.get(key) for key in [
+        "outcome", "status", "priorRevision", "finalRevision",
+    ]})
+live["faultDiagnostics"] = diagnostics
+with open(live_path, "w", encoding="utf-8") as handle:
+    json.dump(live, handle, sort_keys=True, separators=(",", ":"))
+    handle.write("\n")
+PY
+      unset next_private_value
+    fi
     if [ "${SWAN_DYNAMIC_DELEGATION_RECOVERY:-0}" = "1" ]; then
       recovery_failed=0
       recovery_artifact="/tmp/recovery-artifact.json"
@@ -689,7 +1017,9 @@ PY
     fi
     cp /tmp/sanitized-artifact.json /run/acceptance/artifact.json
     chmod 0600 /run/acceptance/artifact.json
-    if ! grep -q '"'"'"status":"passed"'"'"' /tmp/sanitized-artifact.json; then
+    if ! /usr/local/bin/swan-validate-live-interop-artifact \
+      /tmp/sanitized-artifact.json
+    then
       tail -n 40 /tmp/live-interop.log >&2 || true
       exit 1
     fi

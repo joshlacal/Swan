@@ -1265,8 +1265,11 @@ Four portability/lifecycle defects were found and remediated:
 - **ADV-89 (P1, availability):** a TLS/HTTP pipeline failure could remove the
   NIO response handler without channelInactive, leaking its unresolved
   promise. Connect failures, request failures, and handlerRemoved now fail
-  the promise idempotently before channel shutdown. The wrong-hostname
-  regression that exposed the leak passes on macOS and Linux.
+  the promise idempotently before channel shutdown. Dedicated GET and POST
+  active-pipeline removal regressions now prove prompt failure, channel close,
+  timeout cancellation, and no later second completion on macOS; the prior
+  wrong-hostname regression remains the native-Linux evidence until the final
+  sealed Linux rerun includes these two direct lifecycle tests.
 
 The process-local laboratory authority also had a residual bounded-state gap:
 per-space members, clients, and decisions were capped, but the actor retained
@@ -2761,3 +2764,397 @@ external-volume override selected matching
 `swan-alpha-current-20260801_swan-data-v2`, leaving the old volume untouched.
 Final Swan `/health` through Caddy was HTTP 200; reference PDS/PLC, Mailpit,
 and Toxiproxy were healthy; profile and Compose verifiers pass.
+
+## 2026-08-03 current-profile durable incremental and strict recovery witness
+
+The current working image was rebuilt on Swift 6.1/Linux and started against
+a fresh, explicitly named `swan-data-v3` volume. The prior `swan-data-v2`
+volume was retained after startup correctly refused its 11
+pre-logical-limit replay rows; no legacy security binding was invented.
+
+The strict same-host two-account retention matrix passed against the current
+image. Its ignored mode-0600 artifact is
+`/private/tmp/swan-current-full-recovery-20260803.json`: the source returned
+the exact `409 full_repo_recovery_required`, the receiver installed a
+generation-advancing two-root CAR, the corrupted retry failed through block
+CID verification, and the last valid head was preserved.
+
+The first production incremental attempt exposed a profile mismatch: the
+client sent a 4,096 `listRepoOps` limit although the pinned lexicon caps one
+wire page at 1,000. The client now paginates at 1,000, retains a 4,096-operation
+aggregate verification/apply ceiling, refuses a nonadvancing page, and selects
+full CAR above the aggregate bound. A focused test asserts the wire limit.
+
+After rebuilding with that correction, a new source commit synchronized into
+the managed authority receiver through OAuth, exchanged space credentials,
+value-bearing `listRepoOps`, `getLatestCommit`, context-signature and
+content-binding verification, LtHash reconstruction, and a control-plane-
+fenced SQLite CAS publication. The ignored mode-0600 artifact
+`.interop-live/incremental-evidence-20260803/incremental-seq3.json` reports
+`status=passed`, `outcome=applied`, request sequence 3, and receiver head
+advancement from `3ms5zj3pl6a22` to `3ms5zlpgier22`. The per-run private value
+was checked absent from the artifact.
+
+This closes production Swan-to-Swan incremental application plus strict
+compaction/full-CAR corruption recovery on the current Linux image. It does
+not close the pinned TypeScript value-bearing gap without its qualified
+overlay, the full fault-ordering matrix, account lifecycle/export isolation,
+or clean-cache heavy and regeneration gates.
+
+## 2026-08-03 lifecycle and export gate reconciliation after host recovery
+
+The post-restart current tree confirms that two older tail summaries were
+stale rather than open implementation defects. The explicit email-delivery
+cancellation boundary remains fail closed: a delivery must declare a bounded
+cancellation contract before `AccountEmailRecoveryService` can be constructed,
+and the deliberately non-cooperative `.unverified` implementation is rejected
+before any durable row is claimed. The exact
+`AccountEmailOutboxRuntimeTests` selection passes 7/7.
+
+The browser password-reset path is also composed through the current HTTP
+server. The exact
+`RemoteOAuthAuthorizationServerHTTPTests/testPasswordResetXRPCRevokesBrowserConsentAndOAuthFamily`
+selection passes and proves the request/redeem flow revokes both the prior
+browser consent session and OAuth token family before a fresh login succeeds.
+These checks close the supported non-cooperative-delivery and browser
+reset/revocation implementation gates; they are not a claim of strict
+constant-time behavior under arbitrary external SQLite contention.
+
+The current account-export target passes 56 tests with one intentional opt-in
+256 MiB restore skip. Coverage includes public/private blob namespace
+separation, canonical manifests, CAR verification, PLC/signing-key continuity,
+source and destination race resistance, authenticated operator backup, and
+same-version restore. `AccountPermanentDeletionSQLiteTests` passes 5/5,
+covering atomic authority scrubbing, resumable ordered stages, legacy deleted
+rows, residual-trust rejection, and minimal tombstone finalization.
+
+Remaining closure work is the live cross-host fault-ordering/lifecycle matrix,
+the pinned TypeScript qualified-overlay value-bearing path, final current-tree
+regeneration/clean-cache receipts, and formal security review.
+
+## 2026-08-03 qualified TypeScript bidirectional stateful interop
+
+The checksummed reference-PDS recovery overlay first passed its isolated source
+qualification. A fresh disposable Compose project then used the current Swan
+image and the already-built qualified reference image. A control run against
+the stock pinned image proved the upstream boundary honestly: credential
+issuance, blob upload, record create/read, and matching CIDs succeeded, while
+the stock `listRepoOps`, `getRepo`, and permissioned blob-read surfaces returned
+their known unqualified failures. No stock source was mutated.
+
+The qualified TypeScript-member/Swan-authority run passed value-bearing
+incremental sync, permissioned blob retrieval, terminal commitment/revision
+verification, two-root full-CAR recovery, and convergence. Its mode-0600
+sanitized receipt is
+`/private/tmp/swan-live-member-stateful-recovery-qualified-20260803.json`.
+The reverse Swan-member/TypeScript-authority run also passed credential
+exchange, write/read, blob verification, incremental/full-CAR witnesses, and
+convergence; its mode-0600 receipt is
+`/private/tmp/swan-live-reference-authority-stateful-qualified-20260803.json`.
+The separate managed recovery wrapper is intentionally unsupported in that
+reverse harness direction, so no reverse recovery claim is made.
+
+The stock-image control initially appeared to lose its diagnostic because the
+success-path output name was inspected. Adversarial source review confirmed
+the existing cleanup trap intentionally preserves a failed sanitized receipt
+at `<output>.failed`, restores normal Swan, and removes the private working
+directory. No harness change was required; an attempted duplicate installer
+was reverted before acceptance.
+
+The disposable project and its volumes were removed. The normal lab was
+recreated against the preserved explicit
+`swan-alpha-current-20260801_swan-data-v3` volume; Swan, reference PDS/PLC,
+Caddy, and Mailpit are healthy.
+
+The current normal lab then ran the complete live transport matrix through
+Toxiproxy. Normal, delayed, duplicated, reordered, offline, disconnected, and
+corrupted cells all passed and wrote mode-0600 sanitized artifacts under
+`.interop-live/live-fault-matrix-20260803.NAKVhb/`. These are endpoint/fault-
+transport receipts. Semantic duplicate/reorder convergence is separately
+covered by the 104/104 current `SwanInteropTests` target and the live normal
+qualified runs above; a single live stateful runner that mutates repository
+traffic under every fault remains a distinct final matrix gate.
+
+## 2026-08-03 adversarial incremental pagination correction
+
+Review of the production incremental orchestrator found a revision-pagination
+hazard that ordinary successful pages did not expose. The pinned TypeScript
+handler filters continuation requests with `rev > since`, while every operation
+in one atomic `applyWrites` batch shares the same revision and a wire response
+is capped at 1,000 operations. If one revision is split at that cap, advancing
+`since` to the last returned revision skips the remainder of the atomic batch.
+The terminal LtHash check prevented publication of the incomplete state, but
+the client would surface an integrity failure instead of taking its supported
+full-CAR recovery path.
+
+The orchestrator no longer attempts a lossy revision-only continuation. A full
+commitless 1,000-operation page selects `fullCARRecoveryRequired` immediately;
+a shorter commitless page remains a protocol error. The focused suite now
+passes 5/5, including a 1,000-entry single-revision regression that proves no
+`getLatestCommit` request and no durable apply occur before full-CAR fallback.
+
+The same review found the pinned handler's other intentional backfill
+behavior: it omits record values for create/update operations superseded later
+in the requested interval. SQLite cannot safely materialize those intermediate
+CIDs without authenticated bytes. The orchestrator now selects full-CAR
+recovery when any non-delete operation lacks its value instead of surfacing a
+terminal `missingValue` verification error. The focused suite passes 6/6,
+including a value-less superseded-mutation regression proving no latest-head
+request or durable apply occurs.
+
+## 2026-08-03 exact-current Linux image and full-suite receipt
+
+After the host-wide descriptor exhaustion was traced to the Colima VMs and the
+containers were restarted, `kern.num_files` returned to approximately 12,000
+of 491,520 and a fresh Zsh process succeeded. A clean Docker build from the
+current working copy completed the Swift 6.1 Linux release build and produced
+image manifest `sha256:302d6bac06e083c72ccc6ed9053add671c41ef7606b14002a99a51f1b6c0847f`.
+Only the Swan service was recreated from that image; the explicit external
+`swan-alpha-current-20260801_swan-data-v3` volume and prepared secret volumes
+were preserved. Swan and every health-checked laboratory service returned to
+healthy state.
+
+The image's Linux binary verified the immutable permissioned-data profile with
+the current Swan source tree mounted read-only and an explicit `--source-root`:
+`PROFILE OK: permissioned-data-0016-2026-07-30 (offline artifacts verified)`.
+Running `verify` inside the minimal runtime image without that source mount is
+expected to fail because the command verifies the Petrel manifest and every
+checked-in generated source, artifacts intentionally absent from the runtime
+layer. No packaged-runtime verification claim is inferred from the failing
+source-less invocation.
+
+The serialized exact-current macOS `swift test --jobs 1` run then exited 0.
+Notable target totals include SwanSpaces 39, SwanSQLite 247 with six opt-in
+skips, SwanInterop 106, SwanHTTP 191, SwanCore 5, SwanCLI 63 with one opt-in
+skip, SwanAccounts 118, and SwanAccountExport 56 with one opt-in 256 MiB
+restore skip; all reported zero failures. The Swift Testing public-wire suite
+also passed 4/4. The complete local receipt is
+`/private/tmp/swan-full-current-tree-20260803.log`. This replaces the earlier
+suite evidence that predated the two conservative incremental-recovery fixes.
+
+All seven opt-in 256 MiB acceptance cases were then run explicitly against the
+same current build and passed: private CAS streaming, private CAR spooling,
+permissioned production `getRepo`, fresh-process public CAR spool/drain,
+public import staging, production public directory `getRepo`, and portable
+restore staging. The permissioned CAR was 267,396,722 bytes with a measured
+peak RSS increase of 22,003,712 bytes and 64 KiB maximum chunks; it also
+rejected the over-limit record without creating a spool. The public spool
+streamed 270,049,433 bytes with a 19,660,800-byte RSS increase. Portable
+restore staged 268,435,456 bytes with a 5,947,392-byte RSS increase. The full
+receipt is `/private/tmp/swan-heavy-256mib-current-tree-20260803.log`.
+
+Both checked-in generation verifiers and both rejection/determinism suites
+also passed against the recorded Petrel generator workspace at revision
+`416672e698d9`. The intentional missing-generator, checksum, symlink,
+capability, and injected-file diagnostics in the mutation suites were observed
+as expected; each enclosing suite exited 0 after proving fail-closed behavior.
+The complete receipt is
+`/private/tmp/swan-generation-current-tree-20260803.log`.
+
+The subsequent adversarial sync review found that the incremental orchestrator
+accepted every HTTP 409 as a retention-gap signal. Full-CAR verification still
+protected integrity, but an untrusted repository host could force unnecessary
+full-repository recovery with an unrelated conflict. The orchestrator now
+requires JSON plus the exact pinned `full_repo_recovery_required` error code;
+all other 409 responses fail closed without fetching or publishing a CAR. The
+focused suite passes 7/7, including an unrelated-conflict regression.
+
+The exact-current macOS clean-cache acceptance then passed from the new
+scratch graph `/private/tmp/swan-clean-cache-current-20260803`. It reverified
+the immutable profile, reference cache, effective/static Compose invariants,
+and verifier mutation cases; built a fresh `swan` executable; and ran every
+test product with exit 0, including the now-107-case SwanInterop target. The
+receipt is `/private/tmp/swan-clean-cache-current-20260803.log`. The runner's
+terminal message correctly leaves the live cross-host semantic fault matrix
+open rather than treating this source/build gate as interop evidence.
+
+The Linux image was rebuilt once more after the exact-409 error-code hardening.
+The release build completed successfully and produced manifest
+`sha256:4b3a6c5439682034fcbef2f7200774908f81a7ae9489c64bb15b319673a1cb2a`.
+Only the Swan container was recreated, using the same explicit
+`swan-alpha-current-20260801_swan-data-v3` volume and existing prepared secret
+volumes. Docker inspection proves the running healthy Swan container uses that
+exact manifest. This supersedes `sha256:302d6bac...` as the deployed
+exact-current Linux runtime receipt.
+
+Work then began on the distinct live stateful fault gate rather than reusing
+the endpoint transport receipts. `StatefulFaultInteropMatrixArtifact` requires
+exactly one normal, offline, disconnected, delayed, duplicated, reordered, and
+corrupted cell. Each cell derives its verdict from sanitized durable replica
+head witnesses. Outage and corruption cells require an existing last-good head,
+prove it was unchanged during the invalid delivery, and prove convergence after
+healing. Duplicate and reordered cells require one generation advance plus
+explicit idempotent/stale-delivery rejection. The CLI now has bounded,
+strict-JSON `stateful-fault-matrix` validation and a read-only
+`permissioned-replica-head` witness command so the live harness can obtain
+generation, revision, and commitment from SQLite without recording DIDs,
+space URIs, credentials, values, or raw LtHash state. The new evaluator and CLI
+tests pass 8/8, and `git diff --check` is clean. This is infrastructure for the
+gate, not passing live fault evidence; the harness still must populate and pass
+all seven cross-host cells.
+
+The live stateful matrix subsequently passed against a fresh recovery-qualified
+TypeScript-member/Swan-receiver repository for every cell. Normal and delayed
+delivery reached the signed intended head. Offline and disconnected transports
+left the existing head byte-for-byte unchanged and converged after healing.
+Duplicate delivery applied the new revision once, returned the explicit
+`unchanged` idempotent outcome on the repeated trigger, and preserved the same
+head. Reordered delivery sent future sequence 2 first, received
+`stale_or_reordered` with the baseline intact, then applied sequence 1 and
+converged. The corruption cell performed a verified full-CAR replacement,
+rejected the deliberately corrupted retry, and preserved the replacement head.
+
+The final mode-0600 artifact is
+`/private/tmp/swan-stateful-cross-host-fault-matrix-pass2-20260803.json`. It has
+kind `stateful-cross-host-fault-matrix`, status `passed`, exactly seven distinct
+mode cells, and no failed assertions. A byte-level fixture audit found no
+access/refresh tokens, passwords, private keys, DPoP material, record-value
+labels, AT URIs, or PLC DIDs. The run also found and corrected three harness
+false assumptions without weakening the validator: full-CAR bootstrap does not
+consume an incremental sequence; incremental apply advances revision and
+commitment in place rather than generation; and a repeated HTTP sync trigger
+may return `unchanged` before reaching the durable replay table. It additionally
+added an active CA-verified Caddy TLS health probe after same-IP Swan swaps and
+failure-artifact preservation. This closes the previously open live stateful
+cross-host fault matrix gate for the qualified reference overlay.
+
+## 2026-08-03 post-matrix exact-current macOS acceptance
+
+After the live stateful matrix changes, the persistent laboratory was restored
+with its existing external `swan-data-v3` volume. Swan, the pinned reference
+PDS, PLC, Caddy, and Mailpit returned healthy; the Caddy-routed Swan and
+reference-PDS endpoints both responded successfully.
+
+A new serialized clean-scratch `swift test --jobs 1` run used
+`/private/tmp/swan-final-macos-20260803.Ch16ya` and completed with exit 0. The
+fresh build took 473.86 seconds. Every ordinary test product passed; notably,
+`PublicRepositoryReadHTTPTests` passed 13/13 without the earlier SwiftPM
+resolution hang. The ordinary run retained only the intentional opt-in skips.
+
+All eight explicit bounded-transfer selectors were then run serially against
+that same exact build and passed: private CAR spooling, private CAS streaming,
+the 100k-record permissioned recovery index, permissioned production
+`getRepo`, fresh-process public CAR spool/drain, 256 MiB public CAR import,
+production public-directory `getRepo`, and portable restore staging. The
+permissioned CAR was 267,396,722 bytes with 65,536-byte maximum chunks,
+verified integrity, over-limit rejection before spool creation, and a
+22,216,704-byte peak RSS increase. The public spool streamed 270,049,433 bytes
+with a 17,367,040-byte RSS increase. The 100k index reported 6,600,000 logical
+bytes, 20,779,008 scratch bytes, and a 12,353,536-byte RSS increase. Portable
+restore staged 268,435,456 bytes with a 6,389,760-byte RSS increase. The
+mode-0600 receipt is
+`/private/tmp/swan-heavy-final-current-20260803.log`.
+
+This supersedes the earlier macOS heavy-transfer receipt for the final
+post-matrix working tree. It does not substitute for the still-required formal
+security diff scan or the final rebuilt Linux image.
+
+The main Compose project's Swan image was then rebuilt directly from the
+post-matrix working tree. The Swift 6.1 Linux release build completed and
+produced manifest-list image
+`sha256:16e5b0d942faf102ea54ab842d07672ae845dd552929310e968029b10e5485b5`.
+Only the Swan service was recreated; the explicit external
+`swan-alpha-current-20260801_swan-data-v3` volume and prepared secret volumes
+were preserved. Docker inspection proves the healthy running Swan container
+uses that exact image, and the Caddy-routed protected-resource endpoint
+responded successfully after recreation. This supersedes
+`sha256:4b3a6c5439682034fcbef2f7200774908f81a7ae9489c64bb15b319673a1cb2a`
+as the deployed exact-current Linux runtime receipt.
+
+## 2026-08-03 native Linux final acceptance
+
+The exact post-matrix source tree was copied into the `swan-linux` Ubuntu
+ARM64 VM without ignored build products and compiled with Swift 6.2.3 using a
+fresh external scratch graph. The initial test invocation exposed a harness
+layout issue rather than a product failure: CLI tests locate the `swan`
+executable at the package-local `.build/debug/swan`, while the acceptance run
+had deliberately placed all build products under the external scratch path.
+That invocation therefore reported 58 failures, almost all explicit
+`XCTUnwrap` failures for the absent executable. It is retained as negative
+diagnostic evidence and is not used as a passing receipt.
+
+After linking the exact scratch-built executable into the tests' documented
+package-local path, the unchanged test bundle was rerun with `--skip-build`
+and `--jobs 1`. All 1,054 XCTest cases passed with zero failures and nine
+intentional opt-in skips; the four Swift Testing public-wire profile cases
+also passed. The remote process emitted the authoritative
+`__SWAN_REMOTE_RC=0` marker. The mode-0600 receipt is
+`/private/tmp/swan-linux-final-current-rerun-20260803.log`.
+
+All eight current opt-in bounded-transfer gates then ran serially against the
+same Linux binaries and passed: private CAR spool, private CAS blob,
+100k-record permissioned recovery index, near-256 MiB permissioned `getRepo`,
+fresh-process public CAR spool/drain, 256 MiB public import staging,
+production public-directory `getRepo`, and portable restore. The permissioned
+CAR streamed 267,396,722 bytes in at most 65,536-byte chunks, verified
+integrity, rejected the over-limit repository without a spool, and measured a
+65,388,544-byte peak RSS increase. The public spool streamed 270,049,433 bytes
+with a 56,803,328-byte RSS increase. The 100k index used 20,779,008 scratch
+bytes and a 55,738,368-byte RSS increase. Portable restore staged 268,435,456
+bytes with a 42,573,824-byte RSS increase. The receipt ends in eight
+`GATE_PASS` lines and `__SWAN_REMOTE_RC=0` at
+`/private/tmp/swan-linux-heavy-final-current-20260803.log`.
+
+Together with the clean macOS run, exact current Linux image, and seven-mode
+live cross-host fault artifact, this closes the platform/runtime acceptance
+portion of the current tree. The formal exact-diff security scan remains a
+separate gate and must not be inferred from these test results.
+
+## 2026-08-03 Task 43 security remediation closure
+
+The six findings from Codex Security diff scan
+`aec52e6d-aa46-4fb1-bdf7-ea40050f2733` were remediated on the accumulated
+working change. Management requests now use a process-shared admission class
+isolated from anonymous public mutations. Rejected request-body drains acquire
+bounded work admission before awaiting attacker-controlled EOF. An oversized
+valid `listRepoOps` document selects authenticated full-CAR recovery instead of
+leaving a replica permanently behind. Standalone live receipts use the strict,
+bounded root-object artifact validator. The duplicate fault cell resubmits the
+exact authenticated first batch and requires the typed `exact_duplicate`
+outcome. Password recovery retains a 256-entry known-account reserve while its
+unknown-address path remains bounded and non-enumerating.
+
+The remediation pass also found and fixed two Linux portability defects. PLC
+URLs now construct their `/:did` paths through
+`URLComponents.percentEncodedPath`, so Darwin and Foundation-on-Linux both
+preserve the literal DID colons required by the PLC service.
+Descriptor-anchored portable-export reads now compare the already-consumed
+prefix with a bounded `pread` pass and verify exact EOF after the adversarial
+callback, closing the same-inode rewrite gap on filesystems whose timestamp
+granularity did not expose a one-byte mutation.
+
+The exact-current Docker Linux suite passed 1,059 XCTest cases with nine
+intentional opt-in skips and zero failures, followed by the four-case Swift
+Testing public-wire suite. Its receipt is
+`/private/tmp/swan-linux-full-security-remediated-v2-20260803.log`. All eight
+explicit heavy selectors then passed on `aarch64-unknown-linux-gnu`, including
+the 100,000-record permissioned recovery index and the permissioned/public
+near-256 MiB paths. The permissioned CAR streamed 267,396,722 bytes in at most
+65,536-byte chunks with a 42,786,816-byte measured peak RSS increase and
+rejected the over-limit record before spool creation. The public spool streamed
+270,049,433 bytes with a 38,658,048-byte RSS increase; portable restore staged
+268,435,456 bytes with an 8,565,544-byte RSS increase. The receipt is
+`/private/tmp/swan-linux-heavy-security-remediated-v2-20260803.log`.
+
+The exact-current macOS serialized suite was rerun after both portability fixes
+and exited zero. The receipt is
+`/private/tmp/swan-full-security-remediated-v3-20260803.log`. This supersedes
+the earlier post-matrix macOS ordinary-suite receipt for the current bytes;
+the eight-selector macOS heavy receipt remains
+`/private/tmp/swan-heavy-security-remediated-20260803.log`.
+
+The persistent Swan runtime was rebuilt from these bytes as image manifest
+list `sha256:10164844e0f0f5b0925fda507f5c63834d129c86c0608617ee9e95b8e58e6885`
+and recreated against the preserved external
+`swan-alpha-current-20260801_swan-data-v3` volume and prepared secret volumes.
+The recovery-qualified TypeScript overlay was then selected explicitly and the
+fresh seven-cell stateful matrix passed normal, offline, disconnected, delayed,
+duplicated, reordered, and corrupted modes. The duplicate cell includes the
+exact replay proof added by this remediation. The strict mode-0600 aggregate
+receipt is
+`/private/tmp/swan-stateful-cross-host-fault-matrix-security-remediated-20260803.json`.
+Afterward the stock checksum-pinned TypeScript image was rebuilt and restored;
+both Swan and reference PDS are healthy, the stock
+`MethodNotImplementedError` marker is present, and the external account-data
+volume remains unchanged. Qualified permissioned recovery evidence and the
+stock upstream implementation boundary therefore remain explicitly distinct.

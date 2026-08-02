@@ -64,6 +64,8 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
     /// reserves before collection so anonymous callers cannot multiply the
     /// per-request limit by the listener's connection budget.
     let jsonWriteAdmission: PublicRepositoryJSONWriteAdmission
+    /// Shared total elapsed-time policy for every admitted JSON write body.
+    let jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy
 
     public init(
         authorizer: SwanOAuthResourceAuthorizer,
@@ -72,7 +74,8 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
         blobStore: (any BlobStore)? = nil,
         publicBlobSpoolAdmission: PublicRepositorySpoolAdmission? = nil,
         blobStreamAdmission: PublicRepositorySpoolAdmission = .shared,
-        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .processShared
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .processShared,
+        jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy = .productionDefault
     ) {
         self.authorizer = authorizer
         self.directory = directory
@@ -81,5 +84,6 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
         self.publicBlobSpoolAdmission = publicBlobSpoolAdmission
         self.blobStreamAdmission = blobStreamAdmission
         self.jsonWriteAdmission = jsonWriteAdmission
+        self.jsonWriteBodyPolicy = jsonWriteBodyPolicy
     }
 }

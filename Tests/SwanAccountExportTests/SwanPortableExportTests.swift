@@ -19,6 +19,58 @@ final class SwanPortableExportTests: XCTestCase {
     private let handle = "alice.example.com"
     private let profileID = PermissionedData0016.profileID
 
+    func testExpectedDirectoryExpansionRejectsHostilePathDepthBeforePrefixing()
+        throws
+    {
+        let path = Array(repeating: String(repeating: "a", count: 255), count: 64)
+            .joined(separator: "/")
+        XCTAssertThrowsError(
+            try SwanPortableExportFilesystem.expectedDirectories(for: [path])
+        ) { error in
+            XCTAssertEqual(error as? SwanPortableExportError, .invalidManifest)
+        }
+    }
+
+    func testDescriptorReadRejectsSameInodeMutationOfConsumedPrefix() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanStableRead-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let file = root.appending(path: "artifact.bin")
+        XCTAssertTrue(FileManager.default.createFile(
+            atPath: file.path,
+            contents: Data("authenticated-original".utf8),
+            attributes: [.posixPermissions: 0o600]
+        ))
+        let rootDescriptor = try SwanPortableExportFilesystem.openArchiveRoot(root)
+        defer { _ = close(rootDescriptor) }
+
+        XCTAssertThrowsError(try SwanPortableExportFilesystem.read(
+            path: "artifact.bin",
+            root: rootDescriptor,
+            maximumBytes: 1_024,
+            afterReadBeforeFinalValidation: {
+                let descriptor = file.withUnsafeFileSystemRepresentation { path in
+                    open(path!, O_WRONLY | O_CLOEXEC)
+                }
+                guard descriptor >= 0 else {
+                    throw SwanPortableExportError.publicationFailed
+                }
+                defer { _ = close(descriptor) }
+                var replacement: UInt8 = 0x58
+                guard pwrite(descriptor, &replacement, 1, 0) == 1 else {
+                    throw SwanPortableExportError.publicationFailed
+                }
+            }
+        )) { error in
+            XCTAssertEqual(error as? SwanPortableExportError, .invalidArchive)
+        }
+    }
+
     func testVerifierAcceptsCanonicalArchiveAndChecksBothCARTypes() throws {
         let fixture = try ArchiveFixture()
         defer { fixture.remove() }
@@ -417,11 +469,15 @@ final class SwanPortableExportTests: XCTestCase {
             try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
                 .contains { $0.hasPrefix(".swan-export-") }
         )
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
+                .contains { $0.hasPrefix(".swan-scrubbed-restore-") }
+        )
         let after = try await fixture.database.portableExportInventory()
         XCTAssertEqual(after, before)
     }
 
-    func testPostRenamePreSyncFailureRemovesInstalledOutputAndAllowsSafeRetry() async throws {
+    func testPostRenamePreSyncFailureQuarantinesAndBlocksOnlineRetry() async throws {
         let fixture = try await ExporterFixture()
         defer { fixture.remove() }
         let output = fixture.root.appending(path: "post-rename-failure")
@@ -442,13 +498,97 @@ final class SwanPortableExportTests: XCTestCase {
             try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
                 .contains { $0.hasPrefix(".swan-export-") }
         )
-
-        let retried = try await fixture.export(to: output)
-        XCTAssertEqual(retried.outputDirectory, output.path)
-        _ = try SwanPortableExportVerifier.verifyArchive(
-            at: output,
-            signingPublicKey: fixture.signingKey.publicKey
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
+                .contains { $0.hasPrefix(".swan-scrubbed-restore-") }
         )
+        let quarantine = fixture.root.appending(
+            path: SwanPortableExportFilesystem.cleanupQuarantineName
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: quarantine.path))
+        XCTAssertTrue(try allRegularFileBytes(under: quarantine).isEmpty)
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await fixture.export(to: output)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+    }
+
+    func testPostRenameDirectorySwapFailsWithoutDeletingReplacementOrReturningReceipt()
+        async throws
+    {
+        let fixture = try await ExporterFixture()
+        defer { fixture.remove() }
+        let output = fixture.root.appending(path: "swapped-export")
+        let displaced = fixture.root.appending(path: "swapped-export-displaced")
+        let sentinel = Data("attacker-replacement".utf8)
+        let exporter = try SwanPortableAccountExporter(
+            database: fixture.database,
+            keyStore: fixture.keyStore,
+            afterRenameBeforeParentSync: {
+                try FileManager.default.moveItem(at: output, to: displaced)
+                try FileManager.default.createDirectory(
+                    at: output,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                try sentinel.write(to: output.appending(path: "sentinel"))
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: output.appending(path: "sentinel").path
+                )
+            }
+        )
+
+        var receipt: SwanPortableExportResult?
+        do {
+            receipt = try await exporter.export(account: fixture.account, to: output)
+            XCTFail("a swapped advertised directory returned an export receipt")
+        } catch {}
+
+        XCTAssertNil(receipt)
+        XCTAssertEqual(
+            try Data(contentsOf: output.appending(path: "sentinel")),
+            sentinel
+        )
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: output.path),
+            ["sentinel"]
+        )
+    }
+
+    func testPostRenameInPlaceMutationFailsWithoutReturningStagedManifestReceipt()
+        async throws
+    {
+        let fixture = try await ExporterFixture()
+        defer { fixture.remove() }
+        let output = fixture.root.appending(path: "mutated-export")
+        let exporter = try SwanPortableAccountExporter(
+            database: fixture.database,
+            keyStore: fixture.keyStore,
+            afterRenameBeforeParentSync: {
+                let manifestURL = output.appending(path: "manifest.json")
+                let handle = try FileHandle(forUpdating: manifestURL)
+                defer { try? handle.close() }
+                try handle.seek(toOffset: 0)
+                try handle.write(contentsOf: Data([0x20]))
+                try handle.synchronize()
+            }
+        )
+
+        var receipt: SwanPortableExportResult?
+        do {
+            receipt = try await exporter.export(account: fixture.account, to: output)
+            XCTFail("mutated advertised bytes returned the staged manifest receipt")
+        } catch {}
+
+        XCTAssertNil(receipt)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+        let quarantine = fixture.root.appending(
+            path: SwanPortableExportFilesystem.cleanupQuarantineName
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: quarantine.path))
+        XCTAssertTrue(try allRegularFileBytes(under: quarantine).isEmpty)
     }
 
     func testParentReplacementDuringPublicationCannotRedirectOrOrphanStaging() async throws {
@@ -621,9 +761,43 @@ final class SwanPortableExportTests: XCTestCase {
         }
         return result
     }
+
+    private func allRegularFileBytes(under root: URL) throws -> Data {
+        let enumerator = try XCTUnwrap(
+            FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [],
+                errorHandler: nil
+            )
+        )
+        var result = Data()
+        for case let url as URL in enumerator
+        where try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true {
+            result.append(try Data(contentsOf: url))
+        }
+        return result
+    }
 }
 
 final class SwanPortableRestoreTests: XCTestCase {
+    func testPublicVerifierStreamsLargeArtifactsAndSyncCompatibilityFailsClosed()
+        async throws
+    {
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+        try fixture.addLargePublicBlob(
+            byteCount: SwanPortableExportVerifier.maximumSynchronousArtifactBytes + 1
+        )
+
+        XCTAssertThrowsError(
+            try SwanPortableExportVerifier.verifyArchive(at: fixture.root)
+        )
+        let streamed = try await SwanPortableExportVerifier
+            .verifyArchiveStreaming(at: fixture.root)
+        XCTAssertEqual(streamed.manifest.files.count, 4)
+    }
+
     func testSelfContainedVerificationDerivesPLCSigningKeyAndRejectsCorruption() async throws {
         let fixture = try ArchiveFixture()
         defer { fixture.remove() }
@@ -701,14 +875,14 @@ final class SwanPortableRestoreTests: XCTestCase {
         )
     }
 
-    func testStagingCopiesExactVerifiedTreeWithOwnerOnlyModesAndNoActivationState() throws {
+    func testStagingCopiesExactVerifiedTreeWithOwnerOnlyModesAndNoActivationState() async throws {
         let fixture = try ArchiveFixture()
         defer { fixture.remove() }
         let dataDirectory = try temporaryDirectory(named: "data")
         defer { try? FileManager.default.removeItem(at: dataDirectory.deletingLastPathComponent()) }
         let verification = try SwanPortableExportVerifier.verifyArchive(at: fixture.root)
 
-        let result = try SwanPortableAccountRestoreStager().stage(
+        let result = try await SwanPortableAccountRestoreStager().stage(
             archiveAt: fixture.root,
             dataDirectory: dataDirectory
         )
@@ -739,7 +913,7 @@ final class SwanPortableRestoreTests: XCTestCase {
     }
 
     func testInvalidSourceCreatesNoStateAndExistingStageIsIdempotentButOccupiedTargetsFail()
-        throws
+        async throws
     {
         let fixture = try ArchiveFixture()
         defer { fixture.remove() }
@@ -749,22 +923,22 @@ final class SwanPortableRestoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: invalid) }
         try Data("bad".utf8).write(to: invalid.appending(path: "public/repository.car"))
 
-        XCTAssertThrowsError(
-            try SwanPortableAccountRestoreStager().stage(
+        await assertThrowsAsync {
+            try await SwanPortableAccountRestoreStager().stage(
                 archiveAt: invalid,
                 dataDirectory: root
             )
-        )
+        }
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: root.appending(path: "restore-staging").path
         ))
 
-        let first = try SwanPortableAccountRestoreStager().stage(
+        let first = try await SwanPortableAccountRestoreStager().stage(
             archiveAt: fixture.root,
             dataDirectory: root
         )
         let before = try treeSnapshot(URL(fileURLWithPath: first.stagingDirectory))
-        let second = try SwanPortableAccountRestoreStager().stage(
+        let second = try await SwanPortableAccountRestoreStager().stage(
             archiveAt: fixture.root,
             dataDirectory: root
         )
@@ -776,12 +950,12 @@ final class SwanPortableRestoreTests: XCTestCase {
 
         try FileManager.default.removeItem(at: URL(fileURLWithPath: first.stagingDirectory))
         try Data("occupied".utf8).write(to: URL(fileURLWithPath: first.stagingDirectory))
-        XCTAssertThrowsError(
-            try SwanPortableAccountRestoreStager().stage(
+        await assertThrowsAsync {
+            try await SwanPortableAccountRestoreStager().stage(
                 archiveAt: fixture.root,
                 dataDirectory: root
             )
-        )
+        }
         XCTAssertEqual(
             try Data(contentsOf: URL(fileURLWithPath: first.stagingDirectory)),
             Data("occupied".utf8)
@@ -798,16 +972,16 @@ final class SwanPortableRestoreTests: XCTestCase {
             atPath: first.stagingDirectory,
             withDestinationPath: symlinkTarget.path
         )
-        XCTAssertThrowsError(
-            try SwanPortableAccountRestoreStager().stage(
+        await assertThrowsAsync {
+            try await SwanPortableAccountRestoreStager().stage(
                 archiveAt: fixture.root,
                 dataDirectory: root
             )
-        )
+        }
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: symlinkTarget.path), [])
     }
 
-    func testPostRenamePreSyncFailureCleansInstalledStageAndAllowsRetry() throws {
+    func testPostRenamePreSyncFailureQuarantinesAndBlocksRestoreRetry() async throws {
         let fixture = try ArchiveFixture()
         defer { fixture.remove() }
         let dataDirectory = try temporaryDirectory(named: "fault-data")
@@ -818,27 +992,68 @@ final class SwanPortableRestoreTests: XCTestCase {
             .appending(path: "restore-staging")
             .appending(path: hash)
 
-        XCTAssertThrowsError(
-            try SwanPortableAccountRestoreStager(afterRenameBeforeParentSync: {
+        await assertThrowsAsync {
+            try await SwanPortableAccountRestoreStager(afterRenameBeforeParentSync: {
                 throw SwanPortableExportError.publicationFailed
             }).stage(archiveAt: fixture.root, dataDirectory: dataDirectory)
-        )
+        }
         XCTAssertFalse(FileManager.default.fileExists(atPath: installed.path))
-        XCTAssertFalse(FileManager.default.fileExists(
-            atPath: dataDirectory.appending(path: "restore-staging").path
-        ))
+        let restoreParent = dataDirectory.appending(path: "restore-staging")
+        let quarantine = restoreParent.appending(
+            path: SwanPortableExportFilesystem.cleanupQuarantineName
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: quarantine.path))
+        XCTAssertTrue(try regularFileByteCounts(under: quarantine).allSatisfy { $0 == 0 })
 
-        let retried = try SwanPortableAccountRestoreStager().stage(
-            archiveAt: fixture.root,
-            dataDirectory: dataDirectory
-        )
-        XCTAssertEqual(retried.status, .staged)
-        _ = try SwanPortableExportVerifier.verifyArchive(
-            at: URL(fileURLWithPath: retried.stagingDirectory)
-        )
+        await assertThrowsAsync {
+            try await SwanPortableAccountRestoreStager().stage(
+                archiveAt: fixture.root,
+                dataDirectory: dataDirectory
+            )
+        }
     }
 
-    func testRestoreParentReplacementFailsAndCannotRedirectAdvertisedStage() throws {
+    func testPostRenameSameInodeManifestMutationFailsInstalledReverification()
+        async throws
+    {
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+        let dataDirectory = try temporaryDirectory(named: "post-rename-mutation-data")
+        defer { try? FileManager.default.removeItem(at: dataDirectory.deletingLastPathComponent()) }
+        let verification = try SwanPortableExportVerifier.verifyArchive(at: fixture.root)
+        let hash = String(verification.manifestSHA256.dropFirst("sha256:".count))
+        let installed = dataDirectory.appending(path: "restore-staging")
+            .appending(path: hash)
+        let mutationRan = PortableRestoreUnsafeSendableBox(false)
+        let stager = SwanPortableAccountRestoreStager(
+            afterRenameBeforeParentSync: {
+                let manifest = installed.appending(path: "manifest.json")
+                let descriptor = manifest.withUnsafeFileSystemRepresentation { path in
+                    open(path!, O_WRONLY | O_CLOEXEC)
+                }
+                guard descriptor >= 0 else {
+                    throw SwanPortableExportError.publicationFailed
+                }
+                defer { _ = close(descriptor) }
+                var byte: UInt8 = 0x58
+                guard pwrite(descriptor, &byte, 1, 0) == 1 else {
+                    throw SwanPortableExportError.publicationFailed
+                }
+                mutationRan.value = true
+            }
+        )
+
+        await assertThrowsAsync {
+            try await stager.stage(
+                archiveAt: fixture.root,
+                dataDirectory: dataDirectory
+            )
+        }
+        XCTAssertTrue(mutationRan.value)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: installed.path))
+    }
+
+    func testRestoreParentReplacementFailsAndCannotRedirectAdvertisedStage() async throws {
         let fixture = try ArchiveFixture()
         defer { fixture.remove() }
         let dataDirectory = try temporaryDirectory(named: "replacement-data")
@@ -864,12 +1079,12 @@ final class SwanPortableRestoreTests: XCTestCase {
             }
         )
 
-        XCTAssertThrowsError(
-            try stager.stage(
+        await assertThrowsAsync {
+            try await stager.stage(
                 archiveAt: fixture.root,
                 dataDirectory: dataDirectory
             )
-        )
+        }
 
         XCTAssertEqual(
             try FileManager.default.contentsOfDirectory(atPath: restoreParent.path),
@@ -877,11 +1092,18 @@ final class SwanPortableRestoreTests: XCTestCase {
         )
         XCTAssertEqual(
             try FileManager.default.contentsOfDirectory(atPath: displacedParent.path),
-            []
+            [SwanPortableExportFilesystem.cleanupQuarantineName]
+        )
+        XCTAssertTrue(
+            try regularFileByteCounts(
+                under: displacedParent.appending(
+                    path: SwanPortableExportFilesystem.cleanupQuarantineName
+                )
+            ).allSatisfy { $0 == 0 }
         )
     }
 
-    func testIntermediateDirectorySyncFailureCleansAllRestoreState() throws {
+    func testIntermediateDirectorySyncFailureCleansAllRestoreState() async throws {
         let fixture = try ArchiveFixture()
         defer { fixture.remove() }
         let dataDirectory = try temporaryDirectory(named: "sync-failure-data")
@@ -894,20 +1116,21 @@ final class SwanPortableRestoreTests: XCTestCase {
             }
         )
 
-        XCTAssertThrowsError(
-            try stager.stage(
+        await assertThrowsAsync {
+            try await stager.stage(
                 archiveAt: fixture.root,
                 dataDirectory: dataDirectory
             )
-        )
+        }
 
         XCTAssertEqual(recorder.values, [1])
-        XCTAssertFalse(FileManager.default.fileExists(
-            atPath: dataDirectory.appending(path: "restore-staging").path
-        ))
+        let quarantine = dataDirectory.appending(path: "restore-staging")
+            .appending(path: SwanPortableExportFilesystem.cleanupQuarantineName)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: quarantine.path))
+        XCTAssertTrue(try regularFileByteCounts(under: quarantine).allSatisfy { $0 == 0 })
     }
 
-    func testTransientCleanupFailureIsRetriedAndAbsenceIsVerified() throws {
+    func testTransientCleanupFailureRetriesIntoBoundedQuarantine() async throws {
         let fixture = try ArchiveFixture()
         defer { fixture.remove() }
         let dataDirectory = try temporaryDirectory(named: "cleanup-failure-data")
@@ -927,12 +1150,12 @@ final class SwanPortableRestoreTests: XCTestCase {
             }
         )
 
-        XCTAssertThrowsError(
-            try stager.stage(
+        await assertThrowsAsync {
+            try await stager.stage(
                 archiveAt: fixture.root,
                 dataDirectory: dataDirectory
             )
-        )
+        }
 
         XCTAssertEqual(recorder.values, [1, 2])
         XCTAssertFalse(FileManager.default.fileExists(
@@ -941,23 +1164,82 @@ final class SwanPortableRestoreTests: XCTestCase {
                 .appending(path: hash)
                 .path
         ))
-        XCTAssertFalse(FileManager.default.fileExists(
-            atPath: dataDirectory.appending(path: "restore-staging").path
-        ))
+        let quarantine = dataDirectory.appending(path: "restore-staging")
+            .appending(path: SwanPortableExportFilesystem.cleanupQuarantineName)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: quarantine.path))
+        XCTAssertTrue(try regularFileByteCounts(under: quarantine).allSatisfy { $0 == 0 })
     }
 
-    func testDataDirectoryMustAlreadyBeAnOwnerOnlyUnlinkedDirectory() throws {
+    func testStageCleanupRemovesPinnedInodeAndPreservesSameNameReplacement()
+        async throws
+    {
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+        let dataDirectory = try temporaryDirectory(named: "cleanup-swap-data")
+        defer {
+            try? FileManager.default.removeItem(
+                at: dataDirectory.deletingLastPathComponent()
+            )
+        }
+        let verification = try await SwanPortableExportVerifier
+            .verifyArchiveStreaming(at: fixture.root)
+        let hash = String(verification.manifestSHA256.dropFirst("sha256:".count))
+        let parent = dataDirectory.appending(path: "restore-staging")
+        let published = parent.appending(path: hash)
+        let displaced = parent.appending(path: "displaced-pinned-stage")
+        let sentinel = Data("replacement-owned".utf8)
+        let stager = SwanPortableAccountRestoreStager(
+            afterRenameBeforeParentSync: {
+                try FileManager.default.moveItem(at: published, to: displaced)
+                try FileManager.default.createDirectory(
+                    at: published,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                let sentinelURL = published.appending(path: "sentinel")
+                FileManager.default.createFile(
+                    atPath: sentinelURL.path,
+                    contents: sentinel,
+                    attributes: [.posixPermissions: 0o600]
+                )
+                throw SwanPortableExportError.publicationFailed
+            }
+        )
+
+        await assertThrowsAsync {
+            try await stager.stage(
+                archiveAt: fixture.root,
+                dataDirectory: dataDirectory
+            )
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: displaced.path))
+        let quarantine = parent.appending(
+            path: SwanPortableExportFilesystem.cleanupQuarantineName
+        )
+        XCTAssertEqual(
+            Set(try FileManager.default.contentsOfDirectory(atPath: parent.path)),
+            Set([hash, SwanPortableExportFilesystem.cleanupQuarantineName])
+        )
+        XCTAssertTrue(try regularFileByteCounts(under: quarantine).allSatisfy { $0 == 0 })
+        XCTAssertEqual(
+            try Data(contentsOf: published.appending(path: "sentinel")),
+            sentinel
+        )
+    }
+
+    func testDataDirectoryMustAlreadyBeAnOwnerOnlyUnlinkedDirectory() async throws {
         let fixture = try ArchiveFixture()
         defer { fixture.remove() }
         let parent = try temporaryDirectory(named: "placement-parent")
         defer { try? FileManager.default.removeItem(at: parent.deletingLastPathComponent()) }
         let missing = parent.appending(path: "missing")
-        XCTAssertThrowsError(
-            try SwanPortableAccountRestoreStager().stage(
+        await assertThrowsAsync {
+            try await SwanPortableAccountRestoreStager().stage(
                 archiveAt: fixture.root,
                 dataDirectory: missing
             )
-        )
+        }
         XCTAssertFalse(FileManager.default.fileExists(atPath: missing.path))
 
         let broad = parent.appending(path: "broad")
@@ -966,12 +1248,12 @@ final class SwanPortableRestoreTests: XCTestCase {
             withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o755]
         )
-        XCTAssertThrowsError(
-            try SwanPortableAccountRestoreStager().stage(
+        await assertThrowsAsync {
+            try await SwanPortableAccountRestoreStager().stage(
                 archiveAt: fixture.root,
                 dataDirectory: broad
             )
-        )
+        }
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: broad.path), [])
 
         let target = parent.appending(path: "target")
@@ -985,13 +1267,58 @@ final class SwanPortableRestoreTests: XCTestCase {
             atPath: linked.path,
             withDestinationPath: target.path
         )
-        XCTAssertThrowsError(
-            try SwanPortableAccountRestoreStager().stage(
+        await assertThrowsAsync {
+            try await SwanPortableAccountRestoreStager().stage(
                 archiveAt: fixture.root,
                 dataDirectory: linked
             )
-        )
+        }
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: target.path), [])
+    }
+
+    func testOptIn256MiBPortableRestoreStagesWithBoundedRSS() async throws {
+        guard ProcessInfo.processInfo.environment[
+            "SWAN_RUN_256MIB_PORTABLE_RESTORE"
+        ] == "1" else {
+            throw XCTSkip(
+                "set SWAN_RUN_256MIB_PORTABLE_RESTORE=1 for the restore RSS gate"
+            )
+        }
+        let fixture = try ArchiveFixture()
+        defer { fixture.remove() }
+        try fixture.addLargePublicBlob(byteCount: 256 * 1_024 * 1_024)
+        let dataDirectory = try temporaryDirectory(named: "large-restore-data")
+        defer {
+            try? FileManager.default.removeItem(
+                at: dataDirectory.deletingLastPathComponent()
+            )
+        }
+        let baseline = portableRestoreResidentBytes()
+        guard baseline > 0 else {
+            throw XCTSkip("the platform RSS probe is unavailable")
+        }
+        let sampler = PortableRestoreRSSSampler(initial: baseline)
+        let sampling = Task {
+            while !Task.isCancelled {
+                await sampler.sample(portableRestoreResidentBytes())
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+        }
+        let result = try await SwanPortableAccountRestoreStager().stage(
+            archiveAt: fixture.root,
+            dataDirectory: dataDirectory
+        )
+        sampling.cancel()
+        _ = await sampling.result
+        await sampler.sample(portableRestoreResidentBytes())
+        let peak = await sampler.peak
+        let peakIncrease = max(0, peak - baseline)
+        print(
+            "portable restore RSS report: bytes=\(256 * 1_024 * 1_024) "
+                + "baseline=\(baseline) peak=\(peak) delta=\(peakIncrease)"
+        )
+        XCTAssertEqual(result.fileCount, 4)
+        XCTAssertLessThan(peakIncrease, 128 * 1_024 * 1_024)
     }
 
     private func temporaryDirectory(named name: String) throws -> URL {
@@ -1008,6 +1335,17 @@ final class SwanPortableRestoreTests: XCTestCase {
             ofItemAtPath: parent.path
         )
         return directory
+    }
+
+    private func assertThrowsAsync<T>(
+        _ operation: () async throws -> T,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            _ = try await operation()
+            XCTFail("expected operation to throw", file: file, line: line)
+        } catch {}
     }
 
     private func copiedArchive(_ source: URL, named name: String) throws -> URL {
@@ -1059,6 +1397,27 @@ final class SwanPortableRestoreTests: XCTestCase {
         var output: [String: Data] = [:]
         try collectTree(root: root, relative: "", output: &output)
         return output
+    }
+
+    private func regularFileByteCounts(under root: URL) throws -> [Int] {
+        let enumerator = try XCTUnwrap(
+            FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+                options: [],
+                errorHandler: nil
+            )
+        )
+        var counts: [Int] = []
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(
+                forKeys: [.isRegularFileKey, .fileSizeKey]
+            )
+            if values.isRegularFile == true {
+                counts.append(values.fileSize ?? -1)
+            }
+        }
+        return counts
     }
 
     private func collectTree(
@@ -1414,6 +1773,71 @@ private struct ArchiveFixture {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func addLargePublicBlob(byteCount: Int) throws {
+        let temporary = root.appending(path: ".large-blob.tmp")
+        FileManager.default.createFile(
+            atPath: temporary.path,
+            contents: nil,
+            attributes: [.posixPermissions: 0o600]
+        )
+        let handle = try FileHandle(forWritingTo: temporary)
+        var digest = SHA256()
+        let chunk = Data(repeating: 0x5a, count: 64 * 1_024)
+        var remaining = byteCount
+        while remaining > 0 {
+            let part = remaining >= chunk.count
+                ? chunk
+                : Data(chunk.prefix(remaining))
+            try handle.write(contentsOf: part)
+            digest.update(data: part)
+            remaining -= part.count
+        }
+        try handle.synchronize()
+        try handle.close()
+        let digestData = Data(digest.finalize())
+        let cid = CID(
+            codec: .raw,
+            multihash: Multihash(
+                algorithm: Multihash.sha256Code,
+                length: Multihash.sha256Length,
+                digest: digestData
+            )
+        ).string
+        let path = "blobs/public/\(SwanPortableExportPath.encode(cid))"
+        let destination = root.appending(path: path)
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try FileManager.default.moveItem(at: temporary, to: destination)
+        let manifestURL = root.appending(path: "manifest.json")
+        let manifest = try SwanPortableExportManifestCodec.decode(
+            Data(contentsOf: manifestURL)
+        )
+        let blob = try SwanPortableExportFile(
+            path: path,
+            byteCount: byteCount,
+            sha256: digestData.map { String(format: "%02x", $0) }.joined(),
+            type: .publicBlob
+        )
+        let updated = try SwanPortableExportManifest(
+            profileID: manifest.profileID,
+            did: manifest.did,
+            canonicalHandle: manifest.canonicalHandle,
+            createdAt: manifest.createdAt,
+            files: (manifest.files + [blob]).sorted { $0.path < $1.path }
+        )
+        try SwanPortableExportManifestCodec.encode(updated).write(
+            to: manifestURL,
+            options: .atomic
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: manifestURL.path
+        )
+    }
+
     private func write(_ data: Data, path: String) throws {
         let url = root.appending(path: path)
         try FileManager.default.createDirectory(
@@ -1469,3 +1893,50 @@ private enum PLCFixture {
 
 private let portableExportTestVerifier =
     "$argon2id$v=19$m=65536,t=3,p=1$bcdefghijklmnopqrstuvw$BCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq"
+
+private actor PortableRestoreRSSSampler {
+    private(set) var peak: Int
+
+    init(initial: Int) { peak = initial }
+
+    func sample(_ value: Int) { peak = max(peak, value) }
+}
+
+private func portableRestoreResidentBytes() -> Int {
+    #if canImport(Darwin)
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(
+        MemoryLayout<mach_task_basic_info>.size
+            / MemoryLayout<natural_t>.size
+    )
+    let result = withUnsafeMutablePointer(to: &info) { pointer in
+        pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(
+                mach_task_self_,
+                task_flavor_t(MACH_TASK_BASIC_INFO),
+                $0,
+                &count
+            )
+        }
+    }
+    return result == KERN_SUCCESS ? Int(info.resident_size) : 0
+    #elseif canImport(Glibc)
+    guard let fields = try? String(
+        contentsOfFile: "/proc/self/statm",
+        encoding: .utf8
+    ).split(separator: " "),
+    fields.count > 1,
+    let pages = Int(fields[1]) else { return 0 }
+    return pages * Int(sysconf(Int32(_SC_PAGESIZE)))
+    #else
+    return 0
+    #endif
+}
+
+private final class PortableRestoreUnsafeSendableBox<Value>: @unchecked Sendable {
+    var value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+}

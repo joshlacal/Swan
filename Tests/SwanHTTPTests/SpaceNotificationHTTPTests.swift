@@ -17,6 +17,55 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
     private let authority = "did:plc:abcdefghijklmnopqrstuvwx"
     private let writer = "did:plc:bcdefghijklmnopqrstuvwxy"
 
+    func testActualNotificationRouteRetainsAdmissionThroughStrictAndGeneratedDecode() async throws {
+        let maximum = 16 * 1_024
+        let admission = try PublicRepositoryJSONWriteAdmission(
+            maximumConcurrentWrites: 1,
+            maximumReservedRequestBytes: maximum
+        )
+        let barrier = NotificationDecodeBarrier()
+        let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
+        defer { fixture.cleanup() }
+        do {
+            let app = try fixture.server(
+                jsonWriteAdmission: admission,
+                decodeObserver: { await barrier.arriveAndWait() }
+            ).buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.decode-admission"))
+            let body = ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"endpoint\":\"https://receiver.example/notify\"}")
+            try await app.test(.router) { client in
+                let first = Task {
+                    try await client.execute(
+                        uri: "/xrpc/com.atproto.space.registerNotify", method: .post,
+                        headers: try fixture.bearerHeaders(), body: body
+                    )
+                }
+                await barrier.waitUntilEntered()
+                XCTAssertEqual(admission.snapshot, .init(
+                    activeLeases: 1, reservedRequestBytes: maximum
+                ))
+                let second = try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify", method: .post,
+                    headers: try fixture.bearerHeaders(), body: body
+                )
+                XCTAssertEqual(second.status, .serviceUnavailable)
+                XCTAssertEqual(try notificationErrorCode(second.body), "temporarily_unavailable")
+                await barrier.release()
+                let firstResponse = try await first.value
+                XCTAssertEqual(firstResponse.status, .ok)
+            }
+            XCTAssertEqual(admission.snapshot, .init(
+                activeLeases: 0, reservedRequestBytes: 0
+            ))
+            let registrations = await fixture.directory.registrations()
+            XCTAssertEqual(registrations.count, 1)
+            try await fixture.close()
+        } catch {
+            await barrier.release()
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     func testCredentialOnlyWriterDiscoveryRegistrationAndServiceNotifications() async throws {
         let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
         defer { fixture.cleanup() }
@@ -261,7 +310,10 @@ private struct NotificationHTTPFixture {
         }
     }
 
-    func server() throws -> SwanHTTPServer {
+    func server(
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
+        decodeObserver: (@Sendable () async -> Void)? = nil
+    ) throws -> SwanHTTPServer {
         let credentialKeys = try PinnedSpaceCredentialPublicKeyResolver(pins: [
             try .init(authority: authority, generation: 1, publicKey: key.publicKey),
         ])
@@ -276,9 +328,15 @@ private struct NotificationHTTPFixture {
                 delegationPublicKeys: UnavailableSpaceDelegationPublicKeyResolver(),
                 credentialPublicKeys: credentialKeys
             ),
-            spaceNotificationConfiguration: .init(
+            spaceNotificationConfiguration: decodeObserver.map {
+                SwanSpaceNotificationHTTPConfiguration(
+                    serviceAuthentication: NotificationServiceVerifier(authority: authority, writer: writer),
+                    notificationJSONDecodeObserver: $0
+                )
+            } ?? .init(
                 serviceAuthentication: NotificationServiceVerifier(authority: authority, writer: writer)
-            )
+            ),
+            jsonWriteAdmission: jsonWriteAdmission
         )
     }
 
@@ -295,6 +353,34 @@ private struct NotificationHTTPFixture {
 
     func cleanup() {
         try? FileManager.default.removeItem(at: root)
+    }
+}
+
+private actor NotificationDecodeBarrier {
+    private var entered = false
+    private var released = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func arriveAndWait() async {
+        entered = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        guard !released else { return }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
     }
 }
 

@@ -13,7 +13,7 @@ import Darwin
 import Glibc
 #endif
 
-@testable import SwanSQLite
+@_spi(PortableRestore) @testable import SwanSQLite
 
 final class PermissionedRepositoryCARStreamingTests: XCTestCase {
     func testHelperEnvironmentExcludesParentSecretSentinels() {
@@ -215,15 +215,93 @@ final class PermissionedRepositoryCARStreamingTests: XCTestCase {
                     )
                 },
                 index: index,
+                recordSink: index,
                 limits: try SpaceCARRecoveryLimits(maximumCARBytes: car.count)
             )
         } catch {
             await index.cleanup()
             throw error
         }
-        await index.cleanup()
         XCTAssertEqual(summary.recordCount, 2)
+        XCTAssertEqual(summary.logicalRestoredByteCount, value.count * 2)
         XCTAssertEqual(summary.verifiedExpectedWitnessCount, 0)
+        let carriedMetadata = SQLitePortableRestoreRepositoryMetadata(
+            space: fixture.space,
+            author: fixture.author,
+            verification: summary
+        )
+        XCTAssertEqual(
+            carriedMetadata.logicalRestoredByteCount,
+            summary.logicalRestoredByteCount
+        )
+        let first = try await index.nextStagedRecord(afterPath: nil)
+        XCTAssertEqual(first?.path, "app.bsky.feed.post/first")
+        XCTAssertEqual(first?.cid, cid)
+        XCTAssertEqual(first?.value, value)
+        let second = try await index.nextStagedRecord(afterPath: first?.path)
+        XCTAssertEqual(second?.path, "app.bsky.feed.post/second")
+        XCTAssertEqual(second?.cid, cid)
+        XCTAssertEqual(second?.value, value)
+        let exhausted = try await index.nextStagedRecord(afterPath: second?.path)
+        XCTAssertNil(exhausted)
+
+        let restoreRoot = fixture.root.appending(
+            path: "transactional-budget-recheck",
+            directoryHint: .isDirectory
+        )
+        try SwanTestPrivateFilesystem.createOwnerOnlyDirectory(at: restoreRoot)
+        let restoreDatabase = try await SQLiteAccountDatabase(
+            dataDirectory: restoreRoot,
+            did: fixture.author
+        )
+        let understatedMetadata = SQLitePortableRestoreRepositoryMetadata(
+            space: fixture.space,
+            author: fixture.author,
+            wireRevision: summary.wireRevision,
+            recordCount: summary.recordCount,
+            logicalRestoredByteCount: summary.logicalRestoredByteCount - 1,
+            ltHash: summary.ltHash,
+            commitment: summary.commitment
+        )
+        do {
+            try await restoreDatabase.restorePortableRepositoryStreaming(
+                understatedMetadata,
+                staging: index
+            )
+            XCTFail("transactional logical byte recheck accepted understated metadata")
+        } catch {}
+        let rejectedRestoreInventory =
+            try await restoreDatabase.portableExportInventory()
+        XCTAssertEqual(rejectedRestoreInventory.repositories, [])
+        try await restoreDatabase.close()
+        await index.cleanup()
+
+        let rejectingIndex = try await SQLiteSpaceCARRecoveryIndex.create(
+            temporaryParentURL: fixture.root
+        )
+        do {
+            _ = try await SpaceCARCodec.verifyStreamingRecovery(
+                from: PermissionedCARDataSource(car),
+                space: fixture.space,
+                author: fixture.author,
+                contextSignatureVerifier: {
+                    try SpaceCommitCodec.verifyContextSignature(
+                        $0,
+                        publicKey: key.publicKey
+                    )
+                },
+                index: rejectingIndex,
+                recordSink: rejectingIndex,
+                limits: try SpaceCARRecoveryLimits(
+                    maximumCARBytes: car.count,
+                    maximumLogicalRestoredBytes: value.count * 2 - 1
+                )
+            )
+            XCTFail("shared-CID logical restore amplification was accepted")
+        } catch let error as SpaceCARStreamingError {
+            XCTAssertEqual(error, .byteLimitExceeded)
+        }
+        await rejectingIndex.cleanup()
         try await database.close()
     }
 

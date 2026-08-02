@@ -119,7 +119,8 @@ func registerOAuthAuthorizationServerEndpoints(
   on router: Router<BasicRequestContext>,
   configuration: SwanOAuthAuthorizationServerConfiguration,
   runtime: SwanOAuthRuntime,
-  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
+  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
   router.get("/oauth/authorize") { request, _ async -> Response in
     await beginOAuthServerAuthorization(
@@ -128,20 +129,26 @@ func registerOAuthAuthorizationServerEndpoints(
   router.post("/oauth/authorize") { request, context async -> Response in
     await loginOAuthServerAuthorization(
       request: request, context: context, configuration: configuration, runtime: runtime,
-      loginClientIdentityPolicy: loginClientIdentityPolicy)
+      loginClientIdentityPolicy: loginClientIdentityPolicy,
+      requestBodyAdmission: requestBodyAdmission)
   }
-  router.post("/oauth/authorize/consent") { request, _ async -> Response in
+  router.post("/oauth/authorize/consent") { request, context async -> Response in
     await consentOAuthServerAuthorization(
-      request: request, configuration: configuration, runtime: runtime)
+      request: request, context: context, configuration: configuration, runtime: runtime,
+      requestBodyAdmission: requestBodyAdmission)
   }
-  router.post("/oauth/token") { request, _ async -> Response in
-    await exchangeOAuthServerToken(request: request, configuration: configuration, runtime: runtime)
+  router.post("/oauth/token") { request, context async -> Response in
+    await exchangeOAuthServerToken(
+      request: request, context: context, configuration: configuration, runtime: runtime,
+      requestBodyAdmission: requestBodyAdmission)
   }
   router.on("/oauth/token", method: .options) { _, _ -> Response in
     oauthAPICORSPreflightResponse()
   }
-  router.post("/oauth/revoke") { request, _ async -> Response in
-    await revokeOAuthServerToken(request: request, configuration: configuration, runtime: runtime)
+  router.post("/oauth/revoke") { request, context async -> Response in
+    await revokeOAuthServerToken(
+      request: request, context: context, configuration: configuration, runtime: runtime,
+      requestBodyAdmission: requestBodyAdmission)
   }
   router.on("/oauth/revoke", method: .options) { _, _ -> Response in
     oauthAPICORSPreflightResponse()
@@ -151,10 +158,13 @@ func registerOAuthAuthorizationServerEndpoints(
 func registerOAuthAuthorizationServerPAREndpoint(
   on router: Router<BasicRequestContext>,
   configuration: SwanOAuthAuthorizationServerConfiguration,
-  runtime: SwanOAuthRuntime
+  runtime: SwanOAuthRuntime,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
-  router.post("/oauth/par") { request, _ async -> Response in
-    await handleOAuthServerPAR(request: request, configuration: configuration, runtime: runtime)
+  router.post("/oauth/par") { request, context async -> Response in
+    await handleOAuthServerPAR(
+      request: request, context: context, configuration: configuration, runtime: runtime,
+      requestBodyAdmission: requestBodyAdmission)
   }
   router.on("/oauth/par", method: .options) { _, _ -> Response in
     oauthAPICORSPreflightResponse()
@@ -163,12 +173,17 @@ func registerOAuthAuthorizationServerPAREndpoint(
 
 private func handleOAuthServerPAR(
   request: Request,
+  context: SwanHTTPRequestContext,
   configuration: SwanOAuthAuthorizationServerConfiguration,
-  runtime: SwanOAuthRuntime
+  runtime: SwanOAuthRuntime,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
   let form: OAuthServerPARForm
   do {
-    form = try await parseOAuthServerPARForm(request)
+    form = try await parseOAuthServerPARForm(
+      request, context: context, requestBodyAdmission: requestBodyAdmission)
+  } catch let failure as SwanRequestBodyCollectionFailure {
+    return oauthServerBodyFailurePAR(failure)
   } catch let error as OAuthServerRequestError {
     return error == .payloadTooLarge
       ? oauthServerPARJSON(.contentTooLarge, OAuthServerPARError(error: "invalid_request"))
@@ -279,10 +294,12 @@ private func loginOAuthServerAuthorization(
   context: SwanHTTPRequestContext,
   configuration: SwanOAuthAuthorizationServerConfiguration,
   runtime: SwanOAuthRuntime,
-  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
+  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
   do {
-    let form = try await parseOAuthServerLoginForm(request)
+    let form = try await parseOAuthServerLoginForm(
+      request, context: context, requestBodyAdmission: requestBodyAdmission)
     let session = try oauthServerBrowserSession(request, runtime: runtime)
     guard session.subject == nil,
       form.csrf == session.csrfToken,
@@ -337,6 +354,9 @@ private func loginOAuthServerAuthorization(
     return oauthServerAuthorizationError(.serviceUnavailable)
   } catch is SwanLoginClientIdentityError {
     return oauthServerAuthorizationError(.serviceUnavailable)
+  } catch let failure as SwanRequestBodyCollectionFailure {
+    return oauthServerAuthorizationError(
+      failure == .unavailable ? .serviceUnavailable : .badRequest)
   } catch {
     return oauthServerAuthorizationError(.badRequest)
   }
@@ -344,12 +364,15 @@ private func loginOAuthServerAuthorization(
 
 private func consentOAuthServerAuthorization(
   request: Request,
+  context: SwanHTTPRequestContext,
   configuration: SwanOAuthAuthorizationServerConfiguration,
-  runtime: SwanOAuthRuntime
+  runtime: SwanOAuthRuntime,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
   let fallback = oauthServerAuthorizationError(.badRequest, clearCookie: true)
   do {
-    let form = try await parseOAuthServerConsentForm(request)
+    let form = try await parseOAuthServerConsentForm(
+      request, context: context, requestBodyAdmission: requestBodyAdmission)
     let session = try oauthServerBrowserSession(request, runtime: runtime)
     guard let subject = session.subject,
       let subjectRevision = session.subjectRevisionMicroseconds,
@@ -395,6 +418,10 @@ private func consentOAuthServerAuthorization(
       )
     }
     return oauthServerRedirect(destination, clearCookie: true)
+  } catch let failure as SwanRequestBodyCollectionFailure {
+    return failure == .unavailable
+      ? oauthServerAuthorizationError(.serviceUnavailable, clearCookie: true)
+      : fallback
   } catch {
     return fallback
   }
@@ -402,12 +429,17 @@ private func consentOAuthServerAuthorization(
 
 private func exchangeOAuthServerToken(
   request: Request,
+  context: SwanHTTPRequestContext,
   configuration: SwanOAuthAuthorizationServerConfiguration,
-  runtime: SwanOAuthRuntime
+  runtime: SwanOAuthRuntime,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
   let form: OAuthServerTokenForm
   do {
-    form = try await parseOAuthServerTokenForm(request)
+    form = try await parseOAuthServerTokenForm(
+      request, context: context, requestBodyAdmission: requestBodyAdmission)
+  } catch let failure as SwanRequestBodyCollectionFailure {
+    return oauthServerBodyFailureToken(failure)
   } catch let error as OAuthServerRequestError {
     return error == .payloadTooLarge
       ? oauthServerTokenJSON(.contentTooLarge, OAuthServerTokenError(error: "invalid_request"))
@@ -505,12 +537,17 @@ private func exchangeOAuthServerToken(
 
 private func revokeOAuthServerToken(
   request: Request,
+  context: SwanHTTPRequestContext,
   configuration: SwanOAuthAuthorizationServerConfiguration,
-  runtime: SwanOAuthRuntime
+  runtime: SwanOAuthRuntime,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
   let form: OAuthServerRevocationForm
   do {
-    form = try await parseOAuthServerRevocationForm(request)
+    form = try await parseOAuthServerRevocationForm(
+      request, context: context, requestBodyAdmission: requestBodyAdmission)
+  } catch let failure as SwanRequestBodyCollectionFailure {
+    return oauthServerBodyFailureToken(failure)
   } catch let error as OAuthServerRequestError {
     return error == .payloadTooLarge
       ? oauthServerTokenJSON(.contentTooLarge, OAuthServerTokenError(error: "invalid_request"))
@@ -614,8 +651,13 @@ private func validateOAuthServerClientAssertion(
   }
 }
 
-private func parseOAuthServerPARForm(_ request: Request) async throws -> OAuthServerPARForm {
-  let fields = try await oauthServerForm(request)
+private func parseOAuthServerPARForm(
+  _ request: Request,
+  context: SwanHTTPRequestContext,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> OAuthServerPARForm {
+  let fields = try await oauthServerForm(
+    request, context: context, requestBodyAdmission: requestBodyAdmission)
   let required: Set<String> = [
     "client_id", "redirect_uri", "response_type", "scope", "state", "code_challenge",
     "code_challenge_method",
@@ -664,8 +706,13 @@ private func parseOAuthServerAuthorizeQuery(_ request: Request) throws -> OAuthS
   return .init(clientID: clientID, requestURI: requestURI)
 }
 
-private func parseOAuthServerLoginForm(_ request: Request) async throws -> OAuthServerLoginForm {
-  let fields = try await oauthServerForm(request)
+private func parseOAuthServerLoginForm(
+  _ request: Request,
+  context: SwanHTTPRequestContext,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> OAuthServerLoginForm {
+  let fields = try await oauthServerForm(
+    request, context: context, requestBodyAdmission: requestBodyAdmission)
   guard Set(fields.keys) == ["csrf", "handle", "password"],
     let csrf = fields["csrf"], let handle = fields["handle"], let password = fields["password"],
     oauthServerBrowserOpaque(csrf), !handle.isEmpty, handle.utf8.count <= 253,
@@ -676,9 +723,14 @@ private func parseOAuthServerLoginForm(_ request: Request) async throws -> OAuth
   return .init(csrf: csrf, handle: handle, password: password)
 }
 
-private func parseOAuthServerConsentForm(_ request: Request) async throws -> OAuthServerConsentForm
+private func parseOAuthServerConsentForm(
+  _ request: Request,
+  context: SwanHTTPRequestContext,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> OAuthServerConsentForm
 {
-  let fields = try await oauthServerForm(request)
+  let fields = try await oauthServerForm(
+    request, context: context, requestBodyAdmission: requestBodyAdmission)
   guard Set(fields.keys) == ["csrf", "decision"], let csrf = fields["csrf"],
     oauthServerBrowserOpaque(csrf),
     let decision = fields["decision"].flatMap(OAuthServerConsentDecision.init(rawValue:))
@@ -688,8 +740,13 @@ private func parseOAuthServerConsentForm(_ request: Request) async throws -> OAu
   return .init(csrf: csrf, decision: decision)
 }
 
-private func parseOAuthServerTokenForm(_ request: Request) async throws -> OAuthServerTokenForm {
-  let fields = try await oauthServerForm(request)
+private func parseOAuthServerTokenForm(
+  _ request: Request,
+  context: SwanHTTPRequestContext,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> OAuthServerTokenForm {
+  let fields = try await oauthServerForm(
+    request, context: context, requestBodyAdmission: requestBodyAdmission)
   guard let grant = fields["grant_type"].flatMap(OAuthServerTokenGrant.init(rawValue:)),
     let clientText = fields["client_id"], let clientID = oauthServerExactURL(clientText),
     clientText.utf8.count <= 4_096
@@ -729,10 +786,15 @@ private func parseOAuthServerTokenForm(_ request: Request) async throws -> OAuth
   }
 }
 
-private func parseOAuthServerRevocationForm(_ request: Request) async throws
+private func parseOAuthServerRevocationForm(
+  _ request: Request,
+  context: SwanHTTPRequestContext,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws
   -> OAuthServerRevocationForm
 {
-  let fields = try await oauthServerForm(request)
+  let fields = try await oauthServerForm(
+    request, context: context, requestBodyAdmission: requestBodyAdmission)
   let allowed: Set<String> = [
     "token", "client_id", "token_type_hint", "client_assertion_type", "client_assertion",
   ]
@@ -758,22 +820,20 @@ private func parseOAuthServerRevocationForm(_ request: Request) async throws
     clientAssertion: fields["client_assertion"])
 }
 
-private func oauthServerForm(_ request: Request) async throws -> [String: String] {
-  guard oauthServerFormContentType(request.headers) else { throw OAuthServerRequestError.malformed }
-  let lengths = request.headers[values: .contentLength]
-  guard lengths.count <= 1 else { throw OAuthServerRequestError.malformed }
-  if let value = lengths.first {
-    guard let length = Int(value), length >= 0 else { throw OAuthServerRequestError.malformed }
-    guard length <= SwanOAuthAuthorizationServerHTTP.maximumFormBytes else {
-      throw OAuthServerRequestError.payloadTooLarge
-    }
-  }
-  let body: ByteBuffer
-  do {
-    body = try await request.body.collect(upTo: SwanOAuthAuthorizationServerHTTP.maximumFormBytes)
-  } catch is NIOTooManyBytesError { throw OAuthServerRequestError.payloadTooLarge } catch {
-    throw OAuthServerRequestError.malformed
-  }
+private func oauthServerForm(
+  _ request: Request,
+  context: SwanHTTPRequestContext,
+  requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) async throws -> [String: String] {
+  let body = try await collectAdmittedRequestBody(
+    request,
+    mediaType: .formURLEncoded,
+    admission: requestBodyAdmission.admission,
+    policy: requestBodyAdmission.policy,
+    maximumBytes: SwanOAuthAuthorizationServerHTTP.maximumFormBytes,
+    termination: context.jsonWriteBodyTermination
+  )
+  defer { withExtendedLifetime(body) {} }
   guard let bytes = body.getBytes(at: body.readerIndex, length: body.readableBytes), !bytes.isEmpty
   else {
     throw OAuthServerRequestError.malformed
@@ -1024,6 +1084,38 @@ private func oauthServerPARJSON<Body: Encodable>(_ status: HTTPResponse.Status, 
 private func oauthServerTokenJSON<Body: Encodable>(_ status: HTTPResponse.Status, _ body: Body)
   -> Response
 { oauthServerJSON(status, body) }
+
+private func oauthServerBodyFailurePAR(
+  _ failure: SwanRequestBodyCollectionFailure
+) -> Response {
+  switch failure {
+  case .unavailable:
+    oauthServerPARJSON(
+      .serviceUnavailable,
+      OAuthServerPARError(error: "temporarily_unavailable")
+    )
+  case .payloadTooLarge:
+    oauthServerPARJSON(.contentTooLarge, OAuthServerPARError(error: "invalid_request"))
+  case .invalidRequest:
+    oauthServerPARJSON(.badRequest, OAuthServerPARError(error: "invalid_request"))
+  }
+}
+
+private func oauthServerBodyFailureToken(
+  _ failure: SwanRequestBodyCollectionFailure
+) -> Response {
+  switch failure {
+  case .unavailable:
+    oauthServerTokenJSON(
+      .serviceUnavailable,
+      OAuthServerTokenError(error: "temporarily_unavailable")
+    )
+  case .payloadTooLarge:
+    oauthServerTokenJSON(.contentTooLarge, OAuthServerTokenError(error: "invalid_request"))
+  case .invalidRequest:
+    oauthServerTokenJSON(.badRequest, OAuthServerTokenError(error: "invalid_request"))
+  }
+}
 
 private func oauthServerJSON<Body: Encodable>(
   _ status: HTTPResponse.Status, _ body: Body, headers: HTTPFields? = nil

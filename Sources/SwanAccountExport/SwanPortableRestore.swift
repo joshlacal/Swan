@@ -57,7 +57,7 @@ public struct SwanPortableAccountRestoreStager: Sendable {
     public func stage(
         archiveAt inputDirectory: URL,
         dataDirectory: URL
-    ) throws -> SwanPortableRestoreResult {
+    ) async throws -> SwanPortableRestoreResult {
         let sourceDescriptor = try SwanPortableExportFilesystem.openArchiveRoot(
             inputDirectory
         )
@@ -65,7 +65,8 @@ public struct SwanPortableAccountRestoreStager: Sendable {
 
         // The archive is fully authenticated before the Swan data directory is
         // opened, inspected, or changed.
-        let preflight = try SwanPortableExportVerifier.verifySelfContainedArchive(
+        let preflight = try await SwanPortableExportVerifier
+            .verifySelfContainedArchiveStreaming(
             directoryDescriptor: sourceDescriptor
         )
         guard preflight.manifest.includesPrivateKeys == false,
@@ -87,7 +88,6 @@ public struct SwanPortableAccountRestoreStager: Sendable {
             parent: dataDescriptor,
             name: "restore-staging"
         )
-        var removeCreatedParentOnFailure = restoreParent.created
         defer { _ = close(restoreParent.descriptor) }
 
         do {
@@ -100,7 +100,8 @@ public struct SwanPortableAccountRestoreStager: Sendable {
                     name: manifestHash
                 )
                 defer { _ = close(existingDescriptor) }
-                let existing = try SwanPortableExportVerifier.verifySelfContainedArchive(
+                let existing = try await SwanPortableExportVerifier
+                    .verifySelfContainedArchiveStreaming(
                     directoryDescriptor: existingDescriptor
                 )
                 try requireSameIdentity(existing, preflight)
@@ -114,7 +115,6 @@ public struct SwanPortableAccountRestoreStager: Sendable {
                     archiveDescriptor: existingDescriptor,
                     manifestHash: manifestHash
                 )
-                removeCreatedParentOnFailure = false
                 return result(
                     verification: existing,
                     dataDirectory: canonicalDataDirectory,
@@ -128,7 +128,6 @@ public struct SwanPortableAccountRestoreStager: Sendable {
                 parent: restoreParent.descriptor,
                 name: temporaryName
             )
-            var published = false
             do {
                 try copyArchive(
                     preflight.manifest,
@@ -138,16 +137,17 @@ public struct SwanPortableAccountRestoreStager: Sendable {
                 guard fsync(stagingDescriptor) == 0 else {
                     throw SwanPortableExportError.publicationFailed
                 }
-                let staged = try SwanPortableExportVerifier.verifySelfContainedArchive(
+                let staged = try await SwanPortableExportVerifier
+                    .verifySelfContainedArchiveStreaming(
                     directoryDescriptor: stagingDescriptor
                 )
                 try requireSameIdentity(staged, preflight)
+                try Task.checkCancellation()
                 try SwanPortableExportFilesystem.renameExclusively(
                     parent: restoreParent.descriptor,
                     source: temporaryName,
                     destination: manifestHash
                 )
-                published = true
                 try afterRenameBeforeParentSync?()
                 try SwanPortableExportFilesystem.synchronizeParent(
                     restoreParent.descriptor
@@ -155,6 +155,11 @@ public struct SwanPortableAccountRestoreStager: Sendable {
                 if restoreParent.created {
                     try SwanPortableExportFilesystem.synchronizeParent(dataDescriptor)
                 }
+                let installed = try await SwanPortableExportVerifier
+                    .verifySelfContainedArchiveStreaming(
+                        directoryDescriptor: stagingDescriptor
+                    )
+                try requireSameIdentity(installed, staged)
                 try requireCurrentPublication(
                     dataDirectory: canonicalDataDirectory,
                     dataDescriptor: dataDescriptor,
@@ -163,43 +168,28 @@ public struct SwanPortableAccountRestoreStager: Sendable {
                     manifestHash: manifestHash
                 )
                 _ = close(stagingDescriptor)
-                removeCreatedParentOnFailure = false
                 return result(
-                    verification: staged,
+                    verification: installed,
                     dataDirectory: canonicalDataDirectory,
                     manifestHash: manifestHash,
                     status: .staged
                 )
             } catch {
-                _ = close(stagingDescriptor)
                 do {
                     try removeTreeWithRetry(
                         parent: restoreParent.descriptor,
-                        name: published ? manifestHash : temporaryName
+                        matching: stagingDescriptor
                     )
                 } catch {
+                    _ = close(stagingDescriptor)
                     throw SwanPortableExportError.publicationFailed
                 }
+                _ = close(stagingDescriptor)
                 throw error
             }
         } catch {
-            if removeCreatedParentOnFailure {
-                do {
-                    if try SwanPortableExportFilesystem.currentChildDirectoryMatches(
-                        parent: dataDescriptor,
-                        name: "restore-staging",
-                        expectedDescriptor: restoreParent.descriptor
-                    ) {
-                        try SwanPortableExportFilesystem.removeEmptyDirectory(
-                            parent: dataDescriptor,
-                            name: "restore-staging"
-                        )
-                        try SwanPortableExportFilesystem.synchronizeParent(dataDescriptor)
-                    }
-                } catch {
-                    throw SwanPortableExportError.publicationFailed
-                }
-            }
+            // Portable online cleanup never removes by pathname. The owner-only
+            // parent is retained for retry or quiesced operator recovery.
             throw error
         }
     }
@@ -209,32 +199,33 @@ public struct SwanPortableAccountRestoreStager: Sendable {
         source: Int32,
         destination: Int32
     ) throws {
-        let manifestData = try SwanPortableExportFilesystem.read(
+        try SwanPortableExportFilesystem.copyStreaming(
             path: "manifest.json",
-            root: source,
-            maximumBytes: 4 * 1_024 * 1_024
-        )
-        try SwanPortableExportFilesystem.write(
-            manifestData,
-            path: "manifest.json",
-            root: destination,
-            synchronizeCreatedDirectoryParent: synchronizeCreatedDirectoryParent
+            sourceRoot: source,
+            destinationRoot: destination,
+            expectedByteCount: try SwanPortableExportFilesystem.fileByteCount(
+                path: "manifest.json",
+                root: source,
+                maximumBytes: 4 * 1_024 * 1_024
+            ),
+            maximumBytes: 4 * 1_024 * 1_024,
+            synchronizeCreatedDirectoryParent:
+                synchronizeCreatedDirectoryParent
         )
         for entry in manifest.files {
+            try Task.checkCancellation()
             let maximumBytes = switch entry.type {
             case .plcHistory: 64 * 1_024
             default: SwanPortableExportFilesystem.maximumArtifactBytes
             }
-            let data = try SwanPortableExportFilesystem.read(
+            try SwanPortableExportFilesystem.copyStreaming(
                 path: entry.path,
-                root: source,
-                maximumBytes: maximumBytes
-            )
-            try SwanPortableExportFilesystem.write(
-                data,
-                path: entry.path,
-                root: destination,
-                synchronizeCreatedDirectoryParent: synchronizeCreatedDirectoryParent
+                sourceRoot: source,
+                destinationRoot: destination,
+                expectedByteCount: entry.byteCount,
+                maximumBytes: maximumBytes,
+                synchronizeCreatedDirectoryParent:
+                    synchronizeCreatedDirectoryParent
             )
         }
     }
@@ -263,11 +254,17 @@ public struct SwanPortableAccountRestoreStager: Sendable {
         )
     }
 
-    private func removeTreeWithRetry(parent: Int32, name: String) throws {
+    private func removeTreeWithRetry(
+        parent: Int32,
+        matching descriptor: Int32
+    ) throws {
         for attempt in 1 ... 2 {
             do {
                 try beforeCleanupAttempt?(attempt)
-                try SwanPortableExportFilesystem.removeTree(parent: parent, name: name)
+                try SwanPortableExportFilesystem.removeTree(
+                    parent: parent,
+                    matching: descriptor
+                )
                 return
             } catch {
                 if attempt == 2 {

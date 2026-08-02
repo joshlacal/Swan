@@ -10,6 +10,101 @@ import SwanStorage
 import XCTest
 
 final class SwanOperatorBackupTests: XCTestCase {
+    func testPreoccupiedCleanupQuarantineBlocksStagingAndPreservesSentinel()
+        async throws
+    {
+        let fixture = try await OperatorBackupFixture()
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
+        XCTAssertThrowsError(
+            try SwanPortableExportDestination(
+                fixture.root.appending(
+                    path: SwanPortableExportFilesystem.cleanupQuarantineName
+                )
+            )
+        )
+        await XCTAssertThrowsErrorAsync {
+            _ = try await fixture.backup(
+                to: fixture.root.appending(
+                    path: SwanPortableExportFilesystem.cleanupQuarantineName
+                )
+            )
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: fixture.root.appending(
+                    path: SwanPortableExportFilesystem.cleanupQuarantineName
+                ).path
+            )
+        )
+        let quarantine = fixture.root.appending(
+            path: SwanPortableExportFilesystem.cleanupQuarantineName
+        )
+        try FileManager.default.createDirectory(
+            at: quarantine,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let sentinel = Data("operator-owned-quarantine".utf8)
+        try protectedWrite(sentinel, to: quarantine.appending(path: "sentinel"))
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await fixture.backup(
+                to: fixture.root.appending(path: "blocked-backup")
+            )
+        }
+
+        XCTAssertEqual(
+            try Data(contentsOf: quarantine.appending(path: "sentinel")),
+            sentinel
+        )
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
+                .contains { $0.hasPrefix(".swan-backup-") }
+        )
+    }
+
+    func testConcurrentStagingForOneParentAdmitsOnlyOneOperation() async throws {
+        let fixture = try await OperatorBackupFixture()
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let firstExporter = SwanOperatorAccountBackupExporter(
+            database: fixture.database,
+            keyReader: fixture.keyStore,
+            continuityInventory: {
+                try PLCCredentialKeyContinuityInventory(checkpoints: [])
+            },
+            afterRenameBeforeParentSync: {
+                entered.signal()
+                guard release.wait(timeout: .now() + 5) == .success else {
+                    throw SwanOperatorAccountBackupError.failed
+                }
+            }
+        )
+        let first = Task {
+            try await firstExporter.backup(
+                account: fixture.account,
+                credential: fixture.credential,
+                using: fixture.backupKey,
+                to: fixture.root.appending(path: "concurrent-first")
+            )
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await fixture.backup(
+                to: fixture.root.appending(path: "concurrent-second")
+            )
+        }
+        release.signal()
+        _ = try await first.value
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: fixture.root.appending(path: "concurrent-second").path
+            )
+        )
+    }
+
     func testValidBackupContainsVerifiedPortableArchiveAndOnlyEncryptedSecrets() async throws {
         let fixture = try await OperatorBackupFixture()
         addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
@@ -271,6 +366,15 @@ final class SwanOperatorBackupTests: XCTestCase {
             try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
                 .contains { $0.hasPrefix(".swan-backup-") }
         )
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
+                .contains { $0.hasPrefix(".swan-scrubbed-restore-") }
+        )
+        let quarantine = fixture.root.appending(
+            path: SwanPortableExportFilesystem.cleanupQuarantineName
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: quarantine.path))
+        XCTAssertTrue(try allRegularFileBytes(under: quarantine).isEmpty)
     }
 
     func testMountedBackupKeyRequiresCanonicalOwnerOnlyRegularFile() throws {
@@ -300,6 +404,57 @@ final class SwanOperatorBackupTests: XCTestCase {
 }
 
 final class SwanOperatorAccountRestoreTests: XCTestCase {
+    func testRestoreRejectsArchiveWideLogicalRepositoryAmplification()
+        async throws
+    {
+        let fixture = try await OperatorBackupFixture()
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
+        let secondRecordByteCount = try await fixture.addSecondRepository()
+        let backup = try await fixture.completedBackup(named: "aggregate-source")
+        let portable = try await SwanPortableExportVerifier.verifyArchiveStreaming(
+            at: backup.appending(path: "portable")
+        )
+        XCTAssertEqual(
+            portable.manifest.files.filter { $0.type == .spaceCAR }.count,
+            2
+        )
+        let failedParent = fixture.root.appending(path: "aggregate-failed-parent")
+        let successParent = fixture.root.appending(path: "aggregate-success-parent")
+        for parent in [failedParent, successParent] {
+            try FileManager.default.createDirectory(
+                at: parent,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
+        let target = failedParent.appending(path: "data")
+        let restoredKEK = try SwanOperatorAccountKEK(
+            rawBytes: Data(repeating: 0xD4, count: 32)
+        )
+        let individuallyValidAggregate =
+            fixture.initialRecordByteCount + secondRecordByteCount
+        let bounded = SwanOperatorAccountRestorer(
+            maximumLogicalRestoredBytes: individuallyValidAggregate - 1
+        )
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await bounded.restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: restoredKEK,
+                to: target
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+
+        _ = try await SwanOperatorAccountRestorer().restore(
+            backupAt: backup,
+            using: fixture.backupKey,
+            accountKEK: restoredKEK,
+            to: successParent.appending(path: "data")
+        )
+    }
+
     func testVerifiedBackupRestoresOneActiveAccountAndReopensEveryDurableBoundary() async throws {
         let fixture = try await OperatorBackupFixture()
         addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
@@ -610,12 +765,107 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
             )
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: postRenameTarget.path))
-        _ = try await SwanOperatorAccountRestorer().restore(
-            backupAt: backup,
-            using: fixture.backupKey,
-            accountKEK: accountKEK,
-            to: postRenameTarget
+        await XCTAssertThrowsErrorAsync {
+            _ = try await SwanOperatorAccountRestorer().restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: postRenameTarget
+            )
+        }
+    }
+
+    func testPostInstallRecordValueMutationPreservingCIDFailsBeforePublication()
+        async throws
+    {
+        let fixture = try await OperatorBackupFixture()
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
+        let backup = try await fixture.completedBackup(named: "record-mutation-source")
+        let target = fixture.root.appending(path: "record-mutation-target")
+        let mutatedValue = try DAGCBOR.encodeValue(
+            OrderedCBORMap(entries: [(key: "text", value: "restore no")])
         )
+        XCTAssertEqual(mutatedValue.count, fixture.initialRecordValue.count)
+        XCTAssertNotEqual(
+            CID.fromDAGCBOR(mutatedValue),
+            CID.fromDAGCBOR(fixture.initialRecordValue)
+        )
+        let mutationRan = UnsafeSendableBox(false)
+        let restorer = SwanOperatorAccountRestorer(
+            afterStagingBeforeValidation: {
+                let stageName = try XCTUnwrap(
+                    FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
+                        .first { $0.hasPrefix(".swan-account-restore-") }
+                )
+                let stage = fixture.root.appending(path: stageName)
+                let databaseURL = SQLiteLayout.accountDatabase(
+                    in: stage,
+                    did: fixture.account.did
+                )
+                try replaceFirstOccurrenceInPlace(
+                    fixture.initialRecordValue,
+                    with: mutatedValue,
+                    in: databaseURL
+                )
+                mutationRan.value = true
+            }
+        )
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await restorer.restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: try SwanOperatorAccountKEK(
+                    rawBytes: Data(repeating: 0xD4, count: 32)
+                ),
+                to: target
+            )
+        }
+
+        XCTAssertTrue(mutationRan.value)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
+                .contains { $0.hasPrefix(".swan-account-restore-") }
+        )
+    }
+
+    func testPostRenameRecordMutationFailsInstalledRevalidation() async throws {
+        let fixture = try await OperatorBackupFixture()
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
+        let backup = try await fixture.completedBackup(named: "post-rename-record-source")
+        let target = fixture.root.appending(path: "post-rename-record-target")
+        let mutatedValue = try DAGCBOR.encodeValue(
+            OrderedCBORMap(entries: [(key: "text", value: "restore no")])
+        )
+        XCTAssertEqual(mutatedValue.count, fixture.initialRecordValue.count)
+        let mutationRan = UnsafeSendableBox(false)
+        let restorer = SwanOperatorAccountRestorer(
+            afterRenameBeforeParentSync: {
+                try replaceFirstOccurrenceInPlace(
+                    fixture.initialRecordValue,
+                    with: mutatedValue,
+                    in: SQLiteLayout.accountDatabase(
+                        in: target,
+                        did: fixture.account.did
+                    )
+                )
+                mutationRan.value = true
+            }
+        )
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await restorer.restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: try SwanOperatorAccountKEK(
+                    rawBytes: Data(repeating: 0xD4, count: 32)
+                ),
+                to: target
+            )
+        }
+        XCTAssertTrue(mutationRan.value)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
     }
 
     func testStageReplacementBeforeInstallCannotRedirectWritesAndCleanupFindsPinnedInode()
@@ -684,12 +934,14 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
             ["sentinel"]
         )
         try FileManager.default.removeItem(at: replacement)
-        _ = try await SwanOperatorAccountRestorer().restore(
-            backupAt: backup,
-            using: fixture.backupKey,
-            accountKEK: accountKEK,
-            to: target
-        )
+        await XCTAssertThrowsErrorAsync {
+            _ = try await SwanOperatorAccountRestorer().restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: target
+            )
+        }
     }
 
     func testSwapAfterPathValidationCannotRedirectKeyOrSQLiteWrites() async throws {
@@ -756,12 +1008,14 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
             XCTAssertTrue(try allRegularFileBytes(under: displaced).isEmpty)
         }
 
-        _ = try await SwanOperatorAccountRestorer().restore(
-            backupAt: backup,
-            using: fixture.backupKey,
-            accountKEK: accountKEK,
-            to: target
-        )
+        await XCTAssertThrowsErrorAsync {
+            _ = try await SwanOperatorAccountRestorer().restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: target
+            )
+        }
     }
 
     func testCleanupEntrySwapNeverDeletesReplacementOrLeavesSecretState() async throws {
@@ -815,31 +1069,94 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
         let replacement = parent.appending(path: try XCTUnwrap(originalName.value))
-        XCTAssertEqual(
-            try FileManager.default.contentsOfDirectory(atPath: replacement.path),
-            ["sentinel"]
+        XCTAssertFalse(FileManager.default.fileExists(atPath: replacement.path))
+        let quarantine = parent.appending(
+            path: SwanPortableExportFilesystem.cleanupQuarantineName
+        ).appending(
+            path: SwanPortableExportFilesystem.cleanupQuarantinedTreeName
         )
         XCTAssertEqual(
-            try Data(contentsOf: replacement.appending(path: "sentinel")),
+            try Data(contentsOf: quarantine.appending(path: "sentinel")),
             replacementSentinel
         )
-        XCTAssertFalse(FileManager.default.fileExists(atPath: displaced.path))
-        let tombstoneName = try XCTUnwrap(
-            FileManager.default.contentsOfDirectory(atPath: parent.path)
-                .first { $0.hasPrefix(".swan-scrubbed-restore-") }
-        )
-        XCTAssertTrue(
-            try allRegularFileBytes(
-                under: parent.appending(path: tombstoneName)
-            ).isEmpty
+        XCTAssertTrue(FileManager.default.fileExists(atPath: displaced.path))
+        XCTAssertTrue(try allRegularFileBytes(under: displaced).isEmpty)
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: parent.path)
+                .contains { $0.hasPrefix(".swan-scrubbed-restore-") }
         )
 
-        _ = try await SwanOperatorAccountRestorer().restore(
-            backupAt: backup,
-            using: fixture.backupKey,
-            accountKEK: accountKEK,
-            to: target
+        await XCTAssertThrowsErrorAsync {
+            _ = try await SwanOperatorAccountRestorer().restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: target
+            )
+        }
+    }
+
+    func testQuarantineTreeSwapAfterMovePreservesReplacementAndBlocksParent()
+        async throws
+    {
+        let fixture = try await OperatorBackupFixture()
+        addTeardownBlock { try? await fixture.database.close(); fixture.remove() }
+        let backup = try await fixture.completedBackup(named: "quarantine-swap-source")
+        let accountKEK = try SwanOperatorAccountKEK(
+            rawBytes: Data(repeating: 0xD4, count: 32)
         )
+        let parent = fixture.root.appending(path: "quarantine-swap-parent")
+        try FileManager.default.createDirectory(
+            at: parent,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let target = parent.appending(path: "data")
+        let quarantine = parent.appending(
+            path: SwanPortableExportFilesystem.cleanupQuarantineName
+        )
+        let tree = quarantine.appending(
+            path: SwanPortableExportFilesystem.cleanupQuarantinedTreeName
+        )
+        let displaced = quarantine.appending(path: "displaced-pinned-tree")
+        let sentinel = Data("quarantine-replacement".utf8)
+        let interrupted = SwanOperatorAccountRestorer(
+            afterStagingBeforeValidation: {
+                throw SwanOperatorAccountRestoreError.failed
+            },
+            afterQuarantineMoveBeforeValidation: {
+                try FileManager.default.moveItem(at: tree, to: displaced)
+                try FileManager.default.createDirectory(
+                    at: tree,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                try protectedWrite(sentinel, to: tree.appending(path: "sentinel"))
+            }
+        )
+
+        await XCTAssertThrowsErrorAsync {
+            _ = try await interrupted.restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: target
+            )
+        }
+
+        XCTAssertEqual(
+            try Data(contentsOf: tree.appending(path: "sentinel")),
+            sentinel
+        )
+        XCTAssertTrue(try allRegularFileBytes(under: displaced).isEmpty)
+        await XCTAssertThrowsErrorAsync {
+            _ = try await SwanOperatorAccountRestorer().restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: target
+            )
+        }
     }
 
     func testDestinationInsideSourceIsRejectedWithoutMutatingSource() async throws {
@@ -1038,12 +1355,14 @@ final class SwanOperatorAccountRestoreTests: XCTestCase {
             try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
                 .contains { $0.hasPrefix(".swan-account-restore-") }
         )
-        _ = try await SwanOperatorAccountRestorer().restore(
-            backupAt: backup,
-            using: fixture.backupKey,
-            accountKEK: accountKEK,
-            to: target
-        )
+        await XCTAssertThrowsErrorAsync {
+            _ = try await SwanOperatorAccountRestorer().restore(
+                backupAt: backup,
+                using: fixture.backupKey,
+                accountKEK: accountKEK,
+                to: target
+            )
+        }
     }
 }
 
@@ -1056,6 +1375,8 @@ struct OperatorBackupFixture {
     let backupKey: SwanOperatorBackupKey
     let accountKEK: Data
     let space: SpaceURI
+    let initialRecordByteCount: Int
+    let initialRecordValue: Data
     let password: String
     let secretSentinels: [Data]
 
@@ -1165,6 +1486,8 @@ struct OperatorBackupFixture {
         let recordValue = try DAGCBOR.encodeValue(
             OrderedCBORMap(entries: [(key: "text", value: "restore me")])
         )
+        initialRecordByteCount = recordValue.count
+        initialRecordValue = recordValue
         _ = try await database.apply(
             space: space,
             author: did,
@@ -1224,6 +1547,38 @@ struct OperatorBackupFixture {
             continuityInventory:
                 try PLCCredentialKeyContinuityInventory(checkpoints: [])
         )
+    }
+
+    func addSecondRepository() async throws -> Int {
+        let secondSpace = try SpaceURI(
+            authority: account.did,
+            spaceType: "app.example.room",
+            skey: "restored-second"
+        )
+        let value = try DAGCBOR.encodeValue(
+            OrderedCBORMap(entries: [(key: "text", value: "restore me too")])
+        )
+        let uri = try SpaceRecordURI(
+            space: secondSpace,
+            author: account.did,
+            collection: "app.example.note",
+            rkey: "two"
+        )
+        _ = try await database.apply(
+            space: secondSpace,
+            author: account.did,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try TID(tidString: "3jzfcijpj2z3b"),
+            writes: [
+                .create(
+                    uri: uri,
+                    value: value,
+                    cid: CID.fromDAGCBOR(value).string
+                ),
+            ]
+        )
+        return value.count
     }
 
     func backup(
@@ -1366,6 +1721,22 @@ private func protectedWrite(_ data: Data, to url: URL) throws {
         contents: data,
         attributes: [.posixPermissions: 0o600]
     )
+}
+
+private func replaceFirstOccurrenceInPlace(
+    _ original: Data,
+    with replacement: Data,
+    in url: URL
+) throws {
+    precondition(original.count == replacement.count)
+    let bytes = try Data(contentsOf: url)
+    let range = try XCTUnwrap(bytes.range(of: original))
+    XCTAssertNil(bytes[range.upperBound...].range(of: original))
+    let handle = try FileHandle(forUpdating: url)
+    defer { try? handle.close() }
+    try handle.seek(toOffset: UInt64(range.lowerBound))
+    try handle.write(contentsOf: replacement)
+    try handle.synchronize()
 }
 
 private func regularFiles(under root: URL) throws -> [String] {

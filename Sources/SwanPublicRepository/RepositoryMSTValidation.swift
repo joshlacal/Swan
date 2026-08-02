@@ -574,6 +574,11 @@ public enum RepositoryMSTValidation {
 /// record blocks. MST validation cannot stop at CID integrity: the leaf path's
 /// collection and the record's top-level `$type` are one repository invariant.
 private struct RepositoryRecordBlockValidator {
+    /// Keeps a single untrusted DAG-CBOR container from reserving an
+    /// disproportionate amount of memory even when its declared count is
+    /// consistent with the enclosing record's byte budget.
+    private static let maximumContainerElementCount = 65_536
+
     private let bytes: [UInt8]
     private var offset = 0
     private var topLevelType: String?
@@ -633,9 +638,11 @@ private struct RepositoryRecordBlockValidator {
             guard depth < maximumDepth else { throw RepositoryMSTValidationError.invalidRecordBlock }
             let count = try readLength(major: 4)
             // Every definite-length array element consumes at least one byte.
-            // Reject impossible hostile counts before reserveCapacity can turn
-            // an authenticated-but-untrusted block into a huge allocation.
-            guard count <= bytes.count - offset else {
+            // Reject oversized or impossible hostile counts before
+            // reserveCapacity can turn an authenticated-but-untrusted block
+            // into a huge allocation.
+            guard count <= Self.maximumContainerElementCount,
+                  count <= bytes.count - offset else {
                 throw RepositoryMSTValidationError.invalidRecordBlock
             }
             var values: [ATProtocolValueContainer] = []
@@ -699,7 +706,8 @@ private struct RepositoryRecordBlockValidator {
         // A map pair consumes at least one byte for its key and one for its
         // value. This is a necessary lower bound, checked before allocating;
         // the ordinary parser remains responsible for all stronger validity.
-        guard count <= (bytes.count - offset) / 2 else {
+        guard count <= Self.maximumContainerElementCount,
+              count <= (bytes.count - offset) / 2 else {
             throw RepositoryMSTValidationError.invalidRecordBlock
         }
         var previousKey: Data?

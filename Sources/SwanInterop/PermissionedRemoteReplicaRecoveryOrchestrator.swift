@@ -88,7 +88,7 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
     private let store: any PermissionedRemoteReplicaRecoveryStore
     private let stagingFactory: StagingFactory
     private let now: Clock
-    private let publicationAuthorization: PublicationAuthorization?
+    private let publicationAuthorization: PublicationAuthorization
 
     public init(
         store: any PermissionedRemoteReplicaRecoveryStore,
@@ -96,7 +96,7 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
         now: @escaping Clock = {
             Int64(Date().timeIntervalSince1970)
         },
-        publicationAuthorization: PublicationAuthorization? = nil
+        publicationAuthorization: @escaping PublicationAuthorization
     ) {
         self.store = store
         self.stagingFactory = stagingFactory
@@ -112,7 +112,7 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
         now: @escaping Clock = {
             Int64(Date().timeIntervalSince1970)
         },
-        publicationAuthorization: PublicationAuthorization? = nil
+        publicationAuthorization: @escaping PublicationAuthorization
     ) {
         self.init(
             store: database,
@@ -267,26 +267,12 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
                 verification: verification,
                 now: verifiedAt
             )
-            if let publicationAuthorization {
-                guard let authorizingStore = store as?
-                    any PermissionedRemoteReplicaPublicationAuthorizingStore
-                else {
-                    throw PermissionedRemoteReplicaRecoveryError
-                        .publicationAuthorizationUnavailable
-                }
-                return try await authorizingStore
-                    .publishVerifiedPermissionedRemoteReplicaRecovery(
-                        sessionID: sessionID,
-                        consumedAt: verifiedAt,
-                        now: now(),
-                        publicationAuthorization: publicationAuthorization
-                    )
-            }
             return try await store
                 .publishVerifiedPermissionedRemoteReplicaRecovery(
                     sessionID: sessionID,
                     consumedAt: verifiedAt,
-                    now: now()
+                    now: now(),
+                    publicationAuthorization: publicationAuthorization
                 )
         } catch {
             await source.close()
@@ -309,7 +295,7 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
         profileID: String,
         limits: SpaceCARRecoveryLimits
     ) -> Data {
-        var material = Data("swan.permissioned-remote-recovery.v1\0".utf8)
+        var material = Data("swan.permissioned-remote-recovery.v2\0".utf8)
         for value in [
             requestID,
             target.receiverDID,
@@ -325,6 +311,7 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
             String(limits.maximumRecordBytes),
             String(limits.maximumIndexEntries),
             String(limits.maximumUniqueBlocks),
+            String(limits.maximumLogicalRestoredBytes),
         ] {
             material.append(contentsOf: value.utf8)
             material.append(0)

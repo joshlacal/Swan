@@ -15,6 +15,28 @@ import SwanStorage
 import SwanSpaces
 import ServiceLifecycle
 
+private extension PermissionedRemoteReplicaIncrementalSyncOutcome {
+    var code: String {
+        switch self {
+        case .applied: "applied"
+        case .exactDuplicate: "exact_duplicate"
+        case .unchanged: "unchanged"
+        case .fullCARRecoveryRequired: "full_car_recovery_required"
+        case .casConflict: "cas_conflict"
+        case .conflictingReplay: "conflicting_replay"
+        case .staleOrReordered: "stale_or_reordered"
+        case .integrityFailure: "integrity_failure"
+        }
+    }
+
+    var passed: Bool {
+        switch self {
+        case .applied, .exactDuplicate, .unchanged: true
+        default: false
+        }
+    }
+}
+
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
@@ -1210,7 +1232,7 @@ extension SwanCommand {
                 throw ValidationError("portable restore failed")
             }
             do {
-                let result = try SwanPortableAccountRestoreStager().stage(
+                let result = try await SwanPortableAccountRestoreStager().stage(
                     archiveAt: URL(fileURLWithPath: inputDirectory),
                     dataDirectory: URL(fileURLWithPath: dataDirectory)
                 )
@@ -3291,9 +3313,382 @@ extension SwanCommand {
     struct Lab: ParsableCommand {
         static let configuration = CommandConfiguration(
             abstract: "Validate and record sanitized Compose laboratory scenarios",
-            subcommands: [Validate.self, Matrix.self, Scenario.self, Semantic.self, ImportPublic.self, RecoverPermissioned.self, Live.self],
+            subcommands: [Validate.self, Matrix.self, Scenario.self, Semantic.self, StatefulFaultMatrix.self, PermissionedReplicaHead.self, ImportPublic.self, SyncPermissioned.self, RecoverPermissioned.self, Live.self],
             defaultSubcommand: Validate.self
         )
+
+        struct SyncPermissioned: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "sync-permissioned",
+                abstract: "Fetch, verify, and durably apply one permissioned incremental interval"
+            )
+
+            @Option(name: .customLong("receiver-did"))
+            var receiverDID: String
+            @Option(name: .long)
+            var repository: String
+            @Option(name: .long)
+            var space: String
+            @Option(name: .long)
+            var dataDirectory: String
+            @Option(name: .customLong("source-url"))
+            var sourceURL: String = ""
+            @Option(name: .customLong("authority-url"))
+            var authorityURL: String = ""
+            @Option(name: .customLong("source-auth"))
+            var sourceAuth: String = "oauth"
+            @Option(name: .customLong("source-token-env"))
+            var sourceTokenEnvironment = "SWAN_LAB_PRODUCER_TOKEN"
+            @Option(name: .customLong("source-handle-env"))
+            var sourceHandleEnvironment = "SWAN_LAB_PRODUCER_HANDLE"
+            @Option(name: .customLong("source-password-env"))
+            var sourcePasswordEnvironment = "SWAN_LAB_PRODUCER_PASSWORD"
+            @Option(name: .customLong("source-client-id"))
+            var sourceClientID: String = ""
+            @Option(name: .customLong("source-redirect-uri"))
+            var sourceRedirectURI: String = ""
+            @Option(name: .long, parsing: .upToNextOption)
+            var scope: [String] = ["atproto"]
+            @Option(name: .customLong("permissioned-commit-key-env"))
+            var permissionedCommitKeyEnvironment =
+                "SWAN_LAB_PERMISSIONED_COMMIT_KEY"
+            @Option(name: .customLong("request-id"))
+            var requestID: String = ""
+            @Option(name: .customLong("request-sequence"))
+            var requestSequence: UInt64 = 1
+            @Flag(
+                name: .customLong("verify-exact-duplicate-replay"),
+                help: "Apply the same authenticated batch twice and require an exact-duplicate durable replay witness"
+            )
+            var verifyExactDuplicateReplay = false
+            @Flag(
+                name: .customLong("full-car-recovery"),
+                inversion: .prefixedNo,
+                help: "Perform verified full-CAR replacement when incremental history is unavailable"
+            )
+            var fullCARRecovery = true
+            @Option(name: .long)
+            var output = "artifacts/live/permissioned-incremental-sync.json"
+            @Option(name: .customLong("request-timeout-seconds"))
+            var requestTimeoutSeconds: Double = 15
+            @Flag(
+                name: .customLong("fail-on-failure"),
+                inversion: .prefixedNo
+            )
+            var failOnFailure = true
+
+            func run() async throws {
+                let receiver = try canonicalDID(receiverDID, option: "receiver-did")
+                let repository = try canonicalDID(repository, option: "repository")
+                let space: SpaceURI
+                do { space = try SpaceURI(self.space) }
+                catch { throw ValidationError("--space is not a valid space URI") }
+                guard requestSequence > 0 else {
+                    throw ValidationError("--request-sequence must be positive")
+                }
+                guard requestTimeoutSeconds > 0,
+                      requestTimeoutSeconds <= 120,
+                      requestTimeoutSeconds.isFinite else {
+                    throw ValidationError("--request-timeout-seconds is invalid")
+                }
+                let requestID = try normalizedRequestID(self.requestID)
+                let sourceAuth = self.sourceAuth.trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                ).lowercased()
+                guard sourceAuth == "bearer" || sourceAuth == "oauth" else {
+                    throw ValidationError("--source-auth must be bearer or oauth")
+                }
+                let dataURL = URL(fileURLWithPath: dataDirectory)
+                try await requireActiveManagedAccount(
+                    did: receiver,
+                    dataDirectory: dataURL
+                )
+                let key = try LabLiveSupport.permissionedCommitVerificationKey(
+                    environment: permissionedCommitKeyEnvironment
+                )
+                let sourceEndpoint = try LabLiveSupport.url(
+                    explicit: sourceURL,
+                    environment: "SWAN_LAB_PRODUCER_URL",
+                    fallback: "https://pds.test"
+                )
+                let authorityEndpoint = try LabLiveSupport.url(
+                    explicit: authorityURL,
+                    environment: "SWAN_LAB_CONSUMER_URL",
+                    fallback: "https://swan.test"
+                )
+                let member = try await LabLiveSupport.host(
+                    label: "member", url: sourceEndpoint, auth: sourceAuth,
+                    tokenEnvironment: sourceTokenEnvironment,
+                    handleEnvironment: sourceHandleEnvironment,
+                    passwordEnvironment: sourcePasswordEnvironment,
+                    clientID: sourceClientID,
+                    redirectURI: sourceRedirectURI, scopes: scope,
+                    timeout: requestTimeoutSeconds,
+                    permissionedCommitVerificationKey: key
+                )
+                let authority = try await LabLiveSupport.host(
+                    label: "authority", url: authorityEndpoint, auth: "none",
+                    tokenEnvironment: "SWAN_UNUSED",
+                    handleEnvironment: "SWAN_UNUSED",
+                    passwordEnvironment: "SWAN_UNUSED", clientID: "",
+                    redirectURI: "", scopes: scope,
+                    timeout: requestTimeoutSeconds,
+                    permissionedCommitVerificationKey: nil
+                )
+                let credential = try await SpaceCredentialBroker(
+                    member: member.client,
+                    authority: authority.client
+                ).exchange(
+                    space: space,
+                    memberAuthorization: member.authorization,
+                    memberAuthorizationProvider: member.authorizationProvider
+                )
+                let source = LiveInteropHost(
+                    label: "source", client: member.client,
+                    authorization: .bearer(token: credential),
+                    permissionedCommitVerificationKey: key
+                )
+                let database = try await SQLiteAccountDatabase(
+                    dataDirectory: dataURL,
+                    did: receiver,
+                    openMode: .existingManaged
+                )
+                let target = try PermissionedRemoteReplicaTarget(
+                    receiverDID: receiver,
+                    space: space,
+                    repositoryDID: repository
+                )
+                let prior = try await database.permissionedRemoteReplicaHead(
+                    target: target
+                )
+                let applyAuthorized:
+                    PermissionedRemoteReplicaIncrementalHTTPOrchestrator
+                    .PublicationAuthorization = { operation in
+                        let control = try await SQLiteControlDatabase(
+                            dataDirectory: dataURL
+                        )
+                        do {
+                            let result = try await control
+                                .withActiveAccountAuthorization(
+                                    did: receiver,
+                                    operation: operation
+                                )
+                            try await control.close()
+                            return result
+                        } catch {
+                            try? await control.close()
+                            throw error
+                        }
+                    }
+                let authorization:
+                    PermissionedRemoteReplicaIncrementalHTTPOrchestrator
+                    .PublicationAuthorization = { operation in
+                        let first = try await applyAuthorized(operation)
+                        guard verifyExactDuplicateReplay else { return first }
+                        guard case let .applied(firstResult) = first else {
+                            throw SwanError.unavailable(
+                                "exact duplicate replay proof did not begin with an applied batch"
+                            )
+                        }
+                        let second = try await applyAuthorized(operation)
+                        guard case let .exactDuplicate(secondResult) = second,
+                              secondResult == firstResult else {
+                            throw SwanError.unavailable(
+                                "exact duplicate replay proof did not return the original durable result"
+                            )
+                        }
+                        return second
+                    }
+                let orchestrator =
+                    PermissionedRemoteReplicaIncrementalHTTPOrchestrator(
+                        source: source,
+                        store: database,
+                        publicationAuthorization: authorization
+                    )
+                let outcome: PermissionedRemoteReplicaIncrementalSyncOutcome
+                do {
+                    outcome = try await orchestrator.synchronize(
+                        target: target,
+                        requestID: requestID,
+                        requestSequence: requestSequence,
+                        appliedAt: Int64(Date().timeIntervalSince1970)
+                    )
+                } catch {
+                    try? await database.close()
+                    throw error
+                }
+                var outcomeCode = outcome.code
+                var passed = outcome.passed
+                if case .fullCARRecoveryRequired = outcome,
+                   fullCARRecovery {
+                    do {
+                        let limits = SpaceCARRecoveryLimits.standard
+                        let temporaryDirectory = FileManager.default
+                            .temporaryDirectory.appending(
+                                path: "swan-permissioned-sync-\(UUID().uuidString)",
+                                directoryHint: .isDirectory
+                            )
+                        try FileManager.default.createDirectory(
+                            at: temporaryDirectory,
+                            withIntermediateDirectories: false,
+                            attributes: [.posixPermissions: 0o700]
+                        )
+                        defer {
+                            try? FileManager.default.removeItem(
+                                at: temporaryDirectory
+                            )
+                        }
+                        let spoolAdmission = try PublicRepositorySpoolAdmission(
+                            maximumGlobalBytes: limits.maximumCARBytes,
+                            maximumPerAccountBytes: limits.maximumCARBytes
+                        )
+                        let recoveryAuthorization:
+                            PermissionedRemoteReplicaRecoveryOrchestrator
+                            .PublicationAuthorization = { operation in
+                                let control = try await SQLiteControlDatabase(
+                                    dataDirectory: dataURL
+                                )
+                                do {
+                                    let result = try await control
+                                        .withActiveAccountAuthorization(
+                                            did: receiver,
+                                            operation: operation
+                                        )
+                                    try await control.close()
+                                    return result
+                                } catch {
+                                    try? await control.close()
+                                    throw error
+                                }
+                            }
+                        _ = try await LiveInteropRunner
+                            .recoverPermissionedRepository(
+                                target: target,
+                                requestID: "\(requestID)-full-car",
+                                sourceHost: source,
+                                receiverDatabase: database,
+                                expiresAt:
+                                    Int64(Date().timeIntervalSince1970) + 300,
+                                temporaryDirectory: temporaryDirectory,
+                                spoolAdmission: spoolAdmission,
+                                limits: limits,
+                                publicationAuthorization: recoveryAuthorization,
+                                now: { Int64(Date().timeIntervalSince1970) }
+                            )
+                        outcomeCode = "full_car_applied"
+                        passed = true
+                    } catch {
+                        try? await database.close()
+                        throw error
+                    }
+                }
+                let final = try await database.permissionedRemoteReplicaHead(
+                    target: target
+                )
+                try await database.close()
+                let replayWitness: ExactDuplicateReplayWitness?
+                if verifyExactDuplicateReplay {
+                    guard case let .exactDuplicate(result) = outcome else {
+                        throw SwanError.unavailable(
+                            "exact duplicate replay proof did not complete"
+                        )
+                    }
+                    replayWitness = ExactDuplicateReplayWitness(
+                        applyAttempts: 2,
+                        firstOutcome: "applied",
+                        secondOutcome: "exact_duplicate",
+                        requestDigest: Hex.encode(result.requestDigest)
+                    )
+                } else {
+                    replayWitness = nil
+                }
+                let artifact = Artifact(
+                    requestSequence: requestSequence,
+                    outcome: outcomeCode,
+                    priorRevision: prior?.wireRevision.toString(),
+                    finalRevision: final?.wireRevision.toString(),
+                    finalCommitment: final.map { Hex.encode($0.commitment) },
+                    exactDuplicateReplay: replayWitness,
+                    status: passed ? "passed" : "failed"
+                )
+                let outputURL = URL(fileURLWithPath: output)
+                try FileManager.default.createDirectory(
+                    at: outputURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                try encoder.encode(artifact).write(to: outputURL, options: .atomic)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: outputURL.path
+                )
+                print("PERMISSIONED INCREMENTAL ARTIFACT WRITTEN: \(outputURL.path) status=\(artifact.status)")
+                guard !failOnFailure || artifact.status == "passed" else {
+                    throw ValidationError(
+                        "permissioned incremental sync did not pass; inspect \(outputURL.lastPathComponent)"
+                    )
+                }
+            }
+
+            private func canonicalDID(
+                _ value: String,
+                option: String
+            ) throws -> String {
+                do { return try AccountIdentifiers.validateDID(value) }
+                catch { throw ValidationError("--\(option) is not a canonical DID") }
+            }
+
+            private func normalizedRequestID(_ value: String) throws -> String {
+                let value = value.isEmpty
+                    ? "incremental-\(UUID().uuidString.lowercased())"
+                    : try LabLiveSupport.identifier(value, label: "request ID")
+                guard value.utf8.count <= 128 else {
+                    throw ValidationError("request ID must not exceed 128 bytes")
+                }
+                return value
+            }
+
+            private func requireActiveManagedAccount(
+                did: String,
+                dataDirectory: URL
+            ) async throws {
+                let control = try await SQLiteControlDatabase(
+                    dataDirectory: dataDirectory
+                )
+                do {
+                    guard let account = try await control.account(did: did) else {
+                        throw ValidationError(
+                            "receiver account is not managed by this Swan data directory"
+                        )
+                    }
+                    guard account.status.authorizesAccount else {
+                        throw ValidationError("receiver account is not active")
+                    }
+                    try await control.close()
+                } catch {
+                    try? await control.close()
+                    throw error
+                }
+            }
+
+            private struct Artifact: Encodable {
+                let requestSequence: UInt64
+                let outcome: String
+                let priorRevision: String?
+                let finalRevision: String?
+                let finalCommitment: String?
+                let exactDuplicateReplay: ExactDuplicateReplayWitness?
+                let status: String
+            }
+
+            private struct ExactDuplicateReplayWitness: Encodable {
+                let applyAttempts: Int
+                let firstOutcome: String
+                let secondOutcome: String
+                let requestDigest: String
+            }
+        }
 
         struct RecoverPermissioned: AsyncParsableCommand {
             static let configuration = CommandConfiguration(
@@ -3984,6 +4379,215 @@ extension SwanCommand {
                 guard !failOnFailure || artifact.status == "passed" else {
                     throw ValidationError("local semantic interoperability did not pass; inspect \(outputURL.lastPathComponent)")
                 }
+            }
+        }
+
+        struct StatefulFaultMatrix: ParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "stateful-fault-matrix",
+                abstract: "Validate durable cross-host fault witnesses and write a sanitized matrix artifact"
+            )
+
+            @Option(name: .long, help: "Bounded JSON witness input produced by the live harness")
+            var input: String
+
+            @Option(name: .long, help: "Destination for the sanitized matrix artifact")
+            var output: String = "artifacts/live/stateful-fault-matrix.json"
+
+            @Flag(
+                name: .customLong("fail-on-failure"),
+                inversion: .prefixedNo
+            )
+            var failOnFailure = true
+
+            func run() throws {
+                let inputURL = URL(fileURLWithPath: input).standardizedFileURL
+                let attributes = try FileManager.default.attributesOfItem(
+                    atPath: inputURL.path
+                )
+                guard (attributes[.type] as? FileAttributeType) == .typeRegular,
+                      let size = (attributes[.size] as? NSNumber)?.intValue,
+                      (1 ... 1024 * 1024).contains(size) else {
+                    throw ValidationError("stateful fault witness input must be a regular file no larger than 1 MiB")
+                }
+                let raw = try Data(contentsOf: inputURL, options: .mappedIfSafe)
+                let document: InputDocument
+                do {
+                    document = try StrictJSON.decode(InputDocument.self, from: raw)
+                } catch {
+                    throw ValidationError("stateful fault witness input is invalid")
+                }
+                let cells = try document.cells.map { try $0.validated() }
+                let artifact = StatefulFaultInteropMatrixArtifact(
+                    scenario: document.scenario,
+                    cells: cells
+                )
+                let outputURL = URL(fileURLWithPath: output).standardizedFileURL
+                try FileManager.default.createDirectory(
+                    at: outputURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                try encoder.encode(artifact).write(to: outputURL, options: .atomic)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: outputURL.path
+                )
+                print("STATEFUL FAULT MATRIX ARTIFACT WRITTEN: \(outputURL.path) status=\(artifact.status)")
+                guard !failOnFailure || artifact.status == "passed" else {
+                    throw ValidationError("stateful fault matrix did not pass; inspect \(outputURL.lastPathComponent)")
+                }
+            }
+
+            private struct InputDocument: Decodable {
+                let scenario: String
+                let cells: [InputCell]
+            }
+
+            private struct InputCell: Decodable {
+                let mode: StatefulFaultMode
+                let before: InputHead?
+                let intended: InputHead
+                let afterFault: InputHead?
+                let afterHeal: InputHead?
+                let faultObserved: Bool
+                let invalidDeliveryRejected: Bool
+
+                func validated() throws -> StatefulFaultInteropCell {
+                    guard let intended = intended.validated() else {
+                        throw ValidationError("stateful fault witness head is invalid")
+                    }
+                    let before = try validatedOptional(self.before)
+                    let afterFault = try validatedOptional(self.afterFault)
+                    let afterHeal = try validatedOptional(self.afterHeal)
+                    return StatefulFaultInteropCell(
+                        mode: mode,
+                        before: before,
+                        intended: intended,
+                        afterFault: afterFault,
+                        afterHeal: afterHeal,
+                        faultObserved: faultObserved,
+                        invalidDeliveryRejected: invalidDeliveryRejected
+                    )
+                }
+
+                private func validatedOptional(
+                    _ value: InputHead?
+                ) throws -> StatefulReplicaHeadWitness? {
+                    guard let value else { return nil }
+                    guard let head = value.validated() else {
+                        throw ValidationError("stateful fault witness head is invalid")
+                    }
+                    return head
+                }
+            }
+
+            private struct InputHead: Decodable {
+                let generation: UInt64
+                let revision: String
+                let commitment: String
+
+                func validated() -> StatefulReplicaHeadWitness? {
+                    StatefulReplicaHeadWitness(
+                        generation: generation,
+                        revision: revision,
+                        commitment: commitment
+                    )
+                }
+            }
+        }
+
+        struct PermissionedReplicaHead: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "permissioned-replica-head",
+                abstract: "Write a secret-free witness of one durable permissioned replica head"
+            )
+
+            @Option(name: .customLong("receiver-did"))
+            var receiverDID: String
+            @Option(name: .long)
+            var repository: String
+            @Option(name: .long)
+            var space: String
+            @Option(name: .long)
+            var dataDirectory: String
+            @Option(name: .long)
+            var output: String
+
+            func run() async throws {
+                let receiver: String
+                let repository: String
+                let space: SpaceURI
+                do {
+                    receiver = try AccountIdentifiers.validateDID(receiverDID)
+                    repository = try AccountIdentifiers.validateDID(self.repository)
+                    space = try SpaceURI(self.space)
+                } catch {
+                    throw ValidationError("permissioned replica selector is invalid")
+                }
+                let dataURL = URL(fileURLWithPath: dataDirectory)
+                let control = try await SQLiteControlDatabase(
+                    dataDirectory: dataURL
+                )
+                do {
+                    guard let account = try await control.account(did: receiver),
+                          account.status.authorizesAccount else {
+                        throw ValidationError("receiver account is not active")
+                    }
+                    try await control.close()
+                } catch {
+                    try? await control.close()
+                    throw error
+                }
+                let database = try await SQLiteAccountDatabase(
+                    dataDirectory: dataURL,
+                    did: receiver,
+                    openMode: .existingManaged
+                )
+                let target = try PermissionedRemoteReplicaTarget(
+                    receiverDID: receiver,
+                    space: space,
+                    repositoryDID: repository
+                )
+                let head = try await database.permissionedRemoteReplicaHead(
+                    target: target
+                )
+                try await database.close()
+                let witness: StatefulReplicaHeadWitness?
+                if let head {
+                    witness = StatefulReplicaHeadWitness(
+                        generation: head.generation,
+                        revision: head.wireRevision.toString(),
+                        commitment: Hex.encode(head.commitment)
+                    )
+                    guard witness != nil else {
+                        throw ValidationError("durable replica head is invalid")
+                    }
+                } else {
+                    witness = nil
+                }
+                let outputURL = URL(fileURLWithPath: output).standardizedFileURL
+                try FileManager.default.createDirectory(
+                    at: outputURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                try encoder.encode(Artifact(head: witness)).write(
+                    to: outputURL,
+                    options: .atomic
+                )
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: outputURL.path
+                )
+                print("PERMISSIONED REPLICA HEAD WRITTEN: \(outputURL.path)")
+            }
+
+            private struct Artifact: Encodable {
+                let profileID = OfflineProtocolProfileVerifier.stableProfileID
+                let head: StatefulReplicaHeadWitness?
             }
         }
 

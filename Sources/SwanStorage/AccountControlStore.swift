@@ -885,6 +885,9 @@ public struct AccountEmailProofDeliveryRequest: Sendable, Equatable {
 public struct AccountPasswordRecoveryDeliveryRequest: Sendable, Equatable {
     public let deliveryID: AccountEmailDeliveryID
     public let proofDigest: Data
+    /// Canonical address used transiently for uniform active-account
+    /// classification. SQLite never persists this value in the blind marker.
+    public let email: AccountEmailAddress
     /// HMAC-derived canonical-address marker used only for blind recovery
     /// admission. It is not a bearer proof and is never exposed to callers.
     public let lookupDigest: Data
@@ -897,12 +900,14 @@ public struct AccountPasswordRecoveryDeliveryRequest: Sendable, Equatable {
     public init(
         deliveryID: AccountEmailDeliveryID,
         proofDigest: Data,
+        email: AccountEmailAddress,
         lookupDigest: Data,
         emailEnvelope: Data,
         expiresAt: Date,
         now: Date
     ) throws {
         guard proofDigest.count == 32,
+              (try? AccountEmailAddress(email.value)) == email,
               lookupDigest.count == 32,
               (28 ... 4_096).contains(emailEnvelope.count),
               AccountControlMetadata.isControlDate(expiresAt),
@@ -912,6 +917,7 @@ public struct AccountPasswordRecoveryDeliveryRequest: Sendable, Equatable {
         }
         self.deliveryID = deliveryID
         self.proofDigest = proofDigest
+        self.email = email
         self.lookupDigest = lookupDigest
         self.emailEnvelope = emailEnvelope
         self.expiresAt = expiresAt

@@ -208,6 +208,10 @@ public enum SwanPortableExportManifestCodec {
 }
 
 public enum SwanPortableExportVerifier {
+    /// Compatibility-only synchronous verification is deliberately limited;
+    /// production callers must use the streaming async API for larger files.
+    static let maximumSynchronousArtifactBytes = 8 * 1_024 * 1_024
+
     public static func verifyArchive(
         at root: URL
     ) throws -> SwanPortableArchiveVerification {
@@ -223,6 +227,28 @@ public enum SwanPortableExportVerifier {
         let descriptor = try SwanPortableExportFilesystem.openArchiveRoot(root)
         defer { _ = close(descriptor) }
         return try verifyArchive(
+            directoryDescriptor: descriptor,
+            signingPublicKey: signingPublicKey
+        )
+    }
+
+    public static func verifyArchiveStreaming(
+        at root: URL
+    ) async throws -> SwanPortableArchiveVerification {
+        let descriptor = try SwanPortableExportFilesystem.openArchiveRoot(root)
+        defer { _ = close(descriptor) }
+        return try await verifySelfContainedArchiveStreaming(
+            directoryDescriptor: descriptor
+        )
+    }
+
+    public static func verifyArchiveStreaming(
+        at root: URL,
+        signingPublicKey: P256.Signing.PublicKey
+    ) async throws -> SwanPortableExportManifest {
+        let descriptor = try SwanPortableExportFilesystem.openArchiveRoot(root)
+        defer { _ = close(descriptor) }
+        return try await verifyArchiveStreaming(
             directoryDescriptor: descriptor,
             signingPublicKey: signingPublicKey
         )
@@ -262,7 +288,7 @@ public enum SwanPortableExportVerifier {
             case .plcHistory:
                 64 * 1_024
             default:
-                SwanPortableExportFilesystem.maximumArtifactBytes
+                Self.maximumSynchronousArtifactBytes
             }
             guard entry.byteCount <= maximumBytes,
                   totalBytes <= SwanPortableExportFilesystem.maximumArchiveBytes - entry.byteCount
@@ -356,6 +382,7 @@ public enum SwanPortableExportVerifier {
         var plcHistory: Data?
         var totalBytes = manifestData.count
         for entry in manifest.files {
+            try Task.checkCancellation()
             try validatePlacement(entry, manifest: manifest)
             let maximumBytes = switch entry.type {
             case .plcHistory:
@@ -440,7 +467,9 @@ public enum SwanPortableExportVerifier {
                 do {
                     while try await source.read(
                         maximumBytes: SpaceCARBodySpool.maximumChunkBytes
-                    ) != nil {}
+                    ) != nil {
+                        try Task.checkCancellation()
+                    }
                     let digest = try await source.finish()
                     let cidComponent = entry.path.split(separator: "/").last.map(String.init)!
                     let cid = try SwanPortableExportPath.decode(cidComponent)
@@ -537,6 +566,56 @@ public enum SwanPortableExportVerifier {
             expectedDID: manifest.did
         )
         let verifiedManifest = try verifyArchive(
+            directoryDescriptor: directoryDescriptor,
+            signingPublicKey: signingPublicKey
+        )
+        guard verifiedManifest == manifest,
+              verifiedManifest.includesPrivateKeys == false else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        return SwanPortableArchiveVerification(
+            manifest: verifiedManifest,
+            manifestSHA256: "sha256:\(SwanPortableExportDigest.hex(manifestData))",
+            signingPublicKey: signingPublicKey
+        )
+    }
+
+    /// Self-contained verification for restore and publication paths. Only
+    /// the bounded manifest, PLC history, and public genesis CAR are retained;
+    /// permissioned CARs and blobs are authenticated from descriptor-backed
+    /// chunks.
+    static func verifySelfContainedArchiveStreaming(
+        directoryDescriptor: Int32
+    ) async throws -> SwanPortableArchiveVerification {
+        try SwanPortableExportFilesystem.requireOwnerOnlyDirectory(directoryDescriptor)
+        let manifestData = try SwanPortableExportFilesystem.read(
+            path: "manifest.json",
+            root: directoryDescriptor,
+            maximumBytes: 4 * 1_024 * 1_024
+        )
+        let manifest = try SwanPortableExportManifestCodec.decode(manifestData)
+        guard manifest.includesPrivateKeys == false,
+              let historyEntry = manifest.files.first(where: {
+                  $0.type == .plcHistory && $0.path == "plc/history.json"
+              }),
+              manifest.files.filter({ $0.type == .plcHistory }).count == 1,
+              historyEntry.byteCount <= 64 * 1_024 else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        let historyData = try SwanPortableExportFilesystem.read(
+            path: historyEntry.path,
+            root: directoryDescriptor,
+            maximumBytes: 64 * 1_024
+        )
+        guard historyData.count == historyEntry.byteCount,
+              SwanPortableExportDigest.hex(historyData) == historyEntry.sha256 else {
+            throw SwanPortableExportError.invalidArchive
+        }
+        let signingPublicKey = try bootstrapSigningPublicKey(
+            from: historyData,
+            expectedDID: manifest.did
+        )
+        let verifiedManifest = try await verifyArchiveStreaming(
             directoryDescriptor: directoryDescriptor,
             signingPublicKey: signingPublicKey
         )
@@ -812,7 +891,6 @@ public struct SwanPortableAccountExporter: Sendable {
             name: stagingName
         )
         var stagingClosed = false
-        var published = false
         do {
             var writer = StagedArtifactWriter(
                 root: stagingDescriptor,
@@ -846,6 +924,7 @@ public struct SwanPortableAccountExporter: Sendable {
             )
 
             for repository in inventory.repositories {
+                try Task.checkCancellation()
                 guard let snapshot = try await database.prepareRepositoryCARSnapshot(
                     space: repository.space,
                     author: repository.author
@@ -869,12 +948,14 @@ public struct SwanPortableAccountExporter: Sendable {
                     type: SwanPortableExportFileType.spaceCAR
                 ) { consume in
                     defer { snapshot.spool.cleanup() }
+                    try Task.checkCancellation()
                     try await consume(prefix)
                     try await snapshot.spool.streamBody(consume: consume)
                 }
             }
 
             for reference in inventory.blobs {
+                try Task.checkCancellation()
                 let type: SwanPortableExportFileType
                 let path: String
                 switch reference.namespace {
@@ -920,22 +1001,58 @@ public struct SwanPortableAccountExporter: Sendable {
             guard fsync(stagingDescriptor) == 0 else {
                 throw SwanPortableExportError.publicationFailed
             }
-            _ = try await SwanPortableExportVerifier.verifyArchiveStreaming(
-                directoryDescriptor: stagingDescriptor,
+            let stagedVerification = try await SwanPortableExportVerifier
+                .verifySelfContainedArchiveStreaming(
+                    directoryDescriptor: stagingDescriptor
+                )
+            try requireSameVerification(
+                stagedVerification,
+                manifest: manifest,
+                manifestData: manifestData,
                 signingPublicKey: privateKey.publicKey
             )
             try destination.requireCurrentParentAndAbsentTarget()
+            try Task.checkCancellation()
             try SwanPortableExportFilesystem.renameExclusively(
                 parent: destination.parentDescriptor,
                 source: stagingName,
                 destination: destination.outputName
             )
-            published = true
             try afterRenameBeforeParentSync?()
+            try destination.requireCurrentParentAndInstalledTarget()
+            guard try SwanPortableExportFilesystem.currentChildDirectoryMatches(
+                parent: destination.parentDescriptor,
+                name: destination.outputName,
+                expectedDescriptor: stagingDescriptor
+            ) else {
+                throw SwanPortableExportError.publicationFailed
+            }
+            let installedVerification = try await SwanPortableExportVerifier
+                .verifySelfContainedArchiveStreaming(
+                    directoryDescriptor: stagingDescriptor
+                )
+            try requireSameVerification(
+                installedVerification,
+                expected: stagedVerification
+            )
+            guard try SwanPortableExportFilesystem.currentChildDirectoryMatches(
+                parent: destination.parentDescriptor,
+                name: destination.outputName,
+                expectedDescriptor: stagingDescriptor
+            ) else {
+                throw SwanPortableExportError.publicationFailed
+            }
             try SwanPortableExportFilesystem.synchronizeParent(
                 destination.parentDescriptor
             )
             try destination.requireCurrentParentAndInstalledTarget()
+            guard try SwanPortableExportFilesystem.currentChildDirectoryMatches(
+                parent: destination.parentDescriptor,
+                name: destination.outputName,
+                expectedDescriptor: stagingDescriptor
+            ) else {
+                throw SwanPortableExportError.publicationFailed
+            }
             _ = close(stagingDescriptor)
             stagingClosed = true
             return SwanPortableExportResult(
@@ -946,18 +1063,48 @@ public struct SwanPortableAccountExporter: Sendable {
                 includesPrivateKeys: false
             )
         } catch {
-            if !stagingClosed {
-                _ = close(stagingDescriptor)
-            }
             do {
                 try SwanPortableExportFilesystem.removeTree(
                     parent: destination.parentDescriptor,
-                    name: published ? destination.outputName : stagingName
+                    matching: stagingDescriptor
                 )
             } catch {
+                if !stagingClosed {
+                    _ = close(stagingDescriptor)
+                }
                 throw SwanPortableExportError.publicationFailed
             }
+            if !stagingClosed {
+                _ = close(stagingDescriptor)
+            }
             throw error
+        }
+    }
+
+    private func requireSameVerification(
+        _ verification: SwanPortableArchiveVerification,
+        manifest: SwanPortableExportManifest,
+        manifestData: Data,
+        signingPublicKey: P256.Signing.PublicKey
+    ) throws {
+        guard verification.manifest == manifest,
+              verification.manifestSHA256
+                == "sha256:\(SwanPortableExportDigest.hex(manifestData))",
+              verification.signingPublicKey.compressedRepresentation
+                == signingPublicKey.compressedRepresentation else {
+            throw SwanPortableExportError.publicationFailed
+        }
+    }
+
+    private func requireSameVerification(
+        _ candidate: SwanPortableArchiveVerification,
+        expected: SwanPortableArchiveVerification
+    ) throws {
+        guard candidate.manifest == expected.manifest,
+              candidate.manifestSHA256 == expected.manifestSHA256,
+              candidate.signingPublicKey.compressedRepresentation
+                == expected.signingPublicKey.compressedRepresentation else {
+            throw SwanPortableExportError.publicationFailed
         }
     }
 
@@ -1208,11 +1355,10 @@ enum SwanPortableExportTimestamp {
 /// Descriptor-backed byte source used only by the bounded archive verifier.
 /// It snapshots the file identity/length before parsing, hashes the exact bytes
 /// consumed by the parser, and rejects a file that changes underneath it.
-private actor SwanPortableExportFileByteSource:
+actor SwanPortableExportFileByteSource:
     SpaceCARRecoveryByteSource,
     PublicRepositoryCARByteSource
 {
-    private let handle: FileHandle
     private let descriptor: Int32
     private let device: dev_t
     private let inode: ino_t
@@ -1241,10 +1387,10 @@ private actor SwanPortableExportFileByteSource:
         device = metadata.st_dev
         inode = metadata.st_ino
         byteCount = Int(metadata.st_size)
-        handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     }
 
     func read(maximumBytes: Int) async throws -> Data? {
+        try Task.checkCancellation()
         guard !closed,
               (1 ... SpaceCARBodySpool.maximumChunkBytes).contains(maximumBytes)
         else {
@@ -1252,12 +1398,23 @@ private actor SwanPortableExportFileByteSource:
         }
         guard offset < byteCount else { return nil }
         let count = min(maximumBytes, byteCount - offset)
-        guard let chunk = try handle.read(upToCount: count),
-              !chunk.isEmpty,
-              chunk.count <= count else {
-            throw SwanPortableExportError.invalidArchive
+        var chunk = Data(count: count)
+        let readCount = try chunk.withUnsafeMutableBytes { bytes -> Int in
+            while true {
+                #if canImport(Darwin)
+                let result = Darwin.read(descriptor, bytes.baseAddress!, count)
+                #elseif canImport(Glibc)
+                let result = Glibc.read(descriptor, bytes.baseAddress!, count)
+                #endif
+                if result < 0, errno == EINTR { continue }
+                guard result > 0, result <= count else {
+                    throw SwanPortableExportError.invalidArchive
+                }
+                return result
+            }
         }
-        offset += chunk.count
+        chunk.count = readCount
+        offset += readCount
         digest.update(data: chunk)
         return chunk
     }
@@ -1289,6 +1446,10 @@ private actor SwanPortableExportFileByteSource:
     func close() {
         guard !closed else { return }
         closed = true
-        try? handle.close()
+        #if canImport(Darwin)
+        _ = Darwin.close(descriptor)
+        #elseif canImport(Glibc)
+        _ = Glibc.close(descriptor)
+        #endif
     }
 }

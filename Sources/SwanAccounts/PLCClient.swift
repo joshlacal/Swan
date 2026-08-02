@@ -418,9 +418,21 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
 
     private func endpoint(did: String, suffix: [String]) throws -> URL {
         try PLCOperationCodec.validateCanonicalDID(did)
-        var url = configuration.origin.appendingPathComponent(did, isDirectory: false)
-        for component in suffix {
-            url.appendPathComponent(component, isDirectory: false)
+        // `URL.appendingPathComponent` percent-encodes `:` on Linux but not
+        // Darwin. PLC's route is literally `/:did`, so construct the already
+        // validated path explicitly and make its wire representation stable
+        // across Foundation implementations.
+        guard suffix.allSatisfy({ !$0.isEmpty && !$0.contains("/") }),
+              var components = URLComponents(
+                  url: configuration.origin,
+                  resolvingAgainstBaseURL: false
+              ) else {
+            throw SwanError.malformed("PLC request URL is invalid")
+        }
+        components.percentEncodedPath = "/" + ([did] + suffix)
+            .joined(separator: "/")
+        guard let url = components.url else {
+            throw SwanError.malformed("PLC request URL is invalid")
         }
         guard url.host == configuration.origin.host,
               url.scheme == configuration.origin.scheme,

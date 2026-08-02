@@ -217,11 +217,39 @@ require_acceptance_preflight_rejection \
     SWAN_DYNAMIC_DELEGATION_PROJECT=preflight-only \
     ./Scripts/run-reference-member-dynamic-delegation-acceptance.sh
 
+require_acceptance_preflight_rejection \
+  invalid-dynamic-fault-mode \
+  'SWAN_DYNAMIC_DELEGATION_FAULT_MODE is invalid' \
+  env SWAN_DYNAMIC_DELEGATION_FAULT_MODE=time-travel \
+    SWAN_DYNAMIC_DELEGATION_PROJECT=preflight-only \
+    ./Scripts/run-reference-member-dynamic-delegation-acceptance.sh
+
+require_acceptance_preflight_rejection \
+  dynamic-fault-requires-stateful-member \
+  'SWAN_DYNAMIC_DELEGATION_FAULT_MODE requires member direction and stateful mode' \
+  env SWAN_DYNAMIC_DELEGATION_FAULT_MODE=normal \
+    SWAN_DYNAMIC_DELEGATION_DIRECTION=authority \
+    SWAN_DYNAMIC_DELEGATION_STATEFUL=1 \
+    SWAN_DYNAMIC_DELEGATION_PROJECT=preflight-only \
+    ./Scripts/run-reference-member-dynamic-delegation-acceptance.sh
+
 rg -Fq -- 'credentialKeyPLC' Scripts/run-reference-member-dynamic-delegation-acceptance.sh
 rg -Fq -- 'reference-authority-dynamic-credential' Scripts/run-reference-member-dynamic-delegation-acceptance.sh
 rg -Fq -- 'sanitized semantic artifact for a failed run' \
   Scripts/run-reference-member-dynamic-delegation-acceptance.sh
 rg -Fq -- 'reference-member-dynamic-failed.XXXXXX' \
+  Scripts/run-reference-member-dynamic-delegation-acceptance.sh
+
+require_acceptance_preflight_rejection \
+  missing-stateful-fault-project \
+  'SWAN_STATEFUL_FAULT_PROJECT must name a running disposable Compose project' \
+  ./Scripts/run-stateful-cross-host-fault-matrix.sh
+
+rg -Fq -- 'modes=(normal offline disconnected delayed duplicated reordered corrupted)' \
+  Scripts/run-stateful-cross-host-fault-matrix.sh
+rg -Fq -- 'lab stateful-fault-matrix' \
+  Scripts/run-stateful-cross-host-fault-matrix.sh
+rg -Fq -- 'lab permissioned-replica-head' \
   Scripts/run-reference-member-dynamic-delegation-acceptance.sh
 
 require_acceptance_preflight_rejection \

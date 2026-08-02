@@ -340,7 +340,6 @@ public struct SwanOperatorAccountBackupExporter: Sendable {
             parent: destination.parentDescriptor,
             name: stagingName
         )
-        var published = false
         do {
             let stagingURL = destination.url.deletingLastPathComponent()
                 .appending(path: stagingName, directoryHint: .isDirectory)
@@ -384,17 +383,18 @@ public struct SwanOperatorAccountBackupExporter: Sendable {
             guard fsync(stagingDescriptor) == 0 else {
                 throw SwanOperatorAccountBackupError.failed
             }
-            let staged = try SwanOperatorAccountBackupVerifier.verify(
+            let staged = try await SwanOperatorAccountBackupVerifier
+                .verifiedPayloadStreaming(
                 directoryDescriptor: stagingDescriptor,
                 using: backupKey
-            )
+            ).verification
             try destination.requireCurrentParentAndAbsentTarget()
+            try Task.checkCancellation()
             try SwanPortableExportFilesystem.renameExclusively(
                 parent: destination.parentDescriptor,
                 source: stagingName,
                 destination: destination.outputName
             )
-            published = true
             try afterRenameBeforeParentSync?()
             try SwanPortableExportFilesystem.synchronizeParent(destination.parentDescriptor)
             try destination.requireCurrentParentAndInstalledTarget()
@@ -405,10 +405,11 @@ public struct SwanOperatorAccountBackupExporter: Sendable {
             ) else {
                 throw SwanOperatorAccountBackupError.failed
             }
-            let installed = try SwanOperatorAccountBackupVerifier.verify(
+            let installed = try await SwanOperatorAccountBackupVerifier
+                .verifiedPayloadStreaming(
                 directoryDescriptor: stagingDescriptor,
                 using: backupKey
-            )
+            ).verification
             guard installed == staged,
                   try SwanPortableExportFilesystem.currentChildDirectoryMatches(
                       parent: destination.parentDescriptor,
@@ -427,18 +428,19 @@ public struct SwanOperatorAccountBackupExporter: Sendable {
                 portableManifestSHA256: installed.portableManifestSHA256
             )
         } catch {
-            _ = close(stagingDescriptor)
             do {
                 try SwanPortableExportFilesystem.removeTree(
                     parent: destination.parentDescriptor,
-                    name: published ? destination.outputName : stagingName
+                    matching: stagingDescriptor
                 )
                 try SwanPortableExportFilesystem.synchronizeParent(
                     destination.parentDescriptor
                 )
             } catch {
+                _ = close(stagingDescriptor)
                 throw SwanOperatorAccountBackupError.failed
             }
+            _ = close(stagingDescriptor)
             throw SwanOperatorAccountBackupError.failed
         }
     }
@@ -453,6 +455,24 @@ public enum SwanOperatorAccountBackupVerifier {
             let descriptor = try SwanPortableExportFilesystem.openArchiveRoot(root)
             defer { _ = close(descriptor) }
             return try verify(directoryDescriptor: descriptor, using: backupKey)
+        } catch is SwanOperatorAccountBackupCompatibilityError {
+            throw SwanOperatorAccountBackupError.unsupportedVersion
+        } catch {
+            throw SwanOperatorAccountBackupError.failed
+        }
+    }
+
+    public static func verifyBackupStreaming(
+        at root: URL,
+        using backupKey: SwanOperatorBackupKey
+    ) async throws -> SwanOperatorAccountBackupVerification {
+        do {
+            let descriptor = try SwanPortableExportFilesystem.openArchiveRoot(root)
+            defer { _ = close(descriptor) }
+            return try await verifiedPayloadStreaming(
+                directoryDescriptor: descriptor,
+                using: backupKey
+            ).verification
         } catch is SwanOperatorAccountBackupCompatibilityError {
             throw SwanOperatorAccountBackupError.unsupportedVersion
         } catch {
@@ -542,6 +562,106 @@ public enum SwanOperatorAccountBackupVerifier {
             let expectedDirectories = try SwanPortableExportFilesystem.expectedDirectories(
                 for: expectedFiles
             )
+            let entries = try SwanPortableExportFilesystem.entries(
+                root: root,
+                maximumEntries: expectedFiles.count + expectedDirectories.count
+            )
+            guard entries.files == expectedFiles,
+                  entries.directories == expectedDirectories else {
+                throw SwanOperatorAccountBackupError.failed
+            }
+            let verification = SwanOperatorAccountBackupVerification(
+                backupManifestSHA256:
+                    "sha256:\(SwanPortableExportDigest.hex(manifestData))",
+                canonicalHandle: portable.manifest.canonicalHandle,
+                did: portable.manifest.did,
+                fileCount: entries.files.count,
+                portableManifestSHA256: portable.manifestSHA256,
+                profileID: portable.manifest.profileID,
+                publicGenesisCommitCID: plc.publicGenesisCommitCID
+            )
+            return SwanOperatorVerifiedBackupPayload(
+                verification: verification,
+                portable: portable,
+                secrets: secrets
+            )
+        } catch let error as SwanOperatorAccountBackupCompatibilityError {
+            throw error
+        } catch {
+            throw SwanOperatorAccountBackupError.failed
+        }
+    }
+
+    static func verifiedPayloadStreaming(
+        directoryDescriptor root: Int32,
+        using backupKey: SwanOperatorBackupKey
+    ) async throws -> SwanOperatorVerifiedBackupPayload {
+        do {
+            try SwanPortableExportFilesystem.requireOwnerOnlyDirectory(root)
+            let manifestData = try SwanPortableExportFilesystem.read(
+                path: "manifest.json",
+                root: root,
+                maximumBytes: 4 * 1_024
+            )
+            let manifest = try SwanOperatorAccountBackupManifestCodec.decode(manifestData)
+            let portableDescriptor = try SwanPortableExportFilesystem
+                .openOwnerOnlyDirectory(parent: root, name: "portable")
+            defer { _ = close(portableDescriptor) }
+            let portable = try await SwanPortableExportVerifier
+                .verifySelfContainedArchiveStreaming(
+                    directoryDescriptor: portableDescriptor
+                )
+            guard portable.manifestSHA256 == manifest.portableManifestSHA256,
+                  portable.manifest.profileID == manifest.profileID,
+                  portable.manifest.includesPrivateKeys == false else {
+                throw SwanOperatorAccountBackupError.failed
+            }
+            let envelope = try SwanPortableExportFilesystem.read(
+                path: manifest.envelopePath,
+                root: root,
+                maximumBytes:
+                    SwanOperatorAccountSecretsCodec.maximumEncodedBytes + 64
+            )
+            guard SwanPortableExportDigest.hex(envelope)
+                    == manifest.envelopeSHA256 else {
+                throw SwanOperatorAccountBackupError.failed
+            }
+            let plaintext: Data
+            do {
+                plaintext = try AES.GCM.open(
+                    AES.GCM.SealedBox(combined: envelope),
+                    using: SymmetricKey(data: backupKey.bytes),
+                    authenticating: SwanOperatorAccountBackupAAD.make(
+                        portableManifestSHA256: manifest.portableManifestSHA256
+                    )
+                )
+            } catch {
+                throw SwanOperatorAccountBackupError.failed
+            }
+            let secrets = try SwanOperatorAccountSecretsCodec.decode(plaintext)
+            let plc = try SwanOperatorPortablePLC.read(from: portableDescriptor)
+            try validate(
+                secrets: secrets,
+                portable: portable,
+                plc: plc,
+                manifest: manifest
+            )
+            let portableExpectedPaths = Set(
+                portable.manifest.files.map(\.path) + ["manifest.json"]
+            )
+            let portableExpectedDirectories = try SwanPortableExportFilesystem
+                .expectedDirectories(for: portableExpectedPaths)
+            let portableEntries = try SwanPortableExportFilesystem.entries(
+                root: portableDescriptor,
+                maximumEntries: portableExpectedPaths.count
+                    + portableExpectedDirectories.count
+            )
+            let expectedFiles = Set([
+                "manifest.json",
+                SwanOperatorAccountBackupManifest.envelopePathValue,
+            ] + portableEntries.files.map { "portable/\($0)" })
+            let expectedDirectories = try SwanPortableExportFilesystem
+                .expectedDirectories(for: expectedFiles)
             let entries = try SwanPortableExportFilesystem.entries(
                 root: root,
                 maximumEntries: expectedFiles.count + expectedDirectories.count

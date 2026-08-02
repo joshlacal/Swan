@@ -88,6 +88,7 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
             blindColumnNames,
             [
                 "lookup_digest", "expires_at", "created_at",
+                "account_candidate",
                 "delivery_id", "proof_digest", "email_envelope",
                 "lease_owner", "lease_expires_at", "attempts",
             ]
@@ -250,6 +251,80 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
         )
     }
 
+    func testVerifiedAccountUsesReservedRecoveryCapacityAfterAnonymousPartitionFills() async throws {
+        let fixture = try await Fixture(testCase: self)
+        addTeardownBlock {
+            try? await fixture.database.close()
+            fixture.cleanup()
+        }
+        let now = fixture.now
+        _ = try await fixture.database.createAccount(try registration())
+        try await fixture.database.associateEmail(did: did, email: email, now: now)
+        let verification = try deliveryRequest(
+            purpose: .verifyEmail,
+            deliveryByte: 0x61,
+            proofByte: 0x71,
+            now: now
+        )
+        _ = try await fixture.database.enqueueEmailProofDelivery(verification)
+        let confirmation = try await fixture.database.confirmEmailProof(
+            try AccountEmailConfirmationRequest(
+                did: did,
+                email: email,
+                proofDigest: verification.proofDigest
+            ),
+            now: now
+        )
+        XCTAssertEqual(confirmation, .confirmed)
+
+        let anonymousCapacity =
+            SQLiteControlDatabase.maximumPasswordRecoveryWorkMarkers
+            - SQLiteControlDatabase.passwordRecoveryKnownAccountReserve
+        let seedValues = (0 ..< anonymousCapacity).map { value in
+            let digestHex = String(repeating: "00", count: 28)
+                + String(format: "%08x", value)
+            return "(X'" + digestHex
+                + "', 1750000601000000, "
+                + String(1750000001000000 + value) + ")"
+        }.joined(separator: ",")
+        _ = try await fixture.database.connection.query(
+            "INSERT INTO account_password_recovery_work(lookup_digest, expires_at, created_at) VALUES "
+                + seedValues
+        )
+
+        do {
+            try await fixture.database.enqueuePasswordRecoveryDelivery(
+                try passwordRecoveryRequest(
+                    email: AccountEmailAddress("still-unknown@example.com"),
+                    deliveryByte: 0x62,
+                    proofByte: 0x72,
+                    lookupDigest: Data(repeating: 0xfe, count: 32),
+                    now: now.addingTimeInterval(1)
+                )
+            )
+            XCTFail("anonymous recovery work consumed the reserved partition")
+        } catch let error as SwanError {
+            guard case .unavailable = error else {
+                return XCTFail("unexpected Swan error: \(error)")
+            }
+        }
+
+        try await fixture.database.enqueuePasswordRecoveryDelivery(
+            try passwordRecoveryRequest(
+                email: email,
+                deliveryByte: 0x63,
+                proofByte: 0x73,
+                lookupDigest: Data(repeating: 0xfd, count: 32),
+                now: now.addingTimeInterval(2)
+            )
+        )
+        let rows = try await fixture.database.connection.query(
+            "SELECT account_candidate FROM account_password_recovery_work WHERE lookup_digest = ?",
+            [.blob(ByteBuffer(data: Data(repeating: 0xfd, count: 32)))]
+        )
+        XCTAssertEqual(rows.first?.column("account_candidate")?.integer, 1)
+    }
+
     func testPasswordRecoveryRequestPurgesOnlyOneBoundedBatchOfExpiredMarkers() async throws {
         let fixture = try await Fixture(testCase: self)
         addTeardownBlock {
@@ -287,7 +362,7 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
         )
         // One bounded purge plus the new marker.  If this request regresses
         // to a predicate-only DELETE, the count would be one instead.
-        let expectedRemaining = 3_841 // 4,096 - 256 + 1
+        let expectedRemaining = 3_840 // 4,096 - 257 + 1
         XCTAssertEqual(
             remaining.first?.column("row_count")?.integer,
             expectedRemaining
@@ -637,6 +712,169 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
         }
     }
 
+    func testEmailDeliveryClaimPurgesExpiredProofsInBoundedPagesUntilConverged() async throws {
+        let fixture = try await Fixture(testCase: self)
+        addTeardownBlock { try? await fixture.database.close(); fixture.cleanup() }
+        let now = fixture.now
+        _ = try await fixture.database.createAccount(try registration())
+        try await fixture.database.associateEmail(did: did, email: email, now: now)
+        let backlog = 263
+        try await seedEmailRecoveryRows(
+            in: fixture.database,
+            count: backlog,
+            expiresAt: now.addingTimeInterval(-1)
+        )
+
+        let firstClaim = try await fixture.database.claimNextEmailDelivery(
+            workerID: "bounded-purge-worker",
+            now: now,
+            leaseDuration: 30
+        )
+        XCTAssertNil(firstClaim)
+        let afterOneClaim = try await emailRecoveryRowCounts(in: fixture.database)
+        XCTAssertEqual(afterOneClaim.tokens, 7)
+        XCTAssertEqual(afterOneClaim.outbox, 7)
+
+        let secondClaim = try await fixture.database.claimNextEmailDelivery(
+            workerID: "bounded-purge-worker",
+            now: now,
+            leaseDuration: 30
+        )
+        XCTAssertNil(secondClaim)
+        let converged = try await emailRecoveryRowCounts(in: fixture.database)
+        XCTAssertEqual(converged.tokens, 0)
+        XCTAssertEqual(converged.outbox, 0)
+    }
+
+    func testEmailDeliveryClaimResetsExpiredLeasesInBoundedPagesUntilConverged() async throws {
+        let fixture = try await Fixture(testCase: self)
+        addTeardownBlock { try? await fixture.database.close(); fixture.cleanup() }
+        let now = fixture.now
+        _ = try await fixture.database.createAccount(try registration())
+        try await fixture.database.associateEmail(did: did, email: email, now: now)
+        try await seedExpiredLeasedOutboxRows(
+            in: fixture.database,
+            count: 263,
+            now: now
+        )
+
+        let firstClaim = try await fixture.database.claimNextEmailDelivery(
+            workerID: "bounded-lease-reset-worker",
+            now: now,
+            leaseDuration: 30
+        )
+        XCTAssertNil(firstClaim)
+        let afterOneClaim = try await emailDeliveryStateCounts(
+            in: fixture.database
+        )
+        XCTAssertEqual(afterOneClaim.pending, 256)
+        XCTAssertEqual(afterOneClaim.leased, 7)
+
+        let secondClaim = try await fixture.database.claimNextEmailDelivery(
+            workerID: "bounded-lease-reset-worker",
+            now: now,
+            leaseDuration: 30
+        )
+        XCTAssertNil(secondClaim)
+        let converged = try await emailDeliveryStateCounts(in: fixture.database)
+        XCTAssertEqual(converged.pending, 263)
+        XCTAssertEqual(converged.leased, 0)
+    }
+
+    func testDeactivationPurgesProofsInBoundedPagesAndRetainsSendFence() async throws {
+        let fixture = try await Fixture(testCase: self)
+        addTeardownBlock { try? await fixture.database.close(); fixture.cleanup() }
+        let now = fixture.now
+        _ = try await fixture.database.createAccount(try registration())
+        try await fixture.database.associateEmail(did: did, email: email, now: now)
+        let fencedRequest = try deliveryRequest(
+            purpose: .verifyEmail,
+            deliveryByte: 0x1e,
+            proofByte: 0x2e,
+            now: now
+        )
+        _ = try await fixture.database.enqueueEmailProofDelivery(fencedRequest)
+        let leaseResult = try await fixture.database.claimNextEmailDelivery(
+            workerID: "lifecycle-fence-worker",
+            now: now,
+            leaseDuration: 1
+        )
+        let lease = try XCTUnwrap(leaseResult)
+        let fenced = try await fixture.database.beginEmailDeliveryAttempt(
+            deliveryID: lease.deliveryID,
+            workerID: "lifecycle-fence-worker",
+            now: now.addingTimeInterval(0.5)
+        )
+        XCTAssertTrue(fenced)
+        try await seedEmailRecoveryRows(
+            in: fixture.database,
+            count: 263,
+            expiresAt: now.addingTimeInterval(600)
+        )
+
+        _ = try await fixture.database.transitionStatus(
+            did: did,
+            to: .deactivated,
+            declaration: .init(),
+            now: now.addingTimeInterval(2)
+        )
+        let afterOneTransition = try await emailRecoveryRowCounts(
+            in: fixture.database
+        )
+        XCTAssertEqual(afterOneTransition.tokens, 8)
+        XCTAssertEqual(afterOneTransition.outbox, 8)
+        await XCTAssertThrowsAccountControlError(
+            try await fixture.database.transitionStatus(
+                did: did,
+                to: .active,
+                declaration: .init(),
+                now: now.addingTimeInterval(3)
+            ),
+            expected: .invalidTransition
+        )
+
+        _ = try await fixture.database.transitionStatus(
+            did: did,
+            to: .deactivated,
+            declaration: .init(),
+            now: now.addingTimeInterval(3)
+        )
+        let fencedResidue = try await emailRecoveryRowCounts(in: fixture.database)
+        XCTAssertEqual(fencedResidue.tokens, 0)
+        XCTAssertEqual(fencedResidue.outbox, 1)
+        let retainedFence = try await fixture.database.connection.query(
+            "SELECT delivery_id FROM account_email_delivery_outbox WHERE delivery_id = ?",
+            [.text(lease.deliveryID.rawValue)]
+        )
+        XCTAssertEqual(retainedFence.count, 1)
+        await XCTAssertThrowsAccountControlError(
+            try await fixture.database.transitionStatus(
+                did: did,
+                to: .active,
+                declaration: .init(),
+                now: now.addingTimeInterval(4)
+            ),
+            expected: .invalidTransition
+        )
+
+        _ = try await fixture.database.transitionStatus(
+            did: did,
+            to: .deactivated,
+            declaration: .init(),
+            now: now.addingTimeInterval(302)
+        )
+        let converged = try await emailRecoveryRowCounts(in: fixture.database)
+        XCTAssertEqual(converged.tokens, 0)
+        XCTAssertEqual(converged.outbox, 0)
+        let reactivated = try await fixture.database.transitionStatus(
+            did: did,
+            to: .active,
+            declaration: .init(),
+            now: now.addingTimeInterval(303)
+        )
+        XCTAssertEqual(reactivated.status, .active)
+    }
+
     func testDeletionWinsBeforeEmailWorkerFenceAndWorkerCannotSend() async throws {
         let fixture = try await Fixture(testCase: self)
         addTeardownBlock { try? await fixture.database.close(); fixture.cleanup() }
@@ -938,6 +1176,7 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
                 rawValue: Self.base64URL(Data(repeating: deliveryByte, count: 32))
             ),
             proofDigest: Data(repeating: proofByte, count: 32),
+            email: email,
             lookupDigest: lookupDigest ?? Data(repeating: proofByte, count: 32),
             emailEnvelope: Data(repeating: 0x5a, count: 32),
             expiresAt: now.addingTimeInterval(lifetime),
@@ -961,6 +1200,141 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
+    }
+
+    private func seedEmailRecoveryRows(
+        in database: SQLiteControlDatabase,
+        count: Int,
+        expiresAt: Date
+    ) async throws {
+        let emailRows = try await database.connection.query(
+            "SELECT updated_at FROM account_emails WHERE did = ?",
+            [.text(did)]
+        )
+        let generation = try XCTUnwrap(
+            emailRows.first?.column("updated_at")?.integer
+        )
+        let expiry = Int(expiresAt.timeIntervalSince1970 * 1_000_000)
+        var tokenValues: [String] = []
+        var outboxValues: [String] = []
+        tokenValues.reserveCapacity(count)
+        outboxValues.reserveCapacity(count)
+        for value in 0 ..< count {
+            var bytes = Data(repeating: 0, count: 32)
+            let suffix = withUnsafeBytes(of: UInt32(value).bigEndian) {
+                Array($0)
+            }
+            bytes.replaceSubrange(
+                28 ..< 32,
+                with: suffix
+            )
+            let digestHex = bytes.map { String(format: "%02x", $0) }.joined()
+            let deliveryID = Self.base64URL(bytes)
+            tokenValues.append(
+                "(X'\(digestHex)', '\(did)', '\(email.value)', "
+                    + "'verify-email', \(expiry), NULL, '\(deliveryID)')"
+            )
+            outboxValues.append(
+                "('\(deliveryID)', '\(did)', '\(email.value)', \(generation), "
+                    + "'verify-email', \(expiry), 'pending', NULL, NULL, 0, "
+                    + "\(expiry), \(expiry), NULL, NULL)"
+            )
+        }
+        _ = try await database.connection.query(
+            """
+            INSERT INTO account_email_tokens(
+                digest, did, email, purpose, expires_at, consumed_at, delivery_id
+            ) VALUES
+            """ + tokenValues.joined(separator: ",")
+        )
+        _ = try await database.connection.query(
+            """
+            INSERT INTO account_email_delivery_outbox(
+                delivery_id, did, email, email_generation, purpose, expires_at,
+                state, lease_owner, lease_expires_at, attempts, next_attempt_at,
+                created_at, send_started_at, sent_at
+            ) VALUES
+            """ + outboxValues.joined(separator: ",")
+        )
+    }
+
+    private func emailRecoveryRowCounts(
+        in database: SQLiteControlDatabase
+    ) async throws -> (tokens: Int, outbox: Int) {
+        let tokens = try await database.connection.query(
+            "SELECT COUNT(*) AS row_count FROM account_email_tokens"
+        )
+        let outbox = try await database.connection.query(
+            "SELECT COUNT(*) AS row_count FROM account_email_delivery_outbox"
+        )
+        return (
+            try XCTUnwrap(tokens.first?.column("row_count")?.integer),
+            try XCTUnwrap(outbox.first?.column("row_count")?.integer)
+        )
+    }
+
+    private func seedExpiredLeasedOutboxRows(
+        in database: SQLiteControlDatabase,
+        count: Int,
+        now: Date
+    ) async throws {
+        let emailRows = try await database.connection.query(
+            "SELECT updated_at FROM account_emails WHERE did = ?",
+            [.text(did)]
+        )
+        let generation = try XCTUnwrap(
+            emailRows.first?.column("updated_at")?.integer
+        )
+        let timestamp = Int(now.timeIntervalSince1970 * 1_000_000)
+        var values: [String] = []
+        values.reserveCapacity(count)
+        for value in 0 ..< count {
+            var bytes = Data(repeating: 0xff, count: 32)
+            let suffix = withUnsafeBytes(of: UInt32(value).bigEndian) {
+                Array($0)
+            }
+            bytes.replaceSubrange(28 ..< 32, with: suffix)
+            let deliveryID = Self.base64URL(bytes)
+            values.append(
+                "('\(deliveryID)', '\(did)', '\(email.value)', \(generation), "
+                    + "'verify-email', \(timestamp + 600_000_000), 'leased', "
+                    + "'expired-worker', \(timestamp - 1), 1, \(timestamp), "
+                    + "\(timestamp - count + value), NULL, NULL)"
+            )
+        }
+        _ = try await database.connection.query(
+            """
+            INSERT INTO account_email_delivery_outbox(
+                delivery_id, did, email, email_generation, purpose, expires_at,
+                state, lease_owner, lease_expires_at, attempts, next_attempt_at,
+                created_at, send_started_at, sent_at
+            ) VALUES
+            """ + values.joined(separator: ",")
+        )
+    }
+
+    private func emailDeliveryStateCounts(
+        in database: SQLiteControlDatabase
+    ) async throws -> (pending: Int, leased: Int) {
+        let rows = try await database.connection.query(
+            """
+            SELECT state, COUNT(*) AS row_count
+            FROM account_email_delivery_outbox
+            GROUP BY state
+            """
+        )
+        var counts = (pending: 0, leased: 0)
+        for row in rows {
+            switch row.column("state")?.string {
+            case "pending":
+                counts.pending = try XCTUnwrap(row.column("row_count")?.integer)
+            case "leased":
+                counts.leased = try XCTUnwrap(row.column("row_count")?.integer)
+            default:
+                XCTFail("unexpected email delivery state")
+            }
+        }
+        return counts
     }
 }
 

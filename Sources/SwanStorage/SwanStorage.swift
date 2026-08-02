@@ -17,6 +17,33 @@ public struct BlobReference: Sendable, Hashable {
     }
 }
 
+/// Durable per-account bounds for the immutable blob CAS and its namespace
+/// references. Bytes count each logical CID payload once even when several
+/// namespaces reference it; references count each distinct namespace edge.
+public struct AccountBlobQuota: Sendable, Equatable {
+    public static let conservative = AccountBlobQuota(
+        maximumUniqueBytes: 1 * 1_024 * 1_024 * 1_024,
+        maximumReferences: 10_000
+    )
+
+    public let maximumUniqueBytes: Int
+    public let maximumReferences: Int
+
+    public init(maximumUniqueBytes: Int, maximumReferences: Int) {
+        precondition(maximumUniqueBytes > 0)
+        precondition(maximumReferences > 0)
+        self.maximumUniqueBytes = maximumUniqueBytes
+        self.maximumReferences = maximumReferences
+    }
+}
+
+/// A typed admission failure so protocol adapters can distinguish an account
+/// storage ceiling from malformed content or transient storage failure.
+public enum BlobQuotaError: Error, Sendable, Equatable {
+    case uniqueBytesExceeded(limit: Int)
+    case referenceCountExceeded(limit: Int)
+}
+
 public protocol BlobStore: Sendable {
     func put(_ data: Data, namespace: BlobNamespace) async throws -> BlobReference
     func data(for reference: BlobReference) async throws -> Data

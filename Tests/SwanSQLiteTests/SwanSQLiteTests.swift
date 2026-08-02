@@ -2058,6 +2058,111 @@ final class SwanSQLiteTests: XCTestCase {
         }
     }
 
+    func testAccountBlobQuotaDeduplicatesAndReleasesDurableCapacity() async throws {
+        let fixture = try Fixture()
+        let quota = AccountBlobQuota(maximumUniqueBytes: 10, maximumReferences: 3)
+        let database = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root,
+            did: fixture.author,
+            blobQuota: quota
+        )
+        defer { Task { try? await database.close() } }
+
+        let firstPayload = Data(repeating: 0x11, count: 6)
+        let first = try await database.putBlob(firstPayload, namespace: .public)
+        let duplicate = try await database.putBlob(firstPayload, namespace: .public)
+        XCTAssertEqual(duplicate, first, "an exact reference must consume no additional quota")
+        _ = try await database.putBlob(firstPayload, namespace: .space(fixture.space))
+
+        let secondPayload = Data(repeating: 0x22, count: 4)
+        let second = try await database.putBlob(secondPayload, namespace: .public)
+        await XCTAssertThrowsErrorAsync(
+            try await database.putBlob(Data([0x33]), namespace: .public)
+        ) { error in
+            XCTAssertEqual(error as? BlobQuotaError, .uniqueBytesExceeded(limit: 10))
+        }
+
+        try await database.removeBlobReference(second)
+        let replacement = try await database.putBlob(
+            Data(repeating: 0x44, count: 4),
+            namespace: .public
+        )
+        XCTAssertNotEqual(replacement.cid, second.cid)
+
+        let otherSpace = try SpaceURI(
+            authority: fixture.author,
+            spaceType: "app.bsky.bookmarks",
+            skey: "quota-other"
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await database.putBlob(firstPayload, namespace: .space(otherSpace))
+        ) { error in
+            XCTAssertEqual(error as? BlobQuotaError, .referenceCountExceeded(limit: 3))
+        }
+    }
+
+    func testConcurrentAccountBlobQuotaCannotOversubscribe() async throws {
+        let fixture = try Fixture()
+        let quota = AccountBlobQuota(maximumUniqueBytes: 16, maximumReferences: 16)
+        var writers: [SQLiteAccountDatabase] = []
+        for _ in 0 ..< 8 {
+            writers.append(try await SQLiteAccountDatabase(
+                dataDirectory: fixture.root,
+                did: fixture.author,
+                blobQuota: quota
+            ))
+        }
+        defer {
+            for writer in writers {
+                Task { try? await writer.close() }
+            }
+        }
+
+        let outcomes = await withTaskGroup(of: Bool.self, returning: [Bool].self) { group in
+            for (index, writer) in writers.enumerated() {
+                group.addTask {
+                    do {
+                        _ = try await writer.putBlob(
+                            Data(repeating: UInt8(index + 1), count: 8),
+                            namespace: .public
+                        )
+                        return true
+                    } catch is BlobQuotaError {
+                        return false
+                    } catch {
+                        XCTFail("unexpected concurrent quota error: \(error)")
+                        return false
+                    }
+                }
+            }
+            return await group.reduce(into: []) { $0.append($1) }
+        }
+        XCTAssertEqual(outcomes.filter(\.self).count, 2)
+    }
+
+    func testAccountBlobQuotaIsIsolatedByAccountDatabase() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanBlobQuotaIsolation-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let quota = AccountBlobQuota(maximumUniqueBytes: 4, maximumReferences: 1)
+        let alice = try await SQLiteAccountDatabase(
+            dataDirectory: root, did: "did:plc:alice", blobQuota: quota
+        )
+        let bob = try await SQLiteAccountDatabase(
+            dataDirectory: root, did: "did:plc:bob", blobQuota: quota
+        )
+        defer {
+            Task { try? await alice.close() }
+            Task { try? await bob.close() }
+        }
+
+        _ = try await alice.putBlob(Data(repeating: 0xa1, count: 4), namespace: .public)
+        await XCTAssertThrowsErrorAsync(
+            try await alice.putBlob(Data([0xa2]), namespace: .public)
+        )
+        _ = try await bob.putBlob(Data(repeating: 0xb1, count: 4), namespace: .public)
+    }
+
     func testPrivateCASRefusesCorruptOrSymlinkedPayloadsAndReleasesCancelledStreams() async throws {
         let fixture = try Fixture()
         let database = try await fixture.open()

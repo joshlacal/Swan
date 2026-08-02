@@ -341,13 +341,15 @@ public struct SwanAuthenticatedSpaceRecordsCapability: Sendable {
     /// pages cannot multiply the same allocation-heavy response buffers.
     let jsonReadAdmission: PublicRepositoryJSONReadAdmission
     let jsonWriteAdmission: PublicRepositoryJSONWriteAdmission
+    let jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy
 
     init(
         authorizer: SwanOAuthResourceAuthorizer,
         directory: any AuthorizedSpaceRepositoryDirectory,
         credentialAuthorizer: (any SpaceCredentialAuthorizationVerifier)? = nil,
         jsonReadAdmission: PublicRepositoryJSONReadAdmission = .processShared,
-        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .processShared
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .processShared,
+        jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy = .productionDefault
     ) {
         self.authorizer = authorizer
         self.directory = directory
@@ -355,6 +357,7 @@ public struct SwanAuthenticatedSpaceRecordsCapability: Sendable {
         tidAllocator = SwanPermissionedTIDAllocator()
         self.jsonReadAdmission = jsonReadAdmission
         self.jsonWriteAdmission = jsonWriteAdmission
+        self.jsonWriteBodyPolicy = jsonWriteBodyPolicy
     }
 }
 
@@ -962,18 +965,17 @@ func registerAuthenticatedCreateRecordEndpoint(
 ) {
     let handler = AuthenticatedCreateRecordHandler(capability: capability)
     let path: RouterPath = "/xrpc/com.atproto.space.createRecord"
-    router.post(path) { request, _ async -> Response in
-        do {
-            let input: ComAtprotoSpaceCreateRecord.Input = try await
-                decodeAuthenticatedSpaceWriteInput(
-                    request,
-                    admission: capability.jsonWriteAdmission
-                )
-            return authenticatedSpaceWriteJSON(.ok, try await handler.handle(parameters: (), input: input, context: request))
-        } catch let failure as AuthenticatedSpaceWriteFailure {
-            return authenticatedSpaceWriteResponse(for: failure, capability: capability)
-        } catch {
-            return authenticatedSpaceWriteError(.badRequest, code: "InvalidRequest")
+    router.post(path) { request, context async -> Response in
+        await withAuthenticatedSpaceWriteInput(
+            request,
+            context: context,
+            as: ComAtprotoSpaceCreateRecord.Input.self,
+            capability: capability
+        ) { input in
+            authenticatedSpaceWriteJSON(
+                .ok,
+                try await handler.handle(parameters: (), input: input, context: request)
+            )
         }
     }
     registerAuthenticatedWriteWrongMethods(on: router, path: path)
@@ -985,18 +987,17 @@ func registerAuthenticatedPutRecordEndpoint(
 ) {
     let handler = AuthenticatedPutRecordHandler(capability: capability)
     let path: RouterPath = "/xrpc/com.atproto.space.putRecord"
-    router.post(path) { request, _ async -> Response in
-        do {
-            let input: ComAtprotoSpacePutRecord.Input = try await
-                decodeAuthenticatedSpaceWriteInput(
-                    request,
-                    admission: capability.jsonWriteAdmission
-                )
-            return authenticatedSpaceWriteJSON(.ok, try await handler.handle(parameters: (), input: input, context: request))
-        } catch let failure as AuthenticatedSpaceWriteFailure {
-            return authenticatedSpaceWriteResponse(for: failure, capability: capability)
-        } catch {
-            return authenticatedSpaceWriteError(.badRequest, code: "InvalidRequest")
+    router.post(path) { request, context async -> Response in
+        await withAuthenticatedSpaceWriteInput(
+            request,
+            context: context,
+            as: ComAtprotoSpacePutRecord.Input.self,
+            capability: capability
+        ) { input in
+            authenticatedSpaceWriteJSON(
+                .ok,
+                try await handler.handle(parameters: (), input: input, context: request)
+            )
         }
     }
     registerAuthenticatedWriteWrongMethods(on: router, path: path)
@@ -1008,18 +1009,17 @@ func registerAuthenticatedDeleteRecordEndpoint(
 ) {
     let handler = AuthenticatedDeleteRecordHandler(capability: capability)
     let path: RouterPath = "/xrpc/com.atproto.space.deleteRecord"
-    router.post(path) { request, _ async -> Response in
-        do {
-            let input: ComAtprotoSpaceDeleteRecord.Input = try await
-                decodeAuthenticatedSpaceWriteInput(
-                    request,
-                    admission: capability.jsonWriteAdmission
-                )
-            return authenticatedSpaceWriteJSON(.ok, try await handler.handle(parameters: (), input: input, context: request))
-        } catch let failure as AuthenticatedSpaceWriteFailure {
-            return authenticatedSpaceWriteResponse(for: failure, capability: capability)
-        } catch {
-            return authenticatedSpaceWriteError(.badRequest, code: "InvalidRequest")
+    router.post(path) { request, context async -> Response in
+        await withAuthenticatedSpaceWriteInput(
+            request,
+            context: context,
+            as: ComAtprotoSpaceDeleteRecord.Input.self,
+            capability: capability
+        ) { input in
+            authenticatedSpaceWriteJSON(
+                .ok,
+                try await handler.handle(parameters: (), input: input, context: request)
+            )
         }
     }
     registerAuthenticatedWriteWrongMethods(on: router, path: path)
@@ -1031,58 +1031,101 @@ func registerAuthenticatedApplyWritesEndpoint(
 ) {
     let handler = AuthenticatedApplyWritesHandler(capability: capability)
     let path: RouterPath = "/xrpc/com.atproto.space.applyWrites"
-    router.post(path) { request, _ async -> Response in
-        do {
-            let input: ComAtprotoSpaceApplyWrites.Input = try await
-                decodeAuthenticatedSpaceWriteInput(
-                    request,
-                    admission: capability.jsonWriteAdmission
-                )
-            return authenticatedSpaceWriteJSON(.ok, try await handler.handle(parameters: (), input: input, context: request))
-        } catch let failure as AuthenticatedSpaceWriteFailure {
-            return authenticatedSpaceWriteResponse(for: failure, capability: capability)
-        } catch {
-            return authenticatedSpaceWriteError(.badRequest, code: "InvalidRequest")
+    router.post(path) { request, context async -> Response in
+        await withAuthenticatedSpaceWriteInput(
+            request,
+            context: context,
+            as: ComAtprotoSpaceApplyWrites.Input.self,
+            capability: capability
+        ) { input in
+            authenticatedSpaceWriteJSON(
+                .ok,
+                try await handler.handle(parameters: (), input: input, context: request)
+            )
         }
     }
     registerAuthenticatedWriteWrongMethods(on: router, path: path)
 }
 
-private func decodeAuthenticatedSpaceWriteInput<Value: Decodable>(
+private func withAuthenticatedSpaceWriteInput<Value: Decodable>(
     _ request: Request,
-    admission: PublicRepositoryJSONWriteAdmission
-) async throws -> Value {
+    context: SwanHTTPRequestContext,
+    as type: Value.Type,
+    capability: SwanAuthenticatedSpaceRecordsCapability,
+    operation: (Value) async throws -> Response
+) async -> Response {
     let contentTypes = request.headers[values: .contentType]
     guard contentTypes.count == 1,
           contentTypes[0].split(separator: ";", maxSplits: 1).first?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "application/json"
-    else { throw AuthenticatedSpaceWriteFailure.invalidRequest }
-    let lengths = request.headers[values: .contentLength]
-    guard lengths.count <= 1,
-          lengths.first.flatMap(Int.init).map({ (0...authenticatedSpaceWriteMaximumJSONBytes).contains($0) }) ?? true
-    else { throw AuthenticatedSpaceWriteFailure.invalidRequest }
-    guard let lease = admission.reserve(
-        maximumRequestBytes: authenticatedSpaceWriteMaximumJSONBytes
-    ) else {
-        throw AuthenticatedSpaceWriteFailure.unavailable
+    else {
+        context.jsonWriteBodyTermination.terminate()
+        return authenticatedSpaceWriteResponse(
+            for: .invalidRequest,
+            capability: capability
+        )
     }
-    defer { lease.release() }
-    let body: ByteBuffer
-    do {
-        body = try await request.body.collect(upTo: authenticatedSpaceWriteMaximumJSONBytes)
-    } catch is NIOTooManyBytesError {
-        throw AuthenticatedSpaceWriteFailure.invalidRequest
-    } catch {
-        throw AuthenticatedSpaceWriteFailure.invalidRequest
+    guard acceptsAuthenticatedSpaceWriteContentLength(request.headers[values: .contentLength]) else {
+        context.jsonWriteBodyTermination.terminate()
+        return authenticatedSpaceWriteResponse(
+            for: .invalidRequest,
+            capability: capability
+        )
     }
-    guard body.readableBytes > 0,
-          let bytes = body.getBytes(at: body.readerIndex, length: body.readableBytes) else {
-        throw AuthenticatedSpaceWriteFailure.invalidRequest
+    return await withAdmittedJSONWriteResponse(
+        request.body,
+        admission: capability.jsonWriteAdmission,
+        policy: capability.jsonWriteBodyPolicy,
+        maximumBytes: authenticatedSpaceWriteMaximumJSONBytes,
+        termination: context.jsonWriteBodyTermination
+    ) { data in
+        do {
+            try StrictPermissionedWriteJSON.validate(data)
+            return try JSONDecoder().decode(type, from: data)
+        } catch {
+            throw AuthenticatedSpaceWriteFailure.invalidRequest
+        }
+    } operation: { input in
+        try await operation(input)
+    } errorResponse: { error in
+        authenticatedSpaceWriteResponse(for: error, capability: capability)
     }
-    let data = Data(bytes)
-    try StrictPermissionedWriteJSON.validate(data)
-    do { return try JSONDecoder().decode(Value.self, from: data) }
-    catch { throw AuthenticatedSpaceWriteFailure.invalidRequest }
+}
+
+func acceptsAuthenticatedSpaceWriteContentLength(_ values: [String]) -> Bool {
+    guard values.count <= 1 else { return false }
+    guard let value = values.first else { return true }
+    guard !value.isEmpty,
+          value.utf8.allSatisfy({ (48...57).contains($0) }),
+          value.first != "0",
+          let length = Int(value) else {
+        return false
+    }
+    return length <= authenticatedSpaceWriteMaximumJSONBytes
+}
+
+private func authenticatedSpaceWriteResponse(
+    for error: any Error,
+    capability: SwanAuthenticatedSpaceRecordsCapability
+) -> Response {
+    if let failure = error as? AuthenticatedSpaceWriteFailure {
+        return authenticatedSpaceWriteResponse(for: failure, capability: capability)
+    }
+    if let failure = error as? SwanJSONWriteBodyCollectionFailure {
+        return authenticatedSpaceWriteResponse(for: failure)
+    }
+    return authenticatedSpaceWriteError(.badRequest, code: "InvalidRequest")
+}
+
+private func authenticatedSpaceWriteResponse(
+    for failure: SwanJSONWriteBodyCollectionFailure
+) -> Response {
+    switch failure {
+    case .invalidRequest:
+        authenticatedSpaceWriteError(.badRequest, code: "InvalidRequest")
+    case .unavailable:
+        authenticatedSpaceWriteError(.serviceUnavailable, code: "temporarily_unavailable")
+    }
 }
 
 private func registerAuthenticatedWriteWrongMethods(

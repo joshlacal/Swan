@@ -211,7 +211,7 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
     }
 }
 
-private final class PeerPinnedHTTPResponseHandler: ChannelInboundHandler, @unchecked Sendable {
+final class PeerPinnedHTTPResponseHandler: ChannelInboundHandler, RemovableChannelHandler, @unchecked Sendable {
     typealias InboundIn = HTTPClientResponsePart
 
     private let responsePromise: EventLoopPromise<OAuthRemoteHTTPResponse>
@@ -239,10 +239,11 @@ private final class PeerPinnedHTTPResponseHandler: ChannelInboundHandler, @unche
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
+        let channel = context.channel
         timeoutTask = context.eventLoop.scheduleTask(
             in: .milliseconds(Int64(timeout * 1_000))
-        ) { [weak self] in
-            self?.timeout(context: context)
+        ) { [weak self, channel] in
+            self?.timeout(channel: channel)
         }
     }
 
@@ -302,6 +303,12 @@ private final class PeerPinnedHTTPResponseHandler: ChannelInboundHandler, @unche
         }
     }
 
+    func handlerRemoved(context: ChannelHandlerContext) {
+        if !completed {
+            fail(context: context, error: SwanError.unavailable("notification response handler was removed before response"))
+        }
+    }
+
     private func fail(context: ChannelHandlerContext, error: Error) {
         guard !completed else { return }
         completed = true
@@ -311,12 +318,12 @@ private final class PeerPinnedHTTPResponseHandler: ChannelInboundHandler, @unche
         context.close(promise: nil)
     }
 
-    private func timeout(context: ChannelHandlerContext) {
+    private func timeout(channel: Channel) {
         guard !completed else { return }
         completed = true
         timeoutTask = nil
         responsePromise.fail(SwanError.unavailable("notification request timed out"))
-        context.close(promise: nil)
+        channel.close(promise: nil)
     }
 
     private func succeed(_ response: OAuthRemoteHTTPResponse) {

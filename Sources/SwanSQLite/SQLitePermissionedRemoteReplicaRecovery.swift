@@ -238,11 +238,12 @@ extension SQLiteAccountDatabase:
                         verifier_identity, profile_id,
                         maximum_car_bytes, maximum_record_bytes,
                         maximum_index_entries, maximum_unique_blocks,
+                        maximum_logical_restored_bytes,
                         status, created_at, expires_at
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?,
                         'receiving', ?, ?
                     )
                     """,
@@ -274,6 +275,7 @@ extension SQLiteAccountDatabase:
                         .integer(binding.limits.maximumRecordBytes),
                         .integer(binding.limits.maximumIndexEntries),
                         .integer(binding.limits.maximumUniqueBlocks),
+                        .integer(binding.limits.maximumLogicalRestoredBytes),
                         .integer(try remoteReplicaSQLiteInteger(createdAt)),
                         .integer(try remoteReplicaSQLiteInteger(expiresAt)),
                     ]
@@ -836,19 +838,6 @@ extension SQLiteAccountDatabase:
     public func publishVerifiedPermissionedRemoteReplicaRecovery(
         sessionID: String,
         consumedAt: Int64,
-        now: Int64
-    ) async throws -> CommittedPermissionedRemoteReplicaRecovery {
-        try await publishVerifiedPermissionedRemoteReplicaRecoveryCore(
-            sessionID: sessionID,
-            consumedAt: consumedAt,
-            now: now,
-            publicationAuthorization: nil
-        )
-    }
-
-    public func publishVerifiedPermissionedRemoteReplicaRecovery(
-        sessionID: String,
-        consumedAt: Int64,
         now: Int64,
         publicationAuthorization:
             @escaping PermissionedRemoteReplicaPublicationAuthorization
@@ -866,7 +855,7 @@ extension SQLiteAccountDatabase:
         consumedAt: Int64,
         now: Int64,
         publicationAuthorization:
-            PermissionedRemoteReplicaPublicationAuthorization?
+            @escaping PermissionedRemoteReplicaPublicationAuthorization
     ) async throws -> CommittedPermissionedRemoteReplicaRecovery {
         guard consumedAt >= 0, now >= 0 else {
             throw PermissionedRemoteReplicaRecoveryError.invalidTimestamp
@@ -935,12 +924,7 @@ extension SQLiteAccountDatabase:
                         committedAt: consumedAt
                     )
                 }
-                let result: CommittedPermissionedRemoteReplicaRecovery
-                if let publicationAuthorization {
-                    result = try await publicationAuthorization(finalize)
-                } else {
-                    result = try await finalize()
-                }
+                let result = try await publicationAuthorization(finalize)
                 try await cleanupRemoteReplicaImportSessionBatched(
                     sessionID: sessionID,
                     requiredStatus: .consumed
@@ -1041,12 +1025,7 @@ extension SQLiteAccountDatabase:
                         committedAt: consumedAt
                     )
                 }
-                let result: CommittedPermissionedRemoteReplicaRecovery
-                if let publicationAuthorization {
-                    result = try await publicationAuthorization(finalize)
-                } else {
-                    result = try await finalize()
-                }
+                let result = try await publicationAuthorization(finalize)
                 try await cleanupRemoteReplicaImportSessionBatched(
                     sessionID: sessionID,
                     requiredStatus: .consumed
@@ -1669,11 +1648,12 @@ extension SQLiteAccountDatabase:
                 installed_lthash, installed_commitment,
                 installed_marker, commit_root_cid, index_root_cid,
                 record_count, unique_block_count,
-                verifier_identity, profile_id, committed_at,
+                verifier_identity, profile_id,
+                maximum_logical_restored_bytes, committed_at,
                 integrity_digest
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?
+                ?, ?, ?, ?, ?
             )
             RETURNING request_id
             """,
@@ -1700,6 +1680,7 @@ extension SQLiteAccountDatabase:
                 .integer(validation.uniqueBlockCount),
                 .text(session.binding.verifierIdentity),
                 .text(session.binding.profileID),
+                .integer(session.binding.limits.maximumLogicalRestoredBytes),
                 .integer(try remoteReplicaSQLiteInteger(committedAt)),
                 integrity.sqliteData!,
             ]
@@ -2961,6 +2942,9 @@ extension SQLiteAccountDatabase:
             ),
             maximumUniqueBlocks: remoteReplicaInteger(
                 row, "maximum_unique_blocks"
+            ),
+            maximumLogicalRestoredBytes: remoteReplicaInteger(
+                row, "maximum_logical_restored_bytes"
             )
         )
         let source = try PermissionedRemoteReplicaSourceIdentity(
@@ -3421,7 +3405,9 @@ extension SQLiteAccountDatabase:
               remoteReplicaText(row, "verifier_identity")
                 == expectedBinding.verifierIdentity,
               remoteReplicaText(row, "profile_id")
-                == expectedBinding.profileID else {
+                == expectedBinding.profileID,
+              remoteReplicaInteger(row, "maximum_logical_restored_bytes")
+                == expectedBinding.limits.maximumLogicalRestoredBytes else {
             throw PermissionedRemoteReplicaRecoveryError
                 .conflictingRequestReuse
         }
@@ -3593,7 +3579,7 @@ extension SQLiteAccountDatabase:
     ) -> Data {
         var hasher = SHA256()
         hasher.update(data: Data(
-            "swan.permissioned.remote-replica.result.v1".utf8
+            "swan.permissioned.remote-replica.result.v2".utf8
         ))
         let values = [
             binding.requestID,
@@ -3620,6 +3606,11 @@ extension SQLiteAccountDatabase:
             Int64(head.generation),
             Int64(recordCount),
             Int64(uniqueBlockCount),
+            Int64(binding.limits.maximumCARBytes),
+            Int64(binding.limits.maximumRecordBytes),
+            Int64(binding.limits.maximumIndexEntries),
+            Int64(binding.limits.maximumUniqueBlocks),
+            Int64(binding.limits.maximumLogicalRestoredBytes),
             committedAt,
         ]
         for integer in integers {
@@ -3644,7 +3635,7 @@ extension SQLiteAccountDatabase:
     ) -> Data {
         var hasher = SHA256()
         hasher.update(data: Data(
-            "swan.permissioned.remote-replica.binding.v1".utf8
+            "swan.permissioned.remote-replica.binding.v2".utf8
         ))
         func append(_ value: Data) {
             remoteReplicaDigestAppend(value, to: &hasher)
@@ -3686,6 +3677,7 @@ extension SQLiteAccountDatabase:
         append(Data(String(binding.limits.maximumRecordBytes).utf8))
         append(Data(String(binding.limits.maximumIndexEntries).utf8))
         append(Data(String(binding.limits.maximumUniqueBlocks).utf8))
+        append(Data(String(binding.limits.maximumLogicalRestoredBytes).utf8))
         return Data(hasher.finalize())
     }
 

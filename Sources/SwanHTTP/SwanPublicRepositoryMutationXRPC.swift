@@ -20,6 +20,8 @@ private enum PublicMutationFailure: Error {
     case unavailable
 }
 
+private let publicMutationMaximumJSONBytes = 1_000_000
+
 private final class PublicBlobUploadCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var value = 0
@@ -43,53 +45,93 @@ private final class PublicBlobUploadCounter: @unchecked Sendable {
 private struct PublicMutationHandlers {
     let capability: SwanPublicRepositoryMutationCapability
 
-    func uploadBlob(_ request: Request) async throws -> SwanPublicWire.ComAtprotoRepoUploadBlob.Output {
-        let subject = try await authorizedSubject(
-            request: request, method: "POST", path: "/xrpc/com.atproto.repo.uploadBlob"
+    func uploadBlob(
+        _ request: Request,
+        context: SwanHTTPRequestContext
+    ) async throws -> SwanPublicWire.ComAtprotoRepoUploadBlob.Output {
+        let maximumBytes = 256 * 1024 * 1024
+        try validateRequestBodyHeaders(
+            request,
+            mediaType: .unspecified,
+            maximumBytes: maximumBytes,
+            termination: context.jsonWriteBodyTermination
         )
-        guard let target = try await capability.directory.publicRepositoryMutationTarget(selector: subject),
-              target.did == subject,
-              target.status == .active,
-              let blobStore = target.store as? any StreamingBlobStore else {
-            throw PublicMutationFailure.notFound
-        }
-        let contentTypes = request.headers[values: .contentType]
-        guard contentTypes.count <= 1 else {
+        let declaredLength: Int
+        do {
+            declaredLength = try requiredPublicBlobContentLength(request.headers)
+        } catch {
+            try await drainRejectedRequestBody(
+                request,
+                admission: capability.jsonWriteAdmission,
+                policy: capability.jsonWriteBodyPolicy,
+                termination: context.jsonWriteBodyTermination
+            )
             throw PublicMutationFailure.invalidRequest
         }
-        let requestedMIMEType = contentTypes.first?.split(separator: ";", maxSplits: 1).first.map(String.init)
-            ?? "application/octet-stream"
-        let mimeType = safePublicBlobMIMEType(requestedMIMEType)
-        let maximumBytes = 256 * 1024 * 1024
-        guard let admission = capability.publicBlobSpoolAdmission,
-              let lease = admission.reserve(
-                  accountDID: target.did,
-                  maximumBytes: maximumBytes
-              ) else {
-            throw PublicMutationFailure.unavailable
+        let (blobStore, mimeType, lease) = try await withPublicBlobUploadPreflightDrain(
+            request: request,
+            context: context,
+            admission: capability.jsonWriteAdmission,
+            policy: capability.jsonWriteBodyPolicy
+        ) {
+            let subject = try await authorizedSubject(
+                request: request, method: "POST", path: "/xrpc/com.atproto.repo.uploadBlob"
+            )
+            guard let target = try await capability.directory.publicRepositoryMutationTarget(selector: subject),
+                  target.did == subject,
+                  target.status == .active,
+                  let blobStore = target.store as? any StreamingBlobStore else {
+                throw PublicMutationFailure.notFound
+            }
+            let contentTypes = request.headers[values: .contentType]
+            guard contentTypes.count <= 1 else {
+                throw PublicMutationFailure.invalidRequest
+            }
+            let requestedMIMEType = contentTypes.first?.split(separator: ";", maxSplits: 1).first.map(String.init)
+                ?? "application/octet-stream"
+            let mimeType = safePublicBlobMIMEType(requestedMIMEType)
+            guard let admission = capability.publicBlobSpoolAdmission,
+                  let lease = admission.reserve(
+                      accountDID: target.did,
+                      maximumBytes: maximumBytes
+                  ) else {
+                throw PublicMutationFailure.unavailable
+            }
+            return (blobStore, mimeType, lease)
         }
         defer { lease.release() }
         let counter = PublicBlobUploadCounter()
         let body = request.body
-        let reference = try await blobStore.putStreaming(
-            namespace: .public,
-            mimeType: mimeType,
-            maximumBytes: maximumBytes
-        ) { sink in
-            var iterator = body.makeAsyncIterator()
-            while let next = try await iterator.next() {
-                var buffer = next
-                try Task.checkCancellation()
-                let count = buffer.readableBytes
-                try counter.add(count, maximum: maximumBytes)
-                guard count > 0,
-                      let bytes = buffer.readBytes(length: count) else {
-                    continue
+        let reference = try await withAbsoluteRequestBodyDeadline(
+            policy: capability.jsonWriteBodyPolicy,
+            termination: context.jsonWriteBodyTermination
+        ) {
+            try await blobStore.putStreaming(
+                namespace: .public,
+                mimeType: mimeType,
+                maximumBytes: maximumBytes
+            ) { sink in
+                var iterator = body.makeAsyncIterator()
+                while let next = try await iterator.next() {
+                    var buffer = next
+                    try Task.checkCancellation()
+                    let count = buffer.readableBytes
+                    try counter.add(count, maximum: maximumBytes)
+                    guard count > 0,
+                          let bytes = buffer.readBytes(length: count) else {
+                        continue
+                    }
+                    try await sink(Data(bytes))
                 }
-                try await sink(Data(bytes))
-            }
-            guard counter.count > 0 else {
-                throw PublicMutationFailure.invalidRequest
+                guard counter.count > 0 else {
+                    throw PublicMutationFailure.invalidRequest
+                }
+                guard declaredLength == counter.count else {
+                    if await context.jsonWriteBodyTermination.wasTerminated() {
+                        throw PublicMutationFailure.unavailable
+                    }
+                    throw PublicMutationFailure.invalidRequest
+                }
             }
         }
         guard case .public = reference.namespace else {
@@ -363,6 +405,44 @@ private struct PublicMutationHandlers {
     }
 }
 
+private func withPublicBlobUploadPreflightDrain<Value>(
+    request: Request,
+    context: SwanHTTPRequestContext,
+    admission: PublicRepositoryJSONWriteAdmission,
+    policy: SwanJSONWriteBodyPolicy,
+    operation: () async throws -> Value
+) async throws -> Value {
+    do {
+        return try await operation()
+    } catch {
+        do {
+            try await drainRejectedRequestBody(
+                request,
+                admission: admission,
+                policy: policy,
+                termination: context.jsonWriteBodyTermination
+            )
+        } catch {
+            throw PublicMutationFailure.unavailable
+        }
+        throw error
+    }
+}
+
+func requiredPublicBlobContentLength(_ headers: HTTPFields) throws -> Int {
+    let values = headers[values: .contentLength]
+    guard values.count == 1,
+          let value = values.first,
+          !value.isEmpty,
+          value.utf8.allSatisfy({ (48 ... 57).contains($0) }),
+          value.first != "0",
+          let length = Int(value),
+          (1 ... maximumPublicBlobTransferBytes).contains(length) else {
+        throw PublicMutationFailure.invalidRequest
+    }
+    return length
+}
+
 private let maximumPublicBlobTransferBytes = 256 * 1024 * 1024
 
 func registerPublicRepositoryMutationEndpoints(
@@ -375,75 +455,77 @@ func registerPublicRepositoryMutationEndpoints(
     let applyPath: RouterPath = "/xrpc/com.atproto.repo.applyWrites"
     let uploadPath: RouterPath = "/xrpc/com.atproto.repo.uploadBlob"
     let deletePath: RouterPath = "/xrpc/com.atproto.repo.deleteRecord"
-    router.post(putPath) { request, _ async -> Response in
-        do {
-            let (input, digest) = try await publicMutationInput(
-                request,
-                as: SwanPublicWire.ComAtprotoRepoPutRecord.Input.self,
-                admission: capability.jsonWriteAdmission
+    router.post(putPath) { request, context async -> Response in
+        await withPublicMutationInput(
+            request,
+            context: context,
+            as: SwanPublicWire.ComAtprotoRepoPutRecord.Input.self,
+            capability: capability
+        ) { input, digest in
+            publicMutationJSON(
+                .ok,
+                try await handlers.put(input, bodyDigest: digest, request: request)
             )
-            return publicMutationJSON(.ok, try await handlers.put(input, bodyDigest: digest, request: request))
-        } catch let failure as PublicMutationFailure {
-            return publicMutationResponse(failure, authorizer: capability.authorizer)
-        } catch let failure as PublicRepositoryMutationCoordinatorError {
-            return publicMutationResponse(failure)
-        } catch {
-            return publicMutationError(.badRequest, "InvalidRequest")
         }
     }
-    router.post(createPath) { request, _ async -> Response in
-        do {
-            let (input, digest) = try await publicMutationInput(
-                request,
-                as: SwanPublicWire.ComAtprotoRepoCreateRecord.Input.self,
-                admission: capability.jsonWriteAdmission
+    router.post(createPath) { request, context async -> Response in
+        await withPublicMutationInput(
+            request,
+            context: context,
+            as: SwanPublicWire.ComAtprotoRepoCreateRecord.Input.self,
+            capability: capability
+        ) { input, digest in
+            publicMutationJSON(
+                .ok,
+                try await handlers.create(input, bodyDigest: digest, request: request)
             )
-            return publicMutationJSON(.ok, try await handlers.create(input, bodyDigest: digest, request: request))
-        } catch let failure as PublicMutationFailure {
-            return publicMutationResponse(failure, authorizer: capability.authorizer)
-        } catch let failure as PublicRepositoryMutationCoordinatorError {
-            return publicMutationResponse(failure)
-        } catch {
-            return publicMutationError(.badRequest, "InvalidRequest")
         }
     }
-    router.post(applyPath) { request, _ async -> Response in
-        do {
-            let (input, digest) = try await publicMutationInput(
-                request,
-                as: SwanPublicWire.ComAtprotoRepoApplyWrites.Input.self,
-                admission: capability.jsonWriteAdmission
+    router.post(applyPath) { request, context async -> Response in
+        await withPublicMutationInput(
+            request,
+            context: context,
+            as: SwanPublicWire.ComAtprotoRepoApplyWrites.Input.self,
+            capability: capability
+        ) { input, digest in
+            publicMutationJSON(
+                .ok,
+                try await handlers.applyWrites(input, bodyDigest: digest, request: request)
             )
-            return publicMutationJSON(.ok, try await handlers.applyWrites(input, bodyDigest: digest, request: request))
-        } catch let failure as PublicMutationFailure { return publicMutationResponse(failure, authorizer: capability.authorizer) }
-        catch let failure as PublicRepositoryMutationCoordinatorError { return publicMutationResponse(failure) }
-        catch { return publicMutationError(.badRequest, "InvalidRequest") }
+        }
     }
-    router.post(uploadPath) { request, _ async -> Response in
+    router.post(uploadPath) { request, context async -> Response in
         do {
-            return publicMutationJSON(.ok, try await handlers.uploadBlob(request))
+            return publicMutationJSON(
+                .ok,
+                try await handlers.uploadBlob(request, context: context)
+            )
+        } catch let failure as SwanRequestBodyCollectionFailure {
+            return publicMutationResponse(
+                failure == .unavailable ? .unavailable : .invalidRequest,
+                authorizer: capability.authorizer
+            )
         } catch let failure as PublicMutationFailure {
             return publicMutationResponse(failure, authorizer: capability.authorizer)
         } catch let error as SwanError {
+            return publicMutationResponse(error)
+        } catch let error as BlobQuotaError {
             return publicMutationResponse(error)
         } catch {
             return publicMutationError(.badRequest, "InvalidRequest")
         }
     }
-    router.post(deletePath) { request, _ async -> Response in
-        do {
-            let (input, digest) = try await publicMutationInput(
-                request,
-                as: SwanPublicWire.ComAtprotoRepoDeleteRecord.Input.self,
-                admission: capability.jsonWriteAdmission
+    router.post(deletePath) { request, context async -> Response in
+        await withPublicMutationInput(
+            request,
+            context: context,
+            as: SwanPublicWire.ComAtprotoRepoDeleteRecord.Input.self,
+            capability: capability
+        ) { input, digest in
+            publicMutationJSON(
+                .ok,
+                try await handlers.delete(input, bodyDigest: digest, request: request)
             )
-            return publicMutationJSON(.ok, try await handlers.delete(input, bodyDigest: digest, request: request))
-        } catch let failure as PublicMutationFailure {
-            return publicMutationResponse(failure, authorizer: capability.authorizer)
-        } catch let failure as PublicRepositoryMutationCoordinatorError {
-            return publicMutationResponse(failure)
-        } catch {
-            return publicMutationError(.badRequest, "InvalidRequest")
         }
     }
     for path in [putPath, createPath, applyPath, uploadPath, deletePath] {
@@ -452,8 +534,12 @@ func registerPublicRepositoryMutationEndpoints(
         }
     }
     let blobPath: RouterPath = "/xrpc/com.atproto.sync.getBlob"
-    router.get(blobPath) { request, _ async -> Response in
-        guard await publicBlobRequestHasNoBody(request) else {
+    router.get(blobPath) { request, context async -> Response in
+        guard await publicBlobRequestHasNoBody(
+            request,
+            context: context,
+            capability: capability
+        ) else {
             return publicMutationError(.badRequest, "InvalidRequest")
         }
         let parameters: PublicBlobParameters
@@ -525,6 +611,13 @@ func registerPublicRepositoryMutationEndpoints(
     }
 }
 
+private func publicMutationResponse(_ error: BlobQuotaError) -> Response {
+    switch error {
+    case .uniqueBytesExceeded, .referenceCountExceeded:
+        return publicMutationError(.contentTooLarge, "AccountBlobQuotaExceeded")
+    }
+}
+
 private struct PublicBlobParameters {
     let did: String
     let cid: String
@@ -553,9 +646,21 @@ private func publicBlobParameters(_ request: Request) throws -> PublicBlobParame
     return PublicBlobParameters(did: rawDID, cid: rawCID)
 }
 
-private func publicBlobRequestHasNoBody(_ request: Request) async -> Bool {
+private func publicBlobRequestHasNoBody(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    capability: SwanPublicRepositoryMutationCapability
+) async -> Bool {
     do {
-        let body = try await request.body.collect(upTo: 1)
+        let body = try await collectAdmittedRequestBody(
+            request,
+            mediaType: .unspecified,
+            admission: capability.jsonWriteAdmission,
+            policy: capability.jsonWriteBodyPolicy,
+            maximumBytes: 1,
+            termination: context.jsonWriteBodyTermination
+        )
+        defer { withExtendedLifetime(body) {} }
         return body.readableBytes == 0
     } catch {
         return false
@@ -574,27 +679,86 @@ private func publicBlobLifecycleError(_ status: AccountControlStatus) -> Respons
     return publicMutationError(.badRequest, code)
 }
 
-private func publicMutationInput<Value: Decodable>(
+private func withPublicMutationInput<Value: Decodable>(
     _ request: Request,
+    context: SwanHTTPRequestContext,
     as type: Value.Type,
-    admission: PublicRepositoryJSONWriteAdmission
-) async throws -> (Value, Data) {
+    capability: SwanPublicRepositoryMutationCapability,
+    operation: (Value, Data) async throws -> Response
+) async -> Response {
     let contentTypes = request.headers[values: .contentType]
     guard contentTypes.count == 1,
           contentTypes[0].split(separator: ";", maxSplits: 1).first?.lowercased() == "application/json" else {
-        throw PublicMutationFailure.invalidRequest
+        context.jsonWriteBodyTermination.terminate()
+        return publicMutationResponse(
+            PublicMutationFailure.invalidRequest,
+            authorizer: capability.authorizer
+        )
     }
-    guard let lease = admission.reserve(maximumRequestBytes: 1_000_000) else {
-        throw PublicMutationFailure.unavailable
+    guard acceptsPublicMutationContentLength(request.headers[values: .contentLength]) else {
+        context.jsonWriteBodyTermination.terminate()
+        return publicMutationResponse(
+            PublicMutationFailure.invalidRequest,
+            authorizer: capability.authorizer
+        )
     }
-    defer { lease.release() }
-    let body = try await request.body.collect(upTo: 1_000_000)
-    guard let bytes = body.getBytes(at: body.readerIndex, length: body.readableBytes) else {
-        throw PublicMutationFailure.invalidRequest
+    return await withAdmittedJSONWriteResponse(
+        request.body,
+        admission: capability.jsonWriteAdmission,
+        policy: capability.jsonWriteBodyPolicy,
+        maximumBytes: publicMutationMaximumJSONBytes,
+        expectedBytes: request.headers[values: .contentLength].first.flatMap(Int.init),
+        termination: context.jsonWriteBodyTermination
+    ) { data in
+        try StrictPermissionedWriteJSON.validate(data)
+        return (
+            try JSONDecoder().decode(Value.self, from: data),
+            Data(SHA256.hash(data: data))
+        )
+    } operation: { admitted in
+        try await operation(admitted.0, admitted.1)
+    } errorResponse: { error in
+        publicMutationResponse(error, capability: capability)
     }
-    let data = Data(bytes)
-    try StrictPermissionedWriteJSON.validate(data)
-    return (try JSONDecoder().decode(Value.self, from: data), Data(SHA256.hash(data: data)))
+}
+
+func acceptsPublicMutationContentLength(_ values: [String]) -> Bool {
+    guard values.count <= 1 else { return false }
+    guard let value = values.first else { return true }
+    guard !value.isEmpty,
+          value.utf8.allSatisfy({ (48...57).contains($0) }),
+          value.first != "0",
+          let length = Int(value) else {
+        return false
+    }
+    return length <= publicMutationMaximumJSONBytes
+}
+
+private func publicMutationResponse(
+    _ error: any Error,
+    capability: SwanPublicRepositoryMutationCapability
+) -> Response {
+    if let failure = error as? PublicMutationFailure {
+        return publicMutationResponse(failure, authorizer: capability.authorizer)
+    }
+    if let failure = error as? SwanJSONWriteBodyCollectionFailure {
+        return publicMutationResponse(failure)
+    }
+    if let failure = error as? PublicRepositoryMutationCoordinatorError {
+        return publicMutationResponse(failure)
+    }
+    return publicMutationError(.badRequest, "InvalidRequest")
+}
+
+private func publicMutationResponse(
+    _ failure: SwanJSONWriteBodyCollectionFailure
+) -> Response {
+    switch failure {
+    case .invalidRequest:
+        publicMutationError(.badRequest, "InvalidRequest")
+    case .unavailable:
+        publicMutationError(.serviceUnavailable, "temporarily_unavailable")
+    }
 }
 
 private func publicMutationResponse(

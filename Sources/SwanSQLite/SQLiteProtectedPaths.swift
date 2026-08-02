@@ -386,6 +386,53 @@ enum SQLiteProtectedPaths {
         throw SwanError.unavailable("public blob staging is unavailable")
     }
 
+    /// Descriptor-backed restore cannot rely on its display URL. Stage the
+    /// anonymous blob directly below the already-pinned account directory and
+    /// unlink it before returning.
+    static func makeUnlinkedPortableRestoreBlobSpool(
+        accountDirectoryDescriptor: Int32
+    ) throws -> FileHandle {
+        for _ in 0 ..< 16 {
+            let name = ".restore-blob-\(UUID().uuidString.lowercased()).spool"
+            let descriptor = name.withCString { path in
+                openat(
+                    accountDirectoryDescriptor,
+                    path,
+                    O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                    ownerOnlyFileMode
+                )
+            }
+            if descriptor < 0 {
+                guard errno == EEXIST else {
+                    throw SwanError.unavailable("portable blob staging is unavailable")
+                }
+                continue
+            }
+            do {
+                try requireOwnerOnlyRegularFile(descriptor)
+                guard fchmod(descriptor, ownerOnlyFileMode) == 0,
+                      name.withCString({
+                          unlinkat(accountDirectoryDescriptor, $0, 0)
+                      }) == 0 else {
+                    throw SwanError.unavailable(
+                        "portable blob staging is unavailable"
+                    )
+                }
+                return FileHandle(
+                    fileDescriptor: descriptor,
+                    closeOnDealloc: true
+                )
+            } catch {
+                _ = close(descriptor)
+                _ = name.withCString {
+                    unlinkat(accountDirectoryDescriptor, $0, 0)
+                }
+                throw error
+            }
+        }
+        throw SwanError.unavailable("portable blob staging is unavailable")
+    }
+
     // MARK: Permissioned blob CAS
 
     /// Creates one immutable content-addressed payload below the already

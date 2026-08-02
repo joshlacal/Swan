@@ -1,5 +1,6 @@
 import Foundation
 import NIOCore
+import NIOEmbedded
 import NIOHTTP1
 import NIOPosix
 import NIOSSL
@@ -9,7 +10,8 @@ import SwanCore
 
 final class NIOPeerPinnedOAuthPostTransportTests: XCTestCase {
     func testDocumentTransportConnectsToApprovedLiteralAndReportsPeer() async throws {
-        let server = try await LocalTLSPeer.start()
+        let expectedBody = Data("document".utf8)
+        let server = try await LocalTLSPeer.start(responseBody: expectedBody)
         defer { Task { await server.close() } }
 
         let connector = try NIOPeerPinnedOAuthDocumentTransport(
@@ -22,7 +24,8 @@ final class NIOPeerPinnedOAuthPostTransportTests: XCTestCase {
             timeout: 2,
             maximumBodyBytes: 1_024
         )
-        XCTAssertEqual(response.status, 204)
+        XCTAssertEqual(response.status, 200)
+        XCTAssertEqual(response.body, expectedBody)
         XCTAssertEqual(response.connectedPeerAddress, server.peer)
         let requests = try await server.receivedRequest()
         XCTAssertEqual(requests, 1)
@@ -41,6 +44,7 @@ final class NIOPeerPinnedOAuthPostTransportTests: XCTestCase {
         )
         let received = try await server.receivedRequest()
         XCTAssertEqual(received, 1)
+        XCTAssertEqual(server.receivedBodyByteCount(), 2)
     }
 
     func testPinnedTransportRejectsDNSRebindingAfterLiveRequest() async throws {
@@ -120,6 +124,8 @@ final class NIOPeerPinnedOAuthPostTransportTests: XCTestCase {
         }
 
         XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.5)
+        try await server.waitForDisconnect()
+        XCTAssertEqual(server.disconnectCount(), 1)
     }
 
     func testPostTransportTimeoutCompletesAndClosesUnresponsivePeer() async throws {
@@ -146,6 +152,131 @@ final class NIOPeerPinnedOAuthPostTransportTests: XCTestCase {
         }
 
         XCTAssertLessThan(Date().timeIntervalSince(startedAt), 0.5)
+        try await server.waitForDisconnect()
+        XCTAssertEqual(server.disconnectCount(), 1)
+    }
+
+    func testDocumentTransportRejectsResponseBeyondConfiguredBound() async throws {
+        let server = try await LocalTLSPeer.start(responseBody: Data("four".utf8))
+        defer { Task { await server.close() } }
+        let connector = try NIOPeerPinnedOAuthDocumentTransport(
+            maximumTransportTimeout: 2,
+            additionalTrustRootsPEM: Data(LocalTLSCertificate.authority.utf8)
+        )
+
+        do {
+            _ = try await connector.get(
+                url: server.endpoint,
+                approvedPeers: [server.peer],
+                timeout: 2,
+                maximumBodyBytes: 3
+            )
+            XCTFail("the document transport must reject a response beyond its byte bound")
+        } catch let error as SwanError {
+            guard case .unauthorized = error else {
+                return XCTFail("expected response-bound rejection, got \(error)")
+            }
+        }
+    }
+
+    func testPostTransportRejectsResponseBeyondConfiguredBound() async throws {
+        let server = try await LocalTLSPeer.start(responseBody: Data("four".utf8))
+        defer { Task { await server.close() } }
+        let connector = NIOPeerPinnedOAuthPostTransport(configuration: try .init(
+            endpointPeers: [server.endpoint.absoluteString: server.peer],
+            additionalTrustRootsPEM: Data(LocalTLSCertificate.authority.utf8)
+        ))
+
+        do {
+            _ = try await connector.post(
+                url: server.endpoint,
+                approvedPeers: [server.peer],
+                headers: ["content-type": "application/json"],
+                body: Data("{}".utf8),
+                timeout: 2,
+                maximumResponseBodyBytes: 3
+            )
+            XCTFail("the POST transport must reject a response beyond its byte bound")
+        } catch let error as SwanError {
+            guard case .unauthorized = error else {
+                return XCTFail("expected response-bound rejection, got \(error)")
+            }
+        }
+    }
+
+    func testDocumentHandlerRemovalFailsOnceAndClosesActiveChannel() throws {
+        let channel = EmbeddedChannel()
+        let promise = channel.eventLoop.makePromise(of: OAuthRemoteHTTPResponse.self)
+        let peer = try XCTUnwrap(OAuthIPAddress(literal: "127.0.0.1"))
+        let url = try XCTUnwrap(URL(string: "https://hummingbird.codes/oauth-client-metadata.json"))
+        let handler = OAuthDocumentResponseHandler(
+            responsePromise: promise,
+            expectedPeer: peer,
+            requestURL: url,
+            maximumBodyBytes: 1_024,
+            timeout: 1
+        )
+        try channel.pipeline.syncOperations.addHandler(handler, name: "response")
+        try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 443)).wait()
+        XCTAssertTrue(channel.isActive)
+
+        try channel.pipeline.syncOperations.removeHandler(name: "response").wait()
+        assertRemovalFailure(
+            promise.futureResult,
+            equals: .unavailable("OAuth document response handler was removed before response")
+        )
+        XCTAssertFalse(channel.isActive)
+
+        channel.embeddedEventLoop.advanceTime(by: .seconds(2))
+        assertRemovalFailure(
+            promise.futureResult,
+            equals: .unavailable("OAuth document response handler was removed before response")
+        )
+        _ = handler
+        XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true))
+    }
+
+    func testPostHandlerRemovalFailsOnceAndClosesActiveChannel() throws {
+        let channel = EmbeddedChannel()
+        let promise = channel.eventLoop.makePromise(of: OAuthRemoteHTTPResponse.self)
+        let peer = try XCTUnwrap(OAuthIPAddress(literal: "127.0.0.1"))
+        let url = try XCTUnwrap(URL(string: "https://hummingbird.codes/xrpc/com.atproto.space.notifyWrite"))
+        let handler = PeerPinnedHTTPResponseHandler(
+            responsePromise: promise,
+            expectedPeer: peer,
+            requestURL: url,
+            maximumResponseBodyBytes: 1_024,
+            timeout: 1
+        )
+        try channel.pipeline.syncOperations.addHandler(handler, name: "response")
+        try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 443)).wait()
+        XCTAssertTrue(channel.isActive)
+
+        try channel.pipeline.syncOperations.removeHandler(name: "response").wait()
+        assertRemovalFailure(
+            promise.futureResult,
+            equals: .unavailable("notification response handler was removed before response")
+        )
+        XCTAssertFalse(channel.isActive)
+
+        channel.embeddedEventLoop.advanceTime(by: .seconds(2))
+        assertRemovalFailure(
+            promise.futureResult,
+            equals: .unavailable("notification response handler was removed before response")
+        )
+        _ = handler
+        XCTAssertNoThrow(try channel.finish(acceptAlreadyClosed: true))
+    }
+
+    private func assertRemovalFailure(
+        _ future: EventLoopFuture<OAuthRemoteHTTPResponse>,
+        equals expectedError: SwanError,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertThrowsError(try future.wait(), file: file, line: line) { error in
+            XCTAssertEqual(error as? SwanError, expectedError, file: file, line: line)
+        }
     }
 
     private func makePoster(
@@ -192,6 +323,7 @@ private final class LocalTLSPeer: @unchecked Sendable {
     private let group: MultiThreadedEventLoopGroup
     private let channel: Channel
     private let receipt: LocalTLSReceipt
+    private let disconnectReceipt: LocalTLSReceipt
     private let observation: LocalTLSPeerObservation
 
     private init(
@@ -200,6 +332,7 @@ private final class LocalTLSPeer: @unchecked Sendable {
         group: MultiThreadedEventLoopGroup,
         channel: Channel,
         receipt: LocalTLSReceipt,
+        disconnectReceipt: LocalTLSReceipt,
         observation: LocalTLSPeerObservation
     ) {
         self.peer = peer
@@ -207,17 +340,22 @@ private final class LocalTLSPeer: @unchecked Sendable {
         self.group = group
         self.channel = channel
         self.receipt = receipt
+        self.disconnectReceipt = disconnectReceipt
         self.observation = observation
     }
 
     static func start(
-        responseDelay: TimeAmount = .zero
+        responseDelay: TimeAmount = .zero,
+        responseBody: Data = Data()
     ) async throws -> LocalTLSPeer {
         let peer = try XCTUnwrap(OAuthIPAddress(literal: "127.0.0.1"))
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         do {
             let tlsContext = try NIOSSLContext(configuration: LocalTLSCertificate.serverConfiguration())
             let receipt = LocalTLSReceipt(
+                promise: group.next().makePromise(of: Void.self)
+            )
+            let disconnectReceipt = LocalTLSReceipt(
                 promise: group.next().makePromise(of: Void.self)
             )
             let observation = LocalTLSPeerObservation()
@@ -236,8 +374,10 @@ private final class LocalTLSPeer: @unchecked Sendable {
                         try channel.pipeline.syncOperations.addHandler(
                             LocalTLSResponder(
                                 receipt: receipt,
+                                disconnectReceipt: disconnectReceipt,
                                 observation: observation,
-                                responseDelay: responseDelay
+                                responseDelay: responseDelay,
+                                responseBody: responseBody
                             )
                         )
                         return channel.eventLoop.makeSucceededFuture(())
@@ -254,6 +394,7 @@ private final class LocalTLSPeer: @unchecked Sendable {
                 group: group,
                 channel: channel,
                 receipt: receipt,
+                disconnectReceipt: disconnectReceipt,
                 observation: observation
             )
         } catch {
@@ -279,8 +420,17 @@ private final class LocalTLSPeer: @unchecked Sendable {
         observation.snapshot().completedRequests
     }
 
+    func disconnectCount() -> Int {
+        observation.snapshot().disconnects
+    }
+
+    func waitForDisconnect() async throws {
+        try await disconnectReceipt.value()
+    }
+
     func close() async {
         receipt.failIfPending()
+        disconnectReceipt.failIfPending()
         try? await channel.close().get()
         try? await group.shutdownGracefully()
     }
@@ -291,20 +441,26 @@ private final class LocalTLSResponder: ChannelInboundHandler, @unchecked Sendabl
     typealias OutboundOut = HTTPServerResponsePart
 
     private let receipt: LocalTLSReceipt
+    private let disconnectReceipt: LocalTLSReceipt
     private let observation: LocalTLSPeerObservation
     private let responseDelay: TimeAmount
+    private let responseBody: Data
     private var responded = false
     private weak var handlerContext: ChannelHandlerContext?
     private var responseTask: Scheduled<Void>?
 
     init(
         receipt: LocalTLSReceipt,
+        disconnectReceipt: LocalTLSReceipt,
         observation: LocalTLSPeerObservation,
-        responseDelay: TimeAmount
+        responseDelay: TimeAmount,
+        responseBody: Data
     ) {
         self.receipt = receipt
+        self.disconnectReceipt = disconnectReceipt
         self.observation = observation
         self.responseDelay = responseDelay
+        self.responseBody = responseBody
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
@@ -335,15 +491,23 @@ private final class LocalTLSResponder: ChannelInboundHandler, @unchecked Sendabl
         responseTask?.cancel()
         responseTask = nil
         handlerContext = nil
+        observation.recordDisconnect()
+        disconnectReceipt.succeed()
     }
 
     private func respond() {
         guard let context = handlerContext else { return }
         var headers = HTTPHeaders()
-        headers.add(name: "content-length", value: "0")
+        headers.add(name: "content-length", value: String(responseBody.count))
         headers.add(name: "connection", value: "close")
-        let head = HTTPResponseHead(version: .http1_1, status: .noContent, headers: headers)
+        let status: HTTPResponseStatus = responseBody.isEmpty ? .noContent : .ok
+        let head = HTTPResponseHead(version: .http1_1, status: status, headers: headers)
         context.write(wrapOutboundOut(.head(head)), promise: nil)
+        if !responseBody.isEmpty {
+            var buffer = context.channel.allocator.buffer(capacity: responseBody.count)
+            buffer.writeBytes(responseBody)
+            context.write(wrapOutboundOut(.body(.byteBuffer(buffer))), promise: nil)
+        }
         context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
     }
 
@@ -394,6 +558,7 @@ private final class LocalTLSPeerObservation: @unchecked Sendable {
     private var connections = 0
     private var bodyBytes = 0
     private var completedRequests = 0
+    private var disconnects = 0
 
     func recordConnection() {
         lock.lock()
@@ -413,10 +578,16 @@ private final class LocalTLSPeerObservation: @unchecked Sendable {
         lock.unlock()
     }
 
-    func snapshot() -> (connections: Int, bodyBytes: Int, completedRequests: Int) {
+    func recordDisconnect() {
+        lock.lock()
+        disconnects += 1
+        lock.unlock()
+    }
+
+    func snapshot() -> (connections: Int, bodyBytes: Int, completedRequests: Int, disconnects: Int) {
         lock.lock()
         defer { lock.unlock() }
-        return (connections, bodyBytes, completedRequests)
+        return (connections, bodyBytes, completedRequests, disconnects)
     }
 }
 

@@ -119,6 +119,89 @@ final class RepositoryMSTValidationTests: XCTestCase {
                 .invalidRecordBlock
             )
         }
+
+        // This array has enough one-byte values to meet the byte-derived
+        // lower bound, so its rejection exercises the explicit 65,536-item
+        // container ceiling before Array.reserveCapacity can run.
+        var overCeilingArray = Data([0xa2, 0x65])
+        overCeilingArray.append(Data("$type".utf8))
+        overCeilingArray.append(0x72)
+        overCeilingArray.append(Data(path.collection.utf8))
+        overCeilingArray.append(0x65)
+        overCeilingArray.append(Data("array".utf8))
+        overCeilingArray.append(contentsOf: [0x9a, 0x00, 0x01, 0x00, 0x01])
+        overCeilingArray.append(Data(repeating: 0xf6, count: 65_537))
+        XCTAssertThrowsError(
+            try RepositoryMSTValidation.decodeRecordBlock(
+                overCeilingArray, for: path
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? RepositoryMSTValidationError,
+                .invalidRecordBlock
+            )
+        }
+
+        // This canonical map has a complete payload for every entry. `$type`
+        // precedes the fixed-width keys, which then sort lexicographically,
+        // so removing the explicit map ceiling would make this record decode.
+        var overCeilingMap = Data([0xba, 0x00, 0x01, 0x00, 0x01, 0x65])
+        overCeilingMap.append(Data("$type".utf8))
+        overCeilingMap.append(0x72)
+        overCeilingMap.append(Data(path.collection.utf8))
+        for index in 0 ..< 65_536 {
+            overCeilingMap.append(0x65)
+            overCeilingMap.append(Data(String(format: "%05d", index).utf8))
+            overCeilingMap.append(0xf6)
+        }
+
+        // Prove that the same canonical shape decodes at the exact ceiling;
+        // the hostile map below differs only by its final valid entry.
+        var maximumValidMap = overCeilingMap
+        maximumValidMap.removeLast(7)
+        maximumValidMap.replaceSubrange(1 ..< 5, with: [0x00, 0x01, 0x00, 0x00])
+        guard case let .object(maximumValidValue) = try RepositoryMSTValidation.decodeRecordBlock(
+            maximumValidMap, for: path
+        ) else {
+            return XCTFail("expected canonical map at the container ceiling")
+        }
+        XCTAssertEqual(maximumValidValue.count, 65_536)
+        XCTAssertEqual(maximumValidValue["65534"], .null)
+
+        XCTAssertThrowsError(
+            try RepositoryMSTValidation.decodeRecordBlock(
+                overCeilingMap, for: path
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? RepositoryMSTValidationError,
+                .invalidRecordBlock
+            )
+        }
+    }
+
+    func testDirectRecordDecoderAcceptsOrdinaryMapAndArrayCounts() throws {
+        let path = try PublicRepositoryPath(
+            collection: "app.bsky.feed.post", recordKey: "ordinary-count"
+        )
+
+        // This is a minimal ordinary record with a two-pair top-level map and
+        // a two-element nested array. Both declared counts are exactly backed
+        // by their encoded contents and must continue to decode.
+        var record = Data([0xa2, 0x65])
+        record.append(Data("$type".utf8))
+        record.append(0x72)
+        record.append(Data(path.collection.utf8))
+        record.append(0x65)
+        record.append(Data("array".utf8))
+        record.append(contentsOf: [0x82, 0xf4, 0xf6])
+
+        guard case let .object(value) = try RepositoryMSTValidation.decodeRecordBlock(
+            record, for: path
+        ), case let .array(array)? = value["array"] else {
+            return XCTFail("expected ordinary object with array")
+        }
+        XCTAssertEqual(array, [.bool(false), .null])
     }
 
     func testValidatesCanonicalEmptyRepository() async throws {

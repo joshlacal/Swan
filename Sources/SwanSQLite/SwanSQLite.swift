@@ -600,6 +600,8 @@ public enum SQLiteLayout {
             maximum_record_bytes INTEGER NOT NULL,
             maximum_index_entries INTEGER NOT NULL,
             maximum_unique_blocks INTEGER NOT NULL,
+            maximum_logical_restored_bytes INTEGER NOT NULL
+                CHECK(maximum_logical_restored_bytes BETWEEN 1 AND 268435456),
             status TEXT NOT NULL CHECK(
                 status IN (
                     'receiving', 'verifying', 'verified',
@@ -732,8 +734,62 @@ public enum SQLiteLayout {
             unique_block_count INTEGER NOT NULL CHECK(unique_block_count >= 0),
             verifier_identity TEXT NOT NULL,
             profile_id TEXT NOT NULL,
+            maximum_logical_restored_bytes INTEGER NOT NULL
+                CHECK(maximum_logical_restored_bytes BETWEEN 1 AND 268435456),
             committed_at INTEGER NOT NULL CHECK(committed_at >= 0),
             integrity_digest BLOB NOT NULL CHECK(length(integrity_digest) = 32)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS
+            permissioned_remote_replica_incremental_results (
+            request_id TEXT NOT NULL
+                CHECK(length(request_id) BETWEEN 1 AND 512),
+            request_sequence BLOB NOT NULL CHECK(length(request_sequence) = 8),
+            request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
+            batch_digest BLOB NOT NULL CHECK(length(batch_digest) = 32),
+            receiver_did TEXT NOT NULL,
+            space_uri TEXT NOT NULL,
+            repository_did TEXT NOT NULL,
+            expected_generation INTEGER NOT NULL
+                CHECK(expected_generation > 0),
+            expected_wire_revision TEXT NOT NULL,
+            expected_commitment BLOB NOT NULL
+                CHECK(length(expected_commitment) = 32),
+            expected_marker BLOB NOT NULL CHECK(length(expected_marker) > 0),
+            installed_generation INTEGER NOT NULL
+                CHECK(installed_generation > 0),
+            installed_wire_revision TEXT NOT NULL,
+            installed_history_floor TEXT NOT NULL,
+            installed_lthash BLOB NOT NULL CHECK(length(installed_lthash) = 2048),
+            installed_commitment BLOB NOT NULL
+                CHECK(length(installed_commitment) = 32),
+            installed_marker BLOB NOT NULL CHECK(length(installed_marker) > 0),
+            record_count INTEGER NOT NULL CHECK(record_count >= 0),
+            operation_count INTEGER NOT NULL
+                CHECK(operation_count BETWEEN 1 AND 4096),
+            applied_at INTEGER NOT NULL CHECK(applied_at >= 0),
+            integrity_digest BLOB NOT NULL CHECK(length(integrity_digest) = 32),
+            PRIMARY KEY(receiver_did, space_uri, repository_did, request_id),
+            UNIQUE(receiver_did, space_uri, repository_did, request_sequence)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS
+            permissioned_remote_replica_incremental_progress (
+            receiver_did TEXT NOT NULL,
+            space_uri TEXT NOT NULL,
+            repository_did TEXT NOT NULL,
+            replay_floor BLOB NOT NULL CHECK(length(replay_floor) = 8),
+            high_watermark BLOB NOT NULL CHECK(length(high_watermark) = 8),
+            PRIMARY KEY(receiver_did, space_uri, repository_did)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS
+            permissioned_remote_replica_incremental_results_retention
+        ON permissioned_remote_replica_incremental_results(
+            receiver_did, space_uri, repository_did, request_sequence
         )
         """,
         """
@@ -1164,6 +1220,49 @@ public struct SQLitePortableRestoreRepository: Sendable, Equatable {
     }
 }
 
+@_spi(PortableRestore)
+public struct SQLitePortableRestoreRepositoryMetadata: Sendable, Equatable {
+    public let space: SpaceURI
+    public let author: String
+    public let wireRevision: TID
+    public let recordCount: Int
+    public let logicalRestoredByteCount: Int
+    public let ltHash: Data
+    public let commitment: Data
+
+    public init(
+        space: SpaceURI,
+        author: String,
+        verification: VerifiedStreamingSpaceCARRecovery
+    ) {
+        self.space = space
+        self.author = author
+        wireRevision = verification.wireRevision
+        recordCount = verification.recordCount
+        logicalRestoredByteCount = verification.logicalRestoredByteCount
+        ltHash = verification.ltHash
+        commitment = verification.commitment
+    }
+
+    init(
+        space: SpaceURI,
+        author: String,
+        wireRevision: TID,
+        recordCount: Int,
+        logicalRestoredByteCount: Int,
+        ltHash: Data,
+        commitment: Data
+    ) {
+        self.space = space
+        self.author = author
+        self.wireRevision = wireRevision
+        self.recordCount = recordCount
+        self.logicalRestoredByteCount = logicalRestoredByteCount
+        self.ltHash = ltHash
+        self.commitment = commitment
+    }
+}
+
 public enum PersistedOplogRead: Sendable, Equatable {
     case incremental([PersistedSpaceOplogEntry])
     /// The cursor predates retained operations. These durable facts are the
@@ -1448,10 +1547,12 @@ struct SQLiteTestingHooks: Sendable {
     var beforeBlobReferenceCommit: (@Sendable () async throws -> Void)?
     var beforeLegacyBlobMigrationCommit: (@Sendable () async throws -> Void)?
     var afterBlobReclaimCommit: (@Sendable () async throws -> Void)?
+    var permissionedBlobPublicReachabilityOverride: (@Sendable (String) -> Bool?)?
     var afterPublicRepositoryMutatingSQL: (@Sendable (Int) async throws -> Void)?
     var afterRemoteReplicaMutatingSQL: (@Sendable (Int) async throws -> Void)?
     var beforePermanentDeletionClose: (@Sendable () async throws -> Void)?
     var beforeWireOplogValueMaterialization: (@Sendable () async throws -> Void)?
+    var incrementalReplayRetentionOperationLimit: Int?
 
     init(
         beforeApplyCommit: (@Sendable () async throws -> Void)? = nil,
@@ -1459,20 +1560,26 @@ struct SQLiteTestingHooks: Sendable {
         beforeBlobReferenceCommit: (@Sendable () async throws -> Void)? = nil,
         beforeLegacyBlobMigrationCommit: (@Sendable () async throws -> Void)? = nil,
         afterBlobReclaimCommit: (@Sendable () async throws -> Void)? = nil,
+        permissionedBlobPublicReachabilityOverride: (@Sendable (String) -> Bool?)? = nil,
         afterPublicRepositoryMutatingSQL: (@Sendable (Int) async throws -> Void)? = nil,
         afterRemoteReplicaMutatingSQL: (@Sendable (Int) async throws -> Void)? = nil,
         beforePermanentDeletionClose: (@Sendable () async throws -> Void)? = nil,
-        beforeWireOplogValueMaterialization: (@Sendable () async throws -> Void)? = nil
+        beforeWireOplogValueMaterialization: (@Sendable () async throws -> Void)? = nil,
+        incrementalReplayRetentionOperationLimit: Int? = nil
     ) {
         self.beforeApplyCommit = beforeApplyCommit
         self.afterSnapshotStateRead = afterSnapshotStateRead
         self.beforeBlobReferenceCommit = beforeBlobReferenceCommit
         self.beforeLegacyBlobMigrationCommit = beforeLegacyBlobMigrationCommit
         self.afterBlobReclaimCommit = afterBlobReclaimCommit
+        self.permissionedBlobPublicReachabilityOverride =
+            permissionedBlobPublicReachabilityOverride
         self.afterPublicRepositoryMutatingSQL = afterPublicRepositoryMutatingSQL
         self.afterRemoteReplicaMutatingSQL = afterRemoteReplicaMutatingSQL
         self.beforePermanentDeletionClose = beforePermanentDeletionClose
         self.beforeWireOplogValueMaterialization = beforeWireOplogValueMaterialization
+        self.incrementalReplayRetentionOperationLimit =
+            incrementalReplayRetentionOperationLimit
     }
 }
 
@@ -1506,6 +1613,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let spaceNotificationReceiptMigrationVersion = 7
     private static let permissionedRemoteReplicaResultBindingMigrationVersion = 8
     private static let spaceNotificationReceiptCompactionMigrationVersion = 9
+    private static let accountBlobQuotaMigrationVersion = 10
+    private static let permissionedRemoteReplicaIncrementalSequenceMigrationVersion = 11
+    private static let permissionedRemoteReplicaLogicalLimitMigrationVersion = 12
 
     /// A read credential may register notification recipients, but it must
     /// not be able to turn the later deletion fanout into an unbounded
@@ -1536,6 +1646,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     let dataDirectory: URL
     let accountDID: String
     private let oplogRetention: Int
+    private let blobQuota: AccountBlobQuota
     private let portableExportReadOnly: Bool
     private let descriptorBackedRestore: Bool
     private var accountDirectoryDescriptor: Int32
@@ -1551,6 +1662,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         dataDirectory: URL,
         did: String,
         oplogRetention: Int = 10_000,
+        blobQuota: AccountBlobQuota = .conservative,
         openMode: SQLiteAccountDatabaseOpenMode = .managed
     ) async throws {
         guard oplogRetention > 0 else {
@@ -1687,6 +1799,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             : dataDirectory.standardizedFileURL
         self.accountDID = did
         self.oplogRetention = oplogRetention
+        self.blobQuota = blobQuota
         portableExportReadOnly = readOnly
         descriptorBackedRestore = descriptorBacked
         let openedConnection: SQLiteConnection
@@ -1848,9 +1961,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migrateFileBackedBlobSchemaIfNeeded()
             try await migrateFileBackedBlobLifecycleIfNeeded()
             try await migratePhysicalBlobCASLifecycleIfNeeded()
+            try await migrateAccountBlobQuotaIfNeeded()
             try await migratePublicRepositoryRequestIntegrityIfNeeded()
             try await migratePublicRepositoryImportProjectionBindingIfNeeded()
             try await migratePermissionedRemoteReplicaResultBindingIfNeeded()
+            try await migratePermissionedRemoteReplicaIncrementalSequenceIfNeeded()
+            try await migratePermissionedRemoteReplicaLogicalLimitIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -2096,6 +2212,169 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         )
     }
 
+    /// Legacy incremental replay rows cannot be assigned an authenticated
+    /// per-target sequence after the fact. Refuse to open such a database
+    /// rather than silently converting retained request IDs into reusable
+    /// identities. Empty alpha tables can be rebuilt safely.
+    private func migratePermissionedRemoteReplicaIncrementalSequenceIfNeeded()
+        async throws
+    {
+        let version = Self
+            .permissionedRemoteReplicaIncrementalSequenceMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        let columns = try await connection.query(
+            "PRAGMA table_info(permissioned_remote_replica_incremental_results)"
+        )
+        let names = Set(columns.compactMap { $0.column("name")?.string })
+        if !names.contains("request_sequence") {
+            let rows = try await connection.query(
+                "SELECT COUNT(*) AS count FROM permissioned_remote_replica_incremental_results"
+            )
+            guard rows.first?.column("count")?.integer == 0 else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "legacy incremental replay rows require offline recovery"
+                )
+            }
+            _ = try await connection.query(
+                "DROP TABLE permissioned_remote_replica_incremental_results"
+            )
+            _ = try await connection.query(
+                """
+                CREATE TABLE permissioned_remote_replica_incremental_results (
+                    request_id TEXT NOT NULL
+                        CHECK(length(request_id) BETWEEN 1 AND 512),
+                    request_sequence BLOB NOT NULL
+                        CHECK(length(request_sequence) = 8),
+                    request_digest BLOB NOT NULL
+                        CHECK(length(request_digest) = 32),
+                    batch_digest BLOB NOT NULL
+                        CHECK(length(batch_digest) = 32),
+                    receiver_did TEXT NOT NULL,
+                    space_uri TEXT NOT NULL,
+                    repository_did TEXT NOT NULL,
+                    expected_generation INTEGER NOT NULL
+                        CHECK(expected_generation > 0),
+                    expected_wire_revision TEXT NOT NULL,
+                    expected_commitment BLOB NOT NULL
+                        CHECK(length(expected_commitment) = 32),
+                    expected_marker BLOB NOT NULL
+                        CHECK(length(expected_marker) > 0),
+                    installed_generation INTEGER NOT NULL
+                        CHECK(installed_generation > 0),
+                    installed_wire_revision TEXT NOT NULL,
+                    installed_history_floor TEXT NOT NULL,
+                    installed_lthash BLOB NOT NULL
+                        CHECK(length(installed_lthash) = 2048),
+                    installed_commitment BLOB NOT NULL
+                        CHECK(length(installed_commitment) = 32),
+                    installed_marker BLOB NOT NULL
+                        CHECK(length(installed_marker) > 0),
+                    record_count INTEGER NOT NULL CHECK(record_count >= 0),
+                    operation_count INTEGER NOT NULL
+                        CHECK(operation_count BETWEEN 1 AND 4096),
+                    applied_at INTEGER NOT NULL CHECK(applied_at >= 0),
+                    integrity_digest BLOB NOT NULL
+                        CHECK(length(integrity_digest) = 32),
+                    PRIMARY KEY(
+                        receiver_did, space_uri, repository_did, request_id
+                    ),
+                    UNIQUE(
+                        receiver_did, space_uri, repository_did,
+                        request_sequence
+                    )
+                )
+                """
+            )
+            _ = try await connection.query(
+                """
+                CREATE INDEX
+                    permissioned_remote_replica_incremental_results_retention
+                ON permissioned_remote_replica_incremental_results(
+                    receiver_did, space_uri, repository_did, request_sequence
+                )
+                """
+            )
+        }
+
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
+    /// Full-CAR recovery replay is valid only under the exact resource limits
+    /// that governed the original import. Older schemas did not retain the
+    /// logical restored-byte ceiling, so nonempty legacy session/result tables
+    /// cannot be upgraded without inventing security-relevant state. Empty
+    /// alpha tables are safe to extend in place.
+    private func migratePermissionedRemoteReplicaLogicalLimitIfNeeded()
+        async throws
+    {
+        let version = Self.permissionedRemoteReplicaLogicalLimitMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        let tables = [
+            "permissioned_remote_replica_import_sessions",
+            "permissioned_remote_replica_import_results",
+        ]
+        var missing: [String] = []
+        for table in tables {
+            let columns = try await connection.query("PRAGMA table_info(\(table))")
+            let names = Set(columns.compactMap { $0.column("name")?.string })
+            if !names.contains("maximum_logical_restored_bytes") {
+                missing.append(table)
+            }
+        }
+
+        if !missing.isEmpty {
+            for table in tables {
+                let rows = try await connection.query(
+                    "SELECT COUNT(*) AS count FROM \(table)"
+                )
+                guard rows.first?.column("count")?.integer == 0 else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "legacy remote replica logical-limit bindings require offline recovery"
+                    )
+                }
+            }
+            for table in missing {
+                _ = try await connection.query(
+                    """
+                    ALTER TABLE \(table)
+                    ADD COLUMN maximum_logical_restored_bytes INTEGER NOT NULL
+                        CHECK(maximum_logical_restored_bytes BETWEEN 1 AND 268435456)
+                    """
+                )
+            }
+        }
+
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
     /// Upgrades rows written before the persistence API owned its state marker
     /// and outbox-body construction. The sentinel is committed with the row
     /// rewrites: reopening a current database must validate tampering rather
@@ -2306,6 +2585,49 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             definition: "TEXT"
         )
 
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
+    /// Makes every historical payload measurable by the account quota. SQLite
+    /// computes `length(payload)` without materializing the BLOB in Swift, so
+    /// the migration remains bounded in process memory. The sentinel and all
+    /// metadata repairs commit in the same immediate migration transaction.
+    private func migrateAccountBlobQuotaIfNeeded() async throws {
+        let version = Self.accountBlobQuotaMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        _ = try await connection.query(
+            """
+            UPDATE blob_payloads
+            SET byte_count = length(payload)
+            WHERE storage_kind = 'legacy-sqlite' AND byte_count IS NULL
+            """
+        )
+        let invalid = try await connection.query(
+            """
+            SELECT 1 FROM blob_payloads
+            WHERE byte_count IS NULL OR byte_count < 0
+            LIMIT 1
+            """
+        )
+        guard invalid.isEmpty else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "blob quota metadata is incomplete"
+            )
+        }
         _ = try await connection.query(
             """
             INSERT INTO permissioned_repository_migrations(version, applied_at)
@@ -2871,15 +3193,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 throw PublicRepositoryGenesisStoreError.corruptStoredGenesis
             }
             for cid in [commitCID, dataCID] {
-                let blockRows = try await connection.query(
-                    "SELECT bytes FROM public_repository_blocks WHERE cid = ?",
-                    [.text(cid.string)]
+                let read = try await boundedPublicRepositoryBlock(
+                    connection: connection, cid: cid
                 )
-                guard blockRows.count == 1,
-                      let value = blockRows[0].column("bytes"),
-                      let bytes = Data(sqliteData: value),
-                      (try? PublicRepositoryCID.validate(cid, blockBytes: bytes)) != nil
-                else {
+                guard case let .bytes(bytes) = read,
+                      (try? PublicRepositoryCID.validate(cid, blockBytes: bytes)) != nil else {
                     throw PublicRepositoryGenesisStoreError.corruptStoredGenesis
                 }
             }
@@ -2902,20 +3220,20 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             (genesis.commitCID, genesis.signedCommit),
             (genesis.emptyMSTCID, genesis.emptyMST),
         ] {
-            let existing = try await connection.query(
-                "SELECT bytes FROM public_repository_blocks WHERE cid = ?",
-                [.text(cid.string)]
-            )
-            if let row = existing.first {
-                guard let value = row.column("bytes"),
-                      Data(sqliteData: value) == bytes else {
-                    throw PublicRepositoryGenesisStoreError.corruptStoredGenesis
-                }
-            } else {
+            switch try await boundedPublicRepositoryBlock(
+                connection: connection, cid: cid
+            ) {
+            case .missing:
                 _ = try await connection.query(
                     "INSERT INTO public_repository_blocks(cid, bytes) VALUES (?, ?)",
                     [.text(cid.string), bytes.sqliteData!]
                 )
+            case .oversized:
+                throw PublicRepositoryGenesisStoreError.corruptStoredGenesis
+            case let .bytes(existingBytes):
+                guard existingBytes == bytes else {
+                    throw PublicRepositoryGenesisStoreError.corruptStoredGenesis
+                }
             }
         }
     }
@@ -3351,7 +3669,18 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 }
 
                 let blobCountRows = try await connection.query(
-                    "SELECT COUNT(*) AS row_count FROM blob_namespace_references"
+                    """
+                    SELECT COUNT(*) AS row_count
+                    FROM blob_namespace_references AS reference
+                    WHERE reference.namespace_kind = 'public'
+                       OR EXISTS (
+                           SELECT 1
+                           FROM permissioned_repository_state AS repository
+                           WHERE repository.space_uri = reference.space_uri
+                             AND repository.author_did = ?
+                       )
+                    """,
+                    [.text(accountDID)]
                 )
                 guard blobCountRows.count == 1,
                       case let .integer(blobCount) =
@@ -3364,9 +3693,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 let blobRows = try await connection.query(
                     """
                     SELECT cid, namespace_kind, space_uri
-                    FROM blob_namespace_references
+                    FROM blob_namespace_references AS reference
+                    WHERE reference.namespace_kind = 'public'
+                       OR EXISTS (
+                           SELECT 1
+                           FROM permissioned_repository_state AS repository
+                           WHERE repository.space_uri = reference.space_uri
+                             AND repository.author_did = ?
+                       )
                     ORDER BY namespace_kind, space_uri, cid
-                    """
+                    """,
+                    [.text(accountDID)]
                 )
                 guard blobRows.count == blobCount else {
                     throw SwanError.unavailable(
@@ -3447,6 +3784,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 }
 
                 for repository in ordered {
+                    try Task.checkCancellation()
                     for record in repository.records {
                         _ = try await connection.query(
                             """
@@ -3499,6 +3837,149 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                         ]
                     )
                 }
+            }
+        }
+    }
+
+    /// Installs one already-stream-verified permissioned repository while
+    /// retaining at most a single record value. The scratch actor is local
+    /// descriptor-backed SQLite; no network operation occurs in this
+    /// transaction.
+    @_spi(PortableRestore)
+    public func restorePortableRepositoryStreaming(
+        _ repository: SQLitePortableRestoreRepositoryMetadata,
+        staging: SQLiteSpaceCARRecoveryIndex
+    ) async throws {
+        try requireAccount(repository.author)
+        guard repository.recordCount >= 0,
+              (0 ... SpaceCARRecoveryLimits.absoluteMaximumLogicalRestoredBytes)
+              .contains(repository.logicalRestoredByteCount),
+              repository.ltHash.count == LtHash.byteCount,
+              repository.commitment
+              == Data(SHA256.hash(data: repository.ltHash))
+        else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "portable restore repository state is invalid"
+            )
+        }
+        try await withConnectionGate {
+            try await transaction {
+                let existing = try await connection.query(
+                    """
+                    SELECT 1 FROM permissioned_repository_state
+                    WHERE space_uri = ? AND author_did = ?
+                    LIMIT 1
+                    """,
+                    [.text(repository.space.rawValue), .text(repository.author)]
+                )
+                guard existing.isEmpty else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "portable restore repository inventory is invalid"
+                    )
+                }
+                var cursor: String?
+                var installedCount = 0
+                var installedLogicalByteCount = 0
+                var calculatedLtHash = LtHash()
+                while let staged = try await staging.nextStagedRecord(
+                    afterPath: cursor
+                ) {
+                    try Task.checkCancellation()
+                    let components = staged.path.split(
+                        separator: "/",
+                        omittingEmptySubsequences: false
+                    ).map(String.init)
+                    guard components.count == 2 else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "portable restore record path is invalid"
+                        )
+                    }
+                    let uri = try SpaceRecordURI(
+                        space: repository.space,
+                        author: repository.author,
+                        collection: components[0],
+                        rkey: components[1]
+                    )
+                    try SpaceCARCodec.validateCanonicalRecord(
+                        staged.value,
+                        expectedCID: staged.cid.string
+                    )
+                    let (nextInstalledLogicalByteCount, overflow) =
+                        installedLogicalByteCount.addingReportingOverflow(
+                            staged.value.count
+                        )
+                    guard !overflow,
+                          nextInstalledLogicalByteCount
+                          <= repository.logicalRestoredByteCount,
+                          nextInstalledLogicalByteCount
+                          <= SpaceCARRecoveryLimits
+                          .absoluteMaximumLogicalRestoredBytes
+                    else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "portable restore logical byte budget is invalid"
+                        )
+                    }
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO permissioned_space_records(
+                            space_uri, author_did, collection, rkey,
+                            value, cid, revision
+                        ) VALUES (?, ?, ?, ?, ?, ?, 1)
+                        """,
+                        [
+                            .text(repository.space.rawValue),
+                            .text(repository.author),
+                            .text(uri.collection), .text(uri.rkey),
+                            blob(staged.value), .text(staged.cid.string),
+                        ]
+                    )
+                    calculatedLtHash.add(
+                        element:
+                        "\(uri.collection)/\(uri.rkey)/\(staged.cid.string)"
+                    )
+                    installedCount += 1
+                    installedLogicalByteCount = nextInstalledLogicalByteCount
+                    cursor = staged.path
+                }
+                guard installedCount == repository.recordCount,
+                      installedLogicalByteCount
+                      == repository.logicalRestoredByteCount,
+                      calculatedLtHash.serialized == repository.ltHash,
+                      calculatedLtHash.commitment == repository.commitment
+                else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "portable restore repository state is invalid"
+                    )
+                }
+                let marker = try repositoryStateMarker(
+                    space: repository.space,
+                    author: repository.author,
+                    revision: 1,
+                    wireRevision: repository.wireRevision,
+                    commitment: repository.commitment
+                )
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_repository_state(
+                        space_uri, author_did, revision, wire_revision,
+                        lthash, current_commit
+                    ) VALUES (?, ?, 1, ?, ?, ?)
+                    """,
+                    [
+                        .text(repository.space.rawValue),
+                        .text(repository.author),
+                        .text(repository.wireRevision.toString()),
+                        blob(repository.ltHash), blob(marker),
+                    ]
+                )
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_restored_repository_closures(
+                        space_uri, author_did, reason
+                    ) VALUES (?, ?, 'missing-authority-policy-v1')
+                    """,
+                    [.text(repository.space.rawValue), .text(repository.author)]
+                )
             }
         }
     }
@@ -3593,6 +4074,241 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
     }
 
+    @_spi(PortableRestore)
+    public func validatePortableRestoreStreaming(
+        repositories expected: [SQLitePortableRestoreRepositoryMetadata]
+    ) async throws {
+        let ordered = expected.sorted {
+            ($0.space.rawValue, $0.author) < ($1.space.rawValue, $1.author)
+        }
+        guard ordered == expected,
+              Set(ordered.map { "\($0.space.rawValue)\u{0}\($0.author)" }).count
+                == ordered.count else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "portable restore repository inventory is invalid"
+            )
+        }
+        try await withConnectionGate {
+            try await readTransaction {
+                for repository in ordered {
+                    try Task.checkCancellation()
+                    guard repository.recordCount >= 0,
+                          (0 ... SpaceCARRecoveryLimits
+                            .absoluteMaximumLogicalRestoredBytes)
+                            .contains(repository.logicalRestoredByteCount),
+                          repository.ltHash.count == LtHash.byteCount,
+                          repository.commitment
+                            == Data(SHA256.hash(data: repository.ltHash))
+                    else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "portable restore repository validation failed"
+                        )
+                    }
+                    guard let state = try await loadState(
+                        space: repository.space,
+                        author: repository.author
+                    ),
+                        state.revision == 1,
+                        state.wireRevision == repository.wireRevision,
+                        state.ltHash == repository.ltHash,
+                        state.commitment == repository.commitment
+                    else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "portable restore repository validation failed"
+                        )
+                    }
+                    var cursorCollection: String?
+                    var cursorRKey: String?
+                    var count = 0
+                    var logicalRestoredByteCount = 0
+                    var ltHash = LtHash()
+                    while true {
+                        try Task.checkCancellation()
+                        let rows: [SQLiteRow]
+                        if let cursorCollection, let cursorRKey {
+                            rows = try await connection.query(
+                                """
+                                SELECT collection, rkey, cid,
+                                       length(value) AS value_byte_count
+                                FROM permissioned_space_records
+                                WHERE space_uri = ? AND author_did = ?
+                                  AND (collection > ? OR (collection = ? AND rkey > ?))
+                                ORDER BY collection, rkey
+                                LIMIT 256
+                                """,
+                                [
+                                    .text(repository.space.rawValue),
+                                    .text(repository.author),
+                                    .text(cursorCollection),
+                                    .text(cursorCollection), .text(cursorRKey),
+                                ]
+                            )
+                        } else {
+                            rows = try await connection.query(
+                                """
+                                SELECT collection, rkey, cid,
+                                       length(value) AS value_byte_count
+                                FROM permissioned_space_records
+                                WHERE space_uri = ? AND author_did = ?
+                                ORDER BY collection, rkey
+                                LIMIT 256
+                                """,
+                                [
+                                    .text(repository.space.rawValue),
+                                    .text(repository.author),
+                                ]
+                            )
+                        }
+                        guard !rows.isEmpty else { break }
+                        for row in rows {
+                            try Task.checkCancellation()
+                            let collection = try requiredText(row, "collection")
+                            let rkey = try requiredText(row, "rkey")
+                            let cid = try requiredText(row, "cid")
+                            let valueByteCount = try requiredNonnegativeInteger(
+                                row,
+                                "value_byte_count"
+                            )
+                            guard valueByteCount
+                                    <= SpaceCARRecoveryLimits
+                                        .absoluteMaximumRecordBytes
+                            else {
+                                throw SQLiteRepositoryError.corruptDatabase(
+                                    "portable restore repository validation failed"
+                                )
+                            }
+                            _ = try SpaceRecordURI(
+                                space: repository.space,
+                                author: repository.author,
+                                collection: collection,
+                                rkey: rkey
+                            )
+                            let valueRows = try await connection.query(
+                                """
+                                SELECT value
+                                FROM permissioned_space_records
+                                WHERE space_uri = ? AND author_did = ?
+                                  AND collection = ? AND rkey = ?
+                                  AND length(value) = ?
+                                  AND length(value) <= ?
+                                LIMIT 1
+                                """,
+                                [
+                                    .text(repository.space.rawValue),
+                                    .text(repository.author),
+                                    .text(collection), .text(rkey),
+                                    .integer(valueByteCount),
+                                    .integer(
+                                        SpaceCARRecoveryLimits
+                                            .absoluteMaximumRecordBytes
+                                    ),
+                                ]
+                            )
+                            guard valueRows.count == 1,
+                                  let valueRow = valueRows.first else {
+                                throw SQLiteRepositoryError.corruptDatabase(
+                                    "portable restore repository validation failed"
+                                )
+                            }
+                            let value = try requiredBlob(valueRow, "value")
+                            guard value.count == valueByteCount else {
+                                throw SQLiteRepositoryError.corruptDatabase(
+                                    "portable restore repository validation failed"
+                                )
+                            }
+                            do {
+                                try SpaceCARCodec.validateCanonicalRecord(
+                                    value,
+                                    expectedCID: cid
+                                )
+                            } catch {
+                                throw SQLiteRepositoryError.corruptDatabase(
+                                    "portable restore repository validation failed"
+                                )
+                            }
+                            let (nextLogicalRestoredByteCount, overflow) =
+                                logicalRestoredByteCount.addingReportingOverflow(
+                                    value.count
+                                )
+                            guard !overflow,
+                                  nextLogicalRestoredByteCount
+                                    <= repository.logicalRestoredByteCount,
+                                  nextLogicalRestoredByteCount
+                                    <= SpaceCARRecoveryLimits
+                                        .absoluteMaximumLogicalRestoredBytes
+                            else {
+                                throw SQLiteRepositoryError.corruptDatabase(
+                                    "portable restore repository validation failed"
+                                )
+                            }
+                            ltHash.add(element: "\(collection)/\(rkey)/\(cid)")
+                            count += 1
+                            logicalRestoredByteCount =
+                                nextLogicalRestoredByteCount
+                            cursorCollection = collection
+                            cursorRKey = rkey
+                        }
+                    }
+                    guard count == repository.recordCount,
+                          logicalRestoredByteCount
+                            == repository.logicalRestoredByteCount,
+                          ltHash.serialized == repository.ltHash,
+                          ltHash.commitment == repository.commitment
+                    else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "portable restore repository validation failed"
+                        )
+                    }
+                }
+                let closures = try await connection.query(
+                    """
+                    SELECT space_uri, author_did, reason
+                    FROM permissioned_restored_repository_closures
+                    ORDER BY space_uri, author_did
+                    """
+                )
+                guard closures.count == ordered.count else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "portable restore closure inventory is invalid"
+                    )
+                }
+                for (row, repository) in zip(closures, ordered) {
+                    guard try requiredText(row, "space_uri")
+                        == repository.space.rawValue,
+                        try requiredText(row, "author_did")
+                        == repository.author,
+                        try requiredText(row, "reason")
+                        == "missing-authority-policy-v1"
+                    else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "portable restore closure inventory is invalid"
+                        )
+                    }
+                }
+                for table in [
+                    "permissioned_space_oplog",
+                    "permissioned_space_requests",
+                    "permissioned_space_outbox",
+                    "permissioned_simple_space_authorities",
+                    "permissioned_simple_space_members",
+                    "permissioned_simple_space_clients",
+                    "permissioned_simple_space_managing_app_decisions",
+                    "permissioned_space_writers",
+                    "permissioned_space_notification_registrations",
+                ] {
+                    let unexpected = try await connection.query(
+                        "SELECT 1 FROM \(table) LIMIT 1"
+                    )
+                    guard unexpected.isEmpty else {
+                        throw SQLiteRepositoryError.corruptDatabase(
+                            "portable restore fabricated policy or delivery state"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     /// Restores one verified blob under its manifest-selected namespace while
     /// preserving either a current raw CID or the alpha's legacy sha256 label.
     @_spi(PortableRestore)
@@ -3639,6 +4355,110 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 restoreRepositorySpace: restoreRepositorySpace
             )
         }
+    }
+
+    @_spi(PortableRestore)
+    public func restorePortableBlobStreaming(
+        expectedCID: String,
+        expectedByteCount: Int,
+        namespace: BlobNamespace,
+        source: @escaping @Sendable (
+            @escaping (Data) async throws -> Void
+        ) async throws -> Void
+    ) async throws -> BlobReference {
+        guard expectedByteCount >= 0,
+              expectedByteCount <= 512 * 1024 * 1024
+        else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "portable restore blob length is invalid"
+            )
+        }
+        let spoolHandle = try SQLiteProtectedPaths
+            .makeUnlinkedPortableRestoreBlobSpool(
+                accountDirectoryDescriptor: accountDirectoryDescriptor
+            )
+        let spool = SQLiteBlobUploadSpool(
+            handle: spoolHandle,
+            maximumBytes: max(expectedByteCount, 1)
+        )
+        defer { spool.close() }
+        let sink: (Data) async throws -> Void = { chunk in
+            try Task.checkCancellation()
+            try spool.append(chunk)
+        }
+        try await source(sink)
+        let summary = try spool.finish()
+        guard summary.byteCount == expectedByteCount else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "portable restore blob length is invalid"
+            )
+        }
+        let digestHex = Hex.encode(summary.digest)
+        let rawCID = CID(
+            codec: .raw,
+            multihash: Multihash(
+                algorithm: Multihash.sha256Code,
+                length: Multihash.sha256Length,
+                digest: summary.digest
+            )
+        ).string
+        guard expectedCID == rawCID
+            || expectedCID == "sha256:\(digestHex)"
+        else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "portable restore blob CID is invalid"
+            )
+        }
+        let columns = blobNamespaceColumns(namespace)
+        let restoreRepositorySpace: SpaceURI?
+        switch namespace {
+        case .public: restoreRepositorySpace = nil
+        case let .space(space): restoreRepositorySpace = space
+        }
+        try Task.checkCancellation()
+        return try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
+            try await putBlobLocked(
+                .file(
+                    descriptor: spool.fileDescriptor,
+                    length: summary.byteCount,
+                    digest: summary.digest
+                ),
+                cid: expectedCID,
+                digestHex: digestHex,
+                byteCount: summary.byteCount,
+                namespace: namespace,
+                namespaceKind: columns.kind,
+                spaceURI: columns.spaceURI,
+                mimeType: nil,
+                restoreRepositorySpace: restoreRepositorySpace
+            )
+        }
+    }
+
+    @_spi(PortableRestore)
+    public func validatePortableBlob(
+        _ reference: BlobReference,
+        expectedByteCount: Int
+    ) async throws {
+        let columns = blobNamespaceColumns(reference.namespace)
+        let stored = try await blobPayload(
+            cid: reference.cid,
+            namespaceKind: columns.kind,
+            spaceURI: columns.spaceURI,
+            includeLegacyPayload: false
+        )
+        guard stored.storageKind == .casV1,
+              stored.byteCount == expectedByteCount,
+              let digestHex = stored.casDigest
+        else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "portable restore blob validation failed"
+            )
+        }
+        try verifyPrivateBlobFile(
+            digestHex: digestHex,
+            expectedLength: expectedByteCount
+        )
     }
 
     /// Builds a private, bounded-memory CAR suffix from one SQLite read
@@ -6591,6 +7411,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                             restoreRepositorySpace
                         )
                     }
+                    try await admitBlobQuotaWithoutGate(
+                        cid: cid,
+                        byteCount: byteCount,
+                        references: [(
+                            namespaceKind: namespaceKind,
+                            spaceURI: spaceURI,
+                        )]
+                    )
                     _ = try await connection.query(
                         """
                         INSERT INTO blob_payloads(
@@ -6630,6 +7458,92 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             throw error
         }
         return BlobReference(cid: cid, namespace: namespace)
+    }
+
+    /// Admits one payload and every planned reference edge against the
+    /// committed account graph.
+    /// The caller owns `BEGIN IMMEDIATE`, so two actors or processes cannot
+    /// both observe the same remaining capacity and oversubscribe it. Existing
+    /// payloads and exact references contribute zero, preserving CAS dedup.
+    private func admitBlobQuotaWithoutGate(
+        cid: String,
+        byteCount: Int,
+        references: [(namespaceKind: String, spaceURI: String)]
+    ) async throws {
+        let existingPayload = try await connection.query(
+            "SELECT byte_count FROM blob_payloads WHERE cid = ? LIMIT 1",
+            [.text(cid)]
+        )
+        if let row = existingPayload.first {
+            guard let storedByteCount = row.column("byte_count")?.integer,
+                  storedByteCount == byteCount
+            else {
+                throw SQLiteRepositoryError.corruptDatabase(
+                    "blob quota payload metadata does not match content"
+                )
+            }
+        }
+        var addedReferences = 0
+        var uniqueReferences = Set<String>()
+        for reference in references {
+            let key = "\(reference.namespaceKind)\u{0}\(reference.spaceURI)"
+            guard uniqueReferences.insert(key).inserted else { continue }
+            let existingReference = try await connection.query(
+                """
+                SELECT 1 FROM blob_namespace_references
+                WHERE cid = ? AND namespace_kind = ? AND space_uri = ?
+                LIMIT 1
+                """,
+                [
+                    .text(cid), .text(reference.namespaceKind),
+                    .text(reference.spaceURI),
+                ]
+            )
+            if existingReference.isEmpty {
+                let (next, overflow) = addedReferences.addingReportingOverflow(1)
+                guard !overflow else {
+                    throw SQLiteRepositoryError.corruptDatabase(
+                        "blob quota reference plan overflowed"
+                    )
+                }
+                addedReferences = next
+            }
+        }
+        let usageRows = try await connection.query(
+            """
+            SELECT
+                COALESCE((SELECT SUM(byte_count) FROM blob_payloads), 0)
+                    AS unique_bytes,
+                (SELECT COUNT(*) FROM blob_namespace_references)
+                    AS reference_count
+            """
+        )
+        guard usageRows.count == 1,
+              let uniqueBytes = usageRows[0].column("unique_bytes")?.integer,
+              let referenceCount = usageRows[0].column("reference_count")?.integer,
+              uniqueBytes >= 0, referenceCount >= 0
+        else {
+            throw SQLiteRepositoryError.corruptDatabase(
+                "blob quota usage is invalid"
+            )
+        }
+        let addedBytes = existingPayload.isEmpty ? byteCount : 0
+        let (admittedBytes, byteOverflow) = uniqueBytes.addingReportingOverflow(
+            addedBytes
+        )
+        guard !byteOverflow, admittedBytes <= blobQuota.maximumUniqueBytes else {
+            throw BlobQuotaError.uniqueBytesExceeded(
+                limit: blobQuota.maximumUniqueBytes
+            )
+        }
+        let (admittedReferences, referenceOverflow) = referenceCount
+            .addingReportingOverflow(addedReferences)
+        guard !referenceOverflow,
+              admittedReferences <= blobQuota.maximumReferences else {
+            throw BlobQuotaError.referenceCountExceeded(
+                limit: blobQuota.maximumReferences
+            )
+        }
     }
 
     private func blobStorageKindWithoutGate(
@@ -8845,17 +9759,6 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     ) async throws {
         for cid in cids {
             _ = try canonicalRawBlobCID(cid)
-            let privateReferences = try await connection.query(
-                """
-                SELECT 1
-                FROM blob_namespace_references
-                WHERE cid = ? AND namespace_kind = 'space' AND space_uri = ?
-                LIMIT 1
-                """,
-                [.text(cid), .text(space.rawValue)]
-            )
-            if !privateReferences.isEmpty { continue }
-
             let payloadRows = try await connection.query(
                 """
                 SELECT blob_payloads.storage_kind, blob_payloads.cas_digest,
@@ -8877,6 +9780,38 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 )
             }
 
+            let retainPublicReference: Bool
+            if let override = testingHooks
+                .permissionedBlobPublicReachabilityOverride?(cid) {
+                retainPublicReference = override
+            } else {
+                retainPublicReference = try await
+                    publicRepositoryContainsBlobCIDWithoutGate(cid)
+            }
+            if !retainPublicReference {
+                // Cleanup is deliberately before the idempotent private
+                // insert. Re-uploading a CID recreates the staged public edge;
+                // an existing private edge must never bypass its removal.
+                _ = try await connection.query(
+                    """
+                    DELETE FROM blob_namespace_references
+                    WHERE cid = ? AND namespace_kind = 'public' AND space_uri = ''
+                    """,
+                    [.text(cid)]
+                )
+            }
+            var plannedReferences = [(
+                namespaceKind: "space",
+                spaceURI: space.rawValue,
+            )]
+            if retainPublicReference {
+                plannedReferences.append((namespaceKind: "public", spaceURI: ""))
+            }
+            try await admitBlobQuotaWithoutGate(
+                cid: cid,
+                byteCount: Int(byteCount),
+                references: plannedReferences
+            )
             _ = try await connection.query(
                 """
                 INSERT INTO blob_namespace_references(
@@ -8886,21 +9821,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 """,
                 [.text(cid), .text(space.rawValue)]
             )
-            if try await publicRepositoryContainsBlobCIDWithoutGate(cid) {
+            if retainPublicReference {
                 _ = try await connection.query(
                     """
                     INSERT INTO blob_namespace_references(
                         cid, namespace_kind, space_uri
                     ) VALUES (?, 'public', '')
                     ON CONFLICT(cid, namespace_kind, space_uri) DO NOTHING
-                    """,
-                    [.text(cid)]
-                )
-            } else {
-                _ = try await connection.query(
-                    """
-                    DELETE FROM blob_namespace_references
-                    WHERE cid = ? AND namespace_kind = 'public' AND space_uri = ''
                     """,
                     [.text(cid)]
                 )

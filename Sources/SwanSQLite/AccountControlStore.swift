@@ -19,6 +19,7 @@ extension SQLiteControlDatabase {
     /// number of expired rows per request.
     static let maximumEmailRateLimitEntries = 4_096
     static let emailRateLimitPurgeBatchSize = 512
+    static let emailRecoveryPurgeBatchSize = 256
     private static let legacyEmailRateLimitWindowMicroseconds =
         86_400 * 1_000_000
 
@@ -332,6 +333,7 @@ extension SQLiteControlDatabase {
                 lookup_digest BLOB PRIMARY KEY CHECK(length(lookup_digest) = 32),
                 expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
                 created_at INTEGER NOT NULL CHECK(created_at >= 0),
+                account_candidate INTEGER NOT NULL DEFAULT 0 CHECK(account_candidate IN (0, 1)),
                 delivery_id TEXT,
                 proof_digest BLOB,
                 email_envelope BLOB,
@@ -344,6 +346,11 @@ extension SQLiteControlDatabase {
         // Older alpha databases had only the three marker columns. Add the
         // asynchronous queue fields without attempting to infer or revive
         // legacy requests whose bearer material was never persisted.
+        try await addColumnIfMissing(
+            table: "account_password_recovery_work",
+            column: "account_candidate",
+            definition: "INTEGER NOT NULL DEFAULT 0 CHECK(account_candidate IN (0, 1))"
+        )
         try await addColumnIfMissing(
             table: "account_password_recovery_work",
             column: "delivery_id",
@@ -842,17 +849,49 @@ extension SQLiteControlDatabase {
                 guard existingMarker.count <= 1 else {
                     throw AccountControlStoreError.malformedRecord
                 }
+                // Perform the same indexed lookup for every canonical
+                // request. The HTTP layer retains its bounded response floor,
+                // and only this one-bit capacity class is stored; the
+                // plaintext address is never written to the marker.
+                let accountRows = try await connection.query(
+                    """
+                    SELECT 1
+                    FROM account_emails AS e
+                    JOIN accounts AS a ON a.did = e.did
+                    WHERE e.email = ?
+                      AND e.verified_at IS NOT NULL
+                      AND a.status = 'active'
+                    LIMIT 2
+                    """,
+                    [.text(request.email.value)]
+                )
+                guard accountRows.count <= 1 else {
+                    throw AccountControlStoreError.malformedRecord
+                }
+                let accountCandidate = !accountRows.isEmpty
                 if existingMarker.isEmpty {
                     let countRows = try await connection.query(
-                        "SELECT COUNT(*) AS row_count FROM account_password_recovery_work"
+                        """
+                        SELECT COUNT(*) AS row_count,
+                               COALESCE(SUM(CASE WHEN account_candidate = 0 THEN 1 ELSE 0 END), 0)
+                                   AS anonymous_count
+                        FROM account_password_recovery_work
+                        """
                     )
                     guard countRows.count == 1,
                           case let .integer(rowCount) =
                               countRows[0].column("row_count"),
-                          rowCount >= 0 else {
+                          case let .integer(anonymousCount) =
+                              countRows[0].column("anonymous_count"),
+                          rowCount >= 0,
+                          anonymousCount >= 0 else {
                         throw AccountControlStoreError.malformedRecord
                     }
-                    guard rowCount < Self.maximumPasswordRecoveryWorkMarkers else {
+                    let anonymousLimit =
+                        Self.maximumPasswordRecoveryWorkMarkers
+                        - Self.passwordRecoveryKnownAccountReserve
+                    guard rowCount < Self.maximumPasswordRecoveryWorkMarkers,
+                          accountCandidate || anonymousCount < anonymousLimit else {
                         // The HTTP layer collapses this with all other
                         // account-dependent recovery outcomes. Rejecting the
                         // new marker keeps the blind response contract while
@@ -865,13 +904,14 @@ extension SQLiteControlDatabase {
                 _ = try await connection.query(
                     """
                     INSERT INTO account_password_recovery_work(
-                        lookup_digest, expires_at, created_at,
+                        lookup_digest, expires_at, created_at, account_candidate,
                         delivery_id, proof_digest, email_envelope,
                         lease_owner, lease_expires_at, attempts
-                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0)
                     ON CONFLICT(lookup_digest) DO UPDATE SET
                         expires_at = excluded.expires_at,
                         created_at = excluded.created_at,
+                        account_candidate = excluded.account_candidate,
                         delivery_id = excluded.delivery_id,
                         proof_digest = excluded.proof_digest,
                         email_envelope = excluded.email_envelope,
@@ -883,6 +923,7 @@ extension SQLiteControlDatabase {
                         blob(request.lookupDigest),
                         .integer(expiry),
                         .integer(created),
+                        .integer(accountCandidate ? 1 : 0),
                         .text(request.deliveryID.rawValue),
                         blob(request.proofDigest),
                         blob(request.emailEnvelope),
@@ -1174,9 +1215,19 @@ extension SQLiteControlDatabase {
                         lease_owner = NULL,
                         lease_expires_at = NULL,
                         send_started_at = NULL
-                    WHERE state = 'leased' AND lease_expires_at <= ?
+                    WHERE delivery_id IN (
+                        SELECT delivery_id
+                        FROM account_email_delivery_outbox
+                        WHERE state = 'leased'
+                          AND lease_expires_at <= ?
+                        ORDER BY lease_expires_at, created_at, delivery_id
+                        LIMIT ?
+                    )
                     """,
-                    [.integer(timestamp)]
+                    [
+                        .integer(timestamp),
+                        .integer(Self.emailRecoveryPurgeBatchSize),
+                    ]
                 )
                 let candidates = try await connection.query(
                     """
@@ -2209,6 +2260,24 @@ extension SQLiteControlDatabase {
                     from: account.status,
                     to: status
                 )
+                if status.authorizesAccount, !account.status.authorizesAccount {
+                    let recoveryResidue = try await connection.query(
+                        """
+                        SELECT 1
+                        FROM account_email_tokens
+                        WHERE did = ?
+                        UNION ALL
+                        SELECT 1
+                        FROM account_email_delivery_outbox
+                        WHERE did = ?
+                        LIMIT 1
+                        """,
+                        [.text(did), .text(did)]
+                    )
+                    guard recoveryResidue.isEmpty else {
+                        throw AccountControlStoreError.invalidTransition
+                    }
+                }
                 guard declaration.tombstone == nil else {
                     throw AccountControlStoreError.invalidInput
                 }
@@ -2249,16 +2318,14 @@ extension SQLiteControlDatabase {
                 }
                 if !status.authorizesAccount {
                     // Suspension/deactivation is also a recovery-proof
-                    // revocation boundary. Otherwise a proof issued before
-                    // the lifecycle change could become usable again after a
-                    // later reactivation.
-                    _ = try await connection.query(
-                        "DELETE FROM account_email_tokens WHERE did = ?",
-                        [.text(did)]
-                    )
-                    _ = try await connection.query(
-                        "DELETE FROM account_email_delivery_outbox WHERE did = ?",
-                        [.text(did)]
+                    // revocation boundary. Account status rejects the proof
+                    // immediately; cleanup is page-limited so one account
+                    // cannot monopolize the shared write transaction. A
+                    // repeated inactive transition drains another page, and
+                    // reactivation remains blocked until no residue remains.
+                    try await purgeEmailRecoveryStateForInactiveAccountLocked(
+                        did: did,
+                        timestamp: timestamp
                     )
                     if account.status.authorizesAccount {
                         // Families are created before authorization-code
@@ -2376,17 +2443,38 @@ extension SQLiteControlDatabase {
         _ = try await connection.query(
             """
             DELETE FROM account_email_delivery_outbox
-            WHERE expires_at <= ?
-              AND NOT (
-                  send_started_at IS NOT NULL
-                  AND (lease_expires_at IS NULL OR lease_expires_at > ?)
-              )
+            WHERE delivery_id IN (
+                SELECT delivery_id
+                FROM account_email_delivery_outbox
+                WHERE expires_at <= ?
+                  AND NOT (
+                      send_started_at IS NOT NULL
+                      AND (lease_expires_at IS NULL OR lease_expires_at > ?)
+                  )
+                ORDER BY expires_at, created_at, delivery_id
+                LIMIT ?
+            )
             """,
-            [.integer(timestamp), .integer(timestamp)]
+            [
+                .integer(timestamp), .integer(timestamp),
+                .integer(Self.emailRecoveryPurgeBatchSize),
+            ]
         )
         _ = try await connection.query(
-            "DELETE FROM account_email_tokens WHERE expires_at <= ?",
-            [.integer(timestamp)]
+            """
+            DELETE FROM account_email_tokens
+            WHERE digest IN (
+                SELECT digest
+                FROM account_email_tokens
+                WHERE expires_at <= ?
+                ORDER BY expires_at, digest
+                LIMIT ?
+            )
+            """,
+            [
+                .integer(timestamp),
+                .integer(Self.emailRecoveryPurgeBatchSize),
+            ]
         )
         _ = try await connection.query(
             """
@@ -2419,6 +2507,48 @@ extension SQLiteControlDatabase {
                 .integer(timestamp),
                 .integer(Self.emailRateLimitPurgeBatchSize),
             ]
+        )
+    }
+
+    private func purgeEmailRecoveryStateForInactiveAccountLocked(
+        did: String,
+        timestamp: Int
+    ) async throws {
+        guard AccountControlIdentifiers.isDID(did), timestamp >= 0 else {
+            throw AccountControlStoreError.invalidInput
+        }
+        _ = try await connection.query(
+            """
+            DELETE FROM account_email_delivery_outbox
+            WHERE delivery_id IN (
+                SELECT delivery_id
+                FROM account_email_delivery_outbox
+                WHERE did = ?
+                  AND NOT (
+                      send_started_at IS NOT NULL
+                      AND (lease_expires_at IS NULL OR lease_expires_at > ?)
+                  )
+                ORDER BY expires_at, created_at, delivery_id
+                LIMIT ?
+            )
+            """,
+            [
+                .text(did), .integer(timestamp),
+                .integer(Self.emailRecoveryPurgeBatchSize),
+            ]
+        )
+        _ = try await connection.query(
+            """
+            DELETE FROM account_email_tokens
+            WHERE digest IN (
+                SELECT digest
+                FROM account_email_tokens
+                WHERE did = ?
+                ORDER BY expires_at, digest
+                LIMIT ?
+            )
+            """,
+            [.text(did), .integer(Self.emailRecoveryPurgeBatchSize)]
         )
     }
 

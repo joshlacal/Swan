@@ -18,16 +18,19 @@ public struct SwanAuthenticatedSimpleSpaceLifecycleCapability: Sendable {
     let directory: any AuthorizedSimpleSpaceLifecycleDirectory
     let tidAllocator: SwanPermissionedTIDAllocator
     let jsonWriteAdmission: PublicRepositoryJSONWriteAdmission
+    let jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy
 
     init(
         authorizer: SwanOAuthResourceAuthorizer,
         directory: any AuthorizedSimpleSpaceLifecycleDirectory,
-        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .processShared
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .processShared,
+        jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy = .productionDefault
     ) {
         self.authorizer = authorizer
         self.directory = directory
         tidAllocator = SwanPermissionedTIDAllocator()
         self.jsonWriteAdmission = jsonWriteAdmission
+        self.jsonWriteBodyPolicy = jsonWriteBodyPolicy
     }
 }
 
@@ -267,22 +270,19 @@ private func registerSimpleSpaceCreate(
 ) {
     let handler = AuthenticatedSimpleSpaceCreateHandler(capability: capability)
     let path: RouterPath = "/xrpc/com.atproto.simplespace.createSpace"
-    router.post(path) { request, _ async -> Response in
-        do {
-            let input: ComAtprotoSimplespaceCreateSpace.Input = try await decodeSimpleSpaceInput(
-                request,
-                admission: capability.jsonWriteAdmission,
-                required: ["did", "type"],
-                allowed: ["did", "type", "skey", "config"]
-            )
-            return authenticatedGetSpaceJSON(
+    router.post(path) { request, context async -> Response in
+        await withSimpleSpaceInput(
+            request,
+            context: context,
+            as: ComAtprotoSimplespaceCreateSpace.Input.self,
+            capability: capability,
+            required: ["did", "type"],
+            allowed: ["did", "type", "skey", "config"]
+        ) { input in
+            authenticatedGetSpaceJSON(
                 .ok,
                 try await handler.handle(parameters: (), input: input, context: request)
             )
-        } catch let failure as AuthenticatedSimpleSpaceLifecycleFailure {
-            return simpleSpaceLifecycleResponse(for: failure, capability: capability)
-        } catch {
-            return simpleSpaceLifecycleError(.badRequest, code: "InvalidRequest")
         }
     }
     registerSimpleSpaceWrongMethods(on: router, path: path, liveMethod: .post)
@@ -294,20 +294,17 @@ private func registerSimpleSpaceUpdate(
 ) {
     let handler = AuthenticatedSimpleSpaceUpdateHandler(capability: capability)
     let path: RouterPath = "/xrpc/com.atproto.simplespace.updateSpace"
-    router.post(path) { request, _ async -> Response in
-        do {
-            let input: ComAtprotoSimplespaceUpdateSpace.Input = try await decodeSimpleSpaceInput(
-                request,
-                admission: capability.jsonWriteAdmission,
-                required: ["space"],
-                allowed: ["space", "policy", "managingApp", "appAccess"]
-            )
+    router.post(path) { request, context async -> Response in
+        await withSimpleSpaceInput(
+            request,
+            context: context,
+            as: ComAtprotoSimplespaceUpdateSpace.Input.self,
+            capability: capability,
+            required: ["space"],
+            allowed: ["space", "policy", "managingApp", "appAccess"]
+        ) { input in
             _ = try await handler.handle(parameters: (), input: input, context: request)
             return Response(status: .ok, headers: [.cacheControl: "no-store"])
-        } catch let failure as AuthenticatedSimpleSpaceLifecycleFailure {
-            return simpleSpaceLifecycleResponse(for: failure, capability: capability)
-        } catch {
-            return simpleSpaceLifecycleError(.badRequest, code: "InvalidRequest")
         }
     }
     registerSimpleSpaceWrongMethods(on: router, path: path, liveMethod: .post)
@@ -319,20 +316,17 @@ private func registerSimpleSpaceDelete(
 ) {
     let handler = AuthenticatedSimpleSpaceDeleteHandler(capability: capability)
     let path: RouterPath = "/xrpc/com.atproto.simplespace.deleteSpace"
-    router.post(path) { request, _ async -> Response in
-        do {
-            let input: ComAtprotoSimplespaceDeleteSpace.Input = try await decodeSimpleSpaceInput(
-                request,
-                admission: capability.jsonWriteAdmission,
-                required: ["space"],
-                allowed: ["space"]
-            )
+    router.post(path) { request, context async -> Response in
+        await withSimpleSpaceInput(
+            request,
+            context: context,
+            as: ComAtprotoSimplespaceDeleteSpace.Input.self,
+            capability: capability,
+            required: ["space"],
+            allowed: ["space"]
+        ) { input in
             _ = try await handler.handle(parameters: (), input: input, context: request)
             return Response(status: .ok, headers: [.cacheControl: "no-store"])
-        } catch let failure as AuthenticatedSimpleSpaceLifecycleFailure {
-            return simpleSpaceLifecycleResponse(for: failure, capability: capability)
-        } catch {
-            return simpleSpaceLifecycleError(.badRequest, code: "InvalidRequest")
         }
     }
     registerSimpleSpaceWrongMethods(on: router, path: path, liveMethod: .post)
@@ -344,20 +338,17 @@ private func registerSimpleSpaceAddMember(
 ) {
     let handler = AuthenticatedSimpleSpaceAddMemberHandler(capability: capability)
     let path: RouterPath = "/xrpc/com.atproto.simplespace.addMember"
-    router.post(path) { request, _ async -> Response in
-        do {
-            let input: ComAtprotoSimplespaceAddMember.Input = try await decodeSimpleSpaceInput(
-                request,
-                admission: capability.jsonWriteAdmission,
-                required: ["space", "did"],
-                allowed: ["space", "did"]
-            )
+    router.post(path) { request, context async -> Response in
+        await withSimpleSpaceInput(
+            request,
+            context: context,
+            as: ComAtprotoSimplespaceAddMember.Input.self,
+            capability: capability,
+            required: ["space", "did"],
+            allowed: ["space", "did"]
+        ) { input in
             _ = try await handler.handle(parameters: (), input: input, context: request)
             return Response(status: .ok, headers: [.cacheControl: "no-store"])
-        } catch let failure as AuthenticatedSimpleSpaceLifecycleFailure {
-            return simpleSpaceLifecycleResponse(for: failure, capability: capability)
-        } catch {
-            return simpleSpaceLifecycleError(.badRequest, code: "InvalidRequest")
         }
     }
     registerSimpleSpaceWrongMethods(on: router, path: path, liveMethod: .post)
@@ -369,20 +360,17 @@ private func registerSimpleSpaceRemoveMember(
 ) {
     let handler = AuthenticatedSimpleSpaceRemoveMemberHandler(capability: capability)
     let path: RouterPath = "/xrpc/com.atproto.simplespace.removeMember"
-    router.post(path) { request, _ async -> Response in
-        do {
-            let input: ComAtprotoSimplespaceRemoveMember.Input = try await decodeSimpleSpaceInput(
-                request,
-                admission: capability.jsonWriteAdmission,
-                required: ["space", "did"],
-                allowed: ["space", "did"]
-            )
+    router.post(path) { request, context async -> Response in
+        await withSimpleSpaceInput(
+            request,
+            context: context,
+            as: ComAtprotoSimplespaceRemoveMember.Input.self,
+            capability: capability,
+            required: ["space", "did"],
+            allowed: ["space", "did"]
+        ) { input in
             _ = try await handler.handle(parameters: (), input: input, context: request)
             return Response(status: .ok, headers: [.cacheControl: "no-store"])
-        } catch let failure as AuthenticatedSimpleSpaceLifecycleFailure {
-            return simpleSpaceLifecycleResponse(for: failure, capability: capability)
-        } catch {
-            return simpleSpaceLifecycleError(.badRequest, code: "InvalidRequest")
         }
     }
     registerSimpleSpaceWrongMethods(on: router, path: path, liveMethod: .post)
@@ -532,54 +520,96 @@ private func simpleSpaceAppAccess(
     }
 }
 
-private func decodeSimpleSpaceInput<Value: Decodable>(
+private func withSimpleSpaceInput<Value: Decodable>(
     _ request: Request,
-    admission: PublicRepositoryJSONWriteAdmission,
+    context: SwanHTTPRequestContext,
+    as type: Value.Type,
+    capability: SwanAuthenticatedSimpleSpaceLifecycleCapability,
     required: Set<String>,
-    allowed: Set<String>
-) async throws -> Value {
+    allowed: Set<String>,
+    operation: (Value) async throws -> Response
+) async -> Response {
     let contentTypes = request.headers[values: .contentType]
     guard contentTypes.count == 1,
           contentTypes[0].split(separator: ";", maxSplits: 1).first?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "application/json"
-    else { throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest }
-    let lengths = request.headers[values: .contentLength]
-    guard lengths.count <= 1,
-          lengths.first.flatMap(Int.init).map({ (0 ... authenticatedSpaceWriteMaximumJSONBytes).contains($0) }) ?? true
-    else { throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest }
-    guard let lease = admission.reserve(
-        maximumRequestBytes: authenticatedSpaceWriteMaximumJSONBytes
-    ) else {
-        throw AuthenticatedSimpleSpaceLifecycleFailure.unavailable
+    else {
+        context.jsonWriteBodyTermination.terminate()
+        return simpleSpaceLifecycleResponse(
+            for: .invalidRequest,
+            capability: capability
+        )
     }
-    defer { lease.release() }
-    let body: ByteBuffer
-    do {
-        body = try await request.body.collect(upTo: authenticatedSpaceWriteMaximumJSONBytes)
-    } catch {
-        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+    guard acceptsSimpleSpaceWriteContentLength(request.headers[values: .contentLength]) else {
+        context.jsonWriteBodyTermination.terminate()
+        return simpleSpaceLifecycleResponse(
+            for: .invalidRequest,
+            capability: capability
+        )
     }
-    guard body.readableBytes > 0,
-          let bytes = body.getBytes(at: body.readerIndex, length: body.readableBytes) else {
-        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+    return await withAdmittedJSONWriteResponse(
+        request.body,
+        admission: capability.jsonWriteAdmission,
+        policy: capability.jsonWriteBodyPolicy,
+        maximumBytes: authenticatedSpaceWriteMaximumJSONBytes,
+        termination: context.jsonWriteBodyTermination
+    ) { data in
+        do {
+            try StrictPermissionedWriteJSON.validate(data)
+            guard let root = try JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+                Set(root.keys).isSubset(of: allowed),
+                required.isSubset(of: Set(root.keys)),
+                !root.values.contains(where: { $0 is NSNull }) else {
+                throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+            }
+            try validateSimpleSpaceJSON(root)
+            return try JSONDecoder().decode(type, from: data)
+        } catch let failure as AuthenticatedSimpleSpaceLifecycleFailure {
+            throw failure
+        } catch {
+            throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+        }
+    } operation: { input in
+        try await operation(input)
+    } errorResponse: { error in
+        simpleSpaceLifecycleResponse(for: error, capability: capability)
     }
-    let data = Data(bytes)
-    do {
-        try StrictPermissionedWriteJSON.validate(data)
-    } catch {
-        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+}
+
+func acceptsSimpleSpaceWriteContentLength(_ values: [String]) -> Bool {
+    guard values.count <= 1 else { return false }
+    guard let value = values.first else { return true }
+    guard !value.isEmpty,
+          value.utf8.allSatisfy({ (48...57).contains($0) }),
+          value.first != "0",
+          let length = Int(value) else {
+        return false
     }
-    guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          Set(root.keys).isSubset(of: allowed),
-          required.isSubset(of: Set(root.keys)),
-          !root.values.contains(where: { $0 is NSNull }) else {
-        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+    return length <= authenticatedSpaceWriteMaximumJSONBytes
+}
+
+private func simpleSpaceLifecycleResponse(
+    for error: any Error,
+    capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
+) -> Response {
+    if let failure = error as? AuthenticatedSimpleSpaceLifecycleFailure {
+        return simpleSpaceLifecycleResponse(for: failure, capability: capability)
     }
-    try validateSimpleSpaceJSON(root)
-    do {
-        return try JSONDecoder().decode(Value.self, from: data)
-    } catch {
-        throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
+    if let failure = error as? SwanJSONWriteBodyCollectionFailure {
+        return simpleSpaceLifecycleResponse(for: failure)
+    }
+    return simpleSpaceLifecycleError(.badRequest, code: "InvalidRequest")
+}
+
+private func simpleSpaceLifecycleResponse(
+    for failure: SwanJSONWriteBodyCollectionFailure
+) -> Response {
+    switch failure {
+    case .invalidRequest:
+        simpleSpaceLifecycleError(.badRequest, code: "InvalidRequest")
+    case .unavailable:
+        simpleSpaceLifecycleError(.serviceUnavailable, code: "temporarily_unavailable")
     }
 }
 
