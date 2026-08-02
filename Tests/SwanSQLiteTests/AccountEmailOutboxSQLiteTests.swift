@@ -460,6 +460,56 @@ final class AccountEmailOutboxSQLiteTests: XCTestCase {
         XCTAssertTrue(acknowledged)
     }
 
+    func testExpiryPurgePreservesAnInFlightSendFence() async throws {
+        let fixture = try await Fixture(testCase: self)
+        addTeardownBlock { try? await fixture.database.close(); fixture.cleanup() }
+        let now = fixture.now
+        _ = try await fixture.database.createAccount(try registration())
+        try await fixture.database.associateEmail(did: did, email: email, now: now)
+        let request = try deliveryRequest(
+            purpose: .verifyEmail,
+            deliveryByte: 0x1d,
+            proofByte: 0x2d,
+            now: now,
+            lifetime: 1
+        )
+        _ = try await fixture.database.enqueueEmailProofDelivery(request)
+        let leaseResult = try await fixture.database.claimNextEmailDelivery(
+            workerID: "email-worker",
+            now: now,
+            leaseDuration: 1
+        )
+        let lease = try XCTUnwrap(leaseResult)
+        let fenced = try await fixture.database.beginEmailDeliveryAttempt(
+            deliveryID: lease.deliveryID,
+            workerID: "email-worker",
+            now: now.addingTimeInterval(0.5)
+        )
+        XCTAssertTrue(fenced)
+
+        // The proof has expired, but the bounded SMTP fence is still live.
+        // Purging it would make permanent deletion forget that network I/O
+        // was admitted and permit a late send after account deletion.
+        try await fixture.database.purgeExpiredEmailRecoveryState(
+            now: now.addingTimeInterval(2)
+        )
+        let retained = try await fixture.database.connection.query(
+            "SELECT delivery_id FROM account_email_delivery_outbox WHERE delivery_id = ?",
+            [.text(lease.deliveryID.rawValue)]
+        )
+        XCTAssertEqual(retained.count, 1)
+        do {
+            _ = try await fixture.database.beginDeletion(
+                did: did,
+                declaration: .init(),
+                now: now.addingTimeInterval(2)
+            )
+            XCTFail("deletion crossed the retained in-flight send fence")
+        } catch let error as AccountDeletionStoreError {
+            XCTAssertEqual(error, .conflict)
+        }
+    }
+
     func testDeletionWinsBeforeEmailWorkerFenceAndWorkerCannotSend() async throws {
         let fixture = try await Fixture(testCase: self)
         addTeardownBlock { try? await fixture.database.close(); fixture.cleanup() }

@@ -1351,10 +1351,9 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
 
         var lastCollection: String?
         var lastRecordKey: String?
-        var lastRecordCID: String?
         while true {
             let rows: [SQLiteRow]
-            if let lastCollection, let lastRecordKey, let lastRecordCID {
+            if let lastCollection, let lastRecordKey {
                 rows = try await connection.query(
                     """
                     SELECT collection, rkey, record_cid
@@ -1363,20 +1362,14 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                         SELECT 1 FROM public_repository_import_sessions
                         WHERE session_id = ? AND expires_at > ?
                     )
-                      AND (
-                          collection > ?
-                          OR (collection = ? AND rkey > ?)
-                          OR (collection = ? AND rkey = ? AND record_cid > ?)
-                      )
-                    ORDER BY collection, rkey, record_cid
+                      AND (collection, rkey) > (?, ?)
+                    ORDER BY collection, rkey
                     LIMIT ?
                     """,
                     [
                         .text(sessionID), .text(sessionID), .integer(timestamp),
                         .text(lastCollection),
-                        .text(lastCollection), .text(lastRecordKey),
-                        .text(lastCollection), .text(lastRecordKey),
-                        .text(lastRecordCID), .integer(pageSize),
+                        .text(lastRecordKey), .integer(pageSize),
                     ]
                 )
             } else {
@@ -1388,7 +1381,7 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                         SELECT 1 FROM public_repository_import_sessions
                         WHERE session_id = ? AND expires_at > ?
                     )
-                    ORDER BY collection, rkey, record_cid
+                    ORDER BY collection, rkey
                     LIMIT ?
                     """,
                     [
@@ -1407,15 +1400,11 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
             guard let last = rows.last else { break }
             let nextCollection = requiredText(last, "collection")
             let nextRecordKey = requiredText(last, "rkey")
-            let nextRecordCID = requiredText(last, "record_cid")
-            guard nextCollection != lastCollection
-                    || nextRecordKey != lastRecordKey
-                    || nextRecordCID != lastRecordCID else {
+            guard nextCollection != lastCollection || nextRecordKey != lastRecordKey else {
                 throw PublicRepositoryImportStagingError.corruptStaging
             }
             lastCollection = nextCollection
             lastRecordKey = nextRecordKey
-            lastRecordCID = nextRecordCID
             if rows.count < pageSize { break }
         }
 

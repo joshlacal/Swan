@@ -433,14 +433,21 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
         ikmByte: 0x42
       )
       XCTAssertNotEqual(equivalent.commitRootCID, initial.commitRootCID)
+      let publicationCounter = RemoteReplicaPublicationCounter()
       let idempotent = try await fixture.install(
         database: database,
         archive: equivalent,
         expectedBase: installed.result.head,
-        requestID: "same-tid-equivalent"
+        requestID: "same-tid-equivalent",
+        publicationAuthorization: { operation in
+          await publicationCounter.increment()
+          return try await operation()
+        }
       )
       XCTAssertEqual(idempotent.result.head, installed.result.head)
       XCTAssertEqual(idempotent.result.head.generation, 1)
+      let publicationCount = await publicationCounter.value
+      XCTAssertEqual(publicationCount, 1)
       try await assertRemoteReplicaGenerationRows(
         in: database,
         target: fixture.target,
@@ -1106,7 +1113,9 @@ private struct RemoteReplicaSQLiteFixture {
     database: SQLiteAccountDatabase,
     archive: RemoteReplicaArchive,
     expectedBase: PermissionedRemoteReplicaHead?,
-    requestID: String
+    requestID: String,
+    publicationAuthorization:
+      PermissionedRemoteReplicaPublicationAuthorization? = nil
   ) async throws -> RemoteReplicaInstalledImport {
     let staged = try await stage(
       database: database,
@@ -1120,12 +1129,23 @@ private struct RemoteReplicaSQLiteFixture {
       verification: staged.verification,
       now: Self.operationNow
     )
-    let result = try await database
-      .publishVerifiedPermissionedRemoteReplicaRecovery(
-        sessionID: staged.session.id,
-        consumedAt: Self.operationNow + 1,
-        now: Self.operationNow
-      )
+    let result: CommittedPermissionedRemoteReplicaRecovery
+    if let publicationAuthorization {
+      result = try await database
+        .publishVerifiedPermissionedRemoteReplicaRecovery(
+          sessionID: staged.session.id,
+          consumedAt: Self.operationNow + 1,
+          now: Self.operationNow,
+          publicationAuthorization: publicationAuthorization
+        )
+    } else {
+      result = try await database
+        .publishVerifiedPermissionedRemoteReplicaRecovery(
+          sessionID: staged.session.id,
+          consumedAt: Self.operationNow + 1,
+          now: Self.operationNow
+        )
+    }
     return RemoteReplicaInstalledImport(
       binding: staged.binding,
       result: result
@@ -1216,6 +1236,14 @@ private struct RemoteReplicaStagedImport {
 private struct RemoteReplicaInstalledImport {
   let binding: PermissionedRemoteReplicaImportBinding
   let result: CommittedPermissionedRemoteReplicaRecovery
+}
+
+private actor RemoteReplicaPublicationCounter {
+  private(set) var value = 0
+
+  func increment() {
+    value += 1
+  }
 }
 
 private actor RemoteReplicaCARDataSource: SpaceCARRecoveryByteSource {

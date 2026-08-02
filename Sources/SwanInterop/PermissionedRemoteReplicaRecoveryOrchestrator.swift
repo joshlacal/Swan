@@ -82,10 +82,8 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
     public typealias Staging = any SpaceCARRecoveryIndex & SpaceCARRecoveryRecordSink
     public typealias StagingFactory = @Sendable (String) -> Staging
     public typealias Clock = @Sendable () -> Int64
-    public typealias PublicationAuthorization = @Sendable (
-        @escaping @Sendable () async throws
-            -> CommittedPermissionedRemoteReplicaRecovery
-    ) async throws -> CommittedPermissionedRemoteReplicaRecovery
+    public typealias PublicationAuthorization =
+        PermissionedRemoteReplicaPublicationAuthorization
 
     private let store: any PermissionedRemoteReplicaRecoveryStore
     private let stagingFactory: StagingFactory
@@ -269,18 +267,27 @@ public struct PermissionedRemoteReplicaRecoveryOrchestrator: Sendable {
                 verification: verification,
                 now: verifiedAt
             )
-            let publish: @Sendable () async throws
-                -> CommittedPermissionedRemoteReplicaRecovery = {
-                    try await store.publishVerifiedPermissionedRemoteReplicaRecovery(
+            if let publicationAuthorization {
+                guard let authorizingStore = store as?
+                    any PermissionedRemoteReplicaPublicationAuthorizingStore
+                else {
+                    throw PermissionedRemoteReplicaRecoveryError
+                        .publicationAuthorizationUnavailable
+                }
+                return try await authorizingStore
+                    .publishVerifiedPermissionedRemoteReplicaRecovery(
                         sessionID: sessionID,
                         consumedAt: verifiedAt,
-                        now: now()
+                        now: now(),
+                        publicationAuthorization: publicationAuthorization
                     )
-                }
-            if let publicationAuthorization {
-                return try await publicationAuthorization(publish)
             }
-            return try await publish()
+            return try await store
+                .publishVerifiedPermissionedRemoteReplicaRecovery(
+                    sessionID: sessionID,
+                    consumedAt: verifiedAt,
+                    now: now()
+                )
         } catch {
             await source.close()
             await store.poisonPermissionedRemoteReplicaImportSession(

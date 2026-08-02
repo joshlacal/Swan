@@ -2162,8 +2162,8 @@ The fresh Luna rereview found no P0 or P1 in the current tree. The earlier
 missing-account-database and whole-export-payload findings are closed: recovery
 opens only `.existingManaged` account databases, and portable export streams
 CAR/blob artifacts while bounding inventory metadata. The rereview did identify
-two residual P2-shaped boundedness seams and one lifecycle race in the new
-changes; all three are now addressed in this working copy.
+two residual P2-shaped boundedness seams and a lifecycle lease-scope bug in the
+parent change; all three are addressed in this working copy.
 
 The public import publication path now computes staged counts and its projection
 digest through 256-row CID keyset pages. It walks the three canonical block
@@ -2174,18 +2174,27 @@ pagination plan has no temporary sort. Portable export now performs a scalar
 blob-reference count before materializing the bounded inventory and rejects a
 count/select mismatch.
 
-The recovery CLI also installs a final, network-free control-plane publication
-lease. `withActiveAccountAuthorization` holds `BEGIN IMMEDIATE` while the
-already-staged account publication commits, so deactivation serializes either
-before the authorization decision or after the recovery mutation. The initial
-preflight remains an existence/lifecycle check; the final lease is the
-authorization fence. `AccountAuthorizationLeaseTests` proves callback lease
-visibility and deactivated-account rejection.
+The recovery CLI now routes its lifecycle callback through a dedicated
+`PermissionedRemoteReplicaPublicationAuthorizingStore` capability and fails
+closed for stores that cannot provide it. The SQLite implementation validates
+and prepares the replacement before entering the callback, then holds
+`withActiveAccountAuthorization` only across the final same-revision or
+new-generation account transaction. Cleanup runs after the callback returns.
+This keeps the control-plane `BEGIN IMMEDIATE` lease short while still making
+deactivation serialize either before the authorization decision or after the
+recovery mutation. The initial preflight remains an existence/lifecycle check;
+the final lease is the authorization fence. The authorized new-generation
+orchestrator route and authorized same-revision idempotency path are covered by
+focused tests.
 
 Evidence from the current macOS working copy:
 
+- `PermissionedRemoteReplicaRecoverySQLiteTests`: 7/7, including the
+  authorized same-revision path;
+- `PermissionedRemoteReplicaRecoveryOrchestratorTests`: 5/5, including the
+  authorization-capability route;
 - `AccountAuthorizationLeaseTests`: 1/1;
-- `PublicRepositoryImportQueryPlanTests`: 1/1;
+- `PublicRepositoryImportQueryPlanTests`: 2/2;
 - `PublicRepositoryImportStagingTests`: 15/15, one intentional opt-in skip;
 - full serialized `SWIFTPM_MAX_CONCURRENT_OPERATIONS=1 swift test --jobs 1`:
   exit 0, with every XCTest target and the four-test Swift Testing public-wire
@@ -2205,8 +2214,46 @@ This is not formal launcher evidence.
 
 The alpha remains open. The stock pinned-TypeScript value-bearing incremental
 and full-CAR surfaces, broader corrupted/reordered/disconnected/compaction-gap
-traffic, reverse-authority browser/account/OAuth lifecycle coverage,
-non-cooperative custom email-delivery cancellation, and any future native-Linux
-rerun of this exact dirty change still require explicit evidence. The public
-import and export validators outside the changed paths should not be treated as
-covered by this local diff scan.
+traffic, reverse-authority browser/account/OAuth lifecycle coverage, and
+non-cooperative custom email-delivery cancellation still require explicit
+evidence. The public import and export validators outside the changed paths
+should not be treated as covered by this local diff scan.
+
+## Adversarial rereview: native-Linux current-commit receipt and email-fence purge — 2026-08-01
+
+The working copy based on parent commit `787aae50` was rebuilt from a
+tracked-files-only copy in the
+Ubuntu 26.04 ARM64 Lima VM. The first copy attempt accidentally streamed host
+scratch build directories into Lima's 8 GiB `/tmp` tmpfs; it was stopped without
+touching the repository, and the explicitly named temporary copies were removed.
+The successful copy used `/var/tmp` and included only Swan and the local Petrel
+package sources.
+
+Current native-Linux evidence is now:
+
+- `swift build --product swan --jobs 1`: passed with Swift 6.2.3;
+- `swift test --jobs 1 --filter PublicRepositoryReadHTTPTests`: 13/13,
+  0 failures;
+- focused recovery/authorization/pagination/email suites on Linux: 7 recovery,
+  5 orchestrator, 1 lease, 2 query-plan, and 15 email tests, all 0 failures;
+- full `SWIFTPM_MAX_CONCURRENT_OPERATIONS=1 swift test --jobs 1`: 933 tests,
+  8 intentional skips, 0 failures, plus the four-test Swift Testing
+  public-wire profile suite; and
+- the focused post-review email-outbox regression on macOS:
+  `AccountEmailOutboxSQLiteTests` 15/15, 0 failures.
+
+The Luna storage review was extended with a recovery-email lifecycle race. A
+claim that has crossed the durable `send_started_at` fence can outlive the
+proof's `expires_at`; expiry cleanup previously deleted that outbox row before
+the bounded SMTP attempt ended, allowing permanent deletion to lose the fence.
+Cleanup now preserves a row while `send_started_at` is set and
+`lease_expires_at` is still live. `testExpiryPurgePreservesAnInFlightSendFence`
+proves that cleanup retains the row and deletion remains blocked. This closes
+the live Mailpit bounded-delivery seam; unverified custom delivery
+implementations remain rejected by policy.
+
+The active current interop project was restarted by exact container ID after a
+Compose restart was refused because its generated file required a no-longer
+exported secret-directory variable. Swan, the reference PDS, reference PLC,
+Caddy, Mailpit, and Toxiproxy are healthy again. This does not change the
+separate Lima VM descriptor-pressure incident.

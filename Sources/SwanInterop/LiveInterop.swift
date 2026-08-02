@@ -1217,6 +1217,8 @@ public enum PermissionedRecoveryFailureCode {
             case .staleRecovery: return "RecoveryStale"
             case .equivocation: return "RecoveryEquivocation"
             case .freshnessMismatch: return "RecoveryFreshnessMismatch"
+            case .publicationAuthorizationUnavailable:
+                return "RecoveryPublicationAuthorizationUnavailable"
             }
         case let streaming as SpaceCARStreamingError:
             return spaceCARStreamingErrorCode(streaming)

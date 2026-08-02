@@ -2089,8 +2089,15 @@ extension SQLiteControlDatabase {
             throw AccountControlStoreError.invalidInput
         }
         _ = try await connection.query(
-            "DELETE FROM account_email_delivery_outbox WHERE expires_at <= ?",
-            [.integer(timestamp)]
+            """
+            DELETE FROM account_email_delivery_outbox
+            WHERE expires_at <= ?
+              AND NOT (
+                  send_started_at IS NOT NULL
+                  AND (lease_expires_at IS NULL OR lease_expires_at > ?)
+              )
+            """,
+            [.integer(timestamp), .integer(timestamp)]
         )
         _ = try await connection.query(
             "DELETE FROM account_email_tokens WHERE expires_at <= ?",

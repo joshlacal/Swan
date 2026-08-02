@@ -333,7 +333,23 @@ public enum PermissionedRemoteReplicaRecoveryError:
     case staleRecovery
     case equivocation
     case freshnessMismatch
+    /// A caller requested account-lifecycle authorization, but the selected
+    /// recovery store does not expose the narrow final-publication boundary
+    /// required to enforce it.  Silently falling back to an unauthorised
+    /// whole-method publish would turn a lifecycle check into a best-effort
+    /// hint, so the orchestrator fails closed instead.
+    case publicationAuthorizationUnavailable
 }
+
+/// Authorization around the short, network-free account-database transaction
+/// that installs a verified remote-replica head.  Preparation and validation
+/// happen before this callback is entered; implementations must not widen the
+/// callback to cover CAR streaming, staging, or cleanup.
+public typealias PermissionedRemoteReplicaPublicationAuthorization =
+    @Sendable (
+        @escaping @Sendable () async throws
+            -> CommittedPermissionedRemoteReplicaRecovery
+    ) async throws -> CommittedPermissionedRemoteReplicaRecovery
 
 /// Network-free durable boundary for one receiver account's permissioned
 /// remote replicas. Verification can perform key lookup before calling
@@ -425,4 +441,20 @@ public protocol PermissionedRemoteReplicaRecoveryStore: Sendable {
     func recoverExpiredPermissionedRemoteReplicaImportSessions(
         now: Int64
     ) async throws -> Int
+}
+
+/// Optional capability for stores that can enforce account lifecycle state at
+/// the final publication linearization point.  The base protocol remains
+/// usable by pure protocol fixtures; production stores that receive an
+/// authorization callback must conform to this capability or fail closed.
+public protocol PermissionedRemoteReplicaPublicationAuthorizingStore:
+    PermissionedRemoteReplicaRecoveryStore
+{
+    func publishVerifiedPermissionedRemoteReplicaRecovery(
+        sessionID: String,
+        consumedAt: Int64,
+        now: Int64,
+        publicationAuthorization:
+            @escaping PermissionedRemoteReplicaPublicationAuthorization
+    ) async throws -> CommittedPermissionedRemoteReplicaRecovery
 }

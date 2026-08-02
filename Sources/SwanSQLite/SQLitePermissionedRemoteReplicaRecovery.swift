@@ -109,7 +109,9 @@ public struct SQLitePermissionedRemoteReplicaRecoveryStaging:
     }
 }
 
-extension SQLiteAccountDatabase: PermissionedRemoteReplicaRecoveryStore {
+extension SQLiteAccountDatabase:
+    PermissionedRemoteReplicaPublicationAuthorizingStore
+{
     public func permissionedRemoteReplicaHead(
         target: PermissionedRemoteReplicaTarget
     ) async throws -> PermissionedRemoteReplicaHead? {
@@ -836,6 +838,36 @@ extension SQLiteAccountDatabase: PermissionedRemoteReplicaRecoveryStore {
         consumedAt: Int64,
         now: Int64
     ) async throws -> CommittedPermissionedRemoteReplicaRecovery {
+        try await publishVerifiedPermissionedRemoteReplicaRecoveryCore(
+            sessionID: sessionID,
+            consumedAt: consumedAt,
+            now: now,
+            publicationAuthorization: nil
+        )
+    }
+
+    public func publishVerifiedPermissionedRemoteReplicaRecovery(
+        sessionID: String,
+        consumedAt: Int64,
+        now: Int64,
+        publicationAuthorization:
+            @escaping PermissionedRemoteReplicaPublicationAuthorization
+    ) async throws -> CommittedPermissionedRemoteReplicaRecovery {
+        try await publishVerifiedPermissionedRemoteReplicaRecoveryCore(
+            sessionID: sessionID,
+            consumedAt: consumedAt,
+            now: now,
+            publicationAuthorization: publicationAuthorization
+        )
+    }
+
+    private func publishVerifiedPermissionedRemoteReplicaRecoveryCore(
+        sessionID: String,
+        consumedAt: Int64,
+        now: Int64,
+        publicationAuthorization:
+            PermissionedRemoteReplicaPublicationAuthorization?
+    ) async throws -> CommittedPermissionedRemoteReplicaRecovery {
         guard consumedAt >= 0, now >= 0 else {
             throw PermissionedRemoteReplicaRecoveryError.invalidTimestamp
         }
@@ -894,14 +926,20 @@ extension SQLiteAccountDatabase: PermissionedRemoteReplicaRecoveryStore {
                     throw PermissionedRemoteReplicaRecoveryError
                         .corruptReplica
                 }
-                let result = try await transaction {
-                    try await finalizeRemoteReplicaResult(
+                let finalize: @Sendable () async throws
+                    -> CommittedPermissionedRemoteReplicaRecovery = {
+                    try await self.finalizeExistingRemoteReplicaRecovery(
                         session: session,
                         validation: validation,
                         head: current,
-                        committedAt: consumedAt,
-                        requiredStatus: .verified
+                        committedAt: consumedAt
                     )
+                }
+                let result: CommittedPermissionedRemoteReplicaRecovery
+                if let publicationAuthorization {
+                    result = try await publicationAuthorization(finalize)
+                } else {
+                    result = try await finalize()
                 }
                 try await cleanupRemoteReplicaImportSessionBatched(
                     sessionID: sessionID,
@@ -991,64 +1029,23 @@ extension SQLiteAccountDatabase: PermissionedRemoteReplicaRecoveryStore {
                     commitment: validation.commitment,
                     stateMarker: marker
                 )
-                let result = try await transaction {
-                    let preparing =
-                        try await requireActiveRemoteReplicaSession(
-                            id: sessionID,
-                            now: now,
-                            allowed: [.preparing]
-                        )
-                    let preparationRows = try await connection.query(
-                        """
-                        SELECT prepared_generation,
-                               prepared_projection_digest
-                        FROM permissioned_remote_replica_import_sessions
-                        WHERE session_id = ?
-                        """,
-                        [.text(sessionID)]
-                    )
-                    guard preparationRows.count == 1,
-                          let preparation = preparationRows.first,
-                          remoteReplicaInteger(
-                              preparation, "prepared_generation"
-                          ) == Int(generation),
-                          remoteReplicaData(
-                              preparation,
-                              "prepared_projection_digest"
-                          ) == prepared.projectionDigest else {
-                        throw PermissionedRemoteReplicaRecoveryError
-                            .corruptStaging
-                    }
-                    let latest =
-                        try await loadPermissionedRemoteReplicaHead(
-                            target: preparing.binding.target
-                        )
-                    try requireRemoteReplicaExpectedBase(
-                        preparing.binding.expectedBase,
-                        current: latest
-                    )
-                    try await requireRemoteReplicaHighWater(
-                        target: preparing.binding.target,
-                        wireRevision: validation.wireRevision,
-                        commitment: validation.commitment
-                    )
-                    try await installRemoteReplicaHead(
-                        head,
-                        replacing: latest,
-                        installedAt: consumedAt
-                    )
-                    try await testingHooks
-                        .afterRemoteReplicaMutatingSQL?(4)
-                    let committed = try await finalizeRemoteReplicaResult(
-                        session: preparing,
-                        validation: validation,
+                let finalize: @Sendable () async throws
+                    -> CommittedPermissionedRemoteReplicaRecovery = {
+                    try await self.finalizePreparedRemoteReplicaRecovery(
+                        sessionID: sessionID,
+                        now: now,
+                        generation: generation,
+                        prepared: prepared,
                         head: head,
-                        committedAt: consumedAt,
-                        requiredStatus: .preparing
+                        validation: validation,
+                        committedAt: consumedAt
                     )
-                    try await testingHooks
-                        .afterRemoteReplicaMutatingSQL?(5)
-                    return committed
+                }
+                let result: CommittedPermissionedRemoteReplicaRecovery
+                if let publicationAuthorization {
+                    result = try await publicationAuthorization(finalize)
+                } else {
+                    result = try await finalize()
                 }
                 try await cleanupRemoteReplicaImportSessionBatched(
                     sessionID: sessionID,
@@ -1078,6 +1075,94 @@ extension SQLiteAccountDatabase: PermissionedRemoteReplicaRecoveryStore {
                 )
                 throw error
             }
+        }
+    }
+
+    /// Runs the same-revision result finalization in its own short account
+    /// transaction.  The publication-authorization capability wraps this
+    /// helper, so validation and staging never hold the control-plane lease.
+    private func finalizeExistingRemoteReplicaRecovery(
+        session: PermissionedRemoteReplicaImportSession,
+        validation: StagedPermissionedRemoteReplicaValidation,
+        head: PermissionedRemoteReplicaHead,
+        committedAt: Int64
+    ) async throws -> CommittedPermissionedRemoteReplicaRecovery {
+        try await transaction {
+            try await finalizeRemoteReplicaResult(
+                session: session,
+                validation: validation,
+                head: head,
+                committedAt: committedAt,
+                requiredStatus: .verified
+            )
+        }
+    }
+
+    /// Installs a prepared generation and records its result in one short
+    /// account transaction.  All potentially large preparation and cleanup
+    /// work remains outside the publication-authorization callback.
+    private func finalizePreparedRemoteReplicaRecovery(
+        sessionID: String,
+        now: Int64,
+        generation: UInt64,
+        prepared: RemoteReplicaProjectionValidation,
+        head: PermissionedRemoteReplicaHead,
+        validation: StagedPermissionedRemoteReplicaValidation,
+        committedAt: Int64
+    ) async throws -> CommittedPermissionedRemoteReplicaRecovery {
+        try await transaction {
+            let preparing = try await requireActiveRemoteReplicaSession(
+                id: sessionID,
+                now: now,
+                allowed: [.preparing]
+            )
+            let preparationRows = try await connection.query(
+                """
+                SELECT prepared_generation,
+                       prepared_projection_digest
+                FROM permissioned_remote_replica_import_sessions
+                WHERE session_id = ?
+                """,
+                [.text(sessionID)]
+            )
+            guard preparationRows.count == 1,
+                  let preparation = preparationRows.first,
+                  remoteReplicaInteger(
+                      preparation, "prepared_generation"
+                  ) == Int(generation),
+                  remoteReplicaData(
+                      preparation,
+                      "prepared_projection_digest"
+                  ) == prepared.projectionDigest else {
+                throw PermissionedRemoteReplicaRecoveryError.corruptStaging
+            }
+            let latest = try await loadPermissionedRemoteReplicaHead(
+                target: preparing.binding.target
+            )
+            try requireRemoteReplicaExpectedBase(
+                preparing.binding.expectedBase,
+                current: latest
+            )
+            try await requireRemoteReplicaHighWater(
+                target: preparing.binding.target,
+                wireRevision: validation.wireRevision,
+                commitment: validation.commitment
+            )
+            try await installRemoteReplicaHead(
+                head,
+                replacing: latest,
+                installedAt: committedAt
+            )
+            try await testingHooks.afterRemoteReplicaMutatingSQL?(4)
+            let committed = try await finalizeRemoteReplicaResult(
+                session: preparing,
+                validation: validation,
+                head: head,
+                committedAt: committedAt,
+                requiredStatus: .preparing
+            )
+            try await testingHooks.afterRemoteReplicaMutatingSQL?(5)
+            return committed
         }
     }
 

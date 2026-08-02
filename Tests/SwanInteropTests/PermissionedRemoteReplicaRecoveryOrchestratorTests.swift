@@ -45,9 +45,14 @@ final class PermissionedRemoteReplicaRecoveryOrchestratorTests: XCTestCase {
         )
         let target = try makeTarget()
         let clock = TestRecoveryClock(value: 1_750_000_000)
+        let publicationCounter = RecoveryCloseCounter()
         let orchestrator = PermissionedRemoteReplicaRecoveryOrchestrator(
             database: database,
-            now: { clock.value }
+            now: { clock.value },
+            publicationAuthorization: { operation in
+                await publicationCounter.increment()
+                return try await operation()
+            }
         )
 
         let result = try await orchestrator.recover(
@@ -69,6 +74,8 @@ final class PermissionedRemoteReplicaRecoveryOrchestratorTests: XCTestCase {
             result.verifierIdentity,
             verificationKey.recoveryVerifierIdentity
         )
+        let publicationCount = await publicationCounter.value
+        XCTAssertEqual(publicationCount, 1)
         let head = try await database.permissionedRemoteReplicaHead(target: target)
         XCTAssertEqual(head, result.head)
     }
