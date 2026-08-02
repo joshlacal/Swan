@@ -579,3 +579,24 @@ sanitized matrix cell completed with status `passed`; both Caddy routes remained
 HTTP 200 and all long-running services were healthy afterward. This is
 transport/profile fault evidence, not a claim that the stock TypeScript host
 implements value-bearing incremental or full-CAR permissioned recovery.
+
+## 2026-08-02 restart-safe serialized suite and durable fault receipt
+
+After the Compose restart, the complete SwiftPM graph was run serially with
+`swift test --skip-build --jobs 1`. The command exited 0: 935 XCTest cases
+passed with 8 skips, and the four Swift Testing public-wire cases also passed;
+no test failed. The serialized invocation is intentional on this host because
+the `swan-linux` VM's descriptor exhaustion can otherwise surface as a fresh
+shell `ENFILE`, even after the harness has exited.
+
+The seven profile fault modes were then run in one disposable CA-trusted Swan
+runner, with output written to an exact Docker volume and copied out only after
+the runner exited. All seven artifacts under
+`/private/tmp/swan-stock-fault-matrix-20260802/` are mode 0600, parse as
+sanitized JSON, and report `status: passed`. The matrix is a transport/profile
+endpoint receipt: it intentionally does not claim stateful notification
+convergence, stock TypeScript value-bearing `listRepoOps`/`getRepo`, or
+compaction-gap semantics. The Docker artifact volume was removed afterward;
+the active Swan data volumes were not touched. Caddy routes for `swan.test`
+and `pds.test` returned HTTP 200 afterward and every Compose service remained
+healthy.

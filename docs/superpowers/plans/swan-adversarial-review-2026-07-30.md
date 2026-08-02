@@ -2443,3 +2443,23 @@ disconnected, and corrupted modes. All seven matrix artifacts reported
 `passed`, the two HTTPS describe-server routes remained HTTP 200, and the lab
 services remained healthy. This closes a live transport/fault-topology receipt,
 not the stock TypeScript value-bearing or compaction-gap semantic gate.
+
+## Adversarial rereview: restart-safe suite and persisted fault artifacts — 2026-08-02
+
+The restarted lab was kept on one active SwiftPM process. A final
+`swift test --skip-build --jobs 1` exited 0 after covering every test product:
+935 XCTest cases passed with 8 skips, and the four Swift Testing public-wire
+cases passed. No failure was hidden by a shell wrapper; the exit status was
+captured separately from the tail log.
+
+The profile fault matrix was rerun through a disposable CA-trusted Swan
+runner. A first host bind was not durable under Colima, so the rerun used an
+exact named Docker volume, copied the seven sanitized JSON artifacts out after
+completion, changed them to mode 0600, and removed the temporary volume. The
+artifacts in `/private/tmp/swan-stock-fault-matrix-20260802/` all report
+`status: passed` for normal, delayed, duplicated, reordered, offline,
+disconnected, and corrupted traffic. This is stronger custody evidence for
+the existing transport receipt, not a stateful semantic acceptance: no
+value-bearing stock TypeScript sync, compaction-gap recovery, or reverse
+lifecycle gate is being inferred from it. The Swan and reference HTTPS routes
+remained HTTP 200 and the Compose services remained healthy after the run.
