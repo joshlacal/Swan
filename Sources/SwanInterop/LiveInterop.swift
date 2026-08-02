@@ -1973,8 +1973,8 @@ public enum LiveInteropRunner {
         limits: SpaceCARRecoveryLimits = .standard,
         sourceFault: PermissionedRemoteReplicaSourceFault = .none,
         publicationAuthorization:
-            PermissionedRemoteReplicaRecoveryOrchestrator
-            .PublicationAuthorization? = nil,
+            @escaping PermissionedRemoteReplicaRecoveryOrchestrator
+            .PublicationAuthorization,
         now: @escaping @Sendable () -> Int64 = {
             Int64(Date().timeIntervalSince1970)
         }
