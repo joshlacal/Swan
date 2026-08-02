@@ -325,4 +325,56 @@ final class StatefulInteropMatrixTests: XCTestCase {
         XCTAssertFalse(artifact.roundTrip.converged)
         XCTAssertEqual(artifact.roundTrip.status, "failed")
     }
+
+    func testEvaluationRequiresPermissionedBlobRoundTripWhenRequested() {
+        let live = LiveInteropPermissionedRoundTripArtifact(
+            scenario: "permissioned-blob-mismatch",
+            member: "member",
+            authority: "authority",
+            credentialIssued: true,
+            writeStatus: 200,
+            readStatus: 200,
+            writeCID: Self.recordCID,
+            readCID: Self.recordCID,
+            writeResponseSHA256: String(repeating: "d", count: 64),
+            readResponseSHA256: String(repeating: "e", count: 64),
+            syncStatus: 200,
+            syncOpsCount: 1,
+            syncOperationCID: Self.recordCID,
+            syncOperationRevision: "222222222222a",
+            syncCommitment: String(repeating: "a", count: 64),
+            syncCommitRevision: "222222222222a",
+            syncCommitVerified: true,
+            syncValuesIncluded: true,
+            fullCARStatus: 200,
+            fullCARRecordCount: 1,
+            fullCARCommitment: String(repeating: "a", count: 64),
+            fullCARWireRevision: "222222222222a",
+            fullCARExpectedRecordVerified: true,
+            fullCARVerified: true,
+            // A failed upload can have no HTTP status when the transport
+            // throws. It must not be mistaken for a run that did not request
+            // a blob at all.
+            blobUploadStatus: nil,
+            blobDownloadStatus: nil,
+            blobCID: nil,
+            blobBytes: nil,
+            blobVerified: false,
+            converged: true,
+            status: "passed",
+            errorCode: nil,
+            events: []
+        )
+
+        let artifact = StatefulInteropMatrixRunner.evaluate(
+            scenario: "permissioned-blob-mismatch",
+            roundTrip: live
+        )
+
+        XCTAssertEqual(artifact.status, "failed")
+        XCTAssertTrue(artifact.assertions.contains {
+            $0.name == "permissioned-blob-verified" && !$0.passed
+        })
+        XCTAssertFalse(artifact.roundTrip.converged)
+    }
 }

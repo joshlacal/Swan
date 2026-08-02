@@ -3,7 +3,7 @@
   "referenceImplementationCommit": "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
   "referenceArchiveSHA256": "1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea",
   "overlayPatch": "reference-pds-recovery.patch",
-  "overlayPatchSHA256": "acc33987224b9428daac64e0a9f42cd0f924f0cdb6ddfc66f9905bc015d36d90",
+  "overlayPatchSHA256": "363bc352111ae740a543d0dae8f1a6a66f357e67a4bedcadfc949869faa6c237",
   "scope": [
     "Qualify space_record_oplog.space when listRepoOps joins space_record.",
     "Provide a read-authorized, snapshot-stable full-state getRepo CAR with signed-commit and DRISL roots.",
@@ -13,6 +13,6 @@
   "nonGoals": [
     "This is a disposable lab overlay, not a replacement upstream pin.",
     "The CAR is unavailable for a never-written repo because no LtHash revision exists to sign.",
-    "Blob blocks, auth policy changes, and cross-host notification behavior are outside this overlay."
+    "Auth policy changes and cross-host notification behavior are outside this overlay."
   ]
 }

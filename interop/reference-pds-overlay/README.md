@@ -41,7 +41,13 @@ The patch is intentionally narrow:
   canonical DAG-CBOR DRISL mapping `collection/rkey` to record CID. The root
   blocks are followed by current record blocks in lexical path order.
 
-It deliberately does not alter the pin, its archive, blob behavior, auth
-policy, or notification semantics. A never-written repository has no signed
-LtHash state and therefore returns `InvalidRequest` rather than emitting an
-unverifiable recovery CAR.
+It deliberately does not alter the pin, its archive, auth policy, or
+notification semantics. A never-written repository has no signed LtHash state
+and therefore returns `InvalidRequest` rather than emitting an unverifiable
+recovery CAR.
+
+For permissioned blob fixtures, the overlay also promotes typed blobs found in
+accepted `space.createRecord`, `space.putRecord`, and `space.applyWrites`
+records through the reference actor's existing permanent-blob path. This is a
+laboratory compatibility shim: the pinned reference has one actor blob
+namespace, while Swan maintains separate public and permissioned references.

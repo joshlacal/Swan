@@ -54,6 +54,7 @@ public enum StatefulInteropMatrixRunner {
         space: SpaceURI,
         createBody: Data,
         readQuery: [String: String],
+        blobBody: Data? = nil,
         readHost: LiveInteropHost? = nil,
         includeIncrementalValues: Bool = true,
         clientAttestation: String? = nil,
@@ -67,6 +68,7 @@ public enum StatefulInteropMatrixRunner {
             space: space,
             createBody: createBody,
             readQuery: readQuery,
+            blobBody: blobBody,
             readHost: readHost,
             verifyIncrementalSync: true,
             includeIncrementalValues: includeIncrementalValues,
@@ -108,6 +110,18 @@ public enum StatefulInteropMatrixRunner {
             StatefulInteropAssertion(name: "sync-and-full-car-commitments-match", passed: roundTrip.syncCommitment != nil && roundTrip.syncCommitment == roundTrip.fullCARCommitment),
             StatefulInteropAssertion(name: "sync-and-full-car-revisions-match", passed: roundTrip.syncCommitRevision != nil && roundTrip.syncCommitRevision == roundTrip.fullCARWireRevision),
             StatefulInteropAssertion(name: "full-car-verified", passed: roundTrip.fullCARVerified == true),
+            StatefulInteropAssertion(
+                name: "permissioned-blob-verified",
+                passed: (roundTrip.blobUploadStatus == nil
+                    && roundTrip.blobCID == nil
+                    && roundTrip.blobBytes == nil
+                    && roundTrip.blobVerified == nil)
+                    || (roundTrip.blobUploadStatus.map { (200 ... 299).contains($0) } == true
+                        && roundTrip.blobDownloadStatus.map { (200 ... 299).contains($0) } == true
+                        && roundTrip.blobCID != nil
+                        && roundTrip.blobVerified == true
+                        && (roundTrip.blobBytes ?? 0) > 0)
+            ),
         ]
         let evidencePassed = evidenceAssertions.allSatisfy(\.passed)
         let normalizedConvergence = evidencePassed
@@ -172,6 +186,11 @@ public enum StatefulInteropMatrixRunner {
             fullCARExpectedRecordVerified:
                 roundTrip.fullCARExpectedRecordVerified,
             fullCARVerified: roundTrip.fullCARVerified,
+            blobUploadStatus: roundTrip.blobUploadStatus,
+            blobDownloadStatus: roundTrip.blobDownloadStatus,
+            blobCID: roundTrip.blobCID,
+            blobBytes: roundTrip.blobBytes,
+            blobVerified: roundTrip.blobVerified,
             converged: converged,
             status: converged ? "passed" : "failed",
             errorCode: roundTrip.errorCode,

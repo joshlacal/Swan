@@ -16,7 +16,11 @@ source_digest() {
     packages/pds/src/actor-store/space/reader.ts \
     packages/repo/src/car.ts \
     packages/pds/src/api/com/atproto/space/getRepo.ts \
-    packages/pds/tests/spaces.test.ts
+    packages/pds/tests/spaces.test.ts \
+    packages/pds/src/api/com/atproto/space/util.ts \
+    packages/pds/src/api/com/atproto/space/createRecord.ts \
+    packages/pds/src/api/com/atproto/space/putRecord.ts \
+    packages/pds/src/api/com/atproto/space/applyWrites.ts
   do
     shasum -a 256 -- "${pinned}/${relative}"
   done | shasum -a 256 | awk '{print $1}'
@@ -70,4 +74,12 @@ grep -q "writes\\[1\\].cid.*writes\\[2\\].cid" \
   "${overlay_source}/packages/pds/tests/spaces.test.ts"
 grep -q "Credential space mismatch" \
   "${overlay_source}/packages/pds/tests/spaces.test.ts"
+grep -q "makeSpaceRecordBlobsPermanent" \
+  "${overlay_source}/packages/pds/src/api/com/atproto/space/util.ts"
+grep -q "makeSpaceRecordBlobsPermanent" \
+  "${overlay_source}/packages/pds/src/api/com/atproto/space/createRecord.ts"
+grep -q "makeSpaceRecordBlobsPermanent" \
+  "${overlay_source}/packages/pds/src/api/com/atproto/space/putRecord.ts"
+grep -q "makeSpaceRecordBlobsPermanent" \
+  "${overlay_source}/packages/pds/src/api/com/atproto/space/applyWrites.ts"
 echo "REFERENCE PDS OVERLAY SOURCE QUALIFICATION OK"

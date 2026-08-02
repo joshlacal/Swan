@@ -386,6 +386,42 @@ final class SwanInteropTests: XCTestCase {
         XCTAssertEqual(http.maximumStreamingResponseBytes, 512 * 1_024 * 1_024)
     }
 
+    func testInteropHTTPClientPinsOriginPortAndRejectsAuthorityConfusion() async throws {
+        let expectedURL = URL(string: "https://pds.test:8443/xrpc/com.atproto.server.describeServer")!
+        let handler: InteropHTTPExecuteHandler = { _, url, _, _, _ in
+            XCTAssertEqual(url, expectedURL)
+            return InteropHTTPResponse(
+                status: 200,
+                headers: [:],
+                body: Data(),
+                finalURL: url,
+                redirectCount: 0
+            )
+        }
+        let client = try InteropHTTPClient(
+            baseURL: URL(string: "https://pds.test:8443")!,
+            timeout: 1,
+            executeHandler: handler
+        )
+
+        _ = try await client.execute(
+            method: .get,
+            path: "/xrpc/com.atproto.server.describeServer"
+        )
+        for path in [
+            "https://pds.test:443/xrpc/com.atproto.server.describeServer",
+            "https://attacker@pds.test:8443/xrpc/com.atproto.server.describeServer",
+            "https://pds.test:8443/xrpc/com.atproto.server.describeServer#fragment",
+        ] {
+            do {
+                _ = try await client.execute(method: .get, path: path)
+                XCTFail("expected origin validation failure for \(path)")
+            } catch let error as InteropHTTPError {
+                XCTAssertEqual(error, .invalidURL)
+            }
+        }
+    }
+
     func testStreamingResponseBufferIsDrainedThroughAtMost64KiBChunks() throws {
         let byteCount = 3 * 64 * 1_024 + 17
         var buffer = ByteBufferAllocator().buffer(capacity: byteCount)
@@ -758,6 +794,16 @@ final class SwanInteropTests: XCTestCase {
             components.queryItems?.last?.value,
             "urn:ietf:params:oauth:request_uri:fixture"
         )
+    }
+
+    func testOAuthLabRedirectTargetRejectsUserInfoAuthority() throws {
+        let expected = try XCTUnwrap(URL(string: "https://client.example/callback"))
+        let userInfo = try XCTUnwrap(URL(string: "https://attacker@client.example/callback"))
+        let passwordInfo = try XCTUnwrap(URL(string: "https://client:secret@client.example/callback"))
+
+        XCTAssertFalse(SwanOAuthLabClient.sameRedirectTarget(userInfo, expected: expected))
+        XCTAssertFalse(SwanOAuthLabClient.sameRedirectTarget(passwordInfo, expected: expected))
+        XCTAssertTrue(SwanOAuthLabClient.sameRedirectTarget(expected, expected: expected))
     }
 
     func testReferenceOAuthProviderUsesSameOriginJSONCSRFAndEphemeralBearer() async throws {

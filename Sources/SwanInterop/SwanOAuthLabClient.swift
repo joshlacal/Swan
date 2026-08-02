@@ -229,7 +229,7 @@ public actor SwanOAuthLabClient {
               let components = URLComponents(url: locationURL, resolvingAgainstBaseURL: false),
               let code = components.queryItems?.first(where: { $0.name == "code" })?.value,
               components.queryItems?.first(where: { $0.name == "state" })?.value == state,
-              sameRedirectTarget(locationURL, expected: redirectURI) else {
+              Self.sameRedirectTarget(locationURL, expected: redirectURI) else {
             throw InteropHTTPError.unexpectedStatus(redirect.status)
         }
         return try await redeemAuthorizationCode(
@@ -472,7 +472,7 @@ public actor SwanOAuthLabClient {
               let finalCode = locationComponents.queryItems?.first(where: { $0.name == "code" })?.value,
               !finalCode.isEmpty,
               locationComponents.queryItems?.first(where: { $0.name == "state" })?.value == state,
-              sameRedirectTarget(locationURL, expected: redirectURI) else {
+              Self.sameRedirectTarget(locationURL, expected: redirectURI) else {
             throw SwanError.malformed("reference OAuth redirect hop was invalid")
         }
         return try await redeemAuthorizationCode(
@@ -690,9 +690,22 @@ public actor SwanOAuthLabClient {
             + (components.percentEncodedQuery.map { "?\($0)" } ?? "")
     }
 
-    private func sameRedirectTarget(_ actual: URL, expected: URL) -> Bool {
+    // The registered redirect URI may legitimately acquire OAuth response
+    // query items (code/state/iss), so the expected query is a subset rather
+    // than an exact match.  Userinfo is never part of a registered redirect
+    // target, however.  Treating `https://user@client.example/callback` as
+    // the same target would hand an attacker-controlled authority component
+    // to the browser/HTTP stack even though URLComponents reports the same
+    // host.  Keep this check independently of the query-subset rule.
+    static func sameRedirectTarget(_ actual: URL, expected: URL) -> Bool {
         guard let actualComponents = URLComponents(url: actual, resolvingAgainstBaseURL: false),
               let expectedComponents = URLComponents(url: expected, resolvingAgainstBaseURL: false) else {
+            return false
+        }
+        guard actualComponents.user == nil,
+              actualComponents.password == nil,
+              expectedComponents.user == nil,
+              expectedComponents.password == nil else {
             return false
         }
         let expectedQueryMatches = expectedComponents.queryItems?.allSatisfy { expectedItem in

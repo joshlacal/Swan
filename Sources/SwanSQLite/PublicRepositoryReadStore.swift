@@ -149,6 +149,83 @@ extension SQLiteAccountDatabase {
         }
     }
 
+    /// Checks one raw blob CID against the authenticated public repository
+    /// projection while the caller already owns the SQLite connection gate.
+    /// Permissioned promotion uses this to distinguish a staged public upload
+    /// from a blob that is also still reachable through a public record. The
+    /// walk is keyset-paged and uses the same projection limits as the public
+    /// read/promoter path; it never retains record values or the full CID set.
+    func publicRepositoryContainsBlobCIDWithoutGate(_ cid: String) async throws -> Bool {
+        try await preflightPublicReadProjectionWithoutGate()
+        var lastCollection: String?
+        var lastRecordKey: String?
+        var scannedRecords = 0
+        while true {
+            try Task.checkCancellation()
+            let rows: [SQLiteRow]
+            if let lastCollection, let lastRecordKey {
+                rows = try await connection.query(
+                    """
+                    SELECT collection, rkey, record_cid
+                    FROM public_repository_record_index
+                    WHERE collection > ?
+                       OR (collection = ? AND rkey > ?)
+                    ORDER BY collection ASC, rkey ASC
+                    LIMIT ?
+                    """,
+                    [
+                        .text(lastCollection),
+                        .text(lastCollection),
+                        .text(lastRecordKey),
+                        .integer(PublicRepositoryReadLimits.blobPromotionPageSize),
+                    ]
+                )
+            } else {
+                rows = try await connection.query(
+                    """
+                    SELECT collection, rkey, record_cid
+                    FROM public_repository_record_index
+                    ORDER BY collection ASC, rkey ASC
+                    LIMIT ?
+                    """,
+                    [.integer(PublicRepositoryReadLimits.blobPromotionPageSize)]
+                )
+            }
+            if rows.isEmpty { return false }
+            guard rows.count <= PublicRepositoryReadLimits
+                .maximumBlobPromotionIndexEntries - scannedRecords else {
+                throw PublicRepositoryReadError.resourceLimitExceeded
+            }
+            scannedRecords += rows.count
+            for row in rows {
+                let collection = try publicReadRequiredText(row, "collection")
+                let recordKey = try publicReadRequiredText(row, "rkey")
+                let path = try PublicRepositoryPath(
+                    collection: collection, recordKey: recordKey
+                )
+                let recordCID = try publicReadCID(
+                    try publicReadRequiredText(row, "record_cid")
+                )
+                let bytes = try await blockBytesWithoutGate(recordCID)
+                let value = try RepositoryMSTValidation.decodeRecordBlock(
+                    bytes, for: path
+                )
+                let record = try PublicRepositoryRecordCodec.publicRecord(
+                    from: value, collection: collection
+                )
+                if PublicRepositoryRecordCodec.publicBlobCIDs(in: record)
+                    .contains(where: { $0.string == cid }) {
+                    return true
+                }
+                lastCollection = collection
+                lastRecordKey = recordKey
+            }
+            if rows.count < PublicRepositoryReadLimits.blobPromotionPageSize {
+                return false
+            }
+        }
+    }
+
     func admitPublicRepositoryGeneration(
         account: AccountControlAccount,
         identityVerifier: any PublicPLCGenesisVerifying

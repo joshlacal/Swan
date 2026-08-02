@@ -682,3 +682,126 @@ index d127588..a93bace 100644
 +    }
 +  })
 +
+diff --git a/packages/pds/src/api/com/atproto/space/util.ts b/packages/pds/src/api/com/atproto/space/util.ts
+index 218894d..28043d0 100644
+--- a/packages/pds/src/api/com/atproto/space/util.ts
++++ b/packages/pds/src/api/com/atproto/space/util.ts
+@@ -1,6 +1,7 @@
+ import { Keypair } from '@atproto/crypto'
+ import { getPdsEndpoint } from '@atproto/common'
+ import { xrpc } from '@atproto/lex'
++import { LexMap, TypedBlobRef, enumBlobRefs } from '@atproto/lex-data'
+ import { SpacePermissionMatch } from '@atproto/oauth-scopes'
+ import { LtHash, SpaceContext, createCommit } from '@atproto/space'
+ import { DidString, SpaceUri, AtUriString } from '@atproto/syntax'
+@@ -44,6 +45,31 @@ export function assertSpaceScope(
+   } as SpacePermissionMatch)
+ }
+
++/**
++ * A permissioned space upload uses the normal repo.uploadBlob staging path.
++ * Make every typed blob referenced by a committed space record permanent only
++ * after the space transaction has accepted the record. The reference branch
++ * has one actor blob namespace, so this is a compatibility shim for the
++ * permissioned getBlob endpoint; Swan keeps public and space references
++ * separate in its own storage adapter.
++ */
++export async function makeSpaceRecordBlobsPermanent(
++  blobTransactor: {
++    verifyBlobAndMakePermanent(blob: TypedBlobRef): Promise<void>
++  },
++  records: Iterable<LexMap>,
++): Promise<void> {
++  const seen = new Set<string>()
++  for (const record of records) {
++    for (const blob of enumBlobRefs(record, { strict: false })) {
++      const cid = blob.ref.toString()
++      if (seen.has(cid)) continue
++      seen.add(cid)
++      await blobTransactor.verifyBlobAndMakePermanent(blob)
++    }
++  }
++}
++
+ /**
+  * Build a wire-format `signedCommit` from the stored LtHash state + rev.
+  * Returns undefined if either is missing (the repo has never been written to).
+diff --git a/packages/pds/src/api/com/atproto/space/createRecord.ts b/packages/pds/src/api/com/atproto/space/createRecord.ts
+index d8cb1a0..115b835 100644
+--- a/packages/pds/src/api/com/atproto/space/createRecord.ts
++++ b/packages/pds/src/api/com/atproto/space/createRecord.ts
+@@ -6,7 +6,11 @@ import { ForbiddenError, Server } from '@atproto/xrpc-server'
+ import { SqlRepoStorage } from '../../../../actor-store/space/index.js'
+ import { AppContext } from '../../../../context.js'
+ import { com } from '../../../../lexicons/index.js'
+-import { assertSpaceScope, fireNotifyWrite } from './util.js'
++import {
++  assertSpaceScope,
++  fireNotifyWrite,
++  makeSpaceRecordBlobsPermanent,
++} from './util.js'
+
+ export default function (server: Server, ctx: AppContext) {
+   server.add(com.atproto.space.createRecord, {
+@@ -35,6 +39,7 @@ export default function (server: Server, ctx: AppContext) {
+           record,
+         })
+         const rev = await actorTxn.space.applyRepoCommit(space, commit)
++        await makeSpaceRecordBlobsPermanent(actorTxn.repo.blob, [record])
+         const cid = await cidForLex(record)
+         return { cid: cid.toString(), rkey, rev, setHash: commit.setHash }
+       })
+diff --git a/packages/pds/src/api/com/atproto/space/putRecord.ts b/packages/pds/src/api/com/atproto/space/putRecord.ts
+index 46fafde..24772f2 100644
+--- a/packages/pds/src/api/com/atproto/space/putRecord.ts
++++ b/packages/pds/src/api/com/atproto/space/putRecord.ts
+@@ -5,7 +5,11 @@ import { ForbiddenError, Server } from '@atproto/xrpc-server'
+ import { SqlRepoStorage } from '../../../../actor-store/space/index.js'
+ import { AppContext } from '../../../../context.js'
+ import { com } from '../../../../lexicons/index.js'
+-import { assertSpaceScope, fireNotifyWrite } from './util.js'
++import {
++  assertSpaceScope,
++  fireNotifyWrite,
++  makeSpaceRecordBlobsPermanent,
++} from './util.js'
+
+ export default function (server: Server, ctx: AppContext) {
+   server.add(com.atproto.space.putRecord, {
+@@ -36,6 +40,7 @@ export default function (server: Server, ctx: AppContext) {
+           record,
+         })
+         const rev = await actorTxn.space.applyRepoCommit(space, commit)
++        await makeSpaceRecordBlobsPermanent(actorTxn.repo.blob, [record])
+         const cid = await cidForLex(record)
+         return { cid: cid.toString(), rev, setHash: commit.setHash }
+       })
+diff --git a/packages/pds/src/api/com/atproto/space/applyWrites.ts b/packages/pds/src/api/com/atproto/space/applyWrites.ts
+index 93951f7..9d4ad5d 100644
+--- a/packages/pds/src/api/com/atproto/space/applyWrites.ts
++++ b/packages/pds/src/api/com/atproto/space/applyWrites.ts
+@@ -9,7 +9,11 @@ import {
+ import { SqlRepoStorage } from '../../../../actor-store/space/index.js'
+ import { AppContext } from '../../../../context.js'
+ import { com } from '../../../../lexicons/index.js'
+-import { assertSpaceScope, fireNotifyWrite } from './util.js'
++import {
++  assertSpaceScope,
++  fireNotifyWrite,
++  makeSpaceRecordBlobsPermanent,
++} from './util.js'
+
+ const writeOpToAction = {
+   [WriteOpAction.Create]: 'create' as const,
+@@ -70,6 +74,12 @@ export default function (server: Server, ctx: AppContext) {
+           const repoStore = await SpaceRepo.loadOrCreate(storage, did)
+           const commit = await repoStore.formatCommit(ops)
+           const rev = await actorTxn.space.applyRepoCommit(space, commit)
++          await makeSpaceRecordBlobsPermanent(
++            actorTxn.repo.blob,
++            ops.flatMap((op) =>
++              op.action === WriteOpAction.Delete ? [] : [op.record],
++            ),
++          )
+           return { results: commit.writes, rev, setHash: commit.setHash }
+         },

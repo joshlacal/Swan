@@ -1,7 +1,9 @@
 import Foundation
+import Crypto
 import Petrel
 import SwanCore
 @_spi(PortableRestore) @testable import SwanSQLite
+import SwanPublicRepository
 import SwanSpaces
 import SwanStorage
 import XCTest
@@ -99,6 +101,177 @@ final class PermissionedBlobRepositoryReachabilityTests: XCTestCase {
                 received.append(chunk)
             }
             XCTAssertEqual(received, payload)
+        }
+    }
+
+    func testPermissionedRecordPromotesUploadedBlobIntoPrivateNamespace() async throws {
+        let fixture = try PermissionedBlobReachabilityFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        try await fixture.withDatabase { database in
+            let payload = Data("promoted permissioned blob".utf8)
+            let publicReference = try await database.putBlob(
+                payload,
+                namespace: .public
+            )
+            let blobCID = try CID.parse(publicReference.cid)
+            let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+                (key: "$type", value: "app.bsky.feed.post"),
+                (key: "text", value: "private blob"),
+                (key: "blob", value: OrderedCBORMap(entries: [
+                    (key: "$type", value: "blob"),
+                    (key: "ref", value: ATProtoLink(cid: blobCID)),
+                    (key: "mimeType", value: "application/octet-stream"),
+                    (key: "size", value: payload.count),
+                ])),
+            ]))
+            let recordCID = CID.fromDAGCBOR(value).string
+
+            _ = try await database.apply(
+                space: fixture.space,
+                author: fixture.author,
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try TID(tidString: "2222222222222"),
+                writes: [
+                    .create(
+                        uri: fixture.record,
+                        value: value,
+                        cid: recordCID
+                    ),
+                ]
+            )
+
+            let remainsPublic = try await database.publicBlobExists(cid: publicReference.cid)
+            XCTAssertFalse(
+                remainsPublic,
+                "a blob attached only to a permissioned record must not remain publicly reachable"
+            )
+            let privateBlobReference = try await database.permissionedBlob(
+                space: fixture.space,
+                author: fixture.author,
+                cid: publicReference.cid
+            )
+            let privateBlob = try XCTUnwrap(privateBlobReference)
+            var received = Data()
+            try await privateBlob.body.streamBody(maximumChunkBytes: 8) { chunk in
+                received.append(chunk)
+            }
+            XCTAssertEqual(received, payload)
+        }
+    }
+
+    func testPermissionedPromotionRetainsBlobStillReferencedByPublicRecord() async throws {
+        let fixture = try PermissionedBlobReachabilityFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        try await fixture.withDatabase { database in
+            let payload = Data("shared public and permissioned blob".utf8)
+            let publicReference = try await database.putBlob(
+                payload,
+                namespace: .public
+            )
+            let blobCID = try CID.parse(publicReference.cid)
+            let signingKey = P256.Signing.PrivateKey()
+            let genesis = try PublicRepositoryGenesisCodec.create(
+                did: fixture.author,
+                revision: "3jzfcijpj2z2a",
+                signingKey: signingKey
+            )
+            _ = try await database.installPublicRepositoryGenesis(
+                genesis,
+                signingPublicKey: signingKey.publicKey,
+                installedAt: Date(timeIntervalSince1970: 1_750_000_000)
+            )
+            let loadedInitial = try await database.loadPublicRepositoryState()
+            let initial = try XCTUnwrap(loadedInitial)
+            let publicPath = try PublicRepositoryPath(
+                collection: "app.bsky.feed.post",
+                recordKey: "shared"
+            )
+            let publicRequest = try PublicRepositoryMutationRequest(
+                id: "shared-public-record",
+                canonicalDigest: Data(repeating: 0x51, count: 32),
+                baseCommitCID: initial.commitCID
+            )
+            guard case let .reserved(publicReservation) = try await database
+                .reservePublicRepositoryRevision(
+                    publicRequest,
+                    wallClockMicroseconds: 1_750_000_000_000_000
+                ) else {
+                XCTFail("public request unexpectedly replayed")
+                return
+            }
+            let publicRecord = PublicRecord([
+                "$type": .string("app.bsky.feed.post"),
+                "text": .string("public reference"),
+                "blob": .object([
+                    "$type": .string("blob"),
+                    "ref": .link(blobCID),
+                    "mimeType": .string("application/octet-stream"),
+                    "size": .integer(payload.count),
+                ]),
+            ])
+            let prepared = try await PublicRepositoryEngine.apply(
+                repositoryDID: fixture.author,
+                currentState: initial,
+                blocks: database,
+                revision: publicReservation.nextRevision,
+                batch: try PublicRepositoryWriteBatch(
+                    writes: [.create(path: publicPath, record: publicRecord)],
+                    expectedCommitCID: initial.commitCID
+                ),
+                signer: P256PublicRepositoryCommitSigner(privateKey: signingKey)
+            )
+            _ = try await database.applyPublicRepositoryMutation(
+                reservation: publicReservation,
+                prepared: prepared
+            )
+
+            let permissionedValue = try DAGCBOR.encodeValue(
+                OrderedCBORMap(entries: [
+                    (key: "$type", value: "app.bsky.feed.post"),
+                    (key: "text", value: "private reference"),
+                    (key: "blob", value: OrderedCBORMap(entries: [
+                        (key: "$type", value: "blob"),
+                        (key: "ref", value: ATProtoLink(cid: blobCID)),
+                        (key: "mimeType", value: "application/octet-stream"),
+                        (key: "size", value: payload.count),
+                    ])),
+                ])
+            )
+            _ = try await database.apply(
+                space: fixture.space,
+                author: fixture.author,
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try TID(tidString: "2222222222222"),
+                writes: [
+                    .create(
+                        uri: fixture.record,
+                        value: permissionedValue,
+                        cid: CID.fromDAGCBOR(permissionedValue).string
+                    ),
+                ]
+            )
+
+            let remainsPublic = try await database.publicBlobExists(
+                cid: publicReference.cid
+            )
+            let publicData = try await database.publicBlobData(
+                cid: publicReference.cid
+            )
+            let privateBlob = try await database.permissionedBlob(
+                space: fixture.space,
+                author: fixture.author,
+                cid: publicReference.cid
+            )
+            XCTAssertTrue(
+                remainsPublic,
+                "a public record reference must preserve public blob reachability"
+            )
+            XCTAssertEqual(publicData, payload)
+            XCTAssertNotNil(privateBlob)
         }
     }
 }

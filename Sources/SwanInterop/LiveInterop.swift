@@ -305,8 +305,13 @@ public final class InteropHTTPClient: @unchecked Sendable {
         guard !path.isEmpty,
               let url = URL(string: path, relativeTo: baseURL)?.absoluteURL,
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let baseComponents = URLComponents(url: baseURL, resolvingAgainstBaseURL: false),
               components.scheme?.lowercased() == baseURL.scheme?.lowercased(),
-              components.host?.lowercased() == baseURL.host?.lowercased() else {
+              components.host?.lowercased() == baseURL.host?.lowercased(),
+              components.port == baseComponents.port,
+              components.user == nil,
+              components.password == nil,
+              components.fragment == nil else {
             throw InteropHTTPError.invalidURL
         }
         return url
@@ -858,6 +863,16 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
     /// itself is intentionally not persisted in the artifact.
     public let fullCARExpectedRecordVerified: Bool?
     public let fullCARVerified: Bool?
+    /// Permissioned blob transfer evidence, when the live fixture requested a
+    /// blob upload. The blob is uploaded with the member's OAuth capability
+    /// and fetched from the selected repository host with the read-only space
+    /// credential; only status, CID, byte count, and a digest check leave the
+    /// runner.
+    public let blobUploadStatus: Int?
+    public let blobDownloadStatus: Int?
+    public let blobCID: String?
+    public let blobBytes: Int?
+    public let blobVerified: Bool?
     public let converged: Bool
     public let status: String
     public let errorCode: String?
@@ -889,6 +904,11 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
         fullCARWireRevision: String? = nil,
         fullCARExpectedRecordVerified: Bool? = nil,
         fullCARVerified: Bool? = nil,
+        blobUploadStatus: Int? = nil,
+        blobDownloadStatus: Int? = nil,
+        blobCID: String? = nil,
+        blobBytes: Int? = nil,
+        blobVerified: Bool? = nil,
         converged: Bool,
         status: String,
         errorCode: String?,
@@ -928,6 +948,11 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
         self.fullCARWireRevision = canonicalInteropTID(fullCARWireRevision)
         self.fullCARExpectedRecordVerified = fullCARExpectedRecordVerified
         self.fullCARVerified = fullCARVerified
+        self.blobUploadStatus = blobUploadStatus
+        self.blobDownloadStatus = blobDownloadStatus
+        self.blobCID = canonicalInteropCID(blobCID, codec: .raw)
+        self.blobBytes = blobBytes
+        self.blobVerified = blobVerified
         self.converged = converged
         self.status = FixtureSanitizer.artifactStatus(status)
         self.errorCode = errorCode.map(FixtureSanitizer.errorCode)
@@ -961,6 +986,11 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
         case fullCARWireRevision
         case fullCARExpectedRecordVerified
         case fullCARVerified
+        case blobUploadStatus
+        case blobDownloadStatus
+        case blobCID
+        case blobBytes
+        case blobVerified
         case converged
         case status
         case errorCode
@@ -1045,6 +1075,20 @@ public struct LiveInteropPermissionedRoundTripArtifact: Codable, Sendable, Equat
             fullCARVerified: try container.decodeIfPresent(
                 Bool.self,
                 forKey: .fullCARVerified
+            ),
+            blobUploadStatus: try container.decodeIfPresent(
+                Int.self,
+                forKey: .blobUploadStatus
+            ),
+            blobDownloadStatus: try container.decodeIfPresent(
+                Int.self,
+                forKey: .blobDownloadStatus
+            ),
+            blobCID: try container.decodeIfPresent(String.self, forKey: .blobCID),
+            blobBytes: try container.decodeIfPresent(Int.self, forKey: .blobBytes),
+            blobVerified: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .blobVerified
             ),
             converged: try container.decode(Bool.self, forKey: .converged),
             status: try container.decode(String.self, forKey: .status),
@@ -1333,6 +1377,20 @@ public enum LiveInteropRunner {
         )
     }
 
+    private struct PermissionedBlobResult: Sendable {
+        let uploadStatus: Int?
+        let downloadStatus: Int?
+        let cid: String?
+        let byteCount: Int?
+        let verified: Bool?
+        let errorCode: String?
+
+        static let notRequested = Self(
+            uploadStatus: nil, downloadStatus: nil, cid: nil,
+            byteCount: nil, verified: nil, errorCode: nil
+        )
+    }
+
     private struct PublicBlobResult: Sendable {
         let uploadStatus: Int?
         let downloadStatus: Int?
@@ -1574,6 +1632,13 @@ public enum LiveInteropRunner {
                     errorCode: "InvalidBlobResponse"
                 )
             }
+            guard cid == CID.fromBlob(body).string else {
+                return PublicBlobResult(
+                    uploadStatus: response.status, downloadStatus: nil,
+                    cid: cid, byteCount: body.count, verified: false,
+                    errorCode: "BlobCIDMismatch"
+                )
+            }
             return PublicBlobResult(
                 uploadStatus: response.status, downloadStatus: nil,
                 cid: cid, byteCount: body.count, verified: nil, errorCode: nil
@@ -1581,6 +1646,128 @@ public enum LiveInteropRunner {
         } catch {
             return PublicBlobResult(
                 uploadStatus: nil, downloadStatus: nil, cid: nil,
+                byteCount: nil, verified: false, errorCode: liveErrorCode(error)
+            )
+        }
+    }
+
+    private static func uploadPermissionedBlob(
+        member: LiveInteropHost,
+        body: Data,
+        recorder: InteropFixtureRecorder
+    ) async -> PermissionedBlobResult {
+        let path = "/xrpc/com.atproto.repo.uploadBlob"
+        do {
+            let authorization = try await authorization(
+                for: member,
+                method: .post,
+                path: path,
+                body: body
+            )
+            let response = try await member.client.binaryProcedure(
+                "com.atproto.repo.uploadBlob",
+                body: body,
+                contentType: "application/octet-stream",
+                authorization: authorization
+            )
+            await recorder.record(
+                host: member.label,
+                method: "POST",
+                path: path,
+                requestBody: body,
+                response: response
+            )
+            guard (200 ... 299).contains(response.status) else {
+                return PermissionedBlobResult(
+                    uploadStatus: response.status, downloadStatus: nil,
+                    cid: nil, byteCount: nil, verified: false,
+                    errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
+                )
+            }
+            guard let cid = canonicalBlobCID(from: response.body) else {
+                return PermissionedBlobResult(
+                    uploadStatus: response.status, downloadStatus: nil,
+                    cid: nil, byteCount: body.count, verified: false,
+                    errorCode: "InvalidBlobResponse"
+                )
+            }
+            guard cid == CID.fromBlob(body).string else {
+                return PermissionedBlobResult(
+                    uploadStatus: response.status, downloadStatus: nil,
+                    cid: cid, byteCount: body.count, verified: false,
+                    errorCode: "BlobCIDMismatch"
+                )
+            }
+            return PermissionedBlobResult(
+                uploadStatus: response.status, downloadStatus: nil,
+                cid: cid, byteCount: body.count, verified: nil, errorCode: nil
+            )
+        } catch {
+            return PermissionedBlobResult(
+                uploadStatus: nil, downloadStatus: nil, cid: nil,
+                byteCount: nil, verified: false, errorCode: liveErrorCode(error)
+            )
+        }
+    }
+
+    private static func downloadPermissionedBlob(
+        repositoryHost: LiveInteropHost,
+        space: SpaceURI,
+        repository: String,
+        cid: String,
+        expectedBody: Data,
+        uploadStatus: Int?,
+        authorization: InteropAuthorization,
+        recorder: InteropFixtureRecorder
+    ) async -> PermissionedBlobResult {
+        let url = FileManager.default.temporaryDirectory
+            .appending(path: "swan-permissioned-blob-\(UUID().uuidString).blob")
+        defer { try? FileManager.default.removeItem(at: url) }
+        do {
+            let query = [
+                "space": space.rawValue,
+                "repo": repository,
+                "cid": cid,
+            ]
+            let response = try await repositoryHost.client.stream(
+                "com.atproto.space.getBlob",
+                query: query,
+                authorization: authorization,
+                to: url,
+                maximumResponseBytes: 256 * 1024 * 1024
+            )
+            await recorder.record(
+                host: repositoryHost.label,
+                method: "GET",
+                path: "/xrpc/com.atproto.space.getBlob",
+                response: response
+            )
+            guard (200 ... 299).contains(response.status) else {
+                return PermissionedBlobResult(
+                    uploadStatus: uploadStatus, downloadStatus: response.status,
+                    cid: cid, byteCount: nil, verified: false,
+                    errorCode: responseErrorCode(response) ?? "HTTP\(response.status)"
+                )
+            }
+            guard cid == CID.fromBlob(expectedBody).string else {
+                return PermissionedBlobResult(
+                    uploadStatus: uploadStatus, downloadStatus: response.status,
+                    cid: cid, byteCount: nil, verified: false,
+                    errorCode: "BlobCIDMismatch"
+                )
+            }
+            let received = try fileDigest(url)
+            let expectedDigest = Hex.encode(SHA256.hash(data: expectedBody))
+            let verified = received.bytes == expectedBody.count
+                && received.digest == expectedDigest
+            return PermissionedBlobResult(
+                uploadStatus: uploadStatus, downloadStatus: response.status,
+                cid: cid, byteCount: received.bytes, verified: verified,
+                errorCode: verified ? nil : "BlobMismatch"
+            )
+        } catch {
+            return PermissionedBlobResult(
+                uploadStatus: uploadStatus, downloadStatus: nil, cid: cid,
                 byteCount: nil, verified: false, errorCode: liveErrorCode(error)
             )
         }
@@ -1626,6 +1813,13 @@ public enum LiveInteropRunner {
                     uploadStatus: uploadStatus, downloadStatus: response.status,
                     cid: cid, byteCount: nil, verified: false,
                     errorCode: "HTTP\(response.status)"
+                )
+            }
+            guard cid == CID.fromBlob(expectedBody).string else {
+                return PublicBlobResult(
+                    uploadStatus: uploadStatus, downloadStatus: response.status,
+                    cid: cid, byteCount: nil, verified: false,
+                    errorCode: "BlobCIDMismatch"
                 )
             }
             guard response.header("content-type")?.lowercased()
@@ -1771,6 +1965,7 @@ public enum LiveInteropRunner {
         space: SpaceURI,
         createBody: Data,
         readQuery: [String: String],
+        blobBody: Data? = nil,
         readHost: LiveInteropHost? = nil,
         verifyIncrementalSync: Bool = false,
         includeIncrementalValues: Bool = true,
@@ -1802,6 +1997,7 @@ public enum LiveInteropRunner {
         var errorCode: String?
         var syncResult = PermissionedSyncResult.notRequested
         var fullCARResult = PermissionedCARResult.notRequested
+        var blobResult = PermissionedBlobResult.notRequested
         do {
             let credential = try await broker.exchange(
                 space: space,
@@ -1818,15 +2014,60 @@ public enum LiveInteropRunner {
             // repository write is therefore made by the member account using
             // the same fresh OAuth/DPoP provider used to mint its delegation.
             let writePath = "/xrpc/com.atproto.space.createRecord"
+            var writeBody = createBody
+            if let blobBody {
+                blobResult = await uploadPermissionedBlob(
+                    member: member,
+                    body: blobBody,
+                    recorder: recorder
+                )
+                guard blobResult.errorCode == nil,
+                      let blobCID = blobResult.cid,
+                      let bodyText = String(data: createBody, encoding: .utf8),
+                      bodyText.contains(blobCID) || bodyText.contains("{{BLOB_CID}}") else {
+                    return await permissionedArtifact(
+                        scenario: scenario, member: member, authority: authority,
+                        credentialIssued: credentialIssued, writeStatus: nil,
+                        readStatus: nil, writeCID: nil, readCID: nil,
+                        writeDigest: nil, readDigest: nil,
+                        blobResult: blobResult,
+                        converged: false,
+                        errorCode: blobResult.errorCode ?? "BlobReferenceMissing",
+                        recorder: recorder
+                    )
+                }
+                if bodyText.contains("{{BLOB_CID}}") {
+                    writeBody = Data(
+                        bodyText.replacingOccurrences(
+                            of: "{{BLOB_CID}}", with: blobCID
+                        ).utf8
+                    )
+                }
+            }
+            guard jsonFields(writeBody, equalTo: [
+                "space": space.rawValue,
+                "repo": readQuery["repo"] ?? "",
+                "collection": readQuery["collection"] ?? "",
+                "rkey": readQuery["rkey"] ?? "",
+            ]) else {
+                return await permissionedArtifact(
+                    scenario: scenario, member: member, authority: authority,
+                    credentialIssued: credentialIssued, writeStatus: nil,
+                    readStatus: nil, writeCID: nil, readCID: nil,
+                    writeDigest: nil, readDigest: nil,
+                    blobResult: blobResult,
+                    converged: false, errorCode: "InvalidRequest", recorder: recorder
+                )
+            }
             let memberWriteAuthorization = try await authorization(
                 for: member,
                 method: .post,
                 path: writePath,
-                body: createBody
+                body: writeBody
             )
             let write = try await member.client.procedure(
                 "com.atproto.space.createRecord",
-                body: createBody,
+                body: writeBody,
                 authorization: memberWriteAuthorization
             )
             writeStatus = write.status
@@ -1835,7 +2076,7 @@ public enum LiveInteropRunner {
                 host: member.label,
                 method: "POST",
                 path: writePath,
-                requestBody: createBody,
+                requestBody: writeBody,
                 response: write
             )
             guard (200 ... 299).contains(write.status) else {
@@ -1845,6 +2086,7 @@ public enum LiveInteropRunner {
                     credentialIssued: credentialIssued, writeStatus: writeStatus,
                     readStatus: nil, writeCID: nil, readCID: nil,
                     writeDigest: writeDigest, readDigest: nil,
+                    blobResult: blobResult,
                     converged: false, errorCode: errorCode, recorder: recorder
                 )
             }
@@ -1856,6 +2098,7 @@ public enum LiveInteropRunner {
                     credentialIssued: credentialIssued, writeStatus: writeStatus,
                     readStatus: nil, writeCID: nil, readCID: nil,
                     writeDigest: writeDigest, readDigest: nil,
+                    blobResult: blobResult,
                     converged: false, errorCode: errorCode, recorder: recorder
                 )
             }
@@ -1888,6 +2131,7 @@ public enum LiveInteropRunner {
                     credentialIssued: credentialIssued, writeStatus: writeStatus,
                     readStatus: readStatus, writeCID: writeCID, readCID: nil,
                     writeDigest: writeDigest, readDigest: readDigest,
+                    blobResult: blobResult,
                     converged: false, errorCode: errorCode, recorder: recorder
                 )
             }
@@ -1899,7 +2143,20 @@ public enum LiveInteropRunner {
                     credentialIssued: credentialIssued, writeStatus: writeStatus,
                     readStatus: readStatus, writeCID: writeCID, readCID: nil,
                     writeDigest: writeDigest, readDigest: readDigest,
+                    blobResult: blobResult,
                     converged: false, errorCode: errorCode, recorder: recorder
+                )
+            }
+            if let blobBody, let blobCID = blobResult.cid {
+                blobResult = await downloadPermissionedBlob(
+                    repositoryHost: repositoryHost,
+                    space: space,
+                    repository: readQuery["repo"] ?? "",
+                    cid: blobCID,
+                    expectedBody: blobBody,
+                    uploadStatus: blobResult.uploadStatus,
+                    authorization: credentialAuthorization,
+                    recorder: recorder
                 )
             }
             if verifyIncrementalSync {
@@ -1931,7 +2188,9 @@ public enum LiveInteropRunner {
                 verifyIncrementalSync: verifyIncrementalSync,
                 syncResult: syncResult,
                 verifyFullCAR: verifyFullCAR,
-                fullCARResult: fullCARResult
+                fullCARResult: fullCARResult,
+                blobRequested: blobBody != nil,
+                blobResult: blobResult
             )
             let evidenceError = syncResult.errorCode
                 ?? fullCARResult.errorCode
@@ -1943,6 +2202,7 @@ public enum LiveInteropRunner {
                 writeDigest: writeDigest, readDigest: readDigest,
                 syncResult: syncResult,
                 fullCARResult: fullCARResult,
+                blobResult: blobResult,
                 converged: converged,
                 errorCode: evidenceError,
                 recorder: recorder
@@ -1956,6 +2216,7 @@ public enum LiveInteropRunner {
                 writeDigest: writeDigest, readDigest: readDigest,
                 syncResult: syncResult,
                 fullCARResult: fullCARResult,
+                blobResult: blobResult,
                 converged: false, errorCode: errorCode, recorder: recorder
             )
         }
@@ -2603,6 +2864,7 @@ public enum LiveInteropRunner {
         readDigest: String?,
         syncResult: PermissionedSyncResult = .notRequested,
         fullCARResult: PermissionedCARResult = .notRequested,
+        blobResult: PermissionedBlobResult = .notRequested,
         converged: Bool,
         errorCode: String?,
         recorder: InteropFixtureRecorder
@@ -2633,6 +2895,11 @@ public enum LiveInteropRunner {
             fullCARExpectedRecordVerified:
                 fullCARResult.expectedRecordVerified,
             fullCARVerified: fullCARResult.verified,
+            blobUploadStatus: blobResult.uploadStatus,
+            blobDownloadStatus: blobResult.downloadStatus,
+            blobCID: blobResult.cid,
+            blobBytes: blobResult.byteCount,
+            blobVerified: blobResult.verified,
             converged: converged,
             status: converged ? "passed" : "failed",
             errorCode: errorCode,
@@ -2650,7 +2917,9 @@ public enum LiveInteropRunner {
         verifyIncrementalSync: Bool,
         syncResult: PermissionedSyncResult,
         verifyFullCAR: Bool,
-        fullCARResult: PermissionedCARResult
+        fullCARResult: PermissionedCARResult,
+        blobRequested: Bool,
+        blobResult: PermissionedBlobResult
     ) -> Bool {
         guard let writeCID, writeCID == readCID else { return false }
 
@@ -2685,6 +2954,16 @@ public enum LiveInteropRunner {
                   canonicalInteropTID(syncResult.commitRevision)
                     == canonicalInteropTID(fullCARResult.wireRevision)
             else {
+                return false
+            }
+        }
+
+        if blobRequested {
+            guard blobResult.uploadStatus.map({ (200 ... 299).contains($0) }) == true,
+                  blobResult.downloadStatus.map({ (200 ... 299).contains($0) }) == true,
+                  blobResult.verified == true,
+                  (blobResult.byteCount ?? 0) > 0,
+                  blobResult.errorCode == nil else {
                 return false
             }
         }

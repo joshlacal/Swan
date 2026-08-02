@@ -4360,7 +4360,7 @@ extension SwanCommand {
             @Option(name: .long, help: "JSON request body file for the write")
             var bodyFile: String
 
-            @Option(name: .customLong("blob-file"), help: "Optional public blob body file to upload before the record write")
+            @Option(name: .customLong("blob-file"), help: "Optional blob body file to upload before the record write (public or permissioned)")
             var blobFile: String?
 
             @Option(name: .long, parsing: .upToNextOption, help: "Permissioned read query item key=value; repeatable")
@@ -4588,6 +4588,7 @@ extension SwanCommand {
                             space: parsedSpace,
                             createBody: body,
                             readQuery: query,
+                            blobBody: blobBody,
                             readHost: readHost,
                             includeIncrementalValues: !permissionedListOpsExcludeValues
                         )
@@ -4602,6 +4603,7 @@ extension SwanCommand {
                             space: parsedSpace,
                             createBody: body,
                             readQuery: query,
+                            blobBody: blobBody,
                             readHost: readHost,
                             verifyIncrementalSync: permissionedListOps,
                             includeIncrementalValues: !permissionedListOpsExcludeValues,

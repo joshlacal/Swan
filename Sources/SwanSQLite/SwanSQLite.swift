@@ -3004,6 +3004,23 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 break
             }
         }
+        var permissionedBlobCIDs = Set<String>()
+        for write in writes {
+            switch write {
+            case let .create(_, value, _), let .put(_, value, _), let .update(_, value, _):
+                do {
+                    permissionedBlobCIDs.formUnion(
+                        try rawBlobCIDs(in: value)
+                    )
+                } catch {
+                    throw SwanError.malformed(
+                        "permissioned record blob references are invalid"
+                    )
+                }
+            case .delete:
+                break
+            }
+        }
         _ = try sqliteRevision(expectedRevision)
 
         return try await withConnectionGate {
@@ -3030,6 +3047,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     "wire revision must advance"
                 )
             }
+            try await promotePermissionedBlobReferences(
+                permissionedBlobCIDs.sorted(), space: space
+            )
 
             var ltHash = try LtHash(
                 serialized: current?.ltHash ?? Data(repeating: 0, count: LtHash.byteCount)
@@ -8748,6 +8768,132 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             throw SwanError.malformed("blob CID is invalid")
         }
         return cid
+    }
+
+    /// Extracts raw CID links from a permissioned record before the write
+    /// transaction. Raw links are the wire representation of AT blob
+    /// references; DAG-CBOR links remain repository blocks and are ignored by
+    /// this projection. The decoder is bounded by the already-enforced record
+    /// byte limit, and the result is de-duplicated before namespace promotion.
+    private func rawBlobCIDs(in value: Data) throws -> [String] {
+        let decoded = try CARRepository.decodeRecordCBOR(value)
+        var cids = Set<String>()
+
+        func visitAny(_ value: Any) {
+            if let link = value as? ATProtoLink,
+               link.cid.codec == .raw,
+               link.cid.multihash.algorithm == Multihash.sha256Code,
+               link.cid.multihash.length == Multihash.sha256Length {
+                cids.insert(link.cid.string)
+                return
+            }
+            if let map = value as? OrderedCBORMap {
+                for entry in map.entries { visitAny(entry.value) }
+                return
+            }
+            if let map = value as? [String: Any] {
+                for item in map.values { visitAny(item) }
+                return
+            }
+            if let array = value as? [Any] {
+                for item in array { visitAny(item) }
+            }
+        }
+
+        func visit(_ value: ATProtocolValueContainer) throws {
+            switch value {
+            case let .knownType(known):
+                visitAny(try known.toCBORValue())
+            case let .object(fields):
+                for item in fields.values { try visit(item) }
+            case let .array(values):
+                for item in values { try visit(item) }
+            case let .link(link):
+                visitAny(link)
+            case let .unknownType(_, nested):
+                try visit(nested)
+            default:
+                break
+            }
+        }
+
+        try visit(decoded)
+        return cids.sorted()
+    }
+
+    /// Moves a freshly uploaded public blob into the private space namespace
+    /// as part of the same SQLite transaction as its permissioned record.
+    /// A staged-only public reference is removed after the private reference is
+    /// durable, while a CID still referenced by a validated public record
+    /// keeps (or restores) its public reference. Existing private references
+    /// are idempotent, including when another space already owns the CAS.
+    private func promotePermissionedBlobReferences(
+        _ cids: [String],
+        space: SpaceURI
+    ) async throws {
+        for cid in cids {
+            _ = try canonicalRawBlobCID(cid)
+            let privateReferences = try await connection.query(
+                """
+                SELECT 1
+                FROM blob_namespace_references
+                WHERE cid = ? AND namespace_kind = 'space' AND space_uri = ?
+                LIMIT 1
+                """,
+                [.text(cid), .text(space.rawValue)]
+            )
+            if !privateReferences.isEmpty { continue }
+
+            let payloadRows = try await connection.query(
+                """
+                SELECT blob_payloads.storage_kind, blob_payloads.cas_digest,
+                       blob_payloads.byte_count
+                FROM blob_payloads
+                WHERE blob_payloads.cid = ?
+                LIMIT 1
+                """,
+                [.text(cid)]
+            )
+            guard let payloadRow = payloadRows.first,
+                  try requiredText(payloadRow, "storage_kind") == "cas-v1",
+                  try payloadRow.column("cas_digest")?.string
+                    == blobDigestHex(cid: cid, allowLegacy: false),
+                  let byteCount = payloadRow.column("byte_count")?.integer,
+                  byteCount > 0 else {
+                throw SwanError.malformed(
+                    "permissioned blob is not available from the account"
+                )
+            }
+
+            _ = try await connection.query(
+                """
+                INSERT INTO blob_namespace_references(
+                    cid, namespace_kind, space_uri
+                ) VALUES (?, 'space', ?)
+                ON CONFLICT(cid, namespace_kind, space_uri) DO NOTHING
+                """,
+                [.text(cid), .text(space.rawValue)]
+            )
+            if try await publicRepositoryContainsBlobCIDWithoutGate(cid) {
+                _ = try await connection.query(
+                    """
+                    INSERT INTO blob_namespace_references(
+                        cid, namespace_kind, space_uri
+                    ) VALUES (?, 'public', '')
+                    ON CONFLICT(cid, namespace_kind, space_uri) DO NOTHING
+                    """,
+                    [.text(cid)]
+                )
+            } else {
+                _ = try await connection.query(
+                    """
+                    DELETE FROM blob_namespace_references
+                    WHERE cid = ? AND namespace_kind = 'public' AND space_uri = ''
+                    """,
+                    [.text(cid)]
+                )
+            }
+        }
     }
 
     private func blobDigestHex(cid: String, allowLegacy: Bool) throws -> String {

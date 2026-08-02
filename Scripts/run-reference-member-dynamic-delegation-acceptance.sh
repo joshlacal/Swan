@@ -558,10 +558,13 @@ docker run --rm \
   "$swan_image" \
   -ec '
     private_value="$(od -An -N32 -tx1 /dev/urandom | tr -d " \n")"
+    blob_value="swan-permissioned-blob-${private_value}"
+    printf "%s" "$blob_value" >/tmp/permissioned-blob.bin
+    blob_size="$(wc -c </tmp/permissioned-blob.bin | tr -d "[:space:]")"
     umask 077
     printf \
-      '"'"'{"space":"%s","repo":"%s","collection":"%s","rkey":"%s","record":{"$type":"app.bsky.feed.post","text":"%s"}}\n'"'"' \
-      "$1" "$2" "$3" "$4" "$private_value" \
+      '"'"'{"space":"%s","repo":"%s","collection":"%s","rkey":"%s","record":{"$type":"app.bsky.feed.post","text":"%s","blob":{"$type":"blob","ref":{"$link":"{{BLOB_CID}}"},"mimeType":"application/octet-stream","size":%s}}}\n'"'"' \
+      "$1" "$2" "$3" "$4" "$private_value" "$blob_size" \
       >/tmp/permissioned-record.json
     export SSL_CERT_FILE=/etc/ssl/certs/caddy-local-root.crt
     if [ "${SWAN_DYNAMIC_DELEGATION_DIRECTION:-member}" = "member" ]; then
@@ -605,6 +608,7 @@ docker run --rm \
       --permissioned-read-host "$read_host" \
       --provision-space \
       --body-file /tmp/permissioned-record.json \
+      --blob-file /tmp/permissioned-blob.bin \
       --read-query \
         "space=$1" \
         "repo=$2" \
@@ -693,10 +697,14 @@ PY
       echo "sanitized artifact retained a permissioned value" >&2
       exit 1
     fi
+    if grep -F -- "$blob_value" /tmp/sanitized-artifact.json >/dev/null; then
+      echo "sanitized artifact retained permissioned blob bytes" >&2
+      exit 1
+    fi
     if [ "${recovery_failed:-0}" -ne 0 ]; then
       exit 1
     fi
-    unset private_value SWAN_LAB_CONSUMER_PASSWORD
+    unset private_value blob_value SWAN_LAB_CONSUMER_PASSWORD
   ' _ \
   "$space_uri" "$space_member_did" "$collection" "$rkey" "${local_consumer_handle:-}" "$space_authority_did"
 
