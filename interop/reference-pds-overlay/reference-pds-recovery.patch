@@ -162,8 +162,49 @@ index a637932..004ca35 100644
 +import type { Cid } from '@atproto/lex-data'
 +import { writeCarBlockHeader, writeCarHeader } from '@atproto/repo'
 +import { InvalidRequestError, Server } from '@atproto/xrpc-server'
-@@ -3,0 +23,75 @@ import { com } from '../../../../lexicons/index.js'
+@@ -3,0 +23,121 @@ import { com } from '../../../../lexicons/index.js'
 +import { assertSpaceScope, buildSignedCommit } from './util.js'
++
++const maximumRepoArtifactSpoolBytes = 384 * 1024 * 1024
++const repoSpoolReservationBytes = 512 * 1024 * 1024
++const maximumAggregateRepoSpoolBytes = 1024 * 1024 * 1024
++const maximumConcurrentRepoSpools = 2
++const maximumRepoRecordCount = 1_000_000
++let activeRepoSpools = 0
++let reservedRepoSpoolBytes = 0
++
++const acquireRepoSpoolAdmission = (): (() => void) => {
++  if (
++    activeRepoSpools >= maximumConcurrentRepoSpools ||
++    reservedRepoSpoolBytes >
++      maximumAggregateRepoSpoolBytes - repoSpoolReservationBytes
++  ) {
++    throw new Error('Permissioned repo spool admission exhausted')
++  }
++  activeRepoSpools += 1
++  reservedRepoSpoolBytes += repoSpoolReservationBytes
++  let released = false
++  return () => {
++    if (released) return
++    released = true
++    activeRepoSpools -= 1
++    reservedRepoSpoolBytes -= repoSpoolReservationBytes
++  }
++}
++
++const reserveRepoArtifactBytes = (
++  current: number,
++  addition: number,
++): number => {
++  if (
++    !Number.isSafeInteger(addition) ||
++    addition < 0 ||
++    current > maximumRepoArtifactSpoolBytes - addition
++  ) {
++    throw new Error('Permissioned repo spool exceeds its byte budget')
++  }
++  return current + addition
++}
 +
 +type SpooledRepo = {
 +  directory: string
@@ -173,6 +214,7 @@ index a637932..004ca35 100644
 +  commitCid: Cid
 +  indexCid: Cid
 +  indexByteLength: number
++  releaseSpoolAdmission: () => void
 +}
 +
 +const writeAll = async (
@@ -235,10 +277,14 @@ index a637932..004ca35 100644
 +      yield chunk
 +    }
 +  } finally {
-+    await rm(repo.directory, { recursive: true, force: true })
++    try {
++      await rm(repo.directory, { recursive: true, force: true })
++    } finally {
++      repo.releaseSpoolAdmission()
++    }
 +  }
 +}
-@@ -12,6 +106,179 @@ export default function (server: Server, ctx: AppContext) {
+@@ -12,6 +152,205 @@ export default function (server: Server, ctx: AppContext) {
 -    // @TODO Implement full-state CAR export. The CAR declares two roots in
 -    // order — the signedCommit, then a DRISL (DAG-CBOR) index mapping
 -    // "{collection}/{rkey}" -> record CID (lexicographic) — followed by the
@@ -256,19 +302,25 @@ index a637932..004ca35 100644
 +        assertSpaceScope(auth, space, { action: 'read' })
 +      }
 +
-+      const directory = await mkdtemp(
-+        path.join(tmpdir(), 'atproto-space-get-repo-'),
-+      )
-+      const indexPath = path.join(directory, 'index.cbor')
-+      const recordsPath = path.join(directory, 'records.carblocks')
++      const releaseSpoolAdmission = acquireRepoSpoolAdmission()
++      let directory: string | undefined
 +
 +      try {
++        const spoolDirectory = await mkdtemp(
++          path.join(tmpdir(), 'atproto-space-get-repo-'),
++        )
++        directory = spoolDirectory
++        const indexPath = path.join(spoolDirectory, 'index.cbor')
++        const recordsPath = path.join(spoolDirectory, 'records.carblocks')
 +        const exportState = await ctx.actorStore.read(repo, async (store) => {
 +          const keypair = await store.keypair()
 +          return store.transact(async (storeTxn) => {
 +            // countRepoRecords is the first statement in this transaction and
 +            // establishes the SQLite read snapshot used for every later row.
 +            const recordCount = await storeTxn.space.countRepoRecords(space)
++            if (recordCount > maximumRepoRecordCount) {
++              throw new Error('Permissioned repo exceeds its record budget')
++            }
 +            const state = await storeTxn.space.getRepoState(space)
 +            const commit = await buildSignedCommit({
 +              spaceUri: space,
@@ -284,12 +336,17 @@ index a637932..004ca35 100644
 +            const commitCid = await cidForCbor(commitBytes)
 +            const indexHash = createHash('sha256')
 +            let indexByteLength = 0
++            let artifactSpoolBytes = 0
 +            let indexHandle: FileHandle | undefined
 +            let recordsHandle: FileHandle | undefined
 +            let seenCidDb: { close(): void } | undefined
 +
 +            const appendIndex = async (bytes: Uint8Array) => {
 +              if (!indexHandle) throw new Error('Index spool is not open')
++              artifactSpoolBytes = reserveRepoArtifactBytes(
++                artifactSpoolBytes,
++                bytes.byteLength,
++              )
 +              await writeAll(indexHandle, bytes)
 +              indexHash.update(bytes)
 +              indexByteLength += bytes.byteLength
@@ -302,7 +359,7 @@ index a637932..004ca35 100644
 +              // deduplication set on disk so recovery emits one CAR block per
 +              // unique CID without growing process memory with repo size.
 +              const cidDb = new SqliteDB(
-+                path.join(directory, 'seen-cids.sqlite'),
++                path.join(spoolDirectory, 'seen-cids.sqlite'),
 +              )
 +              seenCidDb = cidDb
 +              cidDb.pragma('journal_mode = OFF')
@@ -366,9 +423,17 @@ index a637932..004ca35 100644
 +                  throw new Error('Permissioned record CID mismatch')
 +                }
 +                if (claimCid.run(cid.toString()).changes === 1) {
++                  const blockHeader = writeCarBlockHeader(
++                    cid,
++                    record.value.byteLength,
++                  )
++                  artifactSpoolBytes = reserveRepoArtifactBytes(
++                    artifactSpoolBytes,
++                    blockHeader.byteLength + record.value.byteLength,
++                  )
 +                  await writeAll(
 +                    recordsHandle,
-+                    writeCarBlockHeader(cid, record.value.byteLength),
++                    blockHeader,
 +                  )
 +                  await writeAll(recordsHandle, record.value)
 +                }
@@ -405,13 +470,14 @@ index a637932..004ca35 100644
 +              indexHash.digest(),
 +            )
 +            return {
-+              directory,
++              directory: spoolDirectory,
 +              indexPath,
 +              recordsPath,
 +              commitBytes,
 +              commitCid,
 +              indexCid,
 +              indexByteLength,
++              releaseSpoolAdmission,
 +            }
 +          })
 +        })
@@ -421,7 +487,13 @@ index a637932..004ca35 100644
 +          body: byteIterableToStream(streamSpooledRepo(exportState)),
 +        }
 +      } catch (err) {
-+        await rm(directory, { recursive: true, force: true })
++        try {
++          if (directory) {
++            await rm(directory, { recursive: true, force: true })
++          }
++        } finally {
++          releaseSpoolAdmission()
++        }
 +        throw err
 +      }
 diff --git a/packages/pds/tests/spaces.test.ts b/packages/pds/tests/spaces.test.ts

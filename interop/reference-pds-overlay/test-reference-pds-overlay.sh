@@ -57,6 +57,14 @@ grep -q "Permissioned record CID mismatch" \
   "${overlay_source}/packages/pds/src/api/com/atproto/space/getRepo.ts"
 grep -q "INSERT OR IGNORE INTO seen_cid" \
   "${overlay_source}/packages/pds/src/api/com/atproto/space/getRepo.ts"
+grep -q "maximumAggregateRepoSpoolBytes" \
+  "${overlay_source}/packages/pds/src/api/com/atproto/space/getRepo.ts"
+grep -q "maximumConcurrentRepoSpools" \
+  "${overlay_source}/packages/pds/src/api/com/atproto/space/getRepo.ts"
+grep -q "releaseSpoolAdmission" \
+  "${overlay_source}/packages/pds/src/api/com/atproto/space/getRepo.ts"
+grep -q "reserveRepoArtifactBytes" \
+  "${overlay_source}/packages/pds/src/api/com/atproto/space/getRepo.ts"
 if grep -qE "Object\\.fromEntries|listRepoRecords" \
   "${overlay_source}/packages/pds/src/api/com/atproto/space/getRepo.ts"; then
   echo "reference getRepo reintroduced an in-memory repository export" >&2

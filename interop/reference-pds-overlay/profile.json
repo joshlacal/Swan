@@ -3,7 +3,7 @@
   "referenceImplementationCommit": "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
   "referenceArchiveSHA256": "1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea",
   "overlayPatch": "reference-pds-recovery.patch",
-  "overlayPatchSHA256": "363bc352111ae740a543d0dae8f1a6a66f357e67a4bedcadfc949869faa6c237",
+  "overlayPatchSHA256": "421b6bd8ecd3e6f5871f47b31e3eebb041b600080b113e16c3136cc6cbf69f2d",
   "scope": [
     "Qualify space_record_oplog.space when listRepoOps joins space_record.",
     "Provide a read-authorized, snapshot-stable full-state getRepo CAR with signed-commit and DRISL roots.",
