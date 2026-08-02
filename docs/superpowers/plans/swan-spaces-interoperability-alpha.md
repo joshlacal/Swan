@@ -654,6 +654,31 @@ incremental/full-CAR semantics, stateful cross-host fault/compaction,
 reverse lifecycle, strict password-reset contention, and formal security
 scan gates remain open.
 
+## 2026-08-02 native-Linux current-profile receipt
+
+The `swan-linux` Ubuntu 26.04 ARM64 Lima VM was restarted. The current source
+was copied into `/tmp/swan-linux-current-20260802` with macOS xattrs and
+AppleDouble metadata excluded, then built with Swift 6.2.3, one SwiftPM
+worker, and the current `swan` executable installed into the disposable
+source tree for CLI subprocess tests.
+
+The product build passed in 294.92 seconds. The full graph passed 941 XCTest
+cases with 8 intentional skips and 0 failures, plus 4/4 Swift Testing
+public-wire cases. `PublicRepositoryReadHTTPTests` passed 13/13 in 0.266
+seconds. Seven serialized bounded-transfer selectors also passed: private CAR
+spool, maximum-cardinality recovery index, permissioned near-256 MiB CAR,
+public CAR spool RSS, staged public CAR import, public production `getRepo`
+RSS, and private CAS streaming. The permissioned CAR streamed 267,396,722
+bytes in 65,536-byte chunks; the public spool streamed 270,049,433 bytes; and
+the maximum-cardinality index reported 6,600,000 logical bytes with bounded
+scratch/RSS. Host copies of the sanitized logs are mode-0600 under
+`/private/tmp/swan-linux-current-20260802-receipts/`.
+
+This is current native-Linux evidence, not the Docker-on-Darwin receipt. The
+stock pinned TypeScript value-bearing/recovery limitation, stateful
+cross-host fault/lifecycle matrix, strict password-reset contention,
+non-cooperative email cancellation, and formal security scan remain open.
+
 ## 2026-08-02 focused public-read test receipt
 
 After the Docker capacity recovery, the exact previously problematic filter was

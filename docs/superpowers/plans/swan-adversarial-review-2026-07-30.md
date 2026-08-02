@@ -2672,3 +2672,33 @@ This separates the test target from the environmental failure: dependency
 resolution/toolchain contention and Docker/VM descriptor or disk pressure can
 look like a Swift test hang, while the focused test process itself is finite
 and green once the graph is already built.
+
+## Adversarial rereview: current native-Linux profile and bounded-transfer gate — 2026-08-02
+
+The `swan-linux` Ubuntu 26.04 ARM64 Lima VM was restarted and the current
+source was copied into `/tmp/swan-linux-current-20260802` with macOS xattrs and
+AppleDouble files excluded. The first transfer attempt exposed those
+`._shim.h` metadata files as a real harness defect; the metadata-free copy was
+verified before compilation.
+
+With Swift 6.2.3 at `/opt/swift/usr/bin`, one SwiftPM worker, and the current
+CLI copied into the disposable tree's `.build/debug/swan`, the native build
+completed successfully in 294.92 seconds. The full graph then passed 941
+XCTest cases with 8 intentional skips and 0 failures, plus all 4 Swift Testing
+public-wire cases. The focused `PublicRepositoryReadHTTPTests` selector passed
+13/13 in 0.266 seconds.
+
+All seven current-profile bounded-transfer selectors passed serially: private
+CAR spool, maximum-cardinality recovery index, permissioned near-256 MiB CAR,
+public CAR spool RSS, staged public CAR import, public production `getRepo`
+RSS, and private CAS streaming. The reports show 267,396,722-byte permissioned
+CAR output with 65,536-byte chunks, 270,049,433-byte public spool output, a
+6,600,000-byte logical maximum-cardinality index, and bounded RSS/scratch
+measurements. Sanitized host copies are mode-0600 under
+`/private/tmp/swan-linux-current-20260802-receipts/`.
+
+This closes the current native-Linux build, full-suite, focused-read, and
+bounded-transfer gates. It does not close stock pinned-TypeScript
+value-bearing/recovery behavior, the remaining cross-host lifecycle/fault
+matrix, strict password-reset work-shape proof, non-cooperative email
+cancellation, or the formal security launcher.
