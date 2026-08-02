@@ -49,6 +49,19 @@ public struct PublicBlob: Sendable {
     }
 }
 
+/// Metadata for a reachable public blob.  This projection deliberately does
+/// not expose a body or a storage handle, so record validation can compare a
+/// typed blob reference without opening or materializing the payload.
+public struct PublicBlobMetadata: Sendable, Equatable {
+    public let mimeType: String?
+    public let size: Int
+
+    public init(mimeType: String?, size: Int) {
+        self.mimeType = mimeType
+        self.size = size
+    }
+}
+
 /// Optional streaming extension for durable blob stores. The source closure
 /// is called once and must feed serial chunks to the supplied sink. The store
 /// owns staging, hashing, content-addressed adoption, and cleanup; callers
@@ -68,6 +81,10 @@ public protocol StreamingBlobStore: BlobStore {
     /// Metadata-only reachability check for public record references. This
     /// must not open or materialize the blob body.
     func publicBlobExists(cid: String) async throws -> Bool
+
+    /// Returns the sanitized metadata for a reachable public blob without
+    /// opening or materializing its body.
+    func publicBlobMetadata(cid: String) async throws -> PublicBlobMetadata?
 }
 
 /// Local immutable content-addressed blobs. File contents are shared, while

@@ -11,6 +11,85 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
     private let did = "did:plc:abcdefghijklmnopqrstuvwx"
     private let genesisRevision = "3jzfcijpj2z2a"
 
+    func testCommitRechecksPublicBlobReachabilityInsideTransaction() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let key = P256.Signing.PrivateKey()
+        let database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        defer { Task { try? await database.close() } }
+        let genesis = try PublicRepositoryGenesisCodec.create(
+            did: did,
+            revision: genesisRevision,
+            signingKey: key
+        )
+        _ = try await database.installPublicRepositoryGenesis(
+            genesis,
+            signingPublicKey: key.publicKey,
+            installedAt: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+
+        let payload = Data("public-reference-fence".utf8)
+        let publicReference = try await database.putBlob(
+            payload,
+            namespace: .public,
+            mimeType: "application/octet-stream"
+        )
+        let loadedInitial = try await database.loadPublicRepositoryState()
+        let initial = try XCTUnwrap(loadedInitial)
+        let request = try PublicRepositoryMutationRequest(
+            id: "public-blob-fence",
+            canonicalDigest: Data(repeating: 0x52, count: 32),
+            baseCommitCID: initial.commitCID
+        )
+        let reservation: PublicRepositoryMutationReservation
+        switch try await database.reservePublicRepositoryRevision(
+            request,
+            wallClockMicroseconds: 1_750_000_000_000_000
+        ) {
+        case let .reserved(value): reservation = value
+        case .committed: return XCTFail("public request unexpectedly replayed")
+        }
+        let path = try PublicRepositoryPath(
+            collection: "app.bsky.feed.post",
+            recordKey: "blob-fence"
+        )
+        let blobCID = try CID.parse(publicReference.cid)
+        let prepared = try await PublicRepositoryEngine.apply(
+            repositoryDID: did,
+            currentState: initial,
+            blocks: database,
+            revision: reservation.nextRevision,
+            batch: try PublicRepositoryWriteBatch(
+                writes: [.create(
+                    path: path,
+                    record: PublicRecord([
+                        "$type": .string("app.bsky.feed.post"),
+                        "blob": .link(blobCID),
+                    ])
+                )],
+                expectedCommitCID: initial.commitCID
+            ),
+            signer: P256PublicRepositoryCommitSigner(privateKey: key)
+        )
+
+        try await database.remove(publicReference)
+        var failure: Error?
+        do {
+            _ = try await database.applyPublicRepositoryMutation(
+                reservation: reservation,
+                prepared: prepared
+            )
+        } catch {
+            failure = error
+        }
+        XCTAssertEqual(
+            failure as? PublicRepositoryMutationStoreError,
+            .publicBlobNotReachable
+        )
+        let indexed = try await database.publicRepositoryRecordCID(for: path)
+        XCTAssertNil(indexed)
+    }
+
     func testGenesisBecomesRepositoryTruthAndPreparedCreateSurvivesReopen() async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

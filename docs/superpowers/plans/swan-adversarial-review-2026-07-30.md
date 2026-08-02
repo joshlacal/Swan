@@ -2463,3 +2463,41 @@ the existing transport receipt, not a stateful semantic acceptance: no
 value-bearing stock TypeScript sync, compaction-gap recovery, or reverse
 lifecycle gate is being inferred from it. The Swan and reference HTTPS routes
 remained HTTP 200 and the Compose services remained healthy after the run.
+
+## Adversarial rereview: public blob metadata and commit-time isolation fence — 2026-08-02
+
+The review compared Swan's public record mutation path with the pinned
+TypeScript `verifyBlob` behavior. Swan previously checked only that a raw CID
+was publicly reachable; a caller could therefore submit a structurally valid
+typed blob object whose claimed `mimeType` or `size` differed from the stored
+blob metadata. The HTTP path now performs a metadata-only lookup and rejects
+both mismatches before signing. The lookup does not open or materialize the
+blob body. `PublicRepositoryMutationHTTPTests` covers the valid case plus
+wrong-size and wrong-MIME cases.
+
+The same review found a public/private isolation race: permissioned promotion
+can remove the last public namespace reference after an HTTP preflight but
+before the public repository transaction commits. Prepared public mutations
+now carry their raw blob CID requirements, and SQLite rechecks those CIDs while
+the repository commit transaction is serialized against permissioned
+promotion. A missing reference returns `BlobNotFound` and the public index is
+unchanged. `PublicRepositoryMutationStoreTests` proves the commit-time fence
+by removing the reference after preparation and asserting the typed storage
+failure.
+
+Evidence from the current macOS working copy:
+
+- A fresh serialized SwiftPM graph (`--scratch-path
+  /private/tmp/swan-adversarial-review-20260802-2 --jobs 1`) built successfully
+  in 448.51 seconds;
+- `PublicRepositoryMutationStoreTests`: 13/13, 0 failures;
+- `PublicRepositoryMutationHTTPTests`: 6/6, 0 failures;
+- `PublicRepositoryReadHTTPTests`: 13/13, 0 failures; and
+- `PublicRepositoryEngineTests`: 9/9, 0 failures;
+- recovery and interop verifier mutation suites: passed; and
+- `git diff --check`: passed.
+
+This closes the two local blob integrity/isolation findings. It does not
+upgrade the stock pinned TypeScript value-bearing `listRepoOps`/`getRepo`
+surfaces, and it does not close the broader native-Linux/current-profile,
+fault/compaction, reverse-lifecycle, password-reset, or formal-security gates.

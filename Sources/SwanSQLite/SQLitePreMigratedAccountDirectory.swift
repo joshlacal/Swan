@@ -1917,4 +1917,8 @@ private actor SQLiteGenerationRefreshingPublicMutationStore:
     func publicBlobExists(cid: String) async throws -> Bool {
         try await database.publicBlobExists(cid: cid)
     }
+
+    func publicBlobMetadata(cid: String) async throws -> PublicBlobMetadata? {
+        try await database.publicBlobMetadata(cid: cid)
+    }
 }

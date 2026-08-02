@@ -313,7 +313,8 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         defer { Task { try? await fixture.database.close(); try? await fixture.control.close(); try? FileManager.default.removeItem(at: fixture.root) } }
 
         let publicReference = try await fixture.database.putBlob(
-            Data("public-image".utf8), namespace: .public
+            Data("public-image".utf8), namespace: .public,
+            mimeType: "application/octet-stream"
         )
         let privateReference = try await fixture.database.putBlob(
             Data("private-image".utf8), namespace: .space(
@@ -351,6 +352,28 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
                 let object = try self.jsonObject(response.body)
                 XCTAssertEqual(object["uri"] as? String, "at://" + Self.did + "/" + Self.collection + "/public")
                 XCTAssertNotNil(object["cid"] as? String)
+            }
+
+            for (name, size, mimeType) in [
+                ("typed-wrong-size", 11, "application/octet-stream"),
+                ("typed-wrong-mime", 12, "image/png"),
+            ] {
+                let response = try await client.execute(
+                    uri: Self.mutationPath,
+                    method: .post,
+                    headers: try fixture.headers(
+                        jti: name, method: "POST", path: Self.mutationPath
+                    ),
+                    body: ByteBuffer(string: self.typedRecordBody(
+                        rkey: name, cid: publicReference.cid, size: size, mimeType: mimeType
+                    ))
+                )
+                XCTAssertEqual(response.status, .badRequest, name)
+                XCTAssertEqual(
+                    try self.jsonObject(response.body)["error"] as? String,
+                    "InvalidRequest",
+                    name
+                )
             }
 
             let typedHeaders = try fixture.headers(
@@ -522,10 +545,15 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         "{\"repo\":\"" + Self.did + "\",\"collection\":\"" + Self.collection + "\",\"rkey\":\"" + rkey + "\",\"record\":{\"blob\":{\"$link\":\"" + cid + "\"}}}"
     }
 
-    private func typedRecordBody(rkey: String, cid: String, size: Int) -> String {
+    private func typedRecordBody(
+        rkey: String,
+        cid: String,
+        size: Int,
+        mimeType: String = "application/octet-stream"
+    ) -> String {
         "{\"repo\":\"" + Self.did + "\",\"collection\":\"" + Self.collection
             + "\",\"rkey\":\"" + rkey + "\",\"record\":{\"blob\":{\"$type\":\"blob\",\"ref\":{\"$link\":\""
-            + cid + "\"},\"mimeType\":\"application/octet-stream\",\"size\":" + String(size) + "}}}"
+            + cid + "\"},\"mimeType\":\"" + mimeType + "\",\"size\":" + String(size) + "}}}"
     }
 
     private func putBody(

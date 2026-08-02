@@ -312,6 +312,10 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                       current.revision == reservation.baseRevision else {
                     throw PublicRepositoryMutationStoreError.commitCASConflict
                 }
+                try await validatePublicBlobReferencesWithoutGate(
+                    prepared.publicBlobCIDs,
+                    typedReferences: prepared.publicTypedBlobReferences
+                )
                 try validate(prepared: prepared, reservation: reservation, current: current)
 
                 let projection = try await validatedProjection(
@@ -474,6 +478,47 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
     private func publicRepositorySQLDidMutate(index: inout Int) async throws {
         index += 1
         try await testingHooks.afterPublicRepositoryMutatingSQL?(index)
+    }
+
+    /// Recheck public blob reachability while the repository mutation's
+    /// SQLite transaction is holding the same database serialization boundary
+    /// used by permissioned promotion. The HTTP layer performs the richer
+    /// metadata validation before signing; this final fence prevents a
+    /// concurrent permissioned write from removing the last public reference
+    /// after that check but before the public record is committed.
+    private func validatePublicBlobReferencesWithoutGate(
+        _ cids: [CID],
+        typedReferences: [PublicTypedBlobReference]
+    ) async throws {
+        for cid in cids {
+            let rows = try await connection.query(
+                """
+                SELECT blob_payloads.byte_count, blob_payloads.mime_type
+                FROM blob_payloads
+                JOIN blob_namespace_references USING(cid)
+                WHERE blob_payloads.cid = ?
+                  AND namespace_kind = 'public' AND space_uri = ''
+                LIMIT 2
+                """,
+                [.text(cid.string)]
+            )
+            guard rows.count == 1 else {
+                throw PublicRepositoryMutationStoreError.publicBlobNotReachable
+            }
+            let row = rows[0]
+            guard let byteCount = row.column("byte_count")?.integer,
+                  byteCount >= 0 else {
+                throw PublicRepositoryMutationStoreError.publicBlobNotReachable
+            }
+            let mimeType = row.column("mime_type").flatMap {
+                $0.isNull ? nil : $0.string
+            }
+            for typed in typedReferences where typed.cid == cid {
+                guard mimeType == typed.mimeType, byteCount == typed.size else {
+                    throw PublicRepositoryMutationStoreError.publicBlobNotReachable
+                }
+            }
+        }
     }
 
     private static let maximumRevisionMicroseconds = UInt64(Int64.max) >> 10

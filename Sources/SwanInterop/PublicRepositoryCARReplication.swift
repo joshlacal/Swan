@@ -93,6 +93,7 @@ public enum PublicRepositoryCARImportFailureCode {
             case .conflictingRequestReuse: return "MutationConflictingRequestReuse"
             case .commitCASConflict: return "MutationCommitCASConflict"
             case .preparedMutationMismatch: return "MutationPreparedMismatch"
+            case .publicBlobNotReachable: return "MutationPublicBlobNotReachable"
             case .corruptRepository: return "MutationCorruptRepository"
             case .repositoryNotInstalled: return "MutationRepositoryNotInstalled"
             case .revisionExhausted: return "MutationRevisionExhausted"

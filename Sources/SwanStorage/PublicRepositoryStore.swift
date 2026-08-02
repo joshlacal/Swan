@@ -11,6 +11,7 @@ public enum PublicRepositoryMutationStoreError: Error, Sendable, Equatable {
     case commitCASConflict
     case reservationMismatch
     case preparedMutationMismatch
+    case publicBlobNotReachable
     case revisionExhausted
     case corruptRepository
 }

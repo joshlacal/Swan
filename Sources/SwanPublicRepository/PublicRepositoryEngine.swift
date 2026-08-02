@@ -50,6 +50,14 @@ public struct PreparedPublicRepositoryMutation: Sendable, Equatable {
     public let sinceRevision: String
     public let signedCommit: PreparedPublicRepositorySignedCommit
     public let recordResults: [PublicRepositoryMutationRecordResult]
+    /// Raw blob CIDs that the resulting public records require to remain in
+    /// the public namespace. Storage rechecks these inside its commit
+    /// transaction so permissioned promotion cannot remove a last public
+    /// reference between HTTP validation and repository publication.
+    public let publicBlobCIDs: [CID]
+    /// Typed metadata claims carried by the changed public records. Storage
+    /// rechecks these against the same public blob rows at commit time.
+    public let publicTypedBlobReferences: [PublicTypedBlobReference]
     public let newBlocks: PublicRepositoryBlockMap
 
     fileprivate init(
@@ -58,6 +66,8 @@ public struct PreparedPublicRepositoryMutation: Sendable, Equatable {
         sinceRevision: String,
         signedCommit: PreparedPublicRepositorySignedCommit,
         recordResults: [PublicRepositoryMutationRecordResult],
+        publicBlobCIDs: [CID],
+        publicTypedBlobReferences: [PublicTypedBlobReference],
         newBlocks: PublicRepositoryBlockMap
     ) {
         self.state = state
@@ -65,6 +75,8 @@ public struct PreparedPublicRepositoryMutation: Sendable, Equatable {
         self.sinceRevision = sinceRevision
         self.signedCommit = signedCommit
         self.recordResults = recordResults
+        self.publicBlobCIDs = publicBlobCIDs
+        self.publicTypedBlobReferences = publicTypedBlobReferences
         self.newBlocks = newBlocks
     }
 }
@@ -116,6 +128,8 @@ public enum PublicRepositoryEngine {
 
         var preparedRecordBlocks: [PublicRepositoryBlock] = []
         var recordResults: [PublicRepositoryMutationRecordResult] = []
+        var publicBlobCIDsByString: [String: CID] = [:]
+        var publicTypedBlobReferences: [PublicTypedBlobReference] = []
         for write in batch.writes {
             let currentRecordCID: CID?
             do {
@@ -132,6 +146,18 @@ public enum PublicRepositoryEngine {
                     throw PublicRepositoryEngineError.recordAlreadyExists
                 }
                 let prepared = try prepare(record, for: path, limits: limits)
+                for cid in PublicRepositoryRecordCodec.publicBlobCIDs(in: record) {
+                    publicBlobCIDsByString[cid.string] = cid
+                }
+                do {
+                    let typedReferences = try PublicRepositoryRecordCodec
+                        .publicTypedBlobReferences(in: record)
+                    publicTypedBlobReferences.append(contentsOf: typedReferences)
+                } catch let error as PublicRepositoryDomainError {
+                    throw PublicRepositoryEngineError.record(error)
+                } catch {
+                    throw PublicRepositoryEngineError.record(.invalidRecordType)
+                }
                 do {
                     tree = try await tree.adding(path: path, recordCID: prepared.cid)
                 } catch let error as RepositoryMSTMutationError {
@@ -155,6 +181,18 @@ public enum PublicRepositoryEngine {
                     throw PublicRepositoryEngineError.recordCIDMismatch
                 }
                 let prepared = try prepare(record, for: path, limits: limits)
+                for cid in PublicRepositoryRecordCodec.publicBlobCIDs(in: record) {
+                    publicBlobCIDsByString[cid.string] = cid
+                }
+                do {
+                    let typedReferences = try PublicRepositoryRecordCodec
+                        .publicTypedBlobReferences(in: record)
+                    publicTypedBlobReferences.append(contentsOf: typedReferences)
+                } catch let error as PublicRepositoryDomainError {
+                    throw PublicRepositoryEngineError.record(error)
+                } catch {
+                    throw PublicRepositoryEngineError.record(.invalidRecordType)
+                }
                 do {
                     tree = try await tree.updating(path: path, recordCID: prepared.cid)
                 } catch let error as RepositoryMSTMutationError {
@@ -280,6 +318,10 @@ public enum PublicRepositoryEngine {
             sinceRevision: currentState.revision,
             signedCommit: signedCommit,
             recordResults: recordResults,
+            publicBlobCIDs: publicBlobCIDsByString.keys.sorted().compactMap {
+                publicBlobCIDsByString[$0]
+            },
+            publicTypedBlobReferences: publicTypedBlobReferences,
             newBlocks: newBlocks
         )
     }

@@ -37,6 +37,18 @@ public struct PreparedPublicRecord: Sendable, Equatable {
     public let cid: CID
 }
 
+public struct PublicTypedBlobReference: Sendable, Equatable, Hashable {
+    public let cid: CID
+    public let mimeType: String
+    public let size: Int
+
+    public init(cid: CID, mimeType: String, size: Int) {
+        self.cid = cid
+        self.mimeType = mimeType
+        self.size = size
+    }
+}
+
 public enum PublicRepositoryRecordCodec {
     /// AT Protocol integers are limited to JavaScript's exactly representable
     /// signed integer range even though DAG-CBOR itself can encode wider ints.
@@ -297,6 +309,41 @@ public enum PublicRepositoryRecordCodec {
 
         visit(.object(record.fields))
         return byString.keys.sorted().compactMap { byString[$0] }
+    }
+
+    /// Returns typed blob references embedded in a record.  Unlike raw CID
+    /// links, typed references carry claims about the stored blob and must be
+    /// checked against the public blob namespace before the record commits.
+    public static func publicTypedBlobReferences(
+        in record: PublicRecord
+    ) throws -> [PublicTypedBlobReference] {
+        var references: [PublicTypedBlobReference] = []
+
+        func visit(_ value: PublicRecordValue) throws {
+            switch value {
+            case let .array(values):
+                for value in values { try visit(value) }
+            case let .object(fields):
+                if fields["$type"] == .string("blob") {
+                    try validateTypedBlob(fields)
+                    guard case let .link(cid)? = fields["ref"],
+                          case let .string(mimeType)? = fields["mimeType"],
+                          case let .integer(size)? = fields["size"] else {
+                        throw PublicRepositoryDomainError.invalidRecordType
+                    }
+                    references.append(
+                        PublicTypedBlobReference(cid: cid, mimeType: mimeType, size: size)
+                    )
+                    return
+                }
+                for value in fields.values { try visit(value) }
+            default:
+                break
+            }
+        }
+
+        try visit(.object(record.fields))
+        return references
     }
 
     private static func encodeObject(

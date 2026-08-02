@@ -7,6 +7,7 @@ public enum PublicRepositoryMutationCoordinatorError: Error, Sendable, Equatable
     case repositoryNotFound
     case inactiveAccount
     case invalidSwap
+    case invalidBlobReference
     case unavailable
 }
 
@@ -227,6 +228,10 @@ public enum SwanPublicRepositoryMutationCoordinator {
         if let error = error as? PublicRepositoryMutationStoreError,
            error == .commitCASConflict {
             return .unavailable
+        }
+        if let error = error as? PublicRepositoryMutationStoreError,
+           error == .publicBlobNotReachable {
+            return .invalidBlobReference
         }
         if let error = error as? PublicRepositoryEngineError {
             switch error {

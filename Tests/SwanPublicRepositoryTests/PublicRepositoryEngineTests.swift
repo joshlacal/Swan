@@ -51,6 +51,8 @@ final class PublicRepositoryEngineTests: XCTestCase {
         ])
         XCTAssertEqual(result.baseCommitCID, fixture.state.commitCID)
         XCTAssertEqual(result.sinceRevision, fixture.state.revision)
+        XCTAssertTrue(result.publicBlobCIDs.isEmpty)
+        XCTAssertTrue(result.publicTypedBlobReferences.isEmpty)
         let signerCallCount = await signer.callCount
         XCTAssertEqual(signerCallCount, 1)
         XCTAssertEqual(

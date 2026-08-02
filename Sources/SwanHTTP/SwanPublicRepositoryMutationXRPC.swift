@@ -332,19 +332,33 @@ private struct PublicMutationHandlers {
             }
         }
         let cids = records.flatMap(PublicRepositoryRecordCodec.publicBlobCIDs(in:))
+        let typedReferences: [PublicTypedBlobReference]
+        do {
+            typedReferences = try records.flatMap {
+                try PublicRepositoryRecordCodec.publicTypedBlobReferences(in: $0)
+            }
+        } catch {
+            throw PublicMutationFailure.invalidRequest
+        }
         guard !cids.isEmpty else { return }
         guard let blobStore = target.store as? any StreamingBlobStore else {
             throw PublicMutationFailure.unavailable
         }
         var seen = Set<String>()
         for cid in cids where seen.insert(cid.string).inserted {
-            let reachable: Bool
+            let metadata: PublicBlobMetadata?
             do {
-                reachable = try await blobStore.publicBlobExists(cid: cid.string)
+                metadata = try await blobStore.publicBlobMetadata(cid: cid.string)
             } catch {
                 throw PublicMutationFailure.unavailable
             }
-            guard reachable else { throw PublicMutationFailure.invalidRequest }
+            guard let metadata else { throw PublicMutationFailure.invalidRequest }
+            for typed in typedReferences where typed.cid == cid {
+                guard metadata.mimeType == typed.mimeType,
+                      metadata.size == typed.size else {
+                    throw PublicMutationFailure.invalidRequest
+                }
+            }
         }
     }
 }
@@ -597,6 +611,7 @@ private func publicMutationResponse(
 ) -> Response {
     switch failure {
     case .invalidSwap: return publicMutationError(.badRequest, "InvalidSwap")
+    case .invalidBlobReference: return publicMutationError(.badRequest, "BlobNotFound")
     case .repositoryNotFound: return publicMutationError(.notFound, "RepoNotFound")
     case .inactiveAccount: return publicMutationError(.forbidden, "AccountInactive")
     case .unavailable: return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
