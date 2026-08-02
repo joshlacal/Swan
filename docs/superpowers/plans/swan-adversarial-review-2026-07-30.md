@@ -2658,3 +2658,17 @@ This is a current Docker-on-Darwin container build/health receipt, not native
 Linux-host evidence and not a successful clean-cache script exit. It also does
 not upgrade the stock TypeScript value-bearing recovery gap or the remaining
 stateful cross-host, lifecycle, password-reset, and formal-security gates.
+
+## Adversarial rereview: exact public-read filter after environment repair — 2026-08-02
+
+The exact selector that previously appeared to hang now completes with the
+Xcode Swift 6.4 toolchain first in `PATH`, `SWIFTPM_MAX_CONCURRENT_OPERATIONS=1`,
+`--jobs 1`, and the isolated scratch build directory. `swift test --skip-build
+--filter PublicRepositoryReadHTTPTests` executed all 13
+`PublicRepositoryReadHTTPTests` in 0.213 seconds with zero failures. The other
+products were selected but had zero matching tests, as expected.
+
+This separates the test target from the environmental failure: dependency
+resolution/toolchain contention and Docker/VM descriptor or disk pressure can
+look like a Swift test hang, while the focused test process itself is finite
+and green once the graph is already built.

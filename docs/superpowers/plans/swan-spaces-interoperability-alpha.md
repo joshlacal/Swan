@@ -653,3 +653,18 @@ silently promoted to a clean-script pass. Stock TypeScript value-bearing
 incremental/full-CAR semantics, stateful cross-host fault/compaction,
 reverse lifecycle, strict password-reset contention, and formal security
 scan gates remain open.
+
+## 2026-08-02 focused public-read test receipt
+
+After the Docker capacity recovery, the exact previously problematic filter was
+run with Xcode Swift 6.4 first in `PATH`,
+`SWIFTPM_MAX_CONCURRENT_OPERATIONS=1`, `--jobs 1`, and the isolated clean-cache
+SwiftPM directory:
+
+`swift test --skip-build --filter PublicRepositoryReadHTTPTests`
+
+All 13 `PublicRepositoryReadHTTPTests` passed in 0.213 seconds with zero
+failures. Other products reported zero matching tests, not hangs. The
+remaining operational rule is to serialize dependency resolution/builds and
+give every investigation a unique scratch path; descriptor or Docker-VM
+pressure must be diagnosed separately from the test target.
