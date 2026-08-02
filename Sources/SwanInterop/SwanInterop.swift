@@ -135,7 +135,7 @@ public enum OfflineProtocolProfileVerifier {
     private static let expectedPetrelGeneratorCommit = "c2a1cdbee8c621c7682416114700f032cc7e2b37"
     private static let expectedPetrelCommit = "db84b2c9788aa38000ee3f134e21feffa8f351cd"
     private static let expectedReferenceArchiveSHA256 = "1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea"
-    private static let expectedProfileSHA256 = "937ed10ef7a40717746f752204eba1e30d7bfe12e4deda006ce9236b6e10f001"
+    private static let expectedProfileSHA256 = "431294d96a4a82f15fe5cd0807d89dbcd76d1768a1762d2a0c6a5905e8083988"
     private static let expectedPetrelManifestSHA256 = "ac3c8b006e0e771f6e3cb0b5cbe6e93a78101dc49ce95ea9b3e1ed734a97636f"
     private static let expectedLexiconManifestSHA256 = "9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f"
     private static let expectedGeneratedWireManifestSHA256 = "80f9f7b93127826d95d516a4a9d18b7ca245d82fc74f8fa484bbf3423d1f51db"

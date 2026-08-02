@@ -5,8 +5,10 @@
 - Proposal 0016: `1caad93dbb1f445396f6abf3b97eb4040345e78e`
 - TypeScript implementation: `3f6c96d5d2d25438bd40fa89d6ecc37865f8e354`
 - Petrel runtime baseline: `db84b2c9788aa38000ee3f134e21feffa8f351cd`
-- Isolated Petrel generator revision: `d011ccf0029457434e659ec48c8024baa7b5c4e4`
-- Profile: `Profiles/permissioned-data-0016-2026-07-03.json`
+- Isolated Petrel generator revision: `c2a1cdbee8c621c7682416114700f032cc7e2b37`
+- Active successor profile: `Profiles/permissioned-data-0016-2026-07-30.json`
+- Legacy profile `permissioned-data-0016-2026-07-03` remains checked in byte-exact
+  but is not selected for new builds or exports.
 
 The profile pins the TypeScript source archive and a complete checksum manifest
 for the `com.atproto.space` and `com.atproto.simplespace` lexicons. Normal
@@ -187,7 +189,7 @@ checksum-verified way to populate the ignored reference cache.
   one operation and a terminal signed commit; Swan matched the write/read CID,
   recomputed the commitment, verified the proposal content binding, and
   verified the ES256K context signature against the operator-supplied public
-  key pin. The sanitized artifact reported `syncStatus: 200`,
+  The sanitized artifact reported `syncStatus: 200`,
   `syncCommitVerified: true`, and `syncValuesIncluded: false`. The ordinary
   value-including TypeScript request was separately observed to fail with
   `InternalServerError` (`ambiguous column name: space`) in the pinned branch;
@@ -503,3 +505,77 @@ The recovery overlay source test was also hardened to hash only its four
 patched files. Recursive hashing of the pinned checkout's pnpm dependency
 farm was unnecessary and could trigger the host descriptor-pressure failure.
 The overlay source qualification passes after the bounded check.
+
+## 2026-08-02 qualified stateful member witness and data-volume selection
+
+With the current rebuilt Swan image and the explicit recovery-qualified
+reference overlay, the member-direction stateful matrix passed all 26
+sanitized assertions: credential exchange, permissioned write/read CID
+convergence, value-bearing incremental sync, signed commit verification, and
+two-root full-CAR recovery with equal commitments and revisions. The ignored
+artifact is `/private/tmp/swan-qualified-stateful-member-20260802.json` and
+contains no credentials or permissioned values.
+
+The overlay was removed afterward and the stock pinned reference image was
+restored. The active Compose project now selects its existing encrypted
+`swan-data-v2` volume through
+`interop/docker-compose.external-data-volume.yml`; the older volume remains
+untouched and is not accepted as current evidence.
+
+The same qualified stateful matrix also passed with authority placement
+reversed: 26/26 assertions covered dynamic credential/key resolution,
+value-bearing incremental sync, signed commit verification, full-CAR recovery,
+and equal sync/full-CAR commitments and revisions. The reference service was
+restored to its stock image after the run.
+
+## 2026-08-02 cross-host full-CAR fallback witness
+
+The pinned TypeScript `listRepoOps` implementation returns a successful page
+for an old cursor rather than the proposal's `409 full_repo_recovery_required`
+response. Swan's recovery command therefore keeps the strict 409 behavior by
+default and adds an explicit `--allow-full-car-fallback` compatibility flag for
+this known reference limitation. The flag is recorded as
+`gapFallbackUsed: true` and is rejected by the strict retention-gap artifact
+validator; it cannot be promoted to compaction-gap evidence.
+
+With that flag enabled only for the checksummed recovery overlay, the
+rebuilt-Swan/reference-PDS cross-host run passed all 26 sanitized assertions.
+The artifact `/private/tmp/swan-qualified-cross-host-recovery-fallback-20260802.json`
+was mode 0600, reported `gapStatus: 200` and `gapFallbackUsed: true`, installed
+and verified the two-root full CAR, rejected a corrupted CAR as
+`CARBlockCIDMismatch`, and preserved the last valid receiver head. No secret or
+permissioned value was recorded. The reference service was restored to the
+stock pinned image and the current Swan service was recreated from the rebuilt
+image using the explicit `swan-data-v2` volume.
+
+This closes a qualified cross-host full-CAR transfer witness, not stock
+TypeScript retention-gap interoperability. Native Linux, stock value-bearing
+and gap semantics, cross-host fault ordering/compaction, reverse lifecycle,
+and final security gates remain open.
+
+## 2026-08-02 active-profile and stock-fault receipts
+
+Adding the pinned TypeScript retention-gap behavior to the active successor
+profile exposed and closed the associated deterministic-pin seam: the profile,
+Swift verifier, shell verifier, and wire-generation preflight now use the same
+SHA-256 for `permissioned-data-0016-2026-07-30.json`. Pinned Swift and
+public-wire regeneration, their mutation suites, `SwanInteropTests` (92/92),
+and `PublicRepositoryReadHTTPTests` (13/13) pass on the current macOS
+checkout.
+
+The current rebuilt Swan image was then exercised against the stock reference
+PDS after the lab restart. Credential issuance, permissioned write, and
+credential-authenticated read all returned HTTP 200 with matching record CIDs;
+the pinned member host returned HTTP 500 for value-bearing `listRepoOps` and
+HTTP 501 for `getRepo`. The failure was retained as a mode-0600 sanitized
+artifact at `/private/tmp/swan-stock-member-current-20260802.json.failed` and
+is recorded as the profile's upstream compatibility boundary, not relabeled as
+Swan success.
+
+A disposable CA-trusted Swan runner also executed the live profile endpoint
+fault matrix through the current Caddy/Toxiproxy topology for normal, delayed,
+duplicated, reordered, offline, disconnected, and corrupted modes. Each
+sanitized matrix cell completed with status `passed`; both Caddy routes remained
+HTTP 200 and all long-running services were healthy afterward. This is
+transport/profile fault evidence, not a claim that the stock TypeScript host
+implements value-bearing incremental or full-CAR permissioned recovery.

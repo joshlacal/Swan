@@ -3346,6 +3346,12 @@ extension SwanCommand {
             @Option(name: .long, help: "Retained-operation cursor that must produce full_repo_recovery_required")
             var since: String
 
+            @Flag(
+                name: .customLong("allow-full-car-fallback"),
+                help: "Allow an explicitly requested full-CAR install when the source returns a successful listRepoOps response without a retention-gap error"
+            )
+            var allowFullCARFallback = false
+
             @Option(
                 name: .customLong("permissioned-commit-key-env"),
                 help: "Environment variable containing ES256:<base64url-x963> or ES256K:<base64url> repository-author public key"
@@ -3580,6 +3586,7 @@ extension SwanCommand {
                 )
                 var gapStatus: Int?
                 var gapErrorCode: String?
+                var gapFallbackUsed = false
                 var priorHead: PermissionedRemoteReplicaHead?
                 var valid: CommittedPermissionedRemoteReplicaRecovery?
                 var replacementCASAdvanced = false
@@ -3614,12 +3621,18 @@ extension SwanCommand {
                     )
                     gapStatus = gap.status
                     gapErrorCode = Self.responseError(gap)
-                    guard gap.status == 409,
-                          gapErrorCode ==
-                            "full_repo_recovery_required" else {
+                    let explicitRetentionGap = gap.status == 409
+                        && gapErrorCode == "full_repo_recovery_required"
+                    let successfulWithoutGapError = (200 ... 299).contains(
+                        gap.status
+                    ) && gapErrorCode == nil
+                    guard explicitRetentionGap
+                        || (allowFullCARFallback && successfulWithoutGapError)
+                    else {
                         throw PermissionedRecoveryCommandError
                             .retentionGapMissing
                     }
+                    gapFallbackUsed = !explicitRetentionGap
 
                     priorHead = try await database
                         .permissionedRemoteReplicaHead(target: target)
@@ -3692,8 +3705,9 @@ extension SwanCommand {
                 }
 
                 let passed = outcomeError == nil
-                    && gapStatus == 409
-                    && gapErrorCode == "full_repo_recovery_required"
+                    && ((gapStatus == 409
+                        && gapErrorCode == "full_repo_recovery_required")
+                        || (allowFullCARFallback && gapFallbackUsed))
                     && valid != nil
                     && corruptionRejected
                     && preserved
@@ -3702,6 +3716,7 @@ extension SwanCommand {
                     scenario: scenario,
                     gapStatus: gapStatus,
                     gapErrorCode: gapErrorCode,
+                    gapFallbackUsed: gapFallbackUsed,
                     priorHeadGeneration: priorHead?.generation,
                     priorHeadRevision: priorHead?.wireRevision.toString(),
                     priorCommitment: priorHead.map {

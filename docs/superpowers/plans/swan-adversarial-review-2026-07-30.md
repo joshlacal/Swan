@@ -2347,3 +2347,99 @@ passes without a recursive dependency-tree walk.
 This closes the lab image-identity and overlay-test resource seams. It does
 not turn the stock pinned value-bearing endpoints into an implementation, and
 does not close the broader cross-host fault or lifecycle gates.
+
+## Adversarial rereview: qualified stateful member matrix on the rebuilt Swan — 2026-08-02
+
+The current Swan image was run against the explicitly qualified reference-PDS
+overlay in member direction. The sanitized artifact
+`/private/tmp/swan-qualified-stateful-member-20260802.json` reports a passed
+credential exchange, permissioned write/read CID convergence, value-bearing
+incremental sync, signed commit verification, two-root full-CAR recovery, and
+matching sync/full-CAR commitments and revisions. Its 26 assertions all pass;
+the artifact contains no password, bearer, DPoP, access-token, or permissioned
+record value.
+
+The qualified image was then removed from the current service tag and the
+stock pinned image was restored. Both current HTTPS describe-server routes
+remain HTTP 200 and both Swan and reference-PDS containers are healthy.
+
+The run also showed that the current Compose project must select its existing
+`swan-data-v2` encrypted volume explicitly. A checked-in external-volume
+override now makes that selection auditable without copying or deleting either
+volume; the older `swan-data` volume fails the key-envelope/secret lineage
+check and is not used for current evidence.
+
+This closes a qualified cross-host stateful member witness on the rebuilt
+Swan and the persistence-selection seam. It remains qualified overlay
+evidence, not stock TypeScript evidence; authority-direction recovery,
+fault-injection, reverse lifecycle, and the stock value-bearing upstream gap
+remain open.
+
+The same qualified stateful matrix was then run with authority placement
+reversed. `/private/tmp/swan-qualified-stateful-authority-20260802.json`
+reports 26/26 assertions passed, including dynamic credential/key resolution,
+value-bearing incremental sync, signed commit verification, full-CAR recovery,
+and equal sync/full-CAR commitments and revisions. Its sanitized bytes contain
+none of the checked credential or value markers. The reference service was
+restored to the stock image afterward and verified by its source marker.
+
+## Adversarial rereview: explicit reference full-CAR fallback — 2026-08-02
+
+The first cross-host recovery attempt was intentionally retained as a failure:
+the stock pinned TypeScript `listRepoOps` handler returned HTTP 200 for the old
+cursor and never emits `full_repo_recovery_required`. The failure artifact
+reported `RetentionGapMissing`; no receiver state was published. This is a
+behavioral limitation of the pinned branch, not a reason to relabel a normal
+200 response as a retention gap.
+
+Swan now has an explicit `--allow-full-car-fallback` recovery flag. It remains
+off by default and the strict command still requires HTTP 409 with the exact
+`full_repo_recovery_required` error. When deliberately enabled for the
+qualified reference overlay, a successful value-bearing `listRepoOps` response
+may select the cryptographically verified full-CAR installer. The sanitized
+artifact records `gapFallbackUsed: true`; the strict
+`validate-permissioned-recovery-artifact.py` validator rejects that artifact as
+retention-gap evidence.
+
+The rebuilt Linux image then completed the cross-host fallback run against the
+checksummed recovery overlay. The mode-0600 artifact
+`/private/tmp/swan-qualified-cross-host-recovery-fallback-20260802.json` has
+26/26 live assertions passed, `gapStatus: 200`,
+`gapFallbackUsed: true`, a verified full-CAR install, deterministic
+`CARBlockCIDMismatch` rejection of the corrupted retry, and preservation of the
+last valid head. It contains no passwords, bearer/access tokens, DPoP material,
+or permissioned record values. This closes cross-host full-CAR transfer and
+corruption rejection for the qualified overlay only; it does not close the
+stock TypeScript retention-gap signal or the native-Linux/fault/lifecycle
+gates. The reference service was restored to the stock image and Swan was left
+on the rebuilt current image afterward.
+
+The focused artifact suite passes 7/7 and the shell validator/mutation suite
+passes. During verification, a disposable isolated SwiftPM scratch graph
+filled the host filesystem and caused `swiftc -print-target-info` to fail with
+OS error 28. Only that exact scratch directory was removed, recovering about
+2.4 GiB; no Docker volumes or Swan data were deleted.
+
+## Adversarial rereview: successor profile pin and stock fault receipt — 2026-08-02
+
+The active successor profile now explicitly records the pinned TypeScript
+retention-gap behavior: its `listRepoOps` handler returns a successful page for
+an old cursor and the pinned `getRepo` handler remains unavailable. The profile
+SHA changed accordingly, so the Swift offline verifier and wire-generation
+preflight were updated together; a first `SwanInteropTests` run failed on the
+stale pin, and the corrected run passed 92/92. Pinned Swift/public-wire
+regeneration and mutation suites, profile verification, and
+`PublicRepositoryReadHTTPTests` 13/13 also pass.
+
+The restarted stock-reference run reached credential issuance and permissioned
+write/read with matching CIDs, then reproduced HTTP 500 for value-bearing
+`listRepoOps` and HTTP 501 for `getRepo`. The sanitized mode-0600 failure
+artifact is `/private/tmp/swan-stock-member-current-20260802.json.failed`; no
+credentials, tokens, proofs, or record values were retained.
+
+A disposable CA-trusted Swan runner executed the live profile endpoint matrix
+through Caddy/Toxiproxy for normal, delayed, duplicated, reordered, offline,
+disconnected, and corrupted modes. All seven matrix artifacts reported
+`passed`, the two HTTPS describe-server routes remained HTTP 200, and the lab
+services remained healthy. This closes a live transport/fault-topology receipt,
+not the stock TypeScript value-bearing or compaction-gap semantic gate.

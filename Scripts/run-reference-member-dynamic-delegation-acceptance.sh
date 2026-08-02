@@ -25,6 +25,7 @@ output_path="${SWAN_DYNAMIC_DELEGATION_OUTPUT:-${root}/artifacts/live/reference-
 wait_timeout="${SWAN_DYNAMIC_DELEGATION_TIMEOUT:-180}"
 stateful_mode="${SWAN_DYNAMIC_DELEGATION_STATEFUL:-0}"
 direction="${SWAN_DYNAMIC_DELEGATION_DIRECTION:-member}"
+recovery_mode="${SWAN_DYNAMIC_DELEGATION_RECOVERY:-0}"
 
 [[ "$project_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$ ]] || {
   echo "SWAN_DYNAMIC_DELEGATION_PROJECT must name a running disposable Compose project" >&2
@@ -54,6 +55,14 @@ case "$direction" in
   member|authority) ;;
   *) echo "SWAN_DYNAMIC_DELEGATION_DIRECTION must be member or authority" >&2; exit 64 ;;
 esac
+case "$recovery_mode" in
+  0|1) ;;
+  *) echo "SWAN_DYNAMIC_DELEGATION_RECOVERY must be 0 or 1" >&2; exit 64 ;;
+esac
+if [[ "$recovery_mode" == "1" && "$direction" != "member" ]]; then
+  echo "SWAN_DYNAMIC_DELEGATION_RECOVERY currently requires member direction" >&2
+  exit 64
+fi
 [[ -n "${SWAN_INTEROP_SECRETS_DIR:-}" ]] || {
   echo "SWAN_INTEROP_SECRETS_DIR is required" >&2
   exit 64
@@ -533,12 +542,14 @@ docker run --rm \
   --read-only \
   --tmpfs /tmp:size=16m,mode=1777 \
   --mount "type=volume,src=${bootstrap_secrets_volume},dst=/run/secrets/swan-bootstrap,readonly" \
+  --mount "type=volume,src=${data_volume},dst=/var/lib/swan" \
   --mount "type=volume,src=${caddy_trust_volume},dst=/etc/ssl/certs,readonly" \
   --mount "type=bind,src=${temporary_directory},dst=/run/acceptance" \
   --env SWAN_LAB_PRODUCER_TOKEN \
   --env SWAN_LAB_CONSUMER_TOKEN \
   --env SWAN_DYNAMIC_DELEGATION_DIRECTION="$direction" \
   --env SWAN_DYNAMIC_DELEGATION_STATEFUL="$stateful_mode" \
+  --env SWAN_DYNAMIC_DELEGATION_RECOVERY="$recovery_mode" \
   --env SWAN_DYNAMIC_DELEGATION_SPACE_SCOPE="$space_scope" \
   --env SWAN_DYNAMIC_DELEGATION_WRITE_SCOPE="$write_scope" \
   --env SWAN_DYNAMIC_DELEGATION_SCOPE_CLIENT_ID="$space_scope_client_id" \
@@ -607,6 +618,71 @@ docker run --rm \
       tail -n 40 /tmp/live-interop.log >&2 || true
       exit 1
     fi
+    if [ "${SWAN_DYNAMIC_DELEGATION_RECOVERY:-0}" = "1" ]; then
+      recovery_failed=0
+      recovery_artifact="/tmp/recovery-artifact.json"
+      recovery_command_status=0
+      if /usr/local/bin/swan lab recover-permissioned \
+        --name "${scenario_name}-recovery" \
+        --receiver-did "$6" \
+        --repository "$2" \
+        --space "$1" \
+        --data-directory /var/lib/swan/data \
+        --source-url https://pds.test \
+        --authority-url https://swan.test \
+        --source-auth bearer \
+        --source-token-env SWAN_LAB_PRODUCER_TOKEN \
+        --scope atproto \
+        --since 2222222222222 \
+        --allow-full-car-fallback \
+        --permissioned-commit-key-env SWAN_LAB_PERMISSIONED_COMMIT_KEY \
+        --output "$recovery_artifact" \
+        --no-fail-on-failure \
+        >/tmp/permissioned-recovery.log 2>&1; then
+        recovery_command_status=0
+      else
+        recovery_command_status=$?
+      fi
+      if [ "$recovery_command_status" -ne 0 ]; then
+        tail -n 60 /tmp/permissioned-recovery.log >&2 || true
+      fi
+      recovery_status=failed
+      if python3 - "$recovery_artifact" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    artifact = json.load(handle)
+if artifact.get("status") != "passed":
+    raise SystemExit(1)
+PY
+      then
+        recovery_status=passed
+      else
+        tail -n 60 /tmp/permissioned-recovery.log >&2 || true
+      fi
+      python3 - /tmp/sanitized-artifact.json "$recovery_artifact" <<'PY'
+import json
+import sys
+
+live_path, recovery_path = sys.argv[1:]
+with open(live_path, encoding="utf-8") as handle:
+    live = json.load(handle)
+try:
+    with open(recovery_path, encoding="utf-8") as handle:
+        recovery = json.load(handle)
+except (OSError, ValueError):
+    recovery = {"status": "failed", "errorCode": "recovery_artifact_unavailable"}
+live["recovery"] = recovery
+live["status"] = "passed" if live.get("status") == "passed" and recovery.get("status") == "passed" else "failed"
+with open(live_path, "w", encoding="utf-8") as handle:
+    json.dump(live, handle, sort_keys=True, separators=(",", ":"))
+    handle.write("\n")
+PY
+      if [ "$recovery_command_status" -ne 0 ] || [ "$recovery_status" != "passed" ]; then
+        recovery_failed=1
+      fi
+    fi
     cp /tmp/sanitized-artifact.json /run/acceptance/artifact.json
     chmod 0600 /run/acceptance/artifact.json
     if ! grep -q '"'"'"status":"passed"'"'"' /tmp/sanitized-artifact.json; then
@@ -617,9 +693,12 @@ docker run --rm \
       echo "sanitized artifact retained a permissioned value" >&2
       exit 1
     fi
+    if [ "${recovery_failed:-0}" -ne 0 ]; then
+      exit 1
+    fi
     unset private_value SWAN_LAB_CONSUMER_PASSWORD
   ' _ \
-  "$space_uri" "$space_member_did" "$collection" "$rkey" "${local_consumer_handle:-}"
+  "$space_uri" "$space_member_did" "$collection" "$rkey" "${local_consumer_handle:-}" "$space_authority_did"
 
 unset SWAN_LAB_PRODUCER_TOKEN SWAN_LAB_CONSUMER_TOKEN reference_access_token reference_commit_key
 mkdir -p "$(dirname "$output_path")"

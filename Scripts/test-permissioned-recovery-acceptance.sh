@@ -203,6 +203,7 @@ artifact = {
     "profileID": "permissioned-data-0016-2026-07-30",
     "gapStatus": 409,
     "gapErrorCode": "full_repo_recovery_required",
+    "gapFallbackUsed": False,
     "priorHeadGeneration": 1,
     "priorHeadRevision": "3mrzdwwyosz22",
     "priorCommitment": "a" * 64,
@@ -258,6 +259,7 @@ PY
 reject_mutation scenario '"alternate-scenario"' scenario
 reject_mutation profileID '"alternate-profile"' profile
 reject_mutation gapStatus 200 status
+reject_mutation gapFallbackUsed true gap-fallback
 reject_mutation priorHeadGeneration 0 generation
 reject_mutation replacementHeadGeneration 1 head
 reject_mutation replacementCASAdvanced false replacement

@@ -44,6 +44,12 @@
       "pinnedComponent": "packages/pds/src/actor-store/space/reader.ts from reference implementation 3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
       "referenceBehavior": "com.atproto.space.listRepoOps returns InternalServerError when values are included because the joined SQLite query leaves the space selector ambiguous; excludeValues=true remains callable.",
       "swanBehavior": "Qualifies the joined space selector and serves value-bearing operations. The interop runner exposes an explicit excludeValues mode for the pinned branch and never mutates the reference cache."
+    },
+    {
+      "id": "typescript-space-oplog-retention-gap",
+      "pinnedComponent": "packages/pds/src/api/com/atproto/space/listRepoOps.ts from reference implementation 3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
+      "referenceBehavior": "An old since cursor is filtered with rev > since and returns HTTP 200; the pinned handler does not emit full_repo_recovery_required for a retention gap.",
+      "swanBehavior": "Emits HTTP 409 full_repo_recovery_required when its retained range is exceeded. The recovery CLI remains strict by default and exposes an explicit --allow-full-car-fallback only for qualified reference-host full-CAR testing; fallback artifacts are excluded from retention-gap validation."
     }
   ],
   "endpoints": [

@@ -216,6 +216,7 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
         XCTAssertTrue(artifact.replacementCASAdvanced)
         XCTAssertEqual(artifact.corruptErrorCode, "CARBlockCIDMismatch")
         XCTAssertTrue(artifact.lastValidHeadPreserved)
+        XCTAssertFalse(artifact.gapFallbackUsed)
 
         let serialized = String(
             decoding: try JSONEncoder().encode(artifact),
@@ -228,6 +229,40 @@ final class PermissionedRecoveryAcceptanceArtifactTests: XCTestCase {
         ] {
             XCTAssertFalse(serialized.contains(forbidden), forbidden)
         }
+    }
+
+    func testArtifactLabelsExplicitFullCARFallbackSeparatelyFromRetentionGap() throws {
+        let artifact = PermissionedRecoveryAcceptanceArtifact(
+            scenario: "reference-full-car-fallback",
+            gapStatus: 200,
+            gapErrorCode: nil,
+            gapFallbackUsed: true,
+            priorHeadGeneration: 1,
+            priorHeadRevision: "3lqjz7x4abc2k",
+            priorCommitment: String(repeating: "a", count: 64),
+            replacementHeadGeneration: 2,
+            replacementHeadRevision: "3lqjz7x4abc2m",
+            replacementCommitment: String(repeating: "b", count: 64),
+            replacementRecordCount: 3,
+            replacementCASAdvanced: true,
+            corruptionRejected: true,
+            corruptErrorCode: "CARBlockCIDMismatch",
+            finalHeadGeneration: 2,
+            finalHeadRevision: "3lqjz7x4abc2m",
+            finalCommitment: String(repeating: "b", count: 64),
+            lastValidHeadPreserved: true,
+            status: "passed",
+            errorCode: nil
+        )
+
+        XCTAssertTrue(artifact.gapFallbackUsed)
+        XCTAssertEqual(artifact.gapStatus, 200)
+        XCTAssertNil(artifact.gapErrorCode)
+        let serialized = String(
+            decoding: try JSONEncoder().encode(artifact),
+            as: UTF8.self
+        )
+        XCTAssertTrue(serialized.contains("gapFallbackUsed"))
     }
 
     func testArtifactRedactsNoncanonicalPeerEvidence() {

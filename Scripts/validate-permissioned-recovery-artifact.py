@@ -29,7 +29,7 @@ def main(path: str) -> None:
     if not isinstance(artifact, dict):
         fail("fields")
     expected = {
-        "scenario", "profileID", "gapStatus", "gapErrorCode",
+        "scenario", "profileID", "gapStatus", "gapErrorCode", "gapFallbackUsed",
         "priorHeadGeneration", "priorHeadRevision", "priorCommitment",
         "replacementHeadGeneration", "replacementHeadRevision", "replacementCommitment",
         "replacementRecordCount", "replacementCASAdvanced",
@@ -37,7 +37,7 @@ def main(path: str) -> None:
         "finalCommitment", "lastValidHeadPreserved", "status", "errorCode", "fixturePolicy",
     }
     required = {
-        "scenario", "profileID", "priorHeadGeneration", "priorHeadRevision",
+        "scenario", "profileID", "gapFallbackUsed", "priorHeadGeneration", "priorHeadRevision",
         "priorCommitment", "replacementHeadGeneration", "replacementHeadRevision",
         "replacementCommitment", "replacementRecordCount", "replacementCASAdvanced",
         "corruptionRejected", "lastValidHeadPreserved", "finalHeadGeneration",
@@ -53,6 +53,8 @@ def main(path: str) -> None:
         fail("status")
     if artifact.get("gapErrorCode") != "full_repo_recovery_required":
         fail("gap")
+    if artifact.get("gapFallbackUsed") is not False:
+        fail("gap-fallback")
     if artifact.get("corruptErrorCode") != "CARBlockCIDMismatch" \
             or artifact["corruptionRejected"] is not True:
         fail("corruption")

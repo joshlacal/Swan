@@ -1,0 +1,8 @@
+# Optional lab recovery override. The caller must provide the exact named
+# volume; this never copies, initializes, or deletes account data.
+services: {}
+
+volumes:
+  swan-data:
+    name: ${SWAN_DATA_VOLUME:?set the exact external Swan data volume name}
+    external: true

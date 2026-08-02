@@ -1093,9 +1093,10 @@ public struct PermissionedWriteOnlyApplyWritesArtifact: Codable, Sendable, Equat
     }
 }
 
-/// Sanitized proof that an incremental retention gap selected full-CAR
-/// recovery, an existing durable receiver head was CAS-replaced by a newer
-/// archive, and a deliberately corrupted retry could not replace that head. Repository and
+/// Sanitized proof that either an incremental retention gap selected full-CAR
+/// recovery or an explicitly enabled compatibility fallback selected it, an
+/// existing durable receiver head was CAS-replaced by a newer archive, and a
+/// deliberately corrupted retry could not replace that head. Repository and
 /// receiver identifiers, space URIs, request IDs, verifier fingerprints, raw
 /// LtHash state, credentials, and record values are deliberately absent.
 public struct PermissionedRecoveryAcceptanceArtifact:
@@ -1105,6 +1106,10 @@ public struct PermissionedRecoveryAcceptanceArtifact:
     public let profileID: String
     public let gapStatus: Int?
     public let gapErrorCode: String?
+    /// True only when the caller explicitly enabled the compatibility path
+    /// for a source that returned a successful listRepoOps response without
+    /// the protocol's retention-gap error. This is never retention-gap proof.
+    public let gapFallbackUsed: Bool
     public let priorHeadGeneration: UInt64?
     public let priorHeadRevision: String?
     public let priorCommitment: String?
@@ -1127,6 +1132,7 @@ public struct PermissionedRecoveryAcceptanceArtifact:
         scenario: String,
         gapStatus: Int?,
         gapErrorCode: String?,
+        gapFallbackUsed: Bool = false,
         priorHeadGeneration: UInt64?,
         priorHeadRevision: String?,
         priorCommitment: String?,
@@ -1150,6 +1156,7 @@ public struct PermissionedRecoveryAcceptanceArtifact:
             (100 ... 599).contains($0) ? $0 : nil
         }
         self.gapErrorCode = gapErrorCode.map(FixtureSanitizer.errorCode)
+        self.gapFallbackUsed = gapFallbackUsed
         self.priorHeadGeneration = priorHeadGeneration.flatMap {
             $0 > 0 && $0 <= UInt64(Int.max) ? $0 : nil
         }
