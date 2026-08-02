@@ -2553,3 +2553,20 @@ the Xcode 27 beta `swift-crypto` manifest compiler with no progress. The
 exact child compiler and scratch directory were cleaned up; the prior
 serialized current-commit graph remains the authoritative green macOS test
 receipt. This is a toolchain-resolution limitation, not a Swift test failure.
+
+## Adversarial rereview: current reverse-authority dynamic credential witness — 2026-08-02
+
+The running Compose project was restored after a fresh reverse-authority
+acceptance in which the pinned TypeScript host acted as the space authority and
+Swan hosted the member repository. No static credential-key pin was supplied:
+Swan resolved the authority's current PLC `#atproto` key through the explicit
+laboratory allowlist. The mode-0600 sanitized artifact is
+`/private/tmp/swan-dynamic-reverse-current-20260802.json`.
+
+The witness passed credential issuance, member-side permissioned blob upload,
+record creation, credential-authenticated member read, blob read, and exact
+write/read CID convergence. All six recorded endpoint events returned HTTP 200,
+and the reverse authority/member roles are explicit in the artifact. This is
+current dynamic credential/write/read evidence; it does not claim stock
+value-bearing incremental/full-CAR support or the broader reverse lifecycle and
+fault matrix.
