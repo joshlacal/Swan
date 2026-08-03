@@ -8510,13 +8510,22 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     func withConnectionGate<T: Sendable>(
         _ body: () async throws -> T
     ) async throws -> T {
+        if ProcessInfo.processInfo.environment["SWAN_SYNC_STAGE_LOG"] == "1" {
+            FileHandle.standardError.write(Data("[sqlite] gate acquire\n".utf8))
+        }
         await connectionGate.acquire()
         do {
             let result = try await body()
             await connectionGate.release()
+            if ProcessInfo.processInfo.environment["SWAN_SYNC_STAGE_LOG"] == "1" {
+                FileHandle.standardError.write(Data("[sqlite] gate release\n".utf8))
+            }
             return result
         } catch {
             await connectionGate.release()
+            if ProcessInfo.processInfo.environment["SWAN_SYNC_STAGE_LOG"] == "1" {
+                FileHandle.standardError.write(Data("[sqlite] gate release\n".utf8))
+            }
             throw error
         }
     }

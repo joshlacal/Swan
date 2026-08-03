@@ -3201,3 +3201,130 @@ mounts the preserved `swan-alpha-current-20260801_swan-data-v3` volume, and the
 stock reference PDS is healthy. This closes the Swan Spaces Interoperability
 Alpha acceptance gates without broadening the explicitly deferred production
 PDS scope.
+
+## 2026-08-03 first-write discovery liveness gap — live acceptance
+
+A new live acceptance, `Scripts/run-first-write-notification-loss-acceptance.sh`,
+witnesses the "first-write discovery liveness gap" of the AT Protocol
+permissioned-data proposal (bluesky-social/proposals 0016): a brand-new writer
+whose very first `notifyWrite` to the space authority is lost is never learned
+by the authority, so a sweep (`com.atproto.space.listRepos` / the
+`permissioned_space_writers` table) can never discover them. The proposal's
+healing story ("a later notification or sweep") presumes the authority already
+knows the writer; an entirely unknown writer has no route into the writer set.
+
+The confirmed pinned TypeScript reference code path is
+`.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354/packages/pds/src/api/com/atproto/space/util.ts`:
+`fireNotifyWrite` (~lines 85-121) is fully best-effort — the XRPC delivery is
+`xrpc(...).catch(() => {})` inside an outer `try/catch` — and every space write
+handler commits the local permissioned write BEFORE notifying
+(`createRecord.ts:42`, `putRecord.ts:43`, `applyWrites.ts:77`,
+`deleteRecord.ts:36`). A lost notification therefore never fails the write,
+and the authority-side writer set is only ever populated by whatever
+notifications actually land.
+
+Scenario executed live against the running disposable project
+`swan-alpha-current-20260801` (stock pinned TypeScript reference PDS,
+Swan authority on `swan-data-v3`): a fresh TypeScript member account was
+created, a fresh space was provisioned and the member authorized through the
+authority, the authority container was stopped, the member's FIRST
+`com.atproto.space.putRecord` was issued, the authority was restarted and
+healthchecked, the writer set was swept, and a second write was issued with
+the authority healthy. The sanitized mode-0600 artifact is
+`Swan/artifacts/live/first-write-notification-loss.json` (status `passed`,
+semantic validator green).
+
+Outcome facts recorded from the live run:
+
+- `firstWriteCommittedWhileAuthorityDown` — **true**: the first `putRecord`
+  returned 200 with a CID while the authority was stopped
+  (`cid=bafyreicw5zt5ojsjdiym3jntf3vpmr3uafxhkxyz7jyyokqyy6sfalmxta`), exactly
+  as the best-effort `fireNotifyWrite` design predicts.
+- `writerSetEmptyAfterSweep` — **true**: after the authority restart, the
+  read-only SQLite assertion on `permissioned_space_writers(space_uri,
+  repo_did)` found zero rows for the fresh space and zero rows for the writer.
+- `secondWriteHealedWriterSet` — **false in this lab**: the second write also
+  returned 200 with the authority healthy, and the writer set remained empty
+  (`writerCountForMember=0` after the write). The healing story was not
+  observable.
+- `firstRecordDiscoverableOnlyAfterSecondWrite` — **false in this lab**: the
+  authority never learned of the writer; both records were readable only from
+  the member's own repository through the live read path (both `getRecord`
+  statuses 200 with CIDs matching the writes).
+
+The protocol-level sweep was attempted: `getDelegationToken` (member PDS)
+returned 200, `getSpaceCredential` (authority) returned 401, so `listRepos`
+was not reachable; the read-only SQLite writer-set assertion is the
+authoritative witness because Swan's `listRepos` reads exactly
+`permissioned_space_writers`. Two lab-level constraints explain why the
+healing could not be observed and refine the finding: (1) the pinned
+TypeScript PDS cannot complete TLS to the authority endpoint
+`https://swan.test` (Caddy internal CA not in the stock reference image's
+trust store — `fetch` fails with `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` while
+plain `http://swan:3000` returns 200), so `fireNotifyWrite` dies at the
+transport layer and the swallow is invisible; and (2) the running authority's
+notification configuration has no `delegationKeyPLC` and no service-key pins,
+so its verifiers are local-account-only (`SpaceServiceAuthentication.swift`)
+and reject TypeScript-writer delegation tokens (401) and service JWTs. The
+liveness gap is therefore confirmed and strictly worse than the healing story
+claims in this lab: the authority never learns of a TypeScript member through
+ any notification path, first or later, up or down.
+
+## 2026-08-04 forum vehicle and syncer live state
+
+The Swan forum test vehicle is implemented as `swan lab forum` with `provision`,
+`post`, and `thread` subcommands. It uses the existing permissioned-data
+surface and the collection-agnostic test types `blue.catbird.lab.post` and
+`blue.catbird.lab.reply`; no new public lexicons were added. `thread` obtains
+one space credential, discovers writers with `listRepos`, synchronizes each
+writer repository, and merges the durable records into one rendered thread.
+Per-writer `--writer-host did=url:did:key:z...` overrides provide the correct
+repository commit key when a thread contains writers from different accounts.
+
+The live disposable forum run reached the cross-host write boundary. Against
+the recovery-qualified reference PDS and an ephemeral Caddy trust setup, all
+five writes passed: Carol's root, Carol's reply, Alice's authority post, Bob's
+TypeScript-hosted post, and Carol's cross-host reply to Bob. The TypeScript
+post was written on `pds.test`; it was not copied into Swan by the write path.
+The full three-writer thread run was interrupted by the syncer defect below,
+so this is write-path evidence, not a completed three-writer product receipt.
+
+The first focused thread rerun after the fix passed for the persisted Bob
+state:
+
+```text
+FORUM THREAD: 1 roots, 0 replies, 0 unlinked
+status: passed writers: 1 posts: 1 replies: 0
+```
+
+The rendered root was Bob's TypeScript-hosted post. The recovery-qualified
+sync completed with `unchanged`, read one durable replica record, and rendered
+it. The authority writer set contained one writer in this focused fixture;
+the full demo configuration now includes the authority self-notification
+destination, but the three-writer rerun remains a separate qualification step.
+
+The syncer stall was an in-process connection-gate deadlock, not an upstream
+network timeout. `permissionedRemoteReplicaRecords` acquired
+`SQLiteConnectionGate` and then called the public
+`permissionedRemoteReplicaHead`, which acquired the same non-reentrant gate a
+second time. The gate trace showed two consecutive acquires after the head
+read and no release. The fix calls the gate-free
+`loadPermissionedRemoteReplicaHead` from inside the existing gated read
+transaction. Regression test
+`testRemoteReplicaRecordsEnumerationDoesNotDeadlockTheConnectionGate` passes,
+and the focused live rerun passes.
+
+The forum post command uses `com.atproto.space.createRecord`, which is the
+proven live write path. During investigation, the same OAuth flow and
+create-only scope returned 401 `Unauthorized` for
+`com.atproto.space.putRecord` while `createRecord` succeeded. The SQLite
+`putRecord` implementation requires both create and update grants for its
+state-independent preflight; the exact 401 mapping still needs a separate
+focused investigation and is not claimed as closed by this acceptance.
+
+The current working copy has passed the ordinary macOS Swift suite with zero
+failures. The disposable Compose lab was restored to the stock reference PDS,
+normal Swan authority, and preserved `swan-alpha-current-20260801_swan-data-v3`
+volume before the local Colima/Lima VM was shut down. The live forum artifacts
+and test accounts remain disposable lab state; no Catbird MLS runtime or
+production PDS integration was enabled.

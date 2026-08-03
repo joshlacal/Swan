@@ -164,6 +164,45 @@ final class PermissionedRemoteReplicaRecoverySQLiteTests: XCTestCase {
     }
   }
 
+  // Regression: `permissionedRemoteReplicaRecords` must read the head through
+  // the gate-free loader. Calling the gate-wrapped `permissionedRemoteReplicaHead`
+  // inside its own `withConnectionGate` deadlocks the connection gate forever.
+  func testRemoteReplicaRecordsEnumerationDoesNotDeadlockTheConnectionGate()
+    async throws
+  {
+    let fixture = try RemoteReplicaSQLiteFixture(
+      name: "records-enumeration-regression"
+    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let database = try await fixture.open()
+    do {
+      let archive = try fixture.archive(
+        revision: "222222222222a",
+        values: ["gate regression value"],
+        ikmByte: 0x33
+      )
+      let installed = try await fixture.install(
+        database: database,
+        archive: archive,
+        expectedBase: nil,
+        requestID: "records-enumeration-regression",
+        publicationAuthorization: fixture.publicationAuthorization
+      )
+      XCTAssertEqual(installed.result.head.generation, 1)
+      let snapshots = try await database.permissionedRemoteReplicaRecords(
+        target: fixture.target
+      )
+      XCTAssertEqual(snapshots.count, 1)
+      XCTAssertEqual(snapshots[0].uri.collection, "app.bsky.feed.post")
+      XCTAssertEqual(snapshots[0].uri.rkey, "record")
+      XCTAssertEqual(snapshots[0].value, archive.records[0].value)
+      try await database.close()
+    } catch {
+      try? await database.close()
+      throw error
+    }
+  }
+
   func testDeactivatedControlAccountRejectsDirectSQLitePublication()
     async throws
   {

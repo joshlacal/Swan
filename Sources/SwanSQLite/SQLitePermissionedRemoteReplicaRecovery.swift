@@ -2976,7 +2976,7 @@ extension SQLiteAccountDatabase:
         )
     }
 
-    private func loadPermissionedRemoteReplicaHead(
+    func loadPermissionedRemoteReplicaHead(
         target: PermissionedRemoteReplicaTarget
     ) async throws -> PermissionedRemoteReplicaHead? {
         let rows = try await connection.query(

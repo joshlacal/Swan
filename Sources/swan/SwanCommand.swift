@@ -3363,7 +3363,7 @@ extension SwanCommand {
     struct Lab: ParsableCommand {
         static let configuration = CommandConfiguration(
             abstract: "Validate and record sanitized Compose laboratory scenarios",
-            subcommands: [Validate.self, Matrix.self, Scenario.self, Semantic.self, StatefulFaultMatrix.self, PermissionedReplicaHead.self, ImportPublic.self, SyncPermissioned.self, RecoverPermissioned.self, Live.self],
+            subcommands: [Validate.self, Matrix.self, Scenario.self, Semantic.self, StatefulFaultMatrix.self, PermissionedReplicaHead.self, ImportPublic.self, SyncPermissioned.self, RecoverPermissioned.self, Live.self, Forum.self],
             defaultSubcommand: Validate.self
         )
 
@@ -5279,11 +5279,1180 @@ extension SwanCommand {
             }
         }
 
+        struct Forum: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "forum",
+                abstract: "Exercise a permissioned-data forum: provision a space, post records, and merge one thread",
+                subcommands: [Provision.self, Post.self, Thread.self]
+            )
+
+            static let postCollection = "blue.catbird.lab.post"
+            static let replyCollection = "blue.catbird.lab.reply"
+
+            /// Creates a forum space on an authority and adds one member.
+            /// Mirrors `lab live --provision-space`: it reuses
+            /// `LabLiveSupport.provisionSpace` (simplespace.createSpace +
+            /// addMember) through the OAuth-authorized procedure helper.
+            struct Provision: AsyncParsableCommand {
+                static let configuration = CommandConfiguration(
+                    commandName: "provision",
+                    abstract: "Create a forum space on an authority and add a member"
+                )
+
+                @Option(name: .customLong("authority-url"), help: "Authority PDS base URL (default: SWAN_LAB_AUTHORITY_URL or https://swan.test)")
+                var authorityURL: String = ""
+
+                @Option(name: .long, help: "Permissioned space URI, e.g. at://did:plc:.../space/blue.catbird.lab.forum/lab-1")
+                var space: String
+
+                @Option(name: .customLong("member-did"), help: "Member DID to add to the space")
+                var memberDID: String
+
+                @Option(name: .customLong("authority-auth"), help: "Authority auth: none, bearer, or oauth")
+                var authorityAuth: String = "oauth"
+
+                @Option(name: .customLong("authority-token-env"), help: "Environment variable containing the authority bearer token")
+                var authorityTokenEnvironment = "SWAN_LAB_AUTHORITY_TOKEN"
+
+                @Option(name: .customLong("authority-handle-env"), help: "Environment variable containing the authority OAuth handle")
+                var authorityHandleEnvironment = "SWAN_LAB_AUTHORITY_HANDLE"
+
+                @Option(name: .customLong("authority-password-env"), help: "Environment variable containing the authority OAuth password")
+                var authorityPasswordEnvironment = "SWAN_LAB_AUTHORITY_PASSWORD"
+
+                @Option(name: .customLong("authority-client-id"), help: "Authority OAuth client metadata URL")
+                var authorityClientID: String = ""
+
+                @Option(name: .customLong("authority-redirect-uri"), help: "Authority OAuth redirect URI")
+                var authorityRedirectURI: String = ""
+
+                @Option(name: .long, parsing: .upToNextOption, help: "OAuth scope to request; repeatable")
+                var scope: [String] = ["atproto"]
+
+                @Option(name: .customLong("request-timeout-seconds"))
+                var requestTimeoutSeconds: Double = 15
+
+                func run() async throws {
+                    let parsedSpace: SpaceURI
+                    do { parsedSpace = try SpaceURI(space) }
+                    catch { throw ValidationError("--space is not a valid space URI") }
+                    let member: String
+                    do { member = try AccountIdentifiers.validateDID(memberDID) }
+                    catch { throw ValidationError("--member-did is not a canonical DID") }
+                    let authority = try await LabLiveSupport.host(
+                        label: "authority",
+                        url: LabLiveSupport.url(
+                            explicit: authorityURL,
+                            environment: "SWAN_LAB_AUTHORITY_URL",
+                            fallback: "https://swan.test"
+                        ),
+                        auth: authorityAuth,
+                        tokenEnvironment: authorityTokenEnvironment,
+                        handleEnvironment: authorityHandleEnvironment,
+                        passwordEnvironment: authorityPasswordEnvironment,
+                        clientID: authorityClientID,
+                        redirectURI: authorityRedirectURI,
+                        scopes: scope,
+                        timeout: requestTimeoutSeconds,
+                        permissionedCommitVerificationKey: nil
+                    )
+                    try await LabLiveSupport.provisionSpace(
+                        authority: authority,
+                        space: parsedSpace,
+                        member: member
+                    )
+                    print("FORUM SPACE PROVISIONED: \(parsedSpace.rawValue) member=\(member)")
+                }
+            }
+
+            /// Writes one post or reply record into the CALLER's own
+            /// permissioned repository through `com.atproto.space.putRecord`.
+            /// The write is authorized by the caller's OAuth session with a
+            /// create scope for the space (mirroring `lab live --mode
+            /// permissioned`), never by the read-only space credential.
+            struct Post: AsyncParsableCommand {
+                static let configuration = CommandConfiguration(
+                    commandName: "post",
+                    abstract: "Write one forum record into the caller's permissioned repository"
+                )
+
+                @Option(name: .customLong("producer-url"), help: "Caller PDS base URL (default: SWAN_LAB_PRODUCER_URL or https://swan.test)")
+                var producerURL: String = ""
+
+                @Option(name: .long, help: "Permissioned space URI")
+                var space: String
+
+                @Option(name: .long, help: "Record collection (default: blue.catbird.lab.post)")
+                var collection: String = Forum.postCollection
+
+                @Option(name: .long, help: "Post text")
+                var text: String
+
+                @Option(name: .long, help: "Record key; a sortable TID is generated when absent")
+                var rkey: String = ""
+
+                @Option(name: .customLong("reply-to"), help: "Optional at:// record URI of the parent record (writes reply: {root, parent})")
+                var replyTo: String = ""
+
+                @Option(name: .customLong("reply-root"), help: "Optional at:// record URI of the thread root; defaults to --reply-to")
+                var replyRoot: String = ""
+
+                @Option(name: .long, help: "Repository DID to write (required with bearer auth; defaults to the OAuth subject)")
+                var repo: String = ""
+
+                @Option(name: .customLong("producer-auth"), help: "Caller auth: none, bearer, or oauth")
+                var producerAuth: String = "oauth"
+
+                @Option(name: .customLong("producer-token-env"), help: "Environment variable containing the caller bearer token")
+                var producerTokenEnvironment = "SWAN_LAB_PRODUCER_TOKEN"
+
+                @Option(name: .customLong("producer-handle-env"), help: "Environment variable containing the caller OAuth handle")
+                var producerHandleEnvironment = "SWAN_LAB_PRODUCER_HANDLE"
+
+                @Option(name: .customLong("producer-password-env"), help: "Environment variable containing the caller OAuth password")
+                var producerPasswordEnvironment = "SWAN_LAB_PRODUCER_PASSWORD"
+
+                @Option(name: .customLong("producer-client-id"), help: "Caller OAuth client metadata URL")
+                var producerClientID: String = ""
+
+                @Option(name: .customLong("producer-redirect-uri"), help: "Caller OAuth redirect URI")
+                var producerRedirectURI: String = ""
+
+                @Option(name: .long, parsing: .upToNextOption, help: "OAuth scope to request; repeatable (default: atproto plus the derived space create scope)")
+                var scope: [String] = []
+
+                @Option(name: .long, help: "Destination for the sanitized JSON artifact")
+                var output: String = "artifacts/forum/post.json"
+
+                @Option(name: .customLong("request-timeout-seconds"))
+                var requestTimeoutSeconds: Double = 15
+
+                @Flag(
+                    name: .customLong("fail-on-failure"),
+                    inversion: .prefixedNo,
+                    help: "Return non-zero when the write did not pass (default)"
+                )
+                var failOnFailure: Bool = true
+
+                func run() async throws {
+                    let parsedSpace: SpaceURI
+                    do { parsedSpace = try SpaceURI(space) }
+                    catch { throw ValidationError("--space is not a valid space URI") }
+                    _ = try SpaceRecordURI(
+                        space: parsedSpace,
+                        author: parsedSpace.authority,
+                        collection: collection,
+                        rkey: "2"
+                    )
+                    let normalizedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !normalizedText.isEmpty, normalizedText.utf8.count <= 4_096 else {
+                        throw ValidationError("--text must contain between 1 and 4096 bytes")
+                    }
+                    var reply: [String: String]?
+                    if !replyTo.isEmpty {
+                        do { _ = try SpaceRecordURI(replyTo) }
+                        catch { throw ValidationError("--reply-to is not a valid at:// record URI") }
+                        let root = replyRoot.isEmpty ? replyTo : replyRoot
+                        do { _ = try SpaceRecordURI(root) }
+                        catch { throw ValidationError("--reply-root is not a valid at:// record URI") }
+                        reply = ["root": root, "parent": replyTo]
+                    }
+                    let requestedScopes = Forum.scopes(
+                        requested: scope,
+                        space: parsedSpace,
+                        action: "create",
+                        collection: collection
+                    )
+                    let producerURL = try LabLiveSupport.url(
+                        explicit: producerURL,
+                        environment: "SWAN_LAB_PRODUCER_URL",
+                        fallback: "https://swan.test"
+                    )
+                    let hostResult = try await Forum.oauthAwareHost(
+                        label: "member",
+                        url: producerURL,
+                        auth: producerAuth,
+                        tokenEnvironment: producerTokenEnvironment,
+                        handleEnvironment: producerHandleEnvironment,
+                        passwordEnvironment: producerPasswordEnvironment,
+                        clientID: producerClientID,
+                        redirectURI: producerRedirectURI,
+                        scopes: requestedScopes,
+                        timeout: requestTimeoutSeconds
+                    )
+                    let producer = hostResult.host
+                    let repositoryDID: String
+                    if !repo.isEmpty {
+                        do { repositoryDID = try AccountIdentifiers.validateDID(repo) }
+                        catch { throw ValidationError("--repo is not a canonical DID") }
+                    } else if let subject = hostResult.subject, !subject.isEmpty {
+                        repositoryDID = subject
+                    } else {
+                        throw ValidationError(
+                            "post requires --repo with non-OAuth auth, or OAuth auth so the subject DID can be derived"
+                        )
+                    }
+                    let recordKey: String
+                    if !rkey.isEmpty {
+                        recordKey = rkey
+                    } else {
+                        recordKey = await TIDGenerator.next()
+                    }
+                    _ = try SpaceRecordURI(
+                        space: parsedSpace,
+                        author: repositoryDID,
+                        collection: collection,
+                        rkey: recordKey
+                    )
+                    var record: [String: Any] = [
+                        "$type": collection,
+                        "text": normalizedText,
+                        "createdAt": Forum.currentTimestamp(),
+                    ]
+                    if let reply { record["reply"] = reply }
+                    let body = try JSONSerialization.data(
+                        withJSONObject: [
+                            "space": parsedSpace.rawValue,
+                            "repo": repositoryDID,
+                            "collection": collection,
+                            "rkey": recordKey,
+                            "record": record,
+                        ],
+                        options: [.sortedKeys]
+                    )
+                    var status = "failed"
+                    var errorCode: String?
+                    var writtenURI: String?
+                    var writtenCID: String?
+                    do {
+                        let authorization: InteropAuthorization
+                        if let provider = producer.authorizationProvider {
+                            let path = try producer.client.xrpcPath("com.atproto.space.createRecord")
+                            guard let target = URL(
+                                string: path,
+                                relativeTo: producer.client.http.baseURL
+                            )?.absoluteURL else {
+                                throw InteropHTTPError.invalidURL
+                            }
+                            authorization = try await provider(.post, target, body)
+                        } else {
+                            authorization = producer.authorization
+                        }
+                        let response = try await producer.client.procedure(
+                            "com.atproto.space.createRecord",
+                            body: body,
+                            authorization: authorization
+                        )
+                        guard (200 ... 299).contains(response.status) else {
+                            errorCode = Forum.responseErrorCode(response)
+                            throw ValidationError(
+                                "forum post failed (status=\(response.status), error=\(errorCode ?? "unknown"))"
+                            )
+                        }
+                        let output = try StrictJSON.decode(
+                            ForumPutRecordResponse.self,
+                            from: response.body
+                        )
+                        writtenURI = output.uri
+                        writtenCID = output.cid
+                        _ = try SpaceRecordURI(writtenURI ?? "")
+                        guard let writtenCID, (try? CID.parse(writtenCID)) != nil else {
+                            throw ValidationError("forum post returned an invalid URI/CID")
+                        }
+                        status = "passed"
+                    } catch {
+                        if errorCode == nil {
+                            errorCode = Forum.errorCode(error)
+                        }
+                        let artifact = ForumPostArtifact(
+                            space: parsedSpace.rawValue,
+                            repositoryDID: repositoryDID,
+                            collection: collection,
+                            rkey: recordKey,
+                            uri: writtenURI,
+                            cid: writtenCID,
+                            status: status,
+                            errorCode: errorCode
+                        )
+                        let outputURL = URL(fileURLWithPath: output)
+                        try FileManager.default.createDirectory(
+                            at: outputURL.deletingLastPathComponent(),
+                            withIntermediateDirectories: true
+                        )
+                        let encoder = JSONEncoder()
+                        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                        try encoder.encode(artifact).write(to: outputURL, options: .atomic)
+                        try FileManager.default.setAttributes(
+                            [.posixPermissions: 0o600],
+                            ofItemAtPath: outputURL.path
+                        )
+                        print("FORUM POST ARTIFACT WRITTEN: \(outputURL.path) status=\(artifact.status)")
+                        guard !failOnFailure || artifact.status == "passed" else {
+                            throw ValidationError(
+                                "forum post did not pass; inspect \(outputURL.lastPathComponent)"
+                            )
+                        }
+                        return
+                    }
+                    let artifact = ForumPostArtifact(
+                        space: parsedSpace.rawValue,
+                        repositoryDID: repositoryDID,
+                        collection: collection,
+                        rkey: recordKey,
+                        uri: writtenURI,
+                        cid: writtenCID,
+                        status: status,
+                        errorCode: errorCode
+                    )
+                    let outputURL = URL(fileURLWithPath: output)
+                    try FileManager.default.createDirectory(
+                        at: outputURL.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                    try encoder.encode(artifact).write(to: outputURL, options: .atomic)
+                    try FileManager.default.setAttributes(
+                        [.posixPermissions: 0o600],
+                        ofItemAtPath: outputURL.path
+                    )
+                    print("FORUM POST WRITTEN: \(writtenURI ?? "?") cid=\(writtenCID ?? "?")")
+                    print("FORUM POST ARTIFACT WRITTEN: \(outputURL.path) status=\(artifact.status)")
+                }
+            }
+
+            /// THE SYNCER. Authenticates as the acting user (e.g. Carol),
+            /// mints one delegation token at her PDS, exchanges it at the
+            /// space authority for ONE space credential, discovers the writer
+            /// repos from the authority's `listRepos`, then fetches, verifies,
+            /// and durably applies every writer's repo with that single
+            /// credential, merges the records into one thread, and prints it.
+            struct Thread: AsyncParsableCommand {
+                static let configuration = CommandConfiguration(
+                    commandName: "thread",
+                    abstract: "Sync every writer repo in a forum space and print the merged thread"
+                )
+
+                @Option(name: .customLong("consumer-url"), help: "Acting user PDS base URL (default: SWAN_LAB_CONSUMER_URL or https://pds.test)")
+                var consumerURL: String = ""
+
+                @Option(name: .customLong("authority-url"), help: "Space authority base URL (default: SWAN_LAB_AUTHORITY_URL or https://swan.test)")
+                var authorityURL: String = ""
+
+                @Option(name: .long, help: "Permissioned space URI")
+                var space: String
+
+                @Option(name: .customLong("receiver-did"), help: "Managed receiver account DID (the acting user)")
+                var receiverDID: String
+
+                @Option(name: .long, help: "Swan data directory containing the receiver database")
+                var dataDirectory: String
+
+                @Option(name: .customLong("consumer-auth"), help: "Acting user auth: none, bearer, or oauth")
+                var consumerAuth: String = "oauth"
+
+                @Option(name: .customLong("consumer-token-env"), help: "Environment variable containing the acting user bearer token")
+                var consumerTokenEnvironment = "SWAN_LAB_CONSUMER_TOKEN"
+
+                @Option(name: .customLong("consumer-handle-env"), help: "Environment variable containing the acting user OAuth handle")
+                var consumerHandleEnvironment = "SWAN_LAB_CONSUMER_HANDLE"
+
+                @Option(name: .customLong("consumer-password-env"), help: "Environment variable containing the acting user OAuth password")
+                var consumerPasswordEnvironment = "SWAN_LAB_CONSUMER_PASSWORD"
+
+                @Option(name: .customLong("consumer-client-id"), help: "Acting user OAuth client metadata URL")
+                var consumerClientID: String = ""
+
+                @Option(name: .customLong("consumer-redirect-uri"), help: "Acting user OAuth redirect URI")
+                var consumerRedirectURI: String = ""
+
+                @Option(name: .long, parsing: .upToNextOption, help: "OAuth scope to request; repeatable (default: atproto plus the derived space read scope)")
+                var scope: [String] = []
+
+                @Option(name: .customLong("permissioned-commit-key-env"), help: "Environment variable containing the repository author public key (base64url secp256k1)")
+                var permissionedCommitKeyEnvironment = "SWAN_LAB_PERMISSIONED_COMMIT_KEY"
+
+                @Option(name: .customLong("plc-origin"), help: "PLC directory origin used to discover each writer's repo host (default: https://plc.directory)")
+                var plcOrigin: String = PLCClientConfiguration.defaultProductionOrigin.absoluteString
+
+                @Flag(name: .customLong("plc-laboratory"), help: "Allow an explicitly loopback/allowlisted HTTP PLC origin for the lab")
+                var plcLaboratory = false
+
+                @Option(name: .customLong("plc-laboratory-allowlisted-host"), help: "Explicit Docker/service DNS host allowed for --plc-laboratory")
+                var plcLaboratoryAllowlistedHost: String?
+
+                @Option(name: .customLong("writer-host"), parsing: .upToNextOption, help: "Explicit writer repo host as did=url, optionally did=url:did:key:z... with a per-writer commit key; repeatable (overrides PLC discovery)")
+                var writerHost: [String] = []
+
+                @Flag(
+                    name: .customLong("full-car-recovery"),
+                    inversion: .prefixedNo,
+                    help: "Perform verified full-CAR replacement when incremental history is unavailable"
+                )
+                var fullCARRecovery = true
+
+                @Option(name: .long, help: "Destination for the sanitized JSON artifact")
+                var output: String = "artifacts/forum/thread.json"
+
+                @Option(name: .customLong("request-timeout-seconds"))
+                var requestTimeoutSeconds: Double = 15
+
+                @Flag(
+                    name: .customLong("fail-on-failure"),
+                    inversion: .prefixedNo,
+                    help: "Return non-zero when the thread sync did not pass (default)"
+                )
+                var failOnFailure: Bool = true
+
+                func run() async throws {
+                    let parsedSpace: SpaceURI
+                    do { parsedSpace = try SpaceURI(space) }
+                    catch { throw ValidationError("--space is not a valid space URI") }
+                    let receiver: String
+                    do { receiver = try AccountIdentifiers.validateDID(receiverDID) }
+                    catch { throw ValidationError("--receiver-did is not a canonical DID") }
+                    guard requestTimeoutSeconds > 0,
+                          requestTimeoutSeconds <= 120,
+                          requestTimeoutSeconds.isFinite else {
+                        throw ValidationError("--request-timeout-seconds is invalid")
+                    }
+                    let dataURL = URL(fileURLWithPath: dataDirectory)
+                    let writerHosts = try Forum.writerHostMap(writerHost)
+                    Forum.log("forum thread: writer hosts parsed (\(writerHosts.count))")
+                    try await Forum.requireActiveManagedAccount(
+                        did: receiver,
+                        dataDirectory: dataURL
+                    )
+                    Forum.log("forum thread: receiver account is active")
+                    let globalKey = try LabLiveSupport
+                        .optionalPermissionedCommitVerificationKey(
+                            environment: permissionedCommitKeyEnvironment
+                        )
+                    let consumer = try await Forum.oauthAwareHost(
+                        label: "consumer",
+                        url: LabLiveSupport.url(
+                            explicit: consumerURL,
+                            environment: "SWAN_LAB_CONSUMER_URL",
+                            fallback: "https://pds.test"
+                        ),
+                        auth: consumerAuth,
+                        tokenEnvironment: consumerTokenEnvironment,
+                        handleEnvironment: consumerHandleEnvironment,
+                        passwordEnvironment: consumerPasswordEnvironment,
+                        clientID: consumerClientID,
+                        redirectURI: consumerRedirectURI,
+                        scopes: Forum.scopes(
+                            requested: scope,
+                            space: parsedSpace,
+                            action: "read",
+                            collection: nil
+                        ),
+                        timeout: requestTimeoutSeconds
+                    ).host
+                    Forum.log("forum thread: consumer OAuth complete")
+                    let authority = try await LabLiveSupport.host(
+                        label: "authority",
+                        url: LabLiveSupport.url(
+                            explicit: authorityURL,
+                            environment: "SWAN_LAB_AUTHORITY_URL",
+                            fallback: "https://swan.test"
+                        ),
+                        auth: "none",
+                        tokenEnvironment: "SWAN_UNUSED",
+                        handleEnvironment: "SWAN_UNUSED",
+                        passwordEnvironment: "SWAN_UNUSED",
+                        clientID: "",
+                        redirectURI: "",
+                        scopes: ["atproto"],
+                        timeout: requestTimeoutSeconds,
+                        permissionedCommitVerificationKey: nil
+                    )
+                    Forum.log("forum thread: authority host ready")
+                    let plc = try Forum.plcClient(
+                        origin: plcOrigin,
+                        laboratory: plcLaboratory,
+                        allowlistedHost: plcLaboratoryAllowlistedHost
+                    )
+                    Forum.log("forum thread: opening receiver database")
+                    let database = try await SQLiteAccountDatabase(
+                        dataDirectory: dataURL,
+                        did: receiver,
+                        openMode: .existingManaged
+                    )
+                    Forum.log("forum thread: receiver database open")
+                    var writerStatuses: [ForumWriterStatus] = []
+                    var allRecords: [ForumRecord] = []
+                    var failedWriters: [String] = []
+                    do {
+                        Forum.log("forum thread: exchanging space credential")
+                        let credential = try await SpaceCredentialBroker(
+                            member: consumer.client,
+                            authority: authority.client
+                        ).exchange(
+                            space: parsedSpace,
+                            memberAuthorization: consumer.authorization,
+                            memberAuthorizationProvider: consumer.authorizationProvider
+                        )
+                        Forum.log("forum thread: space credential issued")
+                        guard !credential.isEmpty else {
+                            throw ValidationError("space credential exchange returned an empty credential")
+                        }
+                        let credentialAuthorization = InteropAuthorization.bearer(
+                            token: credential
+                        )
+                        Forum.log("forum thread: listing writers")
+                        let writers = try await Forum.listWriters(
+                            authority: authority,
+                            space: parsedSpace,
+                            authorization: credentialAuthorization,
+                            timeout: requestTimeoutSeconds
+                        )
+                        Forum.log("forum thread: writer set contains \(writers.count) writers")
+                        for writer in writers {
+                            Forum.log("forum thread: syncing writer \(writer)")
+                            let writerURL: URL
+                            do {
+                                writerURL = try await Forum.writerHost(
+                                    did: writer,
+                                    overrides: writerHosts,
+                                    plc: plc
+                                )
+                            } catch {
+                                failedWriters.append(writer)
+                                writerStatuses.append(ForumWriterStatus(
+                                    did: writer,
+                                    host: "<unresolved>",
+                                    outcome: "host_unresolved",
+                                    revision: nil,
+                                    commitment: nil,
+                                    recordCount: 0
+                                ))
+                                continue
+                            }
+                            let writerKey: PermissionedDataJWTVerificationKey
+                            if let overrideKey = writerHosts[writer]?.commitVerificationKey {
+                                writerKey = try LabLiveSupport.decodeCommitVerificationKey(overrideKey)
+                            } else if let globalKey {
+                                writerKey = globalKey
+                            } else {
+                                failedWriters.append(writer)
+                                writerStatuses.append(ForumWriterStatus(
+                                    did: writer,
+                                    host: writerURL.host ?? writerURL.absoluteString,
+                                    outcome: "commit_key_missing",
+                                    revision: nil,
+                                    commitment: nil,
+                                    recordCount: 0
+                                ))
+                                continue
+                            }
+                            let source = LiveInteropHost(
+                                label: "writer-\(writer)",
+                                client: try InteropXRPCClient(
+                                    baseURL: writerURL,
+                                    timeout: requestTimeoutSeconds,
+                                    additionalTrustRootFile: ProcessInfo
+                                        .processInfo.environment["SWAN_LAB_CA_CERT_FILE"]
+                                        .map { URL(fileURLWithPath: $0) }
+                                ),
+                                authorization: credentialAuthorization,
+                                permissionedCommitVerificationKey: writerKey
+                            )
+                            let target = try PermissionedRemoteReplicaTarget(
+                                receiverDID: receiver,
+                                space: parsedSpace,
+                                repositoryDID: writer
+                            )
+                            let requestID = "forum-\(UUID().uuidString.lowercased())"
+                            let applyAuthorized:
+                                PermissionedRemoteReplicaIncrementalHTTPOrchestrator
+                                .PublicationAuthorization = { operation in
+                                    Forum.log("forum thread: apply authorization opening control database")
+                                    let control = try await SQLiteControlDatabase(
+                                        dataDirectory: dataURL
+                                    )
+                                    do {
+                                        Forum.log("forum thread: apply authorization running operation")
+                                        let result = try await control
+                                            .withActiveAccountAuthorization(
+                                                did: receiver,
+                                                operation: operation
+                                            )
+                                        try await control.close()
+                                        Forum.log("forum thread: apply authorization completed")
+                                        return result
+                                    } catch {
+                                        try? await control.close()
+                                        throw error
+                                    }
+                                }
+                            let orchestrator =
+                                PermissionedRemoteReplicaIncrementalHTTPOrchestrator(
+                                    source: source,
+                                    store: database,
+                                    publicationAuthorization: applyAuthorized
+                                )
+                            let outcome:
+                                PermissionedRemoteReplicaIncrementalSyncOutcome
+                            do {
+                                outcome = try await orchestrator.synchronize(
+                                    target: target,
+                                    requestID: requestID,
+                                    requestSequence: 1,
+                                    appliedAt: Int64(Date().timeIntervalSince1970)
+                                )
+                            } catch {
+                                failedWriters.append(writer)
+                                writerStatuses.append(ForumWriterStatus(
+                                    did: writer,
+                                    host: writerURL.host ?? writerURL.absoluteString,
+                                    outcome: Forum.errorCode(error),
+                                    revision: nil,
+                                    commitment: nil,
+                                    recordCount: 0
+                                ))
+                                continue
+                            }
+                            var outcomeCode = outcome.code
+                            Forum.log("forum thread: sync outcome = \(outcomeCode)")
+                            if case .fullCARRecoveryRequired = outcome,
+                               fullCARRecovery {
+                                Forum.log("forum thread: full-CAR recovery starting for \(writer)")
+                                do {
+                                    try await Self.recoverWriter(
+                                        target: target,
+                                        requestID: requestID,
+                                        source: source,
+                                        receiver: receiver,
+                                        dataDirectory: dataURL,
+                                        database: database,
+                                        timeout: requestTimeoutSeconds
+                                    )
+                                    outcomeCode = "full_car_applied"
+                                } catch {
+                                    failedWriters.append(writer)
+                                    writerStatuses.append(ForumWriterStatus(
+                                        did: writer,
+                                        host: writerURL.host ?? writerURL.absoluteString,
+                                        outcome: "full_car_failed",
+                                        revision: nil,
+                                        commitment: nil,
+                                        recordCount: 0
+                                    ))
+                                    continue
+                                }
+                            }
+                            Forum.log("forum thread: reading replica head")
+                            let final = try await database
+                                .permissionedRemoteReplicaHead(target: target)
+                            Forum.log("forum thread: replica head read")
+                            let snapshots = try await database
+                                .permissionedRemoteReplicaRecords(target: target)
+                            Forum.log("forum thread: replica records read (\(snapshots.count))")
+                            var writerRecords: [ForumRecord] = []
+                            for snapshot in snapshots {
+                                guard snapshot.uri.collection == Forum.postCollection
+                                        || snapshot.uri.collection == Forum.replyCollection
+                                else { continue }
+                                writerRecords.append(
+                                    try ForumRecordDecoding.decode(
+                                        uri: snapshot.uri,
+                                        cid: snapshot.cid,
+                                        revision: 0,
+                                        value: snapshot.value
+                                    )
+                                )
+                            }
+                            allRecords.append(contentsOf: writerRecords)
+                            writerStatuses.append(ForumWriterStatus(
+                                did: writer,
+                                host: writerURL.host ?? writerURL.absoluteString,
+                                outcome: outcomeCode,
+                                revision: final?.wireRevision.toString(),
+                                commitment: final.map { Hex.encode($0.commitment) },
+                                recordCount: writerRecords.count
+                            ))
+                            Forum.log("forum thread: writer \(writer) synced (\(outcomeCode), \(writerRecords.count) records)")
+                        }
+                    } catch {
+                        try? await database.close()
+                        let thread = ForumThread(roots: [], unlinked: [])
+                        let artifact = ForumThreadArtifactBuilder.artifact(
+                            profileID: OfflineProtocolProfileVerifier.stableProfileID,
+                            space: parsedSpace.rawValue,
+                            status: "failed",
+                            errorCode: Forum.errorCode(error),
+                            writers: writerStatuses,
+                            thread: thread
+                        )
+                        try Forum.writeArtifact(artifact, to: URL(fileURLWithPath: output))
+                        print("FORUM THREAD ARTIFACT WRITTEN: \(URL(fileURLWithPath: output).path) status=failed")
+                        guard !failOnFailure else {
+                            throw ValidationError(
+                                "forum thread sync did not pass; inspect \(URL(fileURLWithPath: output).lastPathComponent)"
+                            )
+                        }
+                        return
+                    }
+                    try await database.close()
+                    let thread = ForumThreadMerger.merge(allRecords)
+                    let passed = failedWriters.isEmpty
+                    let artifact = ForumThreadArtifactBuilder.artifact(
+                        profileID: OfflineProtocolProfileVerifier.stableProfileID,
+                        space: parsedSpace.rawValue,
+                        status: passed ? "passed" : "failed",
+                        errorCode: failedWriters.isEmpty ? nil : "writer_sync_failed",
+                        writers: writerStatuses,
+                        thread: thread
+                    )
+                    let outputURL = URL(fileURLWithPath: output)
+                    try Forum.writeArtifact(artifact, to: outputURL)
+                    print("FORUM THREAD: \(thread.roots.count) roots, \(thread.replyCount) replies, \(thread.unlinked.count) unlinked")
+                    print(ForumThreadRender.render(thread))
+                    print("FORUM THREAD ARTIFACT WRITTEN: \(outputURL.path) status=\(artifact.status)")
+                    guard !failOnFailure || passed else {
+                        throw ValidationError(
+                            "forum thread sync did not pass; inspect \(outputURL.lastPathComponent)"
+                        )
+                    }
+                }
+
+                private static func recoverWriter(
+                    target: PermissionedRemoteReplicaTarget,
+                    requestID: String,
+                    source: LiveInteropHost,
+                    receiver: String,
+                    dataDirectory: URL,
+                    database: SQLiteAccountDatabase,
+                    timeout: Double
+                ) async throws {
+                    let limits = SpaceCARRecoveryLimits.standard
+                    let temporaryDirectory = FileManager.default
+                        .temporaryDirectory.appending(
+                            path: "swan-forum-recovery-\(UUID().uuidString)",
+                            directoryHint: .isDirectory
+                        )
+                    try FileManager.default.createDirectory(
+                        at: temporaryDirectory,
+                        withIntermediateDirectories: false,
+                        attributes: [.posixPermissions: 0o700]
+                    )
+                    defer {
+                        try? FileManager.default.removeItem(at: temporaryDirectory)
+                    }
+                    let spoolAdmission = try PublicRepositorySpoolAdmission(
+                        maximumGlobalBytes: limits.maximumCARBytes,
+                        maximumPerAccountBytes: limits.maximumCARBytes
+                    )
+                    let recoveryAuthorization:
+                        PermissionedRemoteReplicaRecoveryOrchestrator
+                        .PublicationAuthorization = { operation in
+                            let control = try await SQLiteControlDatabase(
+                                dataDirectory: dataDirectory
+                            )
+                            do {
+                                let result = try await control
+                                    .withActiveAccountAuthorization(
+                                        did: receiver,
+                                        operation: operation
+                                    )
+                                try await control.close()
+                                return result
+                            } catch {
+                                try? await control.close()
+                                throw error
+                            }
+                        }
+                    _ = try await LiveInteropRunner
+                        .recoverPermissionedRepository(
+                            target: target,
+                            requestID: "\(requestID)-full-car",
+                            sourceHost: source,
+                            receiverDatabase: database,
+                            expiresAt:
+                                Int64(Date().timeIntervalSince1970) + 300,
+                            temporaryDirectory: temporaryDirectory,
+                            spoolAdmission: spoolAdmission,
+                            limits: limits,
+                            publicationAuthorization: recoveryAuthorization,
+                            now: { Int64(Date().timeIntervalSince1970) }
+                        )
+                    _ = timeout
+                }
+            }
+
+            /// Builds the default OAuth scope set for a space action, allowing
+            /// operator overrides to replace it entirely.
+            private static func scopes(
+                requested: [String],
+                space: SpaceURI,
+                action: String,
+                collection: String?
+            ) -> [String] {
+                let normalized = requested.map {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                }.filter { !$0.isEmpty }
+                guard normalized.isEmpty else { return normalized }
+                var result = ["atproto"]
+                var scope = "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&action=\(action)"
+                if let collection {
+                    scope += "&collection=\(collection)"
+                }
+                result.append(scope)
+                return result
+            }
+
+            /// OAuth-authorized host creation that also surfaces the token
+            /// subject DID (needed as the `repo` for putRecord). Non-OAuth
+            /// auth reuses `LabLiveSupport.host` unchanged.
+            private static func oauthAwareHost(
+                label: String,
+                url: URL,
+                auth: String,
+                tokenEnvironment: String,
+                handleEnvironment: String,
+                passwordEnvironment: String,
+                clientID: String,
+                redirectURI: String,
+                scopes: [String],
+                timeout: Double
+            ) async throws -> (host: LiveInteropHost, subject: String?) {
+                let normalized = auth.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                guard normalized == "oauth" else {
+                    let host = try await LabLiveSupport.host(
+                        label: label,
+                        url: url,
+                        auth: normalized,
+                        tokenEnvironment: tokenEnvironment,
+                        handleEnvironment: handleEnvironment,
+                        passwordEnvironment: passwordEnvironment,
+                        clientID: clientID,
+                        redirectURI: redirectURI,
+                        scopes: scopes,
+                        timeout: timeout,
+                        permissionedCommitVerificationKey: nil
+                    )
+                    return (host, nil)
+                }
+                let handle = try LabLiveSupport.environmentValue(
+                    handleEnvironment,
+                    label: "OAuth handle"
+                )
+                let password = try LabLiveSupport.environmentValue(
+                    passwordEnvironment,
+                    label: "OAuth password"
+                )
+                let clientIDURL = try LabLiveSupport.requiredURL(
+                    clientID,
+                    label: "OAuth client metadata",
+                    allowQuery: true
+                )
+                let redirectURL = try LabLiveSupport.requiredURL(
+                    redirectURI,
+                    label: "OAuth redirect"
+                )
+                let requestedScopes = Set(scopes.map {
+                    $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                }.filter { !$0.isEmpty })
+                guard !requestedScopes.isEmpty else {
+                    throw ValidationError("OAuth scope must not be empty")
+                }
+                let additionalTrustRootFile = ProcessInfo.processInfo.environment[
+                    "SWAN_LAB_CA_CERT_FILE"
+                ].map { URL(fileURLWithPath: $0) }
+                let oauth = try SwanOAuthLabClient(
+                    issuer: url,
+                    clientID: clientIDURL,
+                    redirectURI: redirectURL,
+                    timeout: timeout,
+                    additionalTrustRootFile: additionalTrustRootFile
+                )
+                let token = try await oauth.authorizationCode(
+                    handle: handle,
+                    password: password,
+                    scopes: requestedScopes
+                )
+                let provider = await oauth.authorizationProvider(for: token)
+                let host = LiveInteropHost(
+                    label: label,
+                    client: try InteropXRPCClient(
+                        baseURL: url,
+                        timeout: timeout,
+                        additionalTrustRootFile: additionalTrustRootFile
+                    ),
+                    authorizationProvider: provider
+                )
+                return (host, token.subject)
+            }
+
+            /// One explicit `--writer-host` override: the writer repo host URL
+            /// and an optional per-writer commit verification key.
+            private struct WriterHostOverride: Sendable, Equatable {
+                let url: URL
+                let commitVerificationKey: String?
+            }
+
+            /// Parses repeatable `did=url` writer-host overrides. Each value
+            /// may optionally carry a per-writer repository commit
+            /// verification key as a `:did:key:z...` suffix, which overrides
+            /// the global SWAN_LAB_PERMISSIONED_COMMIT_KEY for that writer.
+            private static func writerHostMap(
+                _ values: [String]
+            ) throws -> [String: WriterHostOverride] {
+                var result: [String: WriterHostOverride] = [:]
+                for raw in values {
+                    let pieces = raw.split(
+                        separator: "=",
+                        maxSplits: 1,
+                        omittingEmptySubsequences: false
+                    )
+                    guard pieces.count == 2 else {
+                        throw ValidationError("--writer-host values must use did=url[:did:key:z...]")
+                    }
+                    let did = String(pieces[0])
+                    let canonical: String
+                    do { canonical = try AccountIdentifiers.validateDID(did) }
+                    catch { throw ValidationError("--writer-host DID is not canonical") }
+                    guard result[canonical] == nil else {
+                        throw ValidationError("--writer-host contains a duplicate DID")
+                    }
+                    let value = String(pieces[1])
+                    let override: WriterHostOverride
+                    if let keyRange = value.range(
+                        of: ":did:key:z",
+                        options: .backwards
+                    ) {
+                        let urlString = String(value[..<keyRange.lowerBound])
+                        let keyString = String(value[keyRange.lowerBound...].dropFirst())
+                        guard let url = try? LabLiveSupport.requiredURL(
+                            urlString,
+                            label: "writer host"
+                        ), (try? LabLiveSupport.decodeCommitVerificationKey(keyString)) != nil else {
+                            throw ValidationError(
+                                "--writer-host contains an invalid URL or commit key"
+                            )
+                        }
+                        override = WriterHostOverride(
+                            url: url,
+                            commitVerificationKey: keyString
+                        )
+                    } else {
+                        guard let url = try? LabLiveSupport.requiredURL(
+                            value,
+                            label: "writer host"
+                        ) else {
+                            throw ValidationError("--writer-host contains an invalid URL")
+                        }
+                        override = WriterHostOverride(
+                            url: url,
+                            commitVerificationKey: nil
+                        )
+                    }
+                    result[canonical] = override
+                }
+                return result
+            }
+
+            private static func plcClient(
+                origin: String,
+                laboratory: Bool,
+                allowlistedHost: String?
+            ) throws -> (any PLCClient)? {
+                guard let originURL = URL(string: origin) else {
+                    throw ValidationError("--plc-origin must be a URL")
+                }
+                let configuration: PLCClientConfiguration
+                do {
+                    if laboratory {
+                        configuration = try .laboratory(
+                            origin: originURL,
+                            allowlistedHost: allowlistedHost
+                        )
+                    } else {
+                        guard allowlistedHost == nil else {
+                            throw ValidationError(
+                                "--plc-laboratory-allowlisted-host requires --plc-laboratory"
+                            )
+                        }
+                        configuration = try .production(origin: originURL)
+                    }
+                    return try PLCDirectoryClient(configuration: configuration)
+                } catch let error as ValidationError {
+                    throw error
+                } catch {
+                    throw ValidationError("--plc-origin is not an allowed PLC origin")
+                }
+            }
+
+            /// Resolves one writer's repo host: explicit override first, then
+            /// the writer DID's `#atproto_pds` service endpoint from PLC.
+            private static func writerHost(
+                did: String,
+                overrides: [String: WriterHostOverride],
+                plc: (any PLCClient)?
+            ) async throws -> URL {
+                if let override = overrides[did] {
+                    return override.url
+                }
+                guard let plc else {
+                    throw SwanError.unavailable(
+                        "writer host for \(did) requires a PLC origin or --writer-host override"
+                    )
+                }
+                let state: PLCDocumentData
+                do {
+                    state = try await plc.fetchState(did: did)
+                } catch {
+                    throw SwanError.unavailable(
+                        "writer host for \(did) could not be resolved from PLC"
+                    )
+                }
+                guard state.did == did,
+                      let endpoint = state.services["atproto_pds"]?.endpoint,
+                      let url = try? LabLiveSupport.requiredURL(
+                        endpoint,
+                        label: "writer host"
+                      ) else {
+                    throw SwanError.unavailable(
+                        "writer host for \(did) is missing its atproto_pds service"
+                    )
+                }
+                return url
+            }
+
+            /// Pages `com.atproto.space.listRepos` at the authority with the
+            /// space credential and returns the writer DID set.
+            private static func listWriters(
+                authority: LiveInteropHost,
+                space: SpaceURI,
+                authorization: InteropAuthorization,
+                timeout: Double
+            ) async throws -> [String] {
+                _ = timeout
+                var writers: [String] = []
+                var cursor: String?
+                while true {
+                    var query = [
+                        "space": space.rawValue,
+                        "limit": "100",
+                    ]
+                    if let cursor { query["cursor"] = cursor }
+                    let response = try await authority.client.query(
+                        "com.atproto.space.listRepos",
+                        query: query,
+                        authorization: authorization
+                    )
+                    guard (200 ... 299).contains(response.status),
+                          response.header("content-type")?.lowercased()
+                            .contains("json") == true else {
+                        throw InteropHTTPError.unexpectedStatus(response.status)
+                    }
+                    let output = try StrictJSON.decode(
+                        ForumListReposResponse.self,
+                        from: response.body
+                    )
+                    for repo in output.repos {
+                        let did: String
+                        do { did = try AccountIdentifiers.validateDID(repo.did) }
+                        catch {
+                            throw ValidationError("listRepos returned a non-canonical writer DID")
+                        }
+                        if !writers.contains(did) { writers.append(did) }
+                    }
+                    guard let next = output.cursor, !next.isEmpty else { break }
+                    cursor = next
+                }
+                return writers
+            }
+
+            private static func requireActiveManagedAccount(
+                did: String,
+                dataDirectory: URL
+            ) async throws {
+                let control = try await SQLiteControlDatabase(
+                    dataDirectory: dataDirectory
+                )
+                do {
+                    guard let account = try await control.account(did: did) else {
+                        throw ValidationError(
+                            "receiver account is not managed by this Swan data directory"
+                        )
+                    }
+                    guard account.status.authorizesAccount else {
+                        throw ValidationError("receiver account is not active")
+                    }
+                    try await control.close()
+                } catch {
+                    try? await control.close()
+                    throw error
+                }
+            }
+
+            /// Emits one bounded stage marker on stderr. The thread syncer is
+            /// a lab diagnostic surface; its stdout stays clean for the
+            /// rendered thread and sanitized artifact.
+            private static func log(_ message: String) {
+                FileHandle.standardError.write(Data(("[forum] \(message)\n").utf8))
+            }
+
+            private static func writeArtifact(
+                _ artifact: ForumThreadArtifact,
+                to outputURL: URL
+            ) throws {
+                try FileManager.default.createDirectory(
+                    at: outputURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+                try encoder.encode(artifact).write(to: outputURL, options: .atomic)
+                try FileManager.default.setAttributes(
+                    [.posixPermissions: 0o600],
+                    ofItemAtPath: outputURL.path
+                )
+            }
+
+            private static func currentTimestamp() -> String {
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime]
+                return formatter.string(from: Date())
+            }
+
+            private static func responseErrorCode(
+                _ response: InteropHTTPResponse
+            ) -> String? {
+                guard let object = try? JSONSerialization.jsonObject(
+                    with: response.body
+                ) as? [String: Any] else { return nil }
+                return object["error"] as? String
+            }
+
+            private static func errorCode(_ error: Error) -> String {
+                if let error = error as? InteropHTTPError {
+                    switch error {
+                    case .invalidURL: return "InvalidURL"
+                    case .responseTooLarge: return "ResponseTooLarge"
+                    case .unexpectedRedirect: return "UnexpectedRedirect"
+                    case .unexpectedContentType: return "UnexpectedContentType"
+                    case let .unexpectedStatus(status): return "HTTP\(status)"
+                    case .transportFailure: return "TransportFailure"
+                    case .fileFailure: return "FileFailure"
+                    }
+                }
+                if let error = error as? ValidationError {
+                    return "InvalidRequest"
+                }
+                if let error = error as? SpaceCARStreamingError {
+                    return "CARStreamingFailure"
+                }
+                return "InteropFailure"
+            }
+        }
+
         struct Matrix: AsyncParsableCommand {
             static let configuration = CommandConfiguration(
                 abstract: "Run multiple interoperability fault modes and write one sanitized artifact per mode"
             )
-
             @Option(name: .long, help: "Scenario identifier (letters, numbers, hyphen, and underscore only)")
             var name: String = "reference-matrix"
 
@@ -5534,7 +6703,27 @@ private enum LabLiveSupport {
     static func permissionedCommitVerificationKey(
         environment: String
     ) throws -> PermissionedDataJWTVerificationKey {
-        let configured = try environmentValue(environment, label: "permissioned commit public key")
+        try decodeCommitVerificationKey(
+            environmentValue(environment, label: "permissioned commit public key")
+        )
+    }
+
+    /// Reads the same environment variable as `permissionedCommitVerificationKey`
+    /// but treats an absent value as an explicit "no global key" choice, so
+    /// per-writer override keys can be the only configured keys.
+    static func optionalPermissionedCommitVerificationKey(
+        environment: String
+    ) throws -> PermissionedDataJWTVerificationKey? {
+        guard let configured = ProcessInfo.processInfo.environment[environment],
+              !configured.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return try decodeCommitVerificationKey(configured)
+    }
+
+    static func decodeCommitVerificationKey(
+        _ configured: String
+    ) throws -> PermissionedDataJWTVerificationKey {
         // Interop runners may supply the repository's canonical PLC
         // verification method directly.  Decode the multicodec before the
         // legacy base64 forms so curve selection remains bound to the
@@ -5726,6 +6915,63 @@ private struct AnyEncodable: Encodable {
 
     func encode(to encoder: Encoder) throws {
         try encodeValue(encoder)
+    }
+}
+
+/// Minimal wire shapes for the forum commands. The space layer is
+/// collection-agnostic and these endpoints are already covered by the
+/// profile-pinned generated client; these local decoders are intentionally
+/// limited to the fields the forum CLI needs so the `swan` executable does
+/// not need a direct dependency on the generated wire module.
+private struct ForumPutRecordResponse: Decodable {
+    let uri: String
+    let cid: String
+}
+
+private struct ForumListReposResponse: Decodable {
+    struct Repo: Decodable {
+        let did: String
+    }
+
+    let cursor: String?
+    let repos: [Repo]
+}
+
+/// Sanitized artifact for one `forum post` write. Contains only the space,
+/// repository DID, collection, key, and returned URI/CID; never credentials,
+/// tokens, or DPoP proofs.
+private struct ForumPostArtifact: Encodable {
+    let profileID: String
+    let space: String
+    let repositoryDID: String
+    let collection: String
+    let rkey: String
+    let uri: String?
+    let cid: String?
+    let status: String
+    let errorCode: String?
+    let fixturePolicy: String
+
+    init(
+        space: String,
+        repositoryDID: String,
+        collection: String,
+        rkey: String,
+        uri: String?,
+        cid: String?,
+        status: String,
+        errorCode: String?
+    ) {
+        profileID = OfflineProtocolProfileVerifier.stableProfileID
+        self.space = space
+        self.repositoryDID = repositoryDID
+        self.collection = collection
+        self.rkey = rkey
+        self.uri = uri
+        self.cid = cid
+        self.status = status
+        self.errorCode = errorCode
+        fixturePolicy = "counts, DIDs, CIDs, and record keys only; no credentials, tokens, or DPoP proofs"
     }
 }
 

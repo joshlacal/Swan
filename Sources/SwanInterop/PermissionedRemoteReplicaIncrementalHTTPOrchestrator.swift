@@ -51,6 +51,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
         requestSequence: UInt64,
         appliedAt: Int64
     ) async throws -> PermissionedRemoteReplicaIncrementalSyncOutcome {
+        Self.stageLog("synchronize start for \(target.repositoryDID)")
         guard let key = source.permissionedCommitVerificationKey else {
             throw InteropHTTPError.transportFailure
         }
@@ -58,11 +59,13 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
             .permissionedRemoteReplicaIncrementalBaseState(target: target) else {
             return .fullCARRecoveryRequired
         }
+        Self.stageLog("incremental base state loaded")
 
         let page = try await listRepoOps(
             target: target,
             since: base.head.wireRevision.toString()
         )
+        Self.stageLog("listRepoOps response received")
         let output: ComAtprotoSpaceListRepoOps.Output
         switch page {
         case .fullRecoveryRequired:
@@ -104,6 +107,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
                 target: target,
                 verificationKey: key
             )
+            Self.stageLog("getLatestCommit verified")
 
             if operations.isEmpty {
                 let page = try PermissionedRemoteReplicaIncrementalVerifier
@@ -131,6 +135,7 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
                     target: target,
                     verificationKey: key
                 )
+            Self.stageLog("incremental interval verified (\(verified.operations.count) operations)")
             try PermissionedRemoteReplicaIncrementalVerifier.requireSameHead(
                 verified.freshnessWitness, latest
             )
@@ -152,10 +157,13 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
                 requestDigest: digest
             )
             return map(try await publicationAuthorization {
-                try await store.applyVerifiedPermissionedRemoteReplicaBatch(
+                Self.stageLog("durable apply starting")
+                let outcome = try await store.applyVerifiedPermissionedRemoteReplicaBatch(
                     batch,
                     appliedAt: appliedAt
                 )
+                Self.stageLog("durable apply completed")
+                return outcome
             })
     }
 
@@ -276,5 +284,15 @@ public struct PermissionedRemoteReplicaIncrementalHTTPOrchestrator: Sendable {
         case .integrityFailure: .integrityFailure
         case .fullCARRecoveryRequired: .fullCARRecoveryRequired
         }
+    }
+
+    /// Emits one bounded stage marker on stderr when the operator enables
+    /// `SWAN_SYNC_STAGE_LOG=1`. The stateful matrix and `lab live` keep this
+    /// off by default so their sanitized output shape never changes.
+    private static func stageLog(_ message: String) {
+        guard ProcessInfo.processInfo.environment["SWAN_SYNC_STAGE_LOG"] == "1" else {
+            return
+        }
+        FileHandle.standardError.write(Data(("[sync] \(message)\n").utf8))
     }
 }

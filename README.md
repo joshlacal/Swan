@@ -416,3 +416,87 @@ when available and otherwise macOS `shasum -a 256`.
 `Swan` never places permissioned records into a public repository, public blob
 namespace, log line, or fixture. Permissioned data is access-controlled, not
 end-to-end encrypted; a hosting PDS remains in the trust boundary.
+
+## Forum test vehicle
+
+`swan lab forum` is a deliberately minimal, deliberately ugly CLI test vehicle
+for the full permissioned-data social flow: a space authority, multiple
+per-user permissioned repositories on mixed hosts, and one syncer that merges
+them into a single thread. There is no UI, no branding, and no new lexicon: the
+forum space type is `blue.catbird.lab.forum`, records are plain
+`blue.catbird.lab.post` / `blue.catbird.lab.reply` collection names, and the
+space layer treats them as opaque values.
+
+### provision
+
+Create the space on an authority and add a member (reuses the
+`lab live --provision-space` mechanics):
+
+```sh
+export SWAN_LAB_AUTHORITY_HANDLE=...
+export SWAN_LAB_AUTHORITY_PASSWORD=...
+swift run swan lab forum provision \
+  --authority-url https://swan.test \
+  --space at://did:plc:.../space/blue.catbird.lab.forum/lab-1 \
+  --member-did did:plc:...
+```
+
+### post
+
+Write one record into the caller's own permissioned repository with OAuth
+space-create scope (the read-only space credential is never a write
+capability):
+
+```sh
+export SWAN_LAB_PRODUCER_HANDLE=...
+export SWAN_LAB_PRODUCER_PASSWORD=...
+swift run swan lab forum post \
+  --producer-url https://pds.test \
+  --space at://did:plc:.../space/blue.catbird.lab.forum/lab-1 \
+  --text "hello forum" \
+  --reply-to at://did:plc:.../space/blue.catbird.lab.forum/lab-1/did:plc:.../blue.catbird.lab.post/2222222222222
+```
+
+`--rkey` defaults to a fresh sortable TID; `--collection` defaults to
+`blue.catbird.lab.post`. A reply is stored as `reply: {root, parent}` like
+`app.bsky.feed.post`, with `--reply-root` defaulting to `--reply-to`. The
+written repository DID is the OAuth subject (or `--repo` with bearer auth).
+
+### thread (the syncer)
+
+Acting as a consumer (e.g. Carol), the syncer mints one delegation token at
+the consumer's PDS, exchanges it at the authority for ONE space credential
+(delegation tokens are short-lived and single-use), and discovers the writer
+set via `com.atproto.space.listRepos`. For each writer repo it fetches,
+verifies (signed commit + LtHash commitment), and durably applies the
+incremental ops with that same credential at the writer's own host, falling
+back to verified full-CAR recovery when incremental history is unavailable.
+Writer hosts are resolved from each writer DID's `#atproto_pds` PLC service
+endpoint (or an explicit `--writer-host did=url` override). The global
+`SWAN_LAB_PERMISSIONED_COMMIT_KEY` verifies every writer repo's signed commit;
+when writers use different repository signing keys, give each writer its own
+key as a `--writer-host did=url:did:key:z...` suffix (canonical PLC
+verification method), which overrides the global key for that writer. Finally
+it reads
+every record for the space from the durable receiver store, merges them into
+one thread, prints the thread as plain text, and writes a sanitized artifact
+(`--output`, mode 0600) containing counts, DIDs, CIDs, and post text only.
+
+```sh
+export SWAN_LAB_CONSUMER_HANDLE=...
+export SWAN_LAB_CONSUMER_PASSWORD=...
+export SWAN_LAB_PERMISSIONED_COMMIT_KEY=...   # base64url secp256k1 writer key
+swift run swan lab forum thread \
+  --consumer-url https://pds.test \
+  --authority-url https://swan.test \
+  --space at://did:plc:.../space/blue.catbird.lab.forum/lab-1 \
+  --receiver-did did:plc:... \
+  --data-directory .swan-data
+```
+
+Thread-merge semantics (pure `ForumThreadMerger`): a record whose `reply.root`
+is nil or points to itself is a root; every other record attaches under its
+`reply.parent`; a reply whose parent record is absent lands in the `unlinked`
+section (the orphaned-reply rule); roots and siblings are ordered by record
+time (`createdAt`, else the rkey TID timestamp), then revision, then URI;
+records from different writer DIDs merge into the same tree.
