@@ -71,6 +71,24 @@ private struct SQLiteStagedPublicRepositoryProjectionSink: PublicRepositoryReach
     }
 }
 
+/// Replay validation needs only bounded scalar counts. It deliberately does
+/// not retain the reachable MST or record identifiers in Swift collections;
+/// repository truth remains in SQLite and each decoded block can be released
+/// as soon as it has been checked.
+private struct DiscardingPublicRepositoryProjectionSink:
+    PublicRepositoryReachableProjectionSink
+{
+    func recordReachableBlock(
+        cid _: CID,
+        kind _: PublicRepositoryReachableBlockKind
+    ) async throws {}
+
+    func recordRepositoryIndex(
+        path _: PublicRepositoryPath,
+        recordCID _: CID
+    ) async throws {}
+}
+
 /// The publication transaction must not turn a verified CAR into one large
 /// Swift object graph.  SQLiteNIO's `query` API returns an array, so all
 /// staging projections are read in small keyset pages and folded into scalar
@@ -1128,14 +1146,15 @@ extension SQLiteAccountDatabase: PublicRepositoryImportStagingStore {
                 throw PublicRepositoryImportStagingError.corruptRepository
             }
             try PublicRepositoryCID.validate(dataCID, blockBytes: dataBytes)
-            let repository = try await RepositoryMSTValidation.validate(
+            let projection = try await RepositoryMSTValidation.validateProjection(
                 rootCID: dataCID,
                 blocks: SQLitePublicRepositoryBlockSource(connection: connection),
+                projection: DiscardingPublicRepositoryProjectionSink(),
                 limits: try expectedBinding.policy.limits
             )
-            guard repository.leaves.count == recordCount,
-                  repository.reachableMSTBlocks.count
-                    + repository.reachableRecordCIDs.count + 1 == reachableBlockCount
+            guard projection.recordCount == recordCount,
+                  projection.mstBlockCount
+                    + projection.recordBlockCount + 1 == reachableBlockCount
             else {
                 throw PublicRepositoryImportStagingError.corruptRepository
             }

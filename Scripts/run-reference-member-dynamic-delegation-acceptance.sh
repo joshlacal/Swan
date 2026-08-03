@@ -885,17 +885,10 @@ PY
             --permissioned-commit-key-env SWAN_LAB_PERMISSIONED_COMMIT_KEY \
             --output /tmp/corruption-recovery.json \
             >/tmp/corruption-recovery.log 2>&1
-          snapshot_head "$1" "$2" "$3" "$4" "$5" "$6" /tmp/after-fault-head.json
-          cp /tmp/after-fault-head.json /tmp/after-heal-head.json
-          cp /tmp/after-fault-head.json /tmp/intended-head.json
-          cp /tmp/after-fault-head.json /tmp/before-head.json
-          if python3 - /tmp/corruption-recovery.json <<'PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as handle:
-    artifact = json.load(handle)
-if artifact.get("status") != "passed" or artifact.get("corruptionRejected") is not True or artifact.get("lastValidHeadPreserved") is not True:
-    raise SystemExit(1)
-PY
+          if /usr/local/bin/swan-project-corruption-recovery-witness \
+            /tmp/corruption-recovery.json \
+            /tmp/before-head.json /tmp/intended-head.json \
+            /tmp/after-fault-head.json /tmp/after-heal-head.json
           then invalid_delivery_rejected=true; fi
           fault_observed=true
           ;;

@@ -207,7 +207,20 @@ final class SwanHTTPTests: XCTestCase {
         XCTAssertThrowsError(try SwanManagementHTTPConfiguration(bindAddressLiteral: "0.0.0.0", port: 3001))
         XCTAssertThrowsError(try SwanManagementHTTPConfiguration(bindAddressLiteral: "::", port: 3001))
         XCTAssertThrowsError(try SwanManagementHTTPConfiguration(bindAddressLiteral: "127.0.0.1", port: 0))
-        XCTAssertNoThrow(try SwanManagementHTTPConfiguration(bindAddressLiteral: "127.0.0.1", port: 3001))
+        XCTAssertThrowsError(try SwanManagementHTTPConfiguration(
+            bindAddressLiteral: "127.0.0.1", port: 3001,
+            maximumConnections: 0
+        ))
+        XCTAssertThrowsError(try SwanManagementHTTPConfiguration(
+            bindAddressLiteral: "127.0.0.1", port: 3001,
+            idleTimeoutSeconds: 0
+        ))
+        let configuration = try SwanManagementHTTPConfiguration(
+            bindAddressLiteral: "127.0.0.1", port: 3001,
+            maximumConnections: 17, idleTimeoutSeconds: 9
+        )
+        XCTAssertEqual(configuration.maximumConnections, 17)
+        XCTAssertEqual(configuration.idleTimeoutSeconds, 9)
         XCTAssertFalse(SwanManagementPeerPolicy.permits(nil))
         XCTAssertFalse(try SwanManagementPeerPolicy.permits(SocketAddress(ipAddress: "127.0.0.2", port: 1)))
         XCTAssertTrue(try SwanManagementPeerPolicy.permits(SocketAddress(ipAddress: "127.0.0.1", port: 1)))
@@ -402,6 +415,50 @@ final class SwanHTTPTests: XCTestCase {
                     XCTAssertEqual(try Self.status(from: response.body), "deactivated")
                 }
             }
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
+    func testAuthenticatedManagementWorkIsIsolatedFromRejectedBodyDrainSaturation() async throws {
+        let authenticatedAdmission = try PublicRepositoryJSONWriteAdmission(
+            maximumConcurrentWrites: 1,
+            maximumReservedRequestBytes: SwanManagementHTTPServer.maximumJSONBytes
+        )
+        let rejectedAdmission = try PublicRepositoryJSONWriteAdmission(
+            maximumConcurrentWrites: 1,
+            maximumReservedRequestBytes: SwanManagementHTTPServer.maximumJSONBytes
+        )
+        let heldRejectedLease = try XCTUnwrap(rejectedAdmission.reserve(
+            maximumRequestBytes: SwanManagementHTTPServer.maximumJSONBytes
+        ))
+        defer { heldRejectedLease.release() }
+
+        let fixture = try await makeManagementServer(
+            jsonWriteAdmission: authenticatedAdmission,
+            rejectedBodyAdmission: rejectedAdmission
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let app = fixture.server.buildApplication(
+                logger: Logger(label: "SwanManagementRejectedDrainIsolationTests")
+            )
+            try await app.test(.live) { client in
+                try await client.execute(
+                    uri: "/v1/accounts/deactivate",
+                    method: .post,
+                    headers: Self.jsonBearerHeaders("operator-secret"),
+                    body: ByteBuffer(
+                        string: #"{"did":"did:plc:abcdefghijklmnopqrstuvwx"}"#
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            XCTAssertEqual(authenticatedAdmission.snapshot.activeLeases, 0)
+            XCTAssertEqual(rejectedAdmission.snapshot.activeLeases, 1)
             try await fixture.control.close()
         } catch {
             try? await fixture.control.close()
@@ -674,7 +731,9 @@ final class SwanHTTPTests: XCTestCase {
     private func makeManagementServer(
         plcProvisioning: (any SwanManagementPLCProvisioning)? = nil,
         permanentDeletionCoordinator:
-            (any AccountPermanentDeletionCoordinating)? = nil
+            (any AccountPermanentDeletionCoordinating)? = nil,
+        jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .managementProcessShared,
+        rejectedBodyAdmission: PublicRepositoryJSONWriteAdmission = .managementRejectedProcessShared
     ) async throws -> (server: SwanManagementHTTPServer, control: SQLiteControlDatabase, root: URL) {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "SwanManagementHTTPTests-\(UUID().uuidString)")
@@ -701,7 +760,9 @@ final class SwanHTTPTests: XCTestCase {
                 operatorSecretVerifier: verifier,
                 plcProvisioning: plcProvisioning,
                 permanentDeletionCoordinator:
-                    permanentDeletionCoordinator
+                    permanentDeletionCoordinator,
+                jsonWriteAdmission: jsonWriteAdmission,
+                rejectedBodyAdmission: rejectedBodyAdmission
             ), control, root)
         } catch {
             try? await control.close()

@@ -188,6 +188,27 @@ final class LabCLITests: XCTestCase {
         )
     }
 
+    func testLabStatefulFaultMatrixRejectsSymlinkWitnessInput() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let target = directory.appending(path: "target.json")
+        let symlink = directory.appending(path: "witnesses.json")
+        try Data(#"{"scenario":"invalid","cells":[]}"#.utf8).write(to: target)
+        try FileManager.default.createSymbolicLink(
+            at: symlink,
+            withDestinationURL: target
+        )
+        let result = try runCLI(command: [
+            "stateful-fault-matrix",
+            "--input", symlink.path,
+            "--output", directory.appending(path: "matrix.json").path,
+        ])
+        XCTAssertNotEqual(result.status, 0)
+        let combined = String(decoding: result.stdout, as: UTF8.self)
+            + String(decoding: result.stderr, as: UTF8.self)
+        XCTAssertTrue(combined.contains("regular file"), combined)
+    }
+
     func testLabMatrixCommandWritesOneArtifactPerMode() throws {
         let outputDirectory = try temporaryDirectory().appending(path: "artifacts")
         try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
@@ -569,10 +590,9 @@ final class LabCLITests: XCTestCase {
             }
             return executable
         }
-        // SwiftPM may place a scratch build under an arbitrary directory while
-        // an older default `.build` product is still present.  Resolve the
-        // product built beside this test bundle before considering that legacy
-        // fallback so the suite cannot silently exercise stale CLI code.
+        // Only the product built beside this exact test bundle is eligible.
+        // A package-root `.build/debug/swan` may belong to another scratch
+        // build or source revision and must never be used as fallback evidence.
         let coBuiltExecutable = Bundle(for: LabCLITests.self)
             .bundleURL
             .deletingLastPathComponent()
@@ -582,15 +602,9 @@ final class LabCLITests: XCTestCase {
         ) {
             return coBuiltExecutable
         }
-        let packageRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let executable = packageRoot.appending(path: ".build/debug/swan")
-        guard FileManager.default.fileExists(atPath: executable.path) else {
-            throw XCTSkip("swan executable not built at expected path")
-        }
-        return executable
+        throw XCTSkip(
+            "co-built swan executable is unavailable; set SWAN_TEST_EXECUTABLE explicitly"
+        )
     }
 
     private func repoRoot() -> URL {

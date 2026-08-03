@@ -430,6 +430,15 @@ public final class PublicRepositoryJSONWriteAdmission: @unchecked Sendable {
     /// suspension, account lifecycle, and other authenticated operator work.
     public static let managementProcessShared = try! PublicRepositoryJSONWriteAdmission()
 
+    /// Separate, deliberately small capacity for draining unauthorized
+    /// management request bodies. An unauthenticated slow body can consume
+    /// this pool, but it cannot reserve the pool used after operator-secret
+    /// authentication succeeds.
+    public static let managementRejectedProcessShared = try! PublicRepositoryJSONWriteAdmission(
+        maximumConcurrentWrites: 2,
+        maximumReservedRequestBytes: 2 * 8 * 1_024
+    )
+
     private let maximumConcurrentWrites: Int
     private let maximumReservedRequestBytes: Int
     private let lock = NSLock()

@@ -1027,6 +1027,56 @@ private func readOAuthServerKeyFile(_ url: URL) throws -> Data {
     }
 }
 
+/// Opens and validates one pathname exactly once, then performs the bounded
+/// read through that descriptor. `O_NOFOLLOW` prevents a symlink swap from
+/// turning the preflight check into authority to read a different file.
+private func readBoundedRegularFileNoFollow(
+    _ url: URL,
+    maximumBytes: Int,
+    validationMessage: String
+) throws -> Data {
+    guard maximumBytes > 0 else { throw ValidationError(validationMessage) }
+    let descriptor = url.withUnsafeFileSystemRepresentation { path in
+        guard let path else { return Int32(-1) }
+        return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+    }
+    guard descriptor >= 0 else { throw ValidationError(validationMessage) }
+    defer { _ = close(descriptor) }
+
+    var metadata = stat()
+    guard fstat(descriptor, &metadata) == 0,
+          (metadata.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+          metadata.st_size > 0,
+          metadata.st_size <= off_t(maximumBytes) else {
+        throw ValidationError(validationMessage)
+    }
+
+    var data = Data()
+    data.reserveCapacity(min(Int(metadata.st_size), maximumBytes))
+    var buffer = [UInt8](repeating: 0, count: min(64 * 1_024, maximumBytes + 1))
+    while data.count <= maximumBytes {
+        let allowed = min(buffer.count, maximumBytes + 1 - data.count)
+        let count = buffer.withUnsafeMutableBytes { bytes -> Int in
+            while true {
+                #if canImport(Darwin)
+                let result = Darwin.read(descriptor, bytes.baseAddress!, allowed)
+                #else
+                let result = Glibc.read(descriptor, bytes.baseAddress!, allowed)
+                #endif
+                if result < 0, errno == EINTR { continue }
+                return result
+            }
+        }
+        guard count >= 0 else { throw ValidationError(validationMessage) }
+        if count == 0 { break }
+        data.append(contentsOf: buffer.prefix(count))
+    }
+    guard !data.isEmpty, data.count <= maximumBytes else {
+        throw ValidationError(validationMessage)
+    }
+    return data
+}
+
 @main
 struct SwanCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -4402,15 +4452,12 @@ extension SwanCommand {
 
             func run() throws {
                 let inputURL = URL(fileURLWithPath: input).standardizedFileURL
-                let attributes = try FileManager.default.attributesOfItem(
-                    atPath: inputURL.path
+                let raw = try readBoundedRegularFileNoFollow(
+                    inputURL,
+                    maximumBytes: 1024 * 1024,
+                    validationMessage:
+                        "stateful fault witness input must be a regular file no larger than 1 MiB"
                 )
-                guard (attributes[.type] as? FileAttributeType) == .typeRegular,
-                      let size = (attributes[.size] as? NSNumber)?.intValue,
-                      (1 ... 1024 * 1024).contains(size) else {
-                    throw ValidationError("stateful fault witness input must be a regular file no larger than 1 MiB")
-                }
-                let raw = try Data(contentsOf: inputURL, options: .mappedIfSafe)
                 let document: InputDocument
                 do {
                     document = try StrictJSON.decode(InputDocument.self, from: raw)

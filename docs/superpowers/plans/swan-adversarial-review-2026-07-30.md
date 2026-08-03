@@ -3158,3 +3158,46 @@ both Swan and reference PDS are healthy, the stock
 `MethodNotImplementedError` marker is present, and the external account-data
 volume remains unchanged. Qualified permissioned recovery evidence and the
 stock upstream implementation boundary therefore remain explicitly distinct.
+
+## 2026-08-03 final adversarial rereview and exact-current closure
+
+An exact-parent rereview of the prior agent-produced Task 43 remediation found
+two formal low-severity defects and six additional fail-closed or evidence-
+integrity defects. The resulting change isolates rejected management drains
+from authenticated admission, bounds management connections and idle time,
+streams import replay validation without rebuilding an MST object graph,
+requires exact logical-budget errors, removes the stale CLI executable
+fallback, and performs descriptor-anchored witness reads. Live-artifact
+validation now requires a passing root status and validates mode-specific
+fault witnesses rather than accepting status-only receipts.
+
+The corruption recovery cell no longer projects one snapshot into every head.
+It validates the sanitized recovery artifact, compares independently recorded
+replacement/final heads, and atomically writes the four strict witness files.
+Two live reruns found and closed harness packaging defects: the projector is
+installed in the runtime image, invoked through its installed absolute path,
+and safely replaces pre-existing baseline witness files. Both failures are
+retained as negative diagnostic evidence and were not counted as passing
+cells.
+
+The exact-current macOS ordinary suite passed every test product. The native
+Ubuntu ARM64 suite passed 1,061 XCTest cases with nine intentional opt-in skips
+and zero failures, followed by all four Swift Testing profile cases. All eight
+large-transfer gates passed on both platforms. Current mode-0600 receipts are:
+
+- `/private/tmp/swan-full-adversarial-remediation-v2-20260803.log`;
+- `/private/tmp/swan-linux-full-adversarial-remediation-v2-20260803.log`;
+- `/private/tmp/swan-heavy-adversarial-remediation-v3-20260803.log`; and
+- `/private/tmp/swan-linux-heavy-adversarial-remediation-v4-20260803.log`.
+
+The final recovery-qualified semantic matrix passed normal, offline,
+disconnected, delayed, duplicated, reordered, and corrupted cells with zero
+failed assertions. Its mode-0600 aggregate receipt is
+`/private/tmp/swan-stateful-cross-host-fault-matrix-adversarial-remediation-v3-20260803.json`.
+The stock reference image was then rebuilt and restored. The persistent Swan
+container is healthy on exact image
+`sha256:232268a3beaa67b77e48cd7ff8bfe88d467e721f1d170f4aca804445a4262232`,
+mounts the preserved `swan-alpha-current-20260801_swan-data-v3` volume, and the
+stock reference PDS is healthy. This closes the Swan Spaces Interoperability
+Alpha acceptance gates without broadening the explicitly deferred production
+PDS scope.

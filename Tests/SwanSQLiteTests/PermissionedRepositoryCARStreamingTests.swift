@@ -269,7 +269,16 @@ final class PermissionedRepositoryCARStreamingTests: XCTestCase {
                 staging: index
             )
             XCTFail("transactional logical byte recheck accepted understated metadata")
-        } catch {}
+        } catch let error as SQLiteRepositoryError {
+            XCTAssertEqual(
+                error,
+                .corruptDatabase(
+                    "portable restore logical byte budget is invalid"
+                )
+            )
+        } catch {
+            XCTFail("unexpected restore error: \(error)")
+        }
         let rejectedRestoreInventory =
             try await restoreDatabase.portableExportInventory()
         XCTAssertEqual(rejectedRestoreInventory.repositories, [])

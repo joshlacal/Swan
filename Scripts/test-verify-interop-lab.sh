@@ -323,6 +323,13 @@ mutate_and_require_rejection \
   'test -x /usr/local/bin/swan' \
   'Swan healthcheck must probe the live HTTP listener'
 
+rg -Fq -- \
+  'COPY Swan/Scripts/project-corruption-recovery-witness.py /usr/local/bin/swan-project-corruption-recovery-witness' \
+  Dockerfile || fail 'runtime image must install the corruption witness projector'
+rg -Fq -- '/usr/local/bin/swan-project-corruption-recovery-witness' \
+  Scripts/run-reference-member-dynamic-delegation-acceptance.sh \
+  || fail 'corruption recovery must invoke the installed witness projector'
+
 mutate_and_require_rejection \
   reference-pds-started-only \
   $'      reference-plc:\n        condition: service_healthy\n    healthcheck:' \

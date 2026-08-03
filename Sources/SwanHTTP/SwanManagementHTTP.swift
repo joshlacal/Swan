@@ -1,5 +1,6 @@
 import Foundation
 import Hummingbird
+import HummingbirdCore
 import Logging
 import NIOCore
 import SwanAccounts
@@ -17,6 +18,8 @@ public enum SwanManagementBindAddress: String, Sendable, Equatable {
 public enum SwanManagementHTTPConfigurationError: Error, Sendable, Equatable {
     case invalidBindAddress
     case invalidPort
+    case invalidMaximumConnections
+    case invalidIdleTimeout
 }
 
 /// Configuration for the *separate* loopback management application. This is
@@ -24,23 +27,48 @@ public enum SwanManagementHTTPConfigurationError: Error, Sendable, Equatable {
 public struct SwanManagementHTTPConfiguration: Sendable, Equatable {
     public let bindAddress: SwanManagementBindAddress
     public let port: Int
+    public let maximumConnections: Int
+    public let idleTimeoutSeconds: Int
 
-    public init(bindAddress: SwanManagementBindAddress, port: Int) throws {
+    public init(
+        bindAddress: SwanManagementBindAddress,
+        port: Int,
+        maximumConnections: Int = 32,
+        idleTimeoutSeconds: Int = 15
+    ) throws {
         guard (1 ... 65_535).contains(port) else {
             throw SwanManagementHTTPConfigurationError.invalidPort
         }
+        guard maximumConnections > 0 else {
+            throw SwanManagementHTTPConfigurationError.invalidMaximumConnections
+        }
+        guard idleTimeoutSeconds > 0 else {
+            throw SwanManagementHTTPConfigurationError.invalidIdleTimeout
+        }
         self.bindAddress = bindAddress
         self.port = port
+        self.maximumConnections = maximumConnections
+        self.idleTimeoutSeconds = idleTimeoutSeconds
     }
 
     /// This explicit literal parser is used by `swan serve`; accepting a
     /// `String` without this validation would make it too easy to accidentally
     /// bind an operator credential listener to a public interface.
-    public init(bindAddressLiteral: String, port: Int) throws {
+    public init(
+        bindAddressLiteral: String,
+        port: Int,
+        maximumConnections: Int = 32,
+        idleTimeoutSeconds: Int = 15
+    ) throws {
         guard let bindAddress = SwanManagementBindAddress(rawValue: bindAddressLiteral) else {
             throw SwanManagementHTTPConfigurationError.invalidBindAddress
         }
-        try self.init(bindAddress: bindAddress, port: port)
+        try self.init(
+            bindAddress: bindAddress,
+            port: port,
+            maximumConnections: maximumConnections,
+            idleTimeoutSeconds: idleTimeoutSeconds
+        )
     }
 }
 
@@ -102,6 +130,7 @@ public struct SwanManagementHTTPServer: Sendable {
     private let operatorSecretVerifier: OperatorSecretVerifier
     private let plcProvisioning: (any SwanManagementPLCProvisioning)?
     private let requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+    private let rejectedBodyAdmission: SwanRequestBodyAdmissionConfiguration
 
     public init(
         configuration: SwanManagementHTTPConfiguration,
@@ -111,6 +140,7 @@ public struct SwanManagementHTTPServer: Sendable {
         permanentDeletionCoordinator:
             (any AccountPermanentDeletionCoordinating)? = nil,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .managementProcessShared,
+        rejectedBodyAdmission: PublicRepositoryJSONWriteAdmission = .managementRejectedProcessShared,
         jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy = .productionDefault
     ) {
         self.configuration = configuration
@@ -125,6 +155,10 @@ public struct SwanManagementHTTPServer: Sendable {
             admission: jsonWriteAdmission,
             policy: jsonWriteBodyPolicy
         )
+        self.rejectedBodyAdmission = .init(
+            admission: rejectedBodyAdmission,
+            policy: jsonWriteBodyPolicy
+        )
     }
 
     /// The management router has its own request context and is never merged
@@ -135,6 +169,7 @@ public struct SwanManagementHTTPServer: Sendable {
         let verifier = operatorSecretVerifier
         let plcProvisioning = plcProvisioning
         let requestBodyAdmission = requestBodyAdmission
+        let rejectedBodyAdmission = rejectedBodyAdmission
 
         router.get("/v1/accounts") { request, context async -> Response in
             guard authorize(request: request, context: context, verifier: verifier) != nil else {
@@ -152,7 +187,7 @@ public struct SwanManagementHTTPServer: Sendable {
             guard let authorization = authorize(request: request, context: context, verifier: verifier) else {
                 if let failure = await drainManagementRejectedBody(
                     request, context: context,
-                    requestBodyAdmission: requestBodyAdmission
+                    requestBodyAdmission: rejectedBodyAdmission
                 ) { return failure }
                 return managementError(.unauthorized)
             }
@@ -171,7 +206,7 @@ public struct SwanManagementHTTPServer: Sendable {
             guard let authorization = authorize(request: request, context: context, verifier: verifier) else {
                 if let failure = await drainManagementRejectedBody(
                     request, context: context,
-                    requestBodyAdmission: requestBodyAdmission
+                    requestBodyAdmission: rejectedBodyAdmission
                 ) { return failure }
                 return managementError(.unauthorized)
             }
@@ -190,7 +225,7 @@ public struct SwanManagementHTTPServer: Sendable {
             guard let authorization = authorize(request: request, context: context, verifier: verifier) else {
                 if let failure = await drainManagementRejectedBody(
                     request, context: context,
-                    requestBodyAdmission: requestBodyAdmission
+                    requestBodyAdmission: rejectedBodyAdmission
                 ) { return failure }
                 return managementError(.unauthorized)
             }
@@ -215,7 +250,7 @@ public struct SwanManagementHTTPServer: Sendable {
                 guard authorize(request: request, context: context, verifier: verifier) != nil else {
                     if let failure = await drainManagementRejectedBody(
                         request, context: context,
-                        requestBodyAdmission: requestBodyAdmission
+                        requestBodyAdmission: rejectedBodyAdmission
                     ) { return failure }
                     return managementError(.unauthorized)
                 }
@@ -236,7 +271,7 @@ public struct SwanManagementHTTPServer: Sendable {
                 guard authorize(request: request, context: context, verifier: verifier) != nil else {
                     if let failure = await drainManagementRejectedBody(
                         request, context: context,
-                        requestBodyAdmission: requestBodyAdmission
+                        requestBodyAdmission: rejectedBodyAdmission
                     ) { return failure }
                     return managementError(.unauthorized)
                 }
@@ -272,19 +307,30 @@ public struct SwanManagementHTTPServer: Sendable {
     }
 
     public func buildApplication(logger: Logger) -> some ApplicationProtocol {
-        Application(
+        let applicationConfiguration = ApplicationConfiguration(
+            address: .hostname(
+                configuration.bindAddress.rawValue,
+                port: configuration.port
+            ),
+            serverName: "swan-management",
+            availableConnectionsDelegate: MaximumAvailableConnections(
+                configuration.maximumConnections,
+                logger: logger
+            )
+        )
+        return Application(
             router: buildRouter(),
             server: .http1(
                 configuration: .init(
                     additionalChannelHandlers: [SwanJSONWriteBodyDrainHandler(
                         timeout: requestBodyAdmission.policy.totalBodyTimeout + .milliseconds(50)
-                    )]
+                    )],
+                    idleTimeout: .seconds(
+                        Int64(configuration.idleTimeoutSeconds)
+                    )
                 )
             ),
-            configuration: .init(
-                address: .hostname(configuration.bindAddress.rawValue, port: configuration.port),
-                serverName: "swan-management"
-            ),
+            configuration: applicationConfiguration,
             logger: logger
         )
     }

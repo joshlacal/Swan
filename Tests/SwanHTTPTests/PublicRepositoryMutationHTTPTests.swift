@@ -1107,7 +1107,7 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
     ) async throws -> RealSocketDripResponse {
         let channel = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
             .connectTimeout(.seconds(2))
-            .connect(host: "127.0.0.1", port: port)
+            .connect(host: "localhost", port: port)
             .get()
         let asyncChannel = try await channel.eventLoop.submit {
             try NIOAsyncChannel<ByteBuffer, ByteBuffer>(
@@ -1189,7 +1189,7 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
     ) async throws -> RealSocketDripResponse {
         let channel = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
             .connectTimeout(.seconds(2))
-            .connect(host: "127.0.0.1", port: port)
+            .connect(host: "localhost", port: port)
             .get()
         let asyncChannel = try await channel.eventLoop.submit {
             try NIOAsyncChannel<ByteBuffer, ByteBuffer>(
@@ -1436,7 +1436,7 @@ func executeRealSocketIncompleteHTTPBody(
 ) async throws -> RealSocketDripResponse {
     let channel = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
         .connectTimeout(.seconds(2))
-        .connect(host: "127.0.0.1", port: port)
+        .connect(host: "localhost", port: port)
         .get()
     let asyncChannel = try await channel.eventLoop.submit {
         try NIOAsyncChannel<ByteBuffer, ByteBuffer>(wrappingChannelSynchronously: channel)
@@ -1494,7 +1494,7 @@ func executeUploadThenHealthOnSameConnection(
     body: String
 ) async throws -> (first: RealSocketDripResponse, next: RealSocketDripResponse) {
     let channel = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
-        .connectTimeout(.seconds(2)).connect(host: "127.0.0.1", port: port).get()
+        .connectTimeout(.seconds(2)).connect(host: "localhost", port: port).get()
     let asyncChannel = try await channel.eventLoop.submit {
         try NIOAsyncChannel<ByteBuffer, ByteBuffer>(wrappingChannelSynchronously: channel)
     }.get()

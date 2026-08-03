@@ -269,11 +269,18 @@ checksum-verified way to populate the ignored reference cache.
 
 ## Completion gates
 
-Completion still requires the full pinned XRPC surface, delegation minting at
-the user PDS, durable repositories/CARs/blobs, OAuth and account
-lifecycle, and Compose reference PDS/PLC/Caddy matrix, plus macOS/Linux verification.
-The public-genesis vector is a narrow cross-language gate; it is not evidence
-that the complete live interop matrix has passed.
+The alpha completion gates are satisfied by the accumulated implementation and
+the exact-current 2026-08-03 closure receipts recorded in this plan and in
+`swan-adversarial-review-2026-07-30.md`. The full pinned XRPC surface,
+delegation minting, durable repositories/CARs/blobs, OAuth and account
+lifecycle, export/restore, strict public/private isolation, and the Compose
+reference PDS/PLC/Caddy laboratory are implemented. The current macOS and
+native-Linux ordinary suites and all eight opt-in bounded-transfer gates pass.
+The recovery-qualified TypeScript overlay passes the seven-cell stateful
+cross-host matrix; the stock checksum-pinned TypeScript image is restored
+afterward so qualified recovery evidence is never confused with unsupported
+stock behavior. Deferred production-PDS work remains outside this alpha's
+declared scope.
 
 ## Compose laboratory evidence and live gates
 

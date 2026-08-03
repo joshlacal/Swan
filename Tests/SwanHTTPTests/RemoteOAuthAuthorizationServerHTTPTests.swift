@@ -36,7 +36,7 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
         logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.listener-deadline")
       ).test(.live) { client in
         let channel = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
-          .connect(host: "127.0.0.1", port: try XCTUnwrap(client.port)).get()
+          .connect(host: "localhost", port: try XCTUnwrap(client.port)).get()
         try await channel.writeAndFlush(ByteBuffer(string:
           "GET /health HTTP/1.1\r\nhost: localhost\r\ncontent-length: 10\r\n\r\nx"
         )).get()
@@ -1333,7 +1333,7 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
   ) async throws -> RealSocketDripResponse {
     let channel = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
       .connectTimeout(.seconds(2))
-      .connect(host: "127.0.0.1", port: port)
+      .connect(host: "localhost", port: port)
       .get()
     let asyncChannel = try await channel.eventLoop.submit {
       try NIOAsyncChannel<ByteBuffer, ByteBuffer>(wrappingChannelSynchronously: channel)
