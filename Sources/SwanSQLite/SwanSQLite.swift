@@ -214,6 +214,41 @@ public enum SQLiteLayout {
         "CREATE INDEX IF NOT EXISTS permissioned_space_delegation_replay_cleanup ON permissioned_space_delegation_replays(expires_at, jti_digest)",
         "CREATE INDEX IF NOT EXISTS permissioned_space_client_attestation_replay_cleanup ON permissioned_space_client_attestation_replays(expires_at, replay_digest)",
         "CREATE INDEX IF NOT EXISTS oauth_control_family_cleanup ON oauth_control_token_families(expires_at, family_id)",
+        """
+        CREATE TABLE IF NOT EXISTS account_lifecycle_generation (
+            did TEXT PRIMARY KEY,
+            generation INTEGER NOT NULL CHECK(generation >= 0)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS lifecycle_event_batches (
+            batch_id TEXT PRIMARY KEY,
+            did TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK(generation >= 1),
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            UNIQUE(did, generation)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS lifecycle_event_items (
+            batch_id TEXT NOT NULL
+                REFERENCES lifecycle_event_batches(batch_id) ON DELETE CASCADE,
+            batch_ordinal INTEGER NOT NULL CHECK(batch_ordinal >= 0),
+            source_key TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL CHECK(kind IN ('sync', 'identity', 'account')),
+            payload BLOB NOT NULL CHECK(length(payload) > 0),
+            car_bytes BLOB,
+            PRIMARY KEY(batch_id, batch_ordinal),
+            CHECK(
+                (kind = 'sync' AND car_bytes IS NOT NULL AND length(car_bytes) > 0)
+                OR (kind IN ('identity', 'account') AND car_bytes IS NULL)
+            )
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS lifecycle_event_batches_pending
+        ON lifecycle_event_batches(did, generation, created_at, batch_id)
+        """,
     ]
 
     public static let accountConnectionPragmas = [
@@ -2391,30 +2426,30 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         guard applied.isEmpty else { return }
 
         _ = try await connection.query(
-            """
-            CREATE TABLE IF NOT EXISTS public_event_outbox (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_key TEXT NOT NULL UNIQUE,
-                kind TEXT NOT NULL CHECK(kind IN ('commit', 'sync')),
-                lifecycle_generation INTEGER NOT NULL DEFAULT 0
-                    CHECK(lifecycle_generation >= 0),
-                payload BLOB NOT NULL CHECK(length(payload) > 0),
-                car_bytes BLOB NOT NULL CHECK(length(car_bytes) > 0),
-                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
-                created_at INTEGER NOT NULL CHECK(created_at >= 0),
-                available_at INTEGER NOT NULL CHECK(available_at >= 0),
-                lease_token TEXT,
-                lease_expires_at INTEGER,
-                CHECK(
-                    (lease_token IS NULL AND lease_expires_at IS NULL)
-                    OR (
-                        lease_token IS NOT NULL
-                        AND lease_expires_at IS NOT NULL
-                        AND lease_expires_at >= 0
-                    )
+        """
+        CREATE TABLE IF NOT EXISTS public_event_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_key TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL CHECK(kind IN ('commit', 'sync')),
+            lifecycle_generation INTEGER NOT NULL DEFAULT 0
+                CHECK(lifecycle_generation >= 0),
+            payload BLOB NOT NULL CHECK(length(payload) > 0),
+            car_bytes BLOB NOT NULL CHECK(length(car_bytes) > 0),
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            available_at INTEGER NOT NULL CHECK(available_at >= 0),
+            lease_token TEXT,
+            lease_expires_at INTEGER,
+            CHECK(
+                (lease_token IS NULL AND lease_expires_at IS NULL)
+                OR (
+                    lease_token IS NOT NULL
+                    AND lease_expires_at IS NOT NULL
+                    AND lease_expires_at >= 0
                 )
-            );
-            """
+            )
+        );
+        """
         )
         _ = try await connection.query(
             """
