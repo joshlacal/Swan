@@ -103,6 +103,7 @@ public enum PublicRepositoryCARImportFailureCode {
             case .duplicateRequest: return "SQLiteDuplicateRequest"
             case .corruptDatabase: return "SQLiteCorruptDatabase"
             case .revisionOutOfRange: return "SQLiteRevisionOutOfRange"
+            case .conflictingPublicFirehoseSourceKey: return "SQLiteConflictingPublicFirehoseSourceKey"
             }
         case let error as SwanError:
             switch error {

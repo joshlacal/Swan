@@ -1021,6 +1021,7 @@ public enum SQLiteRepositoryError: Error, Sendable, Equatable {
     case duplicateRequest(UUID)
     case corruptDatabase(String)
     case revisionOutOfRange(UInt64)
+    case conflictingPublicFirehoseSourceKey(String)
 }
 
 /// A canonical public-repository record URI. Permissioned space record URIs
@@ -1616,6 +1617,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let accountBlobQuotaMigrationVersion = 10
     private static let permissionedRemoteReplicaIncrementalSequenceMigrationVersion = 11
     private static let permissionedRemoteReplicaLogicalLimitMigrationVersion = 12
+    private static let publicFirehoseOutboxMigrationVersion = 13
 
     /// A read credential may register notification recipients, but it must
     /// not be able to turn the later deletion fanout into an unbounded
@@ -1967,6 +1969,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migratePermissionedRemoteReplicaResultBindingIfNeeded()
             try await migratePermissionedRemoteReplicaIncrementalSequenceIfNeeded()
             try await migratePermissionedRemoteReplicaLogicalLimitIfNeeded()
+            try await migratePublicFirehoseOutboxIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -2363,6 +2366,56 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             }
         }
 
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
+    /// Installs the account-local public firehose outbox. A source row always
+    /// contains CAR bytes: commit rows carry the exact diff CAR and sync rows
+    /// the exact commit-only CAR. There is intentionally no nullable
+    /// `diff_car` column.
+    private func migratePublicFirehoseOutboxIfNeeded() async throws {
+        let version = Self.publicFirehoseOutboxMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        _ = try await connection.query(
+            """
+            CREATE TABLE IF NOT EXISTS public_event_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_key TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL CHECK(kind IN ('commit', 'sync')),
+                lifecycle_generation INTEGER NOT NULL DEFAULT 0
+                    CHECK(lifecycle_generation >= 0),
+                payload BLOB NOT NULL CHECK(length(payload) > 0),
+                car_bytes BLOB NOT NULL CHECK(length(car_bytes) > 0),
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                created_at INTEGER NOT NULL CHECK(created_at >= 0),
+                available_at INTEGER NOT NULL CHECK(available_at >= 0),
+                lease_token TEXT,
+                lease_expires_at INTEGER,
+                CHECK(
+                    (lease_token IS NULL AND lease_expires_at IS NULL)
+                    OR (
+                        lease_token IS NOT NULL
+                        AND lease_expires_at IS NOT NULL
+                        AND lease_expires_at >= 0
+                    )
+                )
+            );
+            """
+        )
         _ = try await connection.query(
             """
             INSERT INTO permissioned_repository_migrations(version, applied_at)
