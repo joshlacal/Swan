@@ -2,6 +2,7 @@ import Crypto
 import Foundation
 import Petrel
 import SQLiteNIO
+import SwanPublicFirehose
 import SwanPublicRepository
 import SwanStorage
 
@@ -105,6 +106,104 @@ private struct SQLitePublicRepositoryProjectionSink:
                 .text(recordCID.string),
             ]
         )
+    }
+}
+
+/// The durable outbox decision for one repository mutation: final event kind,
+/// JSON payload, CAR bytes, and source key. The source transaction owns this
+/// decision; the sequencer never reinterprets a persisted row.
+enum PublicFirehoseSourceDecision: Sendable, Equatable {
+    case commit(payload: Data, car: Data, sourceKey: String)
+    case sync(payload: Data, car: Data, sourceKey: String)
+
+    var kind: PublicFirehoseEventKind {
+        switch self {
+        case .commit: .commit
+        case .sync: .sync
+        }
+    }
+
+    var payload: Data {
+        switch self {
+        case let .commit(payload, _, _): payload
+        case let .sync(payload, _, _): payload
+        }
+    }
+
+    var car: Data {
+        switch self {
+        case let .commit(_, car, _): car
+        case let .sync(_, car, _): car
+        }
+    }
+
+    var sourceKey: String {
+        switch self {
+        case let .commit(_, _, sourceKey): sourceKey
+        case let .sync(_, _, sourceKey): sourceKey
+        }
+    }
+}
+
+enum PublicFirehoseSourceDecisionMaker {
+    /// Sorted keys make repeated encodes byte-identical. JSONEncoder's default
+    /// key order is not stable across calls, and the outbox replay path
+    /// compares stored payload bytes exactly.
+    private static let payloadEncoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
+
+    /// Preflights the exact complete commit frame at the largest legal
+    /// sequence so the check is not smaller than a later real frame due to
+    /// integer encoding width. Oversize shapes degrade to `#sync`; malformed
+    /// durable material is an internal invariant violation.
+    static func decide(
+        accountDID: String,
+        commitCID: CID,
+        commitMaterial: PublicFirehoseCommitMaterial,
+        syncMaterial: PublicFirehoseSyncMaterial,
+        diffCAR: Data,
+        commitOnlyCAR: Data
+    ) throws -> PublicFirehoseSourceDecision {
+        do {
+            _ = try FirehoseFrameEncoder.commitFrame(
+                seq: FirehoseFrameLimits.maximumSequence,
+                material: commitMaterial,
+                diffCAR: diffCAR
+            )
+            return .commit(
+                payload: try payloadEncoder.encode(commitMaterial),
+                car: diffCAR,
+                sourceKey: PublicFirehoseSourceKey.commit(
+                    did: accountDID,
+                    commitCID: commitCID.string
+                )
+            )
+        } catch FirehoseFrameEncoderError.tooManyOperations,
+                FirehoseFrameEncoderError.blocksTooLarge,
+                FirehoseFrameEncoderError.frameTooLarge {
+            do {
+                _ = try FirehoseFrameEncoder.syncFrame(
+                    seq: FirehoseFrameLimits.maximumSequence,
+                    material: syncMaterial,
+                    commitCAR: commitOnlyCAR
+                )
+            } catch {
+                throw PublicRepositoryMutationStoreError.corruptRepository
+            }
+            return .sync(
+                payload: try payloadEncoder.encode(syncMaterial),
+                car: commitOnlyCAR,
+                sourceKey: PublicFirehoseSourceKey.syncOversize(
+                    did: accountDID,
+                    commitCID: commitCID.string
+                )
+            )
+        } catch {
+            throw PublicRepositoryMutationStoreError.corruptRepository
+        }
     }
 }
 
@@ -306,6 +405,35 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         guard reservation.repositoryDID == accountDID else {
             throw PublicRepositoryMutationStoreError.ownershipMismatch
         }
+        // Build every pure in-memory firehose value before entering the
+        // repository transaction. These use immutable prepared data and
+        // in-memory actors only; they must not open SQLite or perform
+        // network I/O.
+        let eventTime = Date()
+        let eventTimeString = PublicFirehoseTime.encode(eventTime)
+        let eventMicros = try PublicFirehoseTime.microseconds(eventTime)
+        let firehoseOps = prepared.recordResults.map { result in
+            let action: PublicFirehoseRepoAction = switch result.action {
+            case .create: .create
+            case .update: .update
+            case .delete: .delete
+            }
+            return PublicFirehoseRepoOp(
+                action: action,
+                path: "\(result.path.collection)/\(result.path.recordKey)",
+                cid: result.recordCID?.string,
+                prev: result.previousRecordCID?.string
+            )
+        }
+        let diffCAR = try await PublicFirehoseDiffCAR.build(
+            commitCID: prepared.state.commitCID,
+            commitBytes: prepared.signedCommit.signedCommitBytes,
+            newBlocks: prepared.newBlocks
+        )
+        let commitOnlyCAR = try await PublicFirehoseDiffCAR.commitOnly(
+            commitCID: prepared.state.commitCID,
+            commitBytes: prepared.signedCommit.signedCommitBytes
+        )
         return try await withConnectionGate {
             try await transaction {
                 var mutatingSQLIndex = 0
@@ -464,6 +592,46 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 )
                 guard marked.count == 1 else {
                     throw PublicRepositoryMutationStoreError.reservationMismatch
+                }
+                try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
+
+                // The stored event kind is final: the source transaction owns
+                // the commit-versus-sync decision and the sequencer must never
+                // reinterpret a persisted row.
+                let commitMaterial = PublicFirehoseCommitMaterial(
+                    did: accountDID,
+                    rev: prepared.state.revision,
+                    since: prepared.sinceRevision,
+                    commitCID: prepared.state.commitCID.string,
+                    prevDataCID: current.dataCID.string,
+                    ops: firehoseOps,
+                    time: eventTimeString
+                )
+                let syncMaterial = PublicFirehoseSyncMaterial(
+                    did: accountDID,
+                    rev: prepared.state.revision,
+                    commitCID: prepared.state.commitCID.string,
+                    time: eventTimeString
+                )
+                let decision = try PublicFirehoseSourceDecisionMaker.decide(
+                    accountDID: accountDID,
+                    commitCID: prepared.state.commitCID,
+                    commitMaterial: commitMaterial,
+                    syncMaterial: syncMaterial,
+                    diffCAR: diffCAR,
+                    commitOnlyCAR: commitOnlyCAR
+                )
+
+                let inserted = try await enqueuePublicFirehoseEventInTransaction(
+                    sourceKey: decision.sourceKey,
+                    kind: decision.kind,
+                    lifecycleGeneration: 0,
+                    payload: decision.payload,
+                    carBytes: decision.car,
+                    createdAt: eventMicros
+                )
+                guard inserted else {
+                    throw PublicRepositoryMutationStoreError.corruptRepository
                 }
                 try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
                 return CommittedPublicRepositoryMutation(

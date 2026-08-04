@@ -424,7 +424,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
     }
 
     func testInjectedFailureRollsBackBlocksIndexStateAndReservationStatus() async throws {
-        for target in 1...6 {
+        for target in 1...7 {
             let root = try temporaryDirectory()
             defer { try? FileManager.default.removeItem(at: root) }
             let key = P256.Signing.PrivateKey()
@@ -440,7 +440,7 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
                 rkey: "rollback-\(target)",
                 clock: 1_750_000_000_000_000
             )
-            XCTAssertEqual(candidate.prepared.newBlocks.count + 3, 6)
+            XCTAssertEqual(candidate.prepared.newBlocks.count + 4, 7)
             await database.installTestingHooks(SQLiteTestingHooks(
                 afterPublicRepositoryMutatingSQL: { index in
                     if index == target { throw InjectedFailure.expected }
@@ -467,6 +467,11 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
                 for: candidate.path
             )
             XCTAssertNil(indexed)
+            let outboxAfterFailure = try await reopened.pendingPublicFirehoseOutbox()
+            XCTAssertTrue(
+                outboxAfterFailure.isEmpty,
+                "failure after SQL boundary \(target) persisted an outbox row"
+            )
             guard case .reserved = try await reopened.reservePublicRepositoryRevision(
                 candidate.reservation.request,
                 wallClockMicroseconds: 1
