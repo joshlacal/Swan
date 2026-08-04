@@ -21,6 +21,10 @@ public enum SQLiteLayout {
         dataDirectory.appending(path: "control.sqlite")
     }
 
+    public static func firehoseDatabase(in dataDirectory: URL) -> URL {
+        dataDirectory.appending(path: "firehose.sqlite")
+    }
+
     public static func accountDatabase(in dataDirectory: URL, did: String) -> URL {
         let digest = Hex.encode(SHA256.hash(data: Data(did.utf8)))
         return dataDirectory
