@@ -1,1288 +1,1729 @@
-# Swan Firehose Phase 1: Durable Event Core — Implementation Plan
+# Swan Firehose Phase 1: Durable Event Core — Reviewed Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Every public repository commit, and every enqueued lifecycle batch, durably lands in a global `firehose.sqlite` log with a monotonic `seq` and fully encoded firehose frame bytes — crash-safe, idempotent, and ordered per-DID.
+**Review status:** Revised after source-level review of Swan, Petrel, and the current reference PDS event formatter.
 
-**Architecture:** Account-local `public_event_outbox` rows are written inside the same SQLite transaction as the public repo commit (exact event material including diff-CAR bytes). A control-plane `lifecycle_event_outbox` holds ordered lifecycle batches with a per-DID generation counter. A single sequencer actor drains both, respects generation barriers, encodes complete DAG-CBOR frames, and appends batches atomically to `firehose.sqlite` with seqs allocated from `firehose_meta`.
+**Goal:** Every public repository commit, and every explicitly enqueued lifecycle batch, durably lands in a global `firehose.sqlite` log with a monotonic `seq` and fully encoded firehose frame bytes — crash-safe, idempotent, and causally ordered per DID.
 
-**Tech Stack:** Swift 6 strict concurrency, SQLiteNIO, Petrel `DAGCBOR`/`OrderedCBORMap`, XCTest.
+**Architecture:**
 
-**Spec:** `docs/superpowers/specs/2026-08-04-swan-public-firehose-design.md` (read it first).
+- Account-local `public_event_outbox` rows are inserted in the same SQLite transaction as the public repository commit. They contain final event kind, typed JSON material, and exact CAR bytes.
+- A control-plane lifecycle outbox stores ordered identity/account/sync batches and assigns a monotonically increasing lifecycle generation per DID.
+- A single sequencer actor merges the two sources per DID. Account event generation `g` is ordered after lifecycle batch `g` and before lifecycle batch `g + 1`.
+- The sequencer allocates consecutive sequence ranges from `firehose_meta`, encodes complete header-plus-body DAG-CBOR frames, and atomically appends them to `firehose.sqlite`.
+- `firehose.sqlite` is the durable authority. Phase 2 live delivery may use in-process notifications only as wakeups; it must always tail this log.
 
-## Global Constraints
+**Tech stack:** Swift 6 strict concurrency, SQLiteNIO, Petrel `DAGCBOR` / `OrderedCBORMap` / `ATProtoLink`, XCTest.
 
-- Swift 6 strict concurrency; actors; 2-space indentation; XCTest (not Swift Testing).
-- VCS: jj only, never git mutation. Commit with path-restricted `jj commit <paths> -m "firehose: …"`. Work happens in the jj workspace at `/Users/joshlacalamito/Developer/Catbird+Petrel/.worktrees/swan-public-federation` — run all commands from there.
-- All DB access via `connection.query(sql, bindings)`; every mutation wrapped `try await withConnectionGate { try await transaction { … } }`. Never open a second database's transaction inside another's. Never perform network I/O inside a transaction.
-- Frame encoding must use Petrel's `DAGCBOR.encodeValue` / `OrderedCBORMap` / tag-42 CID links, mirroring the exact usage in `Sources/SwanPublicRepository/PublicRepositoryCommit.swift:303-326` (`encodeUnsigned`/`encodeSigned`). If a signature there differs from this plan's sketch, the precedent file wins.
-- Hard invariants: `1 <= seq < 9_007_199_254_740_992` (2^53); `#commit.blobs` is always `[]`; total encoded frame ≤ 5,000,000 bytes; `blocks` CAR ≤ 2,000,000 bytes; ≤ 200 ops.
-- Sizes/limits and event body shapes come from the spec — do not improvise fields.
-- Build: `swift build` (~fast on this machine). Test: `swift test --filter <TargetOrTest>`.
-- Account DB migration version ledger: next free version is **13** (`permissionedRemoteReplicaLogicalLimitMigrationVersion = 12` is current highest). If rebasing onto newer main claims 13, renumber.
+**Governing design:** `docs/superpowers/specs/2026-08-04-swan-public-firehose-design.md`, after Task 0 reconciles it with this reviewed plan.
+
+## Review changes applied
+
+This revision changes the submitted plan in the following material ways:
+
+1. Makes `since` and `prevDataCID` optional, encodes absent `since` as CBOR null, and omits absent `prevData` and operation `prev`, matching current event semantics.
+2. Uses Petrel’s actual immutable `OrderedCBORMap(entries:)` / `.adding(key:value:)` API. Petrel has no generic `decodeValueWithLength`; tests receive a dedicated strict two-object CBOR parser.
+3. Adds the 10,000-byte `#sync.blocks` limit and validates operations, CAR sizes, and the complete 5,000,000-byte frame.
+4. Keeps the `PublicRepositoryMutationStore` protocol method signature unchanged. Firehose material is derived internally; Phase 1 writes lifecycle generation `0`.
+5. Makes source CAR bytes non-null and enforces strict account-outbox head-of-line order. A failed older commit can never be overtaken by a newer commit.
+6. Makes source-key replay exact: the same key with different kind, generation, payload, CAR, DID, batch, or encoded frame is corruption, not idempotency.
+7. Splits lifecycle batches from lifecycle items, namespaces batch IDs by DID, carries CAR bytes for lifecycle `#sync`, rejects empty or conflicting replays, and validates material before enqueue.
+8. Replaces the one-sided “lifecycle first” rule with a two-sided per-DID causal merge: account generation `g` precedes lifecycle generation `g + 1`, while lifecycle generation `g` precedes account generation `g`.
+9. Strengthens global sequence allocation against overflow, partial batch replay, mixed existing/new rows, and restore-induced sequence regression.
+10. Corrects service composition: the runtime is assembled in `Sources/swan/SwanCommand.swift`, not `Sources/SwanHTTP/SwanHTTP.swift`; the Phase 1 worker is explicitly feature-gated and closed on every shutdown path.
+11. Corrects all fixed test dates. `2026-08-04T12:00:00.000Z` is Unix time `1_785_844_800`, not `1_754_308_800`.
+12. Adds failure-injection, rollback, multi-DID fairness, generation-boundary, lifecycle crash-replay, and source-conflict tests.
+
+## Global constraints
+
+- Swift 6 strict concurrency; actors; 2-space indentation; XCTest, not Swift Testing.
+- VCS: `jj` only; never mutate history with Git. Commit using path-restricted commands such as:
+
+  ```bash
+  jj commit <paths> -m "firehose: …"
+  ```
+
+- Work from:
+
+  ```text
+  /Users/joshlacalamito/Developer/Catbird+Petrel/.worktrees/swan-public-federation
+  ```
+
+- All SQLite access uses `connection.query(sql, bindings)`.
+- Public mutation methods acquire `withConnectionGate` and use `transaction`. Helpers explicitly named `...InTransaction` assume that gate and transaction are already held and must not reacquire either.
+- Never open one database transaction while another database transaction is open.
+- Never perform network I/O inside a transaction.
+- Build CAR bytes and other pure in-memory material before entering a transaction whenever the required values are already available. Only the durable outbox insertion must be in the repository transaction.
+- Frame encoding uses Petrel’s actual API:
+  - `DAGCBOR.encodeValue(_:)`
+  - `OrderedCBORMap(entries:)` or `.adding(key:value:)`
+  - `CID.parse(_:)`
+  - `ATProtoLink(cid:)`
+- `OrderedCBORMap` is immutable and has no `append` method. Petrel’s DAG-CBOR encoder performs canonical map-key ordering itself; do not rely on insertion order.
+- Petrel currently has no public generic “decode the first CBOR object and return consumed length” API. Do not invent `DAGCBOR.decodeValue` or `decodeValueWithLength`; use the test-only parser required by Task 2.
+- The uploaded Swan archive does not contain its required sibling `../Petrel` checkout. This review verified the current accessible Petrel source; before Task 2, inspect the actual workspace sibling and let that checked-out source win on API spelling. The frame semantics and tests in this plan remain the contract.
+- Hard event invariants:
+  - `1 <= seq <= 9_007_199_254_740_991`
+  - `firehose_meta.next_seq` may additionally equal `9_007_199_254_740_992` as an exhausted sentinel
+  - complete encoded frame `<= 5_000_000` bytes
+  - `#commit.blocks <= 2_000_000` bytes
+  - `#sync.blocks <= 10_000` bytes
+  - `#commit.ops.count <= 200`
+  - `#commit.blobs` is always `[]`
+  - `#commit` operation `cid` is always present as a link or null
+  - operation `prev` is omitted when absent, never encoded as null
+  - `#commit.prevData` is omitted when absent
+  - `#commit.since` is encoded as a string or null
+- Swan-produced operation semantics are stricter than the permissive wire shape:
+  - create: `cid != nil`, `prev == nil`
+  - update: `cid != nil`, `prev != nil`
+  - delete: `cid == nil`, `prev != nil`
+- Public and permissioned storage remain isolated. No permissioned write path may import `SwanPublicFirehose`, insert into `public_event_outbox`, or append to `firehose.sqlite`.
+- Build: `swift build`.
+- Focused test: `swift test --filter <TargetOrTest>`.
+- Account DB migration ledger: version `13` is free in the reviewed snapshot (`permissionedRemoteReplicaLogicalLimitMigrationVersion = 12`). Recheck after rebasing and renumber if necessary.
 
 ---
 
-### Task 1: `SwanPublicFirehose` module — event model + source keys
+### Task 0: Reconcile the governing design before code changes
 
 **Files:**
-- Modify: `Package.swift` (add product, target, test target)
+
+- Verify or create: `docs/superpowers/specs/2026-08-04-swan-public-firehose-design.md`
+- Modify the design if it still contains the pre-review architecture.
+
+The uploaded implementation plan references this spec, but the reviewed archive does not contain it. The older design text also contains superseded decisions: low-level lifecycle hooks, deferred CAR resolution by CID list, direct in-memory event broadcast as a correctness path, and a minimum-row retention floor.
+
+- [ ] **Step 1: Make the design document exist in the workspace**
+
+If the file is absent, create it from the approved P0 design and record that this reviewed implementation plan is authoritative for Phase 1 details.
+
+- [ ] **Step 2: Apply the required architecture corrections**
+
+The design must say all of the following before implementation begins:
+
+- lifecycle events are enqueued by confirmed higher-level operations, not raw PLC-history installation;
+- lifecycle events are ordered batches with per-DID generations;
+- source outboxes persist exact CAR bytes;
+- account outboxes are strict FIFO by insertion ID;
+- global log frames are complete header-plus-body bytes;
+- in-process broadcasts are wakeups only;
+- retention has a hard maximum age and no minimum row count that defeats it;
+- deletion can prune older retained rows for that DID in Phase 3;
+- cursor behavior and relay acceptance are later phases;
+- Phase 1 does not yet integrate real lifecycle operations, so ordinary public commits are stamped generation `0` until the Phase 4 lifecycle saga is wired.
+
+- [ ] **Step 3: Verify no superseded claims remain**
+
+Run:
+
+```bash
+rg -n \
+  'installPublicPLCOperation|CID list|minimum 10,000|Broadcast the event|transitionStatus.*emits' \
+  docs/superpowers/specs/2026-08-04-swan-public-firehose-design.md
+```
+
+Expected: no stale architecture claim. Legitimate historical discussion must be explicitly marked superseded.
+
+- [ ] **Step 4: Commit**
+
+```bash
+jj commit docs/superpowers/specs/2026-08-04-swan-public-firehose-design.md \
+  -m "docs: reconcile Swan public firehose design"
+```
+
+---
+
+### Task 1: Add `SwanPublicFirehose` event models and source keys
+
+**Files:**
+
+- Modify: `Package.swift`
 - Create: `Sources/SwanPublicFirehose/PublicFirehoseEvent.swift`
 - Create: `Sources/SwanPublicFirehose/PublicFirehoseSourceKey.swift`
 - Test: `Tests/SwanPublicFirehoseTests/PublicFirehoseEventTests.swift`
 
-**Interfaces:**
-- Consumes: `CID` from Petrel; nothing else.
-- Produces (later tasks depend on these exact names):
-  - `enum PublicFirehoseEventKind: String, Codable, Sendable { case commit, sync, identity, account }`
-  - `struct PublicFirehoseRepoOp: Codable, Sendable, Equatable { let action: String; let path: String; let cid: String?; let prev: String? }` (action ∈ create/update/delete; path `collection/rkey`; CIDs as strings in stored material)
-  - `struct PublicFirehoseCommitMaterial: Codable, Sendable, Equatable { let did: String; let rev: String; let since: String; let commitCID: String; let prevDataCID: String; let ops: [PublicFirehoseRepoOp]; let time: String }`
-  - `struct PublicFirehoseSyncMaterial: Codable, Sendable, Equatable { let did: String; let rev: String; let commitCID: String; let time: String }`
-  - `struct PublicFirehoseIdentityMaterial: Codable, Sendable, Equatable { let did: String; let handle: String?; let time: String }`
-  - `struct PublicFirehoseAccountMaterial: Codable, Sendable, Equatable { let did: String; let active: Bool; let status: String?; let time: String }`
-  - `enum PublicFirehoseSourceKey` with static funcs: `commit(did:commitCID:) -> String`, `syncOversize(did:commitCID:)`, `syncManual(did:requestUUID:)`, `syncActivation(did:operationID:)`, `syncReactivation(did:operationID:)`, `account(did:operationID:)`, `identity(did:plcOperationCID:)` — formats exactly `"\(did)|commit|\(cid)"`, `"\(did)|sync|oversize|\(cid)"`, `"\(did)|sync|manual|\(uuid)"`, `"\(did)|sync|activation|\(op)"`, `"\(did)|sync|reactivation|\(op)"`, `"\(did)|account|\(op)"`, `"\(did)|identity|\(cid)"`.
-  - `enum PublicFirehoseTime { static func encode(_ date: Date) -> String }` — ISO8601 with fractional seconds, UTC (`ISO8601DateFormatter` with `[.withInternetDateTime, .withFractionalSeconds]`).
+**Produces:**
 
-- [ ] **Step 1: Add Package.swift entries**
-
-In `products:` (alongside the other 12 libraries):
 ```swift
-        .library(name: "SwanPublicFirehose", targets: ["SwanPublicFirehose"]),
-```
-In `targets:`:
-```swift
-        .target(
-            name: "SwanPublicFirehose",
-            dependencies: [
-                "SwanCore", "SwanPublicRepository",
-                .product(name: "Petrel", package: "Petrel"),
-            ]
-        ),
-        .testTarget(
-            name: "SwanPublicFirehoseTests",
-            dependencies: [
-                "SwanPublicFirehose", "SwanPublicRepository",
-                .product(name: "Crypto", package: "swift-crypto"),
-                .product(name: "Petrel", package: "Petrel"),
-            ]
-        ),
-```
+public enum PublicFirehoseEventKind: String, Codable, Sendable {
+  case commit, sync, identity, account
+}
 
-- [ ] **Step 2: Write the failing tests**
+public enum PublicFirehoseRepoAction: String, Codable, Sendable {
+  case create, update, delete
+}
 
-`Tests/SwanPublicFirehoseTests/PublicFirehoseEventTests.swift`:
-```swift
-import Foundation
-@testable import SwanPublicFirehose
-import XCTest
+public struct PublicFirehoseRepoOp: Codable, Sendable, Equatable {
+  public let action: PublicFirehoseRepoAction
+  public let path: String
+  public let cid: String?
+  public let prev: String?
+}
 
-final class PublicFirehoseEventTests: XCTestCase {
-    private let did = "did:plc:abcdefghijklmnopqrstuvwx"
+public struct PublicFirehoseCommitMaterial: Codable, Sendable, Equatable {
+  public let did: String
+  public let rev: String
+  public let since: String?
+  public let commitCID: String
+  public let prevDataCID: String?
+  public let ops: [PublicFirehoseRepoOp]
+  public let time: String
+}
 
-    func testSourceKeyFormats() {
-        XCTAssertEqual(
-            PublicFirehoseSourceKey.commit(did: did, commitCID: "bafyreiabc"),
-            "did:plc:abcdefghijklmnopqrstuvwx|commit|bafyreiabc"
-        )
-        XCTAssertEqual(
-            PublicFirehoseSourceKey.syncOversize(did: did, commitCID: "bafyreiabc"),
-            "did:plc:abcdefghijklmnopqrstuvwx|sync|oversize|bafyreiabc"
-        )
-        XCTAssertEqual(
-            PublicFirehoseSourceKey.syncManual(
-                did: did,
-                requestUUID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
-            ),
-            "did:plc:abcdefghijklmnopqrstuvwx|sync|manual|00000000-0000-0000-0000-000000000001"
-        )
-        XCTAssertEqual(
-            PublicFirehoseSourceKey.identity(did: did, plcOperationCID: "bafyreiop"),
-            "did:plc:abcdefghijklmnopqrstuvwx|identity|bafyreiop"
-        )
-    }
+public struct PublicFirehoseSyncMaterial: Codable, Sendable, Equatable {
+  public let did: String
+  public let rev: String
+  public let commitCID: String
+  public let time: String
+}
 
-    func testCommitMaterialJSONRoundTrip() throws {
-        let material = PublicFirehoseCommitMaterial(
-            did: did,
-            rev: "3jzfcijpj2z2b",
-            since: "3jzfcijpj2z2a",
-            commitCID: "bafyreiabc",
-            prevDataCID: "bafyreidef",
-            ops: [PublicFirehoseRepoOp(
-                action: "create",
-                path: "app.bsky.feed.post/3jzfcijpj2z2b",
-                cid: "bafyreirec",
-                prev: nil
-            )],
-            time: "2026-08-04T12:00:00.000Z"
-        )
-        let data = try JSONEncoder().encode(material)
-        let decoded = try JSONDecoder().decode(PublicFirehoseCommitMaterial.self, from: data)
-        XCTAssertEqual(decoded, material)
-    }
+public struct PublicFirehoseIdentityMaterial: Codable, Sendable, Equatable {
+  public let did: String
+  public let handle: String?
+  public let time: String
+}
 
-    func testTimeEncodingIsUTCWithFractionalSeconds() {
-        let date = Date(timeIntervalSince1970: 1_754_308_800)
-        XCTAssertEqual(PublicFirehoseTime.encode(date), "2026-08-04T12:00:00.000Z")
-    }
+public enum PublicFirehoseAccountStatus: String, Codable, Sendable {
+  case deactivated
+  case suspended
+  case takendown
+  case desynchronized
+  case throttled
+  case deleted
+}
+
+public struct PublicFirehoseAccountMaterial: Codable, Sendable, Equatable {
+  public let did: String
+  public let active: Bool
+  public let status: PublicFirehoseAccountStatus?
+  public let time: String
 }
 ```
 
-- [ ] **Step 3: Run tests, verify they fail to compile (module doesn't exist)**
+`PublicFirehoseSourceKey` exposes:
 
-Run: `swift test --filter PublicFirehoseEventTests`
-Expected: build failure — `no such module 'SwanPublicFirehose'` / missing types.
-
-- [ ] **Step 4: Implement the types**
-
-`Sources/SwanPublicFirehose/PublicFirehoseEvent.swift` — the structs/enums exactly as in Interfaces, all `public`, memberwise `public init`. `Sources/SwanPublicFirehose/PublicFirehoseSourceKey.swift`:
 ```swift
-import Foundation
+commit(did:commitCID:)
+syncOversize(did:commitCID:)
+syncManual(did:requestUUID:)
+syncActivation(did:operationID:)
+syncReactivation(did:operationID:)
+account(did:operationID:)
+identity(did:plcOperationCID:)
+lifecycleBatch(did:operationID:)
+```
 
-public enum PublicFirehoseSourceKey {
-    public static func commit(did: String, commitCID: String) -> String {
-        "\(did)|commit|\(commitCID)"
-    }
+Exact formats:
 
-    public static func syncOversize(did: String, commitCID: String) -> String {
-        "\(did)|sync|oversize|\(commitCID)"
-    }
+```text
+<did>|commit|<cid>
+<did>|sync|oversize|<cid>
+<did>|sync|manual|<lowercase UUID>
+<did>|sync|activation|<operation ID>
+<did>|sync|reactivation|<operation ID>
+<did>|account|<operation ID>
+<did>|identity|<PLC operation CID>
+<did>|lifecycle|<operation ID>
+```
 
-    public static func syncManual(did: String, requestUUID: UUID) -> String {
-        "\(did)|sync|manual|\(requestUUID.uuidString.lowercased())"
-    }
+`PublicFirehoseTime` exposes:
 
-    public static func syncActivation(did: String, operationID: String) -> String {
-        "\(did)|sync|activation|\(operationID)"
-    }
-
-    public static func syncReactivation(did: String, operationID: String) -> String {
-        "\(did)|sync|reactivation|\(operationID)"
-    }
-
-    public static func account(did: String, operationID: String) -> String {
-        "\(did)|account|\(operationID)"
-    }
-
-    public static func identity(did: String, plcOperationCID: String) -> String {
-        "\(did)|identity|\(plcOperationCID)"
-    }
+```swift
+public enum PublicFirehoseTimeError: Error, Equatable {
+  case outOfRange
 }
 
 public enum PublicFirehoseTime {
-    public static func encode(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        return formatter.string(from: date)
-    }
+  public static func encode(_ date: Date) -> String
+  public static func microseconds(_ date: Date) throws -> Int64
 }
 ```
 
-- [ ] **Step 5: Run tests, verify pass**
+`encode` uses UTC ISO-8601 with fractional seconds. `microseconds` rejects non-finite, negative, or overflowing values with `.outOfRange` rather than trapping on conversion.
 
-Run: `swift test --filter PublicFirehoseEventTests`
-Expected: PASS (3 tests).
+- [ ] **Step 1: Add package entries**
+
+Add the library product:
+
+```swift
+.library(name: "SwanPublicFirehose", targets: ["SwanPublicFirehose"]),
+```
+
+Add targets:
+
+```swift
+.target(
+  name: "SwanPublicFirehose",
+  dependencies: [
+    "SwanPublicRepository",
+    .product(name: "Petrel", package: "Petrel"),
+  ]
+),
+.testTarget(
+  name: "SwanPublicFirehoseTests",
+  dependencies: [
+    "SwanPublicFirehose",
+    "SwanPublicRepository",
+    .product(name: "Petrel", package: "Petrel"),
+  ]
+),
+```
+
+Do not add `Crypto` unless a test actually imports it.
+
+- [ ] **Step 2: Write failing tests**
+
+Cover:
+
+- every source-key format, including DID-namespaced lifecycle batch IDs;
+- JSON round-trip with non-null `since` and `prevDataCID`;
+- JSON round-trip with both optional fields nil;
+- typed repository actions;
+- account status round-trip;
+- exact date encoding:
+
+  ```swift
+  let date = Date(timeIntervalSince1970: 1_785_844_800)
+  XCTAssertEqual(
+    PublicFirehoseTime.encode(date),
+    "2026-08-04T12:00:00.000Z"
+  )
+  ```
+
+- microsecond conversion and invalid-date rejection.
+
+- [ ] **Step 3: Confirm red**
+
+```bash
+swift test --filter PublicFirehoseEventTests
+```
+
+Expected: module or type compilation failure.
+
+- [ ] **Step 4: Implement the models**
+
+All public structs have explicit public initializers. Keep material storage JSON-only; CIDs remain strings until frame encoding so SQLite rows do not depend on Petrel binary layout.
+
+For account material, do not encode internal `deleting`, `unknown`, or `active` as status strings. Active events use `active: true, status: nil`.
+
+- [ ] **Step 5: Confirm green**
+
+```bash
+swift test --filter PublicFirehoseEventTests
+```
 
 - [ ] **Step 6: Commit**
 
 ```bash
-jj commit Package.swift Sources/SwanPublicFirehose Tests/SwanPublicFirehoseTests -m "firehose: add SwanPublicFirehose event model and source keys"
+jj commit Package.swift Sources/SwanPublicFirehose Tests/SwanPublicFirehoseTests \
+  -m "firehose: add event models and source keys"
 ```
 
 ---
 
-### Task 2: DAG-CBOR frame encoder
+### Task 2: Add the complete DAG-CBOR frame encoder and strict test decoder
 
 **Files:**
-- Create: `Sources/SwanPublicFirehose/FirehoseFrameEncoder.swift`
+
 - Create: `Sources/SwanPublicFirehose/FirehoseFrameLimits.swift`
+- Create: `Sources/SwanPublicFirehose/FirehoseFrameEncoder.swift`
+- Create: `Tests/SwanPublicFirehoseTests/FirehoseFrameTestDecoder.swift`
 - Test: `Tests/SwanPublicFirehoseTests/FirehoseFrameEncoderTests.swift`
 
-**Interfaces:**
-- Consumes: Task 1 material types; Petrel `DAGCBOR`, `OrderedCBORMap`, `ATProtoLink`, `CID` (mirror usage in `PublicRepositoryCommit.swift:303-326` — that file is the authority on the encode API).
-- Produces:
-  - `enum FirehoseFrameLimits { static let maximumFrameBytes = 5_000_000; static let maximumBlocksBytes = 2_000_000; static let maximumOps = 200; static let maximumSequence: Int64 = 9_007_199_254_740_991; static func validateSequence(_ seq: Int64) throws }`
-  - `enum FirehoseFrameEncoderError: Error, Equatable { case sequenceOutOfRange, frameTooLarge(Int), invalidCID(String) }`
-  - `enum FirehoseFrameEncoder` with:
-    - `static func commitFrame(seq: Int64, material: PublicFirehoseCommitMaterial, diffCAR: Data) throws -> Data`
-    - `static func syncFrame(seq: Int64, material: PublicFirehoseSyncMaterial, commitCAR: Data) throws -> Data`
-    - `static func identityFrame(seq: Int64, material: PublicFirehoseIdentityMaterial) throws -> Data`
-    - `static func accountFrame(seq: Int64, material: PublicFirehoseAccountMaterial) throws -> Data`
-    - `static func infoFrame(name: String, message: String?) throws -> Data`
-    - `static func errorFrame(error: String, message: String?) throws -> Data`
-  - Each returns header+body concatenated. Header map key order: `op`, `t` (alphabetical — DAG-CBOR canonical ordering is enforced by `OrderedCBORMap`/encoder; mirror the commit-encoder precedent). Body fields per spec: commit body keys `seq, rebase, tooBig, repo, commit, rev, since, blocks, ops, blobs, prevData, time` with `rebase: false`, `tooBig: false`, `blobs: []`, `commit`/`prevData` as tag-42 links, `blocks` as CBOR byte string; op entries `{action, path, cid (link or null), prev (link or null)}`.
+**Produces:**
 
-- [ ] **Step 1: Write the failing tests**
-
-```swift
-import Foundation
-import Petrel
-@testable import SwanPublicFirehose
-import XCTest
-
-final class FirehoseFrameEncoderTests: XCTestCase {
-    private let did = "did:plc:abcdefghijklmnopqrstuvwx"
-    // Valid CIDv1 dag-cbor sha2-256 strings: generate once in a helper from real bytes.
-    private func makeCID(_ seed: String) throws -> CID {
-        CID.fromDAGCBOR(Data(seed.utf8))
-    }
-
-    func testCommitFrameDecodesWithExpectedFields() throws {
-        let commitCID = try makeCID("commit")
-        let prevData = try makeCID("prevdata")
-        let recordCID = try makeCID("record")
-        let material = PublicFirehoseCommitMaterial(
-            did: did, rev: "3jzfcijpj2z2b", since: "3jzfcijpj2z2a",
-            commitCID: commitCID.string, prevDataCID: prevData.string,
-            ops: [PublicFirehoseRepoOp(
-                action: "create", path: "app.bsky.feed.post/3jzfcijpj2z2b",
-                cid: recordCID.string, prev: nil
-            )],
-            time: "2026-08-04T12:00:00.000Z"
-        )
-        let car = Data([0x0a, 0x0b, 0x0c])
-        let frame = try FirehoseFrameEncoder.commitFrame(seq: 42, material: material, diffCAR: car)
-
-        // Decode the two concatenated DAG-CBOR objects.
-        let (header, headerLength) = try DAGCBOR.decodeValueWithLength(frame)
-        let body = try DAGCBOR.decodeValue(frame.dropFirst(headerLength))
-        let headerMap = try XCTUnwrap(header as? [String: Any])
-        XCTAssertEqual(headerMap["op"] as? Int, 1)
-        XCTAssertEqual(headerMap["t"] as? String, "#commit")
-        let bodyMap = try XCTUnwrap(body as? [String: Any])
-        XCTAssertEqual(bodyMap["seq"] as? Int, 42)
-        XCTAssertEqual(bodyMap["repo"] as? String, did)
-        XCTAssertEqual(bodyMap["rev"] as? String, "3jzfcijpj2z2b")
-        XCTAssertEqual(bodyMap["since"] as? String, "3jzfcijpj2z2a")
-        XCTAssertEqual(bodyMap["rebase"] as? Bool, false)
-        XCTAssertEqual(bodyMap["tooBig"] as? Bool, false)
-        XCTAssertEqual((bodyMap["blobs"] as? [Any])?.count, 0)
-        XCTAssertEqual(bodyMap["blocks"] as? Data, car)
-        let ops = try XCTUnwrap(bodyMap["ops"] as? [[String: Any]])
-        XCTAssertEqual(ops.count, 1)
-        XCTAssertEqual(ops[0]["action"] as? String, "create")
-        XCTAssertEqual(ops[0]["path"] as? String, "app.bsky.feed.post/3jzfcijpj2z2b")
-    }
-
-    func testSequenceBoundsRejected() {
-        let material = PublicFirehoseAccountMaterial(
-            did: did, active: false, status: "deactivated",
-            time: "2026-08-04T12:00:00.000Z"
-        )
-        XCTAssertThrowsError(
-            try FirehoseFrameEncoder.accountFrame(seq: 0, material: material)
-        )
-        XCTAssertThrowsError(
-            try FirehoseFrameEncoder.accountFrame(
-                seq: 9_007_199_254_740_992, material: material
-            )
-        )
-    }
-
-    func testFrameTooLargeRejected() throws {
-        let material = PublicFirehoseSyncMaterial(
-            did: did, rev: "3jzfcijpj2z2b",
-            commitCID: try makeCID("commit").string,
-            time: "2026-08-04T12:00:00.000Z"
-        )
-        let oversized = Data(count: 5_000_001)
-        XCTAssertThrowsError(
-            try FirehoseFrameEncoder.syncFrame(seq: 1, material: material, commitCAR: oversized)
-        ) { error in
-            guard case FirehoseFrameEncoderError.frameTooLarge = error else {
-                return XCTFail("unexpected error \(error)")
-            }
-        }
-    }
-
-    func testErrorFrame() throws {
-        let frame = try FirehoseFrameEncoder.errorFrame(error: "ConsumerTooSlow", message: nil)
-        let (header, headerLength) = try DAGCBOR.decodeValueWithLength(frame)
-        let headerMap = try XCTUnwrap(header as? [String: Any])
-        XCTAssertEqual(headerMap["op"] as? Int, -1)
-        XCTAssertNil(headerMap["t"])
-        let body = try DAGCBOR.decodeValue(frame.dropFirst(headerLength))
-        XCTAssertEqual((body as? [String: Any])?["error"] as? String, "ConsumerTooSlow")
-    }
-}
-```
-NOTE for implementer: Petrel's decode entry points are in `Petrel/Sources/Petrel/Core/Types/CID.swift:586`. If `decodeValueWithLength` does not exist under that name, use whatever decode API `CommitCBORParser` (`PublicRepositoryCommit.swift:389+`) uses to split concatenated objects — or add a small test-only splitter that decodes the first object and returns consumed byte count. Adjust the test to the real API; the assertions are the contract, not the helper names.
-
-- [ ] **Step 2: Run tests, verify fail**
-
-Run: `swift test --filter FirehoseFrameEncoderTests`
-Expected: compile failure (encoder types missing).
-
-- [ ] **Step 3: Implement**
-
-`FirehoseFrameLimits.swift`:
 ```swift
 public enum FirehoseFrameLimits {
-    public static let maximumFrameBytes = 5_000_000
-    public static let maximumBlocksBytes = 2_000_000
-    public static let maximumOps = 200
-    public static let maximumSequence: Int64 = 9_007_199_254_740_991
+  public static let maximumFrameBytes = 5_000_000
+  public static let maximumCommitBlocksBytes = 2_000_000
+  public static let maximumSyncBlocksBytes = 10_000
+  public static let maximumOps = 200
+  public static let maximumSequence: Int64 = 9_007_199_254_740_991
 
-    public static func validateSequence(_ seq: Int64) throws {
-        guard seq >= 1, seq <= maximumSequence else {
-            throw FirehoseFrameEncoderError.sequenceOutOfRange
-        }
-    }
+  public static func validateSequence(_ seq: Int64) throws
 }
-```
-`FirehoseFrameEncoder.swift` sketch (mirror `PublicRepositoryCommit.encodeSigned` for the exact `OrderedCBORMap`/`DAGCBOR.encodeValue` idioms; keys inserted in canonical order):
-```swift
-import Foundation
-import Petrel
 
 public enum FirehoseFrameEncoderError: Error, Equatable {
-    case sequenceOutOfRange
-    case frameTooLarge(Int)
-    case invalidCID(String)
+  case sequenceOutOfRange
+  case tooManyOperations(Int)
+  case blocksTooLarge(actual: Int, maximum: Int)
+  case frameTooLarge(Int)
+  case invalidCID(String)
+  case invalidOperation(index: Int, reason: String)
+  case invalidAccountStatus
 }
 
 public enum FirehoseFrameEncoder {
-    public static func commitFrame(
-        seq: Int64,
-        material: PublicFirehoseCommitMaterial,
-        diffCAR: Data
-    ) throws -> Data {
-        try FirehoseFrameLimits.validateSequence(seq)
-        let commitLink = try link(material.commitCID)
-        let prevDataLink = try link(material.prevDataCID)
-        var ops: [Any] = []
-        for op in material.ops {
-            let map = OrderedCBORMap()
-            map.append(key: "cid", value: op.cid.map { try link($0) } as Any? ?? NSNull())
-            map.append(key: "path", value: op.path)
-            map.append(key: "prev", value: op.prev.map { try link($0) } as Any? ?? NSNull())
-            map.append(key: "action", value: op.action)
-            ops.append(map)
-        }
-        let body = OrderedCBORMap()
-        body.append(key: "ops", value: ops)
-        body.append(key: "rev", value: material.rev)
-        body.append(key: "seq", value: seq)
-        body.append(key: "repo", value: material.did)
-        body.append(key: "time", value: material.time)
-        body.append(key: "blobs", value: [Any]())
-        body.append(key: "since", value: material.since)
-        body.append(key: "blocks", value: diffCAR)
-        body.append(key: "commit", value: commitLink)
-        body.append(key: "rebase", value: false)
-        body.append(key: "tooBig", value: false)
-        body.append(key: "prevData", value: prevDataLink)
-        return try frame(type: "#commit", body: body)
-    }
-    // syncFrame / identityFrame / accountFrame analogous, fields per spec.
+  public static func commitFrame(
+    seq: Int64,
+    material: PublicFirehoseCommitMaterial,
+    diffCAR: Data
+  ) throws -> Data
 
-    public static func infoFrame(name: String, message: String?) throws -> Data { … }
-    public static func errorFrame(error: String, message: String?) throws -> Data {
-        // header {"op": -1} (no "t"), body {"error": …, "message"?: …}
-        …
-    }
+  public static func syncFrame(
+    seq: Int64,
+    material: PublicFirehoseSyncMaterial,
+    commitCAR: Data
+  ) throws -> Data
 
-    private static func frame(type: String, body: OrderedCBORMap) throws -> Data {
-        let header = OrderedCBORMap()
-        header.append(key: "t", value: type)
-        header.append(key: "op", value: 1)
-        let encoded = try DAGCBOR.encodeValue(header) + DAGCBOR.encodeValue(body)
-        guard encoded.count <= FirehoseFrameLimits.maximumFrameBytes else {
-            throw FirehoseFrameEncoderError.frameTooLarge(encoded.count)
-        }
-        return encoded
-    }
+  public static func identityFrame(
+    seq: Int64,
+    material: PublicFirehoseIdentityMaterial
+  ) throws -> Data
 
-    private static func link(_ cidString: String) throws -> ATProtoLink {
-        guard let cid = try? CID.parse(cidString) else {
-            throw FirehoseFrameEncoderError.invalidCID(cidString)
-        }
-        return ATProtoLink(cid: cid)
-    }
+  public static func accountFrame(
+    seq: Int64,
+    material: PublicFirehoseAccountMaterial
+  ) throws -> Data
+
+  public static func infoFrame(name: String, message: String?) throws -> Data
+  public static func errorFrame(error: String, message: String?) throws -> Data
 }
 ```
-IMPORTANT: `OrderedCBORMap`'s canonical-ordering behavior belongs to Petrel — if it sorts on encode, insertion order above is irrelevant; if it preserves insertion order, insert in DAG-CBOR canonical key order (length-first, then bytewise: e.g. `ops, rev, seq, repo, time, blobs, since, blocks, commit, rebase, tooBig, prevData`). Check `OrderedCBORMap.swift:4` and the commit-encoder precedent, then match. Same for `CID.parse` vs the real parse API name and `ATProtoLink`'s init.
 
-- [ ] **Step 4: Run tests, verify pass**
+Each method returns the complete concatenated frame:
 
-Run: `swift test --filter FirehoseFrameEncoderTests`
-Expected: PASS.
+```text
+canonical DAG-CBOR header object || canonical DAG-CBOR body object
+```
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 1: Add the test-only two-object decoder first**
+
+Petrel does not currently expose the decode helpers used in the submitted sketch. Add `FirehoseFrameTestDecoder.swift`, modeled on the private `CommitCBORParser` in `Sources/SwanPublicRepository/PublicRepositoryCommit.swift`.
+
+The helper must:
+
+- parse one canonical CBOR value and return its consumed byte count;
+- parse the second value from the exact remaining bytes;
+- reject trailing bytes;
+- support maps, arrays, strings, byte strings, signed/unsigned integers, booleans, null, and tag-42 CID links;
+- validate shortest integer encodings and canonical map-key order;
+- expose a small test-only value enum rather than `[String: Any]` casts;
+- preserve the distinction between null, omitted fields, and tag-42 CIDs.
+
+Do not add a production decoder in Phase 1 and do not import transitive `SwiftCBOR` directly.
+
+- [ ] **Step 2: Write failing encoder tests**
+
+Cover at least:
+
+1. Ordinary create commit:
+   - header `op = 1`, `t = #commit`;
+   - `seq`, `repo`, `rev`, `since`, `commit`, `prevData`, `blocks`, `ops`;
+   - `rebase = false`, `tooBig = false`, `blobs = []`;
+   - create operation has link `cid` and omitted `prev`.
+2. Initial/genesis-shaped commit:
+   - `since` is CBOR null;
+   - `prevData` is absent.
+3. Update and delete operation link/null semantics.
+4. `#sync` uses only the required `seq`, `did`, `blocks`, `rev`, and `time` body fields; its supplied CAR is separately proven commit-rooted by `PublicFirehoseDiffCARTests`.
+5. Identity with and without handle.
+6. Active account requires nil status; inactive account requires non-nil status.
+7. `#info` header type and body.
+8. Error frame header `{op: -1}` with no `t`.
+9. sequence `0` and `2^53` rejection.
+10. 201-op rejection.
+11. commit CAR over 2,000,000 rejection.
+12. sync CAR over 10,000 rejection.
+13. complete-frame over 5,000,000 rejection.
+14. invalid CID rejection.
+15. malformed action/CID/previous-CID combinations rejection.
+16. deterministic byte equality across repeated encodes.
+
+- [ ] **Step 3: Confirm red**
 
 ```bash
-jj commit Sources/SwanPublicFirehose Tests/SwanPublicFirehoseTests -m "firehose: add DAG-CBOR frame encoder with limits"
+swift test --filter FirehoseFrameEncoderTests
+```
+
+- [ ] **Step 4: Implement using Petrel’s actual immutable map API**
+
+Construct maps with `OrderedCBORMap(entries:)`, for example:
+
+```swift
+let header = OrderedCBORMap(entries: [
+  (key: "op", value: 1),
+  (key: "t", value: "#commit"),
+])
+```
+
+Petrel canonicalizes keys when encoding; canonical wire order for this header is therefore `t` then `op` because DAG-CBOR sorts by encoded key length and then bytewise. The source entry order is not a wire contract.
+
+For commit operations:
+
+```swift
+let cidValue: Any
+if let cid = op.cid {
+  cidValue = try link(cid)
+} else {
+  cidValue = NSNull()
+}
+
+var entries: [(key: String, value: Any)] = [
+  ("cid", cidValue),
+  ("path", op.path),
+  ("action", op.action.rawValue),
+]
+if let prev = op.prev {
+  entries.append(("prev", try link(prev)))
+}
+```
+
+Build the commit body with:
+
+- `since` always present as string or null;
+- `prevData` only when non-nil;
+- `cid` always present in every op as link or null;
+- `prev` omitted when nil;
+- empty `[Any]()` for `blobs`.
+
+Use:
+
+```swift
+private static func link(_ string: String) throws -> ATProtoLink {
+  do {
+    return ATProtoLink(cid: try CID.parse(string))
+  } catch {
+    throw FirehoseFrameEncoderError.invalidCID(string)
+  }
+}
+```
+
+Validate limits before encoding where possible, then validate the final concatenated byte count.
+
+- [ ] **Step 5: Confirm green**
+
+```bash
+swift test --filter FirehoseFrameEncoderTests
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+jj commit Sources/SwanPublicFirehose Tests/SwanPublicFirehoseTests \
+  -m "firehose: add canonical frame encoder and strict test decoder"
 ```
 
 ---
-
-### Task 3: Account-local `public_event_outbox` table + store methods
+### Task 3: Add the strict-FIFO account-local public event outbox
 
 **Files:**
-- Modify: `Sources/SwanSQLite/SwanSQLite.swift` (migration version constant + migration function + call in `migrateWithoutGate()`)
+
+- Modify: `Package.swift`
+- Modify: `Sources/SwanSQLite/SwanSQLite.swift`
 - Create: `Sources/SwanSQLite/PublicFirehoseOutboxStore.swift`
-- Modify: `Package.swift` (add `"SwanPublicFirehose"` to `SwanSQLite` target dependencies and to `SwanSQLiteTests`)
 - Test: `Tests/SwanSQLiteTests/PublicFirehoseOutboxStoreTests.swift`
 
-**Interfaces:**
-- Consumes: Task 1 types; `SQLiteAccountDatabase` internals (`connection`, `withConnectionGate`, `transaction`).
-- Produces (on `extension SQLiteAccountDatabase`):
-  - `struct PublicFirehoseOutboxRow: Sendable, Equatable { let id: Int64; let sourceKey: String; let kind: PublicFirehoseEventKind; let lifecycleGeneration: Int64; let payload: Data; let diffCAR: Data?; let createdAt: Int64; let attempts: Int }`
-  - `struct PublicFirehoseOutboxLease: Sendable, Equatable { let row: PublicFirehoseOutboxRow; let token: UUID; let expiresAt: Date }`
-  - `func enqueuePublicFirehoseEventInTransaction(sourceKey:kind:lifecycleGeneration:payload:diffCAR:createdAt:) async throws` — **no gate/transaction of its own**; caller must already hold one (Task 4 calls it from inside `applyPublicRepositoryMutation`'s transaction).
-  - `func enqueuePublicFirehoseEvent(sourceKey:kind:lifecycleGeneration:payload:diffCAR:now:) async throws -> Bool` — standalone (gate+txn), returns false if `sourceKey` already present (idempotent saga enqueue).
-  - `func leaseNextPublicFirehoseOutbox(now: Date = Date(), leaseDuration: TimeInterval) async throws -> PublicFirehoseOutboxLease?`
-  - `@discardableResult func completePublicFirehoseOutboxLease(id: Int64, token: UUID) async throws -> Bool` — deletes the row, token-checked.
-  - `@discardableResult func failPublicFirehoseOutboxLease(id: Int64, token: UUID, retryAt: Date) async throws -> Int?`
-  - `func pendingPublicFirehoseOutbox(limit: Int = 100) async throws -> [PublicFirehoseOutboxRow]`
+**Package changes:**
 
-- [ ] **Step 1: Add schema migration**
+- Add `"SwanPublicFirehose"` to the `SwanSQLite` target dependencies.
+- Add `"SwanPublicFirehose"` to `SwanSQLiteTests` dependencies.
 
-In `SQLiteAccountDatabase` (`SwanSQLite.swift`), next to the other version constants:
+**Produces on `SQLiteAccountDatabase`:**
+
 ```swift
-    private static let publicFirehoseOutboxMigrationVersion = 13
-```
-New function, modeled verbatim on `migratePermissionedOutboxLeasesIfNeeded` (`SwanSQLite.swift:2480`):
-```swift
-    private func migratePublicFirehoseOutboxIfNeeded() async throws {
-        let version = Self.publicFirehoseOutboxMigrationVersion
-        let applied = try await connection.query(
-            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
-            [.integer(version)]
-        )
-        guard applied.isEmpty else { return }
+public struct PublicFirehoseOutboxRow: Sendable, Equatable {
+  public let id: Int64
+  public let sourceKey: String
+  public let kind: PublicFirehoseEventKind
+  public let lifecycleGeneration: Int64
+  public let payload: Data
+  public let carBytes: Data
+  public let createdAt: Int64
+  public let availableAt: Int64
+  public let attempts: Int
+}
 
-        _ = try await connection.query(
-            """
-            CREATE TABLE IF NOT EXISTS public_event_outbox (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_key TEXT NOT NULL UNIQUE,
-                kind TEXT NOT NULL CHECK(kind IN ('commit', 'sync')),
-                lifecycle_generation INTEGER NOT NULL DEFAULT 0
-                    CHECK(lifecycle_generation >= 0),
-                payload BLOB NOT NULL,
-                diff_car BLOB,
-                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
-                created_at INTEGER NOT NULL CHECK(created_at >= 0),
-                available_at INTEGER NOT NULL CHECK(available_at >= 0),
-                lease_token TEXT,
-                lease_expires_at INTEGER,
-                CHECK(
-                    (lease_token IS NULL AND lease_expires_at IS NULL)
-                    OR (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL
-                        AND lease_expires_at >= 0)
-                )
-            )
-            """
-        )
-        _ = try await connection.query(
-            """
-            CREATE INDEX IF NOT EXISTS public_event_outbox_available
-            ON public_event_outbox(available_at, created_at, id)
-            """
-        )
-        _ = try await connection.query(
-            """
-            INSERT INTO permissioned_repository_migrations(version, applied_at)
-            VALUES (?, ?)
-            """,
-            [
-                .integer(version),
-                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
-            ]
-        )
-    }
-```
-Call it in `migrateWithoutGate()` inside the first `transaction { … }`, immediately after `try await migratePermissionedRemoteReplicaLogicalLimitIfNeeded()`.
-
-`id INTEGER PRIMARY KEY AUTOINCREMENT` (not UUID like the permissioned outbox): drain order must be insertion order per account — `ORDER BY available_at, id` gives it directly.
-
-- [ ] **Step 2: Write the failing tests**
-
-`Tests/SwanSQLiteTests/PublicFirehoseOutboxStoreTests.swift` (copy the private `temporaryDirectory()` helper pattern from `PublicRepositoryMutationStoreTests.swift:1168` — 0o700 permissions are mandatory):
-```swift
-import Foundation
-import SwanPublicFirehose
-@testable import SwanSQLite
-import XCTest
-
-final class PublicFirehoseOutboxStoreTests: XCTestCase {
-    private let did = "did:plc:abcdefghijklmnopqrstuvwx"
-
-    func testEnqueueLeaseCompleteLifecycle() async throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
-        defer { Task { try? await database.close() } }
-
-        let inserted = try await database.enqueuePublicFirehoseEvent(
-            sourceKey: PublicFirehoseSourceKey.commit(did: did, commitCID: "bafyreiabc"),
-            kind: .commit,
-            lifecycleGeneration: 0,
-            payload: Data("{}".utf8),
-            diffCAR: Data([0x01]),
-            now: Date(timeIntervalSince1970: 1_754_308_800)
-        )
-        XCTAssertTrue(inserted)
-
-        // Same source key again: idempotent, no duplicate.
-        let duplicate = try await database.enqueuePublicFirehoseEvent(
-            sourceKey: PublicFirehoseSourceKey.commit(did: did, commitCID: "bafyreiabc"),
-            kind: .commit,
-            lifecycleGeneration: 0,
-            payload: Data("{}".utf8),
-            diffCAR: Data([0x01]),
-            now: Date(timeIntervalSince1970: 1_754_308_801)
-        )
-        XCTAssertFalse(duplicate)
-
-        let lease = try await database.leaseNextPublicFirehoseOutbox(
-            now: Date(timeIntervalSince1970: 1_754_308_802),
-            leaseDuration: 30
-        )
-        let unwrapped = try XCTUnwrap(lease)
-        XCTAssertEqual(unwrapped.row.kind, .commit)
-        XCTAssertEqual(unwrapped.row.diffCAR, Data([0x01]))
-
-        // Leased row is invisible to a second lease until expiry.
-        let second = try await database.leaseNextPublicFirehoseOutbox(
-            now: Date(timeIntervalSince1970: 1_754_308_803),
-            leaseDuration: 30
-        )
-        XCTAssertNil(second)
-
-        // Stale token cannot complete.
-        let stale = try await database.completePublicFirehoseOutboxLease(
-            id: unwrapped.row.id, token: UUID()
-        )
-        XCTAssertFalse(stale)
-
-        let done = try await database.completePublicFirehoseOutboxLease(
-            id: unwrapped.row.id, token: unwrapped.token
-        )
-        XCTAssertTrue(done)
-        let remaining = try await database.pendingPublicFirehoseOutbox()
-        XCTAssertTrue(remaining.isEmpty)
-    }
-
-    func testFailReschedulesWithAttemptIncrement() async throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
-        defer { Task { try? await database.close() } }
-
-        _ = try await database.enqueuePublicFirehoseEvent(
-            sourceKey: "k1", kind: .sync, lifecycleGeneration: 0,
-            payload: Data("{}".utf8), diffCAR: nil,
-            now: Date(timeIntervalSince1970: 1_754_308_800)
-        )
-        let lease = try XCTUnwrap(try await database.leaseNextPublicFirehoseOutbox(
-            now: Date(timeIntervalSince1970: 1_754_308_801), leaseDuration: 30
-        ))
-        let attempts = try await database.failPublicFirehoseOutboxLease(
-            id: lease.row.id, token: lease.token,
-            retryAt: Date(timeIntervalSince1970: 1_754_308_900)
-        )
-        XCTAssertEqual(attempts, 1)
-        // Not yet available before retryAt.
-        let early = try await database.leaseNextPublicFirehoseOutbox(
-            now: Date(timeIntervalSince1970: 1_754_308_850), leaseDuration: 30
-        )
-        XCTAssertNil(early)
-        let later = try await database.leaseNextPublicFirehoseOutbox(
-            now: Date(timeIntervalSince1970: 1_754_308_901), leaseDuration: 30
-        )
-        XCTAssertNotNil(later)
-    }
-
-    private func temporaryDirectory() throws -> URL {
-        let root = FileManager.default.temporaryDirectory
-            .appending(path: "PublicFirehoseOutboxStoreTests-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o700], ofItemAtPath: root.path
-        )
-        return root
-    }
+public struct PublicFirehoseOutboxLease: Sendable, Equatable {
+  public let row: PublicFirehoseOutboxRow
+  public let token: UUID
+  public let expiresAt: Date
 }
 ```
 
-- [ ] **Step 3: Run tests, verify fail**
+Methods:
 
-Run: `swift test --filter PublicFirehoseOutboxStoreTests`
-Expected: compile failure (methods missing).
-
-- [ ] **Step 4: Implement `PublicFirehoseOutboxStore.swift`**
-
-`extension SQLiteAccountDatabase` cloning the permissioned outbox bodies (lease SQL from `SwanSQLite.swift:8213`, complete `:8263`, fail `:8298`), adapted: table `public_event_outbox`, `ORDER BY available_at, id LIMIT 1`, integer id bindings, and decode via the existing `requiredText`/`requiredInteger`/`requiredBlob` helpers. The in-transaction enqueue:
 ```swift
-    func enqueuePublicFirehoseEventInTransaction(
-        sourceKey: String,
-        kind: PublicFirehoseEventKind,
-        lifecycleGeneration: Int64,
-        payload: Data,
-        diffCAR: Data?,
-        createdAt: Int64
-    ) async throws {
-        _ = try await connection.query(
-            """
-            INSERT INTO public_event_outbox(
-                source_key, kind, lifecycle_generation, payload, diff_car,
-                attempts, created_at, available_at, lease_token, lease_expires_at
-            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL)
-            """,
-            [
-                .text(sourceKey), .text(kind.rawValue), .integer(Int(lifecycleGeneration)),
-                payload.sqliteData!, diffCAR.map { $0.sqliteData! } ?? .null,
-                .integer(Int(createdAt)), .integer(Int(createdAt)),
-            ]
-        )
-    }
+func enqueuePublicFirehoseEventInTransaction(
+  sourceKey: String,
+  kind: PublicFirehoseEventKind,
+  lifecycleGeneration: Int64,
+  payload: Data,
+  carBytes: Data,
+  createdAt: Int64
+) async throws -> Bool
+
+public func enqueuePublicFirehoseEvent(
+  sourceKey: String,
+  kind: PublicFirehoseEventKind,
+  lifecycleGeneration: Int64,
+  payload: Data,
+  carBytes: Data,
+  now: Date
+) async throws -> Bool
+
+public func oldestPendingPublicFirehoseOutbox()
+  async throws -> PublicFirehoseOutboxRow?
+
+public func leaseNextPublicFirehoseOutbox(
+  now: Date = Date(),
+  leaseDuration: TimeInterval
+) async throws -> PublicFirehoseOutboxLease?
+
+@discardableResult
+public func completePublicFirehoseOutboxLease(
+  id: Int64,
+  token: UUID
+) async throws -> Bool
+
+@discardableResult
+public func failPublicFirehoseOutboxLease(
+  id: Int64,
+  token: UUID,
+  retryAt: Date
+) async throws -> Int?
+
+public func pendingPublicFirehoseOutbox(
+  limit: Int = 100
+) async throws -> [PublicFirehoseOutboxRow]
 ```
-The standalone variant wraps `withConnectionGate { transaction { … } }`, first `SELECT 1 … WHERE source_key = ?` and returns `false` if present.
 
-- [ ] **Step 5: Run tests, verify pass; run the full SwanSQLite suite for regressions**
+Add a storage error case for exact-key conflicts, for example:
 
-Run: `swift test --filter PublicFirehoseOutboxStoreTests` → PASS.
-Run: `swift test --filter SwanSQLiteTests` → no new failures (migration must not break existing DBs).
+```swift
+case conflictingPublicFirehoseSourceKey(String)
+```
+
+- [ ] **Step 1: Add account migration version 13**
+
+In `SQLiteAccountDatabase`:
+
+```swift
+private static let publicFirehoseOutboxMigrationVersion = 13
+```
+
+Create:
+
+```sql
+CREATE TABLE IF NOT EXISTS public_event_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_key TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL CHECK(kind IN ('commit', 'sync')),
+    lifecycle_generation INTEGER NOT NULL DEFAULT 0
+        CHECK(lifecycle_generation >= 0),
+    payload BLOB NOT NULL CHECK(length(payload) > 0),
+    car_bytes BLOB NOT NULL CHECK(length(car_bytes) > 0),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    available_at INTEGER NOT NULL CHECK(available_at >= 0),
+    lease_token TEXT,
+    lease_expires_at INTEGER,
+    CHECK(
+        (lease_token IS NULL AND lease_expires_at IS NULL)
+        OR (
+            lease_token IS NOT NULL
+            AND lease_expires_at IS NOT NULL
+            AND lease_expires_at >= 0
+        )
+    )
+);
+```
+
+A source row always contains CAR bytes:
+
+- commit row: exact diff CAR;
+- sync row: exact commit-only CAR.
+
+Do not use a nullable `diff_car` column.
+
+Insert migration ledger version 13 using the existing account migration pattern. Call it from the account migration transaction after the current version-12 migration.
+
+- [ ] **Step 2: Write failing store tests**
+
+Cover:
+
+1. enqueue → lease → complete;
+2. exact source-key replay returns `false` and leaves one row;
+3. same source key with changed kind, generation, payload, or CAR throws conflict;
+4. active lease is invisible until expiry;
+5. stale token cannot complete or fail;
+6. failure increments attempts and reschedules;
+7. strict head-of-line behavior:
+   - enqueue `k1`, then `k2`;
+   - lease and fail `k1` to a future `retryAt`;
+   - a lease before that deadline returns nil even though `k2` is otherwise ready;
+   - after the deadline, `k1` leases first and `k2` only after `k1` completes;
+8. pending rows are returned in ascending `id` order;
+9. `.identity` and `.account` are rejected by the account outbox before SQL;
+10. invalid lease durations, timestamp overflow, invalid limits, or corrupt rows fail closed.
+
+Use corrected fixed dates beginning at:
+
+```swift
+Date(timeIntervalSince1970: 1_785_844_800)
+```
+
+- [ ] **Step 3: Confirm red**
+
+```bash
+swift test --filter PublicFirehoseOutboxStoreTests
+```
+
+- [ ] **Step 4: Implement exact replay and strict FIFO**
+
+The standalone enqueue wraps:
+
+```swift
+try await withConnectionGate {
+  try await transaction { ... }
+}
+```
+
+The in-transaction helper does not acquire the gate or begin a transaction.
+
+On source-key reuse:
+
+1. read the existing row;
+2. compare kind, lifecycle generation, payload, and CAR byte-for-byte;
+3. return `false` only if all values match;
+4. otherwise throw `conflictingPublicFirehoseSourceKey`.
+
+The lease query must examine only the smallest outstanding `id`. It must not order by `available_at`, because that would allow a later repository revision to overtake a failed earlier revision.
+
+Use this logical flow in one transaction:
+
+```text
+head = SELECT ... FROM public_event_outbox ORDER BY id LIMIT 1
+if no head: return nil
+if head.available_at > now: return nil
+if head has an unexpired lease: return nil
+UPDATE that exact id with a new token and expiry, guarded by availability/expiry
+RETURNING row
+```
+
+A blocked account head is local to that DID; Task 7 will continue checking other DIDs.
+
+`oldestPendingPublicFirehoseOutbox` is a non-leasing peek used only by the sequencer’s causal merge. It returns the smallest `id` regardless of availability or lease state.
+
+The helper functions `requiredText`, `requiredInteger`, and `requiredBlob` in `SwanSQLite.swift` are private and cannot be called from a new file. Either:
+
+- add file-private decoding helpers in `PublicFirehoseOutboxStore.swift`, or
+- deliberately refactor only the shared safe row helpers to internal access and run the full SQLite suite.
+
+Do not simply reference the current private helpers from another file.
+
+- [ ] **Step 5: Confirm focused and full SQLite tests**
+
+```bash
+swift test --filter PublicFirehoseOutboxStoreTests
+swift test --filter SwanSQLiteTests
+```
 
 - [ ] **Step 6: Commit**
 
 ```bash
-jj commit Package.swift Sources/SwanSQLite Tests/SwanSQLiteTests -m "firehose: add account-local public event outbox"
+jj commit Package.swift Sources/SwanSQLite Tests/SwanSQLiteTests \
+  -m "firehose: add strict FIFO public event outbox"
 ```
 
 ---
 
-### Task 4: Enqueue commit events inside `applyPublicRepositoryMutation`
+### Task 4: Derive and enqueue final commit-or-sync material atomically with public writes
 
 **Files:**
-- Modify: `Sources/SwanSQLite/PublicRepositoryStore.swift` (insertion point F, after the request is marked committed, before `return CommittedPublicRepositoryMutation(…)` — around line 460)
+
 - Create: `Sources/SwanPublicFirehose/PublicFirehoseDiffCAR.swift`
-- Test: `Tests/SwanSQLiteTests/PublicFirehoseCommitEnqueueTests.swift`, additions to `Tests/SwanPublicFirehoseTests/PublicFirehoseDiffCARTests.swift`
+- Test: `Tests/SwanPublicFirehoseTests/PublicFirehoseDiffCARTests.swift`
+- Modify: `Sources/SwanSQLite/PublicRepositoryStore.swift`
+- Test: `Tests/SwanSQLiteTests/PublicFirehoseCommitEnqueueTests.swift`
+- Modify existing public repository mutation failure-injection tests as required by the extra mutating SQL statement.
 
-**Interfaces:**
-- Consumes: in-scope transaction values — `prepared.state` (`did/revision/commitCID/dataCID`), `prepared.baseCommitCID`, `prepared.sinceRevision`, `prepared.signedCommit.{commitCID, signedCommitBytes}`, `prepared.recordResults`, `prepared.newBlocks`, `current.dataCID` (previous data root), `reservation`; Task 1 material types; Task 3 `enqueuePublicFirehoseEventInTransaction`.
-- Produces:
-  - `enum PublicFirehoseDiffCAR { static func build(commitCID: CID, commitBytes: Data, newBlocks: PublicRepositoryBlockMap) async throws -> Data }` — CAR with commit CID as root; block order: commit block first, remaining CIDs sorted ascending by `cid.string` (deterministic). Built with `PublicRepositoryCAR.write(rootCID:blocks:to:)` using a private array-backed `PublicRepositoryCARBlockStream` (copy the shape of `ArrayCARBlockStream` in `Tests/SwanPublicRepositoryTests/PublicRepositoryCARTests.swift:818`) and a private in-memory `PublicRepositoryCARByteSink`.
-  - `enum PublicFirehoseCommitDecision: Equatable { case commit; case sync }` + `static func decide(opCount: Int, diffCARByteCount: Int) -> PublicFirehoseCommitDecision` (sync iff `opCount > FirehoseFrameLimits.maximumOps || diffCARByteCount > FirehoseFrameLimits.maximumBlocksBytes`).
-  - `applyPublicRepositoryMutation` gains an outbox row per committed mutation. New optional parameter `lifecycleGeneration: Int64 = 0` (threaded for real in Phase 4) and `eventTime: Date = Date()` — compute BOTH **before** the SQL statements, never inside a tight loop.
+**Critical signature rule:**
 
-- [ ] **Step 1: Write the failing diff-CAR unit tests**
+Do **not** add parameters to:
 
-`Tests/SwanPublicFirehoseTests/PublicFirehoseDiffCARTests.swift`:
 ```swift
-import Foundation
-import Petrel
-import SwanPublicRepository
-@testable import SwanPublicFirehose
-import XCTest
-
-final class PublicFirehoseDiffCARTests: XCTestCase {
-    func testBuildProducesCommitRootedDeterministicCAR() async throws {
-        let commitBytes = Data("commit-block".utf8)
-        let commitCID = CID.fromDAGCBOR(commitBytes)
-        let blockA = Data("block-a".utf8)
-        let blockB = Data("block-b".utf8)
-        let blocks = try PublicRepositoryBlockMap(blocks: [
-            PublicRepositoryBlock(cid: CID.fromDAGCBOR(blockA), bytes: blockA),
-            PublicRepositoryBlock(cid: CID.fromDAGCBOR(blockB), bytes: blockB),
-            PublicRepositoryBlock(cid: commitCID, bytes: commitBytes),
-        ])
-        let first = try await PublicFirehoseDiffCAR.build(
-            commitCID: commitCID, commitBytes: commitBytes, newBlocks: blocks
-        )
-        let second = try await PublicFirehoseDiffCAR.build(
-            commitCID: commitCID, commitBytes: commitBytes, newBlocks: blocks
-        )
-        XCTAssertEqual(first, second, "diff CAR must be byte-deterministic")
-        XCTAssertFalse(first.isEmpty)
-        // Root + first block must be the commit: assert the commit CID bytes
-        // appear before either record block's CID bytes in the CAR.
-        let commitRange = first.range(of: commitBytes)
-        let aRange = first.range(of: blockA)
-        XCTAssertNotNil(commitRange)
-        XCTAssertNotNil(aRange)
-        XCTAssertLessThan(commitRange!.lowerBound, aRange!.lowerBound)
-    }
-
-    func testDecision() {
-        XCTAssertEqual(PublicFirehoseDiffCAR.decide(opCount: 1, diffCARByteCount: 100), .commit)
-        XCTAssertEqual(PublicFirehoseDiffCAR.decide(opCount: 201, diffCARByteCount: 100), .sync)
-        XCTAssertEqual(
-            PublicFirehoseDiffCAR.decide(opCount: 1, diffCARByteCount: 2_000_001), .sync
-        )
-    }
-}
+func applyPublicRepositoryMutation(
+  reservation: PublicRepositoryMutationReservation,
+  prepared: PreparedPublicRepositoryMutation
+) async throws -> CommittedPublicRepositoryMutation
 ```
-CAVEAT: `PublicRepositoryCID.validate` pins CIDv1/dag-cbor/sha256 — `CID.fromDAGCBOR(Data(...))` produces exactly that, so these synthetic blocks pass validation.
 
-- [ ] **Step 2: Run, verify fail; implement `PublicFirehoseDiffCAR`**
+That exact method is a `PublicRepositoryMutationStore` protocol requirement. Defaulted extra parameters do not satisfy the protocol witness. Phase 1 stamps normal public commits with lifecycle generation `0`; Phase 4 will add a durable lifecycle-generation handoff without changing this protocol surface.
 
-Run: `swift test --filter PublicFirehoseDiffCARTests` → compile failure.
-Implement in `Sources/SwanPublicFirehose/PublicFirehoseDiffCAR.swift`:
+**Produces:**
+
 ```swift
-import Foundation
-import Petrel
-import SwanPublicRepository
-
 public enum PublicFirehoseDiffCAR {
-    public static func build(
-        commitCID: CID,
-        commitBytes: Data,
-        newBlocks: PublicRepositoryBlockMap
-    ) async throws -> Data {
-        var ordered: [PublicRepositoryBlock] = [
-            PublicRepositoryBlock(cid: commitCID, bytes: commitBytes)
-        ]
-        let remaining = newBlocks.cids
-            .filter { $0 != commitCID }
-            .sorted { $0.string < $1.string }
-        for cid in remaining {
-            guard let bytes = newBlocks.block(for: cid) else {
-                throw PublicFirehoseDiffCARError.missingBlock(cid.string)
-            }
-            ordered.append(PublicRepositoryBlock(cid: cid, bytes: bytes))
-        }
-        let sink = MemoryCARSink()
-        _ = try await PublicRepositoryCAR.write(
-            rootCID: commitCID,
-            blocks: ArrayBlockStream(blocks: ordered),
-            to: sink
-        )
-        return await sink.data
-    }
+  public static func build(
+    commitCID: CID,
+    commitBytes: Data,
+    newBlocks: PublicRepositoryBlockMap
+  ) async throws -> Data
 
-    public static func decide(
-        opCount: Int, diffCARByteCount: Int
-    ) -> PublicFirehoseCommitDecision {
-        if opCount > FirehoseFrameLimits.maximumOps { return .sync }
-        if diffCARByteCount > FirehoseFrameLimits.maximumBlocksBytes { return .sync }
-        return .commit
-    }
-}
-
-public enum PublicFirehoseCommitDecision: Equatable { case commit, sync }
-public enum PublicFirehoseDiffCARError: Error { case missingBlock(String) }
-
-private actor MemoryCARSink: PublicRepositoryCARByteSink {
-    private(set) var buffer = Data()
-    var data: Data { buffer }
-    func write(_ bytes: Data) async throws { buffer.append(bytes) }
-}
-
-private actor ArrayBlockStream: PublicRepositoryCARBlockStream {
-    private var blocks: [PublicRepositoryBlock]
-    init(blocks: [PublicRepositoryBlock]) { self.blocks = blocks }
-    func nextBlock() async throws -> PublicRepositoryBlock? {
-        blocks.isEmpty ? nil : blocks.removeFirst()
-    }
+  public static func commitOnly(
+    commitCID: CID,
+    commitBytes: Data
+  ) async throws -> Data
 }
 ```
-Run: `swift test --filter PublicFirehoseDiffCARTests` → PASS.
 
-- [ ] **Step 3: Write the failing integration test**
+The diff CAR is deterministic:
 
-`Tests/SwanSQLiteTests/PublicFirehoseCommitEnqueueTests.swift` — reuse the setup shape of `PublicRepositoryMutationStoreTests` (genesis install via `PublicRepositoryGenesisCodec.create`, `reservePublicRepositoryRevision`, engine-prepared mutation, then `applyPublicRepositoryMutation`; copy an existing passing mutation test's fixture wholesale — `Fixture`/`commitFirst(on:)` in `Tests/SwanSQLiteTests/SwanSQLiteTests.swift` if reusable). Assertions after a successful commit:
-```swift
-        let rows = try await database.pendingPublicFirehoseOutbox()
-        XCTAssertEqual(rows.count, 1)
-        let row = rows[0]
-        XCTAssertEqual(row.kind, .commit)
-        XCTAssertEqual(
-            row.sourceKey,
-            PublicFirehoseSourceKey.commit(did: did, commitCID: committed.state.commitCID.string)
-        )
-        let material = try JSONDecoder().decode(
-            PublicFirehoseCommitMaterial.self, from: row.payload
-        )
-        XCTAssertEqual(material.did, did)
-        XCTAssertEqual(material.rev, committed.state.revision)
-        XCTAssertEqual(material.commitCID, committed.state.commitCID.string)
-        XCTAssertEqual(material.ops.count, 1)
-        XCTAssertEqual(material.ops[0].action, "create")
-        let car = try XCTUnwrap(row.diffCAR)
-        XCTAssertFalse(car.isEmpty)
-```
-Add a second test: replay the same reservation/prepared pair (idempotent path A) and assert `pendingPublicFirehoseOutbox()` still has exactly 1 row.
+1. root is the commit CID;
+2. commit block is emitted first;
+3. all remaining block CIDs are sorted ascending by `cid.string`;
+4. no duplicate commit block;
+5. every emitted block’s bytes validate against its CID.
 
-- [ ] **Step 4: Run, verify fail; hook the mutation transaction**
+- [ ] **Step 1: Write failing diff-CAR tests**
 
-Run: `swift test --filter PublicFirehoseCommitEnqueueTests` → failure (0 rows).
+Cover:
 
-In `applyPublicRepositoryMutation`, at point F (after the `marked.count == 1` guard, before `return CommittedPublicRepositoryMutation(…)`), with `import SwanPublicFirehose` added to the file:
-```swift
-                let diffCAR = try await PublicFirehoseDiffCAR.build(
-                    commitCID: prepared.signedCommit.commitCID,
-                    commitBytes: prepared.signedCommit.signedCommitBytes,
-                    newBlocks: prepared.newBlocks
-                )
-                let ops = prepared.recordResults.map { result in
-                    PublicFirehoseRepoOp(
-                        action: result.action.rawValue,
-                        path: "\(result.path.collection)/\(result.path.recordKey)",
-                        cid: result.recordCID?.string,
-                        prev: result.previousRecordCID?.string
-                    )
-                }
-                let time = PublicFirehoseTime.encode(eventTime)
-                let decision = PublicFirehoseDiffCAR.decide(
-                    opCount: ops.count, diffCARByteCount: diffCAR.count
-                )
-                let createdAt = Int64(eventTime.timeIntervalSince1970 * 1_000_000)
-                switch decision {
-                case .commit:
-                    let material = PublicFirehoseCommitMaterial(
-                        did: accountDID,
-                        rev: prepared.state.revision,
-                        since: prepared.sinceRevision,
-                        commitCID: prepared.state.commitCID.string,
-                        prevDataCID: current.dataCID.string,
-                        ops: ops,
-                        time: time
-                    )
-                    try await enqueuePublicFirehoseEventInTransaction(
-                        sourceKey: PublicFirehoseSourceKey.commit(
-                            did: accountDID,
-                            commitCID: prepared.state.commitCID.string
-                        ),
-                        kind: .commit,
-                        lifecycleGeneration: lifecycleGeneration,
-                        payload: try JSONEncoder().encode(material),
-                        diffCAR: diffCAR,
-                        createdAt: createdAt
-                    )
-                case .sync:
-                    let commitOnlyCAR = try await PublicFirehoseDiffCAR.build(
-                        commitCID: prepared.signedCommit.commitCID,
-                        commitBytes: prepared.signedCommit.signedCommitBytes,
-                        newBlocks: try PublicRepositoryBlockMap(blocks: [])
-                    )
-                    let material = PublicFirehoseSyncMaterial(
-                        did: accountDID,
-                        rev: prepared.state.revision,
-                        commitCID: prepared.state.commitCID.string,
-                        time: time
-                    )
-                    try await enqueuePublicFirehoseEventInTransaction(
-                        sourceKey: PublicFirehoseSourceKey.syncOversize(
-                            did: accountDID,
-                            commitCID: prepared.state.commitCID.string
-                        ),
-                        kind: .sync,
-                        lifecycleGeneration: lifecycleGeneration,
-                        payload: try JSONEncoder().encode(material),
-                        diffCAR: commitOnlyCAR,
-                        createdAt: createdAt
-                    )
-                }
-```
-Check the real property names on `PublicRepositoryMutationRecordResult` (`.action` raw value, `PublicRepositoryPath.collection/.recordKey`) at `PublicRepositoryEngine.swift:25-40` — adjust to the actual accessors if `rawValue` isn't `"create"/"update"/"delete"` (if the enum's raw values differ, map explicitly).
+- repeated builds are byte-identical;
+- CAR root is the commit CID;
+- commit block is the first block;
+- remaining blocks are sorted by CID string, not `Set` iteration order;
+- a missing block produces a typed error;
+- `commitOnly` contains exactly the commit block;
+- synthetic blocks use valid `CID.fromDAGCBOR` values.
 
-Signature change: append `lifecycleGeneration: Int64 = 0, eventTime: Date = Date()` to `applyPublicRepositoryMutation` — defaulted, so existing call sites (grep for `applyPublicRepositoryMutation(`; includes `SQLitePreMigratedAccountDirectory.swift:1850` wrapper) compile unchanged.
+Use a private array-backed `PublicRepositoryCARBlockStream` with an integer cursor. Do not use `removeFirst()` in the actor, which makes iteration quadratic.
 
-The idempotent-replay early return (point A) precedes point F, so replays cannot double-enqueue; the UNIQUE `source_key` is a backstop, not the mechanism.
-
-- [ ] **Step 5: Run tests, verify pass; full suite**
-
-Run: `swift test --filter PublicFirehoseCommitEnqueueTests` → PASS.
-Run: `swift test --filter SwanSQLiteTests` → no regressions (existing mutation tests must still pass with the defaulted parameters).
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 2: Confirm red, implement, and confirm green**
 
 ```bash
-jj commit Sources/SwanSQLite Sources/SwanPublicFirehose Tests -m "firehose: enqueue commit events inside public mutation transaction"
+swift test --filter PublicFirehoseDiffCARTests
+```
+
+Implementation uses `PublicRepositoryCAR.write(rootCID:blocks:to:)` and an in-memory actor sink. No filesystem or database access is allowed.
+
+- [ ] **Step 3: Add failing mutation integration tests**
+
+Reuse an existing real public mutation fixture: install genesis, reserve a revision, prepare through `PublicRepositoryEngine`, and call the protocol method.
+
+After a successful ordinary write, assert:
+
+- one account outbox row;
+- final kind `.commit`;
+- source key `did|commit|<new commit CID>`;
+- lifecycle generation `0`;
+- decoded material matches DID, new revision, previous revision, commit CID, previous data CID, and operations;
+- CAR is nonempty and deterministic;
+- repeated request replay keeps exactly one source row.
+
+Add these additional tests:
+
+1. **Action mapping:** create/update/delete map by explicit `switch`; no `.rawValue` exists on `PublicRepositoryMutationAction`.
+2. **Rollback on outbox conflict:** preinsert a conflicting row using the prepared commit source key, call apply, assert the repository head, projection, mutation request status, and outbox all remain at pre-call state.
+3. **Injected SQL failure:** every newly introduced mutation point rolls back repository blocks, projection, head, request status, and outbox together.
+4. **Final-frame fallback:** material whose final maximum-sequence commit frame exceeds a commit limit is persisted as `.sync` with a `syncOversize` key and commit-only CAR.
+5. **No runtime decision drift:** the stored event kind is final and replaying the same prepared mutation cannot change it.
+
+- [ ] **Step 4: Build pure event material before entering the repository transaction**
+
+At the beginning of `applyPublicRepositoryMutation`, before `withConnectionGate`:
+
+- capture `eventTime = Date()` once;
+- compute `eventTimeString` and checked microseconds once;
+- map `prepared.recordResults` to typed firehose operations using an explicit action switch;
+- build the deterministic diff CAR from `prepared.newBlocks`;
+- build the commit-only CAR from `prepared.signedCommit`.
+
+These operations use immutable prepared data and in-memory actors only. They must not open SQLite or perform network I/O.
+
+- [ ] **Step 5: Decide the durable final kind inside the existing transaction**
+
+After current state has been loaded and validated, build commit material using:
+
+```text
+did             = accountDID
+rev             = prepared.state.revision
+since           = prepared.sinceRevision
+commitCID       = prepared.state.commitCID.string
+prevDataCID     = current.dataCID.string
+ops             = precomputed typed ops
+time            = captured event time
+```
+
+Preflight the exact complete commit frame at the largest legal sequence:
+
+```swift
+try FirehoseFrameEncoder.commitFrame(
+  seq: FirehoseFrameLimits.maximumSequence,
+  material: material,
+  diffCAR: diffCAR
+)
+```
+
+Using the maximum sequence ensures the preflight is not smaller than a later real frame due to integer encoding width.
+
+Decision:
+
+- success → persist `.commit`, commit material, diff CAR, `commit` source key;
+- `tooManyOperations`, commit `blocksTooLarge`, or `frameTooLarge` → persist `.sync`, sync material, commit-only CAR, `syncOversize` source key;
+- invalid CID, invalid operation, invalid account state, or an invalid sync preflight → throw as an internal invariant violation and roll back the repository transaction.
+
+Preflight the generated sync frame at maximum sequence before insertion as well.
+
+The sequencer must never later reinterpret a persisted commit row as sync. The source transaction owns this decision.
+
+- [ ] **Step 6: Insert at the existing committed-request point**
+
+After the mutation request is marked committed and before returning `CommittedPublicRepositoryMutation`, call:
+
+```swift
+let inserted = try await enqueuePublicFirehoseEventInTransaction(...)
+guard inserted else {
+  throw PublicRepositoryMutationStoreError.corruptRepository
+}
+```
+
+An exact duplicate cannot legitimately occur on this path because committed-request replay returned earlier. Then immediately call:
+
+```swift
+try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
+```
+
+The new INSERT is part of the public mutation’s fault-injection sequence. Update expected mutation counts and all hostile rollback matrices rather than bypassing the instrumentation.
+
+The existing early committed-request replay return remains before this point; it is the primary duplicate-prevention mechanism. The unique source key is a second line of defense.
+
+- [ ] **Step 7: Confirm focused, SQLite, and repository suites**
+
+```bash
+swift test --filter PublicFirehoseCommitEnqueueTests
+swift test --filter PublicRepositoryMutationStoreTests
+swift test --filter SwanSQLiteTests
+```
+
+- [ ] **Step 8: Commit**
+
+```bash
+jj commit Sources/SwanPublicFirehose Sources/SwanSQLite Tests \
+  -m "firehose: enqueue final public events with repository commits"
 ```
 
 ---
-
-### Task 5: Control-plane lifecycle outbox + generation counter
+### Task 5: Add durable lifecycle batches and per-DID generations
 
 **Files:**
-- Modify: `Sources/SwanSQLite/SwanSQLite.swift` (`SQLiteLayout.controlMigrations` — append DDL)
+
+- Modify: `Sources/SwanSQLite/SwanSQLite.swift` (`SQLiteLayout.controlMigrations`)
 - Create: `Sources/SwanSQLite/LifecycleEventOutboxStore.swift`
 - Test: `Tests/SwanSQLiteTests/LifecycleEventOutboxStoreTests.swift`
 
-**Interfaces:**
-- Consumes: `SQLiteControlDatabase` internals (`connection`, `withConnectionGate`, `transaction` — `OAuthControlStore.swift:1425-1461`); Task 1 types.
-- Produces (on `extension SQLiteControlDatabase`):
-  - `struct LifecycleEventItem: Sendable, Equatable { let sourceKey: String; let kind: PublicFirehoseEventKind; let payload: Data }` (kind ∈ .identity/.account/.sync only — commit never originates here)
-  - `struct LifecycleEventBatch: Sendable, Equatable { let batchID: String; let did: String; let generation: Int64; let items: [LifecycleEventItem] }`
-  - `func enqueueLifecycleEventBatch(did: String, operationID: String, items: [LifecycleEventItem], now: Date) async throws -> LifecycleEventBatch` — `batchID = operationID`; **idempotent**: if a batch with this `batchID` exists, return the stored batch unchanged (no generation bump); otherwise increment the per-DID generation and insert all items with ordinals 0..n-1 in one transaction.
-  - `func currentLifecycleGeneration(did: String) async throws -> Int64` (0 if absent)
-  - `func nextPendingLifecycleBatch(did: String?) async throws -> LifecycleEventBatch?` — oldest pending batch (optionally filtered by DID), ordered by generation.
-  - `func completeLifecycleBatch(batchID: String) async throws -> Bool` — deletes the batch's rows.
-  - Simplicity note: no lease columns here — Phase 1 has exactly one sequencer; batch completion is idempotent via the global log's UNIQUE source keys. Record this in a doc comment.
+**Scope:** This task implements the durable batch model and ordering metadata. It does **not** hook raw status or PLC-history methods. Confirmed lifecycle operation integrations remain Phase 4.
 
-- [ ] **Step 1: Add DDL to `SQLiteLayout.controlMigrations`** (idempotent `CREATE TABLE IF NOT EXISTS`, matching how control tables are declared):
+**Produces:**
+
+```swift
+public struct LifecycleEventItem: Sendable, Equatable {
+  public let sourceKey: String
+  public let kind: PublicFirehoseEventKind
+  public let payload: Data
+  public let carBytes: Data?
+}
+
+public struct LifecycleEventBatch: Sendable, Equatable {
+  public let batchID: String
+  public let did: String
+  public let generation: Int64
+  public let createdAt: Int64
+  public let items: [LifecycleEventItem]
+}
+```
+
+Methods on `SQLiteControlDatabase`:
+
+```swift
+public func enqueueLifecycleEventBatch(
+  did: String,
+  operationID: String,
+  items: [LifecycleEventItem],
+  now: Date
+) async throws -> LifecycleEventBatch
+
+public func currentLifecycleGeneration(did: String) async throws -> Int64
+
+public func nextPendingLifecycleBatch(
+  did: String?
+) async throws -> LifecycleEventBatch?
+
+public func pendingLifecycleDIDs() async throws -> [String]
+
+@discardableResult
+public func completeLifecycleBatch(batchID: String) async throws -> Bool
+```
+
+Batch IDs are not raw operation IDs. They are:
+
+```swift
+PublicFirehoseSourceKey.lifecycleBatch(did: did, operationID: operationID)
+```
+
+This prevents two accounts from colliding on the same external operation identifier.
+
+- [ ] **Step 1: Add normalized control-plane tables**
+
+Append idempotent DDL to `SQLiteLayout.controlMigrations`:
 
 ```sql
-CREATE TABLE IF NOT EXISTS lifecycle_event_outbox (
-    batch_id TEXT NOT NULL,
-    batch_ordinal INTEGER NOT NULL CHECK(batch_ordinal >= 0),
-    did TEXT NOT NULL,
-    generation INTEGER NOT NULL CHECK(generation >= 1),
-    source_key TEXT NOT NULL UNIQUE,
-    kind TEXT NOT NULL CHECK(kind IN ('sync', 'identity', 'account')),
-    payload BLOB NOT NULL,
-    created_at INTEGER NOT NULL CHECK(created_at >= 0),
-    PRIMARY KEY (batch_id, batch_ordinal)
-);
-CREATE INDEX IF NOT EXISTS lifecycle_event_outbox_pending
-ON lifecycle_event_outbox(did, generation, batch_id, batch_ordinal);
 CREATE TABLE IF NOT EXISTS account_lifecycle_generation (
     did TEXT PRIMARY KEY,
     generation INTEGER NOT NULL CHECK(generation >= 0)
 );
+
+CREATE TABLE IF NOT EXISTS lifecycle_event_batches (
+    batch_id TEXT PRIMARY KEY,
+    did TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation >= 1),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    UNIQUE(did, generation)
+);
+
+CREATE TABLE IF NOT EXISTS lifecycle_event_items (
+    batch_id TEXT NOT NULL
+        REFERENCES lifecycle_event_batches(batch_id) ON DELETE CASCADE,
+    batch_ordinal INTEGER NOT NULL CHECK(batch_ordinal >= 0),
+    source_key TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL CHECK(kind IN ('sync', 'identity', 'account')),
+    payload BLOB NOT NULL CHECK(length(payload) > 0),
+    car_bytes BLOB,
+    PRIMARY KEY(batch_id, batch_ordinal),
+    CHECK(
+        (kind = 'sync' AND car_bytes IS NOT NULL AND length(car_bytes) > 0)
+        OR (kind IN ('identity', 'account') AND car_bytes IS NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS lifecycle_event_batches_pending
+ON lifecycle_event_batches(did, generation, created_at, batch_id);
 ```
 
-- [ ] **Step 2: Write the failing tests**
+A lifecycle batch contains 1–16 items. Commit events never originate in the control database.
 
-`Tests/SwanSQLiteTests/LifecycleEventOutboxStoreTests.swift` (control DB opens with `SQLiteControlDatabase(dataDirectory: root)`; reuse the 0o700 temp-dir helper):
-```swift
-    func testEnqueueIsIdempotentAndIncrementsGeneration() async throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let control = try await SQLiteControlDatabase(dataDirectory: root)
-        defer { Task { try? await control.close() } }
+- [ ] **Step 2: Write failing tests**
 
-        let did = "did:plc:abcdefghijklmnopqrstuvwx"
-        let items = [
-            LifecycleEventItem(
-                sourceKey: PublicFirehoseSourceKey.identity(did: did, plcOperationCID: "bafyop"),
-                kind: .identity, payload: Data("{}".utf8)
-            ),
-            LifecycleEventItem(
-                sourceKey: PublicFirehoseSourceKey.account(did: did, operationID: "op-1"),
-                kind: .account, payload: Data("{}".utf8)
-            ),
-        ]
-        let batch = try await control.enqueueLifecycleEventBatch(
-            did: did, operationID: "op-1", items: items,
-            now: Date(timeIntervalSince1970: 1_754_308_800)
-        )
-        XCTAssertEqual(batch.generation, 1)
-        XCTAssertEqual(batch.items.count, 2)
+Cover:
 
-        let replay = try await control.enqueueLifecycleEventBatch(
-            did: did, operationID: "op-1", items: items,
-            now: Date(timeIntervalSince1970: 1_754_308_900)
-        )
-        XCTAssertEqual(replay, batch, "idempotent replay returns the stored batch")
-        let generation = try await control.currentLifecycleGeneration(did: did)
-        XCTAssertEqual(generation, 1)
+1. first batch for a DID receives generation 1;
+2. a second new operation receives generation 2;
+3. another DID starts at generation 1;
+4. exact operation replay returns the stored batch and does not increment generation;
+5. same operation ID with changed DID, item count, ordinal, source key, kind, payload, or CAR throws conflict;
+6. batch ID is DID-namespaced;
+7. empty and over-limit batches are rejected;
+8. commit-kind lifecycle item is rejected;
+9. sync without CAR is rejected;
+10. identity/account with CAR is rejected;
+11. malformed payload or a payload whose frame cannot preflight at maximum sequence is rejected before storage;
+12. pending batch order is generation order for one DID;
+13. `pendingLifecycleDIDs` is unique and sorted;
+14. completion deletes items by cascade but preserves the generation counter;
+15. completion replay returns false.
 
-        let pending = try await control.nextPendingLifecycleBatch(did: did)
-        XCTAssertEqual(pending, batch)
-        XCTAssertTrue(try await control.completeLifecycleBatch(batchID: "op-1"))
-        let drained = try await control.nextPendingLifecycleBatch(did: did)
-        XCTAssertNil(drained)
-        // Generation survives batch completion.
-        let after = try await control.currentLifecycleGeneration(did: did)
-        XCTAssertEqual(after, 1)
-    }
-```
-(Confirm the control DB close method name — `SQLiteAccountDatabase` has `close()`; check `SQLiteControlDatabase` for its equivalent and match.)
+Use real encoded material, valid CIDs, and corrected fixed dates.
 
-- [ ] **Step 3: Run, verify fail; implement; run, verify pass**
-
-Run: `swift test --filter LifecycleEventOutboxStoreTests` → compile failure → implement `LifecycleEventOutboxStore.swift` (single `withConnectionGate { transaction { … } }` per public method; generation upsert `INSERT INTO account_lifecycle_generation(did, generation) VALUES (?, 1) ON CONFLICT(did) DO UPDATE SET generation = generation + 1 RETURNING generation`) → PASS.
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Confirm red**
 
 ```bash
-jj commit Sources/SwanSQLite Tests/SwanSQLiteTests -m "firehose: add control-plane lifecycle event outbox with generations"
+swift test --filter LifecycleEventOutboxStoreTests
+```
+
+- [ ] **Step 4: Implement idempotent batch enqueue**
+
+The public method uses one gate and one `BEGIN IMMEDIATE` transaction.
+
+Algorithm:
+
+1. validate item count and kind/CAR shape;
+2. decode each payload by kind;
+3. preflight its frame at `FirehoseFrameLimits.maximumSequence` using its CAR where required;
+4. compute the DID-namespaced batch ID;
+5. if batch ID exists, load the complete stored batch and require exact equality; return it unchanged;
+6. otherwise increment generation atomically:
+
+   ```sql
+   INSERT INTO account_lifecycle_generation(did, generation)
+   VALUES (?, 1)
+   ON CONFLICT(did) DO UPDATE SET generation = generation + 1
+   RETURNING generation;
+   ```
+
+7. insert the batch row;
+8. insert every item with ordinals `0 ..< count`;
+9. return the durable representation.
+
+Map unique-key violations on `source_key` or `(did, generation)` to a typed conflict/corruption error rather than presenting them as successful replay.
+
+No lease columns are required in Phase 1 because there is one sequencer and the global append is idempotent by exact source key. Crash recovery is append-then-complete: a batch left in this table is safely replayed. This assumption must remain in the store’s documentation.
+
+- [ ] **Step 5: Confirm green and run control-store regressions**
+
+```bash
+swift test --filter LifecycleEventOutboxStoreTests
+swift test --filter SwanSQLiteTests
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+jj commit Sources/SwanSQLite Tests/SwanSQLiteTests \
+  -m "firehose: add lifecycle batches and per-DID generations"
 ```
 
 ---
 
-### Task 6: `firehose.sqlite` global log store
+### Task 6: Add the global `firehose.sqlite` log and checked sequence allocator
 
 **Files:**
+
+- Modify: `Sources/SwanSQLite/SwanSQLite.swift` (`SQLiteLayout` path helper)
 - Create: `Sources/SwanSQLite/SQLiteFirehoseDatabase.swift`
 - Test: `Tests/SwanSQLiteTests/SQLiteFirehoseDatabaseTests.swift`
 
-**Interfaces:**
-- Consumes: `SQLiteConnection`, `SQLiteProtectedPaths.openRoot`/`openDatabaseFile` (the `control.sqlite` open pattern at `OAuthControlStore.swift:220-245`); `FirehoseFrameLimits.validateSequence`.
-- Produces:
-  - `public actor SQLiteFirehoseDatabase` with `public init(dataDirectory: URL) async throws` opening `<root>/firehose.sqlite` (one per PDS, sibling of `control.sqlite`), applying pragmas (copy `SQLiteLayout.controlConnectionPragmas`) and schema.
-  - `struct FirehoseAppendItem: Sendable { let sourceKey: String; let batchID: String?; let did: String; let kind: PublicFirehoseEventKind; let encodeFrame: @Sendable (Int64) throws -> Data }` — the closure is pure CPU (frame encoding), safe inside the transaction.
-  - `struct FirehoseStoredEvent: Sendable, Equatable { let seq: Int64; let sourceKey: String; let did: String; let kind: String; let sequencedAt: Int64; let frameBytes: Data }`
-  - `func appendBatch(_ items: [FirehoseAppendItem], now: Date) async throws -> [Int64]` — one transaction: for each item whose `source_key` already exists, return its existing seq (idempotent replay); for the rest, allocate `n` consecutive seqs via `UPDATE firehose_meta SET next_seq = next_seq + n RETURNING next_seq`, validate every seq with `FirehoseFrameLimits.validateSequence`, call `encodeFrame(seq)`, insert. Returns seqs in item order.
-  - `func maxSequencedSeq() async throws -> Int64` (0 when empty)
-  - `func events(after seq: Int64, limit: Int) async throws -> [FirehoseStoredEvent]`
-  - `func reseedSequence(toAtLeast seq: Int64) async throws` — raises `next_seq` only (never lowers), for post-restore recovery.
-  - `func close() async throws`
+**Produces:**
 
-Schema (spec verbatim + meta seeded at first open):
+```swift
+public actor SQLiteFirehoseDatabase
+
+public struct FirehoseAppendItem: Sendable {
+  public let sourceKey: String
+  public let batchID: String?
+  public let did: String
+  public let kind: PublicFirehoseEventKind
+  public let encodeFrame: @Sendable (Int64) throws -> Data
+}
+
+public struct FirehoseStoredEvent: Sendable, Equatable {
+  public let seq: Int64
+  public let sourceKey: String
+  public let batchID: String?
+  public let batchOrdinal: Int?
+  public let did: String
+  public let kind: PublicFirehoseEventKind
+  public let sequencedAt: Int64
+  public let frameBytes: Data
+}
+```
+
+Methods:
+
+```swift
+public init(dataDirectory: URL) async throws
+
+public func appendBatch(
+  _ items: [FirehoseAppendItem],
+  now: Date
+) async throws -> [Int64]
+
+public func maxSequencedSeq() async throws -> Int64
+
+public func events(
+  after seq: Int64,
+  limit: Int
+) async throws -> [FirehoseStoredEvent]
+
+public func reseedSequence(toAtLeast nextSeq: Int64) async throws
+
+public func close() async throws
+```
+
+Add:
+
+```swift
+public static func firehoseDatabase(in dataDirectory: URL) -> URL {
+  dataDirectory.appending(path: "firehose.sqlite")
+}
+```
+
+- [ ] **Step 1: Add hardened schema**
+
+Open and harden the file by copying the managed `SQLiteControlDatabase` path discipline:
+
+- `SQLiteProtectedPaths.openRoot`
+- `openDatabaseFile(... name: "firehose.sqlite" ...)`
+- `SQLiteConnection.open`
+- `SQLiteLayout.controlConnectionPragmas`
+- migration busy retry where applicable
+- `SQLiteProtectedPaths.hardenSQLiteFiles`
+- retained descriptors closed on success, explicit close, and failure paths.
+
+Schema:
+
 ```sql
 CREATE TABLE IF NOT EXISTS firehose_meta (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-    next_seq INTEGER NOT NULL CHECK(next_seq >= 1),
+    next_seq INTEGER NOT NULL
+        CHECK(next_seq >= 1 AND next_seq <= 9007199254740992),
     retained_from_seq INTEGER
+        CHECK(
+            retained_from_seq IS NULL
+            OR (
+                retained_from_seq >= 1
+                AND retained_from_seq <= 9007199254740991
+            )
+        )
 );
+
 INSERT INTO firehose_meta(singleton, next_seq, retained_from_seq)
-    SELECT 1, 1, NULL WHERE NOT EXISTS (SELECT 1 FROM firehose_meta);
+SELECT 1, 1, NULL
+WHERE NOT EXISTS (SELECT 1 FROM firehose_meta WHERE singleton = 1);
+
 CREATE TABLE IF NOT EXISTS firehose_events (
-    seq INTEGER PRIMARY KEY CHECK(seq >= 1),
+    seq INTEGER PRIMARY KEY
+        CHECK(seq >= 1 AND seq <= 9007199254740991),
     source_key TEXT NOT NULL UNIQUE,
     batch_id TEXT,
-    did TEXT NOT NULL,
+    batch_ordinal INTEGER,
+    did TEXT NOT NULL CHECK(length(did) > 0),
     kind TEXT NOT NULL CHECK(kind IN ('commit', 'sync', 'identity', 'account')),
     sequenced_at INTEGER NOT NULL CHECK(sequenced_at >= 0),
     frame_bytes BLOB NOT NULL
+        CHECK(length(frame_bytes) > 0 AND length(frame_bytes) <= 5000000),
+    CHECK(
+        (batch_id IS NULL AND batch_ordinal IS NULL)
+        OR (batch_id IS NOT NULL AND batch_ordinal IS NOT NULL AND batch_ordinal >= 0)
+    ),
+    UNIQUE(batch_id, batch_ordinal)
 );
-CREATE INDEX IF NOT EXISTS firehose_events_did ON firehose_events(did, seq);
+
+CREATE INDEX IF NOT EXISTS firehose_events_did_seq
+ON firehose_events(did, seq);
+
+CREATE INDEX IF NOT EXISTS firehose_events_batch
+ON firehose_events(batch_id, batch_ordinal)
+WHERE batch_id IS NOT NULL;
 ```
 
-- [ ] **Step 1: Write the failing tests**
+`next_seq` is the next unused number. `9_007_199_254_740_992` is allowed only as the exhausted sentinel; no event may receive it.
 
-```swift
-    func testAppendAllocatesConsecutiveSeqsAndIsIdempotent() async throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
-        defer { Task { try? await firehose.close() } }
+- [ ] **Step 2: Write failing tests**
 
-        let items = (0..<3).map { index in
-            FirehoseAppendItem(
-                sourceKey: "key-\(index)", batchID: "batch-1",
-                did: "did:plc:abcdefghijklmnopqrstuvwx", kind: .account,
-                encodeFrame: { seq in Data("frame-\(index)-seq-\(seq)".utf8) }
-            )
-        }
-        let seqs = try await firehose.appendBatch(
-            items, now: Date(timeIntervalSince1970: 1_754_308_800)
-        )
-        XCTAssertEqual(seqs, [1, 2, 3])
+Cover:
 
-        // Replay: same source keys return the same seqs, no new rows.
-        let replayed = try await firehose.appendBatch(
-            items, now: Date(timeIntervalSince1970: 1_754_308_900)
-        )
-        XCTAssertEqual(replayed, [1, 2, 3])
-        let max = try await firehose.maxSequencedSeq()
-        XCTAssertEqual(max, 3)
+1. three-item batch allocates `[1, 2, 3]` and stores complete frames;
+2. reopening continues at `4`;
+3. exact source replay returns original sequences without new rows;
+4. same source key with changed DID, kind, batch ID, or frame bytes throws conflict;
+5. a non-nil batch must be all new or all existing; mixed existing/new is corruption;
+6. an all-existing batch must preserve the same item order, stored batch ordinals, and consecutive sequence range; reordering the request is conflict;
+7. all items in a non-nil batch must share the same batch ID;
+8. a nil batch ID is allowed only for one item;
+9. duplicate source keys inside one request are rejected before SQL;
+10. sequence arithmetic never uses unchecked SQL addition;
+11. allocating across `maximumSequence` fails and inserts nothing;
+12. `next_seq = maximumSequence + 1` is a stable exhausted state;
+13. encoding failure rolls back sequence metadata and rows;
+14. frame larger than 5,000,000 fails before or at the table constraint and rolls back;
+15. `events(after:limit:)` is ascending and strictly greater than `after`;
+16. `after = 0` is valid; negative or over-maximum cursors and non-positive/excessive limits are rejected;
+17. `reseedSequence` raises only, never lowers, and accepts the exhausted sentinel;
+18. close/reopen and descriptor cleanup.
 
-        let page = try await firehose.events(after: 1, limit: 10)
-        XCTAssertEqual(page.map(\.seq), [2, 3])
-        XCTAssertEqual(page[0].frameBytes, Data("frame-1-seq-2".utf8))
-    }
-
-    func testSequenceSurvivesReopen() async throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        do {
-            let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
-            _ = try await firehose.appendBatch([FirehoseAppendItem(
-                sourceKey: "a", batchID: nil, did: "did:plc:abcdefghijklmnopqrstuvwx",
-                kind: .sync, encodeFrame: { _ in Data([0x01]) }
-            )], now: Date(timeIntervalSince1970: 1_754_308_800))
-            try await firehose.close()
-        }
-        let reopened = try await SQLiteFirehoseDatabase(dataDirectory: root)
-        defer { Task { try? await reopened.close() } }
-        let seqs = try await reopened.appendBatch([FirehoseAppendItem(
-            sourceKey: "b", batchID: nil, did: "did:plc:abcdefghijklmnopqrstuvwx",
-            kind: .sync, encodeFrame: { _ in Data([0x02]) }
-        )], now: Date(timeIntervalSince1970: 1_754_308_900))
-        XCTAssertEqual(seqs, [2])
-    }
-
-    func testReseedOnlyRaises() async throws {
-        let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
-        let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
-        defer { Task { try? await firehose.close() } }
-        try await firehose.reseedSequence(toAtLeast: 1_000)
-        try await firehose.reseedSequence(toAtLeast: 5)  // no-op
-        let seqs = try await firehose.appendBatch([FirehoseAppendItem(
-            sourceKey: "a", batchID: nil, did: "did:plc:abcdefghijklmnopqrstuvwx",
-            kind: .sync, encodeFrame: { _ in Data([0x01]) }
-        )], now: Date(timeIntervalSince1970: 1_754_308_800))
-        XCTAssertEqual(seqs, [1_000])
-    }
-```
-
-- [ ] **Step 2: Run, verify fail; implement; run, verify pass**
-
-Run: `swift test --filter SQLiteFirehoseDatabaseTests` → compile failure → implement (actor with `connection`, gate pattern copied from `SQLiteControlDatabase`; `BEGIN IMMEDIATE` transactions; open via `SQLiteProtectedPaths.openRoot` + `openDatabaseFile(parentDescriptor:name:"firehose.sqlite":resolvedPath:)` + `hardenSQLiteFiles`) → PASS.
-
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Confirm red**
 
 ```bash
-jj commit Sources/SwanSQLite Tests/SwanSQLiteTests -m "firehose: add global firehose.sqlite log with seq allocator"
+swift test --filter SQLiteFirehoseDatabaseTests
+```
+
+- [ ] **Step 4: Implement checked atomic allocation**
+
+`appendBatch` validates request shape before entering the transaction.
+
+Inside one `BEGIN IMMEDIATE` transaction:
+
+1. look up all existing `source_key` rows;
+2. if any exist:
+   - require either all items exist or, for a single nil-batch item, that one exists;
+   - for a non-nil batch, require stored `batch_ordinal` values to equal request indices `0 ..< count` and stored sequences to be consecutive in that same order;
+   - re-encode every requested item at its stored sequence;
+   - require exact equality of source key, batch ID, batch ordinal, DID, kind, and frame bytes;
+   - return stored sequence numbers in request order;
+3. if none exist:
+   - `SELECT next_seq FROM firehose_meta WHERE singleton = 1`;
+   - calculate `last = start + count - 1` using checked Swift arithmetic;
+   - require `start <= maximumSequence` and `last <= maximumSequence`;
+   - set `newNext = last + 1`, which may be the exhausted sentinel;
+   - encode all frames before mutating metadata if possible; at minimum, keep all encoding and inserts inside the same transaction so failure rolls back;
+   - `UPDATE firehose_meta SET next_seq = ? WHERE singleton = 1 AND next_seq = ?` and require one row;
+   - insert all events in item order with consecutive sequences, storing array index as `batch_ordinal` for non-nil batches and null for single account events;
+   - commit and return sequences.
+
+Do not use:
+
+```sql
+UPDATE firehose_meta SET next_seq = next_seq + ?
+```
+
+without first performing checked host-language arithmetic. SQLite signed overflow and the AT Protocol safe-integer boundary are separate hazards.
+
+- [ ] **Step 5: Implement exact replay validation**
+
+Idempotency means “the same durable fact was retried,” not “the key happened to exist.” Re-encoding at the stored sequence protects against:
+
+- source-key collisions;
+- changed material under the same source key;
+- a code regression that would change replay bytes;
+- a lifecycle batch partially or incorrectly reconstructed after a crash.
+
+A mixed existing/new non-nil batch cannot result from a successful atomic append and must fail closed.
+
+- [ ] **Step 6: Confirm focused and full SQLite suites**
+
+```bash
+swift test --filter SQLiteFirehoseDatabaseTests
+swift test --filter SwanSQLiteTests
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+jj commit Sources/SwanSQLite Tests/SwanSQLiteTests \
+  -m "firehose: add checked global event log"
 ```
 
 ---
-
-### Task 7: Sequencer worker with generation barriers
+### Task 7: Add the causally ordered sequencer worker
 
 **Files:**
+
 - Create: `Sources/SwanSQLite/PublicFirehoseSequencer.swift`
+- Modify: `Sources/SwanSQLite/SQLitePreMigratedAccountDirectory.swift`
 - Test: `Tests/SwanSQLiteTests/PublicFirehoseSequencerTests.swift`
 
-**Interfaces:**
-- Consumes: Tasks 3–6 APIs exactly as named; `PermissionedSpaceOutboxDeliveryWorker` (`PermissionedOutboxDelivery.swift:114`) as the structural template.
-- Produces:
-  - `public protocol PublicFirehoseWakeupSink: Sendable { func firehoseDidAppend(maxSeq: Int64) async }` (Phase 2 hooks the tailer here; Phase 1 tests use a recorder)
-  - `public struct PublicFirehoseSequencerConfiguration: Sendable { public var leaseDuration: TimeInterval = 30; public var idlePollInterval: TimeInterval = 0.25; public var retryDelay: (Int) -> TimeInterval = PublicFirehoseSequencerConfiguration.defaultRetryDelay; public static let standard = … }`
-  - `public actor PublicFirehoseSequencer` with:
-    - `public init(accountDatabases: [(did: String, database: SQLiteAccountDatabase)], control: SQLiteControlDatabase, firehose: SQLiteFirehoseDatabase, wakeup: (any PublicFirehoseWakeupSink)?, configuration: PublicFirehoseSequencerConfiguration = .standard)`
-    - `public func sequenceNext(now: Date = Date()) async throws -> PublicFirehoseSequencerResult` — one drain step
-    - `public func drainAll(now: Date = Date()) async throws -> Int` — loop `sequenceNext` until `.idle`, returns count (tests use this)
-    - `public func runUntilCancelled() async` — clone of the permissioned worker's loop
-  - `public enum PublicFirehoseSequencerResult: Sendable, Equatable { case idle; case sequencedLifecycleBatch(batchID: String, seqs: [Int64]); case sequencedAccountEvent(sourceKey: String, seq: Int64); case blockedOnBarrier(did: String, requiredGeneration: Int64) }`
-
-**Drain algorithm (`sequenceNext`):**
-1. `control.nextPendingLifecycleBatch(did: nil)` — if present, decode each item's payload (`PublicFirehoseIdentityMaterial` / `PublicFirehoseAccountMaterial` / `PublicFirehoseSyncMaterial` by kind), build `FirehoseAppendItem`s whose `encodeFrame` closures call the matching `FirehoseFrameEncoder` function, `firehose.appendBatch`, then `control.completeLifecycleBatch(batchID:)`, notify wakeup, return `.sequencedLifecycleBatch`. Lifecycle batches always drain before account rows — this plus the generation check below is the barrier.
-2. Otherwise iterate `accountDatabases` round-robin: `leaseNextPublicFirehoseOutbox`. For a leased row:
-   - Barrier check: if `row.lifecycleGeneration > 0`, load pending lifecycle batches for that DID; if any pending batch has `generation <= row.lifecycleGeneration`, `failPublicFirehoseOutboxLease(retryAt: now + retry)` and return `.blockedOnBarrier` (step 1 will drain the batch on the next call).
-   - Decode payload by kind; `encodeFrame` calls `FirehoseFrameEncoder.commitFrame(seq:material:diffCAR: row.diffCAR!)` (or `syncFrame`). If the encoder throws `frameTooLarge` for a commit, re-encode as a `#sync` frame from a `PublicFirehoseSyncMaterial` derived from the commit material (same `sourceKey` — the kind stored in `firehose_events` becomes `sync`; add a doc comment citing the spec's fallback rule).
-   - `firehose.appendBatch([item])` → `completePublicFirehoseOutboxLease(id:token:)` → notify wakeup → `.sequencedAccountEvent`.
-3. Nothing anywhere → `.idle`.
-
-Crash-safety argument (put in the type's doc comment): append-then-complete means a crash between the two leaves the outbox row leased-but-present; on lease expiry it is re-leased, `appendBatch` finds the `source_key` and returns the existing seq without inserting, then completion deletes the row. No duplicates, no losses.
-
-- [ ] **Step 1: Write the failing tests**
-
-`Tests/SwanSQLiteTests/PublicFirehoseSequencerTests.swift` — three tests:
+**Produces:**
 
 ```swift
-    func testCommitEventFlowsToGlobalLog() async throws {
-        // Fixture: account DB with genesis + one committed mutation (reuse Task 4's
-        // fixture — the mutation itself wrote the outbox row), control DB, firehose DB.
-        let sequencer = PublicFirehoseSequencer(
-            accountDatabases: [(did: did, database: database)],
-            control: control, firehose: firehose, wakeup: recorder
-        )
-        let sequenced = try await sequencer.drainAll(
-            now: Date(timeIntervalSince1970: 1_754_308_800)
-        )
-        XCTAssertEqual(sequenced, 1)
-        let events = try await firehose.events(after: 0, limit: 10)
-        XCTAssertEqual(events.count, 1)
-        XCTAssertEqual(events[0].seq, 1)
-        XCTAssertEqual(events[0].kind, "commit")
-        // Frame decodes and carries the right seq/repo/rev (use the same
-        // DAG-CBOR decode helper as FirehoseFrameEncoderTests).
-        …
-        // Outbox drained.
-        let remaining = try await database.pendingPublicFirehoseOutbox()
-        XCTAssertTrue(remaining.isEmpty)
-        // Wakeup fired with maxSeq 1.
-        let wakeups = await recorder.received
-        XCTAssertEqual(wakeups, [1])
-    }
+public struct PublicFirehoseAccountDatabase: Sendable {
+  public let did: String
+  public let database: SQLiteAccountDatabase
+}
 
-    func testCrashBetweenAppendAndCompleteDoesNotDuplicate() async throws {
-        // Simulate: sequence once, then manually re-insert the outbox situation by
-        // appending the same source key again via a second sequencer pass after
-        // resetting the lease (UPDATE public_event_outbox SET lease_token = NULL,
-        // lease_expires_at = NULL via database.connection.query — the
-        // @testable import gives access). appendBatch must return the original
-        // seq and firehose row count must stay 1.
-    }
+public protocol PublicFirehoseAccountDatabaseSource: Sendable {
+  func publicFirehoseAccountDatabases()
+    async throws -> [PublicFirehoseAccountDatabase]
+}
 
-    func testLifecycleBarrierOrdersBatchBeforeCommit() async throws {
-        // 1. Enqueue lifecycle batch (identity + account items) with operationID
-        //    "op-1" → generation 1.
-        // 2. Enqueue an account-outbox row directly via
-        //    database.enqueuePublicFirehoseEvent(sourceKey: "…|sync|manual|…",
-        //    kind: .sync, lifecycleGeneration: 1, …).
-        // 3. drainAll. Assert global order: seqs 1,2 are the lifecycle items
-        //    (kinds identity, account), seq 3 is the sync event.
-    }
-```
-Write all three fully (the comments above describe intent; the test bodies must be real code following the Task 4/5/6 fixtures).
+public protocol PublicFirehoseWakeupSink: Sendable {
+  func firehoseDidAppend(maxSeq: Int64) async
+}
 
-- [ ] **Step 2: Run, verify fail; implement `PublicFirehoseSequencer`; run, verify pass**
+public struct PublicFirehoseSequencerConfiguration: Sendable, Equatable {
+  public let leaseDuration: TimeInterval
+  public let idlePollInterval: TimeInterval
+  public let initialFailureBackoff: TimeInterval
+  public let maximumFailureBackoff: TimeInterval
 
-Run: `swift test --filter PublicFirehoseSequencerTests` → compile failure → implement per the drain algorithm → PASS.
+  public static let standard: Self
 
-- [ ] **Step 3: Full suite**
+  public init(
+    leaseDuration: TimeInterval = 30,
+    idlePollInterval: TimeInterval = 0.25,
+    initialFailureBackoff: TimeInterval = 1,
+    maximumFailureBackoff: TimeInterval = 60
+  ) throws
+}
 
-Run: `swift test`
-Expected: everything green.
+public enum PublicFirehoseSequencerResult: Sendable, Equatable {
+  case idle
+  case sequencedLifecycleBatch(batchID: String, seqs: [Int64])
+  case sequencedAccountEvent(sourceKey: String, seq: Int64)
+  case leaseLost(sourceKey: String, seq: Int64)
+}
 
-- [ ] **Step 4: Commit**
+public actor PublicFirehoseSequencer {
+  public init(
+    accountSource: any PublicFirehoseAccountDatabaseSource,
+    control: SQLiteControlDatabase,
+    firehose: SQLiteFirehoseDatabase,
+    wakeup: (any PublicFirehoseWakeupSink)? = nil,
+    configuration: PublicFirehoseSequencerConfiguration = .standard
+  )
 
-```bash
-jj commit Sources/SwanSQLite Tests/SwanSQLiteTests -m "firehose: add global sequencer with lifecycle generation barriers"
-```
+  public func sequenceNext(
+    now: Date = Date()
+  ) async throws -> PublicFirehoseSequencerResult
 
----
+  public func drainAll(
+    now: Date = Date()
+  ) async throws -> Int
 
-### Task 8: Service wiring + permissioned-isolation gate
-
-**Files:**
-- Create: `Sources/SwanHTTP/SwanPublicFirehoseSequencerService.swift`
-- Modify: `Sources/SwanHTTP/SwanHTTP.swift` (construct + register the service where `SwanNotificationRecoveryService` is wired; grep `makeServiceGroup` / `SwanNotificationRecoveryService` for the exact spot)
-- Modify: `Sources/SwanSQLite/SQLitePreMigratedAccountDirectory.swift` (add `func publicFirehoseDatabases() -> [(did: String, database: SQLiteAccountDatabase)]` next to `notificationRecoveryDatabases()`)
-- Test: `Tests/SwanSQLiteTests/PublicFirehoseIsolationTests.swift`, `Tests/SwanHTTPTests/PublicFirehoseServiceWiringTests.swift`
-
-**Interfaces:**
-- Consumes: Task 7 `PublicFirehoseSequencer`; `SwanNotificationRecoveryService` (`SwanNotificationRecoveryService.swift:47-64`) as the service template; `SwanHTTPServiceLifecycle.makeServiceGroup(services:)`.
-- Produces:
-  - `struct SwanPublicFirehoseSequencerService: Service` (swift-service-lifecycle) whose `run()` calls `sequencer.runUntilCancelled()` and respects graceful shutdown, mirroring the notification recovery service.
-  - `SQLiteFirehoseDatabase` opened during app composition from the same `dataDirectory` as `control.sqlite`, passed to the service. Feature-gate: only wire the service when a new option `publicFirehoseEnabled` (plumb through the same configuration type the notification recovery service uses; find it by reading `SwanHTTP.swift`'s composition of that service) is true — default **true** in tests, and choose the default for the server binary by matching how other new subsystems were introduced (grep `SwanCommand.swift` for feature flags; if none exists, default true and note it).
-
-- [ ] **Step 1: Write the failing isolation test (the hard gate from the spec)**
-
-`Tests/SwanSQLiteTests/PublicFirehoseIsolationTests.swift`: perform a permissioned space write using an existing permissioned-write test fixture (copy the setup from a passing test in the permissioned suite — grep `appendOplogAndOutbox` in `Tests/SwanSQLiteTests` for one), then assert:
-```swift
-        let publicRows = try await database.pendingPublicFirehoseOutbox()
-        XCTAssertTrue(
-            publicRows.isEmpty,
-            "permissioned write must never produce a public firehose outbox row"
-        )
-```
-Also assert `firehose.events(after: 0, limit: 10)` is empty after running a sequencer over the account DB.
-
-- [ ] **Step 2: Run — this should already PASS (nothing hooks permissioned writes). It is a regression tripwire, not TDD red.**
-
-Run: `swift test --filter PublicFirehoseIsolationTests`
-Expected: PASS immediately. Keep it — the spec calls this a hard gate.
-
-- [ ] **Step 3: Write the failing wiring test, implement the service, verify**
-
-`Tests/SwanHTTPTests/PublicFirehoseServiceWiringTests.swift`: build the app composition the way existing `SwanHTTPTests` construct it (grep for a test that asserts `SwanNotificationRecoveryService` wiring or service-group contents and mirror it — if no precedent asserts service registration, instead test `SwanPublicFirehoseSequencerService` directly: construct with a sequencer over a fixture DB set, start it in a task, enqueue an event, poll `firehose.maxSequencedSeq()` until 1 or timeout 5s, cancel, assert clean exit).
-
-Implement the service:
-```swift
-import ServiceLifecycle
-import SwanSQLite
-
-struct SwanPublicFirehoseSequencerService: Service {
-    let sequencer: PublicFirehoseSequencer
-
-    func run() async throws {
-        await cancelWhenGracefulShutdown {
-            await sequencer.runUntilCancelled()
-        }
-    }
+  public func runUntilCancelled() async
 }
 ```
-(Match the exact graceful-shutdown idiom used by `SwanNotificationRecoveryService.run()` — copy it verbatim.) Wire into `SwanHTTP.swift` composition next to the notification recovery service, constructing `SQLiteFirehoseDatabase(dataDirectory:)` alongside the control DB open.
 
-Run: `swift test --filter PublicFirehoseServiceWiringTests` → PASS.
+The configuration mirrors `PermissionedSpaceOutboxDeliveryConfiguration`; do not store an arbitrary retry closure in a `Sendable` public configuration. Validate finite positive values, one-day maximum, and initial-backoff `<=` maximum-backoff.
 
-- [ ] **Step 4: Full suite + build**
+- [ ] **Step 1: Add a dynamic account database source**
 
-Run: `swift build && swift test`
-Expected: green. This is the Phase 1 exit gate: a record written through the running server's mutation path now lands in `firehose.sqlite` with a decodable `#commit` frame.
+Make `SQLitePreMigratedAccountDirectory` conform to `PublicFirehoseAccountDatabaseSource` with:
 
-- [ ] **Step 5: Commit**
+```swift
+public func publicFirehoseAccountDatabases()
+  async throws -> [PublicFirehoseAccountDatabase]
+```
+
+Requirements:
+
+- return a fresh snapshot on every call so accounts activated after server startup can be discovered;
+- sort by DID for deterministic scheduling;
+- return all currently managed/preopened account databases, not only accounts whose current control status is active;
+- do not open, create, or migrate a database from this method;
+- do not reuse `notificationRecoveryDatabases()`, because its active-only filter could strand public commits written before deactivation;
+- reject calls after directory close;
+- permanent deletion must continue removing/closing the account database through the directory’s existing lifecycle path.
+
+Tests use a small fixed source implementation rather than the production directory where convenient.
+
+- [ ] **Step 2: Write failing causal-order and crash tests**
+
+Use real encoded frames and real SQLite stores. Cover:
+
+1. ordinary generation-0 commit flows to global seq 1 and drains its source row;
+2. wakeup receives the new max sequence after source completion;
+3. exact account crash replay:
+   - lease source row;
+   - append globally;
+   - trigger a test-only simulated process crash before source completion;
+   - advance `now` past lease expiry;
+   - retry;
+   - global row count remains one and the original sequence is returned;
+4. exact lifecycle crash replay:
+   - append a multi-item batch;
+   - crash before control-batch completion;
+   - retry;
+   - all original sequences are reused and the batch is then completed;
+5. same-generation ordering:
+   - lifecycle generation 1 contains identity then account;
+   - account source row carries generation 1;
+   - global order is identity, account, account-source event;
+6. two-sided boundary ordering:
+   - account event generation 0;
+   - lifecycle batch generation 1;
+   - account event generation 1;
+   - lifecycle batch generation 2;
+   - account event generation 2;
+   - global order is exactly account-0, lifecycle-1 items, account-1, lifecycle-2 items, account-2;
+7. multiple pending lifecycle generations merge correctly with account heads between them;
+8. a failed or leased account head blocks later account rows and the next lifecycle generation for that DID, but does not block another DID;
+9. round-robin scheduling prevents one hot DID from permanently starving another;
+10. account row final kind is honored; the sequencer never dynamically changes commit to sync;
+11. lifecycle sync uses its stored CAR bytes;
+12. source-key/global-frame conflict fails closed and does not delete the source;
+13. stale source lease completion produces `.leaseLost` while the global append remains durable;
+14. `drainAll` counts successful source steps, where one lifecycle batch is one step even if it appends multiple events.
+
+Add an internal test hook, not a public production API, for the exact crash boundary:
+
+```text
+after global append commits
+before source outbox/batch completion
+```
+
+A throwing hook must leave the source untouched. Do not simulate this by successfully completing and then manually recreating a row; that does not test the real boundary.
+
+- [ ] **Step 3: Confirm red**
 
 ```bash
-jj commit Sources/SwanHTTP Sources/SwanSQLite Tests -m "firehose: wire sequencer service and permissioned isolation gate"
+swift test --filter PublicFirehoseSequencerTests
+```
+
+- [ ] **Step 4: Implement the per-DID causal merge**
+
+The ordering model is:
+
+```text
+lifecycle batch g  <  account events stamped g  <  lifecycle batch g + 1
+```
+
+For each DID, peek:
+
+- the smallest account outbox `id`, with generation `a`;
+- the smallest pending lifecycle batch generation `l`.
+
+Choose the next causal source:
+
+```text
+only account exists       -> account
+only lifecycle exists     -> lifecycle
+both and a < l            -> account
+both and l <= a           -> lifecycle
+neither                    -> none
+```
+
+This is intentionally not “all lifecycle batches first.” Draining lifecycle generation 2 before an older account event stamped generation 1 would invert externally visible causality.
+
+Scheduling algorithm for one `sequenceNext` call:
+
+1. obtain a dynamic account snapshot;
+2. obtain `pendingLifecycleDIDs()`;
+3. take the sorted union of DIDs and rotate it from the actor’s round-robin cursor;
+4. for each DID:
+   - peek both source heads;
+   - choose the causal source by the rule above;
+   - if account is chosen, attempt to lease only its strict FIFO head;
+   - if that head is delayed or has an unexpired lease, continue to another DID; do not process a later event or the next lifecycle batch for this DID;
+   - if lifecycle is chosen, append the complete ordered batch;
+5. after one successful source step, advance the round-robin cursor and return;
+6. if no DID has a causally ready source, return `.idle`.
+
+- [ ] **Step 5: Encode persisted final material without reinterpretation**
+
+Account source:
+
+- decode payload according to stored kind;
+- commit requires its stored diff CAR;
+- sync requires its stored commit-only CAR;
+- construct one `FirehoseAppendItem` with `batchID: nil`;
+- append globally;
+- invoke the test crash hook, if any;
+- complete the token-checked source lease;
+- notify the wakeup sink only after source completion;
+- return `.sequencedAccountEvent` or `.leaseLost`.
+
+Lifecycle source:
+
+- preserve stored item ordinal;
+- decode identity/account/sync material;
+- sync requires stored CAR;
+- construct items sharing the durable batch ID;
+- append as one global transaction;
+- invoke the test crash hook;
+- complete the control batch;
+- notify with `seqs.last`;
+- return `.sequencedLifecycleBatch`.
+
+A persisted `.commit` that no longer encodes within limits is source corruption. Do not silently turn it into `.sync` in this worker; Task 4 owned the durable decision.
+
+- [ ] **Step 6: Preserve append-then-complete crash safety**
+
+Document this invariant on the actor:
+
+```text
+source lease/batch remains durable
+        ↓
+global append commits
+        ↓
+source completion commits
+```
+
+A crash after global append but before source completion leaves the source present. On retry, `appendBatch` finds the exact source key, re-encodes and validates the stored frame, returns the original sequence, and source completion then removes the source. There is no duplicate sequence and no lost event.
+
+Transient pre-append failures reschedule account leases using the persisted attempts count and bounded exponential backoff. Exact source conflicts, malformed durable material, and global-log corruption fail closed and must not delete the source.
+
+- [ ] **Step 7: Implement the service loop**
+
+Mirror the bounded cancellation loop in `PermissionedSpaceOutboxDeliveryWorker`:
+
+- call `sequenceNext`;
+- sleep for `idlePollInterval` on idle;
+- sleep on transient errors;
+- exit promptly when the task is cancelled;
+- never retain arbitrary error strings in durable storage.
+
+- [ ] **Step 8: Confirm focused and full tests**
+
+```bash
+swift test --filter PublicFirehoseSequencerTests
+swift test --filter SwanSQLiteTests
+```
+
+- [ ] **Step 9: Commit**
+
+```bash
+jj commit Sources/SwanSQLite Tests/SwanSQLiteTests \
+  -m "firehose: add causally ordered global sequencer"
 ```
 
 ---
 
-## Self-review notes (already applied)
+### Task 8: Wire the sequencer service and add the isolation/exit gates
 
-- Spec coverage: Phase 1 spec items — account outbox w/ exact material ✔ (T3+T4), oversize→sync durable decision ✔ (T4), lifecycle batch model + generation counter ✔ (T5), barriers ✔ (T7), allocator + `firehose_meta` + full frame bytes + reseed ✔ (T6), batch-atomic append + idempotent source keys ✔ (T6/T7), crash/idempotency tests ✔ (T6/T7), isolation gate ✔ (T8). Deliberately deferred per spec phasing: tailer (Phase 2), WebSocket/cursor/retention (Phase 3), lifecycle *integrations* + announcer + CLI (Phase 4), relay lab (Phase 5). `lifecycleGeneration` is threaded as a defaulted parameter until Phase 4 wires real generations through `withActiveAccountAuthorization` callers.
-- Known API-uncertainty points are marked inline (Petrel decode helper names, `OrderedCBORMap` ordering behavior, control-DB `close()`): in each case the named precedent file is the authority and the tests' assertions are the contract.
-- Type consistency: `PublicFirehoseEventKind` string raw values (`commit`/`sync`/`identity`/`account`) match every CHECK constraint; `FirehoseAppendItem.encodeFrame: (Int64) throws -> Data` matches sequencer usage; source-key helpers match all call sites.
+**Files:**
+
+- Create: `Sources/SwanHTTP/SwanPublicFirehoseSequencerService.swift`
+- Modify: `Sources/swan/SwanCommand.swift`
+- Modify: `Package.swift` only if tests need direct `SwanPublicFirehose` imports
+- Test: `Tests/SwanSQLiteTests/PublicFirehoseIsolationTests.swift`
+- Test: `Tests/SwanHTTPTests/PublicFirehoseServiceWiringTests.swift`
+
+`SQLitePreMigratedAccountDirectory` source conformance was added in Task 7; do not add a second static database inventory here.
+
+**Produces:**
+
+```swift
+public struct SwanPublicFirehoseSequencerService: Service {
+  public init(sequencer: PublicFirehoseSequencer)
+  public func run() async throws
+}
+```
+
+Implementation:
+
+```swift
+public func run() async throws {
+  await sequencer.runUntilCancelled()
+}
+```
+
+Match the actual `SwanNotificationRecoveryService` lifecycle style. Do not call a nonexistent `cancelWhenGracefulShutdown` helper.
+
+- [ ] **Step 1: Add the hard permissioned-isolation test**
+
+Copy a real permissioned-space write fixture and perform a successful permissioned write. Then assert:
+
+- `pendingPublicFirehoseOutbox()` is empty;
+- no lifecycle batch was created;
+- running a sequencer over the account produces zero steps;
+- `firehose.events(after: 0, limit: 10)` is empty.
+
+Also add a source-level dependency tripwire if the repository already uses architecture/dependency tests: permissioned domain and write files must not import `SwanPublicFirehose`.
+
+This test is expected to pass before service wiring; it is a permanent regression gate rather than red/green TDD.
+
+- [ ] **Step 2: Add an explicit Phase 1 server flag**
+
+In the `serve` command in `Sources/swan/SwanCommand.swift`, next to the notification-delivery flag, add:
+
+```swift
+@Flag(
+  name: .customLong("enable-public-firehose"),
+  help: "Enable durable public firehose sequencing into firehose.sqlite"
+)
+var enablePublicFirehose = false
+```
+
+Keep the default false during Phase 1 because:
+
+- there is not yet a WebSocket consumer surface;
+- retention/pruning is Phase 3;
+- an always-on append-only global log would otherwise grow without a production serve path.
+
+The account-local outbox insertion is not feature-gated. With the worker disabled, rows accumulate durably and drain when the flag is enabled. Record this intermediate behavior in the CLI help or nearby comment. Reconsider the default at the Phase 2/3 activation gate.
+
+- [ ] **Step 3: Write a failing direct service test**
+
+Prefer a direct service test over inspecting opaque `ServiceGroup` contents:
+
+1. construct account/control/firehose fixture databases;
+2. construct a dynamic fixed account source and sequencer;
+3. start `SwanPublicFirehoseSequencerService.run()` in a task;
+4. commit a real public repository mutation through the existing mutation store;
+5. poll `firehose.maxSequencedSeq()` with a strict five-second test deadline;
+6. cancel the service task;
+7. assert clean exit;
+8. decode stored frame and confirm DID, revision, source key, and sequence.
+
+Add `SwanPublicFirehose` as a direct `SwanHTTPTests` dependency only if the test imports its types. Do not rely on transitive module visibility.
+
+- [ ] **Step 4: Wire in `SwanCommand.swift`, not `SwanHTTP.swift`**
+
+The executable composition root currently opens `control.sqlite`, builds the account directory, constructs optional workers, assembles `[any Service]`, and calls `SwanHTTPServiceLifecycle.makeServiceGroup` in `Sources/swan/SwanCommand.swift`.
+
+When `--enable-public-firehose` is set:
+
+1. open `SQLiteFirehoseDatabase(dataDirectory:)`;
+2. create `PublicFirehoseSequencer` with:
+   - `accountSource: directory`;
+   - the existing control database;
+   - the new firehose database;
+   - `wakeup: nil` in Phase 1;
+3. wrap it in `SwanPublicFirehoseSequencerService`;
+4. append the service beside notification recovery and email recovery services;
+5. log that durable public firehose sequencing is enabled, without logging paths, rows, payloads, or account identifiers.
+
+The service and initializer must be public because the executable target imports them from `SwanHTTP`.
+
+- [ ] **Step 5: Close the global database on every exit path**
+
+Track the optional `SQLiteFirehoseDatabase` alongside other preopened resources.
+
+- after `serviceGroup.run()` returns, close it before or alongside directory/control closure;
+- in the outer `catch`, `try? await` close it;
+- avoid double close by following the established preopened-resource pattern;
+- add a test or hostile path showing startup failure after global DB open does not leak descriptors.
+
+- [ ] **Step 6: Run the Phase 1 exit gate**
+
+```bash
+swift build
+swift test --filter PublicFirehoseIsolationTests
+swift test --filter PublicFirehoseServiceWiringTests
+swift test --filter PublicFirehose
+swift test
+```
+
+Phase 1 is complete only when all of the following are true:
+
+- a real public mutation transaction atomically creates one exact source event;
+- the running sequencer service appends one complete, decodable frame to `firehose.sqlite`;
+- crash after global append reuses the same sequence;
+- lifecycle batch crash replay reuses the same consecutive sequence range;
+- per-DID generation-boundary tests prove both sides of the causal merge;
+- a delayed DID cannot block another DID;
+- source conflicts fail closed;
+- permissioned writes produce no public source or global rows;
+- all existing test suites remain green.
+
+- [ ] **Step 7: Commit**
+
+```bash
+jj commit Package.swift Sources/SwanHTTP Sources/swan Sources/SwanSQLite Tests \
+  -m "firehose: wire durable sequencer service"
+```
+
+---
+
+## Phase 1 completion record
+
+Before declaring this phase sealed, append a brief implementation record to the governing design or a dedicated completion note containing:
+
+- final migration version;
+- final source-key formats;
+- final per-DID generation ordering rule;
+- exact global sequence allocator semantics;
+- focused and full test commands with results;
+- any renamed files or APIs;
+- whether `--enable-public-firehose` remains default-off;
+- explicit statement that WebSocket streaming, retention, lifecycle integrations, crawl announcement, and Indigo proof remain unimplemented.
+
+## Deferred work and residual risks
+
+These are deliberately outside Phase 1 and must not be presented as completed:
+
+1. **Real lifecycle integrations.** Phase 1 stores and sequences lifecycle batches, but ordinary public writes are stamped generation `0`. Phase 4 must implement a confirmed, idempotent lifecycle saga that assigns generations to affected account writes without opening cross-database transactions.
+2. **Initial activation ordering.** The activation flow must ensure identity/account generation `g` precedes the genesis or activation repository event stamped `g`. Do not hook low-level PLC-history installation.
+3. **Rotation barrier.** A commit signed by a newly confirmed key must not pass its corresponding identity generation.
+4. **Deletion.** Emit the public deleted account event when public availability ends, not after final physical erasure. Phase 3 may prune older retained rows for that DID after appending the deletion event.
+5. **WebSocket/tailer.** Phase 2 must read `firehose.sqlite` as authority and use wakeups only to shorten polling latency.
+6. **Cursor and retention semantics.** Phase 3 owns cursor `0`, future/outdated cursor behavior, hard-age/byte retention, and slow-consumer closure.
+7. **`requestCrawl` and live relay proof.** Later phases own crawler retry state, Indigo pinning, subscription readiness, and inductive verification.
+8. **Restore sequence recovery.** Phase 1 exposes `reseedSequence`; the operator restore workflow must later supply a safe high-water mark and prove that sequence values are never reused after restoring an older database.
+9. **Feature-disabled accumulation.** While the Phase 1 flag is off, account outboxes grow. This is acceptable only as an intermediate development state and must be resolved before production activation.
+
+## Final self-review checklist
+
+- [ ] The governing design exists and no longer contains superseded source hooks, CID-list replay, direct-broadcast correctness, or unbounded minimum-row retention.
+- [ ] No sketch calls nonexistent Petrel APIs such as mutable `OrderedCBORMap.append` or `DAGCBOR.decodeValueWithLength`.
+- [ ] `since`, `prevData`, and operation `prev` have the correct null/optional wire distinctions.
+- [ ] The 10,000-byte sync CAR limit is enforced.
+- [ ] The public mutation protocol signature is unchanged.
+- [ ] Final commit-versus-sync choice is persisted in the repository transaction.
+- [ ] The new outbox INSERT participates in the existing mutating-SQL failure-injection ledger.
+- [ ] Account outbox order is strict by smallest ID; later commits never overtake a delayed head.
+- [ ] Exact source-key reuse compares all durable content.
+- [ ] Lifecycle batches are DID-namespaced, nonempty, bounded, exact-replay validated, and carry sync CAR bytes.
+- [ ] Global batch append is all-existing or all-new; partial replay fails closed.
+- [ ] Sequence arithmetic is checked in Swift and permits only the exhausted sentinel above the event maximum.
+- [ ] Per-DID causal merge proves `lifecycle g < account g < lifecycle g+1`.
+- [ ] One blocked DID cannot stall another.
+- [ ] Crash tests occur at the real append-before-complete boundary.
+- [ ] Service composition changes are in `Sources/swan/SwanCommand.swift`.
+- [ ] The global database is closed on successful shutdown and every startup/runtime failure path.
+- [ ] Permissioned isolation remains a hard gate.
+- [ ] All fixed 2026 dates use Unix time `1_785_844_800` or a value derived from it.
+- [ ] `swift build` and the complete `swift test` suite pass.

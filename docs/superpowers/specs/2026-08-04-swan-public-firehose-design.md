@@ -1,8 +1,32 @@
 # Swan public firehose federation (P0) — design
 
 Date: 2026-08-04 (revised same day after external design review)
-Status: revised; pending user re-review
+Status: revised; reconciled with the reviewed Phase 1 implementation plan
 Workspace: `.worktrees/swan-public-federation` (jj workspace `swan-public-federation`, based on `bc3bec32`)
+
+## Phase 1 scope and authoritative plan
+
+The reviewed implementation plan
+(`docs/superpowers/plans/2026-08-04-swan-firehose-phase1-event-core.md`) is
+authoritative for Phase 1 details. Phase 1 delivers only the durable event
+core: event models, frame encoding, account-local outbox, lifecycle batch
+model, checked global sequence allocator, and the causally ordered sequencer
+worker.
+
+Phase 1 does **not** yet integrate real lifecycle operations. Ordinary public
+commits are stamped lifecycle generation `0` until the Phase 4 lifecycle saga
+is wired; the lifecycle batch model and per-DID generation counter exist and
+are tested, but no confirmed lifecycle operation enqueues batches yet.
+
+The following remain later phases and must not be presented as Phase 1 work:
+
+- WebSocket streaming, cursor behavior, and tailer (Phase 2/3).
+- Retention pruning, `retained_from_seq` advance, and per-DID deletion pruning
+  after the deletion event (Phase 3).
+- `requestCrawl` announcer and reference-relay acceptance proof (Phase 4/5).
+- Real lifecycle integrations: activation, rotation, status changes, deletion
+  (Phase 4). `installPublicPLCOperation` and `transitionStatus` themselves
+  emit nothing in every phase.
 
 ## Goal
 
@@ -114,6 +138,13 @@ replay, no dependency on future block-GC behavior, no nondeterministic block
 ordering, and a simpler sequencer. `#commit.blobs` is deprecated per the sync
 spec — producers send `[]`; no blob CIDs are collected or stored.
 
+The account outbox is **strict FIFO by insertion ID**: the sequencer may only
+lease the smallest outstanding `id`, never an `available_at`-ordered later row.
+A failed or leased head blocks later account rows and the next lifecycle
+generation for that DID until it completes or its lease expires, but never
+blocks another DID. This guarantees a failed older commit can never be
+overtaken by a newer commit.
+
 ### Control-plane outbox: confirmed lifecycle batches
 
 Lifecycle events are emitted by the **higher-level operation that knows the
@@ -215,7 +246,7 @@ transmission are the same code path; no per-subscriber event buffers. Slow
 consumers are detected by bounds — WebSocket write duration, max seq/byte lag,
 max total catch-up time — then error frame `ConsumerTooSlow` + close.
 
-## `subscribeRepos` endpoint
+## `subscribeRepos` endpoint (Phase 2/3 — not Phase 1)
 
 - Dependency: `hummingbird-websocket` 2.x, pinned exact.
 - `GET /xrpc/com.atproto.sync.subscribeRepos`, unauthenticated WebSocket
@@ -249,7 +280,7 @@ max total catch-up time — then error frame `ConsumerTooSlow` + close.
   chiefly covers import, rebase, recovery, and exceptional framing overhead.
   The decision is made durably at outbox-write time.
 
-### Cursor semantics on connect
+### Cursor semantics on connect (Phase 2/3)
 
 - No cursor → live tail from current position.
 - `cursor=0` → entire retained window from oldest event, **no**
@@ -268,7 +299,7 @@ fixture proves the pinned relay receives no duplicate at the cutover boundary.
 Recorded as a compatibility choice, not claimed as unambiguously
 spec-conformant.
 
-### Liveness and retention
+### Liveness and retention (Phase 3)
 
 - WebSocket ping heartbeat every 30 s; graceful shutdown sends close frames
   via the service-lifecycle hook.
@@ -280,7 +311,7 @@ spec-conformant.
   retained events for that DID **in the same global transaction** (matching
   reference PDS behavior). Sequence gaps are permitted.
 
-## `requestCrawl` announcer
+## `requestCrawl` announcer (Phase 4 — not Phase 1)
 
 - Config `SWAN_PUBLIC_CRAWLERS` (comma-separated crawler origins, no default);
   request body carries Swan's canonical public hostname.
@@ -290,7 +321,7 @@ spec-conformant.
   `control.sqlite`; exponential backoff with jitter; plain HTTP client calls,
   never inside a transaction.
 
-## Acceptance: reference relay in the interop lab
+## Acceptance: reference relay in the interop lab (Phase 5 — not Phase 1)
 
 New compose service `reference-relay` (indigo `cmd/relay`):
 
