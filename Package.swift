@@ -9,6 +9,7 @@ let package = Package(
         .library(name: "SwanSpacesWire", targets: ["SwanSpacesWire"]),
         .library(name: "SwanPublicWire", targets: ["SwanPublicWire"]),
         .library(name: "SwanPublicRepository", targets: ["SwanPublicRepository"]),
+        .library(name: "SwanPublicFirehose", targets: ["SwanPublicFirehose"]),
         .library(name: "SwanSpaces", targets: ["SwanSpaces"]),
         .library(name: "SwanStorage", targets: ["SwanStorage"]),
         .library(name: "SwanSQLite", targets: ["SwanSQLite"]),
@@ -84,6 +85,13 @@ let package = Package(
             dependencies: [
                 "SwanCore",
                 .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "Petrel", package: "Petrel"),
+            ]
+        ),
+        .target(
+            name: "SwanPublicFirehose",
+            dependencies: [
+                "SwanPublicRepository",
                 .product(name: "Petrel", package: "Petrel"),
             ]
         ),
@@ -269,6 +277,14 @@ let package = Package(
                 "SwanAccounts", "SwanInterop", "SwanOAuth", "SwanSpaces",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),
+            ]
+        ),
+        .testTarget(
+            name: "SwanPublicFirehoseTests",
+            dependencies: [
+                "SwanPublicFirehose",
+                "SwanPublicRepository",
+                .product(name: "Petrel", package: "Petrel"),
             ]
         ),
         .testTarget(
