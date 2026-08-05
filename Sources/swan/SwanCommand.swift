@@ -1520,6 +1520,12 @@ extension SwanCommand {
         @Flag(name: .customLong("enable-notification-delivery"), help: "Enable durable peer-pinned writer notifications and deletion recovery delivery")
         var enableNotificationDelivery = false
 
+        @Flag(
+            name: .customLong("enable-public-firehose"),
+            help: "Enable durable public firehose sequencing into firehose.sqlite. Phase 1 has no WebSocket consumer surface; with the worker disabled, account-local outbox rows accumulate durably and drain once this flag is enabled."
+        )
+        var enablePublicFirehose = false
+
         @Option(name: .customLong("notification-account-kek-file"), help: "Owner-only mounted account-KEK file for notification signing; SWAN_ACCOUNT_KEK is the alternative")
         var notificationAccountKEKFile: String?
 
@@ -1786,6 +1792,7 @@ extension SwanCommand {
             let controlDatabase = try await SQLiteControlDatabase(dataDirectory: dataURL)
             var preopenedAccountDirectory: SQLitePreMigratedAccountDirectory?
             var preopenedManagementProvisioning: SwanManagementPLCProvisioningRuntime?
+            var preopenedFirehoseDatabase: SQLiteFirehoseDatabase?
             do {
                 if !enableManagementPermanentDeletion {
                     let pending = try await controlDatabase
@@ -2162,6 +2169,30 @@ extension SwanCommand {
                     accountEmailXRPC = nil
                     emailRecoveryService = nil
                 }
+                let publicFirehoseService: SwanPublicFirehoseSequencerService?
+                if enablePublicFirehose {
+                    do {
+                        let firehoseDatabase = try await SQLiteFirehoseDatabase(
+                            dataDirectory: dataURL
+                        )
+                        let sequencer = PublicFirehoseSequencer(
+                            accountSource: directory,
+                            control: controlDatabase,
+                            firehose: firehoseDatabase,
+                            wakeup: nil
+                        )
+                        publicFirehoseService = SwanPublicFirehoseSequencerService(
+                            sequencer: sequencer
+                        )
+                        preopenedFirehoseDatabase = firehoseDatabase
+                    } catch {
+                        throw ValidationError(
+                            "durable public firehose database is unavailable"
+                        )
+                    }
+                } else {
+                    publicFirehoseService = nil
+                }
                 let managementKeyStore: FileAccountKeyStore?
                 if managementNeedsAccountKeyStore {
                     do {
@@ -2318,6 +2349,10 @@ extension SwanCommand {
                     services.append(emailRecoveryService)
                     logger.info("account email recovery delivery enabled with Mailpit SMTP")
                 }
+                if let publicFirehoseService {
+                    services.append(publicFirehoseService)
+                    logger.info("durable public firehose sequencing enabled")
+                }
                 if let managementApplication {
                     services.append(managementApplication)
                     logger.info("starting Swan management listener", metadata: [
@@ -2330,6 +2365,7 @@ extension SwanCommand {
                 )
                 try await serviceGroup.run()
                 try await managementPLCProvisioning?.close()
+                try await preopenedFirehoseDatabase?.close()
                 try await directory.close()
                 try await controlDatabase.close()
             } catch {
@@ -2338,6 +2374,9 @@ extension SwanCommand {
                 }
                 if let preopenedAccountDirectory {
                     try? await preopenedAccountDirectory.close()
+                }
+                if let preopenedFirehoseDatabase {
+                    try? await preopenedFirehoseDatabase.close()
                 }
                 try? await controlDatabase.close()
                 throw error

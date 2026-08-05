@@ -261,13 +261,15 @@ let package = Package(
         .testTarget(
             name: "SwanHTTPTests",
             dependencies: [
-                "swan", "SwanAccounts", "SwanHTTP", "SwanOAuth", "SwanPublicWire", "SwanSQLite", "SwanSpacesWire",
+                "swan", "SwanAccounts", "SwanHTTP", "SwanOAuth", "SwanPublicFirehose", "SwanPublicRepository", "SwanPublicWire", "SwanSQLite", "SwanSpacesWire", "SwanStorage",
+                .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "Petrel", package: "Petrel"),
                 .product(name: "UnixSignals", package: "swift-service-lifecycle"),
             ]
         ),
