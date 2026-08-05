@@ -921,7 +921,8 @@ struct ServePermissionedRuntime {
         localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration? = nil,
         authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
-        loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct
+        loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
+        publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil
     ) -> SwanHTTPServer {
         SwanHTTPServer(
             profile: profile,
@@ -949,7 +950,8 @@ struct ServePermissionedRuntime {
             },
             blobStreamAdmission: directory.publicRepositorySpoolAdmission,
             accountEmailXRPC: accountEmailXRPC,
-            loginClientIdentityPolicy: loginClientIdentityPolicy
+            loginClientIdentityPolicy: loginClientIdentityPolicy,
+            publicFirehoseStreaming: publicFirehoseStreaming
         )
     }
 }
@@ -1522,7 +1524,7 @@ extension SwanCommand {
 
         @Flag(
             name: .customLong("enable-public-firehose"),
-            help: "Enable durable public firehose sequencing into firehose.sqlite. Phase 1 has no WebSocket consumer surface; with the worker disabled, account-local outbox rows accumulate durably and drain once this flag is enabled."
+            help: "Enable durable public firehose sequencing into firehose.sqlite and serve com.atproto.sync.subscribeRepos WebSocket streaming on the public listener. With the worker disabled, account-local outbox rows accumulate durably and drain once this flag is enabled."
         )
         var enablePublicFirehose = false
 
@@ -2170,19 +2172,27 @@ extension SwanCommand {
                     emailRecoveryService = nil
                 }
                 let publicFirehoseService: SwanPublicFirehoseSequencerService?
+                var publicFirehoseStreamingRuntime: SwanPublicFirehoseStreamingRuntime?
                 if enablePublicFirehose {
                     do {
                         let firehoseDatabase = try await SQLiteFirehoseDatabase(
                             dataDirectory: dataURL
                         )
+                        let wakeupHub = PublicFirehoseWakeupHub()
                         let sequencer = PublicFirehoseSequencer(
                             accountSource: directory,
                             control: controlDatabase,
                             firehose: firehoseDatabase,
-                            wakeup: nil
+                            wakeup: wakeupHub
                         )
                         publicFirehoseService = SwanPublicFirehoseSequencerService(
                             sequencer: sequencer
+                        )
+                        publicFirehoseStreamingRuntime = SwanPublicFirehoseStreamingRuntime(
+                            database: firehoseDatabase,
+                            hub: wakeupHub,
+                            limits: .standard,
+                            logger: logger
                         )
                         preopenedFirehoseDatabase = firehoseDatabase
                     } catch {
@@ -2192,6 +2202,7 @@ extension SwanCommand {
                     }
                 } else {
                     publicFirehoseService = nil
+                    publicFirehoseStreamingRuntime = nil
                 }
                 let managementKeyStore: FileAccountKeyStore?
                 if managementNeedsAccountKeyStore {
@@ -2285,7 +2296,8 @@ extension SwanCommand {
                     localhostOAuthConfiguration: localhostOAuthConfiguration,
                     authorizationServerConfiguration: authorizationServerConfiguration,
                     accountEmailXRPC: accountEmailXRPC,
-                    loginClientIdentityPolicy: loginClientIdentityPolicy
+                    loginClientIdentityPolicy: loginClientIdentityPolicy,
+                    publicFirehoseStreaming: publicFirehoseStreamingRuntime
                 )
                 guard server.authenticatedGetSpace != nil else {
                     throw ValidationError(
