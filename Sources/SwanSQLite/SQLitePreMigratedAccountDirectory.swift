@@ -18,7 +18,8 @@ public actor SQLitePreMigratedAccountDirectory:
     AuthorizedSpaceBlobDirectory,
     AuthorizedSpaceNotificationDirectory,
     AuthorizedHostedSpaceDirectory,
-    PublicRepositoryReadDirectory
+    PublicRepositoryReadDirectory,
+    PublicFirehoseAccountDatabaseSource
 {
     private let controlStore: any AccountControlStore
     private let publicIdentityVerifier: (any PublicPLCGenesisVerifying)?
@@ -240,6 +241,24 @@ public actor SQLitePreMigratedAccountDirectory:
             active.append(database)
         }
         return active
+    }
+
+    /// Fresh snapshot of every currently managed account database, sorted by
+    /// DID. Unlike `notificationRecoveryDatabases`, there is no active-status
+    /// filter: public commits written before deactivation must still drain.
+    /// This method never opens, creates, or migrates a database.
+    public func publicFirehoseAccountDatabases()
+        async throws -> [PublicFirehoseAccountDatabase]
+    {
+        guard !isClosed else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        return databases.keys.sorted().map { did in
+            PublicFirehoseAccountDatabase(
+                did: did,
+                database: databases[did]!
+            )
+        }
     }
 
     /// Admits one database only after the loopback management activation flow
