@@ -1,5 +1,6 @@
 import Foundation
 import Petrel
+import SQLiteNIO
 import SwanCore
 import SwanPublicFirehose
 import XCTest
@@ -420,5 +421,22 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     let reopenedMax = try await reopened.maxSequencedSeq()
     XCTAssertEqual(reopenedMax, 1)
     try await reopened.close()
+  }
+
+  func testFirehoseRetainedFromSeqAccessor() async throws {
+    let retained = try await firehose.retainedFromSeq()
+    XCTAssertNil(retained, "retention is never advanced in Phase 2")
+
+    let path = SQLiteLayout.firehoseDatabase(in: root).path
+    let raw = try await SQLiteConnection.open(storage: .file(path: path))
+    _ = try await raw.query("PRAGMA busy_timeout=5000")
+    _ = try await raw.query(
+      "UPDATE firehose_meta SET retained_from_seq = ? WHERE singleton = 1",
+      [.integer(5)]
+    )
+    try await raw.close()
+
+    let advanced = try await firehose.retainedFromSeq()
+    XCTAssertEqual(advanced, 5)
   }
 }

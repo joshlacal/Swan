@@ -345,6 +345,39 @@ public actor SQLiteFirehoseDatabase {
     }
   }
 
+  /// Returns the oldest sequence still retained in the firehose log, or `nil`
+  /// while retention pruning has never advanced. Phase 2 never advances
+  /// retention, so this reads `firehose_meta.retained_from_seq` and returns
+  /// `nil` on a fresh database.
+  public func retainedFromSeq() async throws -> Int64? {
+    try checkOpen()
+    return try await withConnectionGate {
+      let rows = try await connection.query(
+        "SELECT retained_from_seq FROM firehose_meta WHERE singleton = 1"
+      )
+      guard rows.count == 1, let row = rows.first else {
+        throw SQLiteFirehoseDatabaseError.corruptDatabase(
+          "firehose_meta is missing or invalid"
+        )
+      }
+      guard let value = row.column("retained_from_seq") else {
+        throw SQLiteFirehoseDatabaseError.corruptDatabase(
+          "firehose_meta is missing its retention column"
+        )
+      }
+      switch value {
+      case .null:
+        return nil
+      case let .integer(retained) where retained >= 1:
+        return Int64(retained)
+      default:
+        throw SQLiteFirehoseDatabaseError.corruptDatabase(
+          "firehose_meta retained_from_seq is invalid"
+        )
+      }
+    }
+  }
+
   public func events(
     after seq: Int64,
     limit: Int
