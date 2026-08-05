@@ -1,6 +1,7 @@
 import Foundation
 import Hummingbird
 import HummingbirdCore
+import HummingbirdWebSocket
 import HTTPTypes
 import Logging
 import NIOCore
@@ -17,18 +18,24 @@ import SwanStorage
 /// peer. Forwarded headers are deliberately not decoded into this type.
 public struct SwanHTTPRequestContext:
     RequestContext,
-    RemoteAddressRequestContext
+    RemoteAddressRequestContext,
+    @unchecked Sendable
 {
     public var coreContext: CoreRequestContextStorage
     public let remoteAddress: SocketAddress?
     private let requestChannel: any Channel
     private let bodyTerminationState: SwanJSONWriteBodyTerminationState
+    /// WebSocket handler slot set by a matched `router.ws` route. Never
+    /// touched by plain HTTP routes; the upgrade channel reads it only after
+    /// the route returned `.ok`.
+    public let webSocket: WebSocketHandlerReference<SwanHTTPRequestContext>
 
     public init(source: ApplicationRequestContextSource) {
         coreContext = .init(source: source)
         remoteAddress = source.channel.remoteAddress
         requestChannel = source.channel
         bodyTerminationState = SwanJSONWriteBodyTerminationState()
+        webSocket = .init()
     }
 
     /// Stops an admitted inbound body at an absolute deadline. Production
@@ -52,6 +59,14 @@ public struct SwanHTTPRequestContext:
         }, state: { bodyTerminationState.value })
     }
 }
+
+/// The `@unchecked Sendable` annotation above is scoped to the retained
+/// `requestChannel`, which is only touched through NIO's thread-safe pipeline
+/// API from the accepted channel's own event loop. `coreContext` and
+/// `webSocket` are Sendable value types; `bodyTerminationState` is an
+/// `NIOLockedValueBox`-backed Sendable. Without this conformance the ws route
+/// could not store the context in its `WebSocketHandlerReference` slot.
+extension SwanHTTPRequestContext: WebSocketRequestContext {}
 
 // Keep the existing internal route-registration signatures compact while
 // migrating the complete public router to the peer-retaining context.
@@ -385,6 +400,10 @@ public struct SwanHTTPServer: Sendable {
     /// Shared finite total elapsed-time policy for admitted JSON command
     /// bodies. This is distinct from the listener's resettable idle timeout.
     public let jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy
+    /// The durable public firehose streaming runtime backing
+    /// `com.atproto.sync.subscribeRepos`. Nil keeps the legacy wildcard-404
+    /// behavior for the endpoint; non-nil registers the WebSocket route.
+    public let publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime?
 
     public init(
         profile: ProtocolProfile,
@@ -413,7 +432,8 @@ public struct SwanHTTPServer: Sendable {
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         jsonReadAdmission: PublicRepositoryJSONReadAdmission? = nil,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
-        jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil
+        jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil,
+        publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -422,6 +442,7 @@ public struct SwanHTTPServer: Sendable {
         self.loginClientIdentityPolicy = loginClientIdentityPolicy
         self.publicRepositoryReadDirectory = publicRepositoryReadDirectory
         self.accountEmailXRPC = accountEmailXRPC
+        self.publicFirehoseStreaming = publicFirehoseStreaming
         let resolvedJSONReadAdmission = jsonReadAdmission
             ?? PublicRepositoryJSONReadAdmission.processShared
         self.jsonReadAdmission = resolvedJSONReadAdmission
@@ -918,6 +939,15 @@ public struct SwanHTTPServer: Sendable {
                 capability: publicRepositoryMutations
             )
         }
+        // The exact ws route beats the `com.atproto.sync.*` wildcard guard
+        // below (exact paths have higher precedence). When the runtime is
+        // absent the wildcard 404 remains the endpoint's only shape.
+        if let publicFirehoseStreaming {
+            registerPublicFirehoseStreamingEndpoint(
+                on: router,
+                runtime: publicFirehoseStreaming
+            )
+        }
         for descriptor in PublicDataTesting20260727.methods {
             if accountEmailXRPC != nil,
                Self.isInstalledAccountEmailMethod(descriptor.nsid) {
@@ -991,18 +1021,39 @@ public struct SwanHTTPServer: Sendable {
                 logger: logger
             )
         )
+        let router = buildRouter()
         return Application(
-            router: buildRouter(),
-            server: .http1(
+            router: router,
+            server: .http1WebSocketUpgrade(
+                webSocketRouter: router,
                 configuration: .init(
-                    additionalChannelHandlers: [SwanJSONWriteBodyDrainHandler(
-                        timeout: jsonWriteBodyPolicy.totalBodyTimeout + .milliseconds(50)
-                    )],
-                    idleTimeout: .seconds(Int64(configuration.idleTimeoutSeconds))
+                    http1: .init(
+                        additionalChannelHandlers: [SwanJSONWriteBodyDrainHandler(
+                            timeout: jsonWriteBodyPolicy.totalBodyTimeout + .milliseconds(50)
+                        )],
+                        idleTimeout: .seconds(Int64(configuration.idleTimeoutSeconds))
+                    ),
+                    ws: Self.publicFirehoseWebSocketConfiguration()
                 )
             ),
             configuration: applicationConfiguration,
             logger: logger
+        )
+    }
+
+    /// The WebSocket sub-configuration used by the public listener.
+    ///
+    /// `maxFrameSize` must cover the largest stored firehose frame
+    /// (`FirehoseFrameLimits.maximumFrameBytes`); the 16 KiB default would
+    /// fail every real `#commit` with `messageTooLarge`. Auto-ping stays
+    /// disabled (Phase 3 liveness) and close negotiation is bounded so a
+    /// dead peer cannot pin a channel.
+    static func publicFirehoseWebSocketConfiguration() -> WebSocketServerConfiguration {
+        WebSocketServerConfiguration(
+            maxFrameSize: 5_000_000,
+            autoPing: .disabled,
+            closeTimeout: .seconds(15),
+            validateUTF8: true
         )
     }
 }

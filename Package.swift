@@ -160,7 +160,7 @@ let package = Package(
         .target(
             name: "SwanHTTP",
             dependencies: [
-                "SwanAccounts", "SwanCore", "SwanPublicRepository", "SwanPublicWire", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth", "SwanSQLite",
+                "SwanAccounts", "SwanCore", "SwanPublicFirehose", "SwanPublicRepository", "SwanPublicWire", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth", "SwanSQLite",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket"),
                 .product(name: "Petrel", package: "Petrel"),

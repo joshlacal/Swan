@@ -33,6 +33,20 @@ public actor PublicFirehoseWakeupHub: PublicFirehoseWakeupSink {
   /// Returns a per-subscriber stream of append bumps. Each subscriber owns
   /// its continuation; cancellation or deallocation removes it from the hub.
   public func subscribe() -> AsyncStream<Int64> {
+    subscribeWithFinish().stream
+  }
+
+  /// Returns a per-subscriber stream of append bumps plus a handle that
+  /// finishes the stream.
+  ///
+  /// The route owns a per-connection forwarder task that iterates the stream
+  /// for the connection's lifetime; `finish` terminates that iteration so the
+  /// subscriber task ends and `onTermination` removes the subscriber from the
+  /// hub. The handle is safe to call once the stream is already finished.
+  public func subscribeWithFinish() -> (
+    stream: AsyncStream<Int64>,
+    finish: @Sendable () -> Void
+  ) {
     let (stream, continuation) = AsyncStream<Int64>.makeStream(
       bufferingPolicy: .bufferingNewest(1)
     )
@@ -41,7 +55,16 @@ public actor PublicFirehoseWakeupHub: PublicFirehoseWakeupSink {
     continuation.onTermination = { [weak self] _ in
       Task { await self?.removeSubscriber(id) }
     }
-    return stream
+    let finish: @Sendable () -> Void = {
+      continuation.finish()
+    }
+    return (stream, finish)
+  }
+
+  /// Test-visible current subscriber count. A finished or deallocated
+  /// subscription removes itself asynchronously, so callers poll for zero.
+  func subscriberCount() -> Int {
+    subscribers.count
   }
 
   private func removeSubscriber(_ id: UUID) {
