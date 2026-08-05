@@ -24,6 +24,8 @@ func registerUnavailablePublicEndpoint(
             isStreamingAdapter ? publicStreamingEndpointUnavailable() : publicDataUnavailable()
         }
         availableMethod = .post
+    case .subscription:
+        return
     }
     for method in publicGuardedHTTPMethods where method != availableMethod {
         router.on(path, method: method) { _, _ -> Response in

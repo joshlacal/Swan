@@ -15,5 +15,11 @@ public enum SwanPublicWireLexicons {
         ATProtocolValueContainer.registerDecoder(forType: "com.atproto.repo.applyWrites#deleteResult", as: ComAtprotoRepoApplyWrites.DeleteResult.self)
         ATProtocolValueContainer.registerDecoder(forType: "com.atproto.repo.defs#commitMeta", as: ComAtprotoRepoDefs.CommitMeta.self)
         ATProtocolValueContainer.registerDecoder(forType: "com.atproto.repo.listRecords#record", as: ComAtprotoRepoListRecords.Record.self)
+        ATProtocolValueContainer.registerDecoder(forType: "com.atproto.sync.subscribeRepos#commit", as: ComAtprotoSyncSubscribeRepos.Commit.self)
+        ATProtocolValueContainer.registerDecoder(forType: "com.atproto.sync.subscribeRepos#sync", as: ComAtprotoSyncSubscribeRepos.Sync.self)
+        ATProtocolValueContainer.registerDecoder(forType: "com.atproto.sync.subscribeRepos#identity", as: ComAtprotoSyncSubscribeRepos.Identity.self)
+        ATProtocolValueContainer.registerDecoder(forType: "com.atproto.sync.subscribeRepos#account", as: ComAtprotoSyncSubscribeRepos.Account.self)
+        ATProtocolValueContainer.registerDecoder(forType: "com.atproto.sync.subscribeRepos#info", as: ComAtprotoSyncSubscribeRepos.Info.self)
+        ATProtocolValueContainer.registerDecoder(forType: "com.atproto.sync.subscribeRepos#repoOp", as: ComAtprotoSyncSubscribeRepos.RepoOp.self)
     }
 }

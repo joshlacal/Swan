@@ -8,22 +8,25 @@ public_wire_die() {
 }
 
 public_wire_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-public_wire_profile="${public_wire_root}/Profiles/public-data-testing-2026-07-30.json"
+public_wire_profile="${public_wire_root}/Profiles/public-data-testing-2026-08-05.json"
 public_wire_petrel_manifest="${public_wire_root}/PublicPetrelManifest.json"
-public_wire_lexicon_manifest="${public_wire_root}/Profiles/public-data-testing-2026-07-30.lexicons.sha256"
-public_wire_generated_manifest="${public_wire_root}/Profiles/public-data-testing-2026-07-30.generated-wire.sha256"
+public_wire_lexicon_manifest="${public_wire_root}/Profiles/public-data-testing-2026-08-05.lexicons.sha256"
+public_wire_generated_manifest="${public_wire_root}/Profiles/public-data-testing-2026-08-05.generated-wire.sha256"
 public_wire_reference_root="${PUBLIC_WIRE_REFERENCE_ROOT:-${public_wire_root}/.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354}"
 public_wire_sha256="${public_wire_root}/Scripts/sha256.sh"
-readonly public_wire_expected_profile_id="public-data-testing-2026-07-30"
+readonly public_wire_expected_profile_id="public-data-testing-2026-08-05"
 readonly public_wire_expected_reference_commit="3f6c96d5d2d25438bd40fa89d6ecc37865f8e354"
 readonly public_wire_expected_generator_commit="c2a1cdbee8c621c7682416114700f032cc7e2b37"
-readonly public_wire_expected_profile_sha256="7d1a3046825aec4cd83a03fd43c48f305738172fd9c462822e0833977f9c7cf8"
+readonly public_wire_expected_profile_sha256="98bb8609b6dc2dfde2db34fb4f6ee1f56d18dab584fa7987b3d259f151f96121"
 readonly public_wire_expected_petrel_manifest_sha256="cb39d0c4264d02540b67adbe668a1224753b507e35e11f19ba97879931804068"
-readonly public_wire_expected_lexicon_manifest_sha256="fa89a31b4ac6421ebcacdd6a66de77ff191497f19361d41141f538477638bd75"
-readonly public_wire_expected_generated_manifest_sha256="4703b4096dbf5dbc83e19d30c15539f426b73ebaca57c26bf82b5774440f2898"
+readonly public_wire_expected_lexicon_manifest_sha256="2f14fbc29b2c3414baca5e659fb8dbe85f6b5a5252e13ff677b5b19d4309374d"
+readonly public_wire_expected_generated_manifest_sha256="80a03ee8bcaed70008b74556add80108f5cf64d96932b21df60e2d18e247dcc7"
 readonly public_wire_expected_legacy_profile_sha256="6effa7604b1c2613f6819a6c4bb7d21874bd5073db23556089060c495a3c91bf"
 readonly public_wire_expected_legacy_lexicon_manifest_sha256="bd94660a2c2c05fc23185059329194ff6c29635f74ce2efcf97351c1be98fe97"
 readonly public_wire_expected_legacy_generated_manifest_sha256="c68177a315f6a3d6f01419f48be5e0beedf76d1e4ae21ebe5de52ac49ad80d3b"
+readonly public_wire_expected_frozen_profile_sha256="7d1a3046825aec4cd83a03fd43c48f305738172fd9c462822e0833977f9c7cf8"
+readonly public_wire_expected_frozen_lexicon_manifest_sha256="fa89a31b4ac6421ebcacdd6a66de77ff191497f19361d41141f538477638bd75"
+readonly public_wire_expected_frozen_generated_manifest_sha256="4703b4096dbf5dbc83e19d30c15539f426b73ebaca57c26bf82b5774440f2898"
 
 public_wire_profile_value() {
   python3 - "${public_wire_profile}" "$1" <<'PY'
@@ -48,6 +51,9 @@ public_wire_verify_legacy_profile_immutable() {
 Profiles/public-data-testing-2026-07-27.json ${public_wire_expected_legacy_profile_sha256}
 Profiles/public-data-testing-2026-07-27.lexicons.sha256 ${public_wire_expected_legacy_lexicon_manifest_sha256}
 Profiles/public-data-testing-2026-07-27.generated-wire.sha256 ${public_wire_expected_legacy_generated_manifest_sha256}
+Profiles/public-data-testing-2026-07-30.json ${public_wire_expected_frozen_profile_sha256}
+Profiles/public-data-testing-2026-07-30.lexicons.sha256 ${public_wire_expected_frozen_lexicon_manifest_sha256}
+Profiles/public-data-testing-2026-07-30.generated-wire.sha256 ${public_wire_expected_frozen_generated_manifest_sha256}
 EOF
 }
 
@@ -77,6 +83,7 @@ paths = [
     "com/atproto/sync/getLatestCommit.json",
     "com/atproto/sync/getRepo.json",
     "com/atproto/sync/getRepoStatus.json",
+    "com/atproto/sync/subscribeRepos.json",
 ]
 with open(sys.argv[1], "w", encoding="utf-8") as output:
     output.write("\n".join(paths) + "\n")
@@ -117,6 +124,7 @@ lexicons = [
     "com.atproto.sync.getLatestCommit",
     "com.atproto.sync.getRepo",
     "com.atproto.sync.getRepoStatus",
+    "com.atproto.sync.subscribeRepos",
 ]
 endpoints = [identifier for identifier in lexicons if not identifier.endswith(".defs")]
 
@@ -134,10 +142,10 @@ for field, value in expected.items():
     if profile.get(field) != value:
         raise SystemExit(f"profile {field} drifted")
 if profile.get("lexicons") != lexicons:
-    raise SystemExit("profile lexicon inventory must be the exact ordered 20-file set")
+    raise SystemExit("profile lexicon inventory must be the exact ordered 21-file set")
 if profile.get("endpoints") != endpoints:
-    raise SystemExit("profile endpoint inventory must be the exact ordered 18-method set")
-if len(set(lexicons)) != 20 or len(set(endpoints)) != 18:
+    raise SystemExit("profile endpoint inventory must be the exact ordered 19-method set")
+if len(set(lexicons)) != 21 or len(set(endpoints)) != 19:
     raise SystemExit("profile inventory contains duplicate identifiers")
 PY
 }
@@ -160,14 +168,14 @@ public_wire_verify_source_manifest() {
   [[ "${actual}" == "${public_wire_expected_lexicon_manifest_sha256}" ]] || public_wire_die "lexicon manifest checksum mismatch"
   [[ "$(public_wire_profile_value lexiconManifestSHA256)" == "${actual}" ]] || public_wire_die "profile lexicon manifest checksum drifted"
   count="$(wc -l <"${public_wire_lexicon_manifest}" | tr -d ' ')"
-  [[ "${count}" == "20" ]] || public_wire_die "lexicon manifest must contain exactly 20 entries"
+  [[ "${count}" == "21" ]] || public_wire_die "lexicon manifest must contain exactly 21 entries"
 
   expected="$(mktemp "${TMPDIR:-/tmp}/swan-public-expected-lexicons.XXXXXX")"
   actual_paths="$(mktemp "${TMPDIR:-/tmp}/swan-public-actual-lexicons.XXXXXX")"
   public_wire_write_expected_lexicon_paths "${expected}"
   awk '{print $2}' "${public_wire_lexicon_manifest}" >"${actual_paths}"
-  diff -u "${expected}" "${actual_paths}" >/dev/null || public_wire_die "lexicon manifest is not the exact ordered 20-file set"
-  [[ "$(LC_ALL=C sort "${actual_paths}" | uniq | wc -l | tr -d ' ')" == "20" ]] || public_wire_die "lexicon paths must be unique"
+  diff -u "${expected}" "${actual_paths}" >/dev/null || public_wire_die "lexicon manifest is not the exact ordered 21-file set"
+  [[ "$(LC_ALL=C sort "${actual_paths}" | uniq | wc -l | tr -d ' ')" == "21" ]] || public_wire_die "lexicon paths must be unique"
 
   while read -r _ relative; do
     [[ -f "${public_wire_reference_root}/lexicons/${relative}" ]] || public_wire_die "selected lexicon is missing"
@@ -197,7 +205,7 @@ public_wire_stage_lexicons() {
     find com -type f -name '*.json' -print | LC_ALL=C sort
   ) >"${actual}"
   public_wire_write_expected_lexicon_paths "${expected}"
-  diff -u "${expected}" "${actual}" >/dev/null || public_wire_die "staged lexicon inventory is not the exact 20-file set"
+  diff -u "${expected}" "${actual}" >/dev/null || public_wire_die "staged lexicon inventory is not the exact 21-file set"
   rm -f "${actual}" "${expected}"
 }
 
@@ -252,11 +260,11 @@ public_wire_verify_checked_in_manifest() {
   [[ "${manifest_hash}" == "${public_wire_expected_generated_manifest_sha256}" ]] || public_wire_die "generated manifest checksum mismatch"
   [[ "$(public_wire_profile_value generatedWireManifestSHA256)" == "${manifest_hash}" ]] || public_wire_die "profile generated manifest checksum drifted"
   line_count="$(wc -l <"${public_wire_generated_manifest}" | tr -d ' ')"
-  [[ "${line_count}" == "23" ]] || public_wire_die "generated manifest must contain exactly 23 Swift sources"
+  [[ "${line_count}" == "24" ]] || public_wire_die "generated manifest must contain exactly 24 Swift sources"
   expected="$(mktemp "${TMPDIR:-/tmp}/swan-public-expected-generated.XXXXXX")"
   actual="$(mktemp "${TMPDIR:-/tmp}/swan-public-actual-generated.XXXXXX")"
   awk '{print $2}' "${public_wire_generated_manifest}" | LC_ALL=C sort >"${expected}"
-  [[ "$(uniq "${expected}" | wc -l | tr -d ' ')" == "23" ]] || public_wire_die "generated manifest paths must be unique"
+  [[ "$(uniq "${expected}" | wc -l | tr -d ' ')" == "24" ]] || public_wire_die "generated manifest paths must be unique"
   (
     cd "${source_root}" || public_wire_die "unable to inspect generated source root"
     find Sources/SwanPublicWire -type f -name '*.swift' -print | LC_ALL=C sort
@@ -271,8 +279,8 @@ public_wire_verify_checked_in_manifest() {
 
 public_wire_assert_contracts() {
   local output="$1"
-  [[ "$(rg -l 'protocol ServerHandler' "${output}" | wc -l | tr -d ' ')" == "18" ]] || public_wire_die "all eighteen ServerHandler contracts were not generated"
-  [[ "$(rg -l 'XRPCMethodDescriptor' "${output}" | wc -l | tr -d ' ')" == "18" ]] || public_wire_die "all eighteen endpoint descriptors were not generated"
+  [[ "$(rg -l 'protocol ServerHandler' "${output}" | wc -l | tr -d ' ')" == "19" ]] || public_wire_die "all nineteen ServerHandler contracts were not generated"
+  [[ "$(rg -l 'XRPCMethodDescriptor' "${output}" | wc -l | tr -d ' ')" == "19" ]] || public_wire_die "all nineteen endpoint descriptors were not generated"
   [[ ! -e "${output}/Sources/Petrel" ]] || public_wire_die "Petrel core contracts were generated unexpectedly"
 }
 

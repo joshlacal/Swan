@@ -93,6 +93,49 @@ struct SwanPublicWireTests {
     }
 
     @Test
+    func testPublicDataTesting20260805IncludesSubscribeReposSubscription() throws {
+        let methods = PublicDataTesting20260805.methods
+        #expect(methods.count == 19)
+        #expect(Set(methods.map(\.nsid)).count == methods.count)
+
+        let subscribeRepos = methods.last
+        #expect(subscribeRepos?.nsid == "com.atproto.sync.subscribeRepos")
+        #expect(subscribeRepos?.kind == .subscription)
+        #expect(subscribeRepos?.inputEncoding == nil)
+        #expect(subscribeRepos?.outputEncoding == nil)
+        #expect(subscribeRepos?.declaredErrors == ["FutureCursor", "ConsumerTooSlow"])
+
+        let generatedDescriptor = ComAtprotoSyncSubscribeRepos.endpointDescriptor
+        #expect(generatedDescriptor.nsid == "com.atproto.sync.subscribeRepos")
+        #expect(generatedDescriptor.kind == "subscription")
+        #expect(generatedDescriptor.inputEncoding == nil)
+        #expect(generatedDescriptor.outputEncoding == nil)
+        #expect(generatedDescriptor.declaredErrors == ["FutureCursor", "ConsumerTooSlow"])
+
+        struct Profile: Decodable {
+            let id: String
+            let lexicons: [String]
+            let endpoints: [String]
+        }
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let profile = try JSONDecoder().decode(
+            Profile.self,
+            from: Data(contentsOf: root.appending(path: "Profiles/public-data-testing-2026-08-05.json"))
+        )
+
+        #expect(profile.id == PublicDataTesting20260805.profileID)
+        #expect(profile.lexicons.count == 21)
+        #expect(Set(profile.lexicons).count == 21)
+        #expect(profile.lexicons.last == "com.atproto.sync.subscribeRepos")
+        #expect(profile.endpoints == methods.map(\.nsid))
+        #expect(profile.endpoints.count == 19)
+        #expect(Set(profile.endpoints).count == 19)
+    }
+
+    @Test
     func successorProfileAddsExactAccountEmailMethodDescriptors() {
         let accountEmailMethods = Array(PublicDataTesting20260730.methods[8...13])
         #expect(accountEmailMethods == [

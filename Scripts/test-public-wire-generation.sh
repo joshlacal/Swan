@@ -96,8 +96,8 @@ printf '{"lexicon":1,"id":"com.atproto.repo.importRepo","defs":{"main":{"type":"
   >"${reference_copy}/lexicons/com/atproto/repo/importRepo.json"
 printf '{"lexicon":1,"id":"com.atproto.server.createInviteCode","defs":{"main":{"type":"procedure"}}}\n' \
   >"${reference_copy}/lexicons/com/atproto/server/createInviteCode.json"
-printf '{"lexicon":1,"id":"com.atproto.sync.subscribeRepos","defs":{"main":{"type":"subscription"}}}\n' \
-  >"${reference_copy}/lexicons/com/atproto/sync/subscribeRepos.json"
+printf '{"lexicon":1,"id":"com.atproto.sync.requestCrawl","defs":{"main":{"type":"procedure"}}}\n' \
+  >"${reference_copy}/lexicons/com/atproto/sync/requestCrawl.json"
 PUBLIC_WIRE_REFERENCE_ROOT="${reference_copy}" PETREL_GENERATOR_ROOT="${PETREL_GENERATOR_ROOT}" \
   "${root}/Scripts/verify-public-wire-generation.sh"
 public_wire_verify_checked_in_manifest

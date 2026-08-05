@@ -23,6 +23,7 @@ let package = Package(
     dependencies: [
         .package(path: "../Petrel"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", exact: "2.25.1"),
+        .package(url: "https://github.com/hummingbird-project/hummingbird-websocket.git", exact: "2.7.0"),
         .package(url: "https://github.com/swift-server/async-http-client.git", exact: "1.36.0"),
         .package(url: "https://github.com/vapor/sqlite-nio.git", exact: "1.12.10"),
         .package(url: "https://github.com/swift-server/swift-service-lifecycle.git", exact: "2.11.0"),
@@ -161,6 +162,7 @@ let package = Package(
             dependencies: [
                 "SwanAccounts", "SwanCore", "SwanPublicRepository", "SwanPublicWire", "SwanSpaces", "SwanSpacesWire", "SwanStorage", "SwanOAuth", "SwanSQLite",
                 .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HummingbirdWebSocket", package: "hummingbird-websocket"),
                 .product(name: "Petrel", package: "Petrel"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
@@ -265,6 +267,7 @@ let package = Package(
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
+                .product(name: "HummingbirdWSTesting", package: "hummingbird-websocket"),
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),

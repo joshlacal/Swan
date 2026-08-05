@@ -3,6 +3,7 @@ import Foundation
 public enum PublicXRPCMethodKind: String, Sendable, Codable {
     case query
     case procedure
+    case subscription
 }
 
 public struct PublicXRPCMethodDescriptor: Sendable, Codable, Equatable {
@@ -43,6 +44,32 @@ public enum PublicDataTesting20260727 {
         .init(nsid: "com.atproto.sync.getLatestCommit", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
         .init(nsid: "com.atproto.sync.getRepo", kind: .query, inputEncoding: nil, outputEncoding: "application/vnd.ipld.car", declaredErrors: ["RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
         .init(nsid: "com.atproto.sync.getRepoStatus", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["RepoNotFound"]),
+    ]
+}
+
+public enum PublicDataTesting20260805 {
+    public static let profileID = "public-data-testing-2026-08-05"
+
+    public static let methods: [PublicXRPCMethodDescriptor] = [
+        .init(nsid: "com.atproto.repo.applyWrites", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["InvalidSwap"]),
+        .init(nsid: "com.atproto.repo.createRecord", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["InvalidSwap"]),
+        .init(nsid: "com.atproto.repo.deleteRecord", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["InvalidSwap"]),
+        .init(nsid: "com.atproto.repo.describeRepo", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: []),
+        .init(nsid: "com.atproto.repo.getRecord", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["RecordNotFound"]),
+        .init(nsid: "com.atproto.repo.listRecords", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: []),
+        .init(nsid: "com.atproto.repo.putRecord", kind: .procedure, inputEncoding: "application/json", outputEncoding: "application/json", declaredErrors: ["InvalidSwap"]),
+        .init(nsid: "com.atproto.repo.uploadBlob", kind: .procedure, inputEncoding: "*/*", outputEncoding: "application/json", declaredErrors: []),
+        .init(nsid: "com.atproto.server.confirmEmail", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["AccountNotFound", "ExpiredToken", "InvalidToken", "InvalidEmail"]),
+        .init(nsid: "com.atproto.server.requestEmailConfirmation", kind: .procedure, inputEncoding: nil, outputEncoding: nil, declaredErrors: []),
+        .init(nsid: "com.atproto.server.requestEmailUpdate", kind: .procedure, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: []),
+        .init(nsid: "com.atproto.server.requestPasswordReset", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: []),
+        .init(nsid: "com.atproto.server.resetPassword", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["ExpiredToken", "InvalidToken"]),
+        .init(nsid: "com.atproto.server.updateEmail", kind: .procedure, inputEncoding: "application/json", outputEncoding: nil, declaredErrors: ["ExpiredToken", "InvalidToken", "TokenRequired"]),
+        .init(nsid: "com.atproto.sync.getBlob", kind: .query, inputEncoding: nil, outputEncoding: "*/*", declaredErrors: ["BlobNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
+        .init(nsid: "com.atproto.sync.getLatestCommit", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
+        .init(nsid: "com.atproto.sync.getRepo", kind: .query, inputEncoding: nil, outputEncoding: "application/vnd.ipld.car", declaredErrors: ["RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]),
+        .init(nsid: "com.atproto.sync.getRepoStatus", kind: .query, inputEncoding: nil, outputEncoding: "application/json", declaredErrors: ["RepoNotFound"]),
+        .init(nsid: "com.atproto.sync.subscribeRepos", kind: .subscription, inputEncoding: nil, outputEncoding: nil, declaredErrors: ["FutureCursor", "ConsumerTooSlow"]),
     ]
 }
 
