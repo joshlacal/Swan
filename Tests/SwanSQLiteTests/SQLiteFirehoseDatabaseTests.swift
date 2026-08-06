@@ -439,4 +439,153 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     let advanced = try await firehose.retainedFromSeq()
     XCTAssertEqual(advanced, 5)
   }
+
+  func testRetentionPolicyRejectsNonPositiveAgeAndBudgets() {
+    XCTAssertThrowsError(
+      try PublicFirehoseRetentionPolicy(maximumAge: .zero)
+    )
+    XCTAssertThrowsError(
+      try PublicFirehoseRetentionPolicy(maximumRows: 0)
+    )
+    XCTAssertThrowsError(
+      try PublicFirehoseRetentionPolicy(maximumBytes: 4_999_999)
+    )
+  }
+
+  func testAgePruningDeletesExpiredRowsAndAdvancesRetainedCursor() async throws {
+    _ = try await firehose.appendBatch(
+      [identityItem(sourceKey: "old")],
+      now: epoch
+    )
+    _ = try await firehose.appendBatch(
+      [identityItem(sourceKey: "new")],
+      now: epoch.addingTimeInterval(20)
+    )
+
+    let result = try await firehose.prune(
+      now: epoch.addingTimeInterval(20),
+      policy: try PublicFirehoseRetentionPolicy(
+        maximumAge: .seconds(10),
+        maximumRows: 100,
+        maximumBytes: 1_073_741_824
+      )
+    )
+
+    XCTAssertEqual(result.deletedRows, 1)
+    XCTAssertEqual(result.retainedFromSeq, 2)
+    XCTAssertTrue(result.didAdvanceRetention)
+    let retained = try await firehose.retainedFromSeq()
+    let stored = try await firehose.events(after: 0, limit: 10)
+    let maxSeq = try await firehose.maxSequencedSeq()
+    XCTAssertEqual(retained, 2)
+    XCTAssertEqual(stored.map(\.seq), [2])
+    XCTAssertEqual(maxSeq, 2)
+  }
+
+  func testRowBudgetDeletesOldestRowsWithoutAnAgeFloor() async throws {
+    for index in 1 ... 3 {
+      _ = try await firehose.appendBatch(
+        [identityItem(sourceKey: "row-\(index)")],
+        now: epoch
+      )
+    }
+
+    let result = try await firehose.prune(
+      now: epoch,
+      policy: try PublicFirehoseRetentionPolicy(
+        maximumAge: .seconds(72 * 60 * 60),
+        maximumRows: 2,
+        maximumBytes: 1_073_741_824
+      )
+    )
+
+    XCTAssertEqual(result.deletedRows, 1)
+    XCTAssertEqual(result.retainedFromSeq, 2)
+    let stored = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(stored.map(\.seq), [2, 3])
+  }
+
+  func testByteBudgetDeletesOldestRowsByStoredFrameBytes() async throws {
+    func rawItem(sourceKey: String, seed: UInt8) -> FirehoseAppendItem {
+      FirehoseAppendItem(
+        sourceKey: sourceKey,
+        batchID: nil,
+        did: did,
+        kind: .identity
+      ) { _ in Data(repeating: seed, count: 3_000_000) }
+    }
+
+    _ = try await firehose.appendBatch(
+      [rawItem(sourceKey: "bytes-1", seed: 0x01)],
+      now: epoch
+    )
+    _ = try await firehose.appendBatch(
+      [rawItem(sourceKey: "bytes-2", seed: 0x02)],
+      now: epoch
+    )
+
+    let result = try await firehose.prune(
+      now: epoch,
+      policy: try PublicFirehoseRetentionPolicy(
+        maximumAge: .seconds(72 * 60 * 60),
+        maximumRows: 100,
+        maximumBytes: 5_000_000
+      )
+    )
+
+    XCTAssertEqual(result.deletedRows, 1)
+    XCTAssertEqual(result.deletedBytes, 3_000_000)
+    let stored = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(stored.map(\.seq), [2])
+  }
+
+  func testAgeCeilingCanPruneTheEntireLogAndHighWaterMarkDoesNotRegress() async throws {
+    for index in 1 ... 2 {
+      _ = try await firehose.appendBatch(
+        [identityItem(sourceKey: "all-old-\(index)")],
+        now: epoch
+      )
+    }
+
+    let result = try await firehose.prune(
+      now: epoch.addingTimeInterval(20),
+      policy: try PublicFirehoseRetentionPolicy(
+        maximumAge: .seconds(1),
+        maximumRows: 100,
+        maximumBytes: 1_073_741_824
+      )
+    )
+
+    XCTAssertEqual(result.deletedRows, 2)
+    XCTAssertEqual(result.retainedFromSeq, 2)
+    let stored = try await firehose.events(after: 0, limit: 10)
+    XCTAssertTrue(stored.isEmpty)
+    let maxSeq = try await firehose.maxSequencedSeq()
+    XCTAssertEqual(
+      maxSeq,
+      2,
+      "deleting every row must not make an already-issued cursor future"
+    )
+  }
+
+  func testNoOpPruneDoesNotInitializeRetention() async throws {
+    _ = try await firehose.appendBatch(
+      [identityItem(sourceKey: "fresh")],
+      now: epoch
+    )
+
+    let result = try await firehose.prune(
+      now: epoch,
+      policy: try PublicFirehoseRetentionPolicy(
+        maximumAge: .seconds(72 * 60 * 60),
+        maximumRows: 100,
+        maximumBytes: 1_073_741_824
+      )
+    )
+
+    XCTAssertEqual(result.deletedRows, 0)
+    XCTAssertFalse(result.didAdvanceRetention)
+    let retained = try await firehose.retainedFromSeq()
+    XCTAssertNil(retained, "a no-op prune must not arm the retained window")
+  }
 }

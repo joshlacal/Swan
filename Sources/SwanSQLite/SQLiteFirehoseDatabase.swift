@@ -328,20 +328,30 @@ public actor SQLiteFirehoseDatabase {
 
   // MARK: - Reads
 
+  /// Returns the sequence high-water mark from `firehose_meta.next_seq - 1`
+  /// rather than `MAX(seq)`, so the already-issued cursor survives retention
+  /// deletes (including an entirely empty log) and per-DID deletion gaps.
   public func maxSequencedSeq() async throws -> Int64 {
     try checkOpen()
     return try await withConnectionGate {
       let rows = try await connection.query(
-        "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM firehose_events"
+        "SELECT next_seq FROM firehose_meta WHERE singleton = 1"
       )
       guard rows.count == 1,
-            case let .integer(maxSeq)? = rows.first?.column("max_seq"),
-            maxSeq >= 0 else {
+            let row = rows.first,
+            case let .integer(nextSeq)? = row.column("next_seq"),
+            nextSeq >= 1 else {
+        throw SQLiteFirehoseDatabaseError.corruptDatabase(
+          "firehose_meta is missing or invalid"
+        )
+      }
+      let maxSeq = Int64(nextSeq) - 1
+      guard maxSeq >= 0, maxSeq <= FirehoseFrameLimits.maximumSequence else {
         throw SQLiteFirehoseDatabaseError.corruptDatabase(
           "firehose max sequence is invalid"
         )
       }
-      return Int64(maxSeq)
+      return maxSeq
     }
   }
 
@@ -588,6 +598,10 @@ public actor SQLiteFirehoseDatabase {
       ON firehose_events(batch_id, batch_ordinal)
       WHERE batch_id IS NOT NULL;
       """,
+      """
+      CREATE INDEX IF NOT EXISTS firehose_events_sequenced_at_seq
+      ON firehose_events(sequenced_at, seq);
+      """,
     ]
   }
 
@@ -643,6 +657,172 @@ private actor SQLiteFirehoseConnectionGate {
       next.resume()
     } else {
       isLocked = false
+    }
+  }
+}
+
+extension SQLiteFirehoseDatabase {
+  /// Enforces all three policy bounds in one transaction. The age pass deletes
+  /// every row whose `sequenced_at` is below the cutoff first, then the budget
+  /// loop repeatedly removes the minimal prefix of the oldest bounded page
+  /// (at most 1000 rows) that satisfies the row or byte budget, re-checking the
+  /// totals until both are within bounds. The retained boundary is the
+  /// `MIN(seq)` of the surviving rows, or the greatest deleted sequence when
+  /// the log ends empty. `retained_from_seq` is written only when this prune
+  /// deleted at least one row and the new boundary exceeds the previous value;
+  /// the never-set state is treated as unbounded and a no-op prune leaves it
+  /// untouched.
+  public func prune(
+    now: Date,
+    policy: PublicFirehoseRetentionPolicy
+  ) async throws -> PublicFirehosePruneResult {
+    try checkOpen()
+    let nowMicroseconds = try PublicFirehoseTime.microseconds(now)
+    // `nowMicros - maximumAgeMicroseconds` cannot overflow: both values are
+    // non-negative and the age is bounded by Int64. A negative cutoff simply
+    // matches nothing because `sequenced_at` is non-negative.
+    let cutoff = nowMicroseconds - policy.maximumAgeMicroseconds
+
+    return try await withConnectionGate {
+      try await transaction {
+        var deletedRows: Int64 = 0
+        var deletedBytes: Int64 = 0
+        var maximumDeletedSequence: Int64 = 0
+
+        let ageExpired = try await connection.query(
+          """
+          DELETE FROM firehose_events
+          WHERE sequenced_at < ?
+          RETURNING seq, length(frame_bytes) AS bytes
+          """,
+          [.integer(Int(cutoff))]
+        )
+        for row in ageExpired {
+          deletedRows += 1
+          deletedBytes += Int64(row.column("bytes")?.integer ?? 0)
+          if let seq = row.column("seq")?.integer {
+            maximumDeletedSequence = max(maximumDeletedSequence, Int64(seq))
+          }
+        }
+
+        while true {
+          let totals = try await connection.query(
+            """
+            SELECT COUNT(*) AS row_count,
+                   COALESCE(SUM(length(frame_bytes)), 0) AS byte_count
+            FROM firehose_events
+            """
+          )
+          guard totals.count == 1,
+                let total = totals.first,
+                let rowCount = total.column("row_count")?.integer,
+                let byteCount = total.column("byte_count")?.integer,
+                rowCount >= 0, byteCount >= 0 else {
+            throw SQLiteFirehoseDatabaseError.corruptDatabase(
+              "firehose retention totals are invalid"
+            )
+          }
+          let currentRows = Int64(rowCount)
+          let currentBytes = Int64(byteCount)
+          if currentRows <= policy.maximumRows
+              && currentBytes <= policy.maximumBytes {
+            break
+          }
+          // Read the oldest bounded page together with stored frame sizes and
+          // delete only the minimal prefix that satisfies either budget. The
+          // loop then re-checks totals, so row and byte bounds are both
+          // converged on with the fewest deletions.
+          let oldest = try await connection.query(
+            """
+            SELECT seq, length(frame_bytes) AS bytes
+            FROM firehose_events
+            ORDER BY seq
+            LIMIT 1000
+            """
+          )
+          var selectedSequences: [Int64] = []
+          var selectedBytes: Int64 = 0
+          for row in oldest {
+            guard let seq = row.column("seq")?.integer else {
+              throw SQLiteFirehoseDatabaseError.corruptDatabase(
+                "firehose retention page has an invalid sequence"
+              )
+            }
+            selectedSequences.append(Int64(seq))
+            selectedBytes += Int64(row.column("bytes")?.integer ?? 0)
+            if currentRows - Int64(selectedSequences.count) <= policy.maximumRows
+                || currentBytes - selectedBytes <= policy.maximumBytes {
+              break
+            }
+          }
+          guard !selectedSequences.isEmpty else { break }
+          let placeholders = Array(repeating: "?", count: selectedSequences.count)
+            .joined(separator: ", ")
+          let deleted = try await connection.query(
+            """
+            DELETE FROM firehose_events
+            WHERE seq IN (\(placeholders))
+            RETURNING seq, length(frame_bytes) AS bytes
+            """,
+            selectedSequences.map { .integer(Int($0)) }
+          )
+          for row in deleted {
+            deletedRows += 1
+            deletedBytes += Int64(row.column("bytes")?.integer ?? 0)
+            if let seq = row.column("seq")?.integer {
+              maximumDeletedSequence = max(maximumDeletedSequence, Int64(seq))
+            }
+          }
+        }
+
+        let remaining = try await connection.query(
+          "SELECT MIN(seq) AS min_seq FROM firehose_events"
+        )
+        let newBoundary: Int64?
+        if let minSeq = remaining.first?.column("min_seq")?.integer, minSeq >= 1 {
+          newBoundary = Int64(minSeq)
+        } else if deletedRows > 0 {
+          newBoundary = maximumDeletedSequence
+        } else {
+          newBoundary = nil
+        }
+
+        var didAdvanceRetention = false
+        if deletedRows > 0, let newBoundary {
+          let meta = try await connection.query(
+            "SELECT retained_from_seq FROM firehose_meta WHERE singleton = 1"
+          )
+          guard meta.count == 1 else {
+            throw SQLiteFirehoseDatabaseError.corruptDatabase(
+              "firehose_meta is missing or invalid"
+            )
+          }
+          let shouldAdvance: Bool
+          if let previous = meta.first?.column("retained_from_seq")?.integer {
+            shouldAdvance = newBoundary > Int64(previous)
+          } else {
+            shouldAdvance = true
+          }
+          if shouldAdvance {
+            _ = try await connection.query(
+              """
+              UPDATE firehose_meta
+              SET retained_from_seq = ?
+              WHERE singleton = 1
+              """,
+              [.integer(Int(newBoundary))]
+            )
+            didAdvanceRetention = true
+          }
+        }
+
+        return PublicFirehosePruneResult(
+          deletedRows: deletedRows,
+          deletedBytes: deletedBytes,
+          retainedFromSeq: didAdvanceRetention ? newBoundary : nil,
+          didAdvanceRetention: didAdvanceRetention
+        )
+      }
     }
   }
 }
