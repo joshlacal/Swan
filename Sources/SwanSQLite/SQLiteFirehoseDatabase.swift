@@ -662,9 +662,10 @@ private actor SQLiteFirehoseConnectionGate {
 }
 
 extension SQLiteFirehoseDatabase {
-  /// Enforces all three policy bounds in one transaction. The age pass deletes
-  /// every row whose `sequenced_at` is below the cutoff first, then the budget
-  /// loop repeatedly removes the minimal prefix of the oldest bounded page
+  /// Enforces all three policy bounds in one transaction. The age pass pages
+  /// through every row whose `sequenced_at` is below the cutoff first,
+  /// deleting at most 1000 rows per statement, then the budget loop
+  /// repeatedly removes the minimal prefix of the oldest bounded page
   /// (at most 1000 rows) that satisfies the row or byte budget, re-checking the
   /// totals until both are within bounds. The retained boundary is the
   /// `MIN(seq)` of the surviving rows, or the greatest deleted sequence when
@@ -689,20 +690,56 @@ extension SQLiteFirehoseDatabase {
         var deletedBytes: Int64 = 0
         var maximumDeletedSequence: Int64 = 0
 
-        let ageExpired = try await connection.query(
-          """
-          DELETE FROM firehose_events
-          WHERE sequenced_at < ?
-          RETURNING seq, length(frame_bytes) AS bytes
-          """,
-          [.integer(Int(cutoff))]
-        )
-        for row in ageExpired {
-          deletedRows += 1
-          deletedBytes += Int64(row.column("bytes")?.integer ?? 0)
-          if let seq = row.column("seq")?.integer {
-            maximumDeletedSequence = max(maximumDeletedSequence, Int64(seq))
+        // Accumulates a page of `RETURNING seq, length(frame_bytes) AS bytes`
+        // rows into the running totals above. Shared by the age pass and the
+        // budget loop so both bounded-delete sites stay in lockstep.
+        func accumulate(_ rows: [SQLiteRow]) {
+          for row in rows {
+            deletedRows += 1
+            deletedBytes += Int64(row.column("bytes")?.integer ?? 0)
+            if let seq = row.column("seq")?.integer {
+              maximumDeletedSequence = max(maximumDeletedSequence, Int64(seq))
+            }
           }
+        }
+
+        // Age pass: page through rows older than the cutoff in bounded
+        // (<=1000-row) statements, same shape as the budget loop below, so a
+        // large first-ever prune never buffers the whole expired set (up to
+        // ~1M rows) in memory inside this single transaction.
+        while true {
+          let agePage = try await connection.query(
+            """
+            SELECT seq
+            FROM firehose_events
+            WHERE sequenced_at < ?
+            ORDER BY seq
+            LIMIT 1000
+            """,
+            [.integer(Int(cutoff))]
+          )
+          if agePage.isEmpty { break }
+          var pageSequences: [Int64] = []
+          pageSequences.reserveCapacity(agePage.count)
+          for row in agePage {
+            guard let seq = row.column("seq")?.integer else {
+              throw SQLiteFirehoseDatabaseError.corruptDatabase(
+                "firehose retention age page has an invalid sequence"
+              )
+            }
+            pageSequences.append(Int64(seq))
+          }
+          let agePlaceholders = Array(repeating: "?", count: pageSequences.count)
+            .joined(separator: ", ")
+          let ageDeleted = try await connection.query(
+            """
+            DELETE FROM firehose_events
+            WHERE seq IN (\(agePlaceholders))
+            RETURNING seq, length(frame_bytes) AS bytes
+            """,
+            pageSequences.map { .integer(Int($0)) }
+          )
+          accumulate(ageDeleted)
         }
 
         while true {
@@ -766,13 +803,7 @@ extension SQLiteFirehoseDatabase {
             """,
             selectedSequences.map { .integer(Int($0)) }
           )
-          for row in deleted {
-            deletedRows += 1
-            deletedBytes += Int64(row.column("bytes")?.integer ?? 0)
-            if let seq = row.column("seq")?.integer {
-              maximumDeletedSequence = max(maximumDeletedSequence, Int64(seq))
-            }
-          }
+          accumulate(deleted)
         }
 
         let remaining = try await connection.query(

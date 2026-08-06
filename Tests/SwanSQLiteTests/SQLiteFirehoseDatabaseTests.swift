@@ -568,6 +568,38 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     )
   }
 
+  func testAgePruningPagesAcrossMultipleThousandRowBatches() async throws {
+    // Exceeds the age pass's 1000-row-per-statement page size, so a single
+    // prune must loop across at least two bounded DELETE...RETURNING pages
+    // instead of buffering every expired row in one unbounded statement.
+    let rowCount = 1200
+    let items = (1 ... rowCount).map { index in
+      identityItem(sourceKey: "bulk-old-\(index)", batchID: "bulk-old")
+    }
+    _ = try await firehose.appendBatch(items, now: epoch)
+
+    let result = try await firehose.prune(
+      now: epoch.addingTimeInterval(20),
+      policy: try PublicFirehoseRetentionPolicy(
+        maximumAge: .seconds(10),
+        maximumRows: 1_000_000,
+        maximumBytes: 1_073_741_824
+      )
+    )
+
+    XCTAssertEqual(result.deletedRows, Int64(rowCount))
+    XCTAssertEqual(result.retainedFromSeq, Int64(rowCount))
+    XCTAssertTrue(result.didAdvanceRetention)
+    let stored = try await firehose.events(after: 0, limit: 10)
+    XCTAssertTrue(stored.isEmpty)
+    let maxSeq = try await firehose.maxSequencedSeq()
+    XCTAssertEqual(
+      maxSeq,
+      Int64(rowCount),
+      "deleting every row across multiple age-pass pages must not make the cursor future"
+    )
+  }
+
   func testNoOpPruneDoesNotInitializeRetention() async throws {
     _ = try await firehose.appendBatch(
       [identityItem(sourceKey: "fresh")],
