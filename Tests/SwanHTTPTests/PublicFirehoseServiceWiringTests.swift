@@ -360,6 +360,180 @@ final class PublicFirehoseServiceWiringTests: XCTestCase, @unchecked Sendable {
     XCTAssertEqual(retained, 1)
   }
 
+  /// End-to-end production composition proof: the same five objects
+  /// `SwanCommand.Serve` builds under `--enable-public-firehose` — one
+  /// `SQLiteFirehoseDatabase`, one `PublicFirehoseWakeupHub`, one
+  /// `SwanPublicFirehoseSequencerService`, one
+  /// `SwanPublicFirehoseRetentionService`, and one
+  /// `SwanPublicFirehoseStreamingRuntime` — constructed together and run as
+  /// two concurrent services against one live `subscribeRepos` route.
+  ///
+  /// An event well outside the retention window and a fresh one inside it
+  /// are seeded directly (the sequencer has no accounts registered here; its
+  /// wiring into this exact composition is what is under test, not its
+  /// mutation-draining behavior, which Task 1's and this file's other tests
+  /// already cover). The running retention service — not a test-driven
+  /// `prune` call — must age out the old row and advance the retained
+  /// cursor, after which a connection with a cursor below that boundary must
+  /// receive the `OutdatedCursor` info frame followed by the retained
+  /// frame's exact stored bytes.
+  func testProductionCompositionRunsSequencerRetentionAndStreamingOverSharedHubAndDatabase() async throws {
+    let root = FileManager.default.temporaryDirectory
+      .appending(path: "swan-firehose-composition-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(
+      at: root,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let control = try await SQLiteControlDatabase(dataDirectory: root)
+    defer { Task { try? await control.close() } }
+    let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
+    defer { Task { try? await firehose.close() } }
+
+    // One hub instance backs the sequencer's wakeup sink, the retention
+    // service's advance signal, and the streaming runtime's fan-out below —
+    // the exact object graph `SwanCommand.Serve` wires together.
+    let hub = PublicFirehoseWakeupHub()
+    let sequencer = PublicFirehoseSequencer(
+      accountSource: FixedWiringAccountSource(accounts: []),
+      control: control,
+      firehose: firehose,
+      wakeup: hub
+    )
+    let sequencerService = SwanPublicFirehoseSequencerService(sequencer: sequencer)
+    let sequencerTask = Task { try await sequencerService.run() }
+    defer { sequencerTask.cancel() }
+
+    let retentionService = try SwanPublicFirehoseRetentionService(
+      database: firehose,
+      hub: hub,
+      policy: try PublicFirehoseRetentionPolicy(
+        maximumAge: .seconds(3_600),
+        maximumRows: 100,
+        maximumBytes: 5_000_000
+      ),
+      interval: .milliseconds(50),
+      logger: logger
+    )
+    let retentionTask = Task { try await retentionService.run() }
+    defer { retentionTask.cancel() }
+
+    let profile = try ProtocolProfile.load(
+      from: packageRoot().appending(
+        path: "Profiles/permissioned-data-0016-2026-07-03.json"
+      )
+    )
+    let oauthRuntime = try SwanOAuthRuntime(
+      controlStore: control,
+      serverKey: Data(repeating: 0x71, count: 32)
+    )
+    let server = SwanHTTPServer(
+      profile: profile,
+      configuration: .init(host: "127.0.0.1", port: 3_000),
+      oauthRuntime: oauthRuntime,
+      publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime(
+        database: firehose,
+        hub: hub,
+        limits: .standard,
+        logger: logger
+      )
+    )
+    let app = server.buildApplication(logger: logger)
+    do {
+      try await app.test(.live) { client in
+        // Phase 1 — shared-hub identity: the database is still empty here,
+        // so this live (no-cursor) connection has nothing to deliver and
+        // cannot race a client-initiated close the way a connection with
+        // ready data could. That gives a stable window to prove the hub
+        // this route subscribed to is the exact instance the sequencer and
+        // retention service above were constructed with. The connection is
+        // torn down by cancellation (never fed a frame to close itself on)
+        // once this phase's assertions are done.
+        let liveRecorder = WSFrameRecorder()
+        let liveTask = Task {
+          try await self.runWSClient(
+            client,
+            path: self.subscribePath,
+            recorder: liveRecorder
+          )
+        }
+        defer { liveTask.cancel() }
+        try await self.waitUntil { await hub.subscriberCount() == 1 }
+
+        let subscriberCount = await hub.subscriberCount()
+        XCTAssertEqual(subscriberCount, 1)
+        let maxSeq = try await firehose.maxSequencedSeq()
+        await hub.firehoseRetentionDidAdvance(maxSeq: maxSeq)
+
+        // Phase 2 — retained-cursor recovery: an old event (well past the
+        // one-hour retention window) and a newer one (effectively age zero)
+        // seeded directly into the shared database. Only the running
+        // retention service, polling every 50ms, prunes the former and
+        // advances the retained cursor to the latter's sequence.
+        _ = try await firehose.appendBatch(
+          [FirehoseAppendItem(
+            sourceKey: "composition-old",
+            batchID: nil,
+            did: "did:plc:compositionoldaaaaaaaaaaaa",
+            kind: .identity
+          ) { _ in Data([0x01]) }],
+          now: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        _ = try await firehose.appendBatch(
+          [FirehoseAppendItem(
+            sourceKey: "composition-new",
+            batchID: nil,
+            did: "did:plc:compositionnewaaaaaaaaaaaa",
+            kind: .identity
+          ) { _ in Data([0x02]) }],
+          now: Date()
+        )
+        try await self.waitUntil { (try? await firehose.retainedFromSeq()) == 2 }
+
+        // Seq 1 is pruned and seq 2 is retained, so cursor=1 is below the
+        // retained boundary (2): the connection must report `OutdatedCursor`
+        // and then stream the one retained row.
+        let recorder = WSFrameRecorder()
+        let wsTask = Task {
+          try await self.runWSClient(
+            client,
+            path: "\(self.subscribePath)?cursor=1",
+            recorder: recorder,
+            closeAfterFrames: 2
+          )
+        }
+        try await self.waitUntil { await recorder.snapshot().count == 2 }
+        let closeFrame = try await self.awaitWithDeadline { try await wsTask.value }
+        XCTAssertEqual(closeFrame?.closeCode, .normalClosure)
+
+        let frames = await recorder.snapshot()
+        XCTAssertEqual(frames.count, 2)
+        try self.assertInfoFrame(frames[0], name: "OutdatedCursor")
+
+        let stored = try await firehose.events(after: 0, limit: 10)
+        XCTAssertEqual(Data(buffer: frames[1].data), stored.last?.frameBytes)
+      }
+      sequencerTask.cancel()
+      retentionTask.cancel()
+      do {
+        try await sequencerTask.value
+      } catch is CancellationError {
+        XCTFail("sequencer service must exit cleanly on cancellation")
+      }
+      do {
+        try await retentionTask.value
+      } catch is CancellationError {
+        XCTFail("retention service must exit cleanly on cancellation")
+      }
+    } catch {
+      sequencerTask.cancel()
+      retentionTask.cancel()
+      throw error
+    }
+  }
+
   // MARK: - WebSocket client helpers (mirroring PublicFirehoseStreamingHTTPTests)
 
   private actor WSFrameRecorder {
@@ -439,6 +613,25 @@ final class PublicFirehoseServiceWiringTests: XCTestCase, @unchecked Sendable {
     var reader = FirehoseStreamingTestCBORReader(Data(buffer: frame.data))
     let (header, _) = try reader.readFrame()
     return (try XCTUnwrap(reader.headerOp(header)), reader.headerType(header))
+  }
+
+  /// Asserts a connection-control info frame against the real bytes: header
+  /// `op == 1`, `t == "#info"`, body `name == <name>`.
+  private func assertInfoFrame(
+    _ frame: WebSocketDataFrame,
+    name: String,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) throws {
+    XCTAssertEqual(frame.opcode, .binary, file: file, line: line)
+    var reader = FirehoseStreamingTestCBORReader(Data(buffer: frame.data))
+    let (header, body) = try reader.readFrame()
+    XCTAssertEqual(reader.headerOp(header), 1, file: file, line: line)
+    XCTAssertEqual(reader.headerType(header), "#info", file: file, line: line)
+    guard case .some(.text(let value)) = reader.bodyValue(body, key: "name") else {
+      return XCTFail("info frame must carry a name", file: file, line: line)
+    }
+    XCTAssertEqual(value, name, file: file, line: line)
   }
 
   private func packageRoot() -> URL {
