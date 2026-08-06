@@ -119,16 +119,21 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
   /// Appends one commit event and signals the wakeup hub exactly like the
   /// sequencer does in production (`firehoseDidAppend(maxSeq:)`); appends
   /// alone never wake subscribers.
+  ///
+  /// The default matches `epoch` above: Swift does not allow an instance
+  /// member as a default parameter value, so the same literal is repeated
+  /// here rather than written as `now: Date = epoch`.
   @discardableResult
   private func appendCommit(
     to firehose: SQLiteFirehoseDatabase,
     hub: PublicFirehoseWakeupHub,
     sourceKey: String,
-    seed: UInt8
+    seed: UInt8,
+    now: Date = Date(timeIntervalSince1970: 1_785_844_800)
   ) async throws -> FirehoseStoredEvent {
     let sequences = try await firehose.appendBatch(
       [commitItem(sourceKey: sourceKey, seed: seed)],
-      now: epoch
+      now: now
     )
     if let maxSeq = sequences.max() {
       await hub.firehoseDidAppend(maxSeq: maxSeq)
@@ -306,6 +311,25 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
     }
     XCTAssertEqual(errorValue, error, file: file, line: line)
     XCTAssertNil(reader.bodyValue(body, key: "message"), file: file, line: line)
+  }
+
+  /// Asserts a connection-control info frame against the real bytes: header
+  /// `op == 1`, `t == "#info"`, body `name == <name>`.
+  private func assertInfoFrame(
+    _ frame: WebSocketDataFrame,
+    name: String,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) throws {
+    XCTAssertEqual(frame.opcode, .binary, file: file, line: line)
+    var reader = FirehoseStreamingTestCBORReader(Data(buffer: frame.data))
+    let (header, body) = try reader.readFrame()
+    XCTAssertEqual(reader.headerOp(header), 1, file: file, line: line)
+    XCTAssertEqual(reader.headerType(header), "#info", file: file, line: line)
+    guard case .some(.text(let value)) = reader.bodyValue(body, key: "name") else {
+      return XCTFail("info frame must carry a name", file: file, line: line)
+    }
+    XCTAssertEqual(value, name, file: file, line: line)
   }
 
   private func decodeFrameHeader(
@@ -900,26 +924,23 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
     }
   }
 
-  func testSubscribeReposOutdatedCursorDormantInPhase2() async throws {
-    // `retainedFromSeq()` is nil in Phase 2, so the `OutdatedCursor` branch
-    // (exercised at the policy-unit level in PublicFirehoseStreamingTests)
-    // never fires over the wire: cursor=1 backfills strictly after 1 with no
-    // `#info` frame.
+  func testSubscribeReposPrunedCursorReportsOutdatedThenStreamsRetainedRows() async throws {
     let fixture = try await makeFixture()
     defer { try? FileManager.default.removeItem(at: fixture.root) }
     do {
-      try await self.appendCommit(
-        to: fixture.firehose, hub: fixture.hub, sourceKey: "dormant-seed-1", seed: 0x61
+      try await appendCommit(to: fixture.firehose, hub: fixture.hub, sourceKey: "pruned-1", seed: 0x01, now: epoch)
+      try await appendCommit(to: fixture.firehose, hub: fixture.hub, sourceKey: "pruned-2", seed: 0x02, now: epoch)
+      let retained = try await appendCommit(to: fixture.firehose, hub: fixture.hub, sourceKey: "retained-3", seed: 0x03, now: epoch.addingTimeInterval(20))
+      _ = try await fixture.firehose.prune(
+        now: epoch.addingTimeInterval(20),
+        policy: try PublicFirehoseRetentionPolicy(
+          maximumAge: .seconds(1),
+          maximumRows: 100,
+          maximumBytes: 1_073_741_824
+        )
       )
-      try await self.appendCommit(
-        to: fixture.firehose, hub: fixture.hub, sourceKey: "dormant-seed-2", seed: 0x62
-      )
-      try await self.appendCommit(
-        to: fixture.firehose, hub: fixture.hub, sourceKey: "dormant-seed-3", seed: 0x63
-      )
-      let app = fixture.server.buildApplication(
-        logger: Logger(label: "PublicFirehoseStreamingHTTPTests.outdated-dormant")
-      )
+
+      let app = fixture.server.buildApplication(logger: logger)
       try await app.test(.live) { client in
         let recorder = WSFrameRecorder()
         let wsTask = Task {
@@ -931,23 +952,10 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
           )
         }
         try await self.waitUntil { await recorder.snapshot().count == 2 }
-        let closeFrame = try await self.awaitWithDeadline { try await wsTask.value }
-        XCTAssertEqual(closeFrame?.closeCode, .normalClosure)
+        _ = try await self.awaitWithDeadline { try await wsTask.value }
         let frames = await recorder.snapshot()
-        XCTAssertEqual(frames.count, 2, "no OutdatedCursor info frame may be sent")
-        XCTAssertTrue(
-          frames.allSatisfy { $0.opcode == .binary }
-        )
-        for frame in frames {
-          let header = try self.decodeFrameHeader(frame)
-          XCTAssertEqual(header.op, 1)
-          XCTAssertEqual(header.type, "#commit", "no #info frame may be sent")
-        }
-        // Strictly-after semantics: cursor 1 resumes after seq 1.
-        let stored = try await fixture.firehose.events(after: 1, limit: 10)
-        XCTAssertEqual(stored.map(\.seq), [2, 3])
-        let delivered = await recorder.snapshot().map { Data(buffer: $0.data) }
-        XCTAssertEqual(delivered, stored.map(\.frameBytes))
+        try self.assertInfoFrame(frames[0], name: "OutdatedCursor")
+        XCTAssertEqual(Data(buffer: frames[1].data), retained.frameBytes)
       }
       try await fixture.control.close()
       try await fixture.firehose.close()
@@ -956,36 +964,48 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
       try? await fixture.firehose.close()
       throw error
     }
+  }
 
-    // Empty log with cursor=1: `maxSequencedSeq()` is 0, so the policy
-    // resolves 1 > 0 to `FutureCursor` — never `OutdatedCursor`.
-    let emptyFixture = try await makeFixture()
-    defer { try? FileManager.default.removeItem(at: emptyFixture.root) }
+  func testSubscribeReposCursorZeroUsesRetainedWindowWithoutOutdatedInfo() async throws {
+    let fixture = try await makeFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
     do {
-      let app = emptyFixture.server.buildApplication(
-        logger: Logger(label: "PublicFirehoseStreamingHTTPTests.outdated-dormant-empty")
+      try await appendCommit(to: fixture.firehose, hub: fixture.hub, sourceKey: "full-old-1", seed: 0x11, now: epoch)
+      try await appendCommit(to: fixture.firehose, hub: fixture.hub, sourceKey: "full-old-2", seed: 0x12, now: epoch)
+      let retained = try await appendCommit(to: fixture.firehose, hub: fixture.hub, sourceKey: "full-retained-3", seed: 0x13, now: epoch.addingTimeInterval(20))
+      _ = try await fixture.firehose.prune(
+        now: epoch.addingTimeInterval(20),
+        policy: try PublicFirehoseRetentionPolicy(
+          maximumAge: .seconds(1),
+          maximumRows: 100,
+          maximumBytes: 1_073_741_824
+        )
       )
+
+      let app = fixture.server.buildApplication(logger: logger)
       try await app.test(.live) { client in
         let recorder = WSFrameRecorder()
         let wsTask = Task {
-          try await self.runWSClientPassive(
+          try await self.runWSClient(
             client,
-            path: "\(self.subscribePath)?cursor=1",
-            recorder: recorder
+            path: "\(self.subscribePath)?cursor=0",
+            recorder: recorder,
+            closeAfterFrames: 1
           )
         }
         try await self.waitUntil { await recorder.snapshot().count == 1 }
+        _ = try await self.awaitWithDeadline { try await wsTask.value }
         let frames = await recorder.snapshot()
-        XCTAssertEqual(frames.count, 1)
-        try self.assertErrorFrame(frames[0], error: "FutureCursor")
-        let closeFrame = try await self.awaitWithDeadline { try await wsTask.value }
-        XCTAssertEqual(closeFrame?.closeCode, .normalClosure)
+        let frame = try XCTUnwrap(frames.first)
+        let header = try self.decodeFrameHeader(frame)
+        XCTAssertEqual(header.type, "#commit")
+        XCTAssertEqual(Data(buffer: frame.data), retained.frameBytes)
       }
-      try await emptyFixture.control.close()
-      try await emptyFixture.firehose.close()
+      try await fixture.control.close()
+      try await fixture.firehose.close()
     } catch {
-      try? await emptyFixture.control.close()
-      try? await emptyFixture.firehose.close()
+      try? await fixture.control.close()
+      try? await fixture.firehose.close()
       throw error
     }
   }

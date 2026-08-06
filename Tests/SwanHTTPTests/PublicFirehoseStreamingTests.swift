@@ -347,6 +347,41 @@ final class PublicFirehoseStreamingTests: XCTestCase {
     }
   }
 
+  func testTailerReportsAnOutdatedCursorAfterRetentionAdvances() async throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
+    defer { Task { try? await firehose.close() } }
+    _ = try await firehose.appendBatch([identityItem(sourceKey: "old-1")], now: epoch)
+    _ = try await firehose.appendBatch([identityItem(sourceKey: "old-2")], now: epoch)
+
+    let result = try await firehose.prune(
+      now: epoch.addingTimeInterval(20),
+      policy: try PublicFirehoseRetentionPolicy(
+        maximumAge: .seconds(1),
+        maximumRows: 100,
+        maximumBytes: 1_073_741_824
+      )
+    )
+    XCTAssertEqual(result.retainedFromSeq, 2)
+
+    let tailer = PublicFirehoseTailer(
+      database: firehose,
+      limits: .standard,
+      logger: logger
+    )
+    do {
+      try await tailer.run(
+        lastSent: 0,
+        outbound: { _ in XCTFail("outdated cursor must be reported before a write") },
+        waitForWakeup: { nil }
+      )
+      XCTFail("expected outdatedCursor")
+    } catch let error as PublicFirehoseTailerError {
+      XCTAssertEqual(error, .outdatedCursor(retainedFromSeq: 2))
+    }
+  }
+
   func testTailerCancellationExitsPromptly() async throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }

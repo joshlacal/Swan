@@ -112,17 +112,25 @@ public enum PublicFirehoseSlowConsumerPolicy: Sendable {
 /// Errors thrown by the per-connection tailer. The caller maps
 /// ``consumerTooSlow(seqLag:backfillElapsed:)`` and
 /// ``writeTooSlow(duration:)`` to a `ConsumerTooSlow` error frame followed by
-/// a close.
+/// a close, and maps ``outdatedCursor(retainedFromSeq:)`` to an `#info`
+/// `OutdatedCursor` frame followed by resuming from the new retained
+/// boundary rather than closing the connection.
 public enum PublicFirehoseTailerError: Error, Sendable, Equatable {
   case consumerTooSlow(seqLag: Int64, backfillElapsed: Duration)
   case writeTooSlow(duration: Duration)
+  /// The delivered cursor has fallen behind the retained window (a prune
+  /// advanced `retained_from_seq` past what this connection has consumed).
+  /// Carries the new retained boundary so the caller can resume there.
+  case outdatedCursor(retainedFromSeq: Int64)
 }
 
 /// The per-connection log-as-queue delivery loop. Reads complete stored
 /// frames from the durable firehose log and ships them verbatim; backfill and
 /// live delivery are the same code path, so the boundary has no gap or
-/// duplicate. Slow consumers are dropped by throwing a
-/// ``PublicFirehoseTailerError`` that the caller maps to `ConsumerTooSlow`.
+/// duplicate. Slow consumers are dropped, and a cursor that falls behind the
+/// retained window is reported, by throwing a ``PublicFirehoseTailerError``
+/// that the caller maps to a `ConsumerTooSlow` close or an `OutdatedCursor`
+/// resume, respectively.
 ///
 /// No HTTP or WebSocket type is referenced here; the loop is driven purely by
 /// the database, an outbound writer closure, and a wakeup closure.
@@ -148,16 +156,20 @@ public struct PublicFirehoseTailer: Sendable {
   ///     events are delivered strictly after it (`seq > lastSent`).
   ///   - outbound: writes one stored frame verbatim, in sequence order; must
   ///     be invoked exactly once per delivered event.
-  ///   - waitForWakeup: blocks until a new append is signaled, or returns
-  ///     `nil` when nothing is new so the loop falls back to its bounded idle
-  ///     poll. A value at or below the delivered cursor is treated as stale
-  ///     and likewise falls back to the poll. Callers feeding a hub
-  ///     subscription must ensure this closure does not block past task
+  ///   - waitForWakeup: blocks until a new append or retention advance is
+  ///     signaled, or returns `nil` when nothing is new so the loop falls
+  ///     back to its bounded idle poll. Any non-`nil` signal — including a
+  ///     stale append at or below the delivered cursor, or a retention
+  ///     signal whose sequence high-water mark is unchanged — immediately
+  ///     continues the loop rather than sleeping, so the retention check
+  ///     below always gets a fresh pass after any wakeup. Callers feeding a
+  ///     hub subscription must ensure this closure does not block past task
   ///     cancellation; the loop itself exits promptly on cancellation.
   ///
   /// Returns normally on task cancellation (it never rethrows
   /// `CancellationError`). Throws ``PublicFirehoseTailerError`` on a slow
-  /// consumer and propagates database or outbound errors.
+  /// consumer or an outdated cursor, and propagates database or outbound
+  /// errors.
   public func run(
     lastSent: Int64,
     outbound: (Data) async throws -> Void,
@@ -167,10 +179,20 @@ public struct PublicFirehoseTailer: Sendable {
     var backfillElapsed = Duration.zero
     do {
       while !Task.isCancelled {
+        // Checked before every read so a retention advance is caught even
+        // when it does not change what `events(after:)` would return (e.g.
+        // the consumer is already caught up but the retained window moved
+        // past its delivered cursor).
+        if let retainedFromSeq = try await database.retainedFromSeq(),
+           cursor < retainedFromSeq - 1 {
+          throw PublicFirehoseTailerError.outdatedCursor(
+            retainedFromSeq: retainedFromSeq
+          )
+        }
         let rows = try await database.events(after: cursor, limit: limits.pageSize)
         if rows.isEmpty {
           let wakeupSeq = await waitForWakeup()
-          if let wakeupSeq, wakeupSeq > cursor {
+          if wakeupSeq != nil {
             continue
           }
           try await Task.sleep(for: .seconds(limits.idlePollInterval))

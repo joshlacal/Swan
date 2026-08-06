@@ -176,7 +176,12 @@ private func publicFirehoseOnUpgrade(
     case .live:
       lastSent = maxSequencedSeq
     case .fullWindow:
-      lastSent = 0
+      // Start just before the oldest retained row (not literal 0) so the
+      // slow-consumer sequence-lag check is computed against what is
+      // actually deliverable, not against sequences retention already
+      // deleted. This preserves the design rule that `cursor=0` streams the
+      // retained window without an `OutdatedCursor` info frame.
+      lastSent = max(0, (retainedFromSeq ?? 1) - 1)
     case .backfill(from: let from):
       lastSent = from
     }
@@ -222,7 +227,7 @@ private func publicFirehoseOnUpgrade(
     group.addTask {
       await publicFirehoseRunTailer(
         tailer: tailer,
-        lastSent: lastSent,
+        initialLastSent: lastSent,
         outbound: outbound,
         wakeupMailbox: wakeupMailbox,
         logger: logger
@@ -238,47 +243,71 @@ private func publicFirehoseOnUpgrade(
   logger.debug("public firehose subscription ended")
 }
 
-/// Runs one tailer loop for a connection, mapping slow-consumer errors to a
-/// `ConsumerTooSlow` error frame followed by a close. Any other failure
-/// (closed channel, database error) propagates to the task group, which
-/// tears the connection down via cancellation.
+/// Runs the tailer loop for a connection, restarting it in place after a
+/// retention advance so the session survives instead of closing.
+///
+/// `PublicFirehoseTailerError.outdatedCursor` writes an `#info`
+/// `OutdatedCursor` frame and re-enters `tailer.run` from the new retained
+/// boundary — the cursor is mutable across iterations for exactly this
+/// resume. `consumerTooSlow`/`writeTooSlow` map to a `ConsumerTooSlow` error
+/// frame followed by a close, ending the loop. Any other failure (closed
+/// channel, database error) ends the loop without a control frame; the
+/// sibling task group teardown handles the channel.
 private func publicFirehoseRunTailer(
   tailer: PublicFirehoseTailer,
-  lastSent: Int64,
+  initialLastSent: Int64,
   outbound: WebSocketOutboundWriter,
   wakeupMailbox: NIOLockedValueBox<Int64?>,
   logger: Logger
 ) async {
-  do {
-    try await tailer.run(
-      lastSent: lastSent,
-      outbound: { frameBytes in
-        try await outbound.write(.binary(ByteBuffer(data: frameBytes)))
-      },
-      waitForWakeup: {
-        // Never blocks: consumes the newest pending bump or reports none, so
-        // the tailer falls back to its own bounded idle poll (the recovery
-        // path for a missed or pre-subscription wakeup).
-        wakeupMailbox.withLockedValue { value in
-          let pending = value
-          value = nil
-          return pending
-        }
+  let outboundWrite: (Data) async throws -> Void = { frameBytes in
+    try await outbound.write(.binary(ByteBuffer(data: frameBytes)))
+  }
+  let wakeupRead: () async -> Int64? = {
+    // Never blocks: consumes the newest pending bump or reports none, so the
+    // tailer falls back to its own bounded idle poll (the recovery path for
+    // a missed or pre-subscription wakeup, and for a lost retention signal).
+    wakeupMailbox.withLockedValue { value in
+      let pending = value
+      value = nil
+      return pending
+    }
+  }
+
+  var lastSent = initialLastSent
+  while !Task.isCancelled {
+    do {
+      try await tailer.run(
+        lastSent: lastSent,
+        outbound: outboundWrite,
+        waitForWakeup: wakeupRead
+      )
+      return
+    } catch let error as PublicFirehoseTailerError {
+      switch error {
+      case let .outdatedCursor(retainedFromSeq):
+        try? await outbound.write(
+          .binary(ByteBuffer(data: try FirehoseFrameEncoder.infoFrame(
+            name: "OutdatedCursor",
+            message: nil
+          )))
+        )
+        lastSent = max(0, retainedFromSeq - 1)
+      case .consumerTooSlow, .writeTooSlow:
+        try? await outbound.write(
+          .binary(ByteBuffer(data: try FirehoseFrameEncoder.errorFrame(
+            error: "ConsumerTooSlow",
+            message: nil
+          )))
+        )
+        try? await outbound.close(.normalClosure, reason: "ConsumerTooSlow")
+        return
       }
-    )
-  } catch let error as PublicFirehoseTailerError {
-    logger.warning("dropping slow public firehose consumer", metadata: [
-      "tailerError": "\(error)"
-    ])
-    try? await outbound.write(
-      .binary(ByteBuffer(data: try FirehoseFrameEncoder.errorFrame(error: "ConsumerTooSlow", message: nil)))
-    )
-    try? await outbound.close(.normalClosure, reason: "ConsumerTooSlow")
-  } catch {
-    // Closed-channel writes and database failures end the connection without
-    // a control frame; the sibling task group teardown handles the channel.
-    logger.debug("public firehose tailer ended with error", metadata: [
-      "error": "\(error)"
-    ])
+    } catch {
+      logger.debug("public firehose tailer ended with error", metadata: [
+        "error": "\(error)"
+      ])
+      return
+    }
   }
 }
