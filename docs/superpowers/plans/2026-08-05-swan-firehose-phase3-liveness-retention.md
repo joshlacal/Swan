@@ -268,6 +268,27 @@ func testAgeCeilingCanPruneTheEntireLogAndHighWaterMarkDoesNotRegress() async th
     "deleting every row must not make an already-issued cursor future"
   )
 }
+
+func testNoOpPruneDoesNotInitializeRetention() async throws {
+  _ = try await firehose.appendBatch(
+    [identityItem(sourceKey: "fresh")],
+    now: epoch
+  )
+
+  let result = try await firehose.prune(
+    now: epoch,
+    policy: try PublicFirehoseRetentionPolicy(
+      maximumAge: .seconds(72 * 60 * 60),
+      maximumRows: 100,
+      maximumBytes: 1_073_741_824
+    )
+  )
+
+  XCTAssertEqual(result.deletedRows, 0)
+  XCTAssertFalse(result.didAdvanceRetention)
+  let retained = try await firehose.retainedFromSeq()
+  XCTAssertNil(retained, "a no-op prune must not arm the retained window")
+}
 ```
 
 - [ ] **Step 2: Run the focused tests and verify they fail for missing symbols**
@@ -325,7 +346,7 @@ LIMIT 1000
 
 Build the `IN` placeholders from the selected sequence values and delete that page with `RETURNING seq, length(frame_bytes) AS bytes`. Do not add a minimum-row condition. The loop stops only when both `row_count <= maximumRows` and `byte_count <= maximumBytes`.
 
-After all deletes in the same transaction, compute the new boundary as `MIN(seq)` from remaining rows, or the greatest deleted sequence when the log is empty. Read the previous `retained_from_seq`, update it only when the new boundary is greater, and return `didAdvanceRetention` accordingly. A no-op prune must not initialize `retained_from_seq` on a never-used database.
+After all deletes in the same transaction, compute the new boundary as `MIN(seq)` from remaining rows, or the greatest deleted sequence when the log is empty. Read the previous `retained_from_seq`, and write it only when at least one row was deleted in this prune and the new boundary is greater than the previous value (treat the never-set state as unbounded, never as `0`). A no-op prune — zero rows deleted by any bound — must not write `retained_from_seq` at all and must return `didAdvanceRetention == false`; this keeps the dormant Phase 2 behavior intact until the first real prune. Return the retained boundary and advance flag accordingly.
 
 Change `maxSequencedSeq()` to read `firehose_meta.next_seq - 1` rather than `MAX(seq)`. Validate the result is between `0` and `FirehoseFrameLimits.maximumSequence`. This preserves the current sequence high-water mark after retention deletes all rows or after per-DID deletion creates gaps.
 
@@ -988,42 +1009,42 @@ private func publicFirehoseRunTailer(
     }
   }
 
-var lastSent = initialLastSent
-while !Task.isCancelled {
-  do {
-    try await tailer.run(
-      lastSent: lastSent,
-      outbound: outboundWrite,
-      waitForWakeup: wakeupRead
-    )
-    return
-  } catch let error as PublicFirehoseTailerError {
-    switch error {
-    case let .outdatedCursor(retainedFromSeq):
-      try? await outbound.write(
-        .binary(ByteBuffer(data: try FirehoseFrameEncoder.infoFrame(
-          name: "OutdatedCursor",
-          message: nil
-        )))
+  var lastSent = initialLastSent
+  while !Task.isCancelled {
+    do {
+      try await tailer.run(
+        lastSent: lastSent,
+        outbound: outboundWrite,
+        waitForWakeup: wakeupRead
       )
-      lastSent = max(0, retainedFromSeq - 1)
-    case .consumerTooSlow, .writeTooSlow:
-      try? await outbound.write(
-        .binary(ByteBuffer(data: try FirehoseFrameEncoder.errorFrame(
-          error: "ConsumerTooSlow",
-          message: nil
-        )))
-      )
-      try? await outbound.close(.normalClosure, reason: "ConsumerTooSlow")
+      return
+    } catch let error as PublicFirehoseTailerError {
+      switch error {
+      case let .outdatedCursor(retainedFromSeq):
+        try? await outbound.write(
+          .binary(ByteBuffer(data: try FirehoseFrameEncoder.infoFrame(
+            name: "OutdatedCursor",
+            message: nil
+          )))
+        )
+        lastSent = max(0, retainedFromSeq - 1)
+      case .consumerTooSlow, .writeTooSlow:
+        try? await outbound.write(
+          .binary(ByteBuffer(data: try FirehoseFrameEncoder.errorFrame(
+            error: "ConsumerTooSlow",
+            message: nil
+          )))
+        )
+        try? await outbound.close(.normalClosure, reason: "ConsumerTooSlow")
+        return
+      }
+    } catch {
+      logger.debug("public firehose tailer ended with error", metadata: [
+        "error": "\(error)"
+      ])
       return
     }
-  } catch {
-    logger.debug("public firehose tailer ended with error", metadata: [
-      "error": "\(error)"
-    ])
-    return
   }
-}
 }
 ```
 
@@ -1340,7 +1361,7 @@ shasum -a 256 Profiles/public-data-testing-2026-08-06.json \
   Profiles/public-data-testing-2026-08-06.generated-wire.sha256
 ```
 
-The new profile JSON hash is `b96ac7c7fa3df3a0bb5b396c25f776734493d7b0a09a71e1e082e24813b64124`. The lexicon and generated-wire manifest hashes must equal their 2026-08-05 counterparts because no lexicon or generated source changed.
+The new profile JSON hash is `b96ac7c7fa3df3a0bb5b396c25f776734493d7b0a09a71e1e082e24813b64124`. Verify your edited file: it is the 2026-08-05 JSON byte-for-byte with only the `id` value changed and the third `intentionalDivergences` object (the `OutdatedCursor` one) removed; `shasum -a 256` on the result must print `b96ac7c7fa3df3a0bb5b396c25f776734493d7b0a09a71e1e082e24813b64124`. If your editor re-serialized or re-formatted the JSON and the hash differs, redo the edit so the hash matches exactly — the profile pin is byte-immutable once committed. The lexicon and generated-wire manifest hashes must equal their 2026-08-05 counterparts because no lexicon or generated source changed.
 
 - [ ] **Step 3: Update the selected-profile verifier and hand-maintained descriptor list**
 
