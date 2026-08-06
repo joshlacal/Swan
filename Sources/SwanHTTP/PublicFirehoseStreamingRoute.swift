@@ -294,6 +294,9 @@ private func publicFirehoseRunTailer(
         )
         lastSent = max(0, retainedFromSeq - 1)
       case .consumerTooSlow, .writeTooSlow:
+        logger.warning("dropping slow public firehose consumer", metadata: [
+          "tailerError": "\(error)"
+        ])
         try? await outbound.write(
           .binary(ByteBuffer(data: try FirehoseFrameEncoder.errorFrame(
             error: "ConsumerTooSlow",

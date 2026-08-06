@@ -1010,6 +1010,98 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
     }
   }
 
+  /// Exercises the mid-stream recovery path in `publicFirehoseRunTailer`
+  /// (the `.outdatedCursor` retry branch), as opposed to the connect-time
+  /// `.outdatedCursor` branch in `publicFirehoseOnUpgrade` already covered
+  /// above: a session that is already live and caught up must survive a
+  /// retention advance that lands behind it, not close.
+  func testSubscribeReposActiveSessionRecoversFromRetentionAdvanceMidStream() async throws {
+    let fixture = try await makeFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      // Two events delivered before connecting so `cursor=0` catches the
+      // session up to seq 2 with nothing left to backfill.
+      try await appendCommit(to: fixture.firehose, hub: fixture.hub, sourceKey: "active-1", seed: 0xA1, now: epoch)
+      try await appendCommit(to: fixture.firehose, hub: fixture.hub, sourceKey: "active-2", seed: 0xA2, now: epoch)
+
+      let app = fixture.server.buildApplication(logger: logger)
+      try await app.test(.live) { client in
+        let recorder = WSFrameRecorder()
+        let wsTask = Task {
+          try await self.runWSClient(
+            client,
+            path: "\(self.subscribePath)?cursor=0",
+            recorder: recorder,
+            closeAfterFrames: 4
+          )
+        }
+        // The session catches up to the two seeded events and goes idle,
+        // live-tailing at seq 2 with nothing left to deliver.
+        try await self.waitUntil { await recorder.snapshot().count == 2 }
+
+        // Two more events land with an old timestamp, appended directly
+        // (bypassing the hub signal `appendCommit` sends) so the
+        // already-idle tailer does not discover them via its own bounded
+        // poll before the prune below deletes them out from under this
+        // live session. A third, later event survives the prune and
+        // becomes the new retained boundary.
+        _ = try await fixture.firehose.appendBatch(
+          [self.commitItem(sourceKey: "active-3", seed: 0xA3)], now: self.epoch
+        )
+        _ = try await fixture.firehose.appendBatch(
+          [self.commitItem(sourceKey: "active-4", seed: 0xA4)], now: self.epoch
+        )
+        _ = try await fixture.firehose.appendBatch(
+          [self.commitItem(sourceKey: "active-5", seed: 0xA5)],
+          now: self.epoch.addingTimeInterval(20)
+        )
+        let seeded = try await fixture.firehose.events(after: 2, limit: 10)
+        let retained = try XCTUnwrap(seeded.last { $0.sourceKey == "active-5" })
+
+        // The live session's cursor (2) is behind the two events about to
+        // be pruned out from under it; only the later "active-5" survives.
+        _ = try await fixture.firehose.prune(
+          now: self.epoch.addingTimeInterval(20),
+          policy: try PublicFirehoseRetentionPolicy(
+            maximumAge: .seconds(1),
+            maximumRows: 100,
+            maximumBytes: 1_073_741_824
+          )
+        )
+        // Mirrors `SwanPublicFirehoseRetentionService.run()`: re-read the
+        // durable high-water mark and signal the hub directly, exactly as
+        // the scheduled retention service does after a prune that advances
+        // the retained boundary.
+        let maxSeq = try await fixture.firehose.maxSequencedSeq()
+        await fixture.hub.firehoseRetentionDidAdvance(maxSeq: maxSeq)
+
+        try await self.waitUntil { await recorder.snapshot().count == 4 }
+        let closeFrame = try await self.awaitWithDeadline { try await wsTask.value }
+        // A client-initiated close after 4 frames, not a server-initiated
+        // one: the session must survive the retention advance instead of
+        // being torn down.
+        XCTAssertEqual(closeFrame?.closeCode, .normalClosure)
+
+        let frames = await recorder.snapshot()
+        XCTAssertEqual(frames.count, 4)
+        for frame in frames.prefix(2) {
+          let header = try self.decodeFrameHeader(frame)
+          XCTAssertEqual(header.type, "#commit")
+        }
+        try self.assertInfoFrame(frames[2], name: "OutdatedCursor")
+        let resumed = try self.decodeFrameHeader(frames[3])
+        XCTAssertEqual(resumed.type, "#commit", "streaming must resume from the retained window")
+        XCTAssertEqual(Data(buffer: frames[3].data), retained.frameBytes)
+      }
+      try await fixture.control.close()
+      try await fixture.firehose.close()
+    } catch {
+      try? await fixture.control.close()
+      try? await fixture.firehose.close()
+      throw error
+    }
+  }
+
   func testSubscribeReposConsumerTooSlowErrorFrameAndClose() async throws {
     // Task 2's validated init rejects zero bounds, so the smallest positive
     // lag ceiling is 1; seeding two events makes the lag 2 at cursor 0.
