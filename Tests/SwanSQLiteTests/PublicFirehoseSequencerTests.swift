@@ -628,4 +628,35 @@ final class PublicFirehoseSequencerTests: XCTestCase {
     let pendingAfterRetry = try await control.nextPendingLifecycleBatch(did: didA)
     XCTAssertNil(pendingAfterRetry)
   }
+
+  /// Regression: a real lifecycle batch pairing a same-DID `#identity` item
+  /// with the deleted `#account` marker item — the identity item is
+  /// allocated a lower sequence than the account item inside this very
+  /// batch. The delete boundary must exclude both items of this call, not
+  /// just the marker's own row: only the DID's pre-batch history is pruned.
+  func testDeletedAccountSurvivesSameBatchIdentitySibling() async throws {
+    let sequencer = try makeSequencer()
+    _ = try await enqueueCommit(database: accountA, did: didA, generation: 0, seed: 0x06)
+    _ = try await control.enqueueLifecycleEventBatch(
+      did: didA,
+      operationID: "delete-3",
+      items: [
+        identityItem(did: didA, operationID: "delete-3"),
+        deletedAccountItem(did: didA, operationID: "delete-3"),
+      ],
+      now: epoch
+    )
+
+    let steps = try await sequencer.drainAll(now: epoch)
+    XCTAssertEqual(steps, 2)
+    let events = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(
+      events.map(\.kind),
+      [.identity, .account],
+      "the pre-batch commit is pruned; the same-batch identity sibling survives alongside the deletion event"
+    )
+    XCTAssertEqual(events.map(\.did), [didA, didA])
+    let maxSeq = try await firehose.maxSequencedSeq()
+    XCTAssertEqual(maxSeq, 3)
+  }
 }

@@ -144,10 +144,12 @@ public actor SQLiteFirehoseDatabase {
   /// DID's earlier retained history is pruned in the same transaction as the
   /// append: the deletion commits or rolls back atomically with the public
   /// event that announces it. Each marker's source key must match exactly
-  /// one `.account` item in `items`; the delete never touches the row the
-  /// marker's own item occupies, and it applies on exact replay too, so a
-  /// crash between the first commit and lifecycle completion cannot leave
-  /// prior rows behind.
+  /// one `.account` item in `items`; the delete boundary is the first
+  /// sequence allocated (or replayed) to *this* call, not the marker's own
+  /// item's sequence, so it never touches any row `items` is inserting or
+  /// replaying right now — including a same-DID sibling item earlier in this
+  /// same batch. It applies on exact replay too, so a crash between the
+  /// first commit and lifecycle completion cannot leave prior rows behind.
   public func appendBatch(
     _ items: [FirehoseAppendItem],
     now: Date,
@@ -334,22 +336,40 @@ public actor SQLiteFirehoseDatabase {
   }
 
   /// Deletes each marker's DID's rows with `seq` strictly less than the
-  /// marker's own allocated sequence, permitting sequence gaps in the
-  /// remaining log. Never advances `retained_from_seq`: this is a per-DID
-  /// deletion, not a global retention boundary.
+  /// first sequence allocated (or, on exact replay, re-derived) to *this*
+  /// `appendBatch` call — never the marker's own item's sequence. Using the
+  /// marker's own sequence would also delete any same-DID sibling rows
+  /// inserted earlier in this same call (for example an `#identity` item
+  /// paired with the deleted `#account` item in one lifecycle batch); using
+  /// the batch's start boundary instead means only rows sequenced in a
+  /// strictly earlier call are eligible, so every row this call is inserting
+  /// or replaying survives. `seqBySourceKey` always covers every item in the
+  /// call, so its minimum is exactly that start boundary on both the
+  /// new-insert path (where it equals the first allocated sequence) and the
+  /// exact-replay path (where it equals the first item's original stored
+  /// sequence, re-derived fresh from this call's replayed results). This
+  /// permits sequence gaps in the remaining log and never advances
+  /// `retained_from_seq`: this is a per-DID deletion, not a global retention
+  /// boundary.
   private func deletePriorEvents(
     _ markers: [FirehoseDeletionMarker],
     seqBySourceKey: [String: Int64]
   ) async throws {
+    guard !markers.isEmpty else { return }
+    guard let batchStartSeq = seqBySourceKey.values.min() else {
+      throw SQLiteFirehoseDatabaseError.corruptDatabase(
+        "deletion markers require at least one allocated sequence"
+      )
+    }
     for marker in markers {
-      guard let seq = seqBySourceKey[marker.sourceKey] else {
+      guard seqBySourceKey[marker.sourceKey] != nil else {
         throw SQLiteFirehoseDatabaseError.corruptDatabase(
           "deletion marker sequence was not allocated"
         )
       }
       _ = try await connection.query(
         "DELETE FROM firehose_events WHERE did = ? AND seq < ?",
-        [.text(marker.did), .integer(Int(seq))]
+        [.text(marker.did), .integer(Int(batchStartSeq))]
       )
     }
   }

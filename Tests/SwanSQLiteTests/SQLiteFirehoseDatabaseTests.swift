@@ -56,7 +56,8 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
 
   private func deletedAccountItem(
     sourceKey: String,
-    did: String? = nil
+    did: String? = nil,
+    batchID: String? = nil
   ) -> FirehoseAppendItem {
     let accountDID = did ?? self.did
     let material = PublicFirehoseAccountMaterial(
@@ -67,7 +68,7 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     )
     return FirehoseAppendItem(
       sourceKey: sourceKey,
-      batchID: nil,
+      batchID: batchID,
       did: accountDID,
       kind: .account
     ) { seq in
@@ -781,6 +782,86 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
         deletingPriorEvents: [FirehoseDeletionMarker(did: otherDID, sourceKey: "delete-1")]
       ),
       { if case .invalidRequest = $0 { return true }; return false }
+    )
+  }
+
+  /// Regression: the marker's own item's sequence must never be the delete
+  /// boundary. Pairing a same-DID identity item with the deleted-account
+  /// item in one batch, when history for that DID already exists from a
+  /// prior call, exercises the exact failure mode the fix addresses — using
+  /// the marker's own sequence would also delete the same-batch sibling.
+  func testDeletingPriorEventsSurvivesSameBatchSiblingAndOnlyDeletesPreBatchHistory() async throws {
+    _ = try await firehose.appendBatch(
+      [
+        identityItem(sourceKey: "pre-1", batchID: "pre-history"),
+        identityItem(sourceKey: "pre-2", batchID: "pre-history"),
+      ],
+      now: epoch
+    )
+    let otherDID = "did:plc:wwwwwwwwwwwwwwwwwwwwwwww"
+    _ = try await firehose.appendBatch(
+      [identityItem(sourceKey: "other-1", did: otherDID)],
+      now: epoch
+    )
+
+    let sibling = identityItem(sourceKey: "sibling-1", batchID: "delete-batch")
+    let deletion = deletedAccountItem(sourceKey: "delete-1", batchID: "delete-batch")
+    let seqs = try await firehose.appendBatch(
+      [sibling, deletion],
+      now: epoch,
+      deletingPriorEvents: [FirehoseDeletionMarker(did: did, sourceKey: "delete-1")]
+    )
+    XCTAssertEqual(seqs, [4, 5])
+
+    let stored = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(
+      stored.map(\.sourceKey),
+      ["other-1", "sibling-1", "delete-1"],
+      "pre-batch history for the deleted DID is gone, but the same-batch sibling survives"
+    )
+    XCTAssertEqual(stored.map(\.seq), [3, 4, 5])
+    XCTAssertEqual(stored.map(\.did), [otherDID, did, did])
+    XCTAssertEqual(stored.last?.kind, .account)
+  }
+
+  /// Regression: the exact-replay path must re-derive the same batch-start
+  /// boundary from its own replayed sequences, not reuse the marker's own
+  /// sequence either. Replaying the same sibling+deletion batch a second
+  /// time must not retroactively delete the sibling that survived the first
+  /// call.
+  func testDeletingPriorEventsBatchBoundaryIsPreservedOnExactReplay() async throws {
+    _ = try await firehose.appendBatch(
+      [identityItem(sourceKey: "pre-1")],
+      now: epoch
+    )
+    let sibling = identityItem(sourceKey: "sibling-1", batchID: "delete-batch")
+    let deletion = deletedAccountItem(sourceKey: "delete-1", batchID: "delete-batch")
+    let marker = [FirehoseDeletionMarker(did: did, sourceKey: "delete-1")]
+
+    let first = try await firehose.appendBatch(
+      [sibling, deletion],
+      now: epoch,
+      deletingPriorEvents: marker
+    )
+    XCTAssertEqual(first, [2, 3])
+    let afterFirst = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(
+      afterFirst.map(\.seq),
+      [2, 3],
+      "pre-batch history removed; same-batch sibling survives"
+    )
+
+    let replayed = try await firehose.appendBatch(
+      [sibling, deletion],
+      now: epoch,
+      deletingPriorEvents: marker
+    )
+    XCTAssertEqual(replayed, first, "exact replay reproduces the same sequences")
+    let afterReplay = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(
+      afterReplay.map(\.seq),
+      [2, 3],
+      "replay must rederive the same batch-start boundary and must not delete the sibling"
     )
   }
 }
