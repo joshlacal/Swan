@@ -773,11 +773,12 @@ extension SQLiteFirehoseDatabase {
   /// repeatedly removes the minimal prefix of the oldest bounded page
   /// (at most 1000 rows) that satisfies the row or byte budget, re-checking the
   /// totals until both are within bounds. The retained boundary is the
-  /// `MIN(seq)` of the surviving rows, or the greatest deleted sequence when
-  /// the log ends empty. `retained_from_seq` is written only when this prune
-  /// deleted at least one row and the new boundary exceeds the previous value;
-  /// the never-set state is treated as unbounded and a no-op prune leaves it
-  /// untouched.
+  /// `MIN(seq)` of the surviving rows, or one past the greatest deleted
+  /// sequence when the log ends empty (that sequence was itself deleted, so
+  /// the boundary must not claim it as retained). `retained_from_seq` is
+  /// written only when this prune deleted at least one row and the new
+  /// boundary exceeds the previous value; the never-set state is treated as
+  /// unbounded and a no-op prune leaves it untouched.
   public func prune(
     now: Date,
     policy: PublicFirehoseRetentionPolicy
@@ -892,8 +893,16 @@ extension SQLiteFirehoseDatabase {
             }
             selectedSequences.append(Int64(seq))
             selectedBytes += Int64(row.column("bytes")?.integer ?? 0)
+            // Both budgets must be satisfied by the prospective deletion
+            // before stopping. With `||` a single already-satisfied budget
+            // (the common case: only one of the two is actually violated)
+            // broke out after selecting just one row, so each outer-loop
+            // pass re-ran the full-table totals query and deleted exactly
+            // one row — K excess rows cost K full-table scans instead of
+            // ceil(K / 1000). `&&` lets the prefix grow to the full
+            // (<=1000-row) page whenever the other budget is already fine.
             if currentRows - Int64(selectedSequences.count) <= policy.maximumRows
-                || currentBytes - selectedBytes <= policy.maximumBytes {
+                && currentBytes - selectedBytes <= policy.maximumBytes {
               break
             }
           }
@@ -918,7 +927,19 @@ extension SQLiteFirehoseDatabase {
         if let minSeq = remaining.first?.column("min_seq")?.integer, minSeq >= 1 {
           newBoundary = Int64(minSeq)
         } else if deletedRows > 0 {
-          newBoundary = maximumDeletedSequence
+          // The log is now empty: `maximumDeletedSequence` itself was
+          // deleted, so it is one *past* the retained window, not the
+          // oldest retained row (there is no oldest retained row). Using
+          // the bare deleted sequence understated the boundary by one,
+          // which let a mid-stream cursor at `maximumDeletedSequence - 1`
+          // pass the tailer's `cursor < retainedFromSeq - 1` check even
+          // though the very next sequence it needed was pruned, and could
+          // make a later prune whose own maximum deleted sequence equals
+          // this already-recorded boundary look like a no-op advance (the
+          // monotonicity guard below would reject `newBoundary >
+          // previous`), silently dropping `didAdvanceRetention` despite
+          // rows actually being deleted.
+          newBoundary = maximumDeletedSequence + 1
         } else {
           newBoundary = nil
         }

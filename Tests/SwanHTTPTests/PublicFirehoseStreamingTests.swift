@@ -363,7 +363,12 @@ final class PublicFirehoseStreamingTests: XCTestCase {
         maximumBytes: 1_073_741_824
       )
     )
-    XCTAssertEqual(result.retainedFromSeq, 2)
+    XCTAssertEqual(
+      result.retainedFromSeq,
+      3,
+      "the boundary is one past the last deleted sequence (2), not the "
+        + "deleted sequence itself, since seq 2 no longer exists"
+    )
 
     let tailer = PublicFirehoseTailer(
       database: firehose,
@@ -378,7 +383,56 @@ final class PublicFirehoseStreamingTests: XCTestCase {
       )
       XCTFail("expected outdatedCursor")
     } catch let error as PublicFirehoseTailerError {
-      XCTAssertEqual(error, .outdatedCursor(retainedFromSeq: 2))
+      XCTAssertEqual(error, .outdatedCursor(retainedFromSeq: 3))
+    }
+  }
+
+  /// Regression for the whole-log-prune boundary off-by-one: before the fix,
+  /// an emptied log's boundary was set to the last deleted sequence (`M`)
+  /// rather than one past it. A session already delivered up to `M - 1`
+  /// would then pass the tailer's `cursor < retainedFromSeq - 1` check
+  /// (`M - 1 < M - 1` is false) and silently resume with nothing to
+  /// deliver, even though seq `M` itself was pruned out from under it. This
+  /// proves that scenario now correctly reports `OutdatedCursor`.
+  func testTailerReportsOutdatedCursorForLastSentOneBelowWhollyPrunedBoundary() async throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
+    defer { Task { try? await firehose.close() } }
+    for index in 1 ... 3 {
+      _ = try await firehose.appendBatch(
+        [identityItem(sourceKey: "wipe-\(index)")],
+        now: epoch
+      )
+    }
+
+    let result = try await firehose.prune(
+      now: epoch.addingTimeInterval(20),
+      policy: try PublicFirehoseRetentionPolicy(
+        maximumAge: .seconds(1),
+        maximumRows: 100,
+        maximumBytes: 1_073_741_824
+      )
+    )
+    XCTAssertEqual(result.deletedRows, 3)
+    XCTAssertEqual(result.retainedFromSeq, 4)
+
+    let tailer = PublicFirehoseTailer(
+      database: firehose,
+      limits: .standard,
+      logger: logger
+    )
+    do {
+      // lastSent == 2 is one below the last deleted sequence (3), the exact
+      // boundary value the pre-fix code would have written.
+      try await tailer.run(
+        lastSent: 2,
+        outbound: { _ in XCTFail("outdated cursor must be reported before a write") },
+        waitForWakeup: { nil }
+      )
+      XCTFail("expected outdatedCursor")
+    } catch let error as PublicFirehoseTailerError {
+      XCTAssertEqual(error, .outdatedCursor(retainedFromSeq: 4))
     }
   }
 

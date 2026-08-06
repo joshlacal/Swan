@@ -89,8 +89,9 @@ Every named suite passed with zero `error: -` diagnostics:
 `PublicFirehoseSequencerTests`, `SQLiteFirehoseDatabaseTests`,
 `SwanInteropTests`, `PublicFirehoseServiceWiringTests` (4 tests, including
 the new Task 7 composition test), `PublicFirehoseStreamingHTTPTests`,
-`PublicFirehoseStreamingTests`, `SwanHTTPTests.xctest` (230 tests total, 0
-failures), `SwanPublicWireTests` (swift-testing, 6 tests, 0 failures).
+`PublicFirehoseStreamingTests`, `SwanHTTPTests.xctest` (231 tests total as of
+the final-review fix wave below, 0 failures), `SwanPublicWireTests`
+(swift-testing, 6 tests, 0 failures).
 
 Full exit gate:
 
@@ -105,25 +106,37 @@ tests, with S skipped and F failures`):
 | Bundle                          | Tests | Skipped | Failures |
 |----------------------------------|------:|--------:|---------:|
 | SwanSpacesTests.xctest           |    39 |       1 |        0 |
-| SwanSQLiteTests.xctest           |   336 |       6 |        0 |
+| SwanSQLiteTests.xctest           |   338 |       6 |        0 |
 | SwanPublicRepositoryTests.xctest |   111 |       0 |        0 |
 | SwanPublicFirehoseTests.xctest   |    38 |       0 |        0 |
 | SwanOAuthTests.xctest            |   109 |       0 |        0 |
 | SwanInteropTests.xctest          |   116 |       0 |        0 |
-| SwanHTTPTests.xctest             |   230 |       0 |        0 |
+| SwanHTTPTests.xctest             |   231 |       0 |        0 |
 | SwanCoreTests.xctest             |     5 |       0 |        0 |
 | SwanCLITests.xctest              |    67 |       1 |        0 |
 | SwanAccountsTests.xctest         |   118 |       0 |        0 |
 | SwanAccountExportTests.xctest    |    56 |       1 |        0 |
-| **XCTest subtotal**              | **1225** | **9** | **0** |
+| **XCTest subtotal**              | **1228** | **9** | **0** |
 
 Plus one Swift Testing suite (`Swan public wire profile`,
 `Tests/SwanPublicWireTests`): 6 tests, 0 failures.
 
-**Grand total: 1231 tests executed, 9 skipped, 0 failures, 0 unexpected
+**Grand total: 1234 tests executed, 9 skipped, 0 failures, 0 unexpected
 failures, process exit code 0.** The 9 skips are all pre-existing opt-in
 gates unrelated to Phase 3 (e.g. `SWAN_RUN_256MIB_PORTABLE_RESTORE`-style
 manual/resource-gated tests), not new skips introduced by this phase.
+
+**Updated by the final-review fix wave** (see
+`.superpowers/sdd/2026-08-05-swan-firehose-phase3-liveness-retention/task-7-report.md`
+for the itemized findings and fixes): the totals above supersede the
+original Task 7 run (1231 tests / 9 skipped / 0 failures). The delta is
+exactly the 3 regression tests the fix wave added — 2 in
+`SQLiteFirehoseDatabaseTests` (`SwanSQLiteTests.xctest` 336 → 338) and 1 in
+`PublicFirehoseStreamingTests` (`SwanHTTPTests.xctest` 230 → 231) — proving
+the budget-loop paging fix and the whole-log-prune boundary fix; no test was
+removed or newly skipped, and failures remained 0 throughout. Reproduced
+identically across two independent full unfiltered runs (both exit code 0,
+byte-identical per-bundle totals).
 
 ## Explicitly Unimplemented
 
@@ -133,3 +146,33 @@ manual/resource-gated tests), not new skips introduced by this phase.
 - Reference-relay Docker/interop acceptance remains Phase 5.
 - The `--enable-public-firehose` default remains off pending the separate
   activation gate.
+
+## Phase 4 Entry Gates
+
+Conditions the final whole-branch review ruled must be satisfied *before*
+Phase 4 work proceeds, even though nothing in Phase 3 needs to change to
+satisfy them today.
+
+- **Deletion-gap-aware lag computation, required before `transitionStatus`
+  wires deletion markers.** `PublicFirehoseTailer.run`'s slow-consumer check
+  computes `seqLag = maxSeq - cursor` against `maxSequencedSeq()`
+  (`Sources/SwanHTTP/PublicFirehoseStreaming.swift:201-202`), i.e. the
+  highest sequence ever issued. Per-DID deletion (`FirehoseDeletionMarker`,
+  Task 5) can remove an account's entire historical run of sequences while
+  leaving the high-water mark untouched, so a deleted account with more than
+  `maximumSequenceLag` (default 50,000) events between its earliest and
+  latest sequence would make `seqLag` cross the slow-consumer threshold for
+  every connected reader, dropping them all with `ConsumerTooSlow` — a false
+  positive caused entirely by a sequence-space hole, not by any consumer
+  actually falling behind. This is unreachable in Phase 3: nothing calls
+  `deletingPriorEvents` outside test fixtures, since `transitionStatus` and
+  `installPublicPLCOperation` (the only real triggers for account deletion)
+  are themselves Phase 4 work. **Phase 4 must not wire deletion markers into
+  a live lifecycle path until `seqLag` is made deletion-gap-aware** — e.g. by
+  computing lag from the count of actually-deliverable rows between `cursor`
+  and `maxSeq` (a bounded `COUNT(*)` or similar) rather than the raw
+  sequence-number difference, or by clamping the lag calculation to the
+  first stored sequence strictly above `cursor` so a deletion gap is never
+  counted against the consumer. No code changed for this in the fix wave;
+  this is a documented pre-condition on the next phase's design, per human
+  ruling during the final branch review.

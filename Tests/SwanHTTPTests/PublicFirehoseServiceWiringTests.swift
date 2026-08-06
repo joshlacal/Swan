@@ -357,7 +357,12 @@ final class PublicFirehoseServiceWiringTests: XCTestCase, @unchecked Sendable {
     let wakeup = await iterator.next()
     XCTAssertEqual(wakeup, 1)
     let retained = try await firehose.retainedFromSeq()
-    XCTAssertEqual(retained, 1)
+    XCTAssertEqual(
+      retained,
+      2,
+      "the sole row (seq 1) was deleted, so the boundary is one past it, "
+        + "not the deleted sequence itself"
+    )
   }
 
   /// End-to-end production composition proof: the same five objects

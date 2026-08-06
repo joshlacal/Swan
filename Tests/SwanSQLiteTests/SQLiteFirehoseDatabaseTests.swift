@@ -579,7 +579,12 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     )
 
     XCTAssertEqual(result.deletedRows, 2)
-    XCTAssertEqual(result.retainedFromSeq, 2)
+    XCTAssertEqual(
+      result.retainedFromSeq,
+      3,
+      "the boundary is one past the last deleted sequence (2), not the "
+        + "deleted sequence itself, since seq 2 no longer exists"
+    )
     let stored = try await firehose.events(after: 0, limit: 10)
     XCTAssertTrue(stored.isEmpty)
     let maxSeq = try await firehose.maxSequencedSeq()
@@ -610,7 +615,12 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     )
 
     XCTAssertEqual(result.deletedRows, Int64(rowCount))
-    XCTAssertEqual(result.retainedFromSeq, Int64(rowCount))
+    XCTAssertEqual(
+      result.retainedFromSeq,
+      Int64(rowCount) + 1,
+      "the boundary is one past the last deleted sequence, not the "
+        + "deleted sequence itself, since the whole log was pruned"
+    )
     XCTAssertTrue(result.didAdvanceRetention)
     let stored = try await firehose.events(after: 0, limit: 10)
     XCTAssertTrue(stored.isEmpty)
@@ -620,6 +630,106 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
       Int64(rowCount),
       "deleting every row across multiple age-pass pages must not make the cursor future"
     )
+  }
+
+  /// Regression for the budget loop's prefix-break operator: with `||`, the
+  /// inner break fired as soon as *either* budget was already satisfied by
+  /// the prospective deletion, so when only the row budget was violated (the
+  /// common case — bytes stayed far under budget the whole time) every
+  /// outer-loop pass deleted exactly one row and re-ran the full-table
+  /// `SELECT COUNT(*), SUM(length(frame_bytes))` — K excess rows cost K
+  /// full-table scans inside one transaction. With `&&`, the prefix grows to
+  /// the full bounded (<=1000-row) page whenever the other budget is already
+  /// fine, so paging is bounded by `ceil(excess / 1000)` outer iterations
+  /// instead of `excess`. This seeds 2500 rows against a 650-row budget
+  /// (excess 1850, more than one 1000-row page) so a single `prune` must
+  /// page: the first 1000-row page is deleted in full (the inner break never
+  /// fires inside it, since even removing the whole page leaves more than
+  /// 650 rows), and the second page stops partway through (850 of its 1000
+  /// rows) exactly where the row budget is satisfied.
+  func testRowBudgetPagesAcrossMultipleThousandRowBatchesWithoutDegradingToOneRowPerIteration(
+  ) async throws {
+    let rowCount = 2500
+    let items = (1 ... rowCount).map { index in
+      identityItem(sourceKey: "budget-multi-\(index)", batchID: "budget-multi")
+    }
+    _ = try await firehose.appendBatch(items, now: epoch)
+
+    let result = try await firehose.prune(
+      now: epoch,
+      policy: try PublicFirehoseRetentionPolicy(
+        maximumAge: .seconds(72 * 60 * 60),
+        maximumRows: 650,
+        maximumBytes: 1_073_741_824
+      )
+    )
+
+    XCTAssertEqual(result.deletedRows, 1850)
+    XCTAssertEqual(result.retainedFromSeq, 1851)
+    XCTAssertTrue(result.didAdvanceRetention)
+    let stored = try await firehose.events(after: 0, limit: 1_000)
+    XCTAssertEqual(stored.count, 650)
+    XCTAssertEqual(stored.map(\.seq), Array(Int64(1_851) ... Int64(2_500)))
+    let maxSeq = try await firehose.maxSequencedSeq()
+    XCTAssertEqual(maxSeq, Int64(rowCount))
+  }
+
+  /// Regression for the whole-log-prune boundary off-by-one's second-order
+  /// bug: the monotonicity guard (`newBoundary > previous`) must still
+  /// advance when a later prune's maximum deleted sequence numerically
+  /// equals a boundary already recorded by an earlier, non-emptying prune.
+  /// Before the fix, an emptied log's boundary was the bare maximum deleted
+  /// sequence, so if that value happened to equal the already-recorded
+  /// boundary the guard silently rejected the write — `didAdvanceRetention`
+  /// came back `false` even though this prune's `deletedRows` was nonzero,
+  /// and no retention wakeup would fire. This seeds two rows, prunes the
+  /// older one by row budget (setting the boundary to the survivor's own
+  /// seq, 2, via the normal `MIN(seq)` path), then ages the survivor out in
+  /// a second prune that empties the log. The second prune's maximum deleted
+  /// sequence is exactly 2 — the value already recorded as the boundary — so
+  /// this proves the fixed `+ 1` boundary (3) still compares greater and
+  /// still advances.
+  func testSecondWholeLogPruneAdvancesEvenWhenItsMaximumDeletedSequenceEqualsThePriorBoundary(
+  ) async throws {
+    _ = try await firehose.appendBatch([identityItem(sourceKey: "carry-1")], now: epoch)
+    _ = try await firehose.appendBatch([identityItem(sourceKey: "carry-2")], now: epoch)
+
+    let first = try await firehose.prune(
+      now: epoch,
+      policy: try PublicFirehoseRetentionPolicy(
+        maximumAge: .seconds(72 * 60 * 60),
+        maximumRows: 1,
+        maximumBytes: 1_073_741_824
+      )
+    )
+    XCTAssertEqual(first.deletedRows, 1)
+    XCTAssertEqual(first.retainedFromSeq, 2)
+    XCTAssertTrue(first.didAdvanceRetention)
+
+    let second = try await firehose.prune(
+      now: epoch.addingTimeInterval(20),
+      policy: try PublicFirehoseRetentionPolicy(
+        maximumAge: .seconds(1),
+        maximumRows: 100,
+        maximumBytes: 1_073_741_824
+      )
+    )
+    XCTAssertEqual(second.deletedRows, 1, "the surviving row (seq 2) must age out")
+    XCTAssertEqual(
+      second.retainedFromSeq,
+      3,
+      "one past the second prune's maximum deleted sequence (2), which "
+        + "equals the boundary the first prune already recorded"
+    )
+    XCTAssertTrue(
+      second.didAdvanceRetention,
+      "a prune that actually deleted a row must never silently skip the "
+        + "retention advance"
+    )
+    let retained = try await firehose.retainedFromSeq()
+    XCTAssertEqual(retained, 3)
+    let stored = try await firehose.events(after: 0, limit: 10)
+    XCTAssertTrue(stored.isEmpty)
   }
 
   func testNoOpPruneDoesNotInitializeRetention() async throws {

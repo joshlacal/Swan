@@ -13,7 +13,11 @@ import SwanSQLite
 /// service group is the normal shutdown path and returns without throwing.
 /// A prune that advances the retained boundary re-reads the durable high-water
 /// mark and signals the shared wakeup hub so idle tailers wake even when no
-/// new sequence was appended.
+/// new sequence was appended. Every pass logs its outcome: info-level when it
+/// deleted rows and advanced the boundary, debug-level otherwise (including
+/// when it deleted rows but the monotonicity guard left the boundary
+/// unchanged), so retention behavior is observable without only ever seeing
+/// failures.
 public struct SwanPublicFirehoseRetentionService: Service {
   private let database: SQLiteFirehoseDatabase
   private let hub: PublicFirehoseWakeupHub
@@ -44,7 +48,16 @@ public struct SwanPublicFirehoseRetentionService: Service {
         let result = try await database.prune(now: Date(), policy: policy)
         if result.didAdvanceRetention {
           let maxSeq = try await database.maxSequencedSeq()
+          logger.info("public firehose retention pass advanced the retained boundary", metadata: [
+            "deletedRows": "\(result.deletedRows)",
+            "deletedBytes": "\(result.deletedBytes)",
+            "retainedFromSeq": "\(result.retainedFromSeq.map { "\($0)" } ?? "nil")",
+          ])
           await hub.firehoseRetentionDidAdvance(maxSeq: maxSeq)
+        } else {
+          logger.debug("public firehose retention pass was a no-op", metadata: [
+            "deletedRows": "\(result.deletedRows)",
+          ])
         }
       } catch is CancellationError {
         return
