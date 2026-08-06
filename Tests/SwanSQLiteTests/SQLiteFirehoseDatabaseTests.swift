@@ -54,6 +54,27 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     }
   }
 
+  private func deletedAccountItem(
+    sourceKey: String,
+    did: String? = nil
+  ) -> FirehoseAppendItem {
+    let accountDID = did ?? self.did
+    let material = PublicFirehoseAccountMaterial(
+      did: accountDID,
+      active: false,
+      status: .deleted,
+      time: time
+    )
+    return FirehoseAppendItem(
+      sourceKey: sourceKey,
+      batchID: nil,
+      did: accountDID,
+      kind: .account
+    ) { seq in
+      try FirehoseFrameEncoder.accountFrame(seq: seq, material: material)
+    }
+  }
+
   private func expectThrows<T>(
     _ expression: @autoclosure () async throws -> T,
     _ check: (SQLiteFirehoseDatabaseError) -> Bool,
@@ -619,5 +640,147 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     XCTAssertFalse(result.didAdvanceRetention)
     let retained = try await firehose.retainedFromSeq()
     XCTAssertNil(retained, "a no-op prune must not arm the retained window")
+  }
+
+  // MARK: - Deletion markers
+
+  func testDeletingPriorEventsRemovesOnlyThatDIDsEarlierRows() async throws {
+    let otherDID = "did:plc:yyyyyyyyyyyyyyyyyyyyyyyy"
+    _ = try await firehose.appendBatch(
+      [
+        identityItem(sourceKey: "k1", batchID: "history"),
+        identityItem(sourceKey: "k2", batchID: "history"),
+      ],
+      now: epoch
+    )
+    _ = try await firehose.appendBatch(
+      [identityItem(sourceKey: "k3", did: otherDID)],
+      now: epoch
+    )
+
+    let seqs = try await firehose.appendBatch(
+      [deletedAccountItem(sourceKey: "delete-1")],
+      now: epoch,
+      deletingPriorEvents: [FirehoseDeletionMarker(did: did, sourceKey: "delete-1")]
+    )
+    XCTAssertEqual(seqs, [4])
+
+    let stored = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(stored.map(\.seq), [3, 4])
+    XCTAssertEqual(stored.map(\.did), [otherDID, did])
+    XCTAssertEqual(stored.last?.kind, .account)
+    let maxSeq = try await firehose.maxSequencedSeq()
+    XCTAssertEqual(maxSeq, 4, "sequence gaps left by per-DID deletion are permitted")
+  }
+
+  func testDeletingPriorEventsNeverAdvancesRetainedFromSeq() async throws {
+    _ = try await firehose.appendBatch(
+      [identityItem(sourceKey: "k1")],
+      now: epoch
+    )
+    _ = try await firehose.appendBatch(
+      [deletedAccountItem(sourceKey: "delete-1")],
+      now: epoch,
+      deletingPriorEvents: [FirehoseDeletionMarker(did: did, sourceKey: "delete-1")]
+    )
+    let retained = try await firehose.retainedFromSeq()
+    XCTAssertNil(
+      retained,
+      "per-DID deletion is not a global retention boundary and must not arm retained_from_seq"
+    )
+  }
+
+  func testDeletingPriorEventsAppliesIdenticallyOnExactReplay() async throws {
+    _ = try await firehose.appendBatch(
+      [identityItem(sourceKey: "k1")],
+      now: epoch
+    )
+    let item = deletedAccountItem(sourceKey: "delete-1")
+    let marker = [FirehoseDeletionMarker(did: did, sourceKey: "delete-1")]
+    let first = try await firehose.appendBatch(
+      [item],
+      now: epoch,
+      deletingPriorEvents: marker
+    )
+    XCTAssertEqual(first, [2])
+    let afterFirst = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(afterFirst.map(\.seq), [2])
+
+    let replayed = try await firehose.appendBatch(
+      [item],
+      now: epoch,
+      deletingPriorEvents: marker
+    )
+    XCTAssertEqual(
+      replayed,
+      first,
+      "exact source replay must not allocate a new sequence or duplicate the delete"
+    )
+    let stored = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(stored.map(\.seq), [2])
+  }
+
+  func testDeletionMarkerRejectsEmptyDIDOrSourceKey() async throws {
+    await expectThrows(
+      try await firehose.appendBatch(
+        [deletedAccountItem(sourceKey: "delete-1")],
+        now: epoch,
+        deletingPriorEvents: [FirehoseDeletionMarker(did: "", sourceKey: "delete-1")]
+      ),
+      { if case .invalidRequest = $0 { return true }; return false }
+    )
+    await expectThrows(
+      try await firehose.appendBatch(
+        [deletedAccountItem(sourceKey: "delete-1")],
+        now: epoch,
+        deletingPriorEvents: [FirehoseDeletionMarker(did: did, sourceKey: "")]
+      ),
+      { if case .invalidRequest = $0 { return true }; return false }
+    )
+  }
+
+  func testDeletionMarkerRejectsDuplicateMarkerSourceKeys() async throws {
+    await expectThrows(
+      try await firehose.appendBatch(
+        [deletedAccountItem(sourceKey: "delete-1")],
+        now: epoch,
+        deletingPriorEvents: [
+          FirehoseDeletionMarker(did: did, sourceKey: "delete-1"),
+          FirehoseDeletionMarker(did: did, sourceKey: "delete-1"),
+        ]
+      ),
+      { if case .invalidRequest = $0 { return true }; return false }
+    )
+  }
+
+  func testDeletionMarkerRejectsSourceKeyNotInBatch() async throws {
+    await expectThrows(
+      try await firehose.appendBatch(
+        [deletedAccountItem(sourceKey: "delete-1")],
+        now: epoch,
+        deletingPriorEvents: [FirehoseDeletionMarker(did: did, sourceKey: "not-in-batch")]
+      ),
+      { if case .invalidRequest = $0 { return true }; return false }
+    )
+  }
+
+  func testDeletionMarkerRejectsNonAccountItemAndMismatchedDID() async throws {
+    await expectThrows(
+      try await firehose.appendBatch(
+        [identityItem(sourceKey: "k1")],
+        now: epoch,
+        deletingPriorEvents: [FirehoseDeletionMarker(did: did, sourceKey: "k1")]
+      ),
+      { if case .invalidRequest = $0 { return true }; return false }
+    )
+    let otherDID = "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz"
+    await expectThrows(
+      try await firehose.appendBatch(
+        [deletedAccountItem(sourceKey: "delete-1")],
+        now: epoch,
+        deletingPriorEvents: [FirehoseDeletionMarker(did: otherDID, sourceKey: "delete-1")]
+      ),
+      { if case .invalidRequest = $0 { return true }; return false }
+    )
   }
 }

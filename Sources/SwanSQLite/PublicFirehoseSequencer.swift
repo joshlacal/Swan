@@ -227,7 +227,24 @@ public actor PublicFirehoseSequencer {
             try Self.encodeLifecycleFrame(item: item, seq: seq)
           }
         }
-        let seqs = try await firehose.appendBatch(items, now: now)
+        // A decoded `deleted` `#account` item marks its own DID's earlier
+        // retained history for deletion in the same global transaction as
+        // this append, so the public deletion event and the prior-row prune
+        // commit or roll back together.
+        let deletionMarkers = try batch.items.compactMap { item -> FirehoseDeletionMarker? in
+          guard item.kind == .account else { return nil }
+          let material = try JSONDecoder().decode(
+            PublicFirehoseAccountMaterial.self,
+            from: item.payload
+          )
+          guard !material.active, material.status == .deleted else { return nil }
+          return FirehoseDeletionMarker(did: batch.did, sourceKey: item.sourceKey)
+        }
+        let seqs = try await firehose.appendBatch(
+          items,
+          now: now,
+          deletingPriorEvents: deletionMarkers
+        )
         try await testCrashHook?(
           PublicFirehoseSequencerCrashContext(
             accountLease: nil,

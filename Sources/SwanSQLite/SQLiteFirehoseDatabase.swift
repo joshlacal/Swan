@@ -25,6 +25,20 @@ public struct FirehoseAppendItem: Sendable {
   }
 }
 
+/// Marks the source key of a decoded `deleted` `#account` lifecycle item so
+/// its append can atomically prune that DID's earlier retained history in
+/// the same global transaction. The marker's source key must match exactly
+/// one `.account` item in the batch it accompanies.
+public struct FirehoseDeletionMarker: Sendable, Equatable {
+  public let did: String
+  public let sourceKey: String
+
+  public init(did: String, sourceKey: String) {
+    self.did = did
+    self.sourceKey = sourceKey
+  }
+}
+
 public struct FirehoseStoredEvent: Sendable, Equatable {
   public let seq: Int64
   public let sourceKey: String
@@ -125,9 +139,19 @@ public actor SQLiteFirehoseDatabase {
   /// inserts all rows in one transaction. Exact source-key replay re-encodes
   /// at the stored sequence and returns the original sequences without new
   /// rows; any content difference is corruption.
+  ///
+  /// `deletingPriorEvents` marks decoded `deleted` `#account` items so their
+  /// DID's earlier retained history is pruned in the same transaction as the
+  /// append: the deletion commits or rolls back atomically with the public
+  /// event that announces it. Each marker's source key must match exactly
+  /// one `.account` item in `items`; the delete never touches the row the
+  /// marker's own item occupies, and it applies on exact replay too, so a
+  /// crash between the first commit and lifecycle completion cannot leave
+  /// prior rows behind.
   public func appendBatch(
     _ items: [FirehoseAppendItem],
-    now: Date
+    now: Date,
+    deletingPriorEvents: [FirehoseDeletionMarker] = []
   ) async throws -> [Int64] {
     try checkOpen()
     guard !items.isEmpty else {
@@ -151,6 +175,8 @@ public actor SQLiteFirehoseDatabase {
       )
     }
     var seen = Set<String>()
+    var itemsBySourceKey: [String: FirehoseAppendItem] = [:]
+    itemsBySourceKey.reserveCapacity(items.count)
     for item in items {
       guard !item.sourceKey.isEmpty, !item.did.isEmpty else {
         throw SQLiteFirehoseDatabaseError.invalidRequest(
@@ -160,6 +186,30 @@ public actor SQLiteFirehoseDatabase {
       guard seen.insert(item.sourceKey).inserted else {
         throw SQLiteFirehoseDatabaseError.invalidRequest(
           "duplicate source key in one append request"
+        )
+      }
+      itemsBySourceKey[item.sourceKey] = item
+    }
+    var seenMarkerKeys = Set<String>()
+    for marker in deletingPriorEvents {
+      guard !marker.did.isEmpty, !marker.sourceKey.isEmpty else {
+        throw SQLiteFirehoseDatabaseError.invalidRequest(
+          "deletion markers require nonempty DIDs and source keys"
+        )
+      }
+      guard seenMarkerKeys.insert(marker.sourceKey).inserted else {
+        throw SQLiteFirehoseDatabaseError.invalidRequest(
+          "duplicate deletion marker source key"
+        )
+      }
+      guard let matched = itemsBySourceKey[marker.sourceKey] else {
+        throw SQLiteFirehoseDatabaseError.invalidRequest(
+          "deletion marker source key does not match any item in this batch"
+        )
+      }
+      guard matched.kind == .account, matched.did == marker.did else {
+        throw SQLiteFirehoseDatabaseError.invalidRequest(
+          "deletion marker must match exactly one account item for the same DID"
         )
       }
     }
@@ -178,11 +228,18 @@ public actor SQLiteFirehoseDatabase {
           items.map { .text($0.sourceKey) }
         )
         if !existing.isEmpty {
-          return try await replayExisting(
+          let seqs = try await replayExisting(
             items: items,
             existing: existing,
             batchID: batchIDs.first
           )
+          try await deletePriorEvents(
+            deletingPriorEvents,
+            seqBySourceKey: Dictionary(
+              uniqueKeysWithValues: zip(items.map(\.sourceKey), seqs)
+            )
+          )
+          return seqs
         }
 
         let metaRows = try await connection.query(
@@ -264,8 +321,36 @@ public actor SQLiteFirehoseDatabase {
             ]
           )
         }
-        return (0 ..< count).map { start + Int64($0) }
+        let seqs = (0 ..< count).map { start + Int64($0) }
+        try await deletePriorEvents(
+          deletingPriorEvents,
+          seqBySourceKey: Dictionary(
+            uniqueKeysWithValues: zip(items.map(\.sourceKey), seqs)
+          )
+        )
+        return seqs
       }
+    }
+  }
+
+  /// Deletes each marker's DID's rows with `seq` strictly less than the
+  /// marker's own allocated sequence, permitting sequence gaps in the
+  /// remaining log. Never advances `retained_from_seq`: this is a per-DID
+  /// deletion, not a global retention boundary.
+  private func deletePriorEvents(
+    _ markers: [FirehoseDeletionMarker],
+    seqBySourceKey: [String: Int64]
+  ) async throws {
+    for marker in markers {
+      guard let seq = seqBySourceKey[marker.sourceKey] else {
+        throw SQLiteFirehoseDatabaseError.corruptDatabase(
+          "deletion marker sequence was not allocated"
+        )
+      }
+      _ = try await connection.query(
+        "DELETE FROM firehose_events WHERE did = ? AND seq < ?",
+        [.text(marker.did), .integer(Int(seq))]
+      )
     }
   }
 

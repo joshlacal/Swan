@@ -181,6 +181,22 @@ final class PublicFirehoseSequencerTests: XCTestCase {
     )
   }
 
+  private func deletedAccountItem(did: String, operationID: String) -> LifecycleEventItem {
+    LifecycleEventItem(
+      sourceKey: PublicFirehoseSourceKey.account(did: did, operationID: operationID),
+      kind: .account,
+      payload: try! Self.payloadEncoder.encode(
+        PublicFirehoseAccountMaterial(
+          did: did,
+          active: false,
+          status: .deleted,
+          time: time
+        )
+      ),
+      carBytes: nil
+    )
+  }
+
   func testOrdinaryGenerationZeroCommitFlowsToGlobalSequenceOne() async throws {
     let sequencer = try makeSequencer()
     let sourceKey = try await enqueueCommit(
@@ -519,5 +535,97 @@ final class PublicFirehoseSequencerTests: XCTestCase {
     XCTAssertEqual(steps, 3)
     let events = try await firehose.events(after: 0, limit: 10)
     XCTAssertEqual(events.count, 4)
+  }
+
+  func testDeletedAccountEventAndPriorDIDPruningShareOneGlobalAppend() async throws {
+    let sequencer = try makeSequencer()
+    _ = try await enqueueCommit(database: accountA, did: didA, generation: 0, seed: 0x01)
+    _ = try await enqueueCommit(database: accountA, did: didA, generation: 0, seed: 0x02)
+    _ = try await enqueueCommit(database: accountB, did: didB, generation: 0, seed: 0x03)
+    _ = try await control.enqueueLifecycleEventBatch(
+      did: didA,
+      operationID: "delete-1",
+      items: [deletedAccountItem(did: didA, operationID: "delete-1")],
+      now: epoch
+    )
+
+    let steps = try await sequencer.drainAll(now: epoch)
+    XCTAssertEqual(steps, 4)
+    let events = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(events.map(\.seq), [2, 4])
+    XCTAssertEqual(events.map(\.did), [didB, didA])
+    XCTAssertEqual(events.last?.kind, .account)
+    let maxSeq = try await firehose.maxSequencedSeq()
+    XCTAssertEqual(maxSeq, 4)
+    let pendingBatch = try await control.nextPendingLifecycleBatch(did: didA)
+    XCTAssertNil(pendingBatch)
+    let pendingAccountRows = try await accountA.pendingPublicFirehoseOutbox()
+    XCTAssertEqual(
+      pendingAccountRows,
+      [],
+      "the account-local source is completed after the global transaction"
+    )
+  }
+
+  func testDeletedAccountCrashReplayKeepsDeletionAtomic() async throws {
+    let sequencer = try makeSequencer()
+    let oldMaterial = PublicFirehoseIdentityMaterial(
+      did: didA,
+      handle: "alice.test",
+      time: time
+    )
+    _ = try await firehose.appendBatch(
+      [
+        FirehoseAppendItem(
+          sourceKey: "pre-delete-1",
+          batchID: "pre-delete-history",
+          did: didA,
+          kind: .identity
+        ) { seq in
+          try FirehoseFrameEncoder.identityFrame(seq: seq, material: oldMaterial)
+        },
+        FirehoseAppendItem(
+          sourceKey: "pre-delete-2",
+          batchID: "pre-delete-history",
+          did: didA,
+          kind: .identity
+        ) { seq in
+          try FirehoseFrameEncoder.identityFrame(seq: seq, material: oldMaterial)
+        },
+      ],
+      now: epoch
+    )
+    _ = try await control.enqueueLifecycleEventBatch(
+      did: didA,
+      operationID: "delete-crash",
+      items: [deletedAccountItem(did: didA, operationID: "delete-crash")],
+      now: epoch
+    )
+
+    let thrower = FirstCallThrower()
+    await sequencer.setTestCrashHook { context in
+      guard context.batchID != nil, await thrower.shouldThrow() else { return }
+      throw SequencerInjectedFailure.expected
+    }
+    do {
+      _ = try await sequencer.sequenceNext(now: epoch)
+      XCTFail("expected injected failure after the deletion transaction")
+    } catch SequencerInjectedFailure.expected {}
+
+    let afterCrash = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(afterCrash.map(\.seq), [3])
+    XCTAssertEqual(afterCrash.first?.kind, .account)
+    let pendingAfterCrash = try await control.nextPendingLifecycleBatch(did: didA)
+    XCTAssertNotNil(pendingAfterCrash)
+
+    let retry = try await sequencer.sequenceNext(now: epoch.addingTimeInterval(1))
+    guard case let .sequencedLifecycleBatch(_, seqs) = retry else {
+      return XCTFail("expected the exact deletion batch replay")
+    }
+    XCTAssertEqual(seqs, [3])
+    let afterRetry = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(afterRetry.map(\.seq), [3])
+    let pendingAfterRetry = try await control.nextPendingLifecycleBatch(did: didA)
+    XCTAssertNil(pendingAfterRetry)
   }
 }
