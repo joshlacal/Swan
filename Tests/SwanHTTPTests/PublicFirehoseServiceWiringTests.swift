@@ -315,6 +315,51 @@ final class PublicFirehoseServiceWiringTests: XCTestCase, @unchecked Sendable {
     }
   }
 
+  func testRetentionServicePrunesImmediatelyAndSignalsSubscribers() async throws {
+    let root = FileManager.default.temporaryDirectory
+      .appending(path: "swan-firehose-retention-service-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(
+      at: root,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
+    defer { Task { try? await firehose.close() } }
+    let hub = PublicFirehoseWakeupHub()
+    let stream = await hub.subscribe()
+    var iterator = stream.makeAsyncIterator()
+    _ = try await firehose.appendBatch(
+      [FirehoseAppendItem(
+        sourceKey: "retention-service",
+        batchID: nil,
+        did: "did:plc:retentionservice000000000",
+        kind: .identity
+      ) { _ in Data([0x01]) }],
+      now: Date(timeIntervalSince1970: 1_700_000_000)
+    )
+
+    let service = try SwanPublicFirehoseRetentionService(
+      database: firehose,
+      hub: hub,
+      policy: try PublicFirehoseRetentionPolicy(
+        maximumAge: .seconds(1),
+        maximumRows: 100,
+        maximumBytes: 5_000_000
+      ),
+      interval: .seconds(60),
+      logger: Logger(label: "retention-service-test")
+    )
+    let task = Task { try await service.run() }
+    defer { task.cancel() }
+
+    let wakeup = await iterator.next()
+    XCTAssertEqual(wakeup, 1)
+    let retained = try await firehose.retainedFromSeq()
+    XCTAssertEqual(retained, 1)
+  }
+
   // MARK: - WebSocket client helpers (mirroring PublicFirehoseStreamingHTTPTests)
 
   private actor WSFrameRecorder {

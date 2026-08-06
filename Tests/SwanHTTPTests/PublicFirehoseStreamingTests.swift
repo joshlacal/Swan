@@ -403,4 +403,22 @@ final class PublicFirehoseStreamingTests: XCTestCase {
     let next = await firstIterator.next()
     XCTAssertEqual(next, 4)
   }
+
+  func testWakeupHubRetentionSignalIsNotSuppressedByAppendCoalescing() async throws {
+    let hub = PublicFirehoseWakeupHub()
+    let stream = await hub.subscribe()
+    var iterator = stream.makeAsyncIterator()
+
+    await hub.firehoseDidAppend(maxSeq: 4)
+    let first = await iterator.next()
+    XCTAssertEqual(first, 4)
+
+    await hub.firehoseRetentionDidAdvance(maxSeq: 4)
+    let retention = await iterator.next()
+    XCTAssertEqual(
+      retention,
+      4,
+      "retention changes must wake a tailer even when no new sequence exists"
+    )
+  }
 }

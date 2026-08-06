@@ -1528,6 +1528,30 @@ extension SwanCommand {
         )
         var enablePublicFirehose = false
 
+        @Option(
+            name: .customLong("public-firehose-retention-age-hours"),
+            help: "Maximum retained firehose age in hours (default: 72)"
+        )
+        var publicFirehoseRetentionAgeHours: Int64 = 72
+
+        @Option(
+            name: .customLong("public-firehose-retention-max-rows"),
+            help: "Maximum retained firehose rows (default: 1000000)"
+        )
+        var publicFirehoseRetentionMaxRows: Int64 = 1_000_000
+
+        @Option(
+            name: .customLong("public-firehose-retention-max-bytes"),
+            help: "Maximum retained firehose frame bytes (default: 1073741824)"
+        )
+        var publicFirehoseRetentionMaxBytes: Int64 = 1_073_741_824
+
+        @Option(
+            name: .customLong("public-firehose-retention-interval-seconds"),
+            help: "Retention pruning interval in seconds (default: 60)"
+        )
+        var publicFirehoseRetentionIntervalSeconds: Int64 = 60
+
         @Option(name: .customLong("notification-account-kek-file"), help: "Owner-only mounted account-KEK file for notification signing; SWAN_ACCOUNT_KEK is the alternative")
         var notificationAccountKEKFile: String?
 
@@ -2172,6 +2196,7 @@ extension SwanCommand {
                     emailRecoveryService = nil
                 }
                 let publicFirehoseService: SwanPublicFirehoseSequencerService?
+                let publicFirehoseRetentionService: SwanPublicFirehoseRetentionService?
                 var publicFirehoseStreamingRuntime: SwanPublicFirehoseStreamingRuntime?
                 if enablePublicFirehose {
                     do {
@@ -2195,13 +2220,57 @@ extension SwanCommand {
                             logger: logger
                         )
                         preopenedFirehoseDatabase = firehoseDatabase
+
+                        let (retentionAgeSeconds, retentionAgeOverflowed) =
+                            publicFirehoseRetentionAgeHours.multipliedReportingOverflow(by: 3_600)
+                        guard !retentionAgeOverflowed else {
+                            throw ValidationError(
+                                "--public-firehose-retention-age-hours is too large"
+                            )
+                        }
+                        let retentionPolicy: PublicFirehoseRetentionPolicy
+                        do {
+                            retentionPolicy = try PublicFirehoseRetentionPolicy(
+                                maximumAge: .seconds(retentionAgeSeconds),
+                                maximumRows: publicFirehoseRetentionMaxRows,
+                                maximumBytes: publicFirehoseRetentionMaxBytes
+                            )
+                        } catch {
+                            throw ValidationError(
+                                "--public-firehose-retention-age-hours, --public-firehose-retention-max-rows, or --public-firehose-retention-max-bytes is invalid"
+                            )
+                        }
+                        do {
+                            publicFirehoseRetentionService = try SwanPublicFirehoseRetentionService(
+                                database: firehoseDatabase,
+                                hub: wakeupHub,
+                                policy: retentionPolicy,
+                                interval: .seconds(publicFirehoseRetentionIntervalSeconds),
+                                logger: logger
+                            )
+                        } catch {
+                            throw ValidationError(
+                                "--public-firehose-retention-interval-seconds must be positive"
+                            )
+                        }
+                    } catch let error as ValidationError {
+                        throw error
                     } catch {
                         throw ValidationError(
                             "durable public firehose database is unavailable"
                         )
                     }
                 } else {
+                    guard publicFirehoseRetentionAgeHours == 72,
+                          publicFirehoseRetentionMaxRows == 1_000_000,
+                          publicFirehoseRetentionMaxBytes == 1_073_741_824,
+                          publicFirehoseRetentionIntervalSeconds == 60 else {
+                        throw ValidationError(
+                            "public firehose retention options require --enable-public-firehose"
+                        )
+                    }
                     publicFirehoseService = nil
+                    publicFirehoseRetentionService = nil
                     publicFirehoseStreamingRuntime = nil
                 }
                 let managementKeyStore: FileAccountKeyStore?
@@ -2364,6 +2433,10 @@ extension SwanCommand {
                 if let publicFirehoseService {
                     services.append(publicFirehoseService)
                     logger.info("durable public firehose sequencing enabled")
+                }
+                if let publicFirehoseRetentionService {
+                    services.append(publicFirehoseRetentionService)
+                    logger.info("durable public firehose retention pruning enabled")
                 }
                 if let managementApplication {
                     services.append(managementApplication)

@@ -30,6 +30,18 @@ public actor PublicFirehoseWakeupHub: PublicFirehoseWakeupSink {
     }
   }
 
+  /// Records a retention advance and resumes every subscriber with the
+  /// retained-cursor high-water mark. Unlike ``firehoseDidAppend(maxSeq:)``,
+  /// this never compares against or updates `latestMaxSeq`: a prune can
+  /// change what is retained while the sequence high-water mark stays the
+  /// same, so append coalescing must never suppress a retention wakeup.
+  public func firehoseRetentionDidAdvance(maxSeq: Int64) {
+    guard maxSeq >= 0 else { return }
+    for continuation in subscribers.values {
+      continuation.yield(maxSeq)
+    }
+  }
+
   /// Returns a per-subscriber stream of append bumps. Each subscriber owns
   /// its continuation; cancellation or deallocation removes it from the hub.
   public func subscribe() -> AsyncStream<Int64> {
