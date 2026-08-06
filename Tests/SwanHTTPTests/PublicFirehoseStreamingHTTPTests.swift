@@ -1184,24 +1184,32 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
   /// `.seconds(30)`, which this test overrides to `.milliseconds(50)`).
   func testPublicFirehoseAutoPingClosesAClientThatDoesNotPong() async throws {
     let fixture = try await makeFixture()
-    defer { Task { try? await fixture.firehose.close(); try? await fixture.control.close() } }
-    let app = fixture.server.buildApplication(
-      logger: logger,
-      webSocketAutoPingInterval: .milliseconds(50)
-    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let app = fixture.server.buildApplication(
+        logger: logger,
+        webSocketAutoPingInterval: .milliseconds(50)
+      )
 
-    try await app.test(.live) { client in
-      let closeFrame = try await self.awaitWithDeadline(timeout: .seconds(2)) {
-        try await client.ws(
-          self.subscribePath,
-          configuration: .init(maxFrameSize: 5_000_000),
-          logger: self.logger
-        ) { _, _, _ in
-          try await Task.sleep(for: .milliseconds(250))
+      try await app.test(.live) { client in
+        let closeFrame = try await self.awaitWithDeadline(timeout: .seconds(2)) {
+          try await client.ws(
+            self.subscribePath,
+            configuration: .init(maxFrameSize: 5_000_000),
+            logger: self.logger
+          ) { _, _, _ in
+            try await Task.sleep(for: .milliseconds(250))
+          }
         }
+        XCTAssertEqual(closeFrame?.closeCode, .goingAway)
+        XCTAssertEqual(closeFrame?.reason, "Ping timeout")
       }
-      XCTAssertEqual(closeFrame?.closeCode, .goingAway)
-      XCTAssertEqual(closeFrame?.reason, "Ping timeout")
+      try await fixture.control.close()
+      try await fixture.firehose.close()
+    } catch {
+      try? await fixture.control.close()
+      try? await fixture.firehose.close()
+      throw error
     }
   }
 
@@ -1224,33 +1232,41 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
   /// reach `TestClientProtocol`'s `.ws(...)` helper.
   func testPublicFirehoseGracefulShutdownSendsNormalCloseFrame() async throws {
     let fixture = try await makeFixture(port: 0)
-    defer { Task { try? await fixture.firehose.close(); try? await fixture.control.close() } }
-    let portBox = PortBox()
-    let application = fixture.server.buildApplication(
-      logger: logger,
-      onServerRunning: { channel in
-        await portBox.set(channel.localAddress?.port)
-      }
-    )
-    let serviceGroup = SwanHTTPServiceLifecycle.makeServiceGroup(
-      services: [application],
-      logger: logger
-    )
-    let serviceTask = Task { try await serviceGroup.run() }
-    let port = try await portBox.wait()
-    let client = RawTestClient(port: port)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let portBox = PortBox()
+      let application = fixture.server.buildApplication(
+        logger: logger,
+        onServerRunning: { channel in
+          await portBox.set(channel.localAddress?.port)
+        }
+      )
+      let serviceGroup = SwanHTTPServiceLifecycle.makeServiceGroup(
+        services: [application],
+        logger: logger
+      )
+      let serviceTask = Task { try await serviceGroup.run() }
+      let port = try await portBox.wait()
+      let client = RawTestClient(port: port)
 
-    let wsTask = Task {
-      try await client.ws(self.subscribePath) { inbound, _, _ in
-        for try await _ in inbound {}
+      let wsTask = Task {
+        try await client.ws(self.subscribePath) { inbound, _, _ in
+          for try await _ in inbound {}
+        }
       }
+      try await waitUntil { await fixture.hub.subscriberCount() == 1 }
+      await serviceGroup.triggerGracefulShutdown()
+
+      let closeFrame = try await awaitWithDeadline { try await wsTask.value }
+      XCTAssertEqual(closeFrame?.closeCode, .normalClosure)
+      _ = try await serviceTask.value
+      try await fixture.control.close()
+      try await fixture.firehose.close()
+    } catch {
+      try? await fixture.control.close()
+      try? await fixture.firehose.close()
+      throw error
     }
-    try await waitUntil { await fixture.hub.subscriberCount() == 1 }
-    await serviceGroup.triggerGracefulShutdown()
-
-    let closeFrame = try await awaitWithDeadline { try await wsTask.value }
-    XCTAssertEqual(closeFrame?.closeCode, .normalClosure)
-    _ = try await serviceTask.value
   }
 
   // MARK: - Configuration
