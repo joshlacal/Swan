@@ -136,6 +136,50 @@ struct SwanPublicWireTests {
     }
 
     @Test
+    func testPublicDataTesting20260806IncludesSubscribeReposSubscription() throws {
+        // The 2026-08-06 successor profile carries the same 19-method wire
+        // contract as 2026-08-05: no lexicon or generated source changed, so
+        // this reuses `PublicDataTesting20260805.methods` rather than adding a
+        // new descriptor to `SwanPublicWire.swift`. That file's bytes are
+        // pinned by `public-data-testing-2026-08-06.generated-wire.sha256`
+        // (copied byte-for-byte from the 2026-08-05 manifest per the frozen
+        // profile pin), so a new declaration there would invalidate the
+        // checked-in profile's generated-wire source verification.
+        let methods = PublicDataTesting20260805.methods
+        #expect(methods.count == 19)
+        #expect(Set(methods.map(\.nsid)).count == methods.count)
+
+        let subscribeRepos = methods.last
+        #expect(subscribeRepos?.nsid == "com.atproto.sync.subscribeRepos")
+        #expect(subscribeRepos?.kind == .subscription)
+        #expect(subscribeRepos?.inputEncoding == nil)
+        #expect(subscribeRepos?.outputEncoding == nil)
+        #expect(subscribeRepos?.declaredErrors == ["FutureCursor", "ConsumerTooSlow"])
+
+        struct Profile: Decodable {
+            let id: String
+            let lexicons: [String]
+            let endpoints: [String]
+        }
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let profile = try JSONDecoder().decode(
+            Profile.self,
+            from: Data(contentsOf: root.appending(path: "Profiles/public-data-testing-2026-08-06.json"))
+        )
+
+        #expect(profile.id == "public-data-testing-2026-08-06")
+        #expect(profile.lexicons.count == 21)
+        #expect(Set(profile.lexicons).count == 21)
+        #expect(profile.lexicons.last == "com.atproto.sync.subscribeRepos")
+        #expect(profile.endpoints == methods.map(\.nsid))
+        #expect(profile.endpoints.count == 19)
+        #expect(Set(profile.endpoints).count == 19)
+    }
+
+    @Test
     func successorProfileAddsExactAccountEmailMethodDescriptors() {
         let accountEmailMethods = Array(PublicDataTesting20260730.methods[8...13])
         #expect(accountEmailMethods == [

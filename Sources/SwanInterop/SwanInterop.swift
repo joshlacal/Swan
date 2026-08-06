@@ -65,7 +65,7 @@ public struct ProtocolProfileVerificationReport: Sendable, Equatable {
 /// regeneration happens in CI.
 public enum OfflineProtocolProfileVerifier {
     public static let stableProfileID = "permissioned-data-0016-2026-07-30"
-    public static let publicProfileID = "public-data-testing-2026-08-05"
+    public static let publicProfileID = "public-data-testing-2026-08-06"
 
     private struct ProfileIdentity: Decodable {
         let id: String
@@ -139,7 +139,7 @@ public enum OfflineProtocolProfileVerifier {
     private static let expectedPetrelManifestSHA256 = "ac3c8b006e0e771f6e3cb0b5cbe6e93a78101dc49ce95ea9b3e1ed734a97636f"
     private static let expectedLexiconManifestSHA256 = "9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f"
     private static let expectedGeneratedWireManifestSHA256 = "80f9f7b93127826d95d516a4a9d18b7ca245d82fc74f8fa484bbf3423d1f51db"
-    private static let expectedPublicProfileSHA256 = "98bb8609b6dc2dfde2db34fb4f6ee1f56d18dab584fa7987b3d259f151f96121"
+    private static let expectedPublicProfileSHA256 = "b96ac7c7fa3df3a0bb5b396c25f776734493d7b0a09a71e1e082e24813b64124"
     private static let expectedPublicPetrelManifestSHA256 = "cb39d0c4264d02540b67adbe668a1224753b507e35e11f19ba97879931804068"
     private static let expectedPublicLexiconManifestSHA256 = "2f14fbc29b2c3414baca5e659fb8dbe85f6b5a5252e13ff677b5b19d4309374d"
     private static let expectedPublicGeneratedWireManifestSHA256 = "80a03ee8bcaed70008b74556add80108f5cf64d96932b21df60e2d18e247dcc7"
@@ -691,7 +691,7 @@ public enum OfflineProtocolProfileVerifier {
             pins.inventorySemantics == expectedPublicInventorySemantics &&
             pins.lexicons == expectedPublicLexicons &&
             pins.endpoints == expectedPublicEndpoints &&
-            pins.intentionalDivergences.count == 3 &&
+            pins.intentionalDivergences.count == 2 &&
             pins.intentionalDivergences[0].endpoint == "com.atproto.sync.getRepo" &&
             pins.intentionalDivergences[0].referenceBehavior ==
                 "Accepts an optional since revision for an incremental repository CAR." &&
@@ -699,9 +699,7 @@ public enum OfflineProtocolProfileVerifier {
                 "Rejects a nonempty since until retained-history incremental CARs are implemented; it never returns a full CAR while claiming to honor since." &&
             pins.intentionalDivergences[1].endpoint == "com.atproto.sync.subscribeRepos" &&
             pins.intentionalDivergences[1].referenceBehavior ==
-                "Parses the cursor query parameter tolerantly." &&
-            pins.intentionalDivergences[2].endpoint == "com.atproto.sync.subscribeRepos" &&
-            pins.intentionalDivergences[2].swanBehavior.contains("dormant")
+                "Parses the cursor query parameter tolerantly."
     }
 }
 

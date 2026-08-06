@@ -7,11 +7,34 @@ final class PublicProtocolProfileVerifierTests: XCTestCase {
     func testCheckedInPublicProfileIsValid() throws {
         let root = packageRoot()
         let report = OfflineProtocolProfileVerifier.verify(
-            profileURL: root.appending(path: "Profiles/public-data-testing-2026-08-05.json"),
+            profileURL: root.appending(path: "Profiles/public-data-testing-2026-08-06.json"),
             sourceRoot: root
         )
         XCTAssertEqual(report.profileID, OfflineProtocolProfileVerifier.publicProfileID)
         XCTAssertTrue(report.isValid, "\(report.diagnostics)")
+    }
+
+    func testFrozen20260805ProfileRemainsByteExactButIsNoLongerSelected() throws {
+        let root = packageRoot()
+        let artifacts = [
+            ("public-data-testing-2026-08-05.json", "98bb8609b6dc2dfde2db34fb4f6ee1f56d18dab584fa7987b3d259f151f96121"),
+            ("public-data-testing-2026-08-05.lexicons.sha256", "2f14fbc29b2c3414baca5e659fb8dbe85f6b5a5252e13ff677b5b19d4309374d"),
+            ("public-data-testing-2026-08-05.generated-wire.sha256", "80a03ee8bcaed70008b74556add80108f5cf64d96932b21df60e2d18e247dcc7"),
+        ]
+        for (name, checksum) in artifacts {
+            let data = try Data(contentsOf: root.appending(path: "Profiles/\(name)"))
+            XCTAssertEqual(SHA256.hash(data: data).hex, checksum)
+        }
+
+        let report = OfflineProtocolProfileVerifier.verify(
+            profileURL: root.appending(path: "Profiles/public-data-testing-2026-08-05.json"),
+            sourceRoot: root
+        )
+        XCTAssertEqual(report.profileID, "public-data-testing-2026-08-05")
+        XCTAssertEqual(
+            report.diagnostics,
+            [.init(.unsupportedProfileID, artifact: "profile")]
+        )
     }
 
     func testLegacyPublicProfileRemainsByteExactButIsNoLongerSelected() throws {
@@ -248,7 +271,7 @@ private struct PublicProfileFixture {
             at: source.appending(path: "Sources/SwanPublicWire"),
             to: root.appending(path: "Sources/SwanPublicWire")
         )
-        profileURL = root.appending(path: "Profiles/public-data-testing-2026-08-05.json")
+        profileURL = root.appending(path: "Profiles/public-data-testing-2026-08-06.json")
     }
 
     func editProfile(_ edit: (inout [String: Any]) -> Void) throws {

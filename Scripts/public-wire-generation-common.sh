@@ -8,16 +8,16 @@ public_wire_die() {
 }
 
 public_wire_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-public_wire_profile="${public_wire_root}/Profiles/public-data-testing-2026-08-05.json"
+public_wire_profile="${public_wire_root}/Profiles/public-data-testing-2026-08-06.json"
 public_wire_petrel_manifest="${public_wire_root}/PublicPetrelManifest.json"
-public_wire_lexicon_manifest="${public_wire_root}/Profiles/public-data-testing-2026-08-05.lexicons.sha256"
-public_wire_generated_manifest="${public_wire_root}/Profiles/public-data-testing-2026-08-05.generated-wire.sha256"
+public_wire_lexicon_manifest="${public_wire_root}/Profiles/public-data-testing-2026-08-06.lexicons.sha256"
+public_wire_generated_manifest="${public_wire_root}/Profiles/public-data-testing-2026-08-06.generated-wire.sha256"
 public_wire_reference_root="${PUBLIC_WIRE_REFERENCE_ROOT:-${public_wire_root}/.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354}"
 public_wire_sha256="${public_wire_root}/Scripts/sha256.sh"
-readonly public_wire_expected_profile_id="public-data-testing-2026-08-05"
+readonly public_wire_expected_profile_id="public-data-testing-2026-08-06"
 readonly public_wire_expected_reference_commit="3f6c96d5d2d25438bd40fa89d6ecc37865f8e354"
 readonly public_wire_expected_generator_commit="c2a1cdbee8c621c7682416114700f032cc7e2b37"
-readonly public_wire_expected_profile_sha256="98bb8609b6dc2dfde2db34fb4f6ee1f56d18dab584fa7987b3d259f151f96121"
+readonly public_wire_expected_profile_sha256="b96ac7c7fa3df3a0bb5b396c25f776734493d7b0a09a71e1e082e24813b64124"
 readonly public_wire_expected_petrel_manifest_sha256="cb39d0c4264d02540b67adbe668a1224753b507e35e11f19ba97879931804068"
 readonly public_wire_expected_lexicon_manifest_sha256="2f14fbc29b2c3414baca5e659fb8dbe85f6b5a5252e13ff677b5b19d4309374d"
 readonly public_wire_expected_generated_manifest_sha256="80a03ee8bcaed70008b74556add80108f5cf64d96932b21df60e2d18e247dcc7"
@@ -27,6 +27,9 @@ readonly public_wire_expected_legacy_generated_manifest_sha256="c68177a315f6a3d6
 readonly public_wire_expected_frozen_profile_sha256="7d1a3046825aec4cd83a03fd43c48f305738172fd9c462822e0833977f9c7cf8"
 readonly public_wire_expected_frozen_lexicon_manifest_sha256="fa89a31b4ac6421ebcacdd6a66de77ff191497f19361d41141f538477638bd75"
 readonly public_wire_expected_frozen_generated_manifest_sha256="4703b4096dbf5dbc83e19d30c15539f426b73ebaca57c26bf82b5774440f2898"
+readonly public_wire_expected_20260805_profile_sha256="98bb8609b6dc2dfde2db34fb4f6ee1f56d18dab584fa7987b3d259f151f96121"
+readonly public_wire_expected_20260805_lexicon_manifest_sha256="2f14fbc29b2c3414baca5e659fb8dbe85f6b5a5252e13ff677b5b19d4309374d"
+readonly public_wire_expected_20260805_generated_manifest_sha256="80a03ee8bcaed70008b74556add80108f5cf64d96932b21df60e2d18e247dcc7"
 
 public_wire_profile_value() {
   python3 - "${public_wire_profile}" "$1" <<'PY'
@@ -54,6 +57,9 @@ Profiles/public-data-testing-2026-07-27.generated-wire.sha256 ${public_wire_expe
 Profiles/public-data-testing-2026-07-30.json ${public_wire_expected_frozen_profile_sha256}
 Profiles/public-data-testing-2026-07-30.lexicons.sha256 ${public_wire_expected_frozen_lexicon_manifest_sha256}
 Profiles/public-data-testing-2026-07-30.generated-wire.sha256 ${public_wire_expected_frozen_generated_manifest_sha256}
+Profiles/public-data-testing-2026-08-05.json ${public_wire_expected_20260805_profile_sha256}
+Profiles/public-data-testing-2026-08-05.lexicons.sha256 ${public_wire_expected_20260805_lexicon_manifest_sha256}
+Profiles/public-data-testing-2026-08-05.generated-wire.sha256 ${public_wire_expected_20260805_generated_manifest_sha256}
 EOF
 }
 

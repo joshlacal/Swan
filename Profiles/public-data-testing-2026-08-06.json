@@ -1,0 +1,70 @@
+{
+  "id": "public-data-testing-2026-08-06",
+  "referenceImplementationCommit": "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
+  "petrelGeneratorCommit": "c2a1cdbee8c621c7682416114700f032cc7e2b37",
+  "petrelCommit": "db84b2c9788aa38000ee3f134e21feffa8f351cd",
+  "referenceArchiveSHA256": "1924ced5c07fb0ae5d8f13f0911bcbd2efc66e9460e463e9d8da10b94e8215ea",
+  "petrelManifest": "PublicPetrelManifest.json",
+  "petrelManifestSHA256": "cb39d0c4264d02540b67adbe668a1224753b507e35e11f19ba97879931804068",
+  "lexiconManifest": "public-data-testing-2026-08-06.lexicons.sha256",
+  "lexiconManifestSHA256": "2f14fbc29b2c3414baca5e659fb8dbe85f6b5a5252e13ff677b5b19d4309374d",
+  "generatedWireManifest": "public-data-testing-2026-08-06.generated-wire.sha256",
+  "generatedWireManifestSHA256": "80a03ee8bcaed70008b74556add80108f5cf64d96932b21df60e2d18e247dcc7",
+  "inventorySemantics": "lexicons is the exact ordered 21-file source set, including the repo and sync defs files; endpoints is the exact ordered 19-method XRPC contract set and excludes defs.",
+  "intentionalDivergences": [
+    {
+      "endpoint": "com.atproto.sync.getRepo",
+      "referenceBehavior": "Accepts an optional since revision for an incremental repository CAR.",
+      "swanBehavior": "Rejects a nonempty since until retained-history incremental CARs are implemented; it never returns a full CAR while claiming to honor since."
+    },
+    {
+      "endpoint": "com.atproto.sync.subscribeRepos",
+      "referenceBehavior": "Parses the cursor query parameter tolerantly.",
+      "swanBehavior": "Rejects malformed cursor values (non-decimal, negative, or greater than 2^53 - 1) at upgrade time; the reference would tolerate and reinterpret them."
+    }
+  ],
+  "lexicons": [
+    "com.atproto.repo.applyWrites",
+    "com.atproto.repo.createRecord",
+    "com.atproto.repo.defs",
+    "com.atproto.repo.deleteRecord",
+    "com.atproto.repo.describeRepo",
+    "com.atproto.repo.getRecord",
+    "com.atproto.repo.listRecords",
+    "com.atproto.repo.putRecord",
+    "com.atproto.repo.uploadBlob",
+    "com.atproto.server.confirmEmail",
+    "com.atproto.server.requestEmailConfirmation",
+    "com.atproto.server.requestEmailUpdate",
+    "com.atproto.server.requestPasswordReset",
+    "com.atproto.server.resetPassword",
+    "com.atproto.server.updateEmail",
+    "com.atproto.sync.defs",
+    "com.atproto.sync.getBlob",
+    "com.atproto.sync.getLatestCommit",
+    "com.atproto.sync.getRepo",
+    "com.atproto.sync.getRepoStatus",
+    "com.atproto.sync.subscribeRepos"
+  ],
+  "endpoints": [
+    "com.atproto.repo.applyWrites",
+    "com.atproto.repo.createRecord",
+    "com.atproto.repo.deleteRecord",
+    "com.atproto.repo.describeRepo",
+    "com.atproto.repo.getRecord",
+    "com.atproto.repo.listRecords",
+    "com.atproto.repo.putRecord",
+    "com.atproto.repo.uploadBlob",
+    "com.atproto.server.confirmEmail",
+    "com.atproto.server.requestEmailConfirmation",
+    "com.atproto.server.requestEmailUpdate",
+    "com.atproto.server.requestPasswordReset",
+    "com.atproto.server.resetPassword",
+    "com.atproto.server.updateEmail",
+    "com.atproto.sync.getBlob",
+    "com.atproto.sync.getLatestCommit",
+    "com.atproto.sync.getRepo",
+    "com.atproto.sync.getRepoStatus",
+    "com.atproto.sync.subscribeRepos"
+  ]
+}
