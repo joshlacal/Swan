@@ -1012,7 +1012,11 @@ public struct SwanHTTPServer: Sendable {
         }
     }
 
-    public func buildApplication(logger: Logger) -> some ApplicationProtocol {
+    public func buildApplication(
+        logger: Logger,
+        onServerRunning: @escaping @Sendable (any Channel) async -> Void = { _ in },
+        webSocketAutoPingInterval: Duration = .seconds(30)
+    ) -> some ApplicationProtocol {
         let applicationConfiguration = ApplicationConfiguration(
             address: .hostname(configuration.host, port: configuration.port),
             serverName: "swan",
@@ -1033,10 +1037,11 @@ public struct SwanHTTPServer: Sendable {
                         )],
                         idleTimeout: .seconds(Int64(configuration.idleTimeoutSeconds))
                     ),
-                    ws: Self.publicFirehoseWebSocketConfiguration()
+                    ws: Self.publicFirehoseWebSocketConfiguration(autoPingInterval: webSocketAutoPingInterval)
                 )
             ),
             configuration: applicationConfiguration,
+            onServerRunning: onServerRunning,
             logger: logger
         )
     }
@@ -1045,13 +1050,16 @@ public struct SwanHTTPServer: Sendable {
     ///
     /// `maxFrameSize` must cover the largest stored firehose frame
     /// (`FirehoseFrameLimits.maximumFrameBytes`); the 16 KiB default would
-    /// fail every real `#commit` with `messageTooLarge`. Auto-ping stays
-    /// disabled (Phase 3 liveness) and close negotiation is bounded so a
-    /// dead peer cannot pin a channel.
-    static func publicFirehoseWebSocketConfiguration() -> WebSocketServerConfiguration {
+    /// fail every real `#commit` with `messageTooLarge`. Auto-ping runs every
+    /// `autoPingInterval` (30 seconds in production) so a peer that never
+    /// answers a ping is closed by Hummingbird's own liveness loop; close
+    /// negotiation is bounded so a dead peer cannot pin a channel.
+    static func publicFirehoseWebSocketConfiguration(
+        autoPingInterval: Duration = .seconds(30)
+    ) -> WebSocketServerConfiguration {
         WebSocketServerConfiguration(
             maxFrameSize: 5_000_000,
-            autoPing: .disabled,
+            autoPing: .enabled(timePeriod: autoPingInterval),
             closeTimeout: .seconds(15),
             validateUTF8: true
         )

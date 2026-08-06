@@ -37,7 +37,8 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
 
   private func makeFixture(
     limits: PublicFirehoseStreamingLimits? = nil,
-    includeRuntime: Bool = true
+    includeRuntime: Bool = true,
+    port: Int = 3_000
   ) async throws -> Fixture {
     let root = FileManager.default.temporaryDirectory
       .appending(path: "swan-firehose-http-\(UUID().uuidString)")
@@ -72,7 +73,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
       }
       let server = SwanHTTPServer(
         profile: profile,
-        configuration: .init(host: "127.0.0.1", port: 3_000),
+        configuration: .init(host: "127.0.0.1", port: port),
         oauthRuntime: oauthRuntime,
         publicFirehoseStreaming: streamingRuntime
       )
@@ -145,6 +146,59 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
 
     func snapshot() -> [WebSocketDataFrame] {
       frames
+    }
+  }
+
+  /// Captures the ephemeral port handed to `onServerRunning` when a fixture
+  /// is built with `port: 0`, so a test running the application inside an
+  /// explicit `ServiceGroup` can dial the real listener.
+  private actor PortBox {
+    enum Error: Swift.Error { case timeout }
+
+    private var value: Int?
+
+    func set(_ value: Int?) {
+      self.value = value
+    }
+
+    func wait() async throws -> Int {
+      let deadline = ContinuousClock.now + .seconds(5)
+      while ContinuousClock.now < deadline {
+        if let value { return value }
+        try await Task.sleep(for: .milliseconds(10))
+      }
+      throw Error.timeout
+    }
+  }
+
+  /// A minimal `TestClientProtocol` conformance carrying only the port
+  /// HummingbirdWSTesting's `.ws(...)` helper actually reads. Hummingbird
+  /// Testing's own `TestClient` does not conform to `TestClientProtocol`
+  /// itself — only the private `Client` wrapper each test framework
+  /// (`.live`, `.router`, `.ahc`) hands to its closure does — so a test that
+  /// must drive its own `ServiceGroup` (and therefore cannot go through
+  /// `app.test(.live)`) needs this same wrapper shape to reach
+  /// `TestClientProtocol`'s `.ws(...)` helper. That helper dials its own
+  /// independent connection via `WebSocketClient.connect(...)`; it never
+  /// touches a wrapped `TestClient`, so this type does not hold one — an
+  /// earlier version held an unused, connected `TestClient` here, which left
+  /// a second, never-closed TCP connection open against the server and
+  /// deadlocked `ServiceGroup` shutdown (the quiescing helper waits for every
+  /// open child channel, including ones the test never exercises). The
+  /// plain-HTTP path is never exercised by the WebSocket-only fixture that
+  /// uses this type.
+  private struct RawTestClient: TestClientProtocol {
+    struct PlainHTTPUnsupported: Error {}
+
+    let port: Int?
+
+    func executeRequest(
+      uri: String,
+      method: HTTPRequest.Method,
+      headers: HTTPFields,
+      body: ByteBuffer?
+    ) async throws -> TestResponse {
+      throw PlainHTTPUnsupported()
     }
   }
 
@@ -1118,6 +1172,85 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
       try? await fixture.firehose.close()
       throw error
     }
+  }
+
+  // MARK: - Liveness and graceful shutdown
+
+  /// A client handler that never iterates `inbound` cannot answer the
+  /// server's ping, so Hummingbird's auto-ping loop must close it with
+  /// `.goingAway` / `"Ping timeout"`. The short override avoids a
+  /// 30-second test; the production default remains exactly 30 seconds
+  /// (`buildApplication(webSocketAutoPingInterval:)` defaults to
+  /// `.seconds(30)`, which this test overrides to `.milliseconds(50)`).
+  func testPublicFirehoseAutoPingClosesAClientThatDoesNotPong() async throws {
+    let fixture = try await makeFixture()
+    defer { Task { try? await fixture.firehose.close(); try? await fixture.control.close() } }
+    let app = fixture.server.buildApplication(
+      logger: logger,
+      webSocketAutoPingInterval: .milliseconds(50)
+    )
+
+    try await app.test(.live) { client in
+      let closeFrame = try await self.awaitWithDeadline(timeout: .seconds(2)) {
+        try await client.ws(
+          self.subscribePath,
+          configuration: .init(maxFrameSize: 5_000_000),
+          logger: self.logger
+        ) { _, _, _ in
+          try await Task.sleep(for: .milliseconds(250))
+        }
+      }
+      XCTAssertEqual(closeFrame?.closeCode, .goingAway)
+      XCTAssertEqual(closeFrame?.reason, "Ping timeout")
+    }
+  }
+
+  /// Runs the real application as a member of an explicit `ServiceGroup`,
+  /// captures its ephemeral port through `onServerRunning`, holds a passive
+  /// WebSocket open, triggers `serviceGroup.triggerGracefulShutdown()`, and
+  /// asserts the close frame arrives before the `ServiceGroup` exits.
+  /// Hummingbird's `WebSocketHandler.handle` already wraps every upgraded
+  /// handler in `withGracefulShutdownHandler`, whose graceful callback sends
+  /// `.normalClosure` — this test proves that path is actually wired end to
+  /// end through Swan's `ServiceGroup` composition, not a separate registry.
+  ///
+  /// `app.test(.live)` cannot be used here: it owns and tears down its own
+  /// internal `ServiceGroup`, and this test needs to drive
+  /// `triggerGracefulShutdown()` on a `ServiceGroup` it controls itself. The
+  /// bare `TestClient` HummingbirdTesting hands out for that case does not
+  /// itself conform to `TestClientProtocol` (only the framework's private
+  /// `Client` wrappers do, e.g. `LiveTestFramework.Client`), so
+  /// `RawTestClient` below reproduces that same wrapper locally, purely to
+  /// reach `TestClientProtocol`'s `.ws(...)` helper.
+  func testPublicFirehoseGracefulShutdownSendsNormalCloseFrame() async throws {
+    let fixture = try await makeFixture(port: 0)
+    defer { Task { try? await fixture.firehose.close(); try? await fixture.control.close() } }
+    let portBox = PortBox()
+    let application = fixture.server.buildApplication(
+      logger: logger,
+      onServerRunning: { channel in
+        await portBox.set(channel.localAddress?.port)
+      }
+    )
+    let serviceGroup = SwanHTTPServiceLifecycle.makeServiceGroup(
+      services: [application],
+      logger: logger
+    )
+    let serviceTask = Task { try await serviceGroup.run() }
+    let port = try await portBox.wait()
+    let client = RawTestClient(port: port)
+
+    let wsTask = Task {
+      try await client.ws(self.subscribePath) { inbound, _, _ in
+        for try await _ in inbound {}
+      }
+    }
+    try await waitUntil { await fixture.hub.subscriberCount() == 1 }
+    await serviceGroup.triggerGracefulShutdown()
+
+    let closeFrame = try await awaitWithDeadline { try await wsTask.value }
+    XCTAssertEqual(closeFrame?.closeCode, .normalClosure)
+    _ = try await serviceTask.value
   }
 
   // MARK: - Configuration
