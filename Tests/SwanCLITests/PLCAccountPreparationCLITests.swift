@@ -506,6 +506,56 @@ final class PLCAccountPreparationCLITests: XCTestCase {
         XCTAssertFalse(missingKey.error.contains(fixture.encodedKEK))
     }
 
+    func testFirehoseForceSyncEnqueuesManualSyncForActiveAccountAndRefusesInactive() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let server = try TestPLCDirectory(submitBody: Data("OK".utf8))
+        defer { server.shutdown() }
+
+        let preparation = try runPrepare(
+            fixture: fixture,
+            server: server,
+            compatibility: "did-plc-server-0.0.1",
+            handle: "alice.test"
+        )
+        XCTAssertEqual(preparation.status, 0, preparation.error)
+        let did = try XCTUnwrap(try decode(preparation.output)["did"] as? String)
+
+        let activation = try runActivate(fixture: fixture, server: server)
+        XCTAssertEqual(activation.status, 0, activation.error)
+
+        let enqueued = try runForceSync(fixture: fixture, did: did)
+        XCTAssertEqual(enqueued.status, 0, enqueued.error)
+        XCTAssertTrue(
+            enqueued.output.hasPrefix("enqueued forced #sync for \(did) (request "),
+            enqueued.output
+        )
+        XCTAssertTrue(enqueued.error.isEmpty)
+
+        let database = try await SQLiteAccountDatabase(dataDirectory: fixture.data, did: did)
+        let pending = try await database.pendingPublicFirehoseOutbox()
+        try await database.close()
+        XCTAssertTrue(
+            pending.contains {
+                $0.kind == .sync && $0.sourceKey.hasPrefix("\(did)|sync|manual|")
+            },
+            "expected a manual-sync outbox row in \(pending.map(\.sourceKey))"
+        )
+
+        let refused = try runForceSync(fixture: fixture, did: "did:web:not-active.example")
+        XCTAssertNotEqual(refused.status, 0)
+        XCTAssertTrue(refused.output.isEmpty)
+        XCTAssertTrue(refused.error.contains("account is not active"))
+
+        for rendered in [
+            enqueued.output, enqueued.error, refused.output, refused.error,
+        ] {
+            for sentinel in fixture.renderedSecretSentinels {
+                XCTAssertFalse(rendered.contains(sentinel))
+            }
+        }
+    }
+
     private func runPrepare(
         fixture: Fixture,
         server: TestPLCDirectory? = nil,
@@ -678,6 +728,34 @@ final class PLCAccountPreparationCLITests: XCTestCase {
                 decoding: error.fileHandleForReading.readDataToEndOfFile(),
                 as: UTF8.self
             )
+        )
+    }
+
+    private func runForceSync(
+        fixture: Fixture,
+        did: String
+    ) throws -> ProcessResult {
+        let process = Process()
+        process.executableURL = try XCTUnwrap(executableURL())
+        process.arguments = [
+            "firehose", "force-sync",
+            "--data-directory", fixture.data.path,
+            "--did", did,
+        ]
+        var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "SWAN_OPERATOR_SECRET")
+        environment.removeValue(forKey: "SWAN_ACCOUNT_KEK")
+        process.environment = environment
+        let output = Pipe()
+        let error = Pipe()
+        process.standardOutput = output
+        process.standardError = error
+        try process.run()
+        process.waitUntilExit()
+        return ProcessResult(
+            status: process.terminationStatus,
+            output: String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
+            error: String(decoding: error.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         )
     }
 

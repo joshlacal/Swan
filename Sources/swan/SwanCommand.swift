@@ -1089,6 +1089,7 @@ struct SwanCommand: AsyncParsableCommand {
         abstract: "Swift-native AT Protocol permissioned-data interoperability laboratory",
         subcommands: [
             Serve.self, Account.self, Export.self, Backup.self, Restore.self, Verify.self, Lab.self,
+            Firehose.self,
         ],
         defaultSubcommand: Verify.self
     )
@@ -1202,6 +1203,71 @@ extension SwanCommand {
                 try? await accountDatabase?.close()
                 try? await control?.close()
                 throw ValidationError("operator backup failed")
+            }
+        }
+    }
+
+    struct Firehose: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "firehose",
+            abstract: "Operator tools for the durable public firehose",
+            subcommands: [ForceSync.self]
+        )
+
+        struct ForceSync: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "force-sync",
+                abstract: "Enqueue a forced #sync announcing the account's current public repository head"
+            )
+
+            @Option(name: .customLong("data-directory"), help: "Swan data directory")
+            var dataDirectory: String
+
+            @Option(name: .long, help: "Account DID to announce")
+            var did: String
+
+            func run() async throws {
+                guard !dataDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      !did.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw ValidationError("data-directory and did are required")
+                }
+                let dataURL = URL(fileURLWithPath: dataDirectory).standardizedFileURL
+                var control: SQLiteControlDatabase?
+                var accountDatabase: SQLiteAccountDatabase?
+                do {
+                    let openedControl = try await SQLiteControlDatabase(dataDirectory: dataURL)
+                    control = openedControl
+                    guard let account = try await openedControl.account(did: did),
+                          account.status.authorizesAccount else {
+                        throw ValidationError("account is not active: \(did)")
+                    }
+                    let openedAccount = try await SQLiteAccountDatabase(
+                        dataDirectory: dataURL,
+                        did: did
+                    )
+                    accountDatabase = openedAccount
+                    let emitter = SQLitePublicLifecycleEmitter(
+                        control: openedControl,
+                        accounts: SingleAccountFirehoseSource(
+                            account: PublicFirehoseAccountDatabase(
+                                did: did,
+                                database: openedAccount
+                            )
+                        )
+                    )
+                    let requestUUID = UUID().uuidString.lowercased()
+                    try await emitter.emitManualSync(did: did, requestUUID: requestUUID, now: Date())
+                    try await openedAccount.close()
+                    accountDatabase = nil
+                    try await openedControl.close()
+                    control = nil
+                    print("enqueued forced #sync for \(did) (request \(requestUUID))")
+                } catch {
+                    try? await accountDatabase?.close()
+                    try? await control?.close()
+                    if error is ValidationError { throw error }
+                    throw ValidationError("firehose force-sync failed")
+                }
             }
         }
     }
@@ -7354,5 +7420,13 @@ private enum AccountCommandSupport {
             return ValidationError(error.description)
         }
         return ValidationError("account operation failed")
+    }
+}
+
+private struct SingleAccountFirehoseSource: PublicFirehoseAccountDatabaseSource {
+    let account: PublicFirehoseAccountDatabase
+
+    func publicFirehoseAccountDatabases() async throws -> [PublicFirehoseAccountDatabase] {
+        [account]
     }
 }
