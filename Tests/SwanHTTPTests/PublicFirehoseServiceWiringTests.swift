@@ -108,7 +108,8 @@ final class PublicFirehoseServiceWiringTests: XCTestCase, @unchecked Sendable {
     )
     let committed = try await database.applyPublicRepositoryMutation(
       reservation: reservation,
-      prepared: prepared
+      prepared: prepared,
+      firehose: .init(lifecycleGeneration: 0)
     )
 
     let deadline = Date().addingTimeInterval(5)
@@ -274,7 +275,8 @@ final class PublicFirehoseServiceWiringTests: XCTestCase, @unchecked Sendable {
         )
         let committed = try await database.applyPublicRepositoryMutation(
           reservation: reservation,
-          prepared: prepared
+          prepared: prepared,
+          firehose: .init(lifecycleGeneration: 0)
         )
 
         // The sequencer's append must reach the connection through the hub's

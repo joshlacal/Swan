@@ -207,6 +207,29 @@ enum PublicFirehoseSourceDecisionMaker {
     }
 }
 
+/// The lifecycle-generation snapshot that a commit's firehose outbox row is
+/// stamped with. Produced by the pre-activation authorization fence so the
+/// row's generation is the same one observed by the control-plane
+/// transaction that authorized the account.
+public struct PublicFirehoseCommitContext: Sendable, Equatable {
+    public let lifecycleGeneration: Int64
+
+    public init(lifecycleGeneration: Int64) {
+        self.lifecycleGeneration = lifecycleGeneration
+    }
+}
+
+/// Pure in-memory firehose values built before the repository transaction
+/// starts. These use immutable prepared data only; they must not open SQLite
+/// or perform network I/O.
+private struct PreparedPublicFirehoseMaterial {
+    let eventTimeString: String
+    let eventMicros: Int64
+    let ops: [PublicFirehoseRepoOp]
+    let diffCAR: Data
+    let commitOnlyCAR: Data
+}
+
 extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
     public func loadPublicRepositoryState() async throws -> PublicRepositoryState? {
         try await withConnectionGate {
@@ -402,6 +425,23 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         reservation: PublicRepositoryMutationReservation,
         prepared: PreparedPublicRepositoryMutation
     ) async throws -> CommittedPublicRepositoryMutation {
+        try await applyPublicRepositoryMutation(
+            reservation: reservation,
+            prepared: prepared,
+            firehose: nil
+        )
+    }
+
+    /// Commits a prepared repository mutation. `firehose: nil` (the default)
+    /// commits without enqueuing any public firehose outbox row; a non-nil
+    /// context enqueues the commit's event stamped with the context's
+    /// lifecycle generation. The generation must be snapshotted by the
+    /// control-plane authorization transaction, never guessed by the caller.
+    public func applyPublicRepositoryMutation(
+        reservation: PublicRepositoryMutationReservation,
+        prepared: PreparedPublicRepositoryMutation,
+        firehose: PublicFirehoseCommitContext? = nil
+    ) async throws -> CommittedPublicRepositoryMutation {
         guard reservation.repositoryDID == accountDID else {
             throw PublicRepositoryMutationStoreError.ownershipMismatch
         }
@@ -409,31 +449,43 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         // repository transaction. These use immutable prepared data and
         // in-memory actors only; they must not open SQLite or perform
         // network I/O.
-        let eventTime = Date()
-        let eventTimeString = PublicFirehoseTime.encode(eventTime)
-        let eventMicros = try PublicFirehoseTime.microseconds(eventTime)
-        let firehoseOps = prepared.recordResults.map { result in
-            let action: PublicFirehoseRepoAction = switch result.action {
-            case .create: .create
-            case .update: .update
-            case .delete: .delete
+        let firehoseMaterial: PreparedPublicFirehoseMaterial?
+        if let firehose {
+            let eventTime = Date()
+            let eventTimeString = PublicFirehoseTime.encode(eventTime)
+            let eventMicros = try PublicFirehoseTime.microseconds(eventTime)
+            let firehoseOps = prepared.recordResults.map { result in
+                let action: PublicFirehoseRepoAction = switch result.action {
+                case .create: .create
+                case .update: .update
+                case .delete: .delete
+                }
+                return PublicFirehoseRepoOp(
+                    action: action,
+                    path: "\(result.path.collection)/\(result.path.recordKey)",
+                    cid: result.recordCID?.string,
+                    prev: result.previousRecordCID?.string
+                )
             }
-            return PublicFirehoseRepoOp(
-                action: action,
-                path: "\(result.path.collection)/\(result.path.recordKey)",
-                cid: result.recordCID?.string,
-                prev: result.previousRecordCID?.string
+            let diffCAR = try await PublicFirehoseDiffCAR.build(
+                commitCID: prepared.state.commitCID,
+                commitBytes: prepared.signedCommit.signedCommitBytes,
+                newBlocks: prepared.newBlocks
             )
+            let commitOnlyCAR = try await PublicFirehoseDiffCAR.commitOnly(
+                commitCID: prepared.state.commitCID,
+                commitBytes: prepared.signedCommit.signedCommitBytes
+            )
+            firehoseMaterial = PreparedPublicFirehoseMaterial(
+                eventTimeString: eventTimeString,
+                eventMicros: eventMicros,
+                ops: firehoseOps,
+                diffCAR: diffCAR,
+                commitOnlyCAR: commitOnlyCAR
+            )
+        } else {
+            firehoseMaterial = nil
         }
-        let diffCAR = try await PublicFirehoseDiffCAR.build(
-            commitCID: prepared.state.commitCID,
-            commitBytes: prepared.signedCommit.signedCommitBytes,
-            newBlocks: prepared.newBlocks
-        )
-        let commitOnlyCAR = try await PublicFirehoseDiffCAR.commitOnly(
-            commitCID: prepared.state.commitCID,
-            commitBytes: prepared.signedCommit.signedCommitBytes
-        )
         return try await withConnectionGate {
             try await transaction {
                 var mutatingSQLIndex = 0
@@ -598,42 +650,44 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 // The stored event kind is final: the source transaction owns
                 // the commit-versus-sync decision and the sequencer must never
                 // reinterpret a persisted row.
-                let commitMaterial = PublicFirehoseCommitMaterial(
-                    did: accountDID,
-                    rev: prepared.state.revision,
-                    since: prepared.sinceRevision,
-                    commitCID: prepared.state.commitCID.string,
-                    prevDataCID: current.dataCID.string,
-                    ops: firehoseOps,
-                    time: eventTimeString
-                )
-                let syncMaterial = PublicFirehoseSyncMaterial(
-                    did: accountDID,
-                    rev: prepared.state.revision,
-                    commitCID: prepared.state.commitCID.string,
-                    time: eventTimeString
-                )
-                let decision = try PublicFirehoseSourceDecisionMaker.decide(
-                    accountDID: accountDID,
-                    commitCID: prepared.state.commitCID,
-                    commitMaterial: commitMaterial,
-                    syncMaterial: syncMaterial,
-                    diffCAR: diffCAR,
-                    commitOnlyCAR: commitOnlyCAR
-                )
+                if let firehose, let firehoseMaterial {
+                    let commitMaterial = PublicFirehoseCommitMaterial(
+                        did: accountDID,
+                        rev: prepared.state.revision,
+                        since: prepared.sinceRevision,
+                        commitCID: prepared.state.commitCID.string,
+                        prevDataCID: current.dataCID.string,
+                        ops: firehoseMaterial.ops,
+                        time: firehoseMaterial.eventTimeString
+                    )
+                    let syncMaterial = PublicFirehoseSyncMaterial(
+                        did: accountDID,
+                        rev: prepared.state.revision,
+                        commitCID: prepared.state.commitCID.string,
+                        time: firehoseMaterial.eventTimeString
+                    )
+                    let decision = try PublicFirehoseSourceDecisionMaker.decide(
+                        accountDID: accountDID,
+                        commitCID: prepared.state.commitCID,
+                        commitMaterial: commitMaterial,
+                        syncMaterial: syncMaterial,
+                        diffCAR: firehoseMaterial.diffCAR,
+                        commitOnlyCAR: firehoseMaterial.commitOnlyCAR
+                    )
 
-                let inserted = try await enqueuePublicFirehoseEventInTransaction(
-                    sourceKey: decision.sourceKey,
-                    kind: decision.kind,
-                    lifecycleGeneration: 0,
-                    payload: decision.payload,
-                    carBytes: decision.car,
-                    createdAt: eventMicros
-                )
-                guard inserted else {
-                    throw PublicRepositoryMutationStoreError.corruptRepository
+                    let inserted = try await enqueuePublicFirehoseEventInTransaction(
+                        sourceKey: decision.sourceKey,
+                        kind: decision.kind,
+                        lifecycleGeneration: firehose.lifecycleGeneration,
+                        payload: decision.payload,
+                        carBytes: decision.car,
+                        createdAt: firehoseMaterial.eventMicros
+                    )
+                    guard inserted else {
+                        throw PublicRepositoryMutationStoreError.corruptRepository
+                    }
+                    try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
                 }
-                try await publicRepositorySQLDidMutate(index: &mutatingSQLIndex)
                 return CommittedPublicRepositoryMutation(
                     state: prepared.state,
                     recordResults: prepared.recordResults

@@ -2371,6 +2371,37 @@ extension SQLiteControlDatabase {
         }
     }
 
+    /// Same authorization fence as `withActiveAccountAuthorization`, but also
+    /// snapshots the DID's current lifecycle generation inside the same
+    /// control-plane write transaction. The authorization check and the
+    /// generation read therefore linearize together: a lifecycle transition
+    /// either happens before this fence (observed as inactive, or as the
+    /// prior generation) or after the publication returns. Callers must not
+    /// perform network I/O in `operation`; this is a short final publication
+    /// fence, not a general-purpose transaction wrapper.
+    public func withActiveAccountFirehoseAuthorization<T: Sendable>(
+        did: String,
+        operation: @escaping @Sendable (Int64) async throws -> T
+    ) async throws -> T {
+        guard AccountControlIdentifiers.isDID(did) else {
+            throw AccountControlStoreError.invalidInput
+        }
+        return try await withConnectionGate {
+            try await transaction {
+                let account = try await requiredAccount(did: did)
+                guard account.status.authorizesAccount else {
+                    throw AccountControlStoreError.invalidTransition
+                }
+                let rows = try await connection.query(
+                    "SELECT generation FROM account_lifecycle_generation WHERE did = ?",
+                    [.text(did)]
+                )
+                let generation = Int64(rows.first?.column("generation")?.integer ?? 0)
+                return try await operation(generation)
+            }
+        }
+    }
+
     // MARK: Account email recovery internals
 
     private func insertEmailProofDeliveryLocked(

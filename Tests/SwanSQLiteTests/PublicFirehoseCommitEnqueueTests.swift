@@ -45,7 +45,8 @@ final class PublicFirehoseCommitEnqueueTests: XCTestCase {
         )
         _ = try await database.applyPublicRepositoryMutation(
             reservation: candidate.reservation,
-            prepared: candidate.prepared
+            prepared: candidate.prepared,
+            firehose: .init(lifecycleGeneration: 0)
         )
 
         let pending = try await database.pendingPublicFirehoseOutbox()
@@ -105,11 +106,13 @@ final class PublicFirehoseCommitEnqueueTests: XCTestCase {
         )
         let first = try await database.applyPublicRepositoryMutation(
             reservation: candidate.reservation,
-            prepared: candidate.prepared
+            prepared: candidate.prepared,
+            firehose: .init(lifecycleGeneration: 0)
         )
         let replayed = try await database.applyPublicRepositoryMutation(
             reservation: candidate.reservation,
-            prepared: candidate.prepared
+            prepared: candidate.prepared,
+            firehose: .init(lifecycleGeneration: 0)
         )
         XCTAssertEqual(replayed, first)
         let pending = try await database.pendingPublicFirehoseOutbox()
@@ -148,7 +151,8 @@ final class PublicFirehoseCommitEnqueueTests: XCTestCase {
         )
         _ = try await database.applyPublicRepositoryMutation(
             reservation: create.reservation,
-            prepared: create.prepared
+            prepared: create.prepared,
+            firehose: .init(lifecycleGeneration: 0)
         )
         let loadedCreated = try await database.loadPublicRepositoryState()
         let createdState = try XCTUnwrap(loadedCreated)
@@ -171,7 +175,8 @@ final class PublicFirehoseCommitEnqueueTests: XCTestCase {
         )
         _ = try await database.applyPublicRepositoryMutation(
             reservation: updateDelete.reservation,
-            prepared: updateDelete.prepared
+            prepared: updateDelete.prepared,
+            firehose: .init(lifecycleGeneration: 0)
         )
 
         let pending = try await database.pendingPublicFirehoseOutbox()
@@ -233,7 +238,8 @@ final class PublicFirehoseCommitEnqueueTests: XCTestCase {
         do {
             _ = try await database.applyPublicRepositoryMutation(
                 reservation: candidate.reservation,
-                prepared: candidate.prepared
+                prepared: candidate.prepared,
+                firehose: .init(lifecycleGeneration: 0)
             )
             XCTFail("expected conflictingPublicFirehoseSourceKey")
         } catch let error as SQLiteRepositoryError {
@@ -259,6 +265,77 @@ final class PublicFirehoseCommitEnqueueTests: XCTestCase {
         XCTAssertEqual(outbox.count, 1)
         XCTAssertEqual(outbox.first?.sourceKey, conflictingKey)
         XCTAssertEqual(outbox.first?.payload, Data("different material".utf8))
+    }
+
+    func testMutationWithoutFirehoseContextEnqueuesNoOutboxRow() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let key = P256.Signing.PrivateKey()
+        let database = try await installedDatabase(root: root, key: key)
+        defer { Task { try? await database.close() } }
+        let loadedState = try await database.loadPublicRepositoryState()
+        let initial = try XCTUnwrap(loadedState)
+        let candidate = try await prepareWrites(
+            database: database,
+            state: initial,
+            key: key,
+            requestID: "no-firehose-context",
+            digestByte: 0x20,
+            clock: 1_750_000_000_000_000,
+            writes: [
+                .create(
+                    path: try PublicRepositoryPath(
+                        collection: "app.bsky.feed.post",
+                        recordKey: "no-firehose"
+                    ),
+                    record: record("no-firehose")
+                ),
+            ]
+        )
+        _ = try await database.applyPublicRepositoryMutation(
+            reservation: candidate.reservation,
+            prepared: candidate.prepared
+        )
+        let pending = try await database.pendingPublicFirehoseOutbox()
+        XCTAssertTrue(
+            pending.isEmpty,
+            "a mutation without a firehose context must not enqueue an outbox row"
+        )
+    }
+
+    func testMutationWithFirehoseContextStampsItsGeneration() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let key = P256.Signing.PrivateKey()
+        let database = try await installedDatabase(root: root, key: key)
+        defer { Task { try? await database.close() } }
+        let loadedState = try await database.loadPublicRepositoryState()
+        let initial = try XCTUnwrap(loadedState)
+        let candidate = try await prepareWrites(
+            database: database,
+            state: initial,
+            key: key,
+            requestID: "firehose-context-stamp",
+            digestByte: 0x21,
+            clock: 1_750_000_000_000_000,
+            writes: [
+                .create(
+                    path: try PublicRepositoryPath(
+                        collection: "app.bsky.feed.post",
+                        recordKey: "firehose-stamp"
+                    ),
+                    record: record("firehose-stamp")
+                ),
+            ]
+        )
+        _ = try await database.applyPublicRepositoryMutation(
+            reservation: candidate.reservation,
+            prepared: candidate.prepared,
+            firehose: .init(lifecycleGeneration: 7)
+        )
+        let pending = try await database.pendingPublicFirehoseOutbox()
+        let row = try XCTUnwrap(pending.first)
+        XCTAssertEqual(row.lifecycleGeneration, 7)
     }
 
     func testDecisionMakerFallsBackToSyncForOversizeCommitFrame() async throws {

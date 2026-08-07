@@ -48,13 +48,15 @@ public actor SQLitePreMigratedAccountDirectory:
     /// until the new state has been fully re-admitted and atomically published
     /// as the directory's next public-read generation.
     public func generationRefreshingPublicMutationStore(
-        did: String
+        did: String,
+        firehoseFence: PublicFirehoseCommitFence? = nil
     ) async -> (any PublicRepositoryMutationStore)? {
         guard !isClosed, let database = databases[did] else { return nil }
         return SQLiteGenerationRefreshingPublicMutationStore(
             did: did,
             database: database,
-            directory: self
+            directory: self,
+            firehoseFence: firehoseFence
         )
     }
 
@@ -1820,6 +1822,35 @@ public actor SQLitePreMigratedAccountDirectory:
     }
 }
 
+/// Applies a public repository mutation while holding the control-plane
+/// authorization transaction so no lifecycle transition can interleave with
+/// the generation snapshot. An account that no longer authorizes falls back
+/// to a non-emitting mutation: pre-activation and post-deactivation commits
+/// produce no firehose event.
+public struct PublicFirehoseCommitFence: Sendable {
+    private let control: SQLiteControlDatabase
+
+    public init(control: SQLiteControlDatabase) {
+        self.control = control
+    }
+
+    public func apply(
+        did: String,
+        mutate: @escaping @Sendable (PublicFirehoseCommitContext?) async throws
+            -> CommittedPublicRepositoryMutation
+    ) async throws -> CommittedPublicRepositoryMutation {
+        do {
+            return try await control.withActiveAccountFirehoseAuthorization(did: did) {
+                generation in
+                try await mutate(.init(lifecycleGeneration: generation))
+            }
+        } catch let error as AccountControlStoreError {
+            guard case .invalidTransition = error else { throw error }
+            return try await mutate(nil)
+        }
+    }
+}
+
 private actor SQLiteGenerationRefreshingPublicMutationStore:
     PublicRepositoryMutationStore,
     StreamingBlobStore
@@ -1827,15 +1858,18 @@ private actor SQLiteGenerationRefreshingPublicMutationStore:
     let did: String
     let database: SQLiteAccountDatabase
     let directory: SQLitePreMigratedAccountDirectory
+    let firehoseFence: PublicFirehoseCommitFence?
 
     init(
         did: String,
         database: SQLiteAccountDatabase,
-        directory: SQLitePreMigratedAccountDirectory
+        directory: SQLitePreMigratedAccountDirectory,
+        firehoseFence: PublicFirehoseCommitFence?
     ) {
         self.did = did
         self.database = database
         self.directory = directory
+        self.firehoseFence = firehoseFence
     }
 
     func loadPublicRepositoryState() async throws -> PublicRepositoryState? {
@@ -1870,10 +1904,21 @@ private actor SQLiteGenerationRefreshingPublicMutationStore:
         reservation: PublicRepositoryMutationReservation,
         prepared: PreparedPublicRepositoryMutation
     ) async throws -> CommittedPublicRepositoryMutation {
-        let committed = try await database.applyPublicRepositoryMutation(
-            reservation: reservation,
-            prepared: prepared
-        )
+        let committed: CommittedPublicRepositoryMutation
+        if let firehoseFence {
+            committed = try await firehoseFence.apply(did: did) { context in
+                try await self.database.applyPublicRepositoryMutation(
+                    reservation: reservation,
+                    prepared: prepared,
+                    firehose: context
+                )
+            }
+        } else {
+            committed = try await database.applyPublicRepositoryMutation(
+                reservation: reservation,
+                prepared: prepared
+            )
+        }
         try await directory.refreshPublicReadGenerationAfterMutation(
             did: did,
             database: database

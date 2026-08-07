@@ -592,7 +592,10 @@ private struct ServePublicMutationDirectory: PublicRepositoryMutationDirectory {
         guard let account else { return nil }
         // The store is keyed by the resolved DID, not by the caller's handle.
         guard let resolvedStore = await directory
-            .generationRefreshingPublicMutationStore(did: account.did) else {
+            .generationRefreshingPublicMutationStore(
+                did: account.did,
+                firehoseFence: PublicFirehoseCommitFence(control: controls)
+            ) else {
             return nil
         }
         return try PublicRepositoryMutationTarget(did: account.did, status: account.status, store: resolvedStore)

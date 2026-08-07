@@ -449,7 +449,8 @@ final class PublicRepositoryMutationStoreTests: XCTestCase {
             await XCTAssertThrowsAsync(
                 try await database.applyPublicRepositoryMutation(
                     reservation: candidate.reservation,
-                    prepared: candidate.prepared
+                    prepared: candidate.prepared,
+                    firehose: .init(lifecycleGeneration: 0)
                 )
             ) { error in
                 XCTAssertEqual(error as? InjectedFailure, .expected)
