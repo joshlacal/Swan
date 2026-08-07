@@ -104,36 +104,38 @@ extension SQLiteControlDatabase {
         let nowMicros = try PublicFirehoseTime.microseconds(now)
         let nextMicros = try PublicFirehoseTime.microseconds(nextAttemptAt)
         try await withConnectionGate {
-            _ = try await connection.query(
-                """
-                INSERT INTO public_crawl_announcer_state(
-                    crawler_origin, attempts, next_attempt_at,
-                    last_attempt_at, last_success_at
-                ) VALUES (
-                    ?, CASE WHEN ? THEN 0 ELSE 1 END, ?, ?,
-                    CASE WHEN ? THEN ? ELSE NULL END
+            try await transaction {
+                _ = try await connection.query(
+                    """
+                    INSERT INTO public_crawl_announcer_state(
+                        crawler_origin, attempts, next_attempt_at,
+                        last_attempt_at, last_success_at
+                    ) VALUES (
+                        ?, CASE WHEN ? THEN 0 ELSE 1 END, ?, ?,
+                        CASE WHEN ? THEN ? ELSE NULL END
+                    )
+                    ON CONFLICT(crawler_origin) DO UPDATE SET
+                        attempts = CASE WHEN ? THEN 0 ELSE attempts + 1 END,
+                        next_attempt_at = ?,
+                        last_attempt_at = ?,
+                        last_success_at =
+                            CASE WHEN ? THEN ? ELSE last_success_at END
+                    """,
+                    [
+                        .text(origin),
+                        .integer(successFlag),
+                        .integer(Int(nextMicros)),
+                        .integer(Int(nowMicros)),
+                        .integer(successFlag),
+                        .integer(Int(nowMicros)),
+                        .integer(successFlag),
+                        .integer(Int(nextMicros)),
+                        .integer(Int(nowMicros)),
+                        .integer(successFlag),
+                        .integer(Int(nowMicros)),
+                    ]
                 )
-                ON CONFLICT(crawler_origin) DO UPDATE SET
-                    attempts = CASE WHEN ? THEN 0 ELSE attempts + 1 END,
-                    next_attempt_at = ?,
-                    last_attempt_at = ?,
-                    last_success_at =
-                        CASE WHEN ? THEN ? ELSE last_success_at END
-                """,
-                [
-                    .text(origin),
-                    .integer(successFlag),
-                    .integer(Int(nextMicros)),
-                    .integer(Int(nowMicros)),
-                    .integer(successFlag),
-                    .integer(Int(nowMicros)),
-                    .integer(successFlag),
-                    .integer(Int(nextMicros)),
-                    .integer(Int(nowMicros)),
-                    .integer(successFlag),
-                    .integer(Int(nowMicros)),
-                ]
-            )
+            }
         }
     }
 

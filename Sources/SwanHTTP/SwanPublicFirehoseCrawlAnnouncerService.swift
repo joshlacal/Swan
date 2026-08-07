@@ -147,7 +147,11 @@ public struct SwanPublicFirehoseCrawlAnnouncerService: Service {
         }
         await announcePass(now: Date(), sequenced: false)
         while !Task.isCancelled {
-            try await Task.sleep(for: pollInterval)
+            do {
+                try await Task.sleep(for: pollInterval)
+            } catch is CancellationError {
+                return
+            }
             let sequenced = await signal.consumeDirty()
             await announcePass(now: Date(), sequenced: sequenced)
         }
@@ -268,7 +272,8 @@ public struct SwanPublicFirehoseCrawlAnnouncerService: Service {
     /// The exact eligibility rule: a never-attempted crawler is always
     /// eligible; a crawler in failure backoff only when its schedule has
     /// passed; a healthy crawler on the 24 h refresh or, for sequenced
-    /// passes, when the update throttle has elapsed.
+    /// passes, when the update throttle has elapsed — the throttle branch
+    /// must not be gated by the 24 h refresh schedule.
     private func isEligible(
         state: PublicCrawlAnnouncerState?,
         nowMicros: Int64,
@@ -277,10 +282,13 @@ public struct SwanPublicFirehoseCrawlAnnouncerService: Service {
         guard let state, let nextAttemptAt = state.nextAttemptAt else {
             return true
         }
-        guard nowMicros >= nextAttemptAt else { return false }
-        if state.attempts > 0 { return true }
-        if sequenced {
-            guard let lastAttemptAt = state.lastAttemptAt else { return true }
+        if state.attempts > 0 {
+            return nowMicros >= nextAttemptAt
+        }
+        if nowMicros >= nextAttemptAt {
+            return true
+        }
+        if sequenced, let lastAttemptAt = state.lastAttemptAt {
             return nowMicros - lastAttemptAt >= updateThrottleMicroseconds
         }
         return false
