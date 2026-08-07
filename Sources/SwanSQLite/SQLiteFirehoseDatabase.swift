@@ -524,6 +524,43 @@ public actor SQLiteFirehoseDatabase {
     }
   }
 
+  /// Counts stored (deliverable) rows strictly above `seq`, stopping at
+  /// `limit`. Per-DID deletion pruning leaves sequence-number gaps, so
+  /// `maxSequencedSeq() - cursor` overstates a consumer's real backlog; this
+  /// bounded count is the gap-aware measure the slow-consumer policy uses.
+  public func deliverableEventCount(after seq: Int64, limit: Int64) async throws -> Int64 {
+    try checkOpen()
+    guard seq >= 0, seq <= FirehoseFrameLimits.maximumSequence else {
+      throw SQLiteFirehoseDatabaseError.invalidRequest(
+        "firehose cursor must be between 0 and the maximum sequence"
+      )
+    }
+    guard limit >= 1 else {
+      throw SQLiteFirehoseDatabaseError.invalidRequest(
+        "firehose deliverable count limit must be at least 1"
+      )
+    }
+    return try await withConnectionGate {
+      let rows = try await connection.query(
+        """
+        SELECT COUNT(*) AS deliverable FROM (
+          SELECT 1 FROM firehose_events WHERE seq > ? LIMIT ?
+        )
+        """,
+        [.integer(Int(seq)), .integer(Int(limit))]
+      )
+      guard rows.count == 1,
+            let row = rows.first,
+            let deliverable = row.column("deliverable")?.integer,
+            deliverable >= 0 else {
+        throw SQLiteFirehoseDatabaseError.corruptDatabase(
+          "firehose deliverable event count is invalid"
+        )
+      }
+      return Int64(deliverable)
+    }
+  }
+
   /// Raises `next_seq` only; never lowers it. Accepts the exhausted sentinel.
   public func reseedSequence(toAtLeast nextSeq: Int64) async throws {
     try checkOpen()

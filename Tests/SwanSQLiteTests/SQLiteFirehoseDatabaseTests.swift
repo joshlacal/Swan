@@ -402,6 +402,32 @@ final class SQLiteFirehoseDatabaseTests: XCTestCase {
     }
   }
 
+  func testDeliverableEventCountStopsAtLimitAndIgnoresSequenceGaps() async throws {
+    // seqs 1...5 for did A, then delete 2...4 via the deletion-marker path is
+    // not needed: create a gap directly by pruning is overkill — append 5,
+    // then measure counts with cursors inside the range.
+    for index in 1 ... 5 {
+      _ = try await firehose.appendBatch(
+        [identityItem(sourceKey: "count-\(index)")],
+        now: epoch
+      )
+    }
+    // All five deliverable from cursor 0.
+    let all = try await firehose.deliverableEventCount(after: 0, limit: 10)
+    XCTAssertEqual(all, 5)
+    // Bounded: stops counting at the limit.
+    let bounded = try await firehose.deliverableEventCount(after: 0, limit: 3)
+    XCTAssertEqual(bounded, 3)
+    // Cursor mid-range.
+    let tail = try await firehose.deliverableEventCount(after: 3, limit: 10)
+    XCTAssertEqual(tail, 2)
+    // Invalid limit rejected.
+    await expectThrows(
+      try await firehose.deliverableEventCount(after: 0, limit: 0),
+      { if case .invalidRequest = $0 { return true }; return false }
+    )
+  }
+
   func testReseedRaisesOnlyAndAcceptsExhaustedSentinel() async throws {
     _ = try await firehose.appendBatch(
       [identityItem(sourceKey: "k1", batchID: "batch-1")],

@@ -24,19 +24,38 @@ final class PublicFirehoseStreamingTests: XCTestCase {
     return root
   }
 
-  private func identityItem(sourceKey: String) -> FirehoseAppendItem {
+  private func identityItem(sourceKey: String, did: String? = nil) -> FirehoseAppendItem {
+    let identityDID = did ?? self.did
     let material = PublicFirehoseIdentityMaterial(
-      did: did,
+      did: identityDID,
       handle: "alice.test",
       time: time
     )
     return FirehoseAppendItem(
       sourceKey: sourceKey,
       batchID: nil,
-      did: did,
+      did: identityDID,
       kind: .identity
     ) { seq in
       try FirehoseFrameEncoder.identityFrame(seq: seq, material: material)
+    }
+  }
+
+  private func deletedAccountItem(sourceKey: String, did: String? = nil) -> FirehoseAppendItem {
+    let accountDID = did ?? self.did
+    let material = PublicFirehoseAccountMaterial(
+      did: accountDID,
+      active: false,
+      status: .deleted,
+      time: time
+    )
+    return FirehoseAppendItem(
+      sourceKey: sourceKey,
+      batchID: nil,
+      did: accountDID,
+      kind: .account
+    ) { seq in
+      try FirehoseFrameEncoder.accountFrame(seq: seq, material: material)
     }
   }
 
@@ -344,6 +363,81 @@ final class PublicFirehoseStreamingTests: XCTestCase {
       }
       XCTAssertEqual(seqLag, 2)
       XCTAssertEqual(backfillElapsed, .zero)
+    }
+  }
+
+  /// Phase 4 entry gate: a per-DID deletion gap wider than the lag limit
+  /// must not drop a consumer that has almost nothing left to read.
+  func testTailerSurvivesDeletionGapWiderThanSequenceLagLimit() async throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
+    defer { Task { try? await firehose.close() } }
+
+    // Seq 1 (survivor), 2...4 (doomed did), 5 = the deleted #account event.
+    _ = try await firehose.appendBatch([identityItem(sourceKey: "keep-1")], now: epoch)
+    for index in 2 ... 4 {
+      _ = try await firehose.appendBatch(
+        [identityItem(sourceKey: "gap-\(index)", did: "did:web:doomed.example")],
+        now: epoch
+      )
+    }
+    _ = try await firehose.appendBatch(
+      [deletedAccountItem(sourceKey: "gap-account", did: "did:web:doomed.example")],
+      now: epoch,
+      deletingPriorEvents: [
+        FirehoseDeletionMarker(did: "did:web:doomed.example", sourceKey: "gap-account"),
+      ]
+    )
+    // Consumer at cursor 1: raw lag = 4 > limit 2, but only seq 5 is stored.
+    let limits = try PublicFirehoseStreamingLimits(maximumSequenceLag: 2)
+    let tailer = PublicFirehoseTailer(database: firehose, limits: limits, logger: logger)
+    let recorder = FrameRecorder()
+    let task = Task {
+      try await tailer.run(
+        lastSent: 1,
+        outbound: { data in await recorder.record(data) },
+        waitForWakeup: { nil }
+      )
+    }
+    defer { task.cancel() }
+
+    try await waitUntil { await recorder.snapshot().count == 1 }
+    let frames = await recorder.snapshot()
+    XCTAssertEqual(frames.count, 1)
+    task.cancel()
+    _ = await task.result
+  }
+
+  /// A consumer with more deliverable rows than the limit is still dropped.
+  func testTailerStillDropsConsumerWithRealDeliverableBacklog() async throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
+    defer { Task { try? await firehose.close() } }
+    for index in 1 ... 4 {
+      _ = try await firehose.appendBatch(
+        [identityItem(sourceKey: "real-\(index)")],
+        now: epoch
+      )
+    }
+    let limits = try PublicFirehoseStreamingLimits(maximumSequenceLag: 2)
+    let tailer = PublicFirehoseTailer(database: firehose, limits: limits, logger: logger)
+    do {
+      try await tailer.run(
+        lastSent: 0,
+        outbound: { _ in XCTFail("dropped consumer must receive nothing") },
+        waitForWakeup: { nil }
+      )
+      XCTFail("expected consumerTooSlow")
+    } catch let error as PublicFirehoseTailerError {
+      guard case let .consumerTooSlow(seqLag, _) = error else {
+        return XCTFail("unexpected tailer error \(error)")
+      }
+      // The two-step check clamps the reported lag at maximumSequenceLag + 1
+      // (plan Task 1 Step 7): the bounded count stops at the bound, so a
+      // backlog deeper than it reports the clamped value.
+      XCTAssertEqual(seqLag, 3)
     }
   }
 

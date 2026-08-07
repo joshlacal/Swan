@@ -199,7 +199,16 @@ public struct PublicFirehoseTailer: Sendable {
           continue
         }
         let maxSeq = try await database.maxSequencedSeq()
-        let seqLag = maxSeq - cursor
+        // Raw difference is an upper bound on deliverable rows (deletion
+        // gaps only shrink the real count), so the bounded count runs only
+        // when a drop is already plausible.
+        var seqLag = maxSeq - cursor
+        if seqLag > limits.maximumSequenceLag {
+          seqLag = try await database.deliverableEventCount(
+            after: cursor,
+            limit: limits.maximumSequenceLag + 1
+          )
+        }
         if PublicFirehoseSlowConsumerPolicy.shouldDrop(
           seqLag: seqLag,
           backfillElapsed: backfillElapsed,
