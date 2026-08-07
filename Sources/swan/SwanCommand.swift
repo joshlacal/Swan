@@ -2209,6 +2209,7 @@ extension SwanCommand {
                 }
                 let publicFirehoseService: SwanPublicFirehoseSequencerService?
                 let publicFirehoseRetentionService: SwanPublicFirehoseRetentionService?
+                let publicFirehoseCrawlAnnouncerService: SwanPublicFirehoseCrawlAnnouncerService?
                 var publicFirehoseStreamingRuntime: SwanPublicFirehoseStreamingRuntime?
                 if enablePublicFirehose {
                     do {
@@ -2265,6 +2266,47 @@ extension SwanCommand {
                                 "--public-firehose-retention-interval-seconds must be positive"
                             )
                         }
+
+                        let rawCrawlers = ProcessInfo.processInfo.environment["SWAN_PUBLIC_CRAWLERS"] ?? ""
+                        let crawlerOrigins: [URL] = try rawCrawlers
+                            .split(separator: ",")
+                            .map { $0.trimmingCharacters(in: .whitespaces) }
+                            .filter { !$0.isEmpty }
+                            .map { raw in
+                                guard let url = URL(string: raw),
+                                      let scheme = url.scheme, ["http", "https"].contains(scheme),
+                                      url.host != nil else {
+                                    throw ValidationError("SWAN_PUBLIC_CRAWLERS entry is not a crawler origin URL: \(raw)")
+                                }
+                                return url
+                            }
+                        if !crawlerOrigins.isEmpty {
+                            guard let announceHost = baseURL.host else {
+                                throw ValidationError("--public-url must include a hostname to announce")
+                            }
+                            let hostname: String
+                            if let announcePort = baseURL.port, ![80, 443].contains(announcePort) {
+                                hostname = "\(announceHost):\(announcePort)"
+                            } else {
+                                hostname = announceHost
+                            }
+                            do {
+                                publicFirehoseCrawlAnnouncerService = try SwanPublicFirehoseCrawlAnnouncerService(
+                                    control: controlDatabase,
+                                    hub: wakeupHub,
+                                    transport: try AsyncHTTPClientPublicCrawlTransport(),
+                                    crawlers: crawlerOrigins,
+                                    hostname: hostname,
+                                    logger: logger
+                                )
+                            } catch {
+                                throw ValidationError(
+                                    "public firehose requestCrawl announcer is unavailable"
+                                )
+                            }
+                        } else {
+                            publicFirehoseCrawlAnnouncerService = nil
+                        }
                     } catch let error as ValidationError {
                         throw error
                     } catch {
@@ -2283,6 +2325,7 @@ extension SwanCommand {
                     }
                     publicFirehoseService = nil
                     publicFirehoseRetentionService = nil
+                    publicFirehoseCrawlAnnouncerService = nil
                     publicFirehoseStreamingRuntime = nil
                 }
                 let managementKeyStore: FileAccountKeyStore?
@@ -2451,6 +2494,10 @@ extension SwanCommand {
                 if let publicFirehoseRetentionService {
                     services.append(publicFirehoseRetentionService)
                     logger.info("durable public firehose retention pruning enabled")
+                }
+                if let publicFirehoseCrawlAnnouncerService {
+                    services.append(publicFirehoseCrawlAnnouncerService)
+                    logger.info("public firehose requestCrawl announcement enabled")
                 }
                 if let managementApplication {
                     services.append(managementApplication)

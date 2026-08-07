@@ -471,6 +471,7 @@ extension SQLiteControlDatabase {
         )
         try await migrateAccountLoginAdmissionSchema()
         try await migrateAccountPermanentDeletionSchema()
+        try await migratePublicCrawlAnnouncerSchema()
     }
 
     // MARK: AccountControlStore
