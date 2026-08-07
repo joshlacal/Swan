@@ -4,6 +4,7 @@ import Petrel
 import SQLiteNIO
 import SwanCore
 @_spi(PortableRestore) @testable import SwanSQLite
+import SwanPublicFirehose
 import SwanSpaces
 import SwanStorage
 import XCTest
@@ -3550,6 +3551,132 @@ final class SwanSQLiteTests: XCTestCase {
         XCTAssertTrue(controlText.contains(validDigest))
         XCTAssertFalse(controlText.contains(secretSentinel))
         XCTAssertFalse(controlText.contains("c2VlZC1waHJhc2U="))
+    }
+
+    func testTransitionWithEmissionEnqueuesAccountBatchAtomically() async throws {
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        _ = try await database.createAccount(
+            controlRegistration(did: did, handle: "emission.example.com")
+        )
+        let epoch = Date(timeIntervalSince1970: 1_750_000_000)
+        _ = try await database.transitionStatus(
+            did: did,
+            to: .deactivated,
+            declaration: .init(),
+            emitting: .init(operationID: "op-deact-1"),
+            now: epoch
+        )
+        let pending = try await database.nextPendingLifecycleBatch(did: did)
+        let batch = try XCTUnwrap(pending)
+        XCTAssertEqual(batch.items.count, 1)
+        let material = try JSONDecoder().decode(
+            PublicFirehoseAccountMaterial.self,
+            from: batch.items[0].payload
+        )
+        XCTAssertFalse(material.active)
+        XCTAssertEqual(material.status, .deactivated)
+        XCTAssertEqual(
+            batch.items[0].sourceKey,
+            PublicFirehoseSourceKey.account(did: did, operationID: "op-deact-1")
+        )
+    }
+
+    func testSameStatusTransitionWithEmissionEnqueuesNothing() async throws {
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        _ = try await database.createAccount(
+            controlRegistration(did: did, handle: "noop-emission.example.com")
+        )
+        let epoch = Date(timeIntervalSince1970: 1_750_000_000)
+        _ = try await database.transitionStatus(
+            did: did,
+            to: .active,
+            declaration: .init(),
+            emitting: .init(operationID: "op-noop-1"),
+            now: epoch
+        )
+        let pending = try await database.nextPendingLifecycleBatch(did: did)
+        XCTAssertNil(pending)
+    }
+
+    func testTransitionWithoutEmissionEnqueuesNothing() async throws {
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        _ = try await database.createAccount(
+            controlRegistration(did: did, handle: "silent-emission.example.com")
+        )
+        let epoch = Date(timeIntervalSince1970: 1_750_000_000)
+        _ = try await database.transitionStatus(
+            did: did,
+            to: .deactivated,
+            declaration: .init(),
+            now: epoch
+        )
+        let pending = try await database.nextPendingLifecycleBatch(did: did)
+        XCTAssertNil(pending)
+    }
+
+    func testTransitionWithEmissionMapsEveryPublicModerationStatus() async throws {
+        let root = try controlRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await database.close() } }
+        let did = "did:plc:abcdefghijklmnopqrstuvwx"
+        _ = try await database.createAccount(
+            controlRegistration(did: did, handle: "status-sweep.example.com")
+        )
+        let epoch = Date(timeIntervalSince1970: 1_750_000_000)
+        let sweeps: [(AccountControlStatus, PublicFirehoseAccountStatus)] = [
+            (.deactivated, .deactivated),
+            (.suspended, .suspended),
+            (.takendown, .takendown),
+            (.desynchronized, .desynchronized),
+            (.throttled, .throttled),
+        ]
+        for (index, sweep) in sweeps.enumerated() {
+            let operationID = "op-sweep-\(index)"
+            _ = try await database.transitionStatus(
+                did: did,
+                to: sweep.0,
+                declaration: .init(),
+                emitting: .init(operationID: operationID),
+                now: epoch.addingTimeInterval(Double(index + 1))
+            )
+            let pending = try await database.nextPendingLifecycleBatch(did: did)
+            let batch = try XCTUnwrap(pending)
+            XCTAssertEqual(batch.items.count, 1)
+            let material = try JSONDecoder().decode(
+                PublicFirehoseAccountMaterial.self,
+                from: batch.items[0].payload
+            )
+            XCTAssertFalse(material.active)
+            XCTAssertEqual(material.status, sweep.1)
+            XCTAssertEqual(
+                batch.items[0].sourceKey,
+                PublicFirehoseSourceKey.account(did: did, operationID: operationID)
+            )
+            _ = try await database.completeLifecycleBatch(batchID: batch.batchID)
+        }
+        // unknown has no public representation: emission maps to nothing.
+        _ = try await database.transitionStatus(
+            did: did,
+            to: .unknown("future-moderation-state"),
+            declaration: .init(),
+            emitting: .init(operationID: "op-unknown-1"),
+            now: epoch.addingTimeInterval(6)
+        )
+        let pending = try await database.nextPendingLifecycleBatch(did: did)
+        XCTAssertNil(pending)
     }
 
     func testAccountControlConcurrentLegacyOpenSerializesMigration() async throws {

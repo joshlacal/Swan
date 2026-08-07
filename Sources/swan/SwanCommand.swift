@@ -2419,7 +2419,8 @@ extension SwanCommand {
                         operatorSecretVerifier: verifier,
                         plcProvisioning: managementPLCProvisioning,
                         permanentDeletionCoordinator:
-                            permanentDeletionRuntime?.coordinator
+                            permanentDeletionRuntime?.coordinator,
+                        lifecycleEmitter: lifecycleEmitter
                     )
                     managementApplication = managementServer.buildApplication(
                         logger: Logger(label: "swan.management")

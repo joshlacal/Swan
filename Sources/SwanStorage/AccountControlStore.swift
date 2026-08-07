@@ -301,6 +301,17 @@ public struct AccountLifecycleDeclaration: Sendable, Equatable {
     }
 }
 
+/// Requested public lifecycle emission for one status-change transition. The
+/// caller-supplied operation ID becomes the durable `#account` batch and
+/// item source key, so an exact retry converges without duplicate rows.
+public struct AccountLifecycleEmission: Sendable, Equatable {
+    public let operationID: String
+
+    public init(operationID: String) {
+        self.operationID = operationID
+    }
+}
+
 /// Durable permanent-deletion stages. Each transition represents an external
 /// side effect which cannot be enclosed in the control.sqlite transaction.
 /// Callers may advance only one stage at a time and finalization is legal only
@@ -1245,6 +1256,7 @@ public protocol AccountControlStore: Sendable {
         did: String,
         to status: AccountControlStatus,
         declaration: AccountLifecycleDeclaration,
+        emitting: AccountLifecycleEmission?,
         now: Date
     ) async throws -> AccountControlAccount
     func associateEmail(did: String, email: AccountEmailAddress, now: Date) async throws
@@ -1386,6 +1398,19 @@ public protocol AccountControlKeyRotationStore: AccountControlStore {
 }
 
 public extension AccountControlStore {
+    /// Transitions without requesting public lifecycle emission. Stores that
+    /// wire lifecycle emission may add the `emitting:` requirement; this
+    /// overload preserves the legacy four-argument call shape.
+    func transitionStatus(
+        did: String,
+        to status: AccountControlStatus,
+        declaration: AccountLifecycleDeclaration = .init(),
+        now: Date = Date()
+    ) async throws -> AccountControlAccount {
+        try await transitionStatus(
+            did: did, to: status, declaration: declaration, emitting: nil, now: now
+        )
+    }
     /// Stores that predate the startup inventory capability must fail closed:
     /// a service must never infer an account-database location by probing a
     /// request's authority DID.

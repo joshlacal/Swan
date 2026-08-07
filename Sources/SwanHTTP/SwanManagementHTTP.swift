@@ -139,6 +139,7 @@ public struct SwanManagementHTTPServer: Sendable {
         plcProvisioning: (any SwanManagementPLCProvisioning)? = nil,
         permanentDeletionCoordinator:
             (any AccountPermanentDeletionCoordinating)? = nil,
+        lifecycleEmitter: (any PublicLifecycleEventEmitting)? = nil,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .managementProcessShared,
         rejectedBodyAdmission: PublicRepositoryJSONWriteAdmission = .managementRejectedProcessShared,
         jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy = .productionDefault
@@ -147,7 +148,8 @@ public struct SwanManagementHTTPServer: Sendable {
         accounts = AccountOperatorService(
             store: controlStore,
             permanentDeletionCoordinator:
-                permanentDeletionCoordinator
+                permanentDeletionCoordinator,
+            lifecycleEmitter: lifecycleEmitter
         )
         self.operatorSecretVerifier = operatorSecretVerifier
         self.plcProvisioning = plcProvisioning

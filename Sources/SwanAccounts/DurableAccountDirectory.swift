@@ -323,12 +323,14 @@ public actor DurableAccountDirectory {
         did: String,
         to status: AccountControlStatus,
         declaration: AccountLifecycleDeclaration = .init(),
+        emitting: AccountLifecycleEmission? = nil,
         now: Date = Date()
     ) async throws -> AccountControlAccount {
         try await store.transitionStatus(
             did: AccountIdentifiers.validateDID(did),
             to: status,
             declaration: declaration,
+            emitting: emitting,
             now: now
         )
     }

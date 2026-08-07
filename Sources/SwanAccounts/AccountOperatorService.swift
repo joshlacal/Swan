@@ -293,14 +293,17 @@ public struct AccountOperatorService: Sendable {
     private let store: any AccountControlStore
     private let permanentDeletionCoordinator:
         (any AccountPermanentDeletionCoordinating)?
+    private let lifecycleEmitter: (any PublicLifecycleEventEmitting)?
 
     public init(
         store: any AccountControlStore,
         permanentDeletionCoordinator:
-            (any AccountPermanentDeletionCoordinating)? = nil
+            (any AccountPermanentDeletionCoordinating)? = nil,
+        lifecycleEmitter: (any PublicLifecycleEventEmitting)? = nil
     ) {
         self.store = store
         self.permanentDeletionCoordinator = permanentDeletionCoordinator
+        self.lifecycleEmitter = lifecycleEmitter
     }
 
     /// Read-only lookup is intentionally separate from lifecycle authority.
@@ -324,10 +327,12 @@ public struct AccountOperatorService: Sendable {
         authorization: AccountOperatorAuthorization,
         now: Date = Date()
     ) async throws -> AccountOperatorView {
-        try await transition(
+        let operationID = UUID().uuidString.lowercased()
+        return try await transition(
             did: did,
             to: .deactivated,
             declaration: .init(),
+            emitting: .init(operationID: operationID),
             authorization: authorization,
             now: now
         )
@@ -338,13 +343,27 @@ public struct AccountOperatorService: Sendable {
         authorization: AccountOperatorAuthorization,
         now: Date = Date()
     ) async throws -> AccountOperatorView {
-        try await transition(
+        let operationID = UUID().uuidString.lowercased()
+        let view = try await transition(
             did: did,
             to: .active,
             declaration: .init(),
+            emitting: .init(operationID: operationID),
             authorization: authorization,
             now: now
         )
+        if let lifecycleEmitter {
+            // The #account(active) batch commits inside the status-write
+            // transaction above; this follow-up announces the current public
+            // head. A retry after a failed emission never duplicates the
+            // batch (the second transition is same-status and emits nothing),
+            // and a repeated #sync is a benign re-announcement of the same
+            // head rather than a second state change.
+            try await lifecycleEmitter.emitReactivationSync(
+                did: did, operationID: operationID, now: now
+            )
+        }
+        return view
     }
 
     public func delete(
@@ -417,6 +436,7 @@ public struct AccountOperatorService: Sendable {
                     reference: manifestReference
                 )
             ),
+            emitting: nil,
             authorization: authorization,
             now: now
         )
@@ -426,6 +446,7 @@ public struct AccountOperatorService: Sendable {
         did: String,
         to status: AccountControlStatus,
         declaration: AccountLifecycleDeclaration,
+        emitting: AccountLifecycleEmission?,
         authorization: AccountOperatorAuthorization,
         now: Date
     ) async throws -> AccountOperatorView {
@@ -437,6 +458,7 @@ public struct AccountOperatorService: Sendable {
                 did: AccountIdentifiers.validateDID(did),
                 to: status,
                 declaration: declaration,
+                emitting: emitting,
                 now: now
             )
             return AccountOperatorView(account: account)

@@ -512,6 +512,7 @@ private actor LoginShapeAccountStore: AccountControlStore {
         did _: String,
         to _: AccountControlStatus,
         declaration _: AccountLifecycleDeclaration,
+        emitting _: AccountLifecycleEmission?,
         now _: Date
     ) async throws -> AccountControlAccount {
         throw AccountControlStoreError.unavailable

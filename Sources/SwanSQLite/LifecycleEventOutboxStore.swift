@@ -58,102 +58,121 @@ extension SQLiteControlDatabase {
     for (index, item) in items.enumerated() {
       try validateLifecycleItem(item, ordinal: index)
     }
+    return try await withConnectionGate {
+      try await transaction {
+        try await enqueueLifecycleEventBatchInTransaction(
+          did: did,
+          operationID: operationID,
+          items: items,
+          now: now
+        )
+      }
+    }
+  }
+
+  /// The transactional half of `enqueueLifecycleEventBatch`. The caller must
+  /// already hold the connection gate and an open control transaction (the
+  /// public wrapper, or the lifecycle-write transaction of a status change
+  /// which must commit or roll back atomically with the batch). Item count and
+  /// shape are validated by the public wrapper before the gate.
+  func enqueueLifecycleEventBatchInTransaction(
+    did: String,
+    operationID: String,
+    items: [LifecycleEventItem],
+    now: Date
+  ) async throws -> LifecycleEventBatch {
     let createdAt = Int64(try lifecycleTimestamp(now))
     let batchID = PublicFirehoseSourceKey.lifecycleBatch(
       did: did,
       operationID: operationID
     )
-    return try await withConnectionGate {
-      try await transaction {
-        let existing = try await connection.query(
-          """
-          SELECT batch_id, did, generation, created_at
-          FROM lifecycle_event_batches
-          WHERE batch_id = ?
-          """,
-          [.text(batchID)]
-        )
-        if let row = existing.first {
-          let stored = try decodeLifecycleBatchHeader(row)
-          let storedItems = try await lifecycleItems(for: batchID)
-          guard stored.did == did,
-                storedItems == items else {
-            throw LifecycleEventOutboxError.conflictingBatch(batchID)
-          }
-          return LifecycleEventBatch(
-            batchID: batchID,
-            did: stored.did,
-            generation: stored.generation,
-            createdAt: stored.createdAt,
-            items: storedItems
-          )
-        }
+    let existing = try await connection.query(
+      """
+      SELECT batch_id, did, generation, created_at
+      FROM lifecycle_event_batches
+      WHERE batch_id = ?
+      """,
+      [.text(batchID)]
+    )
+    if let row = existing.first {
+      let stored = try decodeLifecycleBatchHeader(row)
+      let storedItems = try await lifecycleItems(for: batchID)
+      guard stored.did == did,
+            storedItems == items else {
+        throw LifecycleEventOutboxError.conflictingBatch(batchID)
+      }
+      return LifecycleEventBatch(
+        batchID: batchID,
+        did: stored.did,
+        generation: stored.generation,
+        createdAt: stored.createdAt,
+        items: storedItems
+      )
+    }
 
-        let generationRows = try await connection.query(
+    let generationRows = try await connection.query(
+      """
+      INSERT INTO account_lifecycle_generation(did, generation)
+      VALUES (?, 1)
+      ON CONFLICT(did) DO UPDATE SET generation = generation + 1
+      RETURNING generation
+      """,
+      [.text(did)]
+    )
+    guard generationRows.count == 1,
+          case let .integer(generation)? = generationRows.first?
+            .column("generation"),
+          generation >= 1 else {
+      throw LifecycleEventOutboxError.corruptState(
+        "lifecycle generation allocation returned an invalid value"
+      )
+    }
+    let storedGeneration = Int64(generation)
+    do {
+      _ = try await connection.query(
+        """
+        INSERT INTO lifecycle_event_batches(
+            batch_id, did, generation, created_at
+        ) VALUES (?, ?, ?, ?)
+        """,
+        [
+          .text(batchID),
+          .text(did),
+          .integer(Int(storedGeneration)),
+          .integer(Int(createdAt)),
+        ]
+      )
+    } catch {
+      throw LifecycleEventOutboxError.conflictingBatch(batchID)
+    }
+    for (ordinal, item) in items.enumerated() {
+      do {
+        _ = try await connection.query(
           """
-          INSERT INTO account_lifecycle_generation(did, generation)
-          VALUES (?, 1)
-          ON CONFLICT(did) DO UPDATE SET generation = generation + 1
-          RETURNING generation
+          INSERT INTO lifecycle_event_items(
+              batch_id, batch_ordinal, source_key, kind, payload, car_bytes
+          ) VALUES (?, ?, ?, ?, ?, ?)
           """,
-          [.text(did)]
+          [
+            .text(batchID),
+            .integer(ordinal),
+            .text(item.sourceKey),
+            .text(item.kind.rawValue),
+            item.payload.sqliteData!,
+            item.carBytes?.sqliteData ?? SQLiteData.null,
+          ]
         )
-        guard generationRows.count == 1,
-              case let .integer(generation)? = generationRows.first?
-                .column("generation"),
-              generation >= 1 else {
-          throw LifecycleEventOutboxError.corruptState(
-            "lifecycle generation allocation returned an invalid value"
-          )
-        }
-        let storedGeneration = Int64(generation)
-        do {
-          _ = try await connection.query(
-            """
-            INSERT INTO lifecycle_event_batches(
-                batch_id, did, generation, created_at
-            ) VALUES (?, ?, ?, ?)
-            """,
-            [
-              .text(batchID),
-              .text(did),
-              .integer(Int(storedGeneration)),
-              .integer(Int(createdAt)),
-            ]
-          )
-        } catch {
-          throw LifecycleEventOutboxError.conflictingBatch(batchID)
-        }
-        for (ordinal, item) in items.enumerated() {
-          do {
-            _ = try await connection.query(
-              """
-              INSERT INTO lifecycle_event_items(
-                  batch_id, batch_ordinal, source_key, kind, payload, car_bytes
-              ) VALUES (?, ?, ?, ?, ?, ?)
-              """,
-              [
-                .text(batchID),
-                .integer(ordinal),
-                .text(item.sourceKey),
-                .text(item.kind.rawValue),
-                item.payload.sqliteData!,
-                item.carBytes?.sqliteData ?? SQLiteData.null,
-              ]
-            )
-          } catch {
-            throw LifecycleEventOutboxError.conflictingBatch(batchID)
-          }
-        }
-        return LifecycleEventBatch(
-          batchID: batchID,
-          did: did,
-          generation: storedGeneration,
-          createdAt: createdAt,
-          items: items
-        )
+      } catch {
+        throw LifecycleEventOutboxError.conflictingBatch(batchID)
       }
     }
+    return LifecycleEventBatch(
+      batchID: batchID,
+      did: did,
+      generation: storedGeneration,
+      createdAt: createdAt,
+      items: items
+    )
   }
 
   public func currentLifecycleGeneration(did: String) async throws -> Int64 {

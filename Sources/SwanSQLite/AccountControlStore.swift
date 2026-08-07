@@ -1,6 +1,7 @@
 import Foundation
 import SQLiteNIO
 import SwanCore
+import SwanPublicFirehose
 import SwanStorage
 
 extension SQLiteControlDatabase {
@@ -2238,6 +2239,7 @@ extension SQLiteControlDatabase {
         did: String,
         to status: AccountControlStatus,
         declaration: AccountLifecycleDeclaration,
+        emitting: AccountLifecycleEmission?,
         now: Date
     ) async throws -> AccountControlAccount {
         guard AccountControlIdentifiers.isDID(did) else {
@@ -2342,8 +2344,61 @@ extension SQLiteControlDatabase {
                         )
                     }
                 }
+                if let emitting,
+                   account.status != status,
+                   let material = Self.publicAccountMaterial(
+                       did: did,
+                       status: status,
+                       time: PublicFirehoseTime.encode(now)
+                   ) {
+                    // The batch commits or rolls back with the status write,
+                    // so a failed transition can never leave an #account
+                    // announcement for a status the account never reached.
+                    let item = LifecycleEventItem(
+                        sourceKey: PublicFirehoseSourceKey.account(
+                            did: did,
+                            operationID: emitting.operationID
+                        ),
+                        kind: .account,
+                        payload: try JSONEncoder().encode(material),
+                        carBytes: nil
+                    )
+                    _ = try await enqueueLifecycleEventBatchInTransaction(
+                        did: did,
+                        operationID: emitting.operationID,
+                        items: [item],
+                        now: now
+                    )
+                }
                 return try await requiredAccount(did: did)
             }
+        }
+    }
+
+    /// Maps an account control status to its public firehose representation.
+    /// `nil` means the status has no public representation and emits nothing.
+    /// `deleting`/`deleted` are policy-unreachable through `transitionStatus`;
+    /// `unknown` has no public counterpart.
+    private static func publicAccountMaterial(
+        did: String,
+        status: AccountControlStatus,
+        time: String
+    ) -> PublicFirehoseAccountMaterial? {
+        switch status {
+        case .active:
+            return .init(did: did, active: true, status: nil, time: time)
+        case .deactivated:
+            return .init(did: did, active: false, status: .deactivated, time: time)
+        case .suspended:
+            return .init(did: did, active: false, status: .suspended, time: time)
+        case .takendown:
+            return .init(did: did, active: false, status: .takendown, time: time)
+        case .desynchronized:
+            return .init(did: did, active: false, status: .desynchronized, time: time)
+        case .throttled:
+            return .init(did: did, active: false, status: .throttled, time: time)
+        case .deleting, .deleted, .unknown:
+            return nil
         }
     }
 

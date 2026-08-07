@@ -1216,12 +1216,14 @@ private struct FinalizationGatedAccountControlStore: AccountControlStore {
         did: String,
         to status: AccountControlStatus,
         declaration: AccountLifecycleDeclaration,
+        emitting: AccountLifecycleEmission?,
         now: Date
     ) async throws -> AccountControlAccount {
         try await base.transitionStatus(
             did: did,
             to: status,
             declaration: declaration,
+            emitting: emitting,
             now: now
         )
     }

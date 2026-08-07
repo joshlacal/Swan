@@ -1,5 +1,6 @@
 import Foundation
 @testable import SwanAccounts
+import SwanPublicFirehose
 import SwanSQLite
 import SwanStorage
 import XCTest
@@ -313,6 +314,79 @@ final class AccountOperatorServiceTests: XCTestCase {
         }
     }
 
+    func testDeactivateAndReactivateEmitAccountBatchesAndReactivationSync() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        do {
+            try await createAlice(in: control)
+            let emitter = RecordingLifecycleEmitter()
+            let service = AccountOperatorService(
+                store: control,
+                lifecycleEmitter: emitter
+            )
+            let authorization = try OperatorSecretResolver.authorize(
+                environment: ["SWAN_OPERATOR_SECRET": "operator-secret"],
+                secretFile: nil
+            )
+
+            let deactivated = try await service.deactivate(
+                did: Self.aliceDID,
+                authorization: authorization,
+                now: Date(timeIntervalSince1970: 1_750_000_010)
+            )
+            XCTAssertEqual(deactivated.status, "deactivated")
+            let deactivationPending = try await control.nextPendingLifecycleBatch(
+                did: Self.aliceDID
+            )
+            let deactivationBatch = try XCTUnwrap(deactivationPending)
+            XCTAssertEqual(deactivationBatch.items.count, 1)
+            XCTAssertEqual(deactivationBatch.items[0].kind, .account)
+            let deactivationMaterial = try JSONDecoder().decode(
+                PublicFirehoseAccountMaterial.self,
+                from: deactivationBatch.items[0].payload
+            )
+            XCTAssertFalse(deactivationMaterial.active)
+            XCTAssertEqual(deactivationMaterial.status, .deactivated)
+            _ = try await control.completeLifecycleBatch(
+                batchID: deactivationBatch.batchID
+            )
+
+            let reactivated = try await service.reactivate(
+                did: Self.aliceDID,
+                authorization: authorization,
+                now: Date(timeIntervalSince1970: 1_750_000_020)
+            )
+            XCTAssertEqual(reactivated.status, "active")
+            let reactivationPending = try await control.nextPendingLifecycleBatch(
+                did: Self.aliceDID
+            )
+            let reactivationBatch = try XCTUnwrap(reactivationPending)
+            XCTAssertEqual(reactivationBatch.items.count, 1)
+            let reactivationMaterial = try JSONDecoder().decode(
+                PublicFirehoseAccountMaterial.self,
+                from: reactivationBatch.items[0].payload
+            )
+            XCTAssertTrue(reactivationMaterial.active)
+            XCTAssertNil(reactivationMaterial.status)
+
+            let syncCalls = await emitter.reactivationSyncCalls()
+            XCTAssertEqual(syncCalls.count, 1)
+            XCTAssertEqual(syncCalls.first?.did, Self.aliceDID)
+            XCTAssertEqual(
+                syncCalls.first?.now,
+                Date(timeIntervalSince1970: 1_750_000_020)
+            )
+            let operationID = try XCTUnwrap(syncCalls.first?.operationID)
+            XCTAssertEqual(operationID, operationID.lowercased())
+            XCTAssertFalse(operationID.isEmpty)
+            try await control.close()
+        } catch {
+            try? await control.close()
+            throw error
+        }
+    }
+
     private func createAlice(in control: SQLiteControlDatabase) async throws {
         _ = try await control.createAccount(
             AccountControlRegistration(
@@ -372,5 +446,42 @@ private actor RecordingPermanentDeletionCoordinator:
 
     func recordedRequests() -> [PermanentDeletionRequest] {
         requests
+    }
+}
+
+private struct RecordedReactivationSync: Sendable, Equatable {
+    let did: String
+    let operationID: String
+    let now: Date
+}
+
+private actor RecordingLifecycleEmitter: PublicLifecycleEventEmitting {
+    private var reactivationSyncs: [RecordedReactivationSync] = []
+
+    func emitActivation(
+        did: String,
+        operationID: String,
+        plcOperationCID: String,
+        handle: String?,
+        now: Date
+    ) async throws {}
+
+    func emitRotationIdentity(
+        did: String,
+        plcOperationCID: String,
+        handle: String?,
+        now: Date
+    ) async throws {}
+
+    func emitReactivationSync(did: String, operationID: String, now: Date) async throws {
+        reactivationSyncs.append(
+            RecordedReactivationSync(did: did, operationID: operationID, now: now)
+        )
+    }
+
+    func emitManualSync(did: String, requestUUID: String, now: Date) async throws {}
+
+    func reactivationSyncCalls() -> [RecordedReactivationSync] {
+        reactivationSyncs
     }
 }
