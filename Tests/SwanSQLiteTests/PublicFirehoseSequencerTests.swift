@@ -2,6 +2,7 @@ import Foundation
 import Petrel
 import SwanCore
 import SwanPublicFirehose
+import SwanStorage
 import XCTest
 @testable import SwanSQLite
 
@@ -43,6 +44,10 @@ final class PublicFirehoseSequencerTests: XCTestCase {
   private let didB = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
   private let epoch = Date(timeIntervalSince1970: 1_785_844_800)
   private let time = "2026-08-04T12:00:00.000Z"
+  private let verifier =
+    "$argon2id$v=19$m=65536,t=2,p=1$initialsalt$initial-precomputed-verifier"
+  private let genesisCID =
+    "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
   private static let payloadEncoder: JSONEncoder = {
     let encoder = JSONEncoder()
@@ -102,6 +107,28 @@ final class PublicFirehoseSequencerTests: XCTestCase {
         initialFailureBackoff: 1,
         maximumFailureBackoff: 60
       )
+    )
+  }
+
+  private func registration(
+    did: String,
+    handle: String,
+    createdAt: Date
+  ) throws -> AccountControlRegistration {
+    try AccountControlRegistration(
+      did: did,
+      canonicalHandle: handle,
+      passwordVerifier: verifier,
+      signingKey: AccountControlKeyReference(
+        purpose: .signing,
+        generation: 3
+      ),
+      rotationKey: AccountControlKeyReference(
+        purpose: .rotation,
+        generation: 3
+      ),
+      publicGenesisCommitCID: genesisCID,
+      createdAt: createdAt
     )
   }
 
@@ -658,5 +685,38 @@ final class PublicFirehoseSequencerTests: XCTestCase {
     XCTAssertEqual(events.map(\.did), [didA, didA])
     let maxSeq = try await firehose.maxSequencedSeq()
     XCTAssertEqual(maxSeq, 3)
+  }
+
+  func testRealBeginDeletionEmitsDeletedAccountAndPrunesPriorHistory() async throws {
+    let sequencer = try makeSequencer()
+    _ = try await control.createAccount(
+      try registration(
+        did: didA,
+        handle: "delete-me.example.com",
+        createdAt: epoch
+      )
+    )
+    _ = try await enqueueCommit(database: accountA, did: didA, generation: 0, seed: 0x01)
+    _ = try await enqueueCommit(database: accountA, did: didA, generation: 0, seed: 0x02)
+    _ = try await enqueueCommit(database: accountB, did: didB, generation: 0, seed: 0x03)
+    let firstDrain = try await sequencer.drainAll(now: epoch)
+    XCTAssertEqual(firstDrain, 3)
+
+    _ = try await control.beginDeletion(did: didA, declaration: .init(), now: epoch)
+    let secondDrain = try await sequencer.drainAll(now: epoch)
+    XCTAssertEqual(secondDrain, 1)
+
+    let events = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(events.map(\.seq), [2, 4])
+    XCTAssertEqual(events.map(\.did), [didB, didA])
+    XCTAssertEqual(events.last?.kind, .account)
+    XCTAssertFalse(
+      events.contains { $0.did == didA && $0.kind == .commit },
+      "didA's earlier commits must be pruned by the real deletion"
+    )
+    let maxSeq = try await firehose.maxSequencedSeq()
+    XCTAssertEqual(maxSeq, 4)
+    let pendingBatch = try await control.nextPendingLifecycleBatch(did: didA)
+    XCTAssertNil(pendingBatch)
   }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import SQLiteNIO
+import SwanPublicFirehose
 @testable import SwanSQLite
 import SwanStorage
 import XCTest
@@ -250,6 +251,42 @@ final class AccountPermanentDeletionSQLiteTests: XCTestCase {
         XCTAssertTrue(keys.stagingKeyBindings.isEmpty)
         XCTAssertNil(keys.rotationKey)
         try await reopened.close()
+    }
+
+    func testBeginDeletionEnqueuesDeletedAccountBatchInScrubTransaction() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { try? await database.close() }
+        let createdAt = Date(timeIntervalSince1970: 1_750_000_100)
+        _ = try await database.createAccount(
+            try registration(
+                did: did,
+                handle: "delete-me.example.com",
+                createdAt: createdAt
+            )
+        )
+        _ = try await database.beginDeletion(
+            did: did,
+            declaration: .init(),
+            now: createdAt
+        )
+        let pending = try await database.nextPendingLifecycleBatch(did: did)
+        let batch = try XCTUnwrap(pending)
+        XCTAssertEqual(batch.items.count, 1)
+        XCTAssertEqual(
+            batch.items[0].sourceKey,
+            PublicFirehoseSourceKey.account(
+                did: did,
+                operationID: "permanent-deletion"
+            )
+        )
+        let material = try JSONDecoder().decode(
+            PublicFirehoseAccountMaterial.self,
+            from: batch.items[0].payload
+        )
+        XCTAssertFalse(material.active)
+        XCTAssertEqual(material.status, .deleted)
     }
 
     func testDeletionStagesAreOrderedMonotonicAndFinalizeToMinimalTombstone() async throws {

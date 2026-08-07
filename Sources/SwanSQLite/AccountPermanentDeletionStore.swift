@@ -1,5 +1,6 @@
 import Foundation
 import SQLiteNIO
+import SwanPublicFirehose
 import SwanStorage
 
 extension SQLiteControlDatabase: AccountDeletionControlStore {
@@ -688,6 +689,36 @@ extension SQLiteControlDatabase: AccountDeletionControlStore {
               let job = try await deletionJobLocked(did: did) else {
             throw AccountDeletionStoreError.conflict
         }
+        // Announce the deletion in the same transaction as the scrub: the
+        // batch is DID-namespaced and `beginDeletion` runs at most once per
+        // DID, so the constant operation ID is safe. The firehose sequencer's
+        // `deleted` marker derivation prunes this DID's prior retained
+        // history atomically with the append.
+        let deletionTime = Date(
+            timeIntervalSince1970: Double(timestamp) / 1_000_000
+        )
+        _ = try await enqueueLifecycleEventBatchInTransaction(
+            did: did,
+            operationID: "permanent-deletion",
+            items: [
+                LifecycleEventItem(
+                    sourceKey: PublicFirehoseSourceKey.account(
+                        did: did, operationID: "permanent-deletion"
+                    ),
+                    kind: .account,
+                    payload: try JSONEncoder().encode(
+                        PublicFirehoseAccountMaterial(
+                            did: did,
+                            active: false,
+                            status: .deleted,
+                            time: PublicFirehoseTime.encode(deletionTime)
+                        )
+                    ),
+                    carBytes: nil
+                )
+            ],
+            now: deletionTime
+        )
         return job
     }
 
