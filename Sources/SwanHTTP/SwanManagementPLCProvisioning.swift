@@ -1,6 +1,7 @@
 import Foundation
 import SwanAccounts
 import SwanSQLite
+import SwanStorage
 
 public struct SwanManagementPLCPrepareInput: Sendable {
     public let requestID: String
@@ -166,19 +167,22 @@ public actor SwanManagementPLCProvisioningRuntime:
     private let keyStore: FileAccountKeyStore
     private let directory: DurableAccountDirectory
     private let liveAccountDirectory: SQLitePreMigratedAccountDirectory?
+    private let lifecycleEmitter: (any PublicLifecycleEventEmitting)?
     private var inFlightActivations: [String: InFlightActivation] = [:]
 
     public init(
         controlDatabase: SQLiteControlDatabase,
         dataDirectory: URL,
         keyStore: FileAccountKeyStore,
-        liveAccountDirectory: SQLitePreMigratedAccountDirectory? = nil
+        liveAccountDirectory: SQLitePreMigratedAccountDirectory? = nil,
+        lifecycleEmitter: (any PublicLifecycleEventEmitting)? = nil
     ) throws {
         let passwordHasher = try LibsodiumArgon2idHasher()
         self.controlDatabase = controlDatabase
         opener = SQLitePLCAccountPreparationStoreOpener(dataDirectory: dataDirectory)
         self.keyStore = keyStore
         self.liveAccountDirectory = liveAccountDirectory
+        self.lifecycleEmitter = lifecycleEmitter
         directory = DurableAccountDirectory(
             store: controlDatabase,
             passwordHasher: passwordHasher,
@@ -257,7 +261,8 @@ public actor SwanManagementPLCProvisioningRuntime:
             keyStore: keyStore,
             plcClient: try PLCDirectoryClient(configuration: input.plcConfiguration),
             handleVerifier: handleVerifier,
-            directory: directory
+            directory: directory,
+            lifecycleEmitter: lifecycleEmitter
         )
         let installation = try await service.activate(
             requestID: input.requestID,

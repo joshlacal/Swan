@@ -25,6 +25,7 @@ public actor PLCAccountActivationService {
     private let handleVerifier: any PLCHandleVerifying
     private let directory: DurableAccountDirectory
     private let hooks: PLCAccountActivationHooks
+    private let lifecycleEmitter: (any PublicLifecycleEventEmitting)?
 
     public init(
         intentStore: any PLCAccountPreparationIntentStore,
@@ -32,7 +33,8 @@ public actor PLCAccountActivationService {
         keyStore: any AccountKeyStore,
         plcClient: any PLCClient,
         handleVerifier: any PLCHandleVerifying,
-        directory: DurableAccountDirectory
+        directory: DurableAccountDirectory,
+        lifecycleEmitter: (any PublicLifecycleEventEmitting)? = nil
     ) {
         self.intentStore = intentStore
         self.accountStoreOpener = accountStoreOpener
@@ -40,6 +42,7 @@ public actor PLCAccountActivationService {
         self.plcClient = plcClient
         self.handleVerifier = handleVerifier
         self.directory = directory
+        self.lifecycleEmitter = lifecycleEmitter
         hooks = .init()
     }
 
@@ -50,7 +53,8 @@ public actor PLCAccountActivationService {
         plcClient: any PLCClient,
         handleVerifier: any PLCHandleVerifying,
         directory: DurableAccountDirectory,
-        hooks: PLCAccountActivationHooks
+        hooks: PLCAccountActivationHooks,
+        lifecycleEmitter: (any PublicLifecycleEventEmitting)? = nil
     ) {
         self.intentStore = intentStore
         self.accountStoreOpener = accountStoreOpener
@@ -59,6 +63,7 @@ public actor PLCAccountActivationService {
         self.handleVerifier = handleVerifier
         self.directory = directory
         self.hooks = hooks
+        self.lifecycleEmitter = lifecycleEmitter
     }
 
     public func activate(
@@ -141,6 +146,22 @@ public actor PLCAccountActivationService {
             }
         } catch {
             throw PLCAccountActivationError.unavailable
+        }
+        // Durable announcement happens before the registration hook so a
+        // completed activation always reaches the public firehose even when a
+        // later hook fails. A thrown emission error fails `activate`; the
+        // documented exact-retry convergence re-runs install idempotently and
+        // re-emits idempotently (source-key dedupe), so this is the saga
+        // recovery path: a retry converges without duplicate generations or
+        // rows.
+        if let lifecycleEmitter {
+            try await lifecycleEmitter.emitActivation(
+                did: installation.account.did,
+                operationID: intent.requestID,
+                plcOperationCID: intent.operationCID,
+                handle: installation.account.canonicalHandle,
+                now: now
+            )
         }
         do {
             try await hooks.afterRegistration?()

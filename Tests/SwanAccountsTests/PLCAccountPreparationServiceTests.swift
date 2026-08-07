@@ -3,6 +3,7 @@ import Foundation
 import SQLiteNIO
 @testable import SwanAccounts
 import SwanCore
+import SwanPublicFirehose
 import SwanPublicRepository
 @testable import SwanSQLite
 import SwanStorage
@@ -679,6 +680,86 @@ final class PLCAccountActivationServiceTests: XCTestCase {
         try await fixture.close()
     }
 
+    /// A completed activation wired with the durable lifecycle emitter
+    /// enqueues the [#identity, #account(active)] batch in the control store
+    /// and the barriered activation #sync in the account outbox.
+    func testActivationEmitsLifecycleBatchAndBarrieredHeadSyncWhenEmitterIsWired() async throws {
+        let fixture = try await ActivationFixture(requestID: "activate-emitter")
+        defer { fixture.removeFiles() }
+        let store = try await fixture.preparation.opener
+            .openPLCAccountPreparationStore(did: fixture.identity.did)
+        let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
+        let emitter = SQLitePublicLifecycleEmitter(
+            control: fixture.preparation.control,
+            accounts: ActivationFixtureAccountSource(
+                accounts: [
+                    PublicFirehoseAccountDatabase(
+                        did: fixture.identity.did,
+                        database: database
+                    ),
+                ]
+            )
+        )
+        _ = try await fixture.activation(lifecycleEmitter: emitter).activate(
+            requestID: "activate-emitter",
+            password: "emitter-password"
+        )
+        let pendingBatch = try await fixture.preparation.control
+            .nextPendingLifecycleBatch(did: fixture.identity.did)
+        let batch = try XCTUnwrap(pendingBatch)
+        XCTAssertEqual(batch.generation, 1)
+        XCTAssertEqual(batch.items.map(\.kind), [.identity, .account])
+        XCTAssertEqual(
+            batch.items[0].sourceKey,
+            PublicFirehoseSourceKey.identity(
+                did: fixture.identity.did,
+                plcOperationCID: fixture.identity.plcOperationCID
+            )
+        )
+        XCTAssertEqual(
+            batch.items[1].sourceKey,
+            PublicFirehoseSourceKey.account(
+                did: fixture.identity.did,
+                operationID: "activate-emitter"
+            )
+        )
+        let identityMaterial = try JSONDecoder().decode(
+            PublicFirehoseIdentityMaterial.self,
+            from: batch.items[0].payload
+        )
+        XCTAssertEqual(identityMaterial.did, fixture.identity.did)
+        XCTAssertEqual(identityMaterial.handle, "activation.example.org")
+        let accountMaterial = try JSONDecoder().decode(
+            PublicFirehoseAccountMaterial.self,
+            from: batch.items[1].payload
+        )
+        XCTAssertEqual(accountMaterial.active, true)
+        XCTAssertNil(accountMaterial.status)
+        let pendingSync = try await database.oldestPendingPublicFirehoseOutbox()
+        let sync = try XCTUnwrap(pendingSync)
+        XCTAssertEqual(sync.kind, .sync)
+        XCTAssertEqual(sync.lifecycleGeneration, batch.generation)
+        XCTAssertEqual(
+            sync.sourceKey,
+            PublicFirehoseSourceKey.syncActivation(
+                did: fixture.identity.did,
+                operationID: "activate-emitter"
+            )
+        )
+        XCTAssertFalse(sync.carBytes.isEmpty)
+        let syncMaterial = try JSONDecoder().decode(
+            PublicFirehoseSyncMaterial.self,
+            from: sync.payload
+        )
+        XCTAssertEqual(syncMaterial.did, fixture.identity.did)
+        XCTAssertEqual(syncMaterial.rev, fixture.identity.repositoryRevision)
+        XCTAssertEqual(
+            syncMaterial.commitCID,
+            fixture.identity.publicGenesisCommitCID
+        )
+        try await fixture.close()
+    }
+
     func testBadPasswordAndDuplicateHandleFailWithoutSecondAccount() async throws {
         let badPassword = try await ActivationFixture(requestID: "activate-password")
         defer { badPassword.removeFiles() }
@@ -980,6 +1061,14 @@ final class PLCAccountActivationServiceTests: XCTestCase {
     }
 }
 
+private struct ActivationFixtureAccountSource: PublicFirehoseAccountDatabaseSource {
+    let accounts: [PublicFirehoseAccountDatabase]
+
+    func publicFirehoseAccountDatabases() async throws -> [PublicFirehoseAccountDatabase] {
+        accounts
+    }
+}
+
 private final class ActivationFixture: @unchecked Sendable {
     let preparation: PreparationFixture
     let identity: PreparedPLCAccountIdentity
@@ -1011,14 +1100,20 @@ private final class ActivationFixture: @unchecked Sendable {
     }
 
     func activation(
-        hooks: PLCAccountActivationHooks = .init()
+        hooks: PLCAccountActivationHooks = .init(),
+        lifecycleEmitter: (any PublicLifecycleEventEmitting)? = nil
     ) -> PLCAccountActivationService {
-        activation(handleVerifier: verifier, hooks: hooks)
+        activation(
+            handleVerifier: verifier,
+            hooks: hooks,
+            lifecycleEmitter: lifecycleEmitter
+        )
     }
 
     func activation(
         handleVerifier: any PLCHandleVerifying,
-        hooks: PLCAccountActivationHooks = .init()
+        hooks: PLCAccountActivationHooks = .init(),
+        lifecycleEmitter: (any PublicLifecycleEventEmitting)? = nil
     ) -> PLCAccountActivationService {
         PLCAccountActivationService(
             intentStore: preparation.control,
@@ -1027,7 +1122,8 @@ private final class ActivationFixture: @unchecked Sendable {
             plcClient: preparation.plc,
             handleVerifier: handleVerifier,
             directory: directory,
-            hooks: hooks
+            hooks: hooks,
+            lifecycleEmitter: lifecycleEmitter
         )
     }
 

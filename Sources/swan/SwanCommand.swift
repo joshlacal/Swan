@@ -1843,6 +1843,15 @@ extension SwanCommand {
                     publicIdentityVerifier: SwanPublicPLCGenesisVerifier()
                 )
                 preopenedAccountDirectory = directory
+                // The lifecycle emitter is constructed unconditionally: the
+                // "unconditional enqueue, gated drain" constraint means every
+                // confirmed activation durably enqueues its lifecycle batch
+                // and barriered head sync even when firehose sequencing and
+                // streaming are not enabled.
+                let lifecycleEmitter = SQLitePublicLifecycleEmitter(
+                    control: controlDatabase,
+                    accounts: directory
+                )
                 let localSpaceRuntime: ServeLocalSpaceRuntime?
                 if enableLocalSpaceInterop {
                     do {
@@ -2311,7 +2320,8 @@ extension SwanCommand {
                             controlDatabase: controlDatabase,
                             dataDirectory: dataURL,
                             keyStore: managementKeyStore,
-                            liveAccountDirectory: directory
+                            liveAccountDirectory: directory,
+                            lifecycleEmitter: lifecycleEmitter
                         )
                         preopenedManagementProvisioning = managementPLCProvisioning
                     } catch {
