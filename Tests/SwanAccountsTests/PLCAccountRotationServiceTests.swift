@@ -9,8 +9,58 @@ import XCTest
 
 final class PLCAccountRotationServiceTests: XCTestCase {
     func testRotationPersistsPendingHistoryAndPromotesControlGeneration() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try await fixture.service.rotate(
+            did: fixture.did,
+            now: fixture.now
+        )
+        XCTAssertEqual(result.generation, 2)
+        XCTAssertEqual(result.account.signingKey?.generation, 2)
+        XCTAssertEqual(result.account.rotationKey?.generation, 2)
+        XCTAssertEqual(result.operation.prev, try fixture.genesisCID)
+
+        let reopened = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root, did: fixture.did
+        )
+        let history = try await reopened.publicPLCOperationHistory()
+        XCTAssertEqual(history.count, 2)
+        XCTAssertEqual(history.last?.cid, try result.operation.cid.string)
+        try await reopened.close()
+        try await fixture.opener.close()
+        try await fixture.control.close()
+    }
+
+    func testRotationEmitsIdentityKeyedOnConfirmedOperationBeforePromotion() async throws {
+        let recorder = RecordingLifecycleEmitter()
+        let fixture = try await makeFixture(lifecycleEmitter: recorder)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let rotated = try await fixture.service.rotate(
+            did: fixture.did,
+            now: fixture.now
+        )
+        let emitted = await recorder.snapshot()
+        XCTAssertEqual(emitted.count, 1)
+        XCTAssertEqual(emitted[0].did, fixture.did)
+        XCTAssertEqual(emitted[0].plcOperationCID, try rotated.operation.cid.string)
+        try await fixture.opener.close()
+        try await fixture.control.close()
+    }
+
+    private struct RotationFixture {
+        let root: URL
+        let did: String
+        let now: Date
+        let genesisCID: String
+        let service: PLCAccountRotationService
+        let control: SQLiteControlDatabase
+        let opener: SQLitePLCAccountPreparationStoreOpener
+    }
+
+    private func makeFixture(
+        lifecycleEmitter: (any PublicLifecycleEventEmitting)? = nil
+    ) async throws -> RotationFixture {
         let root = try temporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
         let didHandle = "alice.example.com"
         let pdsOrigin = "https://swan.example"
         let signing = try P256.Signing.PrivateKey(
@@ -122,24 +172,18 @@ final class PLCAccountRotationServiceTests: XCTestCase {
             controlStore: control,
             accountStoreOpener: opener,
             keyStore: keyStore,
-            plcClient: plc
+            plcClient: plc,
+            lifecycleEmitter: lifecycleEmitter
         )
-        let result = try await service.rotate(
+        return RotationFixture(
+            root: root,
             did: did,
-            now: Date(timeIntervalSince1970: 1_750_000_001)
+            now: Date(timeIntervalSince1970: 1_750_000_001),
+            genesisCID: try genesis.cid.string,
+            service: service,
+            control: control,
+            opener: opener
         )
-        XCTAssertEqual(result.generation, 2)
-        XCTAssertEqual(result.account.signingKey?.generation, 2)
-        XCTAssertEqual(result.account.rotationKey?.generation, 2)
-        XCTAssertEqual(result.operation.prev, try genesis.cid.string)
-
-        let reopened = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
-        let history = try await reopened.publicPLCOperationHistory()
-        XCTAssertEqual(history.count, 2)
-        XCTAssertEqual(history.last?.cid, try result.operation.cid.string)
-        try await reopened.close()
-        try await opener.close()
-        try await control.close()
     }
 
     private func temporaryDirectory() throws -> URL {
@@ -151,6 +195,29 @@ final class PLCAccountRotationServiceTests: XCTestCase {
             attributes: [.posixPermissions: 0o700]
         )
         return root
+    }
+}
+
+private actor RecordingLifecycleEmitter: PublicLifecycleEventEmitting {
+    private(set) var rotations: [(did: String, plcOperationCID: String)] = []
+
+    func emitActivation(
+        did: String, operationID: String, plcOperationCID: String,
+        handle: String?, now: Date
+    ) async throws {}
+
+    func emitRotationIdentity(
+        did: String, plcOperationCID: String, handle: String?, now: Date
+    ) async throws {
+        rotations.append((did, plcOperationCID))
+    }
+
+    func emitReactivationSync(did: String, operationID: String, now: Date) async throws {}
+
+    func emitManualSync(did: String, requestUUID: String, now: Date) async throws {}
+
+    func snapshot() -> [(did: String, plcOperationCID: String)] {
+        rotations
     }
 }
 

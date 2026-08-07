@@ -3125,6 +3125,21 @@ extension SwanCommand {
                 let opener = SQLitePLCAccountPreparationStoreOpener(
                     dataDirectory: dataURL
                 )
+                // The lifecycle emitter's account source is the same
+                // startup-validated directory the serve command uses; a
+                // rotation therefore requires every active account database
+                // to be openable and its public identity admission sound.
+                let directory: SQLitePreMigratedAccountDirectory
+                do {
+                    directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+                        dataDirectory: dataURL,
+                        controlStore: control,
+                        publicIdentityVerifier: SwanPublicPLCGenesisVerifier()
+                    )
+                } catch {
+                    try? await control.close()
+                    throw ValidationError("unable to open Swan account directory")
+                }
                 do {
                     let keyStore = try FileAccountKeyStore(
                         root: keyURL,
@@ -3136,16 +3151,22 @@ extension SwanCommand {
                         keyStore: keyStore,
                         plcClient: try PLCDirectoryClient(
                             configuration: plcConfiguration
+                        ),
+                        lifecycleEmitter: SQLitePublicLifecycleEmitter(
+                            control: control,
+                            accounts: directory
                         )
                     )
                     let result = try await service.rotate(did: did)
                     try await opener.close()
+                    try await directory.close()
                     try await control.close()
                     try AccountCommandSupport.write(
                         try RotatedPLCAccountView(result: result)
                     )
                 } catch {
                     try? await opener.close()
+                    try? await directory.close()
                     try? await control.close()
                     throw AccountCommandSupport.validationError(for: error)
                 }

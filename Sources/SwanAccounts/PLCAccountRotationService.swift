@@ -37,17 +37,20 @@ public actor PLCAccountRotationService {
     private let accountStoreOpener: any PLCAccountPreparationAccountStoreOpener
     private let keyStore: any AccountKeyStore
     private let plcClient: any PLCClient
+    private let lifecycleEmitter: (any PublicLifecycleEventEmitting)?
 
     public init(
         controlStore: any AccountControlStore,
         accountStoreOpener: any PLCAccountPreparationAccountStoreOpener,
         keyStore: any AccountKeyStore,
-        plcClient: any PLCClient
+        plcClient: any PLCClient,
+        lifecycleEmitter: (any PublicLifecycleEventEmitting)? = nil
     ) {
         self.controlStore = controlStore
         self.accountStoreOpener = accountStoreOpener
         self.keyStore = keyStore
         self.plcClient = plcClient
+        self.lifecycleEmitter = lifecycleEmitter
     }
 
     public func rotate(
@@ -379,6 +382,14 @@ public actor PLCAccountRotationService {
         request: AccountControlKeyRotationRequest,
         now: Date
     ) async throws -> RotatedPLCAccountIdentity {
+        if let lifecycleEmitter {
+            try await lifecycleEmitter.emitRotationIdentity(
+                did: account.did,
+                plcOperationCID: try operation.cid.string,
+                handle: nil,
+                now: now
+            )
+        }
         guard let rotationStore = controlStore as? any AccountControlKeyRotationStore else {
             throw PLCAccountRotationError.unavailable
         }
