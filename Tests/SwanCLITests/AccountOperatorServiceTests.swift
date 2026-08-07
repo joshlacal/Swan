@@ -378,8 +378,24 @@ final class AccountOperatorServiceTests: XCTestCase {
                 Date(timeIntervalSince1970: 1_750_000_020)
             )
             let operationID = try XCTUnwrap(syncCalls.first?.operationID)
-            XCTAssertEqual(operationID, operationID.lowercased())
-            XCTAssertFalse(operationID.isEmpty)
+            XCTAssertNotNil(UUID(uuidString: operationID))
+            XCTAssertEqual(operationID, UUID(uuidString: operationID)?.uuidString.lowercased())
+            XCTAssertEqual(
+                reactivationBatch.items[0].sourceKey,
+                PublicFirehoseSourceKey.account(did: Self.aliceDID, operationID: operationID)
+            )
+            let deactivationOperationID = try XCTUnwrap(
+                deactivationBatch.items[0].sourceKey.split(separator: "|").last.map(String.init)
+            )
+            XCTAssertNotNil(UUID(uuidString: deactivationOperationID))
+            XCTAssertEqual(
+                deactivationOperationID,
+                UUID(uuidString: deactivationOperationID)?.uuidString.lowercased()
+            )
+            XCTAssertEqual(
+                deactivationBatch.items[0].sourceKey,
+                PublicFirehoseSourceKey.account(did: Self.aliceDID, operationID: deactivationOperationID)
+            )
             try await control.close()
         } catch {
             try? await control.close()

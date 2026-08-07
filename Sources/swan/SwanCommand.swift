@@ -3239,22 +3239,21 @@ extension SwanCommand {
                 let opener = SQLitePLCAccountPreparationStoreOpener(
                     dataDirectory: dataURL
                 )
-                // The lifecycle emitter's account source is the same
-                // startup-validated directory the serve command uses; a
-                // rotation therefore requires every active account database
-                // to be openable and its public identity admission sound.
-                let directory: SQLitePreMigratedAccountDirectory
+                var accountDatabase: SQLiteAccountDatabase?
                 do {
-                    directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+                    guard let account = try await control.account(did: did),
+                          account.status.authorizesAccount else {
+                        throw ValidationError("account is not active: \(did)")
+                    }
+                    // The rotation emitter enqueues a control batch only and
+                    // never reads the account database, so only the target
+                    // account's database is opened; sibling account databases
+                    // cannot block rotation of a healthy DID.
+                    let openedAccount = try await SQLiteAccountDatabase(
                         dataDirectory: dataURL,
-                        controlStore: control,
-                        publicIdentityVerifier: SwanPublicPLCGenesisVerifier()
+                        did: did
                     )
-                } catch {
-                    try? await control.close()
-                    throw ValidationError("unable to open Swan account directory")
-                }
-                do {
+                    accountDatabase = openedAccount
                     let keyStore = try FileAccountKeyStore(
                         root: keyURL,
                         configuration: keyConfiguration
@@ -3268,19 +3267,25 @@ extension SwanCommand {
                         ),
                         lifecycleEmitter: SQLitePublicLifecycleEmitter(
                             control: control,
-                            accounts: directory
+                            accounts: SingleAccountFirehoseSource(
+                                account: PublicFirehoseAccountDatabase(
+                                    did: did,
+                                    database: openedAccount
+                                )
+                            )
                         )
                     )
                     let result = try await service.rotate(did: did)
+                    try await openedAccount.close()
+                    accountDatabase = nil
                     try await opener.close()
-                    try await directory.close()
                     try await control.close()
                     try AccountCommandSupport.write(
                         try RotatedPLCAccountView(result: result)
                     )
                 } catch {
+                    try? await accountDatabase?.close()
                     try? await opener.close()
-                    try? await directory.close()
                     try? await control.close()
                     throw AccountCommandSupport.validationError(for: error)
                 }
