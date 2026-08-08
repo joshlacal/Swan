@@ -686,6 +686,7 @@ final class PLCAccountActivationServiceTests: XCTestCase {
     func testActivationEmitsLifecycleBatchAndBarrieredHeadSyncWhenEmitterIsWired() async throws {
         let fixture = try await ActivationFixture(requestID: "activate-emitter")
         defer { fixture.removeFiles() }
+        let activationTime = Date(timeIntervalSince1970: 1_785_844_800)
         let store = try await fixture.preparation.opener
             .openPLCAccountPreparationStore(did: fixture.identity.did)
         let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
@@ -700,10 +701,25 @@ final class PLCAccountActivationServiceTests: XCTestCase {
                 ]
             )
         )
-        _ = try await fixture.activation(lifecycleEmitter: emitter).activate(
+        let service = fixture.activation(lifecycleEmitter: emitter)
+        let installed = try await service.activate(
             requestID: "activate-emitter",
-            password: "emitter-password"
+            password: "emitter-password",
+            now: activationTime
         )
+        let recovered: LocalAccountInstallation
+        do {
+            recovered = try await service.activate(
+                requestID: "activate-emitter",
+                password: "emitter-password",
+                now: activationTime.addingTimeInterval(60)
+            )
+        } catch {
+            try await fixture.close()
+            throw error
+        }
+        XCTAssertEqual(recovered.account, installed.account)
+        XCTAssertEqual(installed.account.createdAt, activationTime)
         let pendingBatch = try await fixture.preparation.control
             .nextPendingLifecycleBatch(did: fixture.identity.did)
         let batch = try XCTUnwrap(pendingBatch)
@@ -729,12 +745,14 @@ final class PLCAccountActivationServiceTests: XCTestCase {
         )
         XCTAssertEqual(identityMaterial.did, fixture.identity.did)
         XCTAssertEqual(identityMaterial.handle, "activation.example.org")
+        XCTAssertEqual(identityMaterial.time, "2026-08-04T12:00:00.000Z")
         let accountMaterial = try JSONDecoder().decode(
             PublicFirehoseAccountMaterial.self,
             from: batch.items[1].payload
         )
         XCTAssertEqual(accountMaterial.active, true)
         XCTAssertNil(accountMaterial.status)
+        XCTAssertEqual(accountMaterial.time, "2026-08-04T12:00:00.000Z")
         let pendingSync = try await database.oldestPendingPublicFirehoseOutbox()
         let sync = try XCTUnwrap(pendingSync)
         XCTAssertEqual(sync.kind, .sync)
@@ -757,6 +775,7 @@ final class PLCAccountActivationServiceTests: XCTestCase {
             syncMaterial.commitCID,
             fixture.identity.publicGenesisCommitCID
         )
+        XCTAssertEqual(syncMaterial.time, "2026-08-04T12:00:00.000Z")
         try await fixture.close()
     }
 

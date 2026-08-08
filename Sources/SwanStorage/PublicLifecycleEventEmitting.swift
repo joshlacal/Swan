@@ -6,15 +6,18 @@ import Foundation
 public protocol PublicLifecycleEventEmitting: Sendable {
     /// Activation: enqueue the idempotent [#identity, #account(active)]
     /// batch, then the barriered activation #sync announcing the current
-    /// public repository head.
+    /// public repository head. `materialTime` is the installed account's
+    /// durable creation time; `now` is the current enqueue attempt time.
     func emitActivation(
         did: String, operationID: String, plcOperationCID: String,
-        handle: String?, now: Date
+        handle: String?, materialTime: Date, now: Date
     ) async throws
     /// Key rotation: enqueue the idempotent [#identity] batch keyed on the
-    /// confirmed PLC operation CID.
+    /// confirmed PLC operation CID. `materialTime` is the persisted PLC
+    /// history entry creation time; `now` is the current enqueue attempt time.
     func emitRotationIdentity(
-        did: String, plcOperationCID: String, handle: String?, now: Date
+        did: String, plcOperationCID: String, handle: String?,
+        materialTime: Date, now: Date
     ) async throws
     /// Reactivation follow-up: #sync announcing the current public head.
     func emitReactivationSync(did: String, operationID: String, now: Date) async throws

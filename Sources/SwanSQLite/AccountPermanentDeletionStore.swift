@@ -706,7 +706,7 @@ extension SQLiteControlDatabase: AccountDeletionControlStore {
                         did: did, operationID: "permanent-deletion"
                     ),
                     kind: .account,
-                    payload: try JSONEncoder().encode(
+                    payload: try PersistedPublicFirehoseJSON.encode(
                         PublicFirehoseAccountMaterial(
                             did: did,
                             active: false,

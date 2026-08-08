@@ -479,6 +479,7 @@ private actor RecordingLifecycleEmitter: PublicLifecycleEventEmitting {
         operationID: String,
         plcOperationCID: String,
         handle: String?,
+        materialTime: Date,
         now: Date
     ) async throws {}
 
@@ -486,6 +487,7 @@ private actor RecordingLifecycleEmitter: PublicLifecycleEventEmitting {
         did: String,
         plcOperationCID: String,
         handle: String?,
+        materialTime: Date,
         now: Date
     ) async throws {}
 

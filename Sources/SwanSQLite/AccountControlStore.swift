@@ -2361,7 +2361,7 @@ extension SQLiteControlDatabase {
                             operationID: emitting.operationID
                         ),
                         kind: .account,
-                        payload: try JSONEncoder().encode(material),
+                        payload: try PersistedPublicFirehoseJSON.encode(material),
                         carBytes: nil
                     )
                     _ = try await enqueueLifecycleEventBatchInTransaction(

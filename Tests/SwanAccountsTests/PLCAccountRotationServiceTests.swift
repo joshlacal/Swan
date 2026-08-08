@@ -47,6 +47,32 @@ final class PLCAccountRotationServiceTests: XCTestCase {
         try await fixture.control.close()
     }
 
+    func testPendingRotationRetryUsesPersistedOperationCreationTime() async throws {
+        let recorder = RecordingLifecycleEmitter(failFirstRotation: true)
+        let fixture = try await makeFixture(lifecycleEmitter: recorder)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        do {
+            _ = try await fixture.service.rotate(did: fixture.did, now: fixture.now)
+            XCTFail("the first lifecycle emission should fail after history is durable")
+        } catch RotationEmissionFailure.intentional {}
+
+        let store = try await fixture.opener.openPLCAccountPreparationStore(did: fixture.did)
+        let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
+        let history = try await database.publicPLCOperationHistory()
+        let persistedTime = try XCTUnwrap(history.last?.createdAt)
+
+        _ = try await fixture.service.rotate(
+            did: fixture.did,
+            now: fixture.now.addingTimeInterval(60)
+        )
+        let emitted = await recorder.snapshot()
+        XCTAssertEqual(emitted.map(\.materialTime), [persistedTime, persistedTime])
+        XCTAssertEqual(emitted.map(\.now), [fixture.now, fixture.now.addingTimeInterval(60)])
+        try await fixture.opener.close()
+        try await fixture.control.close()
+    }
+
     private struct RotationFixture {
         let root: URL
         let did: String
@@ -178,7 +204,7 @@ final class PLCAccountRotationServiceTests: XCTestCase {
         return RotationFixture(
             root: root,
             did: did,
-            now: Date(timeIntervalSince1970: 1_750_000_001),
+            now: Date(timeIntervalSince1970: 1_750_000_001.123_456_7),
             genesisCID: try genesis.cid.string,
             service: service,
             control: control,
@@ -198,25 +224,53 @@ final class PLCAccountRotationServiceTests: XCTestCase {
     }
 }
 
+private enum RotationEmissionFailure: Error {
+    case intentional
+}
+
+private struct RecordedRotation: Sendable {
+    let did: String
+    let plcOperationCID: String
+    let materialTime: Date
+    let now: Date
+}
+
 private actor RecordingLifecycleEmitter: PublicLifecycleEventEmitting {
-    private(set) var rotations: [(did: String, plcOperationCID: String)] = []
+    private var rotations: [RecordedRotation] = []
+    private var shouldFailRotation: Bool
+
+    init(failFirstRotation: Bool = false) {
+        shouldFailRotation = failFirstRotation
+    }
 
     func emitActivation(
         did: String, operationID: String, plcOperationCID: String,
-        handle: String?, now: Date
+        handle: String?, materialTime: Date, now: Date
     ) async throws {}
 
     func emitRotationIdentity(
-        did: String, plcOperationCID: String, handle: String?, now: Date
+        did: String, plcOperationCID: String, handle: String?,
+        materialTime: Date, now: Date
     ) async throws {
-        rotations.append((did, plcOperationCID))
+        rotations.append(
+            RecordedRotation(
+                did: did,
+                plcOperationCID: plcOperationCID,
+                materialTime: materialTime,
+                now: now
+            )
+        )
+        if shouldFailRotation {
+            shouldFailRotation = false
+            throw RotationEmissionFailure.intentional
+        }
     }
 
     func emitReactivationSync(did: String, operationID: String, now: Date) async throws {}
 
     func emitManualSync(did: String, requestUUID: String, now: Date) async throws {}
 
-    func snapshot() -> [(did: String, plcOperationCID: String)] {
+    func snapshot() -> [RecordedRotation] {
         rotations
     }
 }

@@ -180,7 +180,7 @@ public actor PLCAccountRotationService {
 
         let entry: PublicPLCOperationHistoryEntry
         do {
-            entry = try PublicPLCOperationHistoryEntry(
+            let proposedEntry = try PublicPLCOperationHistoryEntry(
                 cid: try rotatedOperation.cid.string,
                 previousCID: rotatedOperation.prev,
                 canonicalJSON: try rotatedOperation.canonicalJSON,
@@ -188,7 +188,13 @@ public actor PLCAccountRotationService {
                 signingKeyGeneration: nextGeneration,
                 rotationKeyGeneration: nextGeneration
             )
-            _ = try await historyStore.installPublicPLCOperation(entry)
+            _ = try await historyStore.installPublicPLCOperation(proposedEntry)
+            guard let persistedEntry = try await historyStore
+                .publicPLCOperationHistory().last,
+                  persistedEntry.cid == proposedEntry.cid else {
+                throw PLCAccountRotationError.unavailable
+            }
+            entry = persistedEntry
         } catch let error as SwanError where isConflict(error) {
             throw PLCAccountRotationError.conflict
         } catch {
@@ -226,6 +232,7 @@ public actor PLCAccountRotationService {
             operation: rotatedOperation,
             generation: nextGeneration,
             request: request,
+            materialTime: entry.createdAt,
             now: now
         )
     }
@@ -307,6 +314,7 @@ public actor PLCAccountRotationService {
             operation: operation,
             generation: expectedGeneration + 1,
             request: request,
+            materialTime: pending.createdAt,
             now: now
         )
     }
@@ -380,6 +388,7 @@ public actor PLCAccountRotationService {
         operation: PLCSignedOperation,
         generation: UInt64,
         request: AccountControlKeyRotationRequest,
+        materialTime: Date,
         now: Date
     ) async throws -> RotatedPLCAccountIdentity {
         if let lifecycleEmitter {
@@ -387,6 +396,7 @@ public actor PLCAccountRotationService {
                 did: account.did,
                 plcOperationCID: try operation.cid.string,
                 handle: nil,
+                materialTime: materialTime,
                 now: now
             )
         }

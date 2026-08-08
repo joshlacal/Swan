@@ -31,14 +31,13 @@ public struct SQLitePublicLifecycleEmitter: PublicLifecycleEventEmitting {
 
     public func emitActivation(
         did: String, operationID: String, plcOperationCID: String,
-        handle: String?, now: Date
+        handle: String?, materialTime: Date, now: Date
     ) async throws {
-        let time = PublicFirehoseTime.encode(now)
-        let encoder = JSONEncoder()
+        let time = PublicFirehoseTime.encode(materialTime)
         let identity = LifecycleEventItem(
             sourceKey: PublicFirehoseSourceKey.identity(did: did, plcOperationCID: plcOperationCID),
             kind: .identity,
-            payload: try encoder.encode(
+            payload: try PersistedPublicFirehoseJSON.encode(
                 PublicFirehoseIdentityMaterial(did: did, handle: handle, time: time)
             ),
             carBytes: nil
@@ -46,7 +45,7 @@ public struct SQLitePublicLifecycleEmitter: PublicLifecycleEventEmitting {
         let account = LifecycleEventItem(
             sourceKey: PublicFirehoseSourceKey.account(did: did, operationID: operationID),
             kind: .account,
-            payload: try encoder.encode(
+            payload: try PersistedPublicFirehoseJSON.encode(
                 PublicFirehoseAccountMaterial(did: did, active: true, status: nil, time: time)
             ),
             carBytes: nil
@@ -58,18 +57,20 @@ public struct SQLitePublicLifecycleEmitter: PublicLifecycleEventEmitting {
             did: did,
             sourceKey: PublicFirehoseSourceKey.syncActivation(did: did, operationID: operationID),
             lifecycleGeneration: batch.generation,
+            materialTime: materialTime,
             now: now
         )
     }
 
     public func emitRotationIdentity(
-        did: String, plcOperationCID: String, handle: String?, now: Date
+        did: String, plcOperationCID: String, handle: String?,
+        materialTime: Date, now: Date
     ) async throws {
-        let time = PublicFirehoseTime.encode(now)
+        let time = PublicFirehoseTime.encode(materialTime)
         let identity = LifecycleEventItem(
             sourceKey: PublicFirehoseSourceKey.identity(did: did, plcOperationCID: plcOperationCID),
             kind: .identity,
-            payload: try JSONEncoder().encode(
+            payload: try PersistedPublicFirehoseJSON.encode(
                 PublicFirehoseIdentityMaterial(did: did, handle: handle, time: time)
             ),
             carBytes: nil
@@ -85,6 +86,7 @@ public struct SQLitePublicLifecycleEmitter: PublicLifecycleEventEmitting {
             did: did,
             sourceKey: PublicFirehoseSourceKey.syncReactivation(did: did, operationID: operationID),
             lifecycleGeneration: generation,
+            materialTime: now,
             now: now
         )
     }
@@ -95,12 +97,14 @@ public struct SQLitePublicLifecycleEmitter: PublicLifecycleEventEmitting {
             did: did,
             sourceKey: PublicFirehoseSourceKey.syncManual(did: did, requestUUID: requestUUID),
             lifecycleGeneration: generation,
+            materialTime: now,
             now: now
         )
     }
 
     private func enqueueHeadSync(
-        did: String, sourceKey: String, lifecycleGeneration: Int64, now: Date
+        did: String, sourceKey: String, lifecycleGeneration: Int64,
+        materialTime: Date, now: Date
     ) async throws {
         guard let account = try await accounts.publicFirehoseAccountDatabases()
             .first(where: { $0.did == did }) else {
@@ -119,13 +123,13 @@ public struct SQLitePublicLifecycleEmitter: PublicLifecycleEventEmitting {
             did: did,
             rev: state.revision,
             commitCID: state.commitCID.string,
-            time: PublicFirehoseTime.encode(now)
+            time: PublicFirehoseTime.encode(materialTime)
         )
         _ = try await account.database.enqueuePublicFirehoseEvent(
             sourceKey: sourceKey,
             kind: .sync,
             lifecycleGeneration: lifecycleGeneration,
-            payload: try JSONEncoder().encode(material),
+            payload: try PersistedPublicFirehoseJSON.encode(material),
             carBytes: car,
             now: now
         )

@@ -160,6 +160,7 @@ public actor PLCAccountActivationService {
                 operationID: intent.requestID,
                 plcOperationCID: intent.operationCID,
                 handle: installation.account.canonicalHandle,
+                materialTime: installation.account.createdAt,
                 now: now
             )
         }

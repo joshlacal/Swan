@@ -65,7 +65,7 @@ final class PublicLifecycleEmitterTests: XCTestCase {
   func testEmitActivationEnqueuesBatchAndBarrieredHeadSync() async throws {
     try await emitter.emitActivation(
       did: did, operationID: "req-1", plcOperationCID: "bafyplc1",
-      handle: "alice.example", now: epoch
+      handle: "alice.example", materialTime: epoch, now: epoch
     )
     let pendingBatch = try await control.nextPendingLifecycleBatch(did: did)
     let batch = try XCTUnwrap(pendingBatch)
@@ -77,6 +77,10 @@ final class PublicLifecycleEmitterTests: XCTestCase {
       PublicFirehoseIdentityMaterial.self, from: batch.items[0].payload
     )
     XCTAssertEqual(identity.handle, "alice.example")
+    XCTAssertEqual(
+      String(decoding: batch.items[0].payload, as: UTF8.self),
+      #"{"did":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","handle":"alice.example","time":"2026-08-04T12:00:00.000Z"}"#
+    )
     let oldest = try await account.oldestPendingPublicFirehoseOutbox()
     let head = try XCTUnwrap(oldest)
     XCTAssertEqual(head.kind, .sync)
@@ -91,11 +95,11 @@ final class PublicLifecycleEmitterTests: XCTestCase {
   func testEmitActivationIsIdempotentOnExactRetry() async throws {
     try await emitter.emitActivation(
       did: did, operationID: "req-1", plcOperationCID: "bafyplc1",
-      handle: "alice.example", now: epoch
+      handle: "alice.example", materialTime: epoch, now: epoch
     )
     try await emitter.emitActivation(
       did: did, operationID: "req-1", plcOperationCID: "bafyplc1",
-      handle: "alice.example", now: epoch
+      handle: "alice.example", materialTime: epoch, now: epoch
     )
     let generation = try await control.currentLifecycleGeneration(did: did)
     XCTAssertEqual(generation, 1)
@@ -104,10 +108,54 @@ final class PublicLifecycleEmitterTests: XCTestCase {
     XCTAssertEqual(pending[0].sourceKey, PublicFirehoseSourceKey.syncActivation(did: did, operationID: "req-1"))
   }
 
+  func testEmitActivationReusesByteIdenticalMaterialWithLaterInvocationClock() async throws {
+    try await emitter.emitActivation(
+      did: did, operationID: "req-later", plcOperationCID: "bafyplc-later",
+      handle: "alice.example", materialTime: epoch, now: epoch
+    )
+    let firstPendingBatch = try await control.nextPendingLifecycleBatch(did: did)
+    let firstBatch = try XCTUnwrap(firstPendingBatch)
+    let firstPendingSync = try await account.oldestPendingPublicFirehoseOutbox()
+    let firstSync = try XCTUnwrap(firstPendingSync)
+
+    try await emitter.emitActivation(
+      did: did, operationID: "req-later", plcOperationCID: "bafyplc-later",
+      handle: "alice.example", materialTime: epoch,
+      now: epoch.addingTimeInterval(60)
+    )
+
+    let replayedPendingBatch = try await control.nextPendingLifecycleBatch(did: did)
+    let replayedBatch = try XCTUnwrap(replayedPendingBatch)
+    let replayedPendingSync = try await account.oldestPendingPublicFirehoseOutbox()
+    let replayedSync = try XCTUnwrap(replayedPendingSync)
+    XCTAssertEqual(replayedBatch.items.map(\.payload), firstBatch.items.map(\.payload))
+    XCTAssertEqual(replayedSync.payload, firstSync.payload)
+  }
+
+  func testEmitActivationStillRejectsChangedSemanticMaterialOnRetry() async throws {
+    try await emitter.emitActivation(
+      did: did, operationID: "req-conflict", plcOperationCID: "bafyplc-conflict",
+      handle: "alice.example", materialTime: epoch, now: epoch
+    )
+
+    do {
+      try await emitter.emitActivation(
+        did: did, operationID: "req-conflict", plcOperationCID: "bafyplc-conflict",
+        handle: "mallory.example", materialTime: epoch,
+        now: epoch.addingTimeInterval(60)
+      )
+      XCTFail("changed lifecycle material must remain a hard conflict")
+    } catch let error as LifecycleEventOutboxError {
+      guard case .conflictingBatch = error else {
+        return XCTFail("expected conflictingBatch, got \(error)")
+      }
+    }
+  }
+
   func testEmitManualSyncUsesCurrentGenerationAndManualSourceKey() async throws {
     try await emitter.emitActivation(
       did: did, operationID: "req-1", plcOperationCID: "bafyplc1",
-      handle: nil, now: epoch
+      handle: nil, materialTime: epoch, now: epoch
     )
     try await emitter.emitManualSync(did: did, requestUUID: "d0c0ffee", now: epoch)
     let activationPending = try await account.oldestPendingPublicFirehoseOutbox()
@@ -136,7 +184,8 @@ final class PublicLifecycleEmitterTests: XCTestCase {
 
   func testEmitRotationIdentityBumpsGenerationAndEmitsIdentityItemOnly() async throws {
     try await emitter.emitRotationIdentity(
-      did: did, plcOperationCID: "bafyrotate1", handle: "alice.example", now: epoch
+      did: did, plcOperationCID: "bafyrotate1", handle: "alice.example",
+      materialTime: epoch, now: epoch
     )
     let pendingBatch = try await control.nextPendingLifecycleBatch(did: did)
     let batch = try XCTUnwrap(pendingBatch)
@@ -155,10 +204,28 @@ final class PublicLifecycleEmitterTests: XCTestCase {
     XCTAssertTrue(pending.isEmpty, "rotation identity emission must not touch the account outbox")
   }
 
+  func testEmitRotationIdentityReusesByteIdenticalMaterialWithLaterInvocationClock() async throws {
+    try await emitter.emitRotationIdentity(
+      did: did, plcOperationCID: "bafyrotate-later", handle: "alice.example",
+      materialTime: epoch, now: epoch
+    )
+    let firstPendingBatch = try await control.nextPendingLifecycleBatch(did: did)
+    let firstBatch = try XCTUnwrap(firstPendingBatch)
+
+    try await emitter.emitRotationIdentity(
+      did: did, plcOperationCID: "bafyrotate-later", handle: "alice.example",
+      materialTime: epoch, now: epoch.addingTimeInterval(60)
+    )
+
+    let replayedPendingBatch = try await control.nextPendingLifecycleBatch(did: did)
+    let replayedBatch = try XCTUnwrap(replayedPendingBatch)
+    XCTAssertEqual(replayedBatch.items.map(\.payload), firstBatch.items.map(\.payload))
+  }
+
   func testEmitReactivationSyncUsesCurrentGenerationAndReactivationSourceKey() async throws {
     try await emitter.emitActivation(
       did: did, operationID: "req-1", plcOperationCID: "bafyplc1",
-      handle: nil, now: epoch
+      handle: nil, materialTime: epoch, now: epoch
     )
     try await emitter.emitReactivationSync(did: did, operationID: "react-1", now: epoch)
     let activationLease = try await account.leaseNextPublicFirehoseOutbox(
