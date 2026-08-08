@@ -606,13 +606,18 @@ private struct ServePublicMutationSignerProvider: PublicRepositoryMutationSigner
     let accounts: DurableAccountDirectory
     let keyStore: any AccountKeyStore
 
-    func signer(for did: String) async throws -> any PublicRepositoryCommitSigner {
+    func signer(for did: String) async throws -> PublicRepositoryMutationSigner {
         guard let account = try await accounts.account(did: did), account.status.authorizesAccount,
               let references = try await accounts.keyReferences(did: did) else {
             throw SwanError.unauthorized("public repository signer is unavailable")
         }
         let material = try await keyStore.key(for: references.signing)
-        return P256PublicRepositoryCommitSigner(privateKey: try P256.Signing.PrivateKey(rawRepresentation: material))
+        return PublicRepositoryMutationSigner(
+            generation: references.signing.generation,
+            signer: P256PublicRepositoryCommitSigner(
+                privateKey: try P256.Signing.PrivateKey(rawRepresentation: material)
+            )
+        )
     }
 }
 

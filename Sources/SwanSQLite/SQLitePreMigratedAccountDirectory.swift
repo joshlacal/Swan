@@ -1836,11 +1836,15 @@ public struct PublicFirehoseCommitFence: Sendable {
 
     public func apply(
         did: String,
+        signingGeneration: UInt64,
         mutate: @escaping @Sendable (PublicFirehoseCommitContext?) async throws
             -> CommittedPublicRepositoryMutation
     ) async throws -> CommittedPublicRepositoryMutation {
         do {
-            return try await control.withActiveAccountFirehoseAuthorization(did: did) {
+            return try await control.withActiveAccountFirehoseAuthorization(
+                did: did,
+                signingGeneration: signingGeneration
+            ) {
                 generation in
                 try await mutate(.init(lifecycleGeneration: generation))
             }
@@ -1906,7 +1910,10 @@ private actor SQLiteGenerationRefreshingPublicMutationStore:
     ) async throws -> CommittedPublicRepositoryMutation {
         let committed: CommittedPublicRepositoryMutation
         if let firehoseFence {
-            committed = try await firehoseFence.apply(did: did) { context in
+            committed = try await firehoseFence.apply(
+                did: did,
+                signingGeneration: prepared.signingGeneration
+            ) { context in
                 try await self.database.applyPublicRepositoryMutation(
                     reservation: reservation,
                     prepared: prepared,

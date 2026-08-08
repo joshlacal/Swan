@@ -1,8 +1,9 @@
 import Crypto
 import Foundation
 import SwanCore
+import SwanPublicFirehose
 import SwanPublicRepository
-import SwanSQLite
+@_spi(Testing) import SwanSQLite
 import SwanStorage
 import XCTest
 @testable import SwanAccounts
@@ -31,7 +32,7 @@ final class PLCAccountRotationServiceTests: XCTestCase {
         try await fixture.control.close()
     }
 
-    func testRotationEmitsIdentityKeyedOnConfirmedOperationBeforePromotion() async throws {
+    func testRotationAtomicallyEnqueuesIdentityWithControlPromotion() async throws {
         let recorder = RecordingLifecycleEmitter()
         let fixture = try await makeFixture(lifecycleEmitter: recorder)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -39,23 +40,38 @@ final class PLCAccountRotationServiceTests: XCTestCase {
             did: fixture.did,
             now: fixture.now
         )
-        let emitted = await recorder.snapshot()
-        XCTAssertEqual(emitted.count, 1)
-        XCTAssertEqual(emitted[0].did, fixture.did)
-        XCTAssertEqual(emitted[0].plcOperationCID, try rotated.operation.cid.string)
+        let maybeBatch = try await fixture.control.nextPendingLifecycleBatch(did: fixture.did)
+        let batch = try XCTUnwrap(maybeBatch)
+        XCTAssertEqual(batch.generation, 1)
+        XCTAssertEqual(batch.items.count, 1)
+        XCTAssertEqual(batch.items[0].kind, .identity)
+        XCTAssertEqual(
+            batch.items[0].sourceKey,
+            PublicFirehoseSourceKey.identity(
+                did: fixture.did,
+                plcOperationCID: try rotated.operation.cid.string
+            )
+        )
+        XCTAssertEqual(rotated.account.signingKey?.generation, 2)
+        let recorderCount = await recorder.snapshot().count
+        XCTAssertEqual(recorderCount, 0)
         try await fixture.opener.close()
         try await fixture.control.close()
     }
 
     func testPendingRotationRetryUsesPersistedOperationCreationTime() async throws {
-        let recorder = RecordingLifecycleEmitter(failFirstRotation: true)
+        let recorder = RecordingLifecycleEmitter()
         let fixture = try await makeFixture(lifecycleEmitter: recorder)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let failure = FailOnceRotationCommit()
+        await fixture.control.setBeforeRotationCommitForTesting {
+            try await failure.checkpoint()
+        }
 
         do {
             _ = try await fixture.service.rotate(did: fixture.did, now: fixture.now)
-            XCTFail("the first lifecycle emission should fail after history is durable")
-        } catch RotationEmissionFailure.intentional {}
+            XCTFail("the first atomic control commit should roll back")
+        } catch PLCAccountRotationError.unavailable {}
 
         let store = try await fixture.opener.openPLCAccountPreparationStore(did: fixture.did)
         let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
@@ -66,9 +82,16 @@ final class PLCAccountRotationServiceTests: XCTestCase {
             did: fixture.did,
             now: fixture.now.addingTimeInterval(60)
         )
-        let emitted = await recorder.snapshot()
-        XCTAssertEqual(emitted.map(\.materialTime), [persistedTime, persistedTime])
-        XCTAssertEqual(emitted.map(\.now), [fixture.now, fixture.now.addingTimeInterval(60)])
+        let maybeBatch = try await fixture.control.nextPendingLifecycleBatch(did: fixture.did)
+        let batch = try XCTUnwrap(maybeBatch)
+        XCTAssertEqual(batch.generation, 1)
+        let identity = try JSONDecoder().decode(
+            PublicFirehoseIdentityMaterial.self,
+            from: try XCTUnwrap(batch.items.first).payload
+        )
+        XCTAssertEqual(identity.time, PublicFirehoseTime.encode(persistedTime))
+        let recorderCount = await recorder.snapshot().count
+        XCTAssertEqual(recorderCount, 0)
         try await fixture.opener.close()
         try await fixture.control.close()
     }
@@ -226,6 +249,17 @@ final class PLCAccountRotationServiceTests: XCTestCase {
 
 private enum RotationEmissionFailure: Error {
     case intentional
+}
+
+private actor FailOnceRotationCommit {
+    private var shouldFail = true
+
+    func checkpoint() throws {
+        if shouldFail {
+            shouldFail = false
+            throw RotationEmissionFailure.intentional
+        }
+    }
 }
 
 private struct RecordedRotation: Sendable {

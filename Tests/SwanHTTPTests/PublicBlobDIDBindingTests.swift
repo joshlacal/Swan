@@ -396,7 +396,7 @@ private struct PublicBlobTestSignerProvider:
 
     func signer(
         for did: String
-    ) async throws -> any PublicRepositoryCommitSigner {
-        signer
+    ) async throws -> PublicRepositoryMutationSigner {
+        .init(generation: 1, signer: signer)
     }
 }

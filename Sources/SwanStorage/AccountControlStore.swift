@@ -312,6 +312,25 @@ public struct AccountLifecycleEmission: Sendable, Equatable {
     }
 }
 
+/// Public identity material committed alongside a verified PLC key rotation.
+/// The control store encodes and enqueues this value in the same transaction
+/// that promotes both key generations.
+public struct AccountRotationLifecycleEmission: Sendable, Equatable {
+    public let plcOperationCID: String
+    public let handle: String?
+    public let materialTime: Date
+
+    public init(
+        plcOperationCID: String,
+        handle: String?,
+        materialTime: Date
+    ) {
+        self.plcOperationCID = plcOperationCID
+        self.handle = handle
+        self.materialTime = materialTime
+    }
+}
+
 /// Durable permanent-deletion stages. Each transition represents an external
 /// side effect which cannot be enclosed in the control.sqlite transaction.
 /// Callers may advance only one stage at a time and finalization is legal only
@@ -1393,8 +1412,24 @@ public protocol AccountControlKeyRotationStore: AccountControlStore {
     func rotateAccountKeys(
         did: String,
         request: AccountControlKeyRotationRequest,
+        emitting: AccountRotationLifecycleEmission?,
         now: Date
     ) async throws -> AccountControlAccount
+}
+
+public extension AccountControlKeyRotationStore {
+    func rotateAccountKeys(
+        did: String,
+        request: AccountControlKeyRotationRequest,
+        now: Date
+    ) async throws -> AccountControlAccount {
+        try await rotateAccountKeys(
+            did: did,
+            request: request,
+            emitting: nil,
+            now: now
+        )
+    }
 }
 
 public extension AccountControlStore {

@@ -1742,7 +1742,7 @@ private struct EmptyPublicMutationDirectory: PublicRepositoryMutationDirectory {
 private struct UnavailableMutationSignerProvider: PublicRepositoryMutationSignerProvider {
     func signer(
         for did: String
-    ) async throws -> any PublicRepositoryCommitSigner {
+    ) async throws -> PublicRepositoryMutationSigner {
         throw SwanError.unavailable("test signer unavailable")
     }
 }

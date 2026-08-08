@@ -55,12 +55,14 @@ public enum SwanPublicRepositoryMutationCoordinator {
             case let .committed(committed): return committed
             case let .reserved(reservation):
                 do {
-                    let prepared = try await PublicRepositoryEngine.apply(
-                        repositoryDID: did, currentState: current, blocks: store,
-                        revision: reservation.nextRevision, batch: batch,
-                        signer: try await signerProvider.signer(for: did)
+                    return try await applyReserved(
+                        store: store,
+                        did: did,
+                        current: current,
+                        reservation: reservation,
+                        batch: batch,
+                        signerProvider: signerProvider
                     )
-                    return try await store.applyPublicRepositoryMutation(reservation: reservation, prepared: prepared)
                 } catch let error as PublicRepositoryMutationStoreError where error == .commitCASConflict && !callerSuppliedSwap && attempts < 2 {
                     try? await store.abandonPublicRepositoryReservation(reservation)
                     continue
@@ -184,17 +186,13 @@ public enum SwanPublicRepositoryMutationCoordinator {
                 return try result(committed, path: path, action: action)
             case let .reserved(reservation):
                 do {
-                    let signer = try await signerProvider.signer(for: did)
-                    let prepared = try await PublicRepositoryEngine.apply(
-                        repositoryDID: did,
-                        currentState: current,
-                        blocks: store,
-                        revision: reservation.nextRevision,
+                    let committed = try await applyReserved(
+                        store: store,
+                        did: did,
+                        current: current,
+                        reservation: reservation,
                         batch: batch,
-                        signer: signer
-                    )
-                    let committed = try await store.applyPublicRepositoryMutation(
-                        reservation: reservation, prepared: prepared
+                        signerProvider: signerProvider
                     )
                     return try result(committed, path: path, action: action)
                 } catch let error as PublicRepositoryMutationStoreError {
@@ -209,6 +207,47 @@ public enum SwanPublicRepositoryMutationCoordinator {
                     try? await store.abandonPublicRepositoryReservation(reservation)
                     throw map(error)
                 }
+            }
+        }
+    }
+
+    /// A stale generation is rejected before account-database mutation, so
+    /// the same durable reservation can be safely re-signed once with freshly
+    /// resolved key material. This is deliberately bounded and does not
+    /// abandon the reservation between signer attempts.
+    private static func applyReserved(
+        store: any PublicRepositoryMutationStore,
+        did: String,
+        current: PublicRepositoryState,
+        reservation: PublicRepositoryMutationReservation,
+        batch: PublicRepositoryWriteBatch,
+        signerProvider: any PublicRepositoryMutationSignerProvider
+    ) async throws -> CommittedPublicRepositoryMutation {
+        var signerAttempts = 0
+        while true {
+            signerAttempts += 1
+            let resolved = try await signerProvider.signer(for: did)
+            guard resolved.generation > 0 else {
+                throw PublicRepositoryMutationCoordinatorError.unavailable
+            }
+            let prepared = try await PublicRepositoryEngine.apply(
+                repositoryDID: did,
+                currentState: current,
+                blocks: store,
+                revision: reservation.nextRevision,
+                batch: batch,
+                signer: resolved.signer,
+                signingGeneration: resolved.generation
+            )
+            do {
+                return try await store.applyPublicRepositoryMutation(
+                    reservation: reservation,
+                    prepared: prepared
+                )
+            } catch let error as PublicRepositoryMutationPublicationError
+                where error == .staleSigningGeneration && signerAttempts < 2
+            {
+                continue
             }
         }
     }

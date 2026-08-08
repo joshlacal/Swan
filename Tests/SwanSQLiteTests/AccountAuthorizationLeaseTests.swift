@@ -3,7 +3,7 @@ import SwanPublicFirehose
 import SwanStorage
 import XCTest
 
-@testable import SwanSQLite
+@_spi(Testing) @testable import SwanSQLite
 
 final class AccountAuthorizationLeaseTests: XCTestCase {
     private let did = "did:plc:abcdefghijklmnopqrstuvwx"
@@ -134,5 +134,181 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         } catch let error as AccountControlStoreError {
             guard case .invalidTransition = error else { throw error }
         }
+    }
+
+    func testRotationIdentityAndKeyPromotionHoldOneAuthorizationFence() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "SwanAccountAuthorizationLease-\(UUID().uuidString)"
+            )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await control.close() } }
+        _ = try await control.createAccount(
+            AccountControlRegistration(
+                did: did,
+                canonicalHandle: "authorization-lease.example.com",
+                passwordVerifier:
+                    "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                signingKey: .init(purpose: .signing, generation: 1),
+                rotationKey: .init(purpose: .rotation, generation: 1),
+                createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+            )
+        )
+        _ = try await control.enqueueLifecycleEventBatch(
+            did: did,
+            operationID: "activation",
+            items: [identityItem(did: did)],
+            now: Date(timeIntervalSince1970: 1_750_000_000)
+        )
+
+        let rotationBarrier = RotationCommitBarrier()
+        let accountDID = did
+        await control.setBeforeRotationCommitForTesting {
+            await rotationBarrier.park()
+        }
+        let rotation = Task {
+            try await control.rotateAccountKeys(
+                did: accountDID,
+                request: .init(
+                    expectedGeneration: 1,
+                    signingKey: .init(purpose: .signing, generation: 2),
+                    rotationKey: .init(purpose: .rotation, generation: 2)
+                ),
+                emitting: .init(
+                    plcOperationCID: "bafyrotation2",
+                    handle: nil,
+                    materialTime: Date(timeIntervalSince1970: 1_750_000_001)
+                ),
+                now: Date(timeIntervalSince1970: 1_750_000_001)
+            )
+        }
+        await rotationBarrier.waitUntilParked()
+
+        let fenceProbe = RotationFenceProbe()
+        let fence = Task {
+            await fenceProbe.markAttempted()
+            return try await control.withActiveAccountFirehoseAuthorization(
+                did: accountDID,
+                signingGeneration: 2
+            ) { lifecycleGeneration in
+                await fenceProbe.markEntered()
+                return lifecycleGeneration
+            }
+        }
+        await fenceProbe.waitUntilAttempted()
+        let enteredBeforeRelease = await fenceProbe.hasEntered
+        XCTAssertFalse(
+            enteredBeforeRelease,
+            "the publication fence must remain behind the uncommitted rotation"
+        )
+
+        await rotationBarrier.release()
+        let rotated = try await rotation.value
+        let lifecycleGeneration = try await fence.value
+        XCTAssertEqual(rotated.signingKey?.generation, 2)
+        XCTAssertEqual(rotated.rotationKey?.generation, 2)
+        XCTAssertEqual(lifecycleGeneration, 2)
+        let enteredAfterRelease = await fenceProbe.hasEntered
+        XCTAssertTrue(enteredAfterRelease)
+
+        let finalLifecycleGeneration = try await control.currentLifecycleGeneration(did: did)
+        XCTAssertEqual(finalLifecycleGeneration, 2)
+    }
+
+    func testStaleSignerGenerationNeverFallsBackToNonEmittingMutation() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "SwanAccountAuthorizationLease-\(UUID().uuidString)"
+            )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await control.close() } }
+        _ = try await control.createAccount(
+            AccountControlRegistration(
+                did: did,
+                canonicalHandle: "authorization-lease.example.com",
+                passwordVerifier:
+                    "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                signingKey: .init(purpose: .signing, generation: 2),
+                rotationKey: .init(purpose: .rotation, generation: 2),
+                createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+            )
+        )
+        let callback = RotationFenceProbe()
+        let fence = PublicFirehoseCommitFence(control: control)
+        do {
+            _ = try await fence.apply(did: did, signingGeneration: 1) { _ in
+                await callback.markEntered()
+                throw TestPublicationError.unexpectedMutation
+            }
+            XCTFail("a stale signer must be rejected")
+        } catch let error as PublicRepositoryMutationPublicationError {
+            XCTAssertEqual(error, .staleSigningGeneration)
+        }
+        let entered = await callback.hasEntered
+        XCTAssertFalse(entered, "stale signer rejection must not retry with nil firehose context")
+    }
+}
+
+private enum TestPublicationError: Error {
+    case unexpectedMutation
+}
+
+private actor RotationCommitBarrier {
+    private var parked = false
+    private var parkedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    func park() async {
+        parked = true
+        let waiters = parkedWaiters
+        parkedWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { releaseWaiter = $0 }
+    }
+
+    func waitUntilParked() async {
+        if parked { return }
+        await withCheckedContinuation { parkedWaiters.append($0) }
+    }
+
+    func release() {
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+}
+
+private actor RotationFenceProbe {
+    private var attempted = false
+    private var attemptedWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var hasEntered = false
+
+    func markAttempted() {
+        attempted = true
+        let waiters = attemptedWaiters
+        attemptedWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func waitUntilAttempted() async {
+        if attempted { return }
+        await withCheckedContinuation { attemptedWaiters.append($0) }
+    }
+
+    func markEntered() {
+        hasEntered = true
     }
 }

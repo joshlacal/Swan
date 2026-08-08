@@ -35,8 +35,21 @@ public struct PublicRepositoryMutationTarget: Sendable {
 /// Loads a fresh, DID-bound signing capability for each real commit. A
 /// provider owns private-key handling; HTTP and repository layers never see
 /// scalar bytes.
+public struct PublicRepositoryMutationSigner: Sendable {
+    public let generation: UInt64
+    public let signer: any PublicRepositoryCommitSigner
+
+    public init(
+        generation: UInt64,
+        signer: any PublicRepositoryCommitSigner
+    ) {
+        self.generation = generation
+        self.signer = signer
+    }
+}
+
 public protocol PublicRepositoryMutationSignerProvider: Sendable {
-    func signer(for did: String) async throws -> any PublicRepositoryCommitSigner
+    func signer(for did: String) async throws -> PublicRepositoryMutationSigner
 }
 
 public enum PublicRepositoryMutationCapabilityError: Error, Sendable, Equatable {

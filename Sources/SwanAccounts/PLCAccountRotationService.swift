@@ -391,22 +391,19 @@ public actor PLCAccountRotationService {
         materialTime: Date,
         now: Date
     ) async throws -> RotatedPLCAccountIdentity {
-        if let lifecycleEmitter {
-            try await lifecycleEmitter.emitRotationIdentity(
-                did: account.did,
-                plcOperationCID: try operation.cid.string,
-                handle: nil,
-                materialTime: materialTime,
-                now: now
-            )
-        }
         guard let rotationStore = controlStore as? any AccountControlKeyRotationStore else {
             throw PLCAccountRotationError.unavailable
         }
         do {
+            let operationCID = try operation.cid.string
             let updated = try await rotationStore.rotateAccountKeys(
                 did: account.did,
                 request: request,
+                emitting: lifecycleEmitter == nil ? nil : .init(
+                    plcOperationCID: operationCID,
+                    handle: nil,
+                    materialTime: materialTime
+                ),
                 now: now
             )
             return try RotatedPLCAccountIdentity(

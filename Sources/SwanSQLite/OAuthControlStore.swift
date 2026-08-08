@@ -211,6 +211,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
     private var databaseFileDescriptor: Int32
     private let descriptorBackedRestore: Bool
     private var activeWriteTransactions = 0
+    var beforeRotationCommitForTesting: (@Sendable () async throws -> Void)?
     private var oauthControlStorageLimits = OAuthControlStorageLimits.production
 
     public init(
@@ -1463,6 +1464,13 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
 
     func hasActiveWriteTransactionForTesting() -> Bool {
         activeWriteTransactions > 0
+    }
+
+    @_spi(Testing)
+    public func setBeforeRotationCommitForTesting(
+        _ hook: (@Sendable () async throws -> Void)?
+    ) {
+        beforeRotationCommitForTesting = hook
     }
 
     func configureOAuthControlStorageLimitsForTesting(

@@ -49,6 +49,10 @@ public struct PreparedPublicRepositoryMutation: Sendable, Equatable {
     public let baseCommitCID: CID
     public let sinceRevision: String
     public let signedCommit: PreparedPublicRepositorySignedCommit
+    /// Control-plane generation of the signer that produced `signedCommit`.
+    /// The final publication fence revalidates this durable-free fact before
+    /// committing repository state or a firehose row.
+    public let signingGeneration: UInt64
     public let recordResults: [PublicRepositoryMutationRecordResult]
     /// Raw blob CIDs that the resulting public records require to remain in
     /// the public namespace. Storage rechecks these inside its commit
@@ -65,6 +69,7 @@ public struct PreparedPublicRepositoryMutation: Sendable, Equatable {
         baseCommitCID: CID,
         sinceRevision: String,
         signedCommit: PreparedPublicRepositorySignedCommit,
+        signingGeneration: UInt64,
         recordResults: [PublicRepositoryMutationRecordResult],
         publicBlobCIDs: [CID],
         publicTypedBlobReferences: [PublicTypedBlobReference],
@@ -74,6 +79,7 @@ public struct PreparedPublicRepositoryMutation: Sendable, Equatable {
         self.baseCommitCID = baseCommitCID
         self.sinceRevision = sinceRevision
         self.signedCommit = signedCommit
+        self.signingGeneration = signingGeneration
         self.recordResults = recordResults
         self.publicBlobCIDs = publicBlobCIDs
         self.publicTypedBlobReferences = publicTypedBlobReferences
@@ -89,10 +95,14 @@ public enum PublicRepositoryEngine {
         revision: String,
         batch: PublicRepositoryWriteBatch,
         limits: PublicRepositoryLimits = .standard,
-        signer: any PublicRepositoryCommitSigner
+        signer: any PublicRepositoryCommitSigner,
+        signingGeneration: UInt64 = 1
     ) async throws -> PreparedPublicRepositoryMutation {
         guard repositoryDID == currentState.did else {
             throw PublicRepositoryEngineError.repositoryDIDMismatch
+        }
+        guard signingGeneration > 0 else {
+            throw PublicRepositoryEngineError.signingFailed
         }
         let proposedRevision: PublicRepositoryTID
         let currentRevision: PublicRepositoryTID
@@ -317,6 +327,7 @@ public enum PublicRepositoryEngine {
             baseCommitCID: currentState.commitCID,
             sinceRevision: currentState.revision,
             signedCommit: signedCommit,
+            signingGeneration: signingGeneration,
             recordResults: recordResults,
             publicBlobCIDs: publicBlobCIDsByString.keys.sorted().compactMap {
                 publicBlobCIDsByString[$0]

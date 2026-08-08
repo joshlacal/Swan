@@ -26,6 +26,56 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
     private static let applyPath = "/xrpc/com.atproto.repo.applyWrites"
     private static let uploadPath = "/xrpc/com.atproto.repo.uploadBlob"
 
+    func testStaleSignerGenerationReResolvesAndStillEnqueuesFirehose() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let signingKey = P256.Signing.PrivateKey()
+        let provider = SequencedGenerationSignerProvider(
+            generations: [1, 2],
+            signer: P256PublicRepositoryCommitSigner(privateKey: signingKey)
+        )
+        let store = GenerationCheckingMutationStore(
+            database: fixture.database,
+            activeGeneration: 2
+        )
+        let path = try PublicRepositoryPath(
+            collection: Self.collection,
+            recordKey: "stale-signer-retry"
+        )
+
+        let result = try await SwanPublicRepositoryMutationCoordinator.put(
+            store: store,
+            did: Self.did,
+            path: path,
+            record: PublicRecord([
+                "$type": .string(Self.collection),
+                "text": .string("fresh signer wins"),
+            ]),
+            swapRecord: nil,
+            swapCommit: nil,
+            requestID: "stale-signer-retry",
+            bodyDigest: Data(repeating: 0x42, count: 32),
+            signerProvider: provider,
+            now: { 1_750_000_000_000_000 }
+        )
+
+        XCTAssertFalse(result.isNoOp)
+        let resolutionCount = await provider.resolutionCount()
+        let attemptedGenerations = await store.attemptedGenerations()
+        XCTAssertEqual(resolutionCount, 2)
+        XCTAssertEqual(attemptedGenerations, [1, 2])
+        let pending = try await fixture.database.pendingPublicFirehoseOutbox()
+        XCTAssertEqual(pending.count, 1)
+        XCTAssertEqual(pending.first?.lifecycleGeneration, 2)
+        XCTAssertEqual(pending.first?.kind, .commit)
+    }
+
     func testJSONMutationAdmissionRejectsBeforeDecodeAndReleasesAfterFailure() async throws {
         let maximum = 1_000_000
         let admission = try PublicRepositoryJSONWriteAdmission(
@@ -1600,7 +1650,95 @@ private actor NoopSimpleSpaceDirectory: AuthorizedSimpleSpaceDirectory {
 private struct TestSignerProvider: PublicRepositoryMutationSignerProvider {
     let signer: any PublicRepositoryCommitSigner
 
-    func signer(for did: String) async throws -> any PublicRepositoryCommitSigner {
-        signer
+    func signer(for did: String) async throws -> PublicRepositoryMutationSigner {
+        .init(generation: 1, signer: signer)
     }
+}
+
+private actor SequencedGenerationSignerProvider:
+    PublicRepositoryMutationSignerProvider
+{
+    private var generations: [UInt64]
+    private let signerValue: any PublicRepositoryCommitSigner
+    private var resolutions = 0
+
+    init(
+        generations: [UInt64],
+        signer: any PublicRepositoryCommitSigner
+    ) {
+        self.generations = generations
+        signerValue = signer
+    }
+
+    func signer(for _: String) async throws -> PublicRepositoryMutationSigner {
+        guard generations.isEmpty == false else {
+            throw SwanError.unavailable("no fresh signer generation")
+        }
+        resolutions += 1
+        return .init(generation: generations.removeFirst(), signer: signerValue)
+    }
+
+    func resolutionCount() -> Int { resolutions }
+}
+
+private actor GenerationCheckingMutationStore: PublicRepositoryMutationStore {
+    private let database: SQLiteAccountDatabase
+    private let activeGeneration: UInt64
+    private var generations: [UInt64] = []
+
+    init(database: SQLiteAccountDatabase, activeGeneration: UInt64) {
+        self.database = database
+        self.activeGeneration = activeGeneration
+    }
+
+    func loadPublicRepositoryState() async throws -> PublicRepositoryState? {
+        try await database.loadPublicRepositoryState()
+    }
+
+    func verifyPublicRepositoryProjection() async throws {
+        try await database.verifyPublicRepositoryProjection()
+    }
+
+    func block(for cid: CID) async throws -> Data? {
+        try await database.block(for: cid)
+    }
+
+    func publicRepositoryRecordCID(
+        for path: PublicRepositoryPath
+    ) async throws -> CID? {
+        try await database.publicRepositoryRecordCID(for: path)
+    }
+
+    func reservePublicRepositoryRevision(
+        _ request: PublicRepositoryMutationRequest,
+        wallClockMicroseconds: UInt64
+    ) async throws -> PublicRepositoryMutationReservationOutcome {
+        try await database.reservePublicRepositoryRevision(
+            request,
+            wallClockMicroseconds: wallClockMicroseconds
+        )
+    }
+
+    func applyPublicRepositoryMutation(
+        reservation: PublicRepositoryMutationReservation,
+        prepared: PreparedPublicRepositoryMutation
+    ) async throws -> CommittedPublicRepositoryMutation {
+        generations.append(prepared.signingGeneration)
+        guard prepared.signingGeneration == activeGeneration else {
+            throw PublicRepositoryMutationPublicationError.staleSigningGeneration
+        }
+        return try await database.applyPublicRepositoryMutation(
+            reservation: reservation,
+            prepared: prepared,
+            firehose: .init(lifecycleGeneration: Int64(activeGeneration))
+        )
+    }
+
+    func abandonPublicRepositoryReservation(
+        _ reservation: PublicRepositoryMutationReservation
+    ) async throws {
+        try await database.abandonPublicRepositoryReservation(reservation)
+    }
+
+    func attemptedGenerations() -> [UInt64] { generations }
 }

@@ -574,10 +574,27 @@ extension SQLiteControlDatabase {
     public func rotateAccountKeys(
         did: String,
         request: AccountControlKeyRotationRequest,
+        emitting: AccountRotationLifecycleEmission?,
         now: Date
     ) async throws -> AccountControlAccount {
         guard AccountControlIdentifiers.isDID(did) else {
             throw AccountControlStoreError.invalidInput
+        }
+        let lifecycleItem: LifecycleEventItem? = try emitting.map { emission in
+            let material = PublicFirehoseIdentityMaterial(
+                did: did,
+                handle: emission.handle,
+                time: PublicFirehoseTime.encode(emission.materialTime)
+            )
+            return LifecycleEventItem(
+                sourceKey: PublicFirehoseSourceKey.identity(
+                    did: did,
+                    plcOperationCID: emission.plcOperationCID
+                ),
+                kind: .identity,
+                payload: try PersistedPublicFirehoseJSON.encode(material),
+                carBytes: nil
+            )
         }
         let timestamp = try controlTimestamp(now)
         return try await withConnectionGate {
@@ -631,6 +648,15 @@ extension SQLiteControlDatabase {
                       updated.rotationKey == request.rotationKey else {
                     throw AccountControlStoreError.invalidTransition
                 }
+                if let emitting, let lifecycleItem {
+                    _ = try await enqueueLifecycleEventBatchInTransaction(
+                        did: did,
+                        operationID: emitting.plcOperationCID,
+                        items: [lifecycleItem],
+                        now: now
+                    )
+                }
+                try await beforeRotationCommitForTesting?()
                 return updated
             }
         }
@@ -2447,6 +2473,37 @@ extension SQLiteControlDatabase {
                 let account = try await requiredAccount(did: did)
                 guard account.status.authorizesAccount else {
                     throw AccountControlStoreError.invalidTransition
+                }
+                let rows = try await connection.query(
+                    "SELECT generation FROM account_lifecycle_generation WHERE did = ?",
+                    [.text(did)]
+                )
+                let generation = Int64(rows.first?.column("generation")?.integer ?? 0)
+                return try await operation(generation)
+            }
+        }
+    }
+
+    /// Firehose publication fence that also proves the already-resolved
+    /// signer still belongs to the active control generation. Key lookup and
+    /// signing happen before this transaction; only the generation fact is
+    /// validated while the control lease is held.
+    public func withActiveAccountFirehoseAuthorization<T: Sendable>(
+        did: String,
+        signingGeneration: UInt64,
+        operation: @escaping @Sendable (Int64) async throws -> T
+    ) async throws -> T {
+        guard AccountControlIdentifiers.isDID(did), signingGeneration > 0 else {
+            throw AccountControlStoreError.invalidInput
+        }
+        return try await withConnectionGate {
+            try await transaction {
+                let account = try await requiredAccount(did: did)
+                guard account.status.authorizesAccount else {
+                    throw AccountControlStoreError.invalidTransition
+                }
+                guard account.signingKey?.generation == signingGeneration else {
+                    throw PublicRepositoryMutationPublicationError.staleSigningGeneration
                 }
                 let rows = try await connection.query(
                     "SELECT generation FROM account_lifecycle_generation WHERE did = ?",

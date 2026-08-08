@@ -16,6 +16,13 @@ public enum PublicRepositoryMutationStoreError: Error, Sendable, Equatable {
     case corruptRepository
 }
 
+/// Retryable failure from the final control-plane publication fence. This is
+/// separate from durable mutation-store failures so adding a fence outcome
+/// does not alter repository persistence error exhaustiveness.
+public enum PublicRepositoryMutationPublicationError: Error, Sendable, Equatable {
+    case staleSigningGeneration
+}
+
 public struct PublicRepositoryMutationRequest: Sendable, Equatable {
     public let id: String
     public let canonicalDigest: Data
