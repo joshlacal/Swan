@@ -11,6 +11,7 @@ readonly image="docker.io/library/golang@sha256:727cfc3c40be55cd1bc9a4a059406b28
 readonly image_digest="sha256:727cfc3c40be55cd1bc9a4a059406b28a059857e3be752aa9d09531e12c20c56"
 readonly platform="linux/arm64/v8"
 readonly go_version="go1.26.4"
+readonly archive_writer="${root}/interop/write-deterministic-vendor-archive.go"
 readonly bundle_name="indigo-vendor-${commit}"
 readonly archive_name="indigo-${commit}.vendor.tar.gz"
 cache_dir=".interop-cache"
@@ -50,6 +51,10 @@ docker info >/dev/null 2>&1 || {
 }
 [[ -f "$pin_file" && ! -L "$pin_file" ]] || {
   echo "Indigo vendor pin data is missing or unsafe" >&2
+  exit 1
+}
+[[ -f "$archive_writer" && ! -L "$archive_writer" ]] || {
+  echo "deterministic Indigo vendor archive writer is missing or unsafe" >&2
   exit 1
 }
 ./interop/verify-reference-indigo.sh --bundle-dir "$source_bundle" >/dev/null
@@ -114,6 +119,7 @@ docker run --rm \
   -e GOMODCACHE=/tmp/go-mod \
   -e GOTOOLCHAIN=local \
   -v "${work_tree}:/workspace" \
+  -v "${archive_writer}:/archive-writer.go:ro" \
   -w /workspace \
   "$image" \
   sh -ceu '
@@ -123,6 +129,9 @@ docker run --rm \
     test "$(sed -n "s/^go //p" go.mod)" = "1.26"
     test "$(sed -n "s/^toolchain //p" go.mod)" = "go1.26.1"
     go mod vendor
+    go build -o /workspace/.archive-writer /archive-writer.go
+    /workspace/.archive-writer /workspace/vendor /workspace/.vendor.tar.gz
+    rm /workspace/.archive-writer
   '
 
 after_go_mod="$(shasum -a 256 "${work_tree}/go.mod" | awk '{print $1}')"
@@ -135,60 +144,7 @@ fi
   echo "go mod vendor did not produce a complete regular vendor tree" >&2
   exit 1
 }
-
-python3 - "${work_tree}/vendor" "$staged_archive" <<'PY'
-import gzip
-import io
-import os
-import pathlib
-import stat
-import sys
-import tarfile
-
-source = pathlib.Path(sys.argv[1])
-destination = pathlib.Path(sys.argv[2])
-entries = []
-for directory, directory_names, file_names in os.walk(source, followlinks=False):
-    directory_path = pathlib.Path(directory)
-    for name in directory_names:
-        path = directory_path / name
-        relative = path.relative_to(source).as_posix()
-        if path.is_symlink() or not path.is_dir():
-            raise SystemExit(f"generated vendor tree contains unsafe directory: {relative}")
-        entries.append((f"vendor/{relative}", path, True))
-    for name in file_names:
-        path = directory_path / name
-        relative = path.relative_to(source).as_posix()
-        if path.is_symlink() or not stat.S_ISREG(path.stat().st_mode):
-            raise SystemExit(f"generated vendor tree contains unsafe file: {relative}")
-        entries.append((f"vendor/{relative}", path, False))
-
-buffer = io.BytesIO()
-with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-    root = tarfile.TarInfo("vendor")
-    root.type = tarfile.DIRTYPE
-    root.mode = 0o755
-    root.uid = root.gid = root.mtime = 0
-    root.uname = root.gname = ""
-    archive.addfile(root)
-    for name, path, is_directory in sorted(entries, key=lambda entry: entry[0]):
-        member = tarfile.TarInfo(name)
-        member.uid = member.gid = member.mtime = 0
-        member.uname = member.gname = ""
-        if is_directory:
-            member.type = tarfile.DIRTYPE
-            member.mode = 0o755
-            archive.addfile(member)
-        else:
-            payload = path.read_bytes()
-            member.type = tarfile.REGTYPE
-            member.mode = 0o644
-            member.size = len(payload)
-            archive.addfile(member, io.BytesIO(payload))
-with destination.open("wb") as raw:
-    with gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=9, mtime=0) as zipped:
-        zipped.write(buffer.getvalue())
-PY
+mv "${work_tree}/.vendor.tar.gz" "$staged_archive"
 
 vendor_sha256="$(shasum -a 256 "$staged_archive" | awk '{print $1}')"
 expected_vendor_sha256="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["vendorArchiveSHA256"])' "$pin_file")"

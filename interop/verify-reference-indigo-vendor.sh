@@ -64,7 +64,7 @@ import os
 import pathlib
 import stat
 import sys
-import tarfile
+import zlib
 
 (
     pin_path, metadata_path, cache_dir, bundle_dir, archive_path, vendor_root,
@@ -153,33 +153,106 @@ for directory, directory_names, file_names in os.walk(vendor_root, followlinks=F
             raise SystemExit(f"vendor tree contains a non-regular file: {relative}")
         tree_files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
 
+archive_bytes = archive_path.read_bytes()
+canonical_gzip_header = bytes.fromhex("1f8b08000000000000ff")
+if len(archive_bytes) < 18 or archive_bytes[:10] != canonical_gzip_header:
+    raise SystemExit("vendor archive has a noncanonical gzip header")
+try:
+    decompressor = zlib.decompressobj(wbits=31)
+    tar_bytes = decompressor.decompress(archive_bytes) + decompressor.flush()
+    if not decompressor.eof or decompressor.unused_data:
+        raise SystemExit("vendor archive has a noncanonical gzip stream")
+except (gzip.BadGzipFile, OSError, EOFError, zlib.error) as error:
+    raise SystemExit(f"vendor archive cannot be read: {error}") from error
+if len(tar_bytes) % 512 != 0:
+    raise SystemExit("vendor archive must use canonical USTAR")
+
+def parse_octal(field, label):
+    stripped = field.rstrip(b"\0 ").lstrip(b" ")
+    try:
+        return int(stripped or b"0", 8)
+    except ValueError as error:
+        raise SystemExit(f"vendor archive has invalid {label}") from error
+
+def decode_name(field, label):
+    raw = field.split(b"\0", 1)[0]
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SystemExit(f"vendor archive has invalid {label}") from error
+
 archive_files = {}
 archive_directories = set()
-try:
-    with tarfile.open(archive_path, "r:gz") as archive:
-        for member in archive.getmembers():
-            path = pathlib.PurePosixPath(member.name)
-            if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "vendor":
-                raise SystemExit("vendor archive has unexpected layout")
-            if member.issym() or member.islnk():
-                raise SystemExit(f"vendor archive contains a symlink: {member.name}")
-            if member.uid != 0 or member.gid != 0 or member.mtime != 0 or member.uname or member.gname:
-                raise SystemExit("vendor archive metadata is not deterministic")
-            if member.isdir():
-                if member.mode != 0o755:
-                    raise SystemExit("vendor archive metadata is not deterministic")
-                archive_directories.add(member.name.rstrip("/"))
-            elif member.isfile():
-                if member.mode != 0o644:
-                    raise SystemExit("vendor archive metadata is not deterministic")
-                extracted = archive.extractfile(member)
-                if extracted is None:
-                    raise SystemExit("vendor archive cannot be read")
-                archive_files[member.name] = hashlib.sha256(extracted.read()).hexdigest()
-            else:
-                raise SystemExit(f"vendor archive contains a non-regular entry: {member.name}")
-except (tarfile.TarError, gzip.BadGzipFile, OSError) as error:
-    raise SystemExit(f"vendor archive cannot be read: {error}") from error
+seen_names = set()
+ordered_names = []
+offset = 0
+found_terminator = False
+while offset < len(tar_bytes):
+    header = tar_bytes[offset:offset + 512]
+    if header == bytes(512):
+        if tar_bytes[offset:] != bytes(1024):
+            raise SystemExit("vendor archive must use canonical USTAR")
+        found_terminator = True
+        break
+    if header[257:263] != b"ustar\0" or header[263:265] != b"00":
+        raise SystemExit("vendor archive must use canonical USTAR")
+    stored_checksum = parse_octal(header[148:156], "checksum")
+    checksum_header = header[:148] + (b" " * 8) + header[156:]
+    if sum(checksum_header) != stored_checksum:
+        raise SystemExit("vendor archive has invalid checksum")
+    name = decode_name(header[0:100], "member name")
+    prefix = decode_name(header[345:500], "member prefix")
+    if prefix:
+        name = f"{prefix}/{name}"
+    if name in seen_names:
+        raise SystemExit(f"vendor archive contains a duplicate member: {name}")
+    seen_names.add(name)
+    ordered_names.append(name)
+    typeflag = header[156:157]
+    if typeflag in (b"x", b"g", b"L", b"K"):
+        raise SystemExit("vendor archive must use canonical USTAR")
+    path = pathlib.PurePosixPath(name.rstrip("/"))
+    if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "vendor":
+        raise SystemExit("vendor archive has unexpected layout")
+    if header[157:257].rstrip(b"\0"):
+        raise SystemExit(f"vendor archive contains a symlink: {name}")
+    if header[265:329].rstrip(b"\0"):
+        raise SystemExit("vendor archive metadata is not deterministic")
+    mode = parse_octal(header[100:108], "mode")
+    uid = parse_octal(header[108:116], "uid")
+    gid = parse_octal(header[116:124], "gid")
+    size = parse_octal(header[124:136], "size")
+    mtime = parse_octal(header[136:148], "mtime")
+    devmajor = parse_octal(header[329:337], "device major")
+    devminor = parse_octal(header[337:345], "device minor")
+    if uid != 0 or gid != 0 or mtime != 0 or devmajor != 0 or devminor != 0:
+        raise SystemExit("vendor archive metadata is not deterministic")
+    data_start = offset + 512
+    data_end = data_start + size
+    padded_end = data_start + ((size + 511) // 512) * 512
+    if padded_end > len(tar_bytes) or any(tar_bytes[data_end:padded_end]):
+        raise SystemExit("vendor archive must use canonical USTAR")
+    canonical_name = name.rstrip("/")
+    if typeflag == b"5":
+        if mode != 0o755 or size != 0:
+            raise SystemExit("vendor archive metadata is not deterministic")
+        archive_directories.add(canonical_name)
+    elif typeflag in (b"0", b"\0"):
+        if mode != 0o644:
+            raise SystemExit("vendor archive metadata is not deterministic")
+        archive_files[canonical_name] = hashlib.sha256(
+            tar_bytes[data_start:data_end]
+        ).hexdigest()
+    elif typeflag in (b"1", b"2"):
+        raise SystemExit(f"vendor archive contains a symlink: {name}")
+    else:
+        raise SystemExit(f"vendor archive contains a non-regular entry: {name}")
+    offset = padded_end
+
+if not found_terminator:
+    raise SystemExit("vendor archive must use canonical USTAR")
+if ordered_names != sorted(ordered_names):
+    raise SystemExit("vendor archive members are not strictly sorted")
 
 if "vendor/modules.txt" not in archive_files:
     raise SystemExit("vendor archive is incomplete: missing vendor/modules.txt")

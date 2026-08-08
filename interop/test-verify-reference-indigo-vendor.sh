@@ -152,12 +152,16 @@ else:
     member.type = tarfile.CHRTYPE
 members.append(member)
 buffer = io.BytesIO()
-with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as output:
+with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as output:
     for item in sorted(members, key=lambda candidate: candidate.name):
         output.addfile(item, io.BytesIO(payloads[item.name]) if item.isfile() else None)
+payload_size = sum(512 + ((item.size + 511) // 512) * 512 for item in members)
+canonical_tar = buffer.getvalue()[:payload_size] + bytes(1024)
 with path.open("wb") as raw:
-    with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as zipped:
-        zipped.write(buffer.getvalue())
+    with gzip.GzipFile(
+        filename="", mode="wb", fileobj=raw, compresslevel=6, mtime=0
+    ) as zipped:
+        zipped.write(canonical_tar)
 PY
   digest="$(shasum -a 256 "$archive" | awk '{print $1}')"
   candidate_pin="$(mutated_pin "${name}-pin" vendorArchiveSHA256 "$digest")"
@@ -180,6 +184,79 @@ PY
 
 archive_mutation symlink-archive symlink
 archive_mutation nonregular-archive nonregular
+
+canonicality_mutation() {
+  name="$1"
+  kind="$2"
+  expected="$3"
+  fixture="$(new_cache_fixture "$name")"
+  archive="${fixture}/${bundle_name}/indigo-${commit}.vendor.tar.gz"
+  python3 - "$archive" "$kind" <<'PY'
+import copy
+import gzip
+import io
+import pathlib
+import sys
+import tarfile
+
+path = pathlib.Path(sys.argv[1])
+kind = sys.argv[2]
+with tarfile.open(path, "r:gz") as source:
+    members = source.getmembers()
+    payloads = {
+        member.name: source.extractfile(member).read()
+        for member in members if member.isfile()
+    }
+if kind == "reordered":
+    members = list(reversed(members))
+elif kind == "duplicate":
+    duplicate = next(member for member in members if member.name == "vendor/modules.txt")
+    members.append(copy.copy(duplicate))
+
+buffer = io.BytesIO()
+pax_headers = {"comment": "non-USTAR"} if kind == "pax" else None
+with tarfile.open(
+    fileobj=buffer,
+    mode="w",
+    format=tarfile.PAX_FORMAT if kind == "pax" else tarfile.USTAR_FORMAT,
+    pax_headers=pax_headers,
+) as output:
+    for item in members:
+        output.addfile(item, io.BytesIO(payloads[item.name]) if item.isfile() else None)
+payload_size = sum(512 + ((item.size + 511) // 512) * 512 for item in members)
+canonical_tar = buffer.getvalue()[:payload_size] + bytes(1024)
+with path.open("wb") as raw:
+    filename = "noncanonical" if kind == "gzip-header" else ""
+    with gzip.GzipFile(
+        filename=filename,
+        mode="wb",
+        fileobj=raw,
+        compresslevel=6,
+        mtime=0,
+    ) as zipped:
+        zipped.write(canonical_tar)
+PY
+  digest="$(shasum -a 256 "$archive" | awk '{print $1}')"
+  candidate_pin="$(mutated_pin "${name}-pin" vendorArchiveSHA256 "$digest")"
+  python3 - "${fixture}/${bundle_name}/metadata.json" "$digest" <<'PY'
+import json
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+document = json.loads(path.read_text(encoding="utf-8"))
+document["vendorArchiveSHA256"] = sys.argv[2]
+path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+  require_rejection "$name" "$expected" \
+    env SWAN_REFERENCE_INDIGO_VENDOR_TEST_MODE=1 \
+      SWAN_REFERENCE_INDIGO_VENDOR_PIN_FILE="$candidate_pin" \
+      "$verifier" --cache-dir "$fixture"
+}
+
+canonicality_mutation reordered-members reordered "vendor archive members are not strictly sorted"
+canonicality_mutation duplicate-member duplicate "vendor archive contains a duplicate member"
+canonicality_mutation wrong-tar-format pax "vendor archive must use canonical USTAR"
+canonicality_mutation noncanonical-gzip-header gzip-header "vendor archive has a noncanonical gzip header"
 
 atomic_cache="${temporary_directory}/atomic-cache"
 mkdir -p "$atomic_cache"
