@@ -1,4 +1,5 @@
 import Foundation
+import SQLiteNIO
 import SwanCore
 import SwanPublicFirehose
 import XCTest
@@ -7,6 +8,12 @@ import XCTest
 final class PublicFirehoseOutboxStoreTests: XCTestCase {
   private let did = "did:plc:abcdefghijklmnopqrstuvwx"
   private let epoch = Date(timeIntervalSince1970: 1_785_844_800)
+
+  private static let payloadEncoder: JSONEncoder = {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    return encoder
+  }()
 
   private func makeDatabase() async throws -> (URL, SQLiteAccountDatabase) {
     let root = FileManager.default.temporaryDirectory
@@ -22,15 +29,26 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
 
   private func commitRow(
     sourceKey: String = "did:plc:abc|commit|bafy1",
-    payload: Data = Data("payload".utf8),
+    payload: Data? = nil,
     carBytes: Data = Data("car".utf8),
     generation: Int64 = 0
   ) async throws {
+    let storedPayload = try payload ?? Self.payloadEncoder.encode(
+      PublicFirehoseCommitMaterial(
+        did: "did:plc:abc",
+        rev: "3kabc",
+        since: nil,
+        commitCID: "bafycid",
+        prevDataCID: nil,
+        ops: [],
+        time: "2026-08-04T12:00:00.000Z"
+      )
+    )
     _ = try await database.enqueuePublicFirehoseEvent(
       sourceKey: sourceKey,
       kind: .commit,
       lifecycleGeneration: generation,
-      payload: payload,
+      payload: storedPayload,
       carBytes: carBytes,
       now: epoch
     )
@@ -82,13 +100,140 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
       sourceKey: "did:plc:abc|commit|bafy1",
       kind: .commit,
       lifecycleGeneration: 0,
-      payload: Data("payload".utf8),
+      payload: try Self.payloadEncoder.encode(
+        PublicFirehoseCommitMaterial(
+          did: "did:plc:abc", rev: "3kabc", since: nil,
+          commitCID: "bafycid", prevDataCID: nil, ops: [],
+          time: "2026-08-04T12:00:00.000Z"
+        )
+      ),
       carBytes: Data("car".utf8),
       now: epoch
     )
     XCTAssertFalse(replayed)
     let pending = try await database.pendingPublicFirehoseOutbox()
     XCTAssertEqual(pending.count, 1)
+  }
+
+  func testCompletedOutboxRowRemainsExactReplayAnchorButIsNotPendingOrLeaseable() async throws {
+    try await commitRow()
+    let optionalLease = try await database.leaseNextPublicFirehoseOutbox(
+      now: epoch,
+      leaseDuration: 30
+    )
+    let lease = try XCTUnwrap(optionalLease)
+    let completed = try await database.completePublicFirehoseOutboxLease(
+      id: lease.row.id,
+      token: lease.token
+    )
+    XCTAssertTrue(completed)
+
+    let replayed = try await database.enqueuePublicFirehoseEvent(
+      sourceKey: "did:plc:abc|commit|bafy1",
+      kind: .commit,
+      lifecycleGeneration: 0,
+      payload: try Self.payloadEncoder.encode(
+        PublicFirehoseCommitMaterial(
+          did: "did:plc:abc", rev: "3kabc", since: nil,
+          commitCID: "bafycid", prevDataCID: nil, ops: [],
+          time: "2026-08-04T12:00:00.000Z"
+        )
+      ),
+      carBytes: Data("car".utf8),
+      now: epoch.addingTimeInterval(300)
+    )
+
+    XCTAssertFalse(replayed)
+    let oldest = try await database.oldestPendingPublicFirehoseOutbox()
+    XCTAssertNil(oldest)
+    let pending = try await database.pendingPublicFirehoseOutbox()
+    XCTAssertTrue(pending.isEmpty)
+    let recoveredLease = try await database.leaseNextPublicFirehoseOutbox(
+      now: epoch.addingTimeInterval(301),
+      leaseDuration: 30
+    )
+    XCTAssertNil(recoveredLease)
+  }
+
+  func testChangedMaterialAgainstCompletedOutboxAnchorRemainsConflict() async throws {
+    try await commitRow()
+    let optionalLease = try await database.leaseNextPublicFirehoseOutbox(
+      now: epoch,
+      leaseDuration: 30
+    )
+    let lease = try XCTUnwrap(optionalLease)
+    let completed = try await database.completePublicFirehoseOutboxLease(
+      id: lease.row.id,
+      token: lease.token
+    )
+    XCTAssertTrue(completed)
+
+    do {
+      _ = try await database.enqueuePublicFirehoseEvent(
+        sourceKey: "did:plc:abc|commit|bafy1",
+        kind: .commit,
+        lifecycleGeneration: 0,
+        payload: Data("changed".utf8),
+        carBytes: Data("car".utf8),
+        now: epoch.addingTimeInterval(300)
+      )
+      XCTFail("changed material against a completed source key must conflict")
+    } catch let error as SQLiteRepositoryError {
+      XCTAssertEqual(
+        error,
+        .conflictingPublicFirehoseSourceKey("did:plc:abc|commit|bafy1")
+      )
+    }
+    let pending = try await database.pendingPublicFirehoseOutbox()
+    XCTAssertTrue(pending.isEmpty)
+  }
+
+  func testCorruptMaterialInCompletedOutboxAnchorFailsAsCorruptDatabase() async throws {
+    try await commitRow()
+    let optionalLease = try await database.leaseNextPublicFirehoseOutbox(
+      now: epoch,
+      leaseDuration: 30
+    )
+    let lease = try XCTUnwrap(optionalLease)
+    let completed = try await database.completePublicFirehoseOutboxLease(
+      id: lease.row.id,
+      token: lease.token
+    )
+    XCTAssertTrue(completed)
+    try await database.close()
+    database = nil
+
+    let raw = try await SQLiteConnection.open(
+      storage: .file(path: SQLiteLayout.accountDatabase(in: root, did: did).path)
+    )
+    _ = try await raw.query(
+      "UPDATE public_event_outbox SET payload = ? WHERE id = ?",
+      [Data("not-json".utf8).sqliteData!, .integer(Int(lease.row.id))]
+    )
+    try await raw.close()
+
+    database = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+    do {
+      _ = try await database.enqueuePublicFirehoseEvent(
+        sourceKey: "did:plc:abc|commit|bafy1",
+        kind: .commit,
+        lifecycleGeneration: 0,
+        payload: try Self.payloadEncoder.encode(
+          PublicFirehoseCommitMaterial(
+            did: "did:plc:abc", rev: "3kabc", since: nil,
+            commitCID: "bafycid", prevDataCID: nil, ops: [],
+            time: "2026-08-04T12:00:00.000Z"
+          )
+        ),
+        carBytes: Data("car".utf8),
+        now: epoch.addingTimeInterval(300)
+      )
+      XCTFail("corrupt retained material must fail as corrupt database")
+    } catch let error as SQLiteRepositoryError {
+      guard case .corruptDatabase = error else {
+        return XCTFail("expected corruptDatabase, got \(error)")
+      }
+    }
   }
 
   func testSameSourceKeyWithChangedContentThrowsConflict() async throws {
@@ -303,13 +448,25 @@ final class PublicFirehoseOutboxStoreTests: XCTestCase {
     }
   }
 
-  func testMigrationLedgerRecordsVersionThirteenOnReopen() async throws {
+  func testMigrationLedgerRecordsVersionFourteenOnReopenAndPreservesPendingRow() async throws {
     try await commitRow()
     try await database.close()
+    database = nil
     let reopened = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
-    defer { Task { try? await reopened.close() } }
     let rows = try await reopened.pendingPublicFirehoseOutbox()
     XCTAssertEqual(rows.count, 1)
+    try await reopened.close()
+
+    let raw = try await SQLiteConnection.open(
+      storage: .file(path: SQLiteLayout.accountDatabase(in: root, did: did).path)
+    )
+    defer { Task { try? await raw.close() } }
+    let ledger = try await raw.query(
+      "SELECT version FROM permissioned_repository_migrations WHERE version = 14"
+    )
+    XCTAssertEqual(ledger.compactMap { $0.column("version")?.integer }, [14])
+    let columns = try await raw.query("PRAGMA table_info(public_event_outbox)")
+    XCTAssertTrue(columns.contains { $0.column("name")?.string == "completed" })
   }
 }
 

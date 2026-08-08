@@ -21,6 +21,7 @@ final class PublicLifecycleEmitterTests: XCTestCase {
 
   private var root: URL!
   private var control: SQLiteControlDatabase!
+  private var firehose: SQLiteFirehoseDatabase!
   private var account: SQLiteAccountDatabase!
   private var emitter: SQLitePublicLifecycleEmitter!
 
@@ -34,6 +35,7 @@ final class PublicLifecycleEmitterTests: XCTestCase {
     )
     self.root = root
     control = try await SQLiteControlDatabase(dataDirectory: root)
+    firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
     account = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
     let key = P256.Signing.PrivateKey()
     let genesis = try PublicRepositoryGenesisCodec.create(
@@ -55,11 +57,28 @@ final class PublicLifecycleEmitterTests: XCTestCase {
   }
 
   override func tearDown() async throws {
+    try? await firehose?.close()
     try? await control?.close()
     try? await account?.close()
     if let root {
       try? FileManager.default.removeItem(at: root)
     }
+  }
+
+  private func makeSequencer() throws -> PublicFirehoseSequencer {
+    PublicFirehoseSequencer(
+      accountSource: FixedLifecycleAccountSource(
+        accounts: [PublicFirehoseAccountDatabase(did: did, database: account)]
+      ),
+      control: control,
+      firehose: firehose,
+      configuration: try PublicFirehoseSequencerConfiguration(
+        leaseDuration: 30,
+        idlePollInterval: 0.25,
+        initialFailureBackoff: 1,
+        maximumFailureBackoff: 60
+      )
+    )
   }
 
   func testEmitActivationEnqueuesBatchAndBarrieredHeadSync() async throws {
@@ -150,6 +169,64 @@ final class PublicLifecycleEmitterTests: XCTestCase {
         return XCTFail("expected conflictingBatch, got \(error)")
       }
     }
+  }
+
+  func testActivationRetryAfterFullSequencingKeepsGenerationAndGlobalEventCount() async throws {
+    let sequencer = try makeSequencer()
+    try await emitter.emitActivation(
+      did: did, operationID: "req-sequenced", plcOperationCID: "bafyplc-sequenced",
+      handle: "alice.example", materialTime: epoch, now: epoch
+    )
+    let initialSteps = try await sequencer.drainAll(now: epoch)
+    XCTAssertEqual(initialSteps, 2)
+    let before = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(before.count, 3)
+
+    try await emitter.emitActivation(
+      did: did, operationID: "req-sequenced", plcOperationCID: "bafyplc-sequenced",
+      handle: "alice.example", materialTime: epoch,
+      now: epoch.addingTimeInterval(300)
+    )
+
+    let generation = try await control.currentLifecycleGeneration(did: did)
+    XCTAssertEqual(generation, 1)
+    let replaySteps = try await sequencer.drainAll(now: epoch.addingTimeInterval(300))
+    XCTAssertEqual(replaySteps, 0)
+    let after = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(after.map(\.sourceKey), before.map(\.sourceKey))
+    XCTAssertEqual(after.map(\.seq), before.map(\.seq))
+  }
+
+  func testActivationRetryAfterLifecycleCompletionBeforeSyncDrainConverges() async throws {
+    let sequencer = try makeSequencer()
+    try await emitter.emitActivation(
+      did: did, operationID: "req-crash-gap", plcOperationCID: "bafyplc-crash-gap",
+      handle: "alice.example", materialTime: epoch, now: epoch
+    )
+    guard case .sequencedLifecycleBatch = try await sequencer.sequenceNext(now: epoch) else {
+      return XCTFail("the lifecycle batch must sequence before its generation-matched sync")
+    }
+    let pendingLifecycleAfterFirstStep = try await control.nextPendingLifecycleBatch(did: did)
+    XCTAssertNil(pendingLifecycleAfterFirstStep)
+    let pendingSyncAfterFirstStep = try await account.pendingPublicFirehoseOutbox()
+    XCTAssertEqual(pendingSyncAfterFirstStep.count, 1)
+
+    try await emitter.emitActivation(
+      did: did, operationID: "req-crash-gap", plcOperationCID: "bafyplc-crash-gap",
+      handle: "alice.example", materialTime: epoch,
+      now: epoch.addingTimeInterval(300)
+    )
+
+    let replayedGeneration = try await control.currentLifecycleGeneration(did: did)
+    XCTAssertEqual(replayedGeneration, 1)
+    let replayedPendingLifecycle = try await control.nextPendingLifecycleBatch(did: did)
+    XCTAssertNil(replayedPendingLifecycle)
+    let replayedPendingSync = try await account.pendingPublicFirehoseOutbox()
+    XCTAssertEqual(replayedPendingSync.count, 1)
+    let remainingSteps = try await sequencer.drainAll(now: epoch.addingTimeInterval(300))
+    XCTAssertEqual(remainingSteps, 1)
+    let events = try await firehose.events(after: 0, limit: 10)
+    XCTAssertEqual(events.count, 3)
   }
 
   func testEmitManualSyncUsesCurrentGenerationAndManualSourceKey() async throws {

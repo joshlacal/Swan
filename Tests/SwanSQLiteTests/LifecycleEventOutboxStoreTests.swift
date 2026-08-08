@@ -1,5 +1,6 @@
 import Foundation
 import Petrel
+import SQLiteNIO
 import SwanCore
 import SwanPublicFirehose
 import XCTest
@@ -41,11 +42,12 @@ final class LifecycleEventOutboxStoreTests: XCTestCase {
 
   private func identityItem(
     did: String,
-    handle: String? = "alice.test"
+    handle: String? = "alice.test",
+    plcOperationCID: String = "bafyid1"
   ) -> LifecycleEventItem {
     let material = PublicFirehoseIdentityMaterial(did: did, handle: handle, time: time)
     return LifecycleEventItem(
-      sourceKey: PublicFirehoseSourceKey.identity(did: did, plcOperationCID: "bafyid1"),
+      sourceKey: PublicFirehoseSourceKey.identity(did: did, plcOperationCID: plcOperationCID),
       kind: .identity,
       payload: try! Self.payloadEncoder.encode(material),
       carBytes: nil
@@ -460,7 +462,7 @@ final class LifecycleEventOutboxStoreTests: XCTestCase {
     XCTAssertEqual(dids, [didA, didB])
   }
 
-  func testCompletionDeletesItemsByCascadeButPreservesGeneration() async throws {
+  func testCompletionRemovesBatchFromPendingButPreservesGeneration() async throws {
     let batch = try await control.enqueueLifecycleEventBatch(
       did: didA,
       operationID: "op-1",
@@ -476,10 +478,126 @@ final class LifecycleEventOutboxStoreTests: XCTestCase {
     let next = try await control.enqueueLifecycleEventBatch(
       did: didA,
       operationID: "op-2",
-      items: [identityItem(did: didA)],
+      items: [identityItem(did: didA, plcOperationCID: "bafyid2")],
       now: epoch
     )
     XCTAssertEqual(next.generation, 2)
+  }
+
+  func testCompletedBatchRemainsExactReplayAnchorButIsNotPending() async throws {
+    let items = [identityItem(did: didA), accountItem(did: didA)]
+    let batch = try await control.enqueueLifecycleEventBatch(
+      did: didA,
+      operationID: "completed-replay",
+      items: items,
+      now: epoch
+    )
+    let completed = try await control.completeLifecycleBatch(batchID: batch.batchID)
+    XCTAssertTrue(completed)
+
+    let replayed = try await control.enqueueLifecycleEventBatch(
+      did: didA,
+      operationID: "completed-replay",
+      items: items,
+      now: epoch.addingTimeInterval(300)
+    )
+
+    XCTAssertEqual(replayed, batch)
+    let pending = try await control.nextPendingLifecycleBatch(did: didA)
+    XCTAssertNil(pending)
+    let pendingDIDs = try await control.pendingLifecycleDIDs()
+    XCTAssertFalse(pendingDIDs.contains(didA))
+    let generation = try await control.currentLifecycleGeneration(did: didA)
+    XCTAssertEqual(generation, 1)
+  }
+
+  func testChangedMaterialAgainstCompletedBatchRemainsConflict() async throws {
+    let batch = try await control.enqueueLifecycleEventBatch(
+      did: didA,
+      operationID: "completed-conflict",
+      items: [identityItem(did: didA)],
+      now: epoch
+    )
+    let completed = try await control.completeLifecycleBatch(batchID: batch.batchID)
+    XCTAssertTrue(completed)
+
+    do {
+      _ = try await control.enqueueLifecycleEventBatch(
+        did: didA,
+        operationID: "completed-conflict",
+        items: [identityItem(did: didA, handle: "mallory.test")],
+        now: epoch.addingTimeInterval(300)
+      )
+      XCTFail("changed material against a completed source key must conflict")
+    } catch let error as LifecycleEventOutboxError {
+      XCTAssertEqual(error, .conflictingBatch(batch.batchID))
+    }
+    let pending = try await control.nextPendingLifecycleBatch(did: didA)
+    XCTAssertNil(pending)
+  }
+
+  func testCorruptMaterialInCompletedBatchFailsAsCorruptState() async throws {
+    let batch = try await control.enqueueLifecycleEventBatch(
+      did: didA,
+      operationID: "completed-corrupt",
+      items: [identityItem(did: didA)],
+      now: epoch
+    )
+    let completed = try await control.completeLifecycleBatch(batchID: batch.batchID)
+    XCTAssertTrue(completed)
+    try await control.close()
+    control = nil
+
+    let raw = try await SQLiteConnection.open(
+      storage: .file(path: SQLiteLayout.controlDatabase(in: root).path)
+    )
+    _ = try await raw.query(
+      "UPDATE lifecycle_event_items SET payload = ? WHERE batch_id = ?",
+      [Data("not-json".utf8).sqliteData!, .text(batch.batchID)]
+    )
+    try await raw.close()
+
+    control = try await SQLiteControlDatabase(dataDirectory: root)
+    do {
+      _ = try await control.enqueueLifecycleEventBatch(
+        did: didA,
+        operationID: "completed-corrupt",
+        items: [identityItem(did: didA)],
+        now: epoch.addingTimeInterval(300)
+      )
+      XCTFail("corrupt retained material must fail as corrupt state")
+    } catch let error as LifecycleEventOutboxError {
+      guard case .corruptState = error else {
+        return XCTFail("expected corruptState, got \(error)")
+      }
+    }
+  }
+
+  func testLifecycleCompletionMigrationRecordsVersionOneAndPreservesPendingOnReopen() async throws {
+    let pending = try await control.enqueueLifecycleEventBatch(
+      did: didA,
+      operationID: "migration-pending",
+      items: [identityItem(did: didA)],
+      now: epoch
+    )
+    try await control.close()
+    control = nil
+
+    let reopened = try await SQLiteControlDatabase(dataDirectory: root)
+    let reopenedPending = try await reopened.nextPendingLifecycleBatch(did: didA)
+    XCTAssertEqual(reopenedPending, pending)
+    try await reopened.close()
+
+    let raw = try await SQLiteConnection.open(
+      storage: .file(path: SQLiteLayout.controlDatabase(in: root).path)
+    )
+    defer { Task { try? await raw.close() } }
+    let ledger = try await raw.query(
+      "SELECT version FROM public_lifecycle_migrations ORDER BY version"
+    )
+    XCTAssertEqual(ledger.compactMap { $0.column("version")?.integer }, [1])
+    let columns = try await raw.query("PRAGMA table_info(lifecycle_event_batches)")
+    XCTAssertTrue(columns.contains { $0.column("name")?.string == "completed" })
   }
 
   func testCompletionReplayReturnsFalse() async throws {

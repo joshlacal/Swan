@@ -124,6 +124,7 @@ extension SQLiteAccountDatabase {
         SELECT id, source_key, kind, lifecycle_generation, payload, car_bytes,
                attempts, created_at, available_at, lease_token, lease_expires_at
         FROM public_event_outbox
+        WHERE completed = 0
         ORDER BY id
         LIMIT 1
         """
@@ -152,6 +153,7 @@ extension SQLiteAccountDatabase {
           SELECT id, source_key, kind, lifecycle_generation, payload, car_bytes,
                  attempts, created_at, available_at, lease_token, lease_expires_at
           FROM public_event_outbox
+          WHERE completed = 0
           ORDER BY id
           LIMIT 1
           """
@@ -168,7 +170,7 @@ extension SQLiteAccountDatabase {
           """
           UPDATE public_event_outbox
           SET lease_token = ?, lease_expires_at = ?
-          WHERE id = ?
+          WHERE id = ? AND completed = 0
           """,
           [
             .text(token.uuidString),
@@ -185,7 +187,9 @@ extension SQLiteAccountDatabase {
     }
   }
 
-  /// Deletes a source row only while the caller still owns its durable lease.
+  /// Completes a source row only while the caller still owns its durable
+  /// lease, retaining its public material indefinitely as an exact-replay and
+  /// conflict-detection anchor.
   @discardableResult
   public func completePublicFirehoseOutboxLease(
     id: Int64,
@@ -198,7 +202,7 @@ extension SQLiteAccountDatabase {
           SELECT id, source_key, kind, lifecycle_generation, payload, car_bytes,
                  attempts, created_at, available_at, lease_token, lease_expires_at
           FROM public_event_outbox
-          WHERE id = ?
+          WHERE id = ? AND completed = 0
           """,
           [.integer(Int(id))]
         )
@@ -208,8 +212,9 @@ extension SQLiteAccountDatabase {
         guard lease.token == token.uuidString else { return false }
         _ = try await connection.query(
           """
-          DELETE FROM public_event_outbox
-          WHERE id = ? AND lease_token = ?
+          UPDATE public_event_outbox
+          SET completed = 1, lease_token = NULL, lease_expires_at = NULL
+          WHERE id = ? AND lease_token = ? AND completed = 0
           """,
           [.integer(Int(id)), .text(token.uuidString)]
         )
@@ -235,7 +240,7 @@ extension SQLiteAccountDatabase {
           SELECT id, source_key, kind, lifecycle_generation, payload, car_bytes,
                  attempts, created_at, available_at, lease_token, lease_expires_at
           FROM public_event_outbox
-          WHERE id = ?
+          WHERE id = ? AND completed = 0
           """,
           [.integer(Int(id))]
         )
@@ -248,7 +253,7 @@ extension SQLiteAccountDatabase {
           UPDATE public_event_outbox
           SET attempts = attempts + 1, lease_token = NULL,
               lease_expires_at = NULL, available_at = ?
-          WHERE id = ? AND lease_token = ?
+          WHERE id = ? AND lease_token = ? AND completed = 0
           """,
           [
             .integer(retryTimestamp),
@@ -274,6 +279,7 @@ extension SQLiteAccountDatabase {
         SELECT id, source_key, kind, lifecycle_generation, payload, car_bytes,
                attempts, created_at, available_at, lease_token, lease_expires_at
         FROM public_event_outbox
+        WHERE completed = 0
         ORDER BY id
         LIMIT ?
         """,
@@ -302,6 +308,32 @@ extension SQLiteAccountDatabase {
     let storedGeneration = Int64(try requiredFirehoseInteger(row, "lifecycle_generation"))
     let storedPayload = try requiredFirehoseBlob(row, "payload")
     let storedCAR = try requiredFirehoseBlob(row, "car_bytes")
+    do {
+      switch storedKind {
+      case .commit:
+        _ = try JSONDecoder().decode(
+          PublicFirehoseCommitMaterial.self,
+          from: storedPayload
+        )
+      case .sync:
+        _ = try JSONDecoder().decode(
+          PublicFirehoseSyncMaterial.self,
+          from: storedPayload
+        )
+      case .identity, .account:
+        throw SQLiteRepositoryError.corruptDatabase(
+          "invalid public firehose outbox kind"
+        )
+      }
+    } catch is SQLiteRepositoryError {
+      throw SQLiteRepositoryError.corruptDatabase(
+        "invalid public firehose outbox material"
+      )
+    } catch {
+      throw SQLiteRepositoryError.corruptDatabase(
+        "invalid public firehose outbox material"
+      )
+    }
     guard storedKind == kind,
           storedGeneration == lifecycleGeneration,
           storedPayload == payload,

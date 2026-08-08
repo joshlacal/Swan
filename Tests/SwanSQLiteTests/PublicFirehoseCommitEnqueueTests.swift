@@ -226,11 +226,22 @@ final class PublicFirehoseCommitEnqueueTests: XCTestCase {
             did: did,
             commitCID: candidate.prepared.state.commitCID.string
         )
+        let conflictingPayload = try JSONEncoder().encode(
+            PublicFirehoseCommitMaterial(
+                did: did,
+                rev: "3different",
+                since: nil,
+                commitCID: candidate.prepared.state.commitCID.string,
+                prevDataCID: nil,
+                ops: [],
+                time: "2026-08-04T12:00:00.000Z"
+            )
+        )
         _ = try await database.enqueuePublicFirehoseEvent(
             sourceKey: conflictingKey,
             kind: .commit,
             lifecycleGeneration: 0,
-            payload: Data("different material".utf8),
+            payload: conflictingPayload,
             carBytes: Data("different car".utf8),
             now: Date(timeIntervalSince1970: 1_785_844_800)
         )
@@ -264,7 +275,7 @@ final class PublicFirehoseCommitEnqueueTests: XCTestCase {
         let outbox = try await database.pendingPublicFirehoseOutbox()
         XCTAssertEqual(outbox.count, 1)
         XCTAssertEqual(outbox.first?.sourceKey, conflictingKey)
-        XCTAssertEqual(outbox.first?.payload, Data("different material".utf8))
+        XCTAssertEqual(outbox.first?.payload, conflictingPayload)
     }
 
     func testMutationWithoutFirehoseContextEnqueuesNoOutboxRow() async throws {

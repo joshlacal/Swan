@@ -225,11 +225,18 @@ public enum SQLiteLayout {
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS public_lifecycle_migrations (
+            version INTEGER PRIMARY KEY CHECK(version > 0),
+            applied_at INTEGER NOT NULL CHECK(applied_at >= 0)
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS lifecycle_event_batches (
             batch_id TEXT PRIMARY KEY,
             did TEXT NOT NULL,
             generation INTEGER NOT NULL CHECK(generation >= 1),
             created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            completed INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1)),
             UNIQUE(did, generation)
         )
         """,
@@ -1657,6 +1664,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let permissionedRemoteReplicaIncrementalSequenceMigrationVersion = 11
     private static let permissionedRemoteReplicaLogicalLimitMigrationVersion = 12
     private static let publicFirehoseOutboxMigrationVersion = 13
+    private static let publicFirehoseCompletionAnchorMigrationVersion = 14
 
     /// A read credential may register notification recipients, but it must
     /// not be able to turn the later deletion fanout into an unbounded
@@ -2009,6 +2017,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migratePermissionedRemoteReplicaIncrementalSequenceIfNeeded()
             try await migratePermissionedRemoteReplicaLogicalLimitIfNeeded()
             try await migratePublicFirehoseOutboxIfNeeded()
+            try await migratePublicFirehoseCompletionAnchorsIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -2454,6 +2463,35 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             )
         );
         """
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
+    /// Retains completed source keys indefinitely so a retry can still prove
+    /// exact idempotence after the global append has committed. Completed rows
+    /// contain only already-public firehose material; pruning requires a
+    /// separately designed tombstone that preserves the same conflict checks.
+    private func migratePublicFirehoseCompletionAnchorsIfNeeded() async throws {
+        let version = Self.publicFirehoseCompletionAnchorMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        try await addAccountColumnIfMissing(
+            table: "public_event_outbox",
+            column: "completed",
+            definition: "INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1))"
         )
         _ = try await connection.query(
             """

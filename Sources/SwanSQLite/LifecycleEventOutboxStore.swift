@@ -46,6 +46,44 @@ public enum LifecycleEventOutboxError: Error, Sendable, Equatable {
 /// by exact source key: crash recovery is append-then-complete, and a batch
 /// left in these tables is safely replayed.
 extension SQLiteControlDatabase {
+  /// Installs the first versioned public-lifecycle migration. The pre-ledger
+  /// schema hard-deleted completed batches, so every row present during this
+  /// additive migration is pending and receives the default `completed = 0`.
+  func migratePublicLifecycleCompletionAnchorsIfNeeded() async throws {
+    let version = 1
+    let applied = try await connection.query(
+      "SELECT 1 FROM public_lifecycle_migrations WHERE version = ?",
+      [.integer(version)]
+    )
+    guard applied.isEmpty else { return }
+
+    try await addColumnIfMissing(
+      table: "lifecycle_event_batches",
+      column: "completed",
+      definition: "INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1))"
+    )
+    _ = try await connection.query(
+      "DROP INDEX IF EXISTS lifecycle_event_batches_pending"
+    )
+    _ = try await connection.query(
+      """
+      CREATE INDEX lifecycle_event_batches_pending
+      ON lifecycle_event_batches(did, generation, created_at, batch_id)
+      WHERE completed = 0
+      """
+    )
+    _ = try await connection.query(
+      """
+      INSERT INTO public_lifecycle_migrations(version, applied_at)
+      VALUES (?, ?)
+      """,
+      [
+        .integer(version),
+        .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+      ]
+    )
+  }
+
   public func enqueueLifecycleEventBatch(
     did: String,
     operationID: String,
@@ -97,6 +135,15 @@ extension SQLiteControlDatabase {
     if let row = existing.first {
       let stored = try decodeLifecycleBatchHeader(row)
       let storedItems = try await lifecycleItems(for: batchID)
+      do {
+        for (ordinal, item) in storedItems.enumerated() {
+          try validateLifecycleItem(item, ordinal: ordinal)
+        }
+      } catch {
+        throw LifecycleEventOutboxError.corruptState(
+          "stored lifecycle batch contains invalid material"
+        )
+      }
       guard stored.did == did,
             storedItems == items else {
         throw LifecycleEventOutboxError.conflictingBatch(batchID)
@@ -211,7 +258,7 @@ extension SQLiteControlDatabase {
           """
           SELECT batch_id, did, generation, created_at
           FROM lifecycle_event_batches
-          WHERE did = ?
+          WHERE did = ? AND completed = 0
           ORDER BY generation, created_at, batch_id
           LIMIT 1
           """,
@@ -222,6 +269,7 @@ extension SQLiteControlDatabase {
           """
           SELECT batch_id, did, generation, created_at
           FROM lifecycle_event_batches
+          WHERE completed = 0
           ORDER BY did, generation, created_at, batch_id
           LIMIT 1
           """
@@ -246,6 +294,7 @@ extension SQLiteControlDatabase {
         """
         SELECT DISTINCT did
         FROM lifecycle_event_batches
+        WHERE completed = 0
         ORDER BY did
         """
       )
@@ -260,21 +309,23 @@ extension SQLiteControlDatabase {
     }
   }
 
-  /// Deletes the batch; items are removed by cascade. The per-DID generation
+  /// Marks the batch complete while retaining its material indefinitely as an
+  /// exact-replay and conflict-detection anchor. The per-DID generation
   /// counter is intentionally preserved so generations are never reused.
   @discardableResult
   public func completeLifecycleBatch(batchID: String) async throws -> Bool {
     try await withConnectionGate {
       try await transaction {
-        let deleted = try await connection.query(
+        let completed = try await connection.query(
           """
-          DELETE FROM lifecycle_event_batches
-          WHERE batch_id = ?
+          UPDATE lifecycle_event_batches
+          SET completed = 1
+          WHERE batch_id = ? AND completed = 0
           RETURNING batch_id
           """,
           [.text(batchID)]
         )
-        return deleted.count == 1
+        return completed.count == 1
       }
     }
   }

@@ -1419,6 +1419,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 """
             )
             try await migrateAccountControlSchema()
+            try await migratePublicLifecycleCompletionAnchorsIfNeeded()
         }
     }
 
