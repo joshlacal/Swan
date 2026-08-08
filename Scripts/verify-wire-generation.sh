@@ -17,7 +17,52 @@ temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/swan-wire-generation.XXXXXX")"
 trap 'rm -rf "${temporary_root}"' EXIT
 temporary_manifest="${temporary_root}/PetrelManifest.json"
 temporary_output="${temporary_root}/Generated"
-wire_generation_materialize_manifest "${temporary_manifest}" "${temporary_output}"
+python3 - \
+  "${root}/PetrelManifest.json" \
+  "${root}" \
+  "${temporary_manifest}" \
+  "${temporary_output}" <<'PY'
+import json
+import os
+import sys
+
+source, swan_root, destination, output = sys.argv[1:]
+with open(source, encoding="utf-8") as file:
+    manifest = json.load(file)
+
+workspace_prefix = "../Swan/"
+interop_root = os.path.join(swan_root, ".interop-cache")
+for key in ("emit", "reference"):
+    paths = manifest.get("lexicons", {}).get(key)
+    if not isinstance(paths, list) or not paths:
+        raise SystemExit(f"wire generation: manifest has no {key} lexicon inputs")
+
+    staged_paths = []
+    for path in paths:
+        if not isinstance(path, str) or not path.startswith(workspace_prefix):
+            raise SystemExit(
+                f"wire generation: {key} lexicon input is not rooted in Swan: {path!r}"
+            )
+        staged_path = os.path.normpath(
+            os.path.join(swan_root, path[len(workspace_prefix):])
+        )
+        if os.path.commonpath((interop_root, staged_path)) != interop_root:
+            raise SystemExit(
+                f"wire generation: {key} lexicon input escapes .interop-cache: {path}"
+            )
+        if not os.path.isdir(staged_path):
+            raise SystemExit(
+                "wire generation: required active-workspace lexicon directory "
+                f"is missing: {staged_path}"
+            )
+        staged_paths.append(staged_path)
+    manifest["lexicons"][key] = staged_paths
+
+manifest["swift"]["output"] = output
+with open(destination, "w", encoding="utf-8") as file:
+    json.dump(manifest, file, indent=2, sort_keys=True)
+    file.write("\n")
+PY
 
 (
   cd "${PETREL_GENERATOR_ROOT}"
