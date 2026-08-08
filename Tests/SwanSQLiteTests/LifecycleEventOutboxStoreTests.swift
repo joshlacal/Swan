@@ -583,13 +583,43 @@ final class LifecycleEventOutboxStoreTests: XCTestCase {
     try await control.close()
     control = nil
 
+    let databasePath = SQLiteLayout.controlDatabase(in: root).path
+    let legacy = try await SQLiteConnection.open(storage: .file(path: databasePath))
+    _ = try await legacy.query(
+      "DROP INDEX IF EXISTS lifecycle_event_batches_pending"
+    )
+    _ = try await legacy.query(
+      "ALTER TABLE lifecycle_event_batches DROP COLUMN completed"
+    )
+    _ = try await legacy.query("DROP TABLE public_lifecycle_migrations")
+    _ = try await legacy.query(
+      """
+      CREATE INDEX lifecycle_event_batches_pending
+      ON lifecycle_event_batches(did, generation, created_at, batch_id)
+      """
+    )
+    let preUpgradeColumns = try await legacy.query(
+      "PRAGMA table_info(lifecycle_event_batches)"
+    )
+    XCTAssertFalse(
+      preUpgradeColumns.contains { $0.column("name")?.string == "completed" }
+    )
+    let preUpgradeRows = try await legacy.query(
+      "SELECT batch_id FROM lifecycle_event_batches"
+    )
+    XCTAssertEqual(
+      preUpgradeRows.compactMap { $0.column("batch_id")?.string },
+      [pending.batchID]
+    )
+    try await legacy.close()
+
     let reopened = try await SQLiteControlDatabase(dataDirectory: root)
     let reopenedPending = try await reopened.nextPendingLifecycleBatch(did: didA)
     XCTAssertEqual(reopenedPending, pending)
     try await reopened.close()
 
     let raw = try await SQLiteConnection.open(
-      storage: .file(path: SQLiteLayout.controlDatabase(in: root).path)
+      storage: .file(path: databasePath)
     )
     defer { Task { try? await raw.close() } }
     let ledger = try await raw.query(
@@ -598,6 +628,17 @@ final class LifecycleEventOutboxStoreTests: XCTestCase {
     XCTAssertEqual(ledger.compactMap { $0.column("version")?.integer }, [1])
     let columns = try await raw.query("PRAGMA table_info(lifecycle_event_batches)")
     XCTAssertTrue(columns.contains { $0.column("name")?.string == "completed" })
+    let migratedRows = try await raw.query(
+      "SELECT batch_id, completed FROM lifecycle_event_batches"
+    )
+    XCTAssertEqual(migratedRows.count, 1)
+    XCTAssertEqual(migratedRows[0].column("batch_id")?.string, pending.batchID)
+    XCTAssertEqual(migratedRows[0].column("completed")?.integer, 0)
+    let indexes = try await raw.query(
+      "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'lifecycle_event_batches_pending'"
+    )
+    let migratedIndexSQL = try XCTUnwrap(indexes.first?.column("sql")?.string)
+    XCTAssertTrue(migratedIndexSQL.contains("WHERE completed = 0"))
   }
 
   func testCompletionReplayReturnsFalse() async throws {

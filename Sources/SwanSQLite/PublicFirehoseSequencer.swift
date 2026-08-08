@@ -90,8 +90,8 @@ public enum PublicFirehoseSequencerError: Error, Sendable, Equatable {
 ///
 /// A crash after the global append but before source completion leaves the
 /// source present; retry re-encodes at the stored sequence and returns the
-/// original sequences, then removes the source. No duplicate sequence, no
-/// lost event.
+/// original sequences, then marks the source complete while retaining its
+/// exact replay anchor. No duplicate sequence, no lost event.
 /// Test-only crash boundary context, invoked after the global append commits
 /// and before the source outbox row or lifecycle batch is completed. A
 /// throwing hook must leave the source untouched.

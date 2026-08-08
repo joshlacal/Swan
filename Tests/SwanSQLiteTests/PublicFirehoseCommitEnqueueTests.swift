@@ -237,12 +237,16 @@ final class PublicFirehoseCommitEnqueueTests: XCTestCase {
                 time: "2026-08-04T12:00:00.000Z"
             )
         )
+        let conflictingCAR = try await PublicFirehoseDiffCAR.commitOnly(
+            commitCID: candidate.prepared.state.commitCID,
+            commitBytes: candidate.prepared.signedCommit.signedCommitBytes
+        )
         _ = try await database.enqueuePublicFirehoseEvent(
             sourceKey: conflictingKey,
             kind: .commit,
             lifecycleGeneration: 0,
             payload: conflictingPayload,
-            carBytes: Data("different car".utf8),
+            carBytes: conflictingCAR,
             now: Date(timeIntervalSince1970: 1_785_844_800)
         )
 

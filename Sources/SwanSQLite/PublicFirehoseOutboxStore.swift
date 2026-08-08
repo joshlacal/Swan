@@ -1,7 +1,9 @@
 import Foundation
+import Petrel
 import SQLiteNIO
 import SwanCore
 import SwanPublicFirehose
+import SwanPublicRepository
 
 public struct PublicFirehoseOutboxRow: Sendable, Equatable {
   public let id: Int64
@@ -60,7 +62,7 @@ extension SQLiteAccountDatabase {
       [.text(sourceKey)]
     )
     if let row = existing.first {
-      return try matchExactFirehoseReplay(
+      return try await matchExactFirehoseReplay(
         row,
         sourceKey: sourceKey,
         kind: kind,
@@ -298,7 +300,7 @@ extension SQLiteAccountDatabase {
     lifecycleGeneration: Int64,
     payload: Data,
     carBytes: Data
-  ) throws -> Bool {
+  ) async throws -> Bool {
     let storedKindText = try requiredFirehoseText(row, "kind")
     guard let storedKind = PublicFirehoseEventKind(rawValue: storedKindText) else {
       throw SQLiteRepositoryError.corruptDatabase(
@@ -308,27 +310,57 @@ extension SQLiteAccountDatabase {
     let storedGeneration = Int64(try requiredFirehoseInteger(row, "lifecycle_generation"))
     let storedPayload = try requiredFirehoseBlob(row, "payload")
     let storedCAR = try requiredFirehoseBlob(row, "car_bytes")
+    guard storedGeneration >= 0 else {
+      throw SQLiteRepositoryError.corruptDatabase(
+        "invalid public firehose outbox generation"
+      )
+    }
     do {
+      let commitCID: String
       switch storedKind {
       case .commit:
-        _ = try JSONDecoder().decode(
+        let material = try JSONDecoder().decode(
           PublicFirehoseCommitMaterial.self,
           from: storedPayload
         )
+        try validateStoredFirehoseTime(material.time)
+        _ = try FirehoseFrameEncoder.commitFrame(
+          seq: FirehoseFrameLimits.maximumSequence,
+          material: material,
+          diffCAR: storedCAR
+        )
+        commitCID = material.commitCID
       case .sync:
-        _ = try JSONDecoder().decode(
+        let material = try JSONDecoder().decode(
           PublicFirehoseSyncMaterial.self,
           from: storedPayload
         )
-      case .identity, .account:
-        throw SQLiteRepositoryError.corruptDatabase(
-          "invalid public firehose outbox kind"
+        try validateStoredFirehoseTime(material.time)
+        _ = try FirehoseFrameEncoder.syncFrame(
+          seq: FirehoseFrameLimits.maximumSequence,
+          material: material,
+          commitCAR: storedCAR
         )
+        commitCID = material.commitCID
+      case .identity, .account:
+        throw StoredFirehoseReplayValidationError.invalidMaterial
       }
-    } catch is SQLiteRepositoryError {
-      throw SQLiteRepositoryError.corruptDatabase(
-        "invalid public firehose outbox material"
+      let expectedRoot = try CID.parse(commitCID)
+      try PublicRepositoryCID.validate(expectedRoot)
+      guard expectedRoot.string == commitCID else {
+        throw StoredFirehoseReplayValidationError.invalidMaterial
+      }
+      let source = StoredFirehoseCARSource(storedCAR)
+      let sink = StoredFirehoseCARSink()
+      let parsed = try await PublicRepositoryCAR.parseIncrementally(
+        from: source,
+        to: sink
       )
+      guard parsed.rootCID == expectedRoot,
+            parsed.frameCount > 0,
+            await sink.contains(expectedRoot) else {
+        throw StoredFirehoseReplayValidationError.invalidCAR
+      }
     } catch {
       throw SQLiteRepositoryError.corruptDatabase(
         "invalid public firehose outbox material"
@@ -342,6 +374,16 @@ extension SQLiteAccountDatabase {
       throw SQLiteRepositoryError.conflictingPublicFirehoseSourceKey(sourceKey)
     }
     return false
+  }
+
+  private func validateStoredFirehoseTime(_ value: String) throws {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    guard let date = formatter.date(from: value),
+          PublicFirehoseTime.encode(date) == value else {
+      throw StoredFirehoseReplayValidationError.invalidMaterial
+    }
   }
 
   // MARK: - Row decoding
@@ -434,5 +476,44 @@ extension SQLiteAccountDatabase {
       throw SwanError.malformed("public firehose timestamp is out of range")
     }
     return Int(microseconds.rounded(.down))
+  }
+}
+
+private enum StoredFirehoseReplayValidationError: Error {
+  case invalidMaterial
+  case invalidCAR
+}
+
+private actor StoredFirehoseCARSource: PublicRepositoryCARByteSource {
+  private let bytes: Data
+  private var offset = 0
+
+  init(_ bytes: Data) {
+    self.bytes = bytes
+  }
+
+  func read(maximumBytes: Int) -> Data? {
+    guard offset < bytes.count else { return nil }
+    let end = min(bytes.count, offset + maximumBytes)
+    defer { offset = end }
+    return Data(bytes[offset ..< end])
+  }
+}
+
+private actor StoredFirehoseCARSink: PublicRepositoryCARFrameSink {
+  private var receivedCIDs = Set<CID>()
+
+  func receiveHeader(rootCID: CID, receivedByteCount: Int) {}
+
+  func receiveBlock(
+    _ block: PublicRepositoryBlock,
+    receivedByteCount: Int,
+    frameCount: Int
+  ) {
+    receivedCIDs.insert(block.cid)
+  }
+
+  func contains(_ cid: CID) -> Bool {
+    receivedCIDs.contains(cid)
   }
 }
