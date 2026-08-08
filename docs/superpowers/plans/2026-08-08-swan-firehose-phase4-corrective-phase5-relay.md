@@ -120,6 +120,58 @@ the exact corrective head. A single flake fails the gate.
 
 ## Task 4: Checksum-pinned indigo source foundation
 
+### Audited Phase 5 execution decisions
+
+The Phase 5 inventory and authoritative-upstream preflight resolve the open
+build and topology choices as follows:
+
+- Pin `bluesky-social/indigo` commit
+  `8b43a326dbbb394f63b6d68761553cdfe25532de` and GitHub source archive
+  SHA-256 `bc6f57e6211560220ac49dc7d6b55c5a43291f1e1193113ce413ffe4478fdd0b`.
+  The signed upstream commit contains `cmd/relay`, `go.mod`, and `go.sum`, but
+  no `vendor/` directory.
+- Materialize the Go closure before Docker build with a digest-pinned Go 1.26
+  toolchain container. `go mod vendor` is governed by the pinned `go.sum` and
+  produces a deterministic ignored vendor archive with a recorded SHA-256.
+  Later Docker builds are network-disabled and consume only the verified
+  Indigo source and vendor archives. Task 4 may contact the Go module proxy
+  and checksum database only for this `go.sum`-authenticated materialization.
+- Do not build the optional relay admin UI; acceptance uses XRPC/admin HTTP.
+- The pinned relay rejects private upstream addresses. Add a
+  checksum-qualified disposable reference-relay overlay, following the
+  reference-PDS overlay pattern, with an explicit lab-only private-upstream
+  opt-in. Static verification must prove it is absent by default.
+- Put relay activation in `docker-compose.reference-relay.yml`. The base lab
+  remains unchanged and public firehose remains default-off outside it.
+- Route only the relay's `swan.test:443` resolution through Toxiproxy. Add a
+  dedicated `:443 -> caddy:443` proxy and give only `reference-relay` an
+  `extra_hosts` mapping from `swan.test` to Toxiproxy's fixed IP. TLS SNI and
+  the DID document's PDS URL remain `https://swan.test`; other lab clients do
+  not traverse this fault path.
+- Expose relay HTTP/WebSocket to the host-side runner through Caddy at
+  `https://relay.test`, with no direct host port. Swan announces internally to
+  `http://reference-relay:2470`. Add non-sensitive structured Swan
+  connection-open/close observations so the runner proves a real
+  `subscribeRepos` connection instead of inferring it from crawl state.
+- Every ordered scenario removes only the named project's dedicated relay
+  volume, then proves `listHosts` is empty before requesting crawl. No wildcard
+  or broad volume deletion is allowed.
+- Create the fresh account by parameterizing the existing `account
+  prepare-plc` / `account activate-plc` laboratory workflow in
+  `interop/bootstrap-local-space.sh`, using a unique request ID, handle,
+  password file, and owner-only identity file in ignored evidence state.
+- Use exactly `N = 5` offline-window commits. If the pinned relay sends
+  `getRepo?since`, pass only if the artifact proves its full-snapshot response
+  was accepted and the relay reached the exact final revision/MST; otherwise
+  implement revision-aware block selection before continuing.
+- The mode-0600 aggregate artifact must record `status: passed`, scenario,
+  Indigo commit/source/vendor/image digests, corrective Swan head, fresh-state
+  witness, ordered source keys, five-commit expected/observed deltas, reconnect
+  cursors, duplicate/gap counts, observed `getRepo` query mode, final
+  revision/commit/MST digests, and verifier result. It must end with
+  `REFERENCE RELAY ACCEPTANCE OK` and contain no values, credentials, proofs,
+  tokens, or raw logs.
+
 Select a concrete `bluesky-social/indigo` commit from the authoritative
 upstream repository and record the archive SHA-256. Add:
 
@@ -132,7 +184,8 @@ upstream repository and record the archive SHA-256. Add:
 Follow the existing atproto reference pattern: staged download, checksum
 verification before extraction, required-file checks, no Dockerfile network
 fetch, and `.interop-cache` excluded from commits. This task may use the
-network only to fetch the authoritative pinned archive.
+network only for the authoritative source archive and the `go.sum`-authenticated
+vendor materialization described above.
 
 ## Task 5: Reference relay container and static lab topology
 
@@ -149,6 +202,10 @@ service using indigo `cmd/relay` with:
 - `SWAN_PUBLIC_CRAWLERS` wired to the relay and public firehose explicitly
   enabled only inside this lab topology.
 
+Wire `verify-reference-indigo.sh` into every relay-override Compose preflight.
+Keep the Indigo pin out of `Profiles/`: this is an interop-lab reference pin,
+and the protected permissioned/public wire profiles remain byte-identical.
+
 Extend `Scripts/verify-interop-lab.sh` and its mutation suite before changing
 the topology, so missing pin, trust, health, dependency, network, or secret
 constraints fail RED first.
@@ -163,7 +220,7 @@ design's exact order:
 3. create and activate a fresh account;
 4. prove `#identity -> #account -> activation #sync`;
 5. create a public record and observe the relay's outbound `#commit`;
-6. interrupt relay-to-Swan through toxiproxy, create N commits, reconnect,
+6. interrupt relay-to-Swan through toxiproxy, create exactly 5 commits, reconnect,
    and prove exactly-once cursor recovery plus equal `getRepo` state;
 7. force manual `#sync` and prove clean relay resynchronization.
 
@@ -171,7 +228,10 @@ The independent verifier must validate binary framing, bounds, DID
 resolution, signed commit CID/signature, repo/rev/commit agreement, every CAR
 block CID, CAR root, op paths and old/new CIDs, reverse-op `prevData`,
 `since`/`prevData`, and final MST equality. Observe whether the pinned relay
-sends `getRepo?since`; never label a full snapshot as a diff.
+sends `getRepo?since`; never label a full snapshot as a diff. A `since` request
+is a fail-closed decision branch: prove the pinned relay accepted the returned
+full snapshot and reached exact final state, or implement revision-aware block
+selection before the scenario can pass.
 
 Artifacts are aggregate/digest-only, mode 0600, under ignored evidence paths.
 No record value, credential, token, proof, or raw private log is retained.
