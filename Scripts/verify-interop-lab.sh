@@ -821,19 +821,66 @@ import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
-allowed = (
+allowed_parent = (
     "!Swan/.interop-cache/"
+    "indigo-8b43a326dbbb394f63b6d68761553cdfe25532de"
+)
+allowed_archive = (
+    "!Swan/.interop-cache/"
+    "indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/"
     "indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz"
 )
-exceptions = {
+rules = [
     line.strip()
     for line in path.read_text(encoding="utf-8").splitlines()
-    if line.strip().startswith("!") and "/.interop-cache/" in line
+    if line.strip() and not line.lstrip().startswith("#")
+]
+exceptions = {
+    line for line in rules if line.startswith("!") and "/.interop-cache/" in line
 }
-if exceptions != {allowed}:
+if exceptions != {allowed_parent, allowed_archive}:
     raise SystemExit(
         "the Swan image build context must allow only the pinned Indigo source archive"
     )
+if rules[-2:] != [allowed_parent, allowed_archive]:
+    raise SystemExit(
+        "the Swan image build context must allow only the pinned Indigo source archive"
+    )
+
+# Evaluate ordered membership for the exact allowed archive and representative
+# forbidden cache paths. A later broad negation such as !Swan/** must not undo
+# the cache exclusion without naming .interop-cache itself.
+import fnmatch
+
+def is_ignored(candidate):
+    ignored = False
+    for rule in rules:
+        negated = rule.startswith("!")
+        pattern = rule[1:] if negated else rule
+        pattern = pattern.lstrip("/")
+        if pattern.endswith("/"):
+            pattern += "**"
+        if fnmatch.fnmatchcase(candidate, pattern):
+            ignored = not negated
+    return ignored
+
+pinned_parent = allowed_parent[1:]
+pinned = allowed_archive[1:]
+for candidate, expected_ignored in (
+    (pinned_parent, False),
+    (pinned, False),
+    (
+        "Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/"
+        "source/go.mod",
+        True,
+    ),
+    ("Swan/.interop-cache/atproto-unpinned.tar.gz", True),
+    ("Swan/.interop-cache/indigo-unpinned/archive.tar.gz", True),
+):
+    if is_ignored(candidate) != expected_ignored:
+        raise SystemExit(
+            "the Swan image build context must allow only the pinned Indigo source archive"
+        )
 PY
 for ignore_file in "$reference_pds_dockerignore" "$reference_plc_dockerignore"; do
   rg -qx 'Swan/\.interop-cache/\*\*' "$ignore_file"

@@ -4,17 +4,28 @@ set -euo pipefail
 readonly COMMIT="8b43a326dbbb394f63b6d68761553cdfe25532de"
 readonly ARCHIVE_SHA256="bc6f57e6211560220ac49dc7d6b55c5a43291f1e1193113ce413ffe4478fdd0b"
 cache_dir=".interop-cache"
+bundle_dir=""
+scan_cache=1
 
 if [[ "${1:-}" == "--cache-dir" && -n "${2:-}" && $# -eq 2 ]]; then
   cache_dir="$2"
+elif [[ "${1:-}" == "--bundle-dir" && -n "${2:-}" && $# -eq 2 ]]; then
+  bundle_dir="$2"
+  scan_cache=0
 elif [[ $# -ne 0 ]]; then
-  echo "usage: interop/verify-reference-indigo.sh [--cache-dir <directory>]" >&2
+  echo "usage: interop/verify-reference-indigo.sh [--cache-dir <directory> | --bundle-dir <directory>]" >&2
   exit 64
 fi
 
-archive="${cache_dir}/indigo-${COMMIT}.tar.gz"
-source_root="${cache_dir}/indigo-${COMMIT}"
-if [[ ! -f "$archive" || -L "$archive" || ! -d "$source_root" || -L "$source_root" ]]; then
+if [[ -z "$bundle_dir" ]]; then
+  bundle_dir="${cache_dir}/indigo-${COMMIT}"
+fi
+archive="${bundle_dir}/indigo-${COMMIT}.tar.gz"
+source_root="${bundle_dir}/source"
+if [[ ! -d "$bundle_dir" || -L "$bundle_dir" \
+  || ! -f "$archive" || -L "$archive" \
+  || ! -d "$source_root" || -L "$source_root" ]]
+then
   echo "pinned Indigo reference cache is unavailable; run interop/fetch-reference-indigo.sh" >&2
   exit 1
 fi
@@ -25,7 +36,7 @@ if [[ "$actual_sha256" != "$ARCHIVE_SHA256" ]]; then
   exit 1
 fi
 
-python3 - "$cache_dir" "$archive" "$source_root" "$COMMIT" <<'PY'
+python3 - "$cache_dir" "$bundle_dir" "$archive" "$source_root" "$COMMIT" "$scan_cache" <<'PY'
 import hashlib
 import os
 import pathlib
@@ -33,17 +44,24 @@ import stat
 import sys
 import tarfile
 
-cache_dir, archive_path, source_root = map(pathlib.Path, sys.argv[1:4])
-commit = sys.argv[4]
+cache_dir, bundle_dir, archive_path, source_root = map(pathlib.Path, sys.argv[1:5])
+commit = sys.argv[5]
+scan_cache = sys.argv[6] == "1"
 expected_prefix = f"indigo-{commit}"
-allowed_cache_entries = {expected_prefix, f"{expected_prefix}.tar.gz"}
+allowed_cache_entries = {expected_prefix}
 
-for entry in cache_dir.iterdir():
-    is_indigo_entry = entry.name.startswith("indigo-") or entry.name.startswith(
-        ".indigo-"
-    )
-    if is_indigo_entry and entry.name not in allowed_cache_entries:
-        raise SystemExit(f"unexpected Indigo cache entry: {entry.name}")
+if scan_cache:
+    for entry in cache_dir.iterdir():
+        is_indigo_entry = entry.name.startswith("indigo-") or entry.name.startswith(
+            ".indigo-"
+        )
+        if is_indigo_entry and entry.name not in allowed_cache_entries:
+            raise SystemExit(f"unexpected Indigo cache entry: {entry.name}")
+
+expected_bundle_entries = {"source", f"indigo-{commit}.tar.gz"}
+actual_bundle_entries = {entry.name for entry in bundle_dir.iterdir()}
+if actual_bundle_entries != expected_bundle_entries:
+    raise SystemExit("pinned Indigo bundle has unexpected layout")
 
 required_files = (
     "go.mod",

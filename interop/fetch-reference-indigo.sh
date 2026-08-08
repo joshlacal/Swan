@@ -4,13 +4,32 @@ set -euo pipefail
 readonly COMMIT="8b43a326dbbb394f63b6d68761553cdfe25532de"
 readonly ARCHIVE_SHA256="bc6f57e6211560220ac49dc7d6b55c5a43291f1e1193113ce413ffe4478fdd0b"
 readonly SOURCE_URL="https://github.com/bluesky-social/indigo/archive/${COMMIT}.tar.gz"
-readonly CACHE_DIR=".interop-cache"
+cache_dir=".interop-cache"
+
+override_names=(
+  SWAN_REFERENCE_INDIGO_CACHE_DIR
+  SWAN_REFERENCE_INDIGO_SOURCE_ARCHIVE
+  SWAN_REFERENCE_INDIGO_FAIL_BEFORE_INSTALL
+)
+for override_name in "${override_names[@]}"; do
+  if [[ -n "${!override_name:-}" ]] \
+    && [[ "${SWAN_REFERENCE_INDIGO_FETCH_TEST_MODE:-0}" != "1" ]]
+  then
+    echo "Indigo fetch overrides require mutation-test mode" >&2
+    exit 64
+  fi
+done
+if [[ "${SWAN_REFERENCE_INDIGO_FETCH_TEST_MODE:-0}" == "1" ]]; then
+  cache_dir="${SWAN_REFERENCE_INDIGO_CACHE_DIR:-$cache_dir}"
+fi
+
+readonly CACHE_DIR="$cache_dir"
 readonly DESTINATION="${CACHE_DIR}/indigo-${COMMIT}"
-readonly ARCHIVE="${CACHE_DIR}/indigo-${COMMIT}.tar.gz"
 readonly STAGING="${CACHE_DIR}/.indigo-${COMMIT}.staging"
+readonly STAGED_ARCHIVE="${STAGING}/indigo-${COMMIT}.tar.gz"
 
 mkdir -p "$CACHE_DIR"
-if [[ -e "$DESTINATION" || -e "$ARCHIVE" ]]; then
+if [[ -e "$DESTINATION" ]]; then
   echo "pinned Indigo cache already exists; remove or archive it explicitly before refetching" >&2
   exit 1
 fi
@@ -21,17 +40,18 @@ fi
 
 mkdir -p "$STAGING"
 trap 'rm -rf "$STAGING"' EXIT
-staged_archive="${STAGING}/indigo-${COMMIT}.tar.gz"
-staged_source="${STAGING}/indigo-${COMMIT}"
-
-curl --fail --location --retry 3 "$SOURCE_URL" -o "$staged_archive"
-actual_sha256="$(shasum -a 256 "$staged_archive" | awk '{print $1}')"
+if [[ -n "${SWAN_REFERENCE_INDIGO_SOURCE_ARCHIVE:-}" ]]; then
+  cp "$SWAN_REFERENCE_INDIGO_SOURCE_ARCHIVE" "$STAGED_ARCHIVE"
+else
+  curl --fail --location --retry 3 "$SOURCE_URL" -o "$STAGED_ARCHIVE"
+fi
+actual_sha256="$(shasum -a 256 "$STAGED_ARCHIVE" | awk '{print $1}')"
 if [[ "$actual_sha256" != "$ARCHIVE_SHA256" ]]; then
   echo "reference Indigo archive checksum mismatch" >&2
   exit 1
 fi
 
-python3 - "$staged_archive" "$STAGING" "$COMMIT" <<'PY'
+python3 - "$STAGED_ARCHIVE" "$STAGING" "$COMMIT" <<'PY'
 import pathlib
 import sys
 import tarfile
@@ -80,15 +100,29 @@ try:
                 "verified reference Indigo archive is missing required relay source: "
                 + ", ".join(missing)
             )
-        archive.extractall(staging, members=members)
+        extraction_root = staging / ".extract"
+        extraction_root.mkdir()
+        archive.extractall(extraction_root, members=members)
+        (extraction_root / expected_prefix).replace(staging / "source")
+        extraction_root.rmdir()
 except (tarfile.TarError, OSError) as error:
     raise SystemExit(f"reference Indigo archive cannot be read: {error}") from error
 PY
 
-./interop/verify-reference-indigo.sh --cache-dir "$STAGING"
-mv "$staged_source" "$DESTINATION"
-mv "$staged_archive" "$ARCHIVE"
-rmdir "$STAGING"
+./interop/verify-reference-indigo.sh --bundle-dir "$STAGING"
+if [[ "${SWAN_REFERENCE_INDIGO_FAIL_BEFORE_INSTALL:-0}" == "1" ]]; then
+  echo "injected failure before Indigo cache install" >&2
+  exit 1
+fi
+python3 - "$STAGING" "$DESTINATION" <<'PY'
+import os
+import sys
+
+# Both paths are direct children of CACHE_DIR. rename(2) is therefore the one
+# same-filesystem publication point and refuses an extant destination instead
+# of nesting the staging directory inside it as mv may do.
+os.rename(sys.argv[1], sys.argv[2])
+PY
 trap - EXIT
-./interop/verify-reference-indigo.sh
-echo "verified ${ARCHIVE}"
+./interop/verify-reference-indigo.sh --cache-dir "$CACHE_DIR"
+echo "verified ${DESTINATION}/indigo-${COMMIT}.tar.gz"

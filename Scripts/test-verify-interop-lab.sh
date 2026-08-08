@@ -476,16 +476,32 @@ mutate_file_and_require_rejection \
 mutate_file_and_require_rejection \
   unpinned-swan-reference-cache-exception \
   Dockerfile.dockerignore \
-  '!Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz' \
-  $'!Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz\n!Swan/.interop-cache/atproto-unsafe.tar.gz' \
+  '!Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz' \
+  $'!Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz\n!Swan/.interop-cache/atproto-unsafe.tar.gz' \
   SWAN_INTEROP_SWAN_DOCKERIGNORE \
   'the Swan image build context must allow only the pinned Indigo source archive'
 
 mutate_file_and_require_rejection \
   wrong-indigo-source-archive-pin \
   Dockerfile.dockerignore \
-  '!Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz' \
-  '!Swan/.interop-cache/indigo-0000000000000000000000000000000000000000.tar.gz' \
+  '!Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz' \
+  '!Swan/.interop-cache/indigo-0000000000000000000000000000000000000000/indigo-0000000000000000000000000000000000000000.tar.gz' \
+  SWAN_INTEROP_SWAN_DOCKERIGNORE \
+  'the Swan image build context must allow only the pinned Indigo source archive'
+
+mutate_file_and_require_rejection \
+  broad-late-swan-cache-reinclude \
+  Dockerfile.dockerignore \
+  '!Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz' \
+  $'!Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz\n!Swan/**' \
+  SWAN_INTEROP_SWAN_DOCKERIGNORE \
+  'the Swan image build context must allow only the pinned Indigo source archive'
+
+mutate_file_and_require_rejection \
+  missing-indigo-bundle-traversal \
+  Dockerfile.dockerignore \
+  $'!Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de\n' \
+  $'# removed pinned Indigo bundle traversal\n' \
   SWAN_INTEROP_SWAN_DOCKERIGNORE \
   'the Swan image build context must allow only the pinned Indigo source archive'
 

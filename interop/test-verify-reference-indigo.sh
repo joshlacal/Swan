@@ -7,6 +7,7 @@ cd "$root"
 readonly commit="8b43a326dbbb394f63b6d68761553cdfe25532de"
 readonly archive_sha256="bc6f57e6211560220ac49dc7d6b55c5a43291f1e1193113ce413ffe4478fdd0b"
 readonly verifier="./interop/verify-reference-indigo.sh"
+readonly fetcher="./interop/fetch-reference-indigo.sh"
 readonly source_cache="${SWAN_REFERENCE_INDIGO_CACHE_DIR:-.interop-cache}"
 
 temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/swan-indigo-verifier.XXXXXX")"
@@ -16,11 +17,8 @@ if [[ ! -x "$verifier" ]]; then
   echo "reference Indigo verifier is missing or not executable" >&2
   exit 1
 fi
-
-if [[ ! -f "${source_cache}/indigo-${commit}.tar.gz" ]] \
-  || [[ ! -d "${source_cache}/indigo-${commit}" ]]
-then
-  echo "pinned Indigo mutation fixture is unavailable; run interop/fetch-reference-indigo.sh" >&2
+if [[ ! -x "$fetcher" ]]; then
+  echo "reference Indigo fetcher is missing or not executable" >&2
   exit 1
 fi
 
@@ -28,8 +26,7 @@ new_fixture() {
   name="$1"
   fixture="${temporary_directory}/${name}"
   mkdir -p "$fixture"
-  cp "${source_cache}/indigo-${commit}.tar.gz" "$fixture/"
-  cp -R "${source_cache}/indigo-${commit}" "$fixture/"
+  cp -R "${atomic_cache}/indigo-${commit}" "$fixture/"
   printf '%s\n' "$fixture"
 }
 
@@ -50,6 +47,36 @@ require_rejection() {
     exit 1
   fi
 }
+
+custody_archive="${source_cache}/indigo-${commit}.tar.gz"
+if [[ -f "${source_cache}/indigo-${commit}/indigo-${commit}.tar.gz" ]]; then
+  custody_archive="${source_cache}/indigo-${commit}/indigo-${commit}.tar.gz"
+fi
+if [[ ! -f "$custody_archive" ]]; then
+  echo "pinned Indigo mutation fixture is unavailable; run interop/fetch-reference-indigo.sh" >&2
+  exit 1
+fi
+atomic_cache="${temporary_directory}/atomic-cache"
+require_rejection \
+  injected-pre-install-failure \
+  "injected failure before Indigo cache install" \
+  env \
+    SWAN_REFERENCE_INDIGO_FETCH_TEST_MODE=1 \
+    SWAN_REFERENCE_INDIGO_CACHE_DIR="$atomic_cache" \
+    SWAN_REFERENCE_INDIGO_SOURCE_ARCHIVE="$custody_archive" \
+    SWAN_REFERENCE_INDIGO_FAIL_BEFORE_INSTALL=1 \
+    "$fetcher"
+if [[ -e "${atomic_cache}/indigo-${commit}" ]] \
+  || [[ -e "${atomic_cache}/.indigo-${commit}.staging" ]]
+then
+  echo "injected failure left partial Indigo cache material" >&2
+  exit 1
+fi
+SWAN_REFERENCE_INDIGO_FETCH_TEST_MODE=1 \
+  SWAN_REFERENCE_INDIGO_CACHE_DIR="$atomic_cache" \
+  SWAN_REFERENCE_INDIGO_SOURCE_ARCHIVE="$custody_archive" \
+  "$fetcher" >/dev/null
+"$verifier" --cache-dir "$atomic_cache" >/dev/null
 
 rewrite_verifier_constant() {
   source="$1"
@@ -104,36 +131,36 @@ require_rejection \
   "$wrong_checksum_verifier" --cache-dir "$baseline_fixture"
 
 missing_archive_fixture="$(new_fixture missing-archive)"
-rm "${missing_archive_fixture}/indigo-${commit}.tar.gz"
+rm "${missing_archive_fixture}/indigo-${commit}/indigo-${commit}.tar.gz"
 require_rejection \
   missing-archive \
   "pinned Indigo reference cache is unavailable" \
   "$verifier" --cache-dir "$missing_archive_fixture"
 
 corrupt_archive_fixture="$(new_fixture corrupt-archive)"
-printf 'not a gzip archive\n' >"${corrupt_archive_fixture}/indigo-${commit}.tar.gz"
+printf 'not a gzip archive\n' >"${corrupt_archive_fixture}/indigo-${commit}/indigo-${commit}.tar.gz"
 require_rejection \
   corrupt-archive \
   "pinned Indigo archive checksum mismatch" \
   "$verifier" --cache-dir "$corrupt_archive_fixture"
 
 missing_source_fixture="$(new_fixture missing-source)"
-rm "${missing_source_fixture}/indigo-${commit}/cmd/relay/relay/slurper.go"
+rm "${missing_source_fixture}/indigo-${commit}/source/cmd/relay/relay/slurper.go"
 require_rejection \
   missing-required-relay-source \
   "pinned Indigo source is incomplete" \
   "$verifier" --cache-dir "$missing_source_fixture"
 
 symlink_fixture="$(new_fixture symlink-source)"
-rm "${symlink_fixture}/indigo-${commit}/cmd/relay/main.go"
-ln -s README.md "${symlink_fixture}/indigo-${commit}/cmd/relay/main.go"
+rm "${symlink_fixture}/indigo-${commit}/source/cmd/relay/main.go"
+ln -s README.md "${symlink_fixture}/indigo-${commit}/source/cmd/relay/main.go"
 require_rejection \
   symlink-source \
   "pinned Indigo source contains a symlink" \
   "$verifier" --cache-dir "$symlink_fixture"
 
 mismatch_fixture="$(new_fixture archive-tree-mismatch)"
-printf '\n// mutation\n' >>"${mismatch_fixture}/indigo-${commit}/cmd/relay/main.go"
+printf '\n// mutation\n' >>"${mismatch_fixture}/indigo-${commit}/source/cmd/relay/main.go"
 require_rejection \
   archive-tree-mismatch \
   "pinned Indigo source does not match its archive" \
@@ -148,7 +175,7 @@ require_rejection \
 
 unexpected_archive_fixture="$(new_fixture unexpected-archive-layout)"
 python3 - \
-  "${unexpected_archive_fixture}/indigo-${commit}.tar.gz" \
+  "${unexpected_archive_fixture}/indigo-${commit}/indigo-${commit}.tar.gz" \
   "${unexpected_archive_fixture}/unexpected-layout.tar.gz" <<'PY'
 import pathlib
 import tarfile
@@ -164,7 +191,7 @@ with tarfile.open(source, "r:gz") as input_archive:
             output_archive.addfile(member, extracted)
 destination.replace(source)
 PY
-unexpected_sha256="$(shasum -a 256 "${unexpected_archive_fixture}/indigo-${commit}.tar.gz" | awk '{print $1}')"
+unexpected_sha256="$(shasum -a 256 "${unexpected_archive_fixture}/indigo-${commit}/indigo-${commit}.tar.gz" | awk '{print $1}')"
 unexpected_archive_verifier="${temporary_directory}/verify-unexpected-archive.sh"
 rewrite_verifier_constant \
   "$verifier" \
