@@ -67,12 +67,16 @@ import sys
 path = pathlib.Path(sys.argv[1])
 commit, source_digest, image, image_digest, platform, go_version = sys.argv[2:]
 document = json.loads(path.read_text(encoding="utf-8"))
-expected_keys = {
+task4_keys = {
     "schemaVersion", "indigoCommit", "sourceArchiveSHA256", "toolchainImage",
     "toolchainImageDigest", "toolchainPlatform", "goVersion",
     "vendorArchiveSHA256",
 }
-if set(document) != expected_keys or document.get("schemaVersion") != 1:
+relay_builder_keys = {
+    "relayBuilderImage", "relayBuilderImageDigest", "relayBuilderManifestDigest",
+    "relayBuilderPlatform", "relayBuilderGoVersion",
+}
+if set(document) != (task4_keys | relay_builder_keys) or document.get("schemaVersion") != 1:
     raise SystemExit("Indigo vendor pin data has unexpected layout")
 expected = {
     "indigoCommit": commit,

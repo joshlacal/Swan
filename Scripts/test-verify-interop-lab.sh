@@ -4,6 +4,11 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
+fail() {
+  echo "$*" >&2
+  exit 1
+}
+
 # Mutation coverage includes YAML values that only become dangerous after
 # Compose resolves quoting, comments, aliases, and interpolation.
 export SWAN_INTEROP_REQUIRE_EFFECTIVE_COMPOSE="${SWAN_INTEROP_REQUIRE_EFFECTIVE_COMPOSE:-1}"
@@ -37,6 +42,179 @@ if [[ "$override_output" != *"verifier input overrides require mutation-test mod
 fi
 
 export SWAN_INTEROP_VERIFIER_TEST_MODE=1
+
+# Phase 5 is intentionally a second Compose file. The normal lab must stay
+# relay-free; this suite makes the optional topology and all of its custody
+# inputs explicit before any Docker or Compose production changes are made.
+relay_compose_file="interop/docker-compose.reference-relay.yml"
+relay_compose_script="interop/compose-reference-relay.sh"
+relay_dockerfile="interop/Dockerfile.reference-relay"
+relay_dockerignore="interop/Dockerfile.reference-relay.dockerignore"
+relay_overlay_profile="interop/reference-relay-overlay/profile.json"
+relay_overlay_patch="interop/reference-relay-overlay/reference-relay-private-upstream.patch"
+relay_overlay_apply="interop/reference-relay-overlay/apply-reference-relay-overlay.sh"
+relay_caddyfile="interop/Caddyfile.reference-relay"
+relay_caddy_dockerfile="interop/Dockerfile.caddy.reference-relay"
+relay_toxiproxy_config="interop/toxiproxy.reference-relay.json"
+relay_toxiproxy_dockerfile="interop/Dockerfile.toxiproxy.reference-relay"
+
+for required_relay_input in \
+  "$relay_compose_file" \
+  "$relay_compose_script" \
+  "$relay_dockerfile" \
+  "$relay_dockerignore" \
+  "$relay_overlay_profile" \
+  "$relay_overlay_patch" \
+  "$relay_overlay_apply" \
+  "$relay_caddyfile" \
+  "$relay_caddy_dockerfile" \
+  "$relay_toxiproxy_config" \
+  "$relay_toxiproxy_dockerfile"
+do
+  [[ -f "$required_relay_input" ]] || fail "reference relay topology input is missing: ${required_relay_input}"
+done
+for executable_relay_input in "$relay_compose_script" "$relay_overlay_apply"; do
+  [[ -x "$executable_relay_input" ]] \
+    || fail "reference relay topology script is not executable: ${executable_relay_input}"
+done
+
+mutate_relay_and_require_rejection() {
+  name="$1"
+  old="$2"
+  new="$3"
+  expected="$4"
+  candidate="${temporary_directory}/${name}.yml"
+  cp "$relay_compose_file" "$candidate"
+
+  python3 - "$candidate" "$old" "$new" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+old, new = sys.argv[2:]
+contents = path.read_text(encoding="utf-8")
+if contents.count(old) != 1:
+    raise SystemExit(
+        f"relay mutation fixture expected exactly one occurrence, found {contents.count(old)}"
+    )
+path.write_text(contents.replace(old, new, 1), encoding="utf-8")
+PY
+
+  output=""
+  if output="$(
+    SWAN_INTEROP_REFERENCE_RELAY_COMPOSE_FILE="$candidate" \
+      ./Scripts/verify-interop-lab.sh 2>&1
+  )"; then
+    fail "interop verifier accepted unsafe relay mutation: ${name}"
+  fi
+  if [[ "$output" != *"$expected"* ]]; then
+    echo "interop verifier rejected relay mutation ${name} for the wrong reason" >&2
+    echo "expected diagnostic: ${expected}" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+}
+
+mutate_relay_file_and_require_rejection() {
+  name="$1"
+  source_file="$2"
+  old="$3"
+  new="$4"
+  override_name="$5"
+  expected="$6"
+  candidate="${temporary_directory}/${name}"
+  cp "$source_file" "$candidate"
+  [[ ! -x "$source_file" ]] || chmod 0755 "$candidate"
+
+  python3 - "$candidate" "$old" "$new" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+old, new = sys.argv[2:]
+contents = path.read_text(encoding="utf-8")
+if contents.count(old) != 1:
+    raise SystemExit(
+        f"relay file mutation expected exactly one occurrence, found {contents.count(old)}"
+    )
+path.write_text(contents.replace(old, new, 1), encoding="utf-8")
+PY
+
+  output=""
+  if output="$(env "$override_name=$candidate" ./Scripts/verify-interop-lab.sh 2>&1)"; then
+    fail "interop verifier accepted unsafe relay file mutation: ${name}"
+  fi
+  if [[ "$output" != *"$expected"* ]]; then
+    echo "interop verifier rejected relay file mutation ${name} for the wrong reason" >&2
+    echo "expected diagnostic: ${expected}" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+}
+
+mutate_relay_and_require_rejection \
+  relay-without-caddy-trust \
+  'caddy-trust:/etc/ssl/certs:ro' \
+  'caddy-trust:/etc/ssl/certs:rw' \
+  'reference relay must mount the Caddy private CA read-only'
+
+mutate_relay_and_require_rejection \
+  relay-without-public-firehose \
+  $'      - --enable-public-firehose\n' \
+  '' \
+  'relay topology must explicitly enable the public firehose'
+
+mutate_relay_and_require_rejection \
+  relay-bypasses-toxiproxy \
+  '      - "swan.test:172.30.0.8"' \
+  '      - "swan.test:172.30.0.2"' \
+  'reference relay must resolve swan.test through the fixed Toxiproxy address'
+
+mutate_relay_and_require_rejection \
+  relay-publishes-direct-port \
+  $'    volumes:\n      - reference-relay-data:/data' \
+  $'    ports:\n      - "2470:2470"\n    volumes:\n      - reference-relay-data:/data' \
+  'reference relay must not publish a host port'
+
+mutate_relay_and_require_rejection \
+  relay-parent-workspace-context \
+  $'      context: .\n      dockerfile: interop/Dockerfile.reference-relay' \
+  $'      context: ..\n      dockerfile: interop/Dockerfile.reference-relay' \
+  'reference relay must build from its workspace root'
+
+mutate_relay_file_and_require_rejection \
+  relay-overlay-without-private-upstream-opt-in \
+  "$relay_overlay_apply" \
+  'Transport: ssrf.PublicOnlyTransport(),' \
+  'Transport: http.DefaultTransport,' \
+  SWAN_INTEROP_REFERENCE_RELAY_OVERLAY_APPLY \
+  'reference relay overlay must use the dedicated lab-only private upstream transport'
+
+# Phase 5's CGO builder must be a separate immutable Bookworm tuple. The
+# existing Alpine vendor materializer pin is intentionally not a substitute.
+mutate_relay_file_and_require_rejection \
+  relay-builder-digest-mismatch \
+  "$relay_dockerfile" \
+  'FROM docker.io/library/golang@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b AS build' \
+  'FROM docker.io/library/golang@sha256:0000000000000000000000000000000000000000000000000000000000000000 AS build' \
+  SWAN_INTEROP_REFERENCE_RELAY_DOCKERFILE \
+  'reference relay Dockerfile must use the checksum-pinned Bookworm builder and static offline CGO recipe'
+
+mutate_relay_file_and_require_rejection \
+  relay-builder-without-static-recipe \
+  "$relay_dockerfile" \
+  "go build -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags \"-static\"' -o /out/reference-relay ./cmd/relay" \
+  "go build -tags timetzdata -o /out/reference-relay ./cmd/relay" \
+  SWAN_INTEROP_REFERENCE_RELAY_DOCKERFILE \
+  'reference relay Dockerfile must use the checksum-pinned Bookworm builder and static offline CGO recipe'
+
+mutate_relay_file_and_require_rejection \
+  relay-toxiproxy-without-tls-listener \
+  "$relay_toxiproxy_config" \
+  $'  },\n  {\n    "name": "reference-relay-swan",\n    "listen": "0.0.0.0:443",\n    "upstream": "caddy:443",\n    "enabled": true\n  }\n' \
+  '  }' \
+  SWAN_INTEROP_REFERENCE_RELAY_TOXIPROXY_CONFIG_FILE \
+  'reference relay Toxiproxy config must contain the dedicated TLS listener'
 
 mutate_and_require_rejection() {
   name="$1"

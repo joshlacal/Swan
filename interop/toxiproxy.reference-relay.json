@@ -1,0 +1,14 @@
+[
+  {
+    "name": "reference-pds",
+    "listen": "0.0.0.0:8666",
+    "upstream": "reference-pds:3000",
+    "enabled": true
+  },
+  {
+    "name": "reference-relay-swan",
+    "listen": "0.0.0.0:443",
+    "upstream": "caddy:443",
+    "enabled": true
+  }
+]

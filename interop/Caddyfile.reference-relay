@@ -1,0 +1,22 @@
+{
+	# This is only selected by docker-compose.reference-relay.yml. The normal
+	# lab Caddyfile remains relay-free and does not enable the firehose topology.
+	local_certs
+}
+
+https://swan.test {
+	tls internal
+	reverse_proxy swan:3000 {
+		header_up X-Swan-Client-IP {http.request.remote.host}
+	}
+}
+
+https://pds.test {
+	tls internal
+	reverse_proxy toxiproxy:8666
+}
+
+https://relay.test {
+	tls internal
+	reverse_proxy reference-relay:2470
+}

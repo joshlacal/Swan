@@ -83,12 +83,63 @@ PY
   printf '%s\n' "$candidate"
 }
 
+relay_builder_pin() {
+  name="$1"
+  field="$2"
+  value="$3"
+  candidate="${temporary_directory}/${name}.json"
+  python3 - "$pin_file" "$candidate" "$field" "$value" <<'PY'
+import json
+import pathlib
+import sys
+
+source, destination, field, value = sys.argv[1:]
+document = json.loads(pathlib.Path(source).read_text(encoding="utf-8"))
+document.update({
+    "relayBuilderImage": "docker.io/library/golang@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b",
+    "relayBuilderImageDigest": "sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b",
+    "relayBuilderManifestDigest": "sha256:b58a2431884c6dfc5ddcea953c7f426ad72c2ff9e94b4b8495fefa74e4dabcc0",
+    "relayBuilderPlatform": "linux/arm64/v8",
+    "relayBuilderGoVersion": "go1.26.4",
+})
+if field == "__missing__":
+    del document[value]
+else:
+    document[field] = value
+pathlib.Path(destination).write_text(
+    json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+  printf '%s\n' "$candidate"
+}
+
 zero64="0000000000000000000000000000000000000000000000000000000000000000"
 wrong_toolchain_pin="$(mutated_pin wrong-toolchain toolchainImageDigest "sha256:${zero64}")"
 require_rejection wrong-toolchain "toolchain image digest mismatch" \
   env SWAN_REFERENCE_INDIGO_VENDOR_TEST_MODE=1 \
     SWAN_REFERENCE_INDIGO_VENDOR_PIN_FILE="$wrong_toolchain_pin" \
     "$verifier" --cache-dir "$cache_dir"
+
+# Phase 5 uses a distinct Bookworm builder only for the CGO relay recipe.
+# These are deliberately RED before the pin schema/verifier knows about it.
+missing_relay_builder_pin="$(relay_builder_pin missing-relay-builder __missing__ relayBuilderImage)"
+require_rejection missing-relay-builder "relay builder image mismatch" \
+  env SWAN_REFERENCE_INDIGO_VENDOR_TEST_MODE=1 \
+    SWAN_REFERENCE_INDIGO_VENDOR_PIN_FILE="$missing_relay_builder_pin" \
+    "$verifier" --cache-dir "$cache_dir"
+
+while IFS='|' read -r relay_builder_field expected_diagnostic; do
+  wrong_relay_builder_pin="$(relay_builder_pin "wrong-${relay_builder_field}" "$relay_builder_field" "invalid-${relay_builder_field}")"
+  require_rejection "wrong-${relay_builder_field}" "$expected_diagnostic" \
+    env SWAN_REFERENCE_INDIGO_VENDOR_TEST_MODE=1 \
+      SWAN_REFERENCE_INDIGO_VENDOR_PIN_FILE="$wrong_relay_builder_pin" \
+    "$verifier" --cache-dir "$cache_dir"
+done <<'EOF'
+relayBuilderImageDigest|relay builder image digest mismatch
+relayBuilderPlatform|relay builder platform mismatch
+relayBuilderGoVersion|relay builder Go version mismatch
+relayBuilderManifestDigest|relay builder manifest digest mismatch
+EOF
 
 wrong_source_pin="$(mutated_pin wrong-source sourceArchiveSHA256 "$zero64")"
 require_rejection wrong-source "source archive digest mismatch" \

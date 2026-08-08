@@ -1,0 +1,26 @@
+# Relay context: only the immutable Indigo source/vendor archives and the
+# checksum-qualified private-upstream overlay may enter the offline image build.
+**
+**/.env*
+!**/.env.example
+**/.swan-data/
+**/.swan-data/**
+**/*.sqlite
+**/*.sqlite-shm
+**/*.sqlite-wal
+**/*.pem
+**/*.key
+**/*.p8
+**/keys/
+**/keys/**
+.swan-interop-secrets/
+**/.swan-interop-secrets/
+**/.swan-interop-secrets/**
+.interop-cache/**
+!.interop-cache/
+!.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz
+!.interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.vendor.tar.gz
+!interop/
+!interop/reference-relay-overlay/
+!interop/reference-relay-overlay/reference-relay-private-upstream.patch
+!interop/reference-relay-healthcheck.go

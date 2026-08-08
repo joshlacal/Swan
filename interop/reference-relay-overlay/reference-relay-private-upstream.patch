@@ -1,0 +1,19 @@
+--- a/cmd/relay/relay/host_checker.go
++++ b/cmd/relay/relay/host_checker.go
+@@ -10,7 +10,6 @@
+ 	"github.com/bluesky-social/indigo/atproto/atclient"
+ 	"github.com/bluesky-social/indigo/atproto/identity"
+ 	"github.com/bluesky-social/indigo/cmd/relay/relay/models"
+-	"github.com/bluesky-social/indigo/util/ssrf"
+ )
+ 
+ // Simple interface for doing host and account status checks.
+@@ -35,7 +34,7 @@
+ 	}
+ 	c := http.Client{
+ 		Timeout:   5 * time.Second,
+-		Transport: ssrf.PublicOnlyTransport(),
++		Transport: http.DefaultTransport,
+ 	}
+ 	return &HostClient{
+ 		Client:    &c,

@@ -14,6 +14,10 @@ override_names=(
   SWAN_INTEROP_SWAN_DOCKERIGNORE
   SWAN_INTEROP_REFERENCE_PDS_DOCKERIGNORE
   SWAN_INTEROP_REFERENCE_PLC_DOCKERIGNORE
+  SWAN_INTEROP_REFERENCE_RELAY_COMPOSE_FILE
+  SWAN_INTEROP_REFERENCE_RELAY_DOCKERFILE
+  SWAN_INTEROP_REFERENCE_RELAY_OVERLAY_APPLY
+  SWAN_INTEROP_REFERENCE_RELAY_TOXIPROXY_CONFIG_FILE
 )
 for override_name in "${override_names[@]}"; do
   if [[ -n "${!override_name:-}" ]] \
@@ -42,6 +46,17 @@ recovery_overlay_profile="interop/reference-pds-overlay/profile.json"
 recovery_overlay_patch="interop/reference-pds-overlay/reference-pds-recovery.patch"
 recovery_overlay_apply="interop/reference-pds-overlay/apply-reference-pds-overlay.sh"
 recovery_overlay_test="interop/reference-pds-overlay/test-reference-pds-overlay.sh"
+relay_compose_file="${SWAN_INTEROP_REFERENCE_RELAY_COMPOSE_FILE:-interop/docker-compose.reference-relay.yml}"
+relay_compose_script="interop/compose-reference-relay.sh"
+relay_dockerfile="${SWAN_INTEROP_REFERENCE_RELAY_DOCKERFILE:-interop/Dockerfile.reference-relay}"
+relay_dockerignore="interop/Dockerfile.reference-relay.dockerignore"
+relay_overlay_profile="interop/reference-relay-overlay/profile.json"
+relay_overlay_patch="interop/reference-relay-overlay/reference-relay-private-upstream.patch"
+relay_overlay_apply="${SWAN_INTEROP_REFERENCE_RELAY_OVERLAY_APPLY:-interop/reference-relay-overlay/apply-reference-relay-overlay.sh}"
+relay_caddyfile="interop/Caddyfile.reference-relay"
+relay_caddy_dockerfile="interop/Dockerfile.caddy.reference-relay"
+relay_toxiproxy_config="${SWAN_INTEROP_REFERENCE_RELAY_TOXIPROXY_CONFIG_FILE:-interop/toxiproxy.reference-relay.json}"
+relay_toxiproxy_dockerfile="interop/Dockerfile.toxiproxy.reference-relay"
 
 for required_file in \
   "$compose_file" \
@@ -61,7 +76,18 @@ for required_file in \
   "$recovery_overlay_profile" \
   "$recovery_overlay_patch" \
   "$recovery_overlay_apply" \
-  "$recovery_overlay_test"
+  "$recovery_overlay_test" \
+  "$relay_compose_file" \
+  "$relay_compose_script" \
+  "$relay_dockerfile" \
+  "$relay_dockerignore" \
+  "$relay_overlay_profile" \
+  "$relay_overlay_patch" \
+  "$relay_overlay_apply" \
+  "$relay_caddyfile" \
+  "$relay_caddy_dockerfile" \
+  "$relay_toxiproxy_config" \
+  "$relay_toxiproxy_dockerfile"
 do
   if [[ ! -f "$required_file" ]]; then
     echo "interop verifier input is missing: ${required_file}" >&2
@@ -79,7 +105,9 @@ fi
 for recovery_script in \
   "$recovery_compose_script" \
   "$recovery_overlay_apply" \
-  "$recovery_overlay_test"
+  "$recovery_overlay_test" \
+  "$relay_compose_script" \
+  "$relay_overlay_apply"
 do
   if [[ ! -x "$recovery_script" ]]; then
     echo "recovery overlay script must be executable: ${recovery_script}" >&2
@@ -138,13 +166,18 @@ rg -q 'pinned reference checkout' "$recovery_overlay_test"
   --bundle-dir ".interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de"
 ./interop/verify-reference-indigo-vendor.sh
 
-service_block() {
-  service="$1"
+service_block_from_file() {
+  file="$1"
+  service="$2"
   awk -v service="$service" '
     $0 == "  " service ":" { capture=1; next }
     capture && /^  [[:alnum:]][[:alnum:]-]*:/ { capture=0 }
     capture { print }
-  ' "$compose_file"
+  ' "$file"
+}
+
+service_block() {
+  service_block_from_file "$compose_file" "$1"
 }
 
 require_contains() {
@@ -166,6 +199,164 @@ reject_contains() {
     exit 1
   fi
 }
+
+require_exact_line() {
+  block="$1"
+  expected="$2"
+  message="$3"
+  if ! printf '%s\n' "$block" | rg -Fqx "$expected"; then
+    echo "$message" >&2
+    exit 1
+  fi
+}
+
+# The normal laboratory deliberately remains relay-free. Phase 5's crawler
+# and feature flag live only in the dedicated second Compose file.
+if rg -n 'reference-relay|SWAN_PUBLIC_CRAWLERS|--enable-public-firehose|relay\.test' "$compose_file"; then
+  echo "base interop laboratory must remain reference-relay-free" >&2
+  exit 1
+fi
+
+relay_block="$(service_block_from_file "$relay_compose_file" reference-relay)"
+relay_swan_block="$(service_block_from_file "$relay_compose_file" swan)"
+relay_caddy_block="$(service_block_from_file "$relay_compose_file" caddy)"
+relay_toxiproxy_block="$(service_block_from_file "$relay_compose_file" toxiproxy)"
+relay_setup_block="$(service_block_from_file "$relay_compose_file" toxiproxy-setup)"
+if [[ -z "$relay_block" ]]; then
+  echo "reference relay service is missing from the dedicated override" >&2
+  exit 1
+fi
+require_contains "$relay_block" 'dockerfile: interop/Dockerfile.reference-relay' "reference relay must use its pinned Dockerfile"
+require_exact_line "$relay_block" '      context: .' "reference relay must build from its workspace root"
+require_contains "$relay_block" 'reference-relay-data:/data' "reference relay must persist its data in the dedicated named volume"
+require_contains "$relay_block" 'caddy-trust:/etc/ssl/certs:ro' "reference relay must mount the Caddy private CA read-only"
+require_contains "$relay_block" 'SSL_CERT_FILE: /etc/ssl/certs/caddy-local-root.crt' "reference relay must use the Caddy private CA trust file"
+require_contains "$relay_block" 'RELAY_PLC_HOST: http://reference-plc:2582' "reference relay must resolve PLC through the lab service"
+require_contains "$relay_block" 'swan.test:172.30.0.8' "reference relay must resolve swan.test through the fixed Toxiproxy address"
+require_contains "$relay_block" '/usr/local/bin/reference-relay-healthcheck' "reference relay healthcheck must probe the live HTTP listener"
+require_contains "$relay_block" $'caddy-ca-ready:\n        condition: service_completed_successfully' "reference relay must wait for prepared Caddy trust"
+require_contains "$relay_block" $'reference-plc:\n        condition: service_healthy' "reference relay must wait for a healthy PLC"
+reject_contains "$relay_block" 'ports:' "reference relay must not publish a host port"
+reject_contains "$relay_block" 'RELAY_ADMIN_' "reference relay must not inject admin credentials through Compose"
+reject_contains "$relay_block" 'PASSWORD' "reference relay must not inject credentials through Compose"
+reject_contains "$relay_block" 'TOKEN' "reference relay must not inject credentials through Compose"
+require_contains "$relay_swan_block" 'SWAN_PUBLIC_CRAWLERS: http://reference-relay:2470' "relay topology must wire Swan crawlers to the internal reference relay"
+require_contains "$relay_swan_block" '--enable-public-firehose' "relay topology must explicitly enable the public firehose"
+require_contains "$relay_caddy_block" 'dockerfile: interop/Dockerfile.caddy.reference-relay' "relay topology must use its Caddy route override"
+require_exact_line "$relay_caddy_block" '      context: .' "relay topology Caddy must build from its workspace root"
+require_contains "$relay_caddy_block" 'relay.test' "relay topology must give Caddy the relay.test alias"
+require_contains "$relay_toxiproxy_block" 'dockerfile: interop/Dockerfile.toxiproxy.reference-relay' "relay topology must use its dedicated Toxiproxy listener config"
+require_exact_line "$relay_toxiproxy_block" '      context: .' "relay topology Toxiproxy must build from its workspace root"
+require_contains "$relay_setup_block" 'reference-relay-swan' "relay topology must provision the dedicated relay-to-Swan Toxiproxy listener"
+require_contains "$relay_setup_block" '"listen":"0.0.0.0:443","upstream":"caddy:443"' "relay topology must route Toxiproxy TLS to Caddy"
+if ! rg -q '^  reference-relay-data:$' "$relay_compose_file"; then
+  echo "relay topology must declare the dedicated named data volume" >&2
+  exit 1
+fi
+
+# The private-network exception is a checksum-qualified disposable overlay,
+# never a mutation of the pinned source cache or an ambient relay setting.
+python3 - "$relay_overlay_profile" "$relay_overlay_patch" "interop/reference-indigo-vendor-pin.json" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+profile_path, patch_path, pin_path = map(pathlib.Path, sys.argv[1:])
+profile = json.loads(profile_path.read_text(encoding="utf-8"))
+pin = json.loads(pin_path.read_text(encoding="utf-8"))
+expected = {
+    "id",
+    "indigoCommit",
+    "sourceArchiveSHA256",
+    "vendorArchiveSHA256",
+    "toolchainImageDigest",
+    "relayBuilderImageDigest",
+    "relayBuilderManifestDigest",
+    "relayBuilderPlatform",
+    "relayBuilderGoVersion",
+    "overlayPatch",
+    "overlayPatchSHA256",
+}
+if set(profile) != expected or profile.get("id") != "reference-relay-private-upstream-overlay-2026-08-08":
+    raise SystemExit("reference relay overlay profile has unexpected layout")
+for key in (
+    "indigoCommit", "sourceArchiveSHA256", "vendorArchiveSHA256", "toolchainImageDigest",
+    "relayBuilderImageDigest", "relayBuilderManifestDigest", "relayBuilderPlatform",
+    "relayBuilderGoVersion",
+):
+    if profile.get(key) != pin.get(key):
+        raise SystemExit(f"reference relay overlay profile is not bound to the Indigo pin: {key}")
+if profile.get("overlayPatch") != patch_path.name:
+    raise SystemExit("reference relay overlay profile points to the wrong patch")
+if profile.get("overlayPatchSHA256") != hashlib.sha256(patch_path.read_bytes()).hexdigest():
+    raise SystemExit("reference relay overlay patch checksum does not match its profile")
+PY
+require_contains "$(<"$relay_overlay_apply")" 'required_patch_line='"'"'Transport: ssrf.PublicOnlyTransport(),'"'"'' "reference relay overlay must use the dedicated lab-only private upstream transport"
+# shellcheck disable=SC2016 # Match the literal script contract, including variables.
+require_contains "$(<"$relay_overlay_apply")" './interop/verify-reference-indigo.sh --bundle-dir "$source_bundle"' "reference relay overlay must verify the pinned Indigo source"
+# shellcheck disable=SC2016 # Match the literal script contract, including variables.
+require_contains "$(<"$relay_overlay_apply")" './interop/verify-reference-indigo-vendor.sh --bundle-dir "$vendor_bundle" --source-bundle "$source_bundle"' "reference relay overlay must verify the pinned Indigo vendor bundle"
+if rg -n '^[[:space:]]*RUN .*(curl|wget|git clone|git fetch|go mod download)' "$relay_dockerfile"; then
+  echo "reference relay Dockerfile must not fetch source from the network" >&2
+  exit 1
+fi
+for required_relay_docker_line in \
+  'FROM docker.io/library/golang@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b AS build' \
+  'COPY .interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz /tmp/indigo.tar.gz' \
+  'COPY .interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.vendor.tar.gz /tmp/indigo.vendor.tar.gz' \
+  'COPY interop/reference-relay-overlay/reference-relay-private-upstream.patch /tmp/reference-relay-private-upstream.patch' \
+  'ENV CGO_ENABLED=1 GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-mod=vendor' \
+  "go build -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags \"-static\"' -o /out/reference-relay ./cmd/relay" \
+  "go build -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags \"-static\"' -o /out/reference-relay-healthcheck /tmp/reference-relay-healthcheck.go" \
+  'ENV SSL_CERT_FILE=/etc/ssl/certs/caddy-local-root.crt GODEBUG=netdns=go' \
+  'RUN --network=none'
+do
+  if ! rg -Fq "$required_relay_docker_line" "$relay_dockerfile"; then
+    echo "reference relay Dockerfile must use the checksum-pinned Bookworm builder and static offline CGO recipe" >&2
+    exit 1
+  fi
+done
+python3 - "$relay_dockerignore" <<'PY'
+import pathlib
+import sys
+
+rules = {
+    line.strip() for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip() and not line.lstrip().startswith("#")
+}
+required = {
+    "**", ".interop-cache/**", "!.interop-cache/",
+    "!.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz",
+    "!.interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.vendor.tar.gz",
+    "!interop/reference-relay-overlay/",
+    "!interop/reference-relay-overlay/reference-relay-private-upstream.patch",
+}
+if not required <= rules:
+    raise SystemExit("reference relay build context must allow only pinned archives and overlay material")
+for forbidden in ("!.interop-cache/**", "!.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/source/**"):
+    if forbidden in rules:
+        raise SystemExit("reference relay build context must allow only pinned archives and overlay material")
+PY
+python3 - "$relay_toxiproxy_config" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+configuration = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = [
+    {"name": "reference-pds", "listen": "0.0.0.0:8666", "upstream": "reference-pds:3000", "enabled": True},
+    {"name": "reference-relay-swan", "listen": "0.0.0.0:443", "upstream": "caddy:443", "enabled": True},
+]
+if configuration != expected:
+    raise SystemExit("reference relay Toxiproxy config must contain the dedicated TLS listener")
+PY
+for relay_preflight in './interop/verify-reference-indigo.sh' './interop/verify-reference-indigo-vendor.sh'; do
+  if ! rg -Fq "$relay_preflight" "$relay_compose_script"; then
+    echo "relay override Compose preflight must verify pinned Indigo source and vendor" >&2
+    exit 1
+  fi
+done
 
 for service in \
   swan-secrets-init \
@@ -1160,8 +1351,74 @@ PY
   echo "INTEROP LAB EFFECTIVE COMPOSE INVARIANTS OK"
 }
 
+verify_effective_relay_compose() {
+  local effective_secret_source="/var/empty/swan-interop-verifier-secrets"
+  local effective_json=""
+  effective_json="$(mktemp "${TMPDIR:-/tmp}/swan-effective-relay-compose.XXXXXX")"
+
+  if ! SWAN_INTEROP_SECRETS_DIR="$effective_secret_source" docker compose \
+    --profile planned-not-executed -f "$compose_file" -f "$relay_compose_file" \
+    config --format json >"$effective_json"; then
+    rm -f "$effective_json"
+    echo "effective reference relay Compose configuration could not be rendered" >&2
+    exit 1
+  fi
+
+  if python3 - "$effective_json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+configuration = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+services = configuration.get("services")
+if not isinstance(services, dict) or "reference-relay" not in services:
+    raise SystemExit("effective reference relay Compose service is missing")
+swan = services["swan"]
+if swan.get("environment", {}).get("SWAN_PUBLIC_CRAWLERS") != "http://reference-relay:2470":
+    raise SystemExit("effective relay topology must wire Swan crawlers internally")
+if swan.get("command", []).count("--enable-public-firehose") != 1:
+    raise SystemExit("effective relay topology must explicitly enable public firehose once")
+relay = services["reference-relay"]
+if relay.get("ports"):
+    raise SystemExit("effective reference relay must not publish a host port")
+if relay.get("environment", {}).get("RELAY_PLC_HOST") != "http://reference-plc:2582":
+    raise SystemExit("effective reference relay PLC origin is not pinned")
+if relay.get("environment", {}).get("SSL_CERT_FILE") != "/etc/ssl/certs/caddy-local-root.crt":
+    raise SystemExit("effective reference relay Caddy trust file is missing")
+trust_mounts = [volume for volume in relay.get("volumes", []) if volume.get("target") == "/etc/ssl/certs"]
+if len(trust_mounts) != 1 or trust_mounts[0].get("source") != "caddy-trust" or trust_mounts[0].get("read_only") is not True:
+    raise SystemExit("effective reference relay Caddy trust mount is not read-only")
+data_mounts = [volume for volume in relay.get("volumes", []) if volume.get("target") == "/data"]
+if len(data_mounts) != 1 or data_mounts[0].get("source") != "reference-relay-data":
+    raise SystemExit("effective reference relay data volume is missing")
+if not {"swan.test:172.30.0.8", "swan.test=172.30.0.8"} & set(relay.get("extra_hosts", [])):
+    raise SystemExit("effective reference relay must resolve swan.test through Toxiproxy")
+if relay.get("depends_on", {}).get("caddy-ca-ready", {}).get("condition") != "service_completed_successfully":
+    raise SystemExit("effective reference relay must wait for prepared Caddy trust")
+if relay.get("depends_on", {}).get("reference-plc", {}).get("condition") != "service_healthy":
+    raise SystemExit("effective reference relay must wait for healthy PLC")
+for key in relay.get("environment", {}):
+    if any(token in key.lower() for token in ("password", "secret", "token")):
+        raise SystemExit("effective reference relay contains a secret-like environment key")
+caddy_aliases = services["caddy"].get("networks", {}).get("swan", {}).get("aliases", [])
+if set(caddy_aliases) != {"swan.test", "pds.test", "relay.test"}:
+    raise SystemExit("effective relay topology Caddy aliases do not include relay.test exactly")
+if services["toxiproxy"].get("build", {}).get("dockerfile") != "interop/Dockerfile.toxiproxy.reference-relay":
+    raise SystemExit("effective relay topology Toxiproxy listener image is not pinned")
+PY
+  then
+    :
+  else
+    rm -f "$effective_json"
+    exit 1
+  fi
+  rm -f "$effective_json"
+  echo "REFERENCE RELAY EFFECTIVE COMPOSE INVARIANTS OK"
+}
+
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   verify_effective_compose
+  verify_effective_relay_compose
 elif [[ "${SWAN_INTEROP_REQUIRE_EFFECTIVE_COMPOSE:-0}" == "1" ]]; then
   echo "Docker Compose is required for effective interop verification" >&2
   exit 1

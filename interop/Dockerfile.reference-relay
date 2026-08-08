@@ -1,0 +1,34 @@
+FROM docker.io/library/golang@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b AS build
+
+ENV CGO_ENABLED=1 GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-mod=vendor
+WORKDIR /work
+COPY .interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz /tmp/indigo.tar.gz
+COPY .interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.vendor.tar.gz /tmp/indigo.vendor.tar.gz
+COPY interop/reference-relay-overlay/reference-relay-private-upstream.patch /tmp/reference-relay-private-upstream.patch
+COPY interop/reference-relay-healthcheck.go /tmp/reference-relay-healthcheck.go
+
+# The source, module closure, and narrow lab-only overlay are verified before
+# extraction. BuildKit networking stays disabled for every build action.
+RUN --network=none echo "bc6f57e6211560220ac49dc7d6b55c5a43291f1e1193113ce413ffe4478fdd0b  /tmp/indigo.tar.gz" | sha256sum -c - \
+    && echo "8dc18074f7833f610c622fc698bed545511a32dd633c348825560ee9b2878b4e  /tmp/indigo.vendor.tar.gz" | sha256sum -c - \
+    && echo "b8513ef5e488d522670eede7926b985a6618225e43355daeb7ab75699c6564fb  /tmp/reference-relay-private-upstream.patch" | sha256sum -c - \
+    && mkdir /src \
+    && tar -xzf /tmp/indigo.tar.gz --strip-components=1 -C /src \
+    && tar -xzf /tmp/indigo.vendor.tar.gz -C /src \
+    && sed -i '/github.com\/bluesky-social\/indigo\/util\/ssrf/d' /src/cmd/relay/relay/host_checker.go \
+    && sed -i 's/Transport: ssrf.PublicOnlyTransport(),/Transport: http.DefaultTransport,/' /src/cmd/relay/relay/host_checker.go \
+    && ! grep -q 'ssrf\.PublicOnlyTransport' /src/cmd/relay/relay/host_checker.go \
+    && cd /src \
+    && go build -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags "-static"' -o /out/reference-relay ./cmd/relay \
+    && go build -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags "-static"' -o /out/reference-relay-healthcheck /tmp/reference-relay-healthcheck.go
+
+FROM docker.io/library/golang@sha256:727cfc3c40be55cd1bc9a4a059406b28a059857e3be752aa9d09531e12c20c56
+COPY --from=build /out/reference-relay /usr/local/bin/reference-relay
+COPY --from=build /out/reference-relay-healthcheck /usr/local/bin/reference-relay-healthcheck
+RUN --network=none mkdir /data && chown 65532:65532 /data && chmod 0700 /data
+USER 65532:65532
+WORKDIR /data
+ENV SSL_CERT_FILE=/etc/ssl/certs/caddy-local-root.crt GODEBUG=netdns=go
+HEALTHCHECK --interval=5s --timeout=3s --retries=24 CMD ["/usr/local/bin/reference-relay-healthcheck"]
+ENTRYPOINT ["/usr/local/bin/reference-relay"]
+CMD ["serve", "--bind", "0.0.0.0:2470", "--db-url", "sqlite:///data/relay.sqlite", "--persist-dir", "/data/persist"]

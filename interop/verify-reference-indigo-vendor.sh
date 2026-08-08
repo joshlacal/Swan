@@ -71,19 +71,23 @@ import zlib
 ) = map(pathlib.Path, sys.argv[1:7])
 commit, bundle_name, archive_name = sys.argv[7:10]
 scan_cache = sys.argv[10] == "1"
-expected_keys = {
+task4_keys = {
     "schemaVersion", "indigoCommit", "sourceArchiveSHA256", "toolchainImage",
     "toolchainImageDigest", "toolchainPlatform", "goVersion",
     "vendorArchiveSHA256",
+}
+relay_builder_keys = {
+    "relayBuilderImage", "relayBuilderImageDigest", "relayBuilderManifestDigest",
+    "relayBuilderPlatform", "relayBuilderGoVersion",
 }
 try:
     pin = json.loads(pin_path.read_text(encoding="utf-8"))
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 except (OSError, UnicodeError, json.JSONDecodeError) as error:
     raise SystemExit(f"Indigo vendor metadata cannot be read: {error}") from error
-if set(pin) != expected_keys or pin.get("schemaVersion") != 1:
+if set(pin) - (task4_keys | relay_builder_keys) or pin.get("schemaVersion") != 1:
     raise SystemExit("Indigo vendor pin data has unexpected layout")
-if set(metadata) != expected_keys or metadata.get("schemaVersion") != 1:
+if set(metadata) != task4_keys or metadata.get("schemaVersion") != 1:
     raise SystemExit("Indigo vendor metadata has unexpected layout")
 immutable_pin = {
     "indigoCommit": commit,
@@ -92,6 +96,11 @@ immutable_pin = {
     "toolchainImageDigest": "sha256:727cfc3c40be55cd1bc9a4a059406b28a059857e3be752aa9d09531e12c20c56",
     "toolchainPlatform": "linux/arm64/v8",
     "goVersion": "go1.26.4",
+    "relayBuilderImage": "docker.io/library/golang@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b",
+    "relayBuilderImageDigest": "sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b",
+    "relayBuilderManifestDigest": "sha256:b58a2431884c6dfc5ddcea953c7f426ad72c2ff9e94b4b8495fefa74e4dabcc0",
+    "relayBuilderPlatform": "linux/arm64/v8",
+    "relayBuilderGoVersion": "go1.26.4",
 }
 immutable_diagnostics = {
     "indigoCommit": "Indigo commit mismatch",
@@ -100,10 +109,17 @@ immutable_diagnostics = {
     "toolchainImageDigest": "toolchain image digest mismatch",
     "toolchainPlatform": "toolchain platform mismatch",
     "goVersion": "Go version mismatch",
+    "relayBuilderImage": "relay builder image mismatch",
+    "relayBuilderImageDigest": "relay builder image digest mismatch",
+    "relayBuilderManifestDigest": "relay builder manifest digest mismatch",
+    "relayBuilderPlatform": "relay builder platform mismatch",
+    "relayBuilderGoVersion": "relay builder Go version mismatch",
 }
 for field, value in immutable_pin.items():
     if pin.get(field) != value:
         raise SystemExit(immutable_diagnostics[field])
+if set(pin) != (task4_keys | relay_builder_keys):
+    raise SystemExit("Indigo vendor pin data has unexpected layout")
 if pin.get("indigoCommit") != commit or metadata.get("indigoCommit") != commit:
     raise SystemExit("Indigo commit mismatch")
 for field, diagnostic in (
