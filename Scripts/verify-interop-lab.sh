@@ -134,6 +134,9 @@ rg -q 'overlay patch checksum mismatch' "$recovery_overlay_apply"
 rg -q 'pinned reference checkout' "$recovery_overlay_test"
 
 ./interop/verify-reference.sh
+./interop/verify-reference-indigo.sh \
+  --bundle-dir ".interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de"
+./interop/verify-reference-indigo-vendor.sh
 
 service_block() {
   service="$1"
@@ -821,14 +824,23 @@ import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
-allowed_parent = (
+allowed_source_parent = (
     "!Swan/.interop-cache/"
     "indigo-8b43a326dbbb394f63b6d68761553cdfe25532de"
 )
-allowed_archive = (
+allowed_source_archive = (
     "!Swan/.interop-cache/"
     "indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/"
     "indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz"
+)
+allowed_vendor_parent = (
+    "!Swan/.interop-cache/"
+    "indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de"
+)
+allowed_vendor_archive = (
+    "!Swan/.interop-cache/"
+    "indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/"
+    "indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.vendor.tar.gz"
 )
 rules = [
     line.strip()
@@ -838,13 +850,24 @@ rules = [
 exceptions = {
     line for line in rules if line.startswith("!") and "/.interop-cache/" in line
 }
-if exceptions != {allowed_parent, allowed_archive}:
+allowed = {
+    allowed_source_parent,
+    allowed_source_archive,
+    allowed_vendor_parent,
+    allowed_vendor_archive,
+}
+if exceptions != allowed:
     raise SystemExit(
-        "the Swan image build context must allow only the pinned Indigo source archive"
+        "the Swan image build context must allow only the pinned Indigo source and vendor archives"
     )
-if rules[-2:] != [allowed_parent, allowed_archive]:
+if rules[-4:] != [
+    allowed_source_parent,
+    allowed_source_archive,
+    allowed_vendor_parent,
+    allowed_vendor_archive,
+]:
     raise SystemExit(
-        "the Swan image build context must allow only the pinned Indigo source archive"
+        "the Swan image build context must allow only the pinned Indigo source and vendor archives"
     )
 
 # Evaluate ordered membership for the exact allowed archive and representative
@@ -864,14 +887,28 @@ def is_ignored(candidate):
             ignored = not negated
     return ignored
 
-pinned_parent = allowed_parent[1:]
-pinned = allowed_archive[1:]
+pinned_source_parent = allowed_source_parent[1:]
+pinned_source = allowed_source_archive[1:]
+pinned_vendor_parent = allowed_vendor_parent[1:]
+pinned_vendor = allowed_vendor_archive[1:]
 for candidate, expected_ignored in (
-    (pinned_parent, False),
-    (pinned, False),
+    (pinned_source_parent, False),
+    (pinned_source, False),
+    (pinned_vendor_parent, False),
+    (pinned_vendor, False),
     (
         "Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/"
         "source/go.mod",
+        True,
+    ),
+    (
+        "Swan/.interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/"
+        "vendor/modules.txt",
+        True,
+    ),
+    (
+        "Swan/.interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/"
+        "metadata.json",
         True,
     ),
     ("Swan/.interop-cache/atproto-unpinned.tar.gz", True),
@@ -879,7 +916,7 @@ for candidate, expected_ignored in (
 ):
     if is_ignored(candidate) != expected_ignored:
         raise SystemExit(
-            "the Swan image build context must allow only the pinned Indigo source archive"
+            "the Swan image build context must allow only the pinned Indigo source and vendor archives"
         )
 PY
 for ignore_file in "$reference_pds_dockerignore" "$reference_plc_dockerignore"; do

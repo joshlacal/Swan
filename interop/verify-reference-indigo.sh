@@ -48,7 +48,10 @@ cache_dir, bundle_dir, archive_path, source_root = map(pathlib.Path, sys.argv[1:
 commit = sys.argv[5]
 scan_cache = sys.argv[6] == "1"
 expected_prefix = f"indigo-{commit}"
-allowed_cache_entries = {expected_prefix}
+allowed_cache_entries = {
+    expected_prefix,
+    f"indigo-vendor-{commit}",
+}
 
 if scan_cache:
     for entry in cache_dir.iterdir():

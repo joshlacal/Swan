@@ -56,6 +56,12 @@ if [[ ! -f "$custody_archive" ]]; then
   echo "pinned Indigo mutation fixture is unavailable; run interop/fetch-reference-indigo.sh" >&2
   exit 1
 fi
+# Task 4B installs one separately verified vendor sibling. The Task 4A source
+# verifier must tolerate that exact pinned name while retaining its own source
+# custody checks and rejecting every unpinned Indigo cache entry.
+if [[ -d "${source_cache}/indigo-vendor-${commit}" ]]; then
+  "$verifier" --cache-dir "$source_cache" >/dev/null
+fi
 atomic_cache="${temporary_directory}/atomic-cache"
 require_rejection \
   injected-pre-install-failure \
