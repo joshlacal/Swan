@@ -19,7 +19,7 @@ final class PLCAccountRotationServiceTests: XCTestCase {
         XCTAssertEqual(result.generation, 2)
         XCTAssertEqual(result.account.signingKey?.generation, 2)
         XCTAssertEqual(result.account.rotationKey?.generation, 2)
-        XCTAssertEqual(result.operation.prev, try fixture.genesisCID)
+        XCTAssertEqual(result.operation.prev, fixture.genesisCID)
 
         let reopened = try await SQLiteAccountDatabase(
             dataDirectory: fixture.root, did: fixture.did
@@ -96,6 +96,224 @@ final class PLCAccountRotationServiceTests: XCTestCase {
         try await fixture.control.close()
     }
 
+    func testRotationCausallyOrdersAccountSignedCommitsAroundIdentityAnnouncement() async throws {
+        let fixture = try await makeFixture(lifecycleEmitter: RecordingLifecycleEmitter())
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let database = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root,
+            did: fixture.did
+        )
+        let firehose = try await SQLiteFirehoseDatabase(dataDirectory: fixture.root)
+        defer {
+            Task {
+                try? await firehose.close()
+                try? await database.close()
+                try? await fixture.opener.close()
+                try? await fixture.control.close()
+            }
+        }
+
+        let generationOneSigner = try await activeAccountSigner(fixture: fixture)
+        XCTAssertEqual(generationOneSigner.generation, 1)
+        let loadedGenesisState = try await database.loadPublicRepositoryState()
+        let genesisState = try XCTUnwrap(loadedGenesisState)
+        let loadedGenesisBytes = try await database.block(for: genesisState.commitCID)
+        let genesisBytes = try XCTUnwrap(loadedGenesisBytes)
+        _ = try await PublicRepositoryCommitCodec.verify(
+            signedCommitBytes: genesisBytes,
+            expectedCommitCID: genesisState.commitCID,
+            verifier: P256PublicRepositoryCommitVerifier(
+                publicKey: generationOneSigner.key.publicKey
+            )
+        )
+
+        _ = try await fixture.control.enqueueLifecycleEventBatch(
+            did: fixture.did,
+            operationID: "activation",
+            items: [rotationIdentityItem(
+                did: fixture.did,
+                operationCID: fixture.genesisCID,
+                time: fixture.now.addingTimeInterval(-1)
+            )],
+            now: fixture.now.addingTimeInterval(-1)
+        )
+        let generationOneCommit = try await applyPublicCommit(
+            did: fixture.did,
+            recordKey: "before-rotation",
+            requestByte: 0x41,
+            wallClockMicroseconds: 1_750_000_001_000_000,
+            signingGeneration: generationOneSigner.generation,
+            signingKey: generationOneSigner.key,
+            database: database,
+            control: fixture.control
+        )
+
+        let rotated = try await fixture.service.rotate(did: fixture.did, now: fixture.now)
+        let generationTwoSigner = try await activeAccountSigner(fixture: fixture)
+        XCTAssertEqual(generationTwoSigner.generation, 2)
+        let generationTwoCommit = try await applyPublicCommit(
+            did: fixture.did,
+            recordKey: "after-rotation",
+            requestByte: 0x42,
+            wallClockMicroseconds: 1_750_000_002_000_000,
+            signingGeneration: generationTwoSigner.generation,
+            signingKey: generationTwoSigner.key,
+            database: database,
+            control: fixture.control
+        )
+
+        let sequencer = PublicFirehoseSequencer(
+            accountSource: RotationFirehoseAccountSource(
+                did: fixture.did,
+                database: database
+            ),
+            control: fixture.control,
+            firehose: firehose
+        )
+        let drained = try await sequencer.drainAll(
+            now: Date(timeIntervalSince1970: 2_000_000_000)
+        )
+        XCTAssertEqual(drained, 4)
+        let events = try await firehose.events(after: 0, limit: 10)
+        XCTAssertEqual(events.map(\.kind), [.identity, .commit, .identity, .commit])
+        XCTAssertEqual(
+            events.map(\.sourceKey),
+            [
+                PublicFirehoseSourceKey.identity(
+                    did: fixture.did,
+                    plcOperationCID: fixture.genesisCID
+                ),
+                PublicFirehoseSourceKey.commit(
+                    did: fixture.did,
+                    commitCID: generationOneCommit.commitCID.string
+                ),
+                PublicFirehoseSourceKey.identity(
+                    did: fixture.did,
+                    plcOperationCID: try rotated.operation.cid.string
+                ),
+                PublicFirehoseSourceKey.commit(
+                    did: fixture.did,
+                    commitCID: generationTwoCommit.commitCID.string
+                ),
+            ]
+        )
+        _ = try await PublicRepositoryCommitCodec.verify(
+            signedCommitBytes: generationOneCommit.signedCommitBytes,
+            expectedCommitCID: generationOneCommit.commitCID,
+            verifier: P256PublicRepositoryCommitVerifier(
+                publicKey: generationOneSigner.key.publicKey
+            )
+        )
+        _ = try await PublicRepositoryCommitCodec.verify(
+            signedCommitBytes: generationTwoCommit.signedCommitBytes,
+            expectedCommitCID: generationTwoCommit.commitCID,
+            verifier: P256PublicRepositoryCommitVerifier(
+                publicKey: generationTwoSigner.key.publicKey
+            )
+        )
+    }
+
+    private func activeAccountSigner(
+        fixture: RotationFixture
+    ) async throws -> (generation: UInt64, key: P256.Signing.PrivateKey) {
+        let loadedAccount = try await fixture.control.account(did: fixture.did)
+        let account = try XCTUnwrap(loadedAccount)
+        let generation = try XCTUnwrap(account.signingKey?.generation)
+        let reference = try AccountKeyReference(
+            accountDID: fixture.did,
+            purpose: .signing,
+            generation: generation
+        )
+        let key = try P256.Signing.PrivateKey(
+            rawRepresentation: try await fixture.keyStore.key(for: reference)
+        )
+        return (generation, key)
+    }
+
+    private func rotationIdentityItem(
+        did: String,
+        operationCID: String,
+        time: Date
+    ) throws -> LifecycleEventItem {
+        LifecycleEventItem(
+            sourceKey: PublicFirehoseSourceKey.identity(
+                did: did,
+                plcOperationCID: operationCID
+            ),
+            kind: .identity,
+            payload: try JSONEncoder().encode(
+                PublicFirehoseIdentityMaterial(
+                    did: did,
+                    handle: "alice.example.com",
+                    time: PublicFirehoseTime.encode(time)
+                )
+            ),
+            carBytes: nil
+        )
+    }
+
+    private func applyPublicCommit(
+        did: String,
+        recordKey: String,
+        requestByte: UInt8,
+        wallClockMicroseconds: UInt64,
+        signingGeneration: UInt64,
+        signingKey: P256.Signing.PrivateKey,
+        database: SQLiteAccountDatabase,
+        control: SQLiteControlDatabase
+    ) async throws -> PreparedPublicRepositorySignedCommit {
+        let loadedCurrent = try await database.loadPublicRepositoryState()
+        let current = try XCTUnwrap(loadedCurrent)
+        let request = try PublicRepositoryMutationRequest(
+            id: "rotation-ordering-\(recordKey)",
+            canonicalDigest: Data(repeating: requestByte, count: 32),
+            baseCommitCID: current.commitCID
+        )
+        let reservation: PublicRepositoryMutationReservation
+        switch try await database.reservePublicRepositoryRevision(
+            request,
+            wallClockMicroseconds: wallClockMicroseconds
+        ) {
+        case let .reserved(value):
+            reservation = value
+        case .committed:
+            throw SwanError.conflict(expected: 0, actual: 1)
+        }
+        let prepared = try await PublicRepositoryEngine.apply(
+            repositoryDID: did,
+            currentState: current,
+            blocks: database,
+            revision: reservation.nextRevision,
+            batch: try PublicRepositoryWriteBatch(
+                writes: [.create(
+                    path: try PublicRepositoryPath(
+                        collection: "app.bsky.feed.post",
+                        recordKey: recordKey
+                    ),
+                    record: PublicRecord([
+                        "$type": .string("app.bsky.feed.post"),
+                        "text": .string(recordKey),
+                    ])
+                )],
+                expectedCommitCID: current.commitCID
+            ),
+            signer: P256PublicRepositoryCommitSigner(privateKey: signingKey),
+            signingGeneration: signingGeneration
+        )
+        let fence = PublicFirehoseCommitFence(control: control)
+        _ = try await fence.apply(
+            did: did,
+            signingGeneration: signingGeneration
+        ) { context in
+            try await database.applyPublicRepositoryMutation(
+                reservation: reservation,
+                prepared: prepared,
+                firehose: context
+            )
+        }
+        return prepared.signedCommit
+    }
+
     private struct RotationFixture {
         let root: URL
         let did: String
@@ -104,6 +322,7 @@ final class PLCAccountRotationServiceTests: XCTestCase {
         let service: PLCAccountRotationService
         let control: SQLiteControlDatabase
         let opener: SQLitePLCAccountPreparationStoreOpener
+        let keyStore: FileAccountKeyStore
     }
 
     private func makeFixture(
@@ -145,15 +364,14 @@ final class PLCAccountRotationServiceTests: XCTestCase {
         let accountDatabase = try await SQLiteAccountDatabase(
             dataDirectory: root, did: did
         )
-        let repositoryKey = P256.Signing.PrivateKey()
         let repositoryGenesis = try PublicRepositoryGenesisCodec.create(
             did: did,
             revision: "3jzfcijpj2z2a",
-            signingKey: repositoryKey
+            signingKey: signing
         )
         _ = try await accountDatabase.installPublicRepositoryGenesis(
             repositoryGenesis,
-            signingPublicKey: repositoryKey.publicKey,
+            signingPublicKey: signing.publicKey,
             installedAt: Date(timeIntervalSince1970: 1_750_000_000)
         )
         let journal = try PLCAccountPreparationJournal(
@@ -231,7 +449,8 @@ final class PLCAccountRotationServiceTests: XCTestCase {
             genesisCID: try genesis.cid.string,
             service: service,
             control: control,
-            opener: opener
+            opener: opener,
+            keyStore: keyStore
         )
     }
 
@@ -244,6 +463,15 @@ final class PLCAccountRotationServiceTests: XCTestCase {
             attributes: [.posixPermissions: 0o700]
         )
         return root
+    }
+}
+
+private struct RotationFirehoseAccountSource: PublicFirehoseAccountDatabaseSource {
+    let did: String
+    let database: SQLiteAccountDatabase
+
+    func publicFirehoseAccountDatabases() async throws -> [PublicFirehoseAccountDatabase] {
+        [PublicFirehoseAccountDatabase(did: did, database: database)]
     }
 }
 

@@ -17,6 +17,7 @@ actor ControlSQLiteConnectionGate {
     private let maximumQueuedWaiters: Int
     private var isHeld = false
     private var waiters: [Waiter] = []
+    private var waiterEnqueuedForTesting: (@Sendable () -> Void)?
 
     init(maximumQueuedWaiters: Int = 128) {
         precondition(maximumQueuedWaiters > 0)
@@ -82,8 +83,15 @@ actor ControlSQLiteConnectionGate {
                     id: id,
                     continuation: continuation
                 ))
+                waiterEnqueuedForTesting?()
             }
         }
+    }
+
+    func setWaiterEnqueuedForTesting(
+        _ hook: (@Sendable () -> Void)?
+    ) {
+        waiterEnqueuedForTesting = hook
     }
 
     func admissionSnapshotForTesting() -> AdmissionSnapshot {
@@ -1471,6 +1479,13 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         _ hook: (@Sendable () async throws -> Void)?
     ) {
         beforeRotationCommitForTesting = hook
+    }
+
+    @_spi(Testing)
+    public func setConnectionGateWaiterEnqueuedForTesting(
+        _ hook: (@Sendable () -> Void)?
+    ) async {
+        await connectionGate.setWaiterEnqueuedForTesting(hook)
     }
 
     func configureOAuthControlStorageLimitsForTesting(

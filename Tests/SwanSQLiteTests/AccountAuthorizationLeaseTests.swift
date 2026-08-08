@@ -192,17 +192,20 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         await rotationBarrier.waitUntilParked()
 
         let fenceProbe = RotationFenceProbe()
+        await control.setConnectionGateWaiterEnqueuedForTesting {
+            Task { await fenceProbe.record(.queuedAtControlGate) }
+        }
         let fence = Task {
-            await fenceProbe.markAttempted()
             return try await control.withActiveAccountFirehoseAuthorization(
                 did: accountDID,
                 signingGeneration: 2
             ) { lifecycleGeneration in
-                await fenceProbe.markEntered()
+                await fenceProbe.record(.enteredAuthorization)
                 return lifecycleGeneration
             }
         }
-        await fenceProbe.waitUntilAttempted()
+        let firstFenceOutcome = await fenceProbe.waitForFirstOutcome()
+        XCTAssertEqual(firstFenceOutcome, .queuedAtControlGate)
         let enteredBeforeRelease = await fenceProbe.hasEntered
         XCTAssertFalse(
             enteredBeforeRelease,
@@ -251,7 +254,7 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         let fence = PublicFirehoseCommitFence(control: control)
         do {
             _ = try await fence.apply(did: did, signingGeneration: 1) { _ in
-                await callback.markEntered()
+                await callback.record(.enteredAuthorization)
                 throw TestPublicationError.unexpectedMutation
             }
             XCTFail("a stale signer must be rejected")
@@ -292,23 +295,28 @@ private actor RotationCommitBarrier {
 }
 
 private actor RotationFenceProbe {
-    private var attempted = false
-    private var attemptedWaiters: [CheckedContinuation<Void, Never>] = []
+    enum Outcome: Sendable, Equatable {
+        case queuedAtControlGate
+        case enteredAuthorization
+    }
+
+    private var firstOutcome: Outcome?
+    private var outcomeWaiters: [CheckedContinuation<Outcome, Never>] = []
     private(set) var hasEntered = false
 
-    func markAttempted() {
-        attempted = true
-        let waiters = attemptedWaiters
-        attemptedWaiters.removeAll()
-        waiters.forEach { $0.resume() }
+    func record(_ outcome: Outcome) {
+        if outcome == .enteredAuthorization {
+            hasEntered = true
+        }
+        guard firstOutcome == nil else { return }
+        firstOutcome = outcome
+        let waiters = outcomeWaiters
+        outcomeWaiters.removeAll()
+        waiters.forEach { $0.resume(returning: outcome) }
     }
 
-    func waitUntilAttempted() async {
-        if attempted { return }
-        await withCheckedContinuation { attemptedWaiters.append($0) }
-    }
-
-    func markEntered() {
-        hasEntered = true
+    func waitForFirstOutcome() async -> Outcome {
+        if let firstOutcome { return firstOutcome }
+        return await withCheckedContinuation { outcomeWaiters.append($0) }
     }
 }
