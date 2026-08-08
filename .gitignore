@@ -1,6 +1,8 @@
 .build/
 .build-*/
 .swiftpm/
+# Downloaded reference sources, including the checksum-pinned Indigo archive
+# and its extracted tree, remain local custody material rather than VCS input.
 .interop-cache/
 .interop-live/
 artifacts/

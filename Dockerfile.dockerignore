@@ -58,6 +58,8 @@ Swan/**/.DS_Store
 .swan-interop-secrets/
 **/.swan-interop-secrets/
 **/.swan-interop-secrets/**
-Swan/.interop-cache/
 Swan/.interop-cache/**
-Swan/**/.interop-cache*
+Swan/**/.interop-cache/**
+# Phase 5's network-disabled relay build may consume this one source archive;
+# extracted trees and every other cache entry remain excluded above.
+!Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz

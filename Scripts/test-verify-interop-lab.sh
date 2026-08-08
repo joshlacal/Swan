@@ -474,12 +474,20 @@ mutate_file_and_require_rejection \
   'reference image Dockerfiles must verify the pinned pnpm bootstrap'
 
 mutate_file_and_require_rejection \
-  swan-reference-cache-exception \
+  unpinned-swan-reference-cache-exception \
   Dockerfile.dockerignore \
-  $'Swan/.interop-cache/**\n' \
-  $'Swan/.interop-cache/**\n!Swan/.interop-cache/atproto-unsafe.tar.gz\n' \
+  '!Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz' \
+  $'!Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz\n!Swan/.interop-cache/atproto-unsafe.tar.gz' \
   SWAN_INTEROP_SWAN_DOCKERIGNORE \
-  'the Swan image build context must not expose a reference-source cache exception'
+  'the Swan image build context must allow only the pinned Indigo source archive'
+
+mutate_file_and_require_rejection \
+  wrong-indigo-source-archive-pin \
+  Dockerfile.dockerignore \
+  '!Swan/.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz' \
+  '!Swan/.interop-cache/indigo-0000000000000000000000000000000000000000.tar.gz' \
+  SWAN_INTEROP_SWAN_DOCKERIGNORE \
+  'the Swan image build context must allow only the pinned Indigo source archive'
 
 ./Scripts/test-bootstrap-local-space.sh
 echo "INTEROP LAB VERIFIER MUTATION TESTS OK"

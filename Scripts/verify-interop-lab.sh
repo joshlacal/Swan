@@ -816,10 +816,25 @@ do
   rg -qx '\*\*/\.swan-interop-secrets/\*\*' "$ignore_file"
 done
 rg -qx 'Swan/\.interop-cache/\*\*' "$swan_dockerignore"
-if rg -q '^!Swan/\.interop-cache/atproto-' "$swan_dockerignore"; then
-  echo "the Swan image build context must not expose a reference-source cache exception" >&2
-  exit 1
-fi
+python3 - "$swan_dockerignore" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+allowed = (
+    "!Swan/.interop-cache/"
+    "indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz"
+)
+exceptions = {
+    line.strip()
+    for line in path.read_text(encoding="utf-8").splitlines()
+    if line.strip().startswith("!") and "/.interop-cache/" in line
+}
+if exceptions != {allowed}:
+    raise SystemExit(
+        "the Swan image build context must allow only the pinned Indigo source archive"
+    )
+PY
 for ignore_file in "$reference_pds_dockerignore" "$reference_plc_dockerignore"; do
   rg -qx 'Swan/\.interop-cache/\*\*' "$ignore_file"
   rg -qx '!Swan/\.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354\.tar\.gz' "$ignore_file"
