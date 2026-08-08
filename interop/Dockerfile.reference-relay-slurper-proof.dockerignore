@@ -1,0 +1,13 @@
+*
+!.interop-cache/
+!.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/
+!.interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz
+!.interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/
+!.interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.vendor.tar.gz
+!interop/
+!interop/apply-reference-relay-overlay.go
+!interop/reference-relay-overlay/
+!interop/reference-relay-overlay/reference-relay-private-upstream.patch
+!interop/reference-relay-slurper-private-upstream_test.go
+!interop/reference-relay-slurper-proof.go
+!interop/toxiproxy.reference-relay.json

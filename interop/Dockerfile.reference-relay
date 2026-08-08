@@ -5,19 +5,20 @@ WORKDIR /work
 COPY .interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz /tmp/indigo.tar.gz
 COPY .interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.vendor.tar.gz /tmp/indigo.vendor.tar.gz
 COPY interop/reference-relay-overlay/reference-relay-private-upstream.patch /tmp/reference-relay-private-upstream.patch
+COPY interop/apply-reference-relay-overlay.go /tmp/apply-reference-relay-overlay.go
 COPY interop/reference-relay-healthcheck.go /tmp/reference-relay-healthcheck.go
 
 # The source, module closure, and narrow lab-only overlay are verified before
 # extraction. BuildKit networking stays disabled for every build action.
 RUN --network=none echo "bc6f57e6211560220ac49dc7d6b55c5a43291f1e1193113ce413ffe4478fdd0b  /tmp/indigo.tar.gz" | sha256sum -c - \
     && echo "8dc18074f7833f610c622fc698bed545511a32dd633c348825560ee9b2878b4e  /tmp/indigo.vendor.tar.gz" | sha256sum -c - \
-    && echo "b8513ef5e488d522670eede7926b985a6618225e43355daeb7ab75699c6564fb  /tmp/reference-relay-private-upstream.patch" | sha256sum -c - \
+    && echo "b89924692e75845b680e39e1467a4786785cd297b586f233692b350c94d1b101  /tmp/reference-relay-private-upstream.patch" | sha256sum -c - \
     && mkdir /src \
     && tar -xzf /tmp/indigo.tar.gz --strip-components=1 -C /src \
     && tar -xzf /tmp/indigo.vendor.tar.gz -C /src \
-    && sed -i '/github.com\/bluesky-social\/indigo\/util\/ssrf/d' /src/cmd/relay/relay/host_checker.go \
-    && sed -i 's/Transport: ssrf.PublicOnlyTransport(),/Transport: http.DefaultTransport,/' /src/cmd/relay/relay/host_checker.go \
+    && go run /tmp/apply-reference-relay-overlay.go /src /tmp/reference-relay-private-upstream.patch \
     && ! grep -q 'ssrf\.PublicOnlyTransport' /src/cmd/relay/relay/host_checker.go \
+    && ! grep -q 'ssrf\.PublicOnlyDialer' /src/cmd/relay/relay/slurper.go \
     && cd /src \
     && go build -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags "-static"' -o /out/reference-relay ./cmd/relay \
     && go build -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags "-static"' -o /out/reference-relay-healthcheck /tmp/reference-relay-healthcheck.go

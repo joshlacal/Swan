@@ -9,6 +9,7 @@ readonly commit="8b43a326dbbb394f63b6d68761553cdfe25532de"
 readonly source_bundle="${root}/.interop-cache/indigo-${commit}"
 readonly vendor_bundle="${root}/.interop-cache/indigo-vendor-${commit}"
 readonly required_patch_line='Transport: ssrf.PublicOnlyTransport(),'
+readonly required_subscription_patch_line='netDialer := ssrf.PublicOnlyDialer()'
 
 if [[ $# -gt 1 ]]; then
   echo "usage: $0 [destination]" >&2
@@ -66,8 +67,13 @@ cp -R "${source_bundle}/source/." "$destination"
 tar -xzf "${vendor_bundle}/indigo-${commit}.vendor.tar.gz" -C "$destination"
 patch --batch --forward -d "$destination" -p1 < "$patch_file"
 grep -Fq "$required_patch_line" "$patch_file"
+grep -Fq "$required_subscription_patch_line" "$patch_file"
 if rg -q 'ssrf\.PublicOnlyTransport' "$destination/cmd/relay/relay/host_checker.go"; then
   echo "reference relay overlay did not replace the private-upstream transport" >&2
+  exit 1
+fi
+if rg -q 'ssrf\.PublicOnlyDialer' "$destination/cmd/relay/relay/slurper.go"; then
+  echo "reference relay overlay did not replace the Slurper private-upstream dialer" >&2
   exit 1
 fi
 printf 'REFERENCE RELAY OVERLAY READY: %s\n' "$destination"

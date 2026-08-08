@@ -1,0 +1,56 @@
+FROM docker.io/library/golang@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b AS prepared
+
+ENV CGO_ENABLED=1 GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-mod=vendor
+COPY .interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz /tmp/indigo.tar.gz
+COPY .interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.vendor.tar.gz /tmp/indigo.vendor.tar.gz
+COPY interop/reference-relay-overlay/reference-relay-private-upstream.patch /tmp/reference-relay-private-upstream.patch
+COPY interop/apply-reference-relay-overlay.go /tmp/apply-reference-relay-overlay.go
+COPY interop/reference-relay-slurper-private-upstream_test.go /tmp/reference-relay-slurper-private-upstream_test.go
+COPY interop/reference-relay-slurper-proof.go /tmp/reference-relay-slurper-proof.go
+
+RUN --network=none echo "bc6f57e6211560220ac49dc7d6b55c5a43291f1e1193113ce413ffe4478fdd0b  /tmp/indigo.tar.gz" | sha256sum -c - \
+    && echo "8dc18074f7833f610c622fc698bed545511a32dd633c348825560ee9b2878b4e  /tmp/indigo.vendor.tar.gz" | sha256sum -c - \
+    && echo "b89924692e75845b680e39e1467a4786785cd297b586f233692b350c94d1b101  /tmp/reference-relay-private-upstream.patch" | sha256sum -c - \
+    && mkdir /src /out \
+    && tar -xzf /tmp/indigo.tar.gz --strip-components=1 -C /src \
+    && tar -xzf /tmp/indigo.vendor.tar.gz -C /src \
+    && cp /src/cmd/relay/relay/slurper.go /tmp/slurper.public-only.go \
+    && go run /tmp/apply-reference-relay-overlay.go /src /tmp/reference-relay-private-upstream.patch \
+    && cp /tmp/reference-relay-slurper-private-upstream_test.go /src/cmd/relay/relay/reference_relay_slurper_private_upstream_test.go \
+    && mkdir -p /src/cmd/reference-relay-slurper-proof \
+    && cp /tmp/reference-relay-slurper-proof.go /src/cmd/reference-relay-slurper-proof/main.go \
+    && cd /src \
+    && CGO_ENABLED=0 go build -o /out/reference-relay-slurper-proof-helper ./cmd/reference-relay-slurper-proof
+
+FROM prepared AS patched-build
+RUN --network=none cd /src \
+    && go test -c -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags "-static"' -o /out/reference-relay-slurper-proof ./cmd/relay/relay
+
+FROM prepared AS public-only-build
+RUN --network=none cp /tmp/slurper.public-only.go /src/cmd/relay/relay/slurper.go \
+    && cd /src \
+    && go test -c -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags "-static"' -o /out/reference-relay-slurper-proof ./cmd/relay/relay
+
+FROM docker.io/library/golang@sha256:727cfc3c40be55cd1bc9a4a059406b28a059857e3be752aa9d09531e12c20c56 AS upstream
+COPY --from=prepared /out/reference-relay-slurper-proof-helper /usr/local/bin/reference-relay-slurper-proof
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/reference-relay-slurper-proof"]
+CMD ["serve"]
+HEALTHCHECK --interval=1s --timeout=3s --retries=15 CMD ["/usr/local/bin/reference-relay-slurper-proof", "health", "http://127.0.0.1:3000/health"]
+
+FROM ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e AS toxiproxy
+COPY --from=prepared /out/reference-relay-slurper-proof-helper /reference-relay-slurper-proof
+COPY interop/toxiproxy.reference-relay.json /etc/toxiproxy/config.json
+HEALTHCHECK --interval=1s --timeout=3s --retries=15 CMD ["/reference-relay-slurper-proof", "health", "http://127.0.0.1:8474/version"]
+
+FROM docker.io/library/golang@sha256:727cfc3c40be55cd1bc9a4a059406b28a059857e3be752aa9d09531e12c20c56 AS patched
+COPY --from=patched-build /out/reference-relay-slurper-proof /usr/local/bin/reference-relay-slurper-proof
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/reference-relay-slurper-proof"]
+CMD ["-test.v", "-test.run=^TestReferenceRelaySlurperPrivateWSS$", "-test.count=1", "-test.timeout=12s"]
+
+FROM docker.io/library/golang@sha256:727cfc3c40be55cd1bc9a4a059406b28a059857e3be752aa9d09531e12c20c56 AS public-only
+COPY --from=public-only-build /out/reference-relay-slurper-proof /usr/local/bin/reference-relay-slurper-proof
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/reference-relay-slurper-proof"]
+CMD ["-test.v", "-test.run=^TestReferenceRelaySlurperPrivateWSS$", "-test.count=1", "-test.timeout=12s"]

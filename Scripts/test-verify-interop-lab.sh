@@ -78,6 +78,15 @@ for executable_relay_input in "$relay_compose_script" "$relay_overlay_apply"; do
     || fail "reference relay topology script is not executable: ${executable_relay_input}"
 done
 
+# The lab-only overlay must cover the real WebSocket subscriber, not merely
+# host probing. This is deliberately exercised before its static mutation
+# cases so a retained PublicOnlyDialer is a hard RED.
+overlay_subscription_probe="${temporary_directory}/relay-overlay-subscription"
+./"$relay_overlay_apply" "$overlay_subscription_probe" >/dev/null
+if rg -q 'ssrf\.PublicOnlyDialer' "$overlay_subscription_probe/cmd/relay/relay/slurper.go"; then
+  fail "reference relay overlay leaves the Slurper private-upstream dialer enabled"
+fi
+
 mutate_relay_and_require_rejection() {
   name="$1"
   old="$2"
@@ -190,6 +199,14 @@ mutate_relay_file_and_require_rejection \
   SWAN_INTEROP_REFERENCE_RELAY_OVERLAY_APPLY \
   'reference relay overlay must use the dedicated lab-only private upstream transport'
 
+mutate_relay_file_and_require_rejection \
+  relay-overlay-without-slurper-private-upstream-opt-in \
+  "$relay_overlay_patch" \
+  'netDialer := ssrf.PublicOnlyDialer()' \
+  'netDialer := (&net.Dialer{}).DialContext' \
+  SWAN_INTEROP_REFERENCE_RELAY_OVERLAY_PATCH \
+  'reference relay overlay must replace both private-upstream SSRF guards'
+
 # Phase 5's CGO builder must be a separate immutable Bookworm tuple. The
 # existing Alpine vendor materializer pin is intentionally not a substitute.
 mutate_relay_file_and_require_rejection \
@@ -207,6 +224,14 @@ mutate_relay_file_and_require_rejection \
   "go build -tags timetzdata -o /out/reference-relay ./cmd/relay" \
   SWAN_INTEROP_REFERENCE_RELAY_DOCKERFILE \
   'reference relay Dockerfile must use the checksum-pinned Bookworm builder and static offline CGO recipe'
+
+mutate_relay_file_and_require_rejection \
+  relay-runtime-image-drift \
+  "$relay_dockerfile" \
+  'FROM docker.io/library/golang@sha256:727cfc3c40be55cd1bc9a4a059406b28a059857e3be752aa9d09531e12c20c56' \
+  'FROM docker.io/library/golang@sha256:0000000000000000000000000000000000000000000000000000000000000000' \
+  SWAN_INTEROP_REFERENCE_RELAY_DOCKERFILE \
+  'reference relay Dockerfile must use the pinned Alpine runtime image'
 
 mutate_relay_file_and_require_rejection \
   relay-toxiproxy-without-tls-listener \

@@ -17,3 +17,21 @@
  	}
  	return &HostClient{
  		Client:    &c,
+--- a/cmd/relay/relay/slurper.go
++++ b/cmd/relay/relay/slurper.go
+@@ -16,7 +16,6 @@ import (
+ 	"github.com/bluesky-social/indigo/cmd/relay/relay/models"
+ 	"github.com/bluesky-social/indigo/cmd/relay/stream"
+ 	"github.com/bluesky-social/indigo/cmd/relay/stream/schedulers/parallel"
+-	"github.com/bluesky-social/indigo/util/ssrf"
+ 
+ 	"github.com/RussellLuo/slidingwindow"
+ 	"github.com/gorilla/websocket"
+@@ -300,7 +299 @@
+-	// if this isn't a localhost / private connection, then we should enable SSRF protections
+-	if !host.NoSSL {
+-		netDialer := ssrf.PublicOnlyDialer()
+-		d.NetDialContext = netDialer.DialContext
+-	}
+-
+ 	cursor := host.LastSeq

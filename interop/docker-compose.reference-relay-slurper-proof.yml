@@ -1,0 +1,111 @@
+name: swan-reference-relay-slurper-proof
+
+services:
+  swan:
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile.reference-relay-slurper-proof
+      target: upstream
+    networks:
+      swan:
+        ipv4_address: 172.30.0.5
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/reference-relay-slurper-proof", "health", "http://127.0.0.1:3000/health"]
+      interval: 1s
+      timeout: 3s
+      retries: 15
+
+  caddy:
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile.caddy.reference-relay
+    volumes:
+      - caddy-data:/data
+    networks:
+      swan:
+        ipv4_address: 172.30.0.2
+        aliases:
+          - swan.test
+    depends_on:
+      swan:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /data/caddy/pki/authorities/local/root.crt"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+
+  caddy-ca-ready:
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile.reference-relay-slurper-proof
+      target: upstream
+    user: "0:0"
+    command:
+      - prepare-trust
+      - /caddy-data/caddy/pki/authorities/local/root.crt
+      - /prepared-trust/caddy-local-root.crt
+    volumes:
+      - caddy-data:/caddy-data:ro
+      - caddy-trust:/prepared-trust
+    network_mode: "none"
+    depends_on:
+      caddy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/reference-relay-slurper-proof", "health", "http://127.0.0.1:3001/health"]
+      interval: 1s
+      timeout: 3s
+      retries: 15
+
+  toxiproxy:
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile.reference-relay-slurper-proof
+      target: toxiproxy
+    command:
+      - -host=0.0.0.0
+      - -config=/etc/toxiproxy/config.json
+    networks:
+      swan:
+        ipv4_address: 172.30.0.8
+    depends_on:
+      caddy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/reference-relay-slurper-proof", "health", "http://127.0.0.1:8474/version"]
+      interval: 1s
+      timeout: 3s
+      retries: 15
+
+  slurper-proof:
+    build:
+      context: ..
+      dockerfile: interop/Dockerfile.reference-relay-slurper-proof
+      target: ${SWAN_SLURPER_PROOF_TARGET:-patched}
+    environment:
+      SLURPER_PROOF_OBSERVER_URL: http://swan:3000/proof
+      SSL_CERT_FILE: /etc/ssl/certs/caddy-local-root.crt
+      GODEBUG: netdns=go
+    volumes:
+      - caddy-trust:/etc/ssl/certs:ro
+    extra_hosts:
+      - "swan.test:172.30.0.8"
+    networks:
+      swan: {}
+    depends_on:
+      caddy-ca-ready:
+        condition: service_healthy
+      swan:
+        condition: service_healthy
+      toxiproxy:
+        condition: service_healthy
+
+volumes:
+  caddy-data:
+  caddy-trust:
+
+networks:
+  swan:
+    external: true
+    name: ${SWAN_SLURPER_PROOF_NETWORK:?set an empty Docker network with subnet 172.30.0.0/24}

@@ -16,6 +16,7 @@ override_names=(
   SWAN_INTEROP_REFERENCE_PLC_DOCKERIGNORE
   SWAN_INTEROP_REFERENCE_RELAY_COMPOSE_FILE
   SWAN_INTEROP_REFERENCE_RELAY_DOCKERFILE
+  SWAN_INTEROP_REFERENCE_RELAY_OVERLAY_PATCH
   SWAN_INTEROP_REFERENCE_RELAY_OVERLAY_APPLY
   SWAN_INTEROP_REFERENCE_RELAY_TOXIPROXY_CONFIG_FILE
 )
@@ -51,7 +52,7 @@ relay_compose_script="interop/compose-reference-relay.sh"
 relay_dockerfile="${SWAN_INTEROP_REFERENCE_RELAY_DOCKERFILE:-interop/Dockerfile.reference-relay}"
 relay_dockerignore="interop/Dockerfile.reference-relay.dockerignore"
 relay_overlay_profile="interop/reference-relay-overlay/profile.json"
-relay_overlay_patch="interop/reference-relay-overlay/reference-relay-private-upstream.patch"
+relay_overlay_patch="${SWAN_INTEROP_REFERENCE_RELAY_OVERLAY_PATCH:-interop/reference-relay-overlay/reference-relay-private-upstream.patch}"
 relay_overlay_apply="${SWAN_INTEROP_REFERENCE_RELAY_OVERLAY_APPLY:-interop/reference-relay-overlay/apply-reference-relay-overlay.sh}"
 relay_caddyfile="interop/Caddyfile.reference-relay"
 relay_caddy_dockerfile="interop/Dockerfile.caddy.reference-relay"
@@ -256,6 +257,17 @@ fi
 
 # The private-network exception is a checksum-qualified disposable overlay,
 # never a mutation of the pinned source cache or an ambient relay setting.
+for required_relay_overlay_line in \
+  '--- a/cmd/relay/relay/host_checker.go' \
+  'Transport: ssrf.PublicOnlyTransport(),' \
+  '--- a/cmd/relay/relay/slurper.go' \
+  'netDialer := ssrf.PublicOnlyDialer()'
+do
+  if ! rg -Fq -- "$required_relay_overlay_line" "$relay_overlay_patch"; then
+    echo "reference relay overlay must replace both private-upstream SSRF guards" >&2
+    exit 1
+  fi
+done
 python3 - "$relay_overlay_profile" "$relay_overlay_patch" "interop/reference-indigo-vendor-pin.json" <<'PY'
 import hashlib
 import json
@@ -293,6 +305,7 @@ if profile.get("overlayPatchSHA256") != hashlib.sha256(patch_path.read_bytes()).
     raise SystemExit("reference relay overlay patch checksum does not match its profile")
 PY
 require_contains "$(<"$relay_overlay_apply")" 'required_patch_line='"'"'Transport: ssrf.PublicOnlyTransport(),'"'"'' "reference relay overlay must use the dedicated lab-only private upstream transport"
+require_contains "$(<"$relay_overlay_apply")" 'required_subscription_patch_line='"'"'netDialer := ssrf.PublicOnlyDialer()'"'"'' "reference relay overlay must use the dedicated Slurper private upstream transport"
 # shellcheck disable=SC2016 # Match the literal script contract, including variables.
 require_contains "$(<"$relay_overlay_apply")" './interop/verify-reference-indigo.sh --bundle-dir "$source_bundle"' "reference relay overlay must verify the pinned Indigo source"
 # shellcheck disable=SC2016 # Match the literal script contract, including variables.
@@ -301,12 +314,18 @@ if rg -n '^[[:space:]]*RUN .*(curl|wget|git clone|git fetch|go mod download)' "$
   echo "reference relay Dockerfile must not fetch source from the network" >&2
   exit 1
 fi
+if ! rg -Fq 'FROM docker.io/library/golang@sha256:727cfc3c40be55cd1bc9a4a059406b28a059857e3be752aa9d09531e12c20c56' "$relay_dockerfile"; then
+  echo "reference relay Dockerfile must use the pinned Alpine runtime image" >&2
+  exit 1
+fi
 for required_relay_docker_line in \
   'FROM docker.io/library/golang@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b AS build' \
   'COPY .interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.tar.gz /tmp/indigo.tar.gz' \
   'COPY .interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.vendor.tar.gz /tmp/indigo.vendor.tar.gz' \
   'COPY interop/reference-relay-overlay/reference-relay-private-upstream.patch /tmp/reference-relay-private-upstream.patch' \
+  'COPY interop/apply-reference-relay-overlay.go /tmp/apply-reference-relay-overlay.go' \
   'ENV CGO_ENABLED=1 GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-mod=vendor' \
+  'go run /tmp/apply-reference-relay-overlay.go /src /tmp/reference-relay-private-upstream.patch' \
   "go build -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags \"-static\"' -o /out/reference-relay ./cmd/relay" \
   "go build -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags \"-static\"' -o /out/reference-relay-healthcheck /tmp/reference-relay-healthcheck.go" \
   'ENV SSL_CERT_FILE=/etc/ssl/certs/caddy-local-root.crt GODEBUG=netdns=go' \
@@ -317,6 +336,10 @@ do
     exit 1
   fi
 done
+if rg -n 'sed -i.*(host_checker|slurper)' "$relay_dockerfile"; then
+  echo "reference relay Dockerfile must apply the checksum-verified overlay rather than reimplement it" >&2
+  exit 1
+fi
 python3 - "$relay_dockerignore" <<'PY'
 import pathlib
 import sys
@@ -331,6 +354,7 @@ required = {
     "!.interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.vendor.tar.gz",
     "!interop/reference-relay-overlay/",
     "!interop/reference-relay-overlay/reference-relay-private-upstream.patch",
+    "!interop/apply-reference-relay-overlay.go",
 }
 if not required <= rules:
     raise SystemExit("reference relay build context must allow only pinned archives and overlay material")
