@@ -44,6 +44,15 @@ final class PublicRelayVerifierCLIParseTests: XCTestCase {
     XCTAssertEqual(accepted.reconnects[0].firstDeliveredSequence, 13)
   }
 
+  func testRelayVerifierManifestRejectsReconnectUnrelatedToOfflineRecoveryRange() throws {
+    XCTAssertThrowsError(try RelayVerifierManifest.decode(manifestData(
+      frameFiles: (1 ... 17).map { "frame-\($0).cbor" },
+      reconnects: [(5, 6)],
+      offlineStart: 13,
+      offlineEnd: 17
+    )))
+  }
+
   func testFirehoseVerifyRelayCaptureParsesExplicitLaboratoryPLCPolicy() throws {
     let command = try SwanCommand.parseAsRoot([
       "firehose", "verify-relay-capture",
@@ -86,13 +95,14 @@ final class PublicRelayVerifierCLIParseTests: XCTestCase {
   }
 
   private func manifestData(
+    frameFiles: [String] = ["frame-1.cbor"],
     reconnects: [(cursor: Int64, firstDeliveredSequence: Int64)],
     offlineStart: Int64? = nil,
     offlineEnd: Int64? = nil
   ) throws -> Data {
     var object: [String: Any] = [
       "did": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
-      "frameFiles": ["frame-1.cbor"],
+      "frameFiles": frameFiles,
       "finalCARFile": "final.car",
       "finalRevision": "3jzfcijpj2z2a",
       "finalCommitCID": "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

@@ -1135,7 +1135,11 @@ struct RelayVerifierManifest: Decodable {
               let offlineEnd = decoded.offlineSequenceEnd,
               offlineStart > 0,
               offlineStart <= FirehoseFrameLimits.maximumSequence - 4,
-              offlineEnd == offlineStart + 4 else {
+              offlineEnd == offlineStart + 4,
+              decoded.reconnects.contains(where: {
+                  $0.cursor == offlineStart - 1 &&
+                      $0.firstDeliveredSequence == offlineStart
+              }) else {
             throw RelayVerifierError.invalidCaptureManifest
         }
         return decoded
