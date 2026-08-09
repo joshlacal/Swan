@@ -1089,7 +1089,7 @@ private func readBoundedRegularFileNoFollow(
     return data
 }
 
-private struct RelayVerifierManifest: Decodable {
+struct RelayVerifierManifest: Decodable {
     let did: String
     let frameFiles: [String]
     let finalCARFile: String
@@ -1130,10 +1130,12 @@ private struct RelayVerifierManifest: Decodable {
               decoded.frameFiles.count <= 100_000,
               decoded.frameFiles.allSatisfy({ !$0.isEmpty }),
               !decoded.finalCARFile.isEmpty,
-              (decoded.offlineSequenceStart == nil) == (decoded.offlineSequenceEnd == nil),
-              decoded.offlineSequenceStart.map({ start in
-                  decoded.offlineSequenceEnd.map { start <= $0 } ?? false
-              }) ?? true else {
+              !decoded.reconnects.isEmpty,
+              let offlineStart = decoded.offlineSequenceStart,
+              let offlineEnd = decoded.offlineSequenceEnd,
+              offlineStart > 0,
+              offlineStart <= FirehoseFrameLimits.maximumSequence - 4,
+              offlineEnd == offlineStart + 4 else {
             throw RelayVerifierError.invalidCaptureManifest
         }
         return decoded
@@ -1311,6 +1313,22 @@ extension SwanCommand {
             @Option(name: .customLong("plc-origin"), help: "Authenticated PLC directory origin")
             var plcOrigin: String
 
+            @Flag(
+                name: .customLong("plc-laboratory"),
+                help: "Allow an explicitly loopback/allowlisted HTTP PLC origin for the lab"
+            )
+            var plcLaboratory = false
+
+            @Option(
+                name: .customLong("plc-laboratory-allowlisted-host"),
+                help: "Explicit Docker/service DNS host allowed for --plc-laboratory"
+            )
+            var plcLaboratoryAllowlistedHost: String?
+
+            mutating func validate() throws {
+                _ = try plcConfiguration()
+            }
+
             func run() async throws {
                 do {
                     let manifestURL = URL(fileURLWithPath: manifest).standardizedFileURL
@@ -1320,12 +1338,8 @@ extension SwanCommand {
                         validationMessage: "relay verifier manifest is unavailable"
                     )
                     let input = try RelayVerifierManifest.decode(rawManifest)
-                    guard let origin = URL(string: plcOrigin),
-                          origin.scheme?.lowercased() == "https" else {
-                        throw RelayVerifierError.invalidCaptureManifest
-                    }
                     let resolver = try PLCPublicRepositoryCommitKeyResolver(
-                        configuration: .production(origin: origin)
+                        configuration: plcConfiguration()
                     )
                     let commitVerifier = try await resolver.resolveCommitVerifier(for: input.did)
                     let base = manifestURL.deletingLastPathComponent()
@@ -1424,6 +1438,30 @@ extension SwanCommand {
                     throw ValidationError("relay verification failed: input unavailable")
                 } catch {
                     throw ValidationError("relay verification failed")
+                }
+            }
+
+            private func plcConfiguration() throws -> PLCClientConfiguration {
+                guard let origin = URL(string: plcOrigin) else {
+                    throw ValidationError("--plc-origin must be a URL")
+                }
+                do {
+                    if plcLaboratory {
+                        return try .laboratory(
+                            origin: origin,
+                            allowlistedHost: plcLaboratoryAllowlistedHost
+                        )
+                    }
+                    guard plcLaboratoryAllowlistedHost == nil else {
+                        throw ValidationError(
+                            "--plc-laboratory-allowlisted-host requires --plc-laboratory"
+                        )
+                    }
+                    return try .production(origin: origin)
+                } catch let error as ValidationError {
+                    throw error
+                } catch {
+                    throw ValidationError("--plc-origin is not an allowed PLC origin")
                 }
             }
         }
