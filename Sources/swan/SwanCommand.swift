@@ -9,6 +9,8 @@ import SwanHTTP
 import SwanInterop
 import SwanCore
 import SwanOAuth
+import SwanPublicFirehose
+import SwanPublicRelayVerifier
 import SwanPublicRepository
 import SwanSQLite
 import SwanStorage
@@ -1087,6 +1089,84 @@ private func readBoundedRegularFileNoFollow(
     return data
 }
 
+private struct RelayVerifierManifest: Decodable {
+    let did: String
+    let frameFiles: [String]
+    let finalCARFile: String
+    let finalRevision: String
+    let finalCommitCID: String
+    let finalDataCID: String
+    let reconnects: [RelayReconnectEvidence]
+    let getRepo: RelayGetRepoObservation
+    let offlineSequenceStart: Int64?
+    let offlineSequenceEnd: Int64?
+
+    var expectedOfflineCommitCount: Int { 5 }
+
+    var offlineSequenceRange: ClosedRange<Int64>? {
+        guard let start = offlineSequenceStart, let end = offlineSequenceEnd else {
+            return nil
+        }
+        return start ... end
+    }
+
+    static func decode(_ data: Data) throws -> Self {
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(object.keys).isSubset(of: [
+                  "did", "frameFiles", "finalCARFile", "finalRevision",
+                  "finalCommitCID", "finalDataCID", "reconnects", "getRepo",
+                  "offlineSequenceStart", "offlineSequenceEnd",
+              ]) else {
+            throw RelayVerifierError.invalidCaptureManifest
+        }
+        let decoded: Self
+        do {
+            decoded = try JSONDecoder().decode(Self.self, from: data)
+        } catch {
+            throw RelayVerifierError.invalidCaptureManifest
+        }
+        guard (try? DID(didString: decoded.did)) != nil,
+              !decoded.frameFiles.isEmpty,
+              decoded.frameFiles.count <= 100_000,
+              decoded.frameFiles.allSatisfy({ !$0.isEmpty }),
+              !decoded.finalCARFile.isEmpty,
+              (decoded.offlineSequenceStart == nil) == (decoded.offlineSequenceEnd == nil),
+              decoded.offlineSequenceStart.map({ start in
+                  decoded.offlineSequenceEnd.map { start <= $0 } ?? false
+              }) ?? true else {
+            throw RelayVerifierError.invalidCaptureManifest
+        }
+        return decoded
+    }
+
+    func finalHead() throws -> RelayRepositoryHead {
+        let commit: CID
+        let data: CID
+        do {
+            commit = try CID.parse(finalCommitCID)
+            data = try CID.parse(finalDataCID)
+            try PublicRepositoryCID.validate(commit)
+            try PublicRepositoryCID.validate(data)
+            _ = try PublicRepositoryTID(finalRevision)
+        } catch {
+            throw RelayVerifierError.invalidCaptureManifest
+        }
+        return .init(
+            did: did,
+            revision: finalRevision,
+            commitCID: commit,
+            dataCID: data
+        )
+    }
+
+    static func resolve(_ path: String, relativeTo base: URL) -> URL {
+        if path.hasPrefix("/") {
+            return URL(fileURLWithPath: path).standardizedFileURL
+        }
+        return base.appending(path: path).standardizedFileURL
+    }
+}
+
 @main
 struct SwanCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -1216,8 +1296,137 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(
             commandName: "firehose",
             abstract: "Operator tools for the durable public firehose",
-            subcommands: [ForceSync.self]
+            subcommands: [ForceSync.self, VerifyRelayCapture.self]
         )
+
+        struct VerifyRelayCapture: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "verify-relay-capture",
+                abstract: "Independently verify ephemeral relay frames and Swan repository state"
+            )
+
+            @Option(name: .long, help: "Owner-controlled JSON manifest naming ephemeral inputs")
+            var manifest: String
+
+            @Option(name: .customLong("plc-origin"), help: "Authenticated PLC directory origin")
+            var plcOrigin: String
+
+            func run() async throws {
+                do {
+                    let manifestURL = URL(fileURLWithPath: manifest).standardizedFileURL
+                    let rawManifest = try readBoundedRegularFileNoFollow(
+                        manifestURL,
+                        maximumBytes: 256 * 1_024,
+                        validationMessage: "relay verifier manifest is unavailable"
+                    )
+                    let input = try RelayVerifierManifest.decode(rawManifest)
+                    guard let origin = URL(string: plcOrigin),
+                          origin.scheme?.lowercased() == "https" else {
+                        throw RelayVerifierError.invalidCaptureManifest
+                    }
+                    let resolver = try PLCPublicRepositoryCommitKeyResolver(
+                        configuration: .production(origin: origin)
+                    )
+                    let commitVerifier = try await resolver.resolveCommitVerifier(for: input.did)
+                    let base = manifestURL.deletingLastPathComponent()
+                    let events = try input.frameFiles.map { path in
+                        let url = RelayVerifierManifest.resolve(path, relativeTo: base)
+                        let frame = try readBoundedRegularFileNoFollow(
+                            url,
+                            maximumBytes: FirehoseFrameLimits.maximumFrameBytes + 1,
+                            validationMessage: "relay frame input is unavailable"
+                        )
+                        return try RelayFrameDecoder.decode(frame)
+                    }
+                    try RelayLifecycleVerifier.verify(events: events, expectedDID: input.did)
+                    let sequence = try RelaySequenceVerifier.verify(
+                        events: events,
+                        reconnects: input.reconnects,
+                        offlineCommitRange: input.offlineSequenceRange,
+                        expectedOfflineCommitCount: input.expectedOfflineCommitCount
+                    )
+
+                    var relayState: RelayRepositoryVerificationState?
+                    for event in events {
+                        switch event {
+                        case let .sync(sync):
+                            if let current = relayState {
+                                relayState = try await current.synchronizing(
+                                    sync,
+                                    verifier: commitVerifier
+                                )
+                            } else {
+                                relayState = try await .activationSync(
+                                    sync,
+                                    verifier: commitVerifier
+                                )
+                            }
+                        case let .commit(commit):
+                            guard let current = relayState else {
+                                throw RelayVerifierError.lifecycleOrderMismatch
+                            }
+                            relayState = try await current.applying(
+                                commit: commit,
+                                verifier: commitVerifier
+                            )
+                        case .identity, .account, .info:
+                            break
+                        case .error:
+                            throw RelayVerifierError.invalidEventBody
+                        }
+                    }
+                    guard let relayState else { throw RelayVerifierError.missingFinalRepository }
+
+                    let finalCARURL = RelayVerifierManifest.resolve(
+                        input.finalCARFile,
+                        relativeTo: base
+                    )
+                    let finalCAR = try readBoundedRegularFileNoFollow(
+                        finalCARURL,
+                        maximumBytes: PublicRepositoryLimits.standard.maximumCARBytes,
+                        validationMessage: "final Swan repository CAR is unavailable"
+                    )
+                    let finalHead = try input.finalHead()
+                    let swanFinal = try await RelayFullRepositoryVerifier.verify(
+                        car: finalCAR,
+                        expected: finalHead,
+                        verifier: commitVerifier
+                    )
+                    try RelayFinalStateVerifier.verify(
+                        relay: relayState.snapshot,
+                        swan: swanFinal.snapshot
+                    )
+                    _ = try RelayGetRepoPolicy.verify(input.getRepo)
+
+                    try AccountCommandSupport.write(RelayVerificationAggregate(
+                        did: input.did,
+                        firstSequence: sequence.firstSequence,
+                        lastSequence: sequence.lastSequence,
+                        frameCount: events.count,
+                        finalRevision: swanFinal.snapshot.revision,
+                        finalCommitCID: swanFinal.snapshot.commitCID.string,
+                        finalDataCID: swanFinal.snapshot.dataCID.string,
+                        projectionDigest: RelayRepositoryDigest.projection(
+                            swanFinal.snapshot.records
+                        ),
+                        checks: [
+                            .init(name: .canonicalFrames, outcome: .passed),
+                            .init(name: .orderedLifecycle, outcome: .passed),
+                            .init(name: .cursorRecovery, outcome: .passed),
+                            .init(name: .repositoryCommits, outcome: .passed),
+                            .init(name: .getRepoMode, outcome: .passed),
+                            .init(name: .finalMSTEquality, outcome: .passed),
+                        ]
+                    ))
+                } catch let error as RelayVerifierError {
+                    throw ValidationError("relay verification failed: \(error.rawValue)")
+                } catch is ValidationError {
+                    throw ValidationError("relay verification failed: input unavailable")
+                } catch {
+                    throw ValidationError("relay verification failed")
+                }
+            }
+        }
 
         struct ForceSync: AsyncParsableCommand {
             static let configuration = CommandConfiguration(

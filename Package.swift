@@ -10,6 +10,7 @@ let package = Package(
         .library(name: "SwanPublicWire", targets: ["SwanPublicWire"]),
         .library(name: "SwanPublicRepository", targets: ["SwanPublicRepository"]),
         .library(name: "SwanPublicFirehose", targets: ["SwanPublicFirehose"]),
+        .library(name: "SwanPublicRelayVerifier", targets: ["SwanPublicRelayVerifier"]),
         .library(name: "SwanSpaces", targets: ["SwanSpaces"]),
         .library(name: "SwanStorage", targets: ["SwanStorage"]),
         .library(name: "SwanSQLite", targets: ["SwanSQLite"]),
@@ -93,6 +94,14 @@ let package = Package(
             name: "SwanPublicFirehose",
             dependencies: [
                 "SwanPublicRepository",
+                .product(name: "Petrel", package: "Petrel"),
+            ]
+        ),
+        .target(
+            name: "SwanPublicRelayVerifier",
+            dependencies: [
+                "SwanPublicFirehose", "SwanPublicRepository",
+                .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Petrel", package: "Petrel"),
             ]
         ),
@@ -186,7 +195,7 @@ let package = Package(
             name: "swan",
             dependencies: [
                 "SwanAccountExport", "SwanAccounts", "SwanHTTP", "SwanInterop", "SwanOAuth",
-                "SwanPublicRepository", "SwanSQLite",
+                "SwanPublicFirehose", "SwanPublicRelayVerifier", "SwanPublicRepository", "SwanSQLite",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Logging", package: "swift-log"),
@@ -288,6 +297,7 @@ let package = Package(
             name: "SwanPublicFirehoseTests",
             dependencies: [
                 "SwanPublicFirehose",
+                "SwanPublicRelayVerifier",
                 "SwanPublicRepository",
                 .product(name: "Petrel", package: "Petrel"),
             ]
