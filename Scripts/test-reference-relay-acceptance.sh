@@ -73,6 +73,11 @@ manual_sync = source.index("poll_until 'manual sync relay event'", manual)
 assert manual < manual_sync
 cleanup_body = source[source.index('cleanup()'):source.index('poll_until()')]
 assert 'swan_running' not in cleanup_body
+assert 'finalize_artifact_after_cleanup' in cleanup_body
+assert 'disposable_container_count' in cleanup_body
+assert "printf '%s\\n' 'REFERENCE RELAY ACCEPTANCE OK'" in source
+assert source.index('compose down --remove-orphans', source.index('cleanup()')) < source.index('finalize_artifact_after_cleanup', source.index('cleanup()'))
+assert 'capture_container_is_running' in source
 PY
 python3 - "$relay_compose" <<'PY'
 import pathlib
@@ -136,7 +141,7 @@ good="${temporary_directory}/good.json"
 python3 - "$good" <<'PY'
 import json, os, sys
 artifact = {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "scenario": "swan-reference-relay-phase5",
   "status": "passed",
   "swanHead": "e" * 40,
@@ -152,16 +157,28 @@ artifact = {
     "listHostsCount": 0,
   },
   "orderedSteps": [
-    "fresh_state", "crawl", "subscription_open", "account_activation",
+    "fresh_state", "crawl", "subscription_open", "admission_sync",
+    "public_host_entry", "account_activation",
     "activation_lifecycle", "first_commit", "offline_five_commit_recovery",
     "manual_sync",
   ],
+  "admission": {"syncEmissionCount": 1, "publicHostObserved": True},
   "connectionObservations": [
     {"ordinal": 1, "cursorMode": "live", "upstreamCursor": None},
     {"ordinal": 2, "cursorMode": "backfill", "upstreamCursor": 104},
   ],
   "account": {"didDigest": "d" * 64, "fresh": True},
   "lifecycleKinds": ["identity", "account", "sync"],
+  "eventCensus": {
+    "identity": 1, "account": 1, "activationSync": 1,
+    "commit": 6, "manualSync": 1,
+    "orderedKinds": ["identity", "account", "sync", "commit", "commit",
+                     "commit", "commit", "commit", "commit", "sync"],
+  },
+  "captureHelper": {
+    "runningThroughFinalFrame": True,
+    "terminalStatus": "removed_after_running",
+  },
   "firstCommit": {"observed": True, "sequence": 4},
   "offlineRecovery": {
     "expectedCommitCount": 5, "observedCommitCount": 5,
@@ -236,7 +253,15 @@ PY
 
 reject_mutation missing-step 'artifact["orderedSteps"].pop(2)'
 reject_mutation reordered-step 'artifact["orderedSteps"][1], artifact["orderedSteps"][2] = artifact["orderedSteps"][2], artifact["orderedSteps"][1]'
+reject_mutation missing-admission-sync 'artifact["admission"]["syncEmissionCount"] = 0'
+reject_mutation missing-public-host 'artifact["admission"]["publicHostObserved"] = False'
 reject_mutation duplicate-lifecycle 'artifact["lifecycleKinds"].insert(1, "identity")'
+reject_mutation late-duplicate-identity 'artifact["eventCensus"]["identity"] = 2; artifact["eventCensus"]["orderedKinds"].append("identity")'
+reject_mutation late-duplicate-account 'artifact["eventCensus"]["account"] = 2; artifact["eventCensus"]["orderedKinds"].append("account")'
+reject_mutation late-duplicate-sync 'artifact["eventCensus"]["manualSync"] = 2; artifact["eventCensus"]["orderedKinds"].append("sync")'
+reject_mutation hidden-extra-kind 'artifact["eventCensus"]["orderedKinds"].append("commit")'
+reject_mutation capture-not-running 'artifact["captureHelper"]["runningThroughFinalFrame"] = False'
+reject_mutation capture-nonzero 'artifact["captureHelper"]["terminalStatus"] = "exited_1"'
 reject_mutation wrong-offline-count 'artifact["offlineRecovery"]["observedCommitCount"] = 4'
 reject_mutation cursor-gap 'artifact["offlineRecovery"]["firstDeliveredRelaySequence"] = 6'
 reject_mutation missing-upstream-observation 'artifact["connectionObservations"][1]["upstreamCursor"] = 103'

@@ -20,6 +20,11 @@ swan_image=""
 network_name=""
 toxiproxy_enabled=1
 scenario_started=0
+acceptance_ready=0
+output_temporary=""
+admission_sync_count=0
+public_host_observed=0
+capture_running_through_final_frame=0
 base_compose_file="docker-compose.yml"
 
 [[ "$project" == "swan-interop-alpha" ]] || {
@@ -71,9 +76,48 @@ set_toxiproxy_enabled() {
     -H 'Content-Type: application/json' --data "{\"enabled\":${enabled}}" >/dev/null
 }
 
+toxiproxy_is_enabled() {
+  [[ -n "$network_name" && -n "$swan_image" ]] || return 1
+  docker run --rm --network "$network_name" --read-only \
+    --tmpfs /tmp:size=1m,mode=1777 --entrypoint curl "$swan_image" \
+    --fail --silent --show-error --max-time 5 \
+    http://toxiproxy:8474/proxies/reference-relay-swan \
+    | python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("enabled") is True else 1)'
+}
+
+disposable_container_count() {
+  {
+    docker ps --all --filter "label=com.docker.compose.project=${project}" --format '{{.ID}}'
+    docker ps --all --filter "name=^/${project}-task6c-" --format '{{.ID}}'
+  } | awk 'NF && !seen[$0]++ { count += 1 } END { print count + 0 }'
+}
+
+finalize_artifact_after_cleanup() {
+  local disposable_count="$1" toxiproxy_restored="$2"
+  python3 - "$output_temporary" "$disposable_count" "$toxiproxy_restored" <<'PY'
+import json,os,sys
+path,count_raw,toxiproxy_raw=sys.argv[1:]
+artifact=json.load(open(path,encoding="utf-8"))
+artifact["cleanup"]={
+  "toxiproxyEnabled": toxiproxy_raw == "true",
+  "disposableContainersRemaining": int(count_raw),
+}
+with open(path,"w",encoding="utf-8") as out:
+  json.dump(artifact,out,separators=(",",":")); out.write("\n")
+os.chmod(path,0o600)
+PY
+  ./Scripts/validate-reference-relay-artifact.py "$output_temporary" || return 1
+  mv -f "$output_temporary" "$output" || return 1
+  output_temporary=""
+  chmod 0600 "$output" || return 1
+  printf '%s\n' 'REFERENCE RELAY ACCEPTANCE OK'
+}
+
 cleanup() {
   local result=$?
   local failed_swan=""
+  local cleanup_toxiproxy_enabled=false
+  local remaining=1
   trap - EXIT INT TERM HUP
   set +e
   if ((result != 0 && scenario_started == 1)); then
@@ -89,17 +133,31 @@ cleanup() {
       result=1
     fi
   fi
+  if [[ -n "$toxiproxy_id" ]] && ((toxiproxy_enabled == 1)) && toxiproxy_is_enabled; then
+    cleanup_toxiproxy_enabled=true
+  elif ((scenario_started == 1)); then
+    result=1
+  fi
   if [[ -n "$capture_container" ]]; then
-    docker rm --force "$capture_container" >/dev/null 2>&1 || true
+    docker rm --force "$capture_container" >/dev/null 2>&1 || result=1
   fi
   if [[ -n "$handle_container" ]]; then
-    docker rm --force "$handle_container" >/dev/null 2>&1 || true
+    docker rm --force "$handle_container" >/dev/null 2>&1 || result=1
   fi
   if [[ -n "$plc_proxy_container" ]]; then
-    docker rm --force "$plc_proxy_container" >/dev/null 2>&1 || true
+    docker rm --force "$plc_proxy_container" >/dev/null 2>&1 || result=1
   fi
   if ((scenario_started == 1)); then
     compose down --remove-orphans >/dev/null 2>&1 || result=1
+  fi
+  remaining="$(disposable_container_count)" || result=1
+  [[ "$remaining" == 0 ]] || result=1
+  if ((result == 0 && acceptance_ready == 1)); then
+    finalize_artifact_after_cleanup "$remaining" "$cleanup_toxiproxy_enabled" || result=1
+  fi
+  if ((result != 0)); then
+    [[ -z "$output_temporary" ]] || rm -f "$output_temporary"
+    rm -f "$output"
   fi
   [[ -z "$workspace_compose_directory" ]] || rm -rf "$workspace_compose_directory"
   [[ -z "$temporary_directory" ]] || rm -rf "$temporary_directory"
@@ -110,6 +168,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
+rm -f "$output"
 
 poll_until() {
   local label="$1"; shift
@@ -205,6 +264,24 @@ capture_has_commits() {
 
 capture_has_manual_sync() {
   [[ "$(capture_count "$fresh_did" sync)" -ge 2 ]]
+}
+
+capture_has_exact_final_census() {
+  python3 - "${temporary_directory}/capture/index.jsonl" "$fresh_did" <<'PY'
+import json,sys
+expected=["identity","account","sync"] + ["commit"] * 6 + ["sync"]
+kinds=[]
+with open(sys.argv[1],encoding="utf-8") as source:
+  for line in source:
+    value=json.loads(line)
+    if value.get("did")==sys.argv[2]: kinds.append(value.get("kind"))
+raise SystemExit(0 if kinds == expected else 1)
+PY
+}
+
+capture_container_is_running() {
+  [[ -n "$capture_container" ]] || return 1
+  [[ "$(docker inspect --format '{{.State.Running}} {{.State.ExitCode}}' "$capture_container")" == "true 0" ]]
 }
 
 management_post() {
@@ -408,7 +485,9 @@ curl_from_swan -X POST 'http://reference-relay:2470/xrpc/com.atproto.sync.reques
 poll_until 'Swan live subscribeRepos observation' logs_have_open_mode live
 log_since="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 seed_relay_host_admission
+admission_sync_count=$((admission_sync_count + 1))
 poll_until 'relay host entry' relay_has_swan_host
+public_host_observed=1
 
 capture_container="${project}-task6c-capture-$$"
 docker run --detach --name "$capture_container" --user "$(id -u):$(id -g)" \
@@ -524,6 +603,12 @@ fi
 
 management_firehose_sync "$fresh_did"
 poll_until 'manual sync relay event' capture_has_manual_sync
+poll_until 'exact final fresh-DID event census' capture_has_exact_final_census
+capture_container_is_running || {
+  echo "relay capture helper was not running through the final required frame" >&2
+  exit 1
+}
+capture_running_through_final_frame=1
 docker rm --force "$capture_container" >/dev/null
 capture_container=""
 
@@ -596,15 +681,17 @@ verification="$(docker run --rm --user "$(id -u):$(id -g)" --network "$network_n
   --plc-laboratory --plc-laboratory-allowlisted-host reference-plc)"
 
 mkdir -p "$(dirname "$output")"
+rm -f "$output"
 output_temporary="$(mktemp "$(dirname "$output")/.reference-relay-acceptance.XXXXXX")"
 chmod 0600 "$output_temporary"
 image_id="$(docker inspect --format '{{.Id}}' "$relay_image")"
 image_id="${image_id#sha256:}"
 swan_head="$(jj log -r '@-' --no-graph -T 'commit_id' | tr -d '\r\n')"
 python3 - "$output_temporary" "${temporary_directory}/manifest.json" "$inspection" "$verification" \
-  "$swan_head" "$image_id" "$first_sequence" "$fresh_did" <<'PY'
+  "$swan_head" "$image_id" "$first_sequence" "$fresh_did" "$admission_sync_count" \
+  "$public_host_observed" "$capture_running_through_final_frame" <<'PY'
 import hashlib,json,os,sys
-target,manifest_path,inspection_raw,verification_raw,swan_head,image_id,first_sequence,did=sys.argv[1:]
+target,manifest_path,inspection_raw,verification_raw,swan_head,image_id,first_sequence,did,admission_count_raw,host_observed_raw,capture_running_raw=sys.argv[1:]
 manifest=json.load(open(manifest_path,encoding="utf-8"))
 inspection=json.loads(inspection_raw)
 verification=json.loads(verification_raw)
@@ -612,28 +699,36 @@ frames=[]
 for path in manifest["frameFiles"]:
   frame_path=os.path.join(os.path.dirname(manifest_path),path)
   frames.append(hashlib.sha256(open(frame_path,"rb").read()).hexdigest())
+event_kinds=[]
+with open(os.path.join(os.path.dirname(manifest_path),"capture/index.jsonl"),encoding="utf-8") as source:
+  for line in source:
+    event=json.loads(line)
+    if event.get("did")==did: event_kinds.append(event.get("kind"))
 offline_start=manifest["offlineSequenceStart"]
+expected_kinds=["identity","account","sync"] + ["commit"] * 6 + ["sync"]
+if event_kinds != expected_kinds: raise SystemExit("final fresh-DID event census changed")
+activation_sync_count=sum(1 for index,kind in enumerate(event_kinds) if index == 2 and kind == "sync")
+manual_sync_count=sum(1 for index,kind in enumerate(event_kinds) if index == len(event_kinds) - 1 and kind == "sync")
 artifact={
- "schemaVersion":1,"scenario":"swan-reference-relay-phase5","status":"passed","swanHead":swan_head,
+ "schemaVersion":2,"scenario":"swan-reference-relay-phase5","status":"passed","swanHead":swan_head,
  "indigo":{"commit":"8b43a326dbbb394f63b6d68761553cdfe25532de","sourceSHA256":"bc6f57e6211560220ac49dc7d6b55c5a43291f1e1193113ce413ffe4478fdd0b","vendorSHA256":"8dc18074f7833f610c622fc698bed545511a32dd633c348825560ee9b2878b4e","imageID":image_id},
  "freshState":{"volume":"swan-interop-alpha_reference-relay-data","removed":True,"listHostsCount":0},
- "orderedSteps":["fresh_state","crawl","subscription_open","account_activation","activation_lifecycle","first_commit","offline_five_commit_recovery","manual_sync"],
+ "orderedSteps":["fresh_state","crawl","subscription_open","admission_sync","public_host_entry","account_activation","activation_lifecycle","first_commit","offline_five_commit_recovery","manual_sync"],
+ "admission":{"syncEmissionCount":int(admission_count_raw),"publicHostObserved":host_observed_raw=="1"},
  "connectionObservations":[{"ordinal":1,"cursorMode":"live","upstreamCursor":None},{"ordinal":2,"cursorMode":"backfill","upstreamCursor":manifest["reconnects"][0]["upstreamCursor"]}],
  "account":{"didDigest":hashlib.sha256(did.encode()).hexdigest(),"fresh":True},
  "lifecycleKinds":["identity","account","sync"],
+ "eventCensus":{"identity":event_kinds.count("identity"),"account":event_kinds.count("account"),"activationSync":activation_sync_count,"commit":event_kinds.count("commit"),"manualSync":manual_sync_count,"orderedKinds":event_kinds},
+ "captureHelper":{"runningThroughFinalFrame":capture_running_raw=="1","terminalStatus":"removed_after_running"},
  "firstCommit":{"observed":True,"sequence":int(first_sequence)},
  "offlineRecovery":{"expectedCommitCount":5,"observedCommitCount":5,"relaySequenceStart":offline_start,"relaySequenceEnd":manifest["offlineSequenceEnd"],"upstreamCursor":manifest["reconnects"][0]["upstreamCursor"],"firstDeliveredRelaySequence":offline_start,"duplicateCount":0,"gapCount":0,"queryMode":"subscribe_repos_cursor_only"},
  "finalRepository":{"relayRevision":inspection["revision"],"swanRevision":inspection["revision"],"relayCommitCID":inspection["commitCID"],"swanCommitCID":inspection["commitCID"],"relayDataCID":inspection["dataCID"],"swanDataCID":inspection["dataCID"],"relayMSTDigest":inspection["mstDigest"].removeprefix("sha256:"),"swanMSTDigest":inspection["mstDigest"].removeprefix("sha256:"),"projectionDigest":inspection["projectionDigest"].removeprefix("sha256:"),"equal":True},
  "manualSync":{"observed":True,"clean":True},
  "verifier":{"status":"passed","checks":[item["name"] for item in verification["checks"]]},
- "cleanup":{"toxiproxyEnabled":True,"disposableContainersRemaining":0},
+ "cleanup":{"toxiproxyEnabled":False,"disposableContainersRemaining":-1},
  "artifactPolicy":"aggregate-digest-only","successMarker":"REFERENCE RELAY ACCEPTANCE OK",
 }
 with open(target,"w",encoding="utf-8") as out: json.dump(artifact,out,separators=(",",":")); out.write("\n")
 os.chmod(target,0o600)
 PY
-
-./Scripts/validate-reference-relay-artifact.py "$output_temporary"
-mv -f "$output_temporary" "$output"
-chmod 0600 "$output"
-printf '%s\n' 'REFERENCE RELAY ACCEPTANCE OK'
+acceptance_ready=1

@@ -15,6 +15,8 @@ EXPECTED_STEPS = [
     "fresh_state",
     "crawl",
     "subscription_open",
+    "admission_sync",
+    "public_host_entry",
     "account_activation",
     "activation_lifecycle",
     "first_commit",
@@ -32,7 +34,8 @@ EXPECTED_CHECKS = [
 EXPECTED_KEYS = {
     "schemaVersion", "scenario", "status", "swanHead", "indigo",
     "freshState", "orderedSteps", "connectionObservations", "account",
-    "lifecycleKinds", "firstCommit", "offlineRecovery", "finalRepository",
+    "admission", "lifecycleKinds", "eventCensus", "captureHelper",
+    "firstCommit", "offlineRecovery", "finalRepository",
     "manualSync", "verifier", "cleanup", "artifactPolicy", "successMarker",
 }
 FORBIDDEN_KEY = re.compile(
@@ -92,7 +95,7 @@ def main() -> int:
     if not exact_dict(artifact, EXPECTED_KEYS):
         fail("artifact-layout")
     scan_keys(artifact)
-    if artifact["schemaVersion"] != 1 or artifact["scenario"] != "swan-reference-relay-phase5":
+    if artifact["schemaVersion"] != 2 or artifact["scenario"] != "swan-reference-relay-phase5":
         fail("scenario")
     if artifact["status"] != "passed" or artifact["successMarker"] != "REFERENCE RELAY ACCEPTANCE OK":
         fail("status-marker")
@@ -116,6 +119,8 @@ def main() -> int:
         fail("fresh-state")
     if artifact["orderedSteps"] != EXPECTED_STEPS:
         fail("ordered-steps")
+    if artifact["admission"] != {"syncEmissionCount": 1, "publicHostObserved": True}:
+        fail("admission")
 
     observations = artifact["connectionObservations"]
     if not isinstance(observations, list) or len(observations) < 2:
@@ -138,6 +143,24 @@ def main() -> int:
         fail("account")
     if artifact["lifecycleKinds"] != ["identity", "account", "sync"]:
         fail("lifecycle-order")
+    expected_event_kinds = ["identity", "account", "sync"] + ["commit"] * 6 + ["sync"]
+    census = artifact["eventCensus"]
+    if not exact_dict(census, {
+        "identity", "account", "activationSync", "commit", "manualSync", "orderedKinds",
+    }) or census != {
+        "identity": 1,
+        "account": 1,
+        "activationSync": 1,
+        "commit": 6,
+        "manualSync": 1,
+        "orderedKinds": expected_event_kinds,
+    }:
+        fail("event-census")
+    if artifact["captureHelper"] != {
+        "runningThroughFinalFrame": True,
+        "terminalStatus": "removed_after_running",
+    }:
+        fail("capture-helper")
 
     first = artifact["firstCommit"]
     if not exact_dict(first, {"observed", "sequence"}) or first["observed"] is not True \
