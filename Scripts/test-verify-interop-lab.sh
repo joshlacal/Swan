@@ -14,7 +14,8 @@ fail() {
 export SWAN_INTEROP_REQUIRE_EFFECTIVE_COMPOSE="${SWAN_INTEROP_REQUIRE_EFFECTIVE_COMPOSE:-1}"
 
 temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/swan-interop-verifier.XXXXXX")"
-trap 'rm -rf "$temporary_directory"' EXIT
+docker_temporary_directory="$(mktemp -d "${root}/.reference-relay-live.XXXXXX")"
+trap 'rm -rf "$temporary_directory" "$docker_temporary_directory"' EXIT
 
 baseline_output=""
 if ! baseline_output="$(./Scripts/verify-interop-lab.sh 2>&1)"; then
@@ -86,6 +87,55 @@ overlay_subscription_probe="${temporary_directory}/relay-overlay-subscription"
 if rg -q 'ssrf\.PublicOnlyDialer' "$overlay_subscription_probe/cmd/relay/relay/slurper.go"; then
   fail "reference relay overlay leaves the Slurper private-upstream dialer enabled"
 fi
+
+# Break caught: a literal unified-diff context line is itself an added line in
+# the branch's outer diff, so tabs/blank context become branch whitespace
+# errors. The shipped overlay must use only zero-context additions/deletions.
+python3 - "$relay_overlay_patch" <<'PY'
+import pathlib,sys
+lines=pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+if any(line.startswith(" ") for line in lines):
+  raise SystemExit("reference relay overlay patch contains context lines")
+if any(line.startswith("+") and not line[1:].strip() for line in lines if not line.startswith("+++")):
+  raise SystemExit("reference relay overlay patch contains a whitespace-only addition")
+PY
+
+branch_base="a9bbd311b3f3d59e0b8fba851eecb949052e1ade"
+branch_head="$(jj log -r '@' --no-graph -T 'commit_id')"
+branch_whitespace="${temporary_directory}/branch-whitespace.log"
+if ! git --git-dir="$(jj git root)" diff --check "${branch_base}..${branch_head}" \
+  >"$branch_whitespace" 2>&1; then
+  cat "$branch_whitespace" >&2
+  fail "Task 7 branch diff contains whitespace errors"
+fi
+[[ ! -s "$branch_whitespace" ]] || fail "Task 7 branch diff emitted whitespace diagnostics"
+
+# Break caught: reducing hunks to zero context must not change either Indigo
+# source file produced by the already-reviewed private-upstream overlay.
+custom_overlay="${docker_temporary_directory}/relay-overlay-custom"
+mkdir "$custom_overlay"
+cp -R ".interop-cache/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de/source/." "$custom_overlay"
+tar -xzf ".interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/indigo-8b43a326dbbb394f63b6d68761553cdfe25532de.vendor.tar.gz" \
+  -C "$custom_overlay"
+docker run --rm --network none --user "$(id -u):$(id -g)" \
+  --read-only --tmpfs /tmp:rw,exec,size=512m,mode=1777 \
+  -e GOCACHE=/tmp/go-build \
+  --mount "type=bind,src=${root},dst=/workspace,readonly" \
+  --mount "type=bind,src=${custom_overlay},dst=/overlay" \
+  --entrypoint /usr/local/go/bin/go \
+  'docker.io/library/golang@sha256:b305420a68d0f229d91eb3b3ed9e519fcf2cf5461da4bef997bf927e8c0bfd2b' \
+  run /workspace/interop/apply-reference-relay-overlay.go /overlay \
+    /workspace/interop/reference-relay-overlay/reference-relay-private-upstream.patch
+cmp "$overlay_subscription_probe/cmd/relay/relay/host_checker.go" \
+  "$custom_overlay/cmd/relay/relay/host_checker.go"
+cmp "$overlay_subscription_probe/cmd/relay/relay/slurper.go" \
+  "$custom_overlay/cmd/relay/relay/slurper.go"
+[[ "$(shasum -a 256 "$custom_overlay/cmd/relay/relay/host_checker.go" | awk '{print $1}')" \
+  == "17897e3a2a869b38cbd709b7bb04339742e8a7f9db98f10f81ac1ce5d3e44f98" ]] \
+  || fail "reference relay host checker overlay output changed"
+[[ "$(shasum -a 256 "$custom_overlay/cmd/relay/relay/slurper.go" | awk '{print $1}')" \
+  == "29d57bfdc78a16ff5218bbc34efccc20c112ea294eb2d904c45fbd2b5fc39389" ]] \
+  || fail "reference relay Slurper overlay output changed"
 
 mutate_relay_and_require_rejection() {
   name="$1"

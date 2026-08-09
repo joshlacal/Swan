@@ -13,7 +13,7 @@ COPY interop/reference-relay-capture.go /tmp/reference-relay-capture.go
 # extraction. BuildKit networking stays disabled for every build action.
 RUN --network=none echo "bc6f57e6211560220ac49dc7d6b55c5a43291f1e1193113ce413ffe4478fdd0b  /tmp/indigo.tar.gz" | sha256sum -c - \
     && echo "8dc18074f7833f610c622fc698bed545511a32dd633c348825560ee9b2878b4e  /tmp/indigo.vendor.tar.gz" | sha256sum -c - \
-    && echo "b89924692e75845b680e39e1467a4786785cd297b586f233692b350c94d1b101  /tmp/reference-relay-private-upstream.patch" | sha256sum -c - \
+    && echo "7867e9f31a4ea5ccb36ed880cf66ea60d911ccb2366934dda0c14561db89136d  /tmp/reference-relay-private-upstream.patch" | sha256sum -c - \
     && mkdir /src \
     && tar -xzf /tmp/indigo.tar.gz --strip-components=1 -C /src \
     && tar -xzf /tmp/indigo.vendor.tar.gz -C /src \

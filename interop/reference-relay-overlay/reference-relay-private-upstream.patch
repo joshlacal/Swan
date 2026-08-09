@@ -1,37 +1,18 @@
 --- a/cmd/relay/relay/host_checker.go
 +++ b/cmd/relay/relay/host_checker.go
-@@ -10,7 +10,6 @@
- 	"github.com/bluesky-social/indigo/atproto/atclient"
- 	"github.com/bluesky-social/indigo/atproto/identity"
- 	"github.com/bluesky-social/indigo/cmd/relay/relay/models"
+@@ -13 +12,0 @@
 -	"github.com/bluesky-social/indigo/util/ssrf"
- )
- 
- // Simple interface for doing host and account status checks.
-@@ -35,7 +34,7 @@
- 	}
- 	c := http.Client{
- 		Timeout:   5 * time.Second,
+@@ -38 +37 @@
 -		Transport: ssrf.PublicOnlyTransport(),
 +		Transport: http.DefaultTransport,
- 	}
- 	return &HostClient{
- 		Client:    &c,
 --- a/cmd/relay/relay/slurper.go
 +++ b/cmd/relay/relay/slurper.go
-@@ -16,7 +16,6 @@ import (
- 	"github.com/bluesky-social/indigo/cmd/relay/relay/models"
- 	"github.com/bluesky-social/indigo/cmd/relay/stream"
- 	"github.com/bluesky-social/indigo/cmd/relay/stream/schedulers/parallel"
+@@ -19 +18,0 @@
 -	"github.com/bluesky-social/indigo/util/ssrf"
- 
- 	"github.com/RussellLuo/slidingwindow"
- 	"github.com/gorilla/websocket"
-@@ -300,7 +299 @@
+@@ -300,6 +299,0 @@
 -	// if this isn't a localhost / private connection, then we should enable SSRF protections
 -	if !host.NoSSL {
 -		netDialer := ssrf.PublicOnlyDialer()
 -		d.NetDialContext = netDialer.DialContext
 -	}
 -
- 	cursor := host.LastSeq
