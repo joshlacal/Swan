@@ -25,7 +25,81 @@ output_temporary=""
 admission_sync_count=0
 public_host_observed=0
 capture_running_through_final_frame=0
+custody_parent_commit=""
 base_compose_file="docker-compose.yml"
+
+validate_artifact_output_path() {
+  python3 - "$root" "$output" <<'PY'
+import os,pathlib,stat,sys
+root=pathlib.Path(sys.argv[1])
+raw=sys.argv[2]
+artifacts=root / "artifacts"
+candidate=pathlib.Path(raw)
+if not candidate.is_absolute() or os.path.normpath(raw) != raw:
+  raise SystemExit("artifact output must be canonical and absolute")
+try:
+  candidate.relative_to(artifacts)
+except ValueError:
+  raise SystemExit("artifact output must remain beneath the repository artifacts directory")
+if candidate == artifacts or candidate.name in {"", ".", ".."}:
+  raise SystemExit("artifact output must name a file beneath the artifacts directory")
+ignore=(root / ".gitignore").read_text(encoding="utf-8").splitlines()
+if "artifacts/" not in {line.strip() for line in ignore}:
+  raise SystemExit("repository artifacts directory is not ignored")
+current=artifacts
+for part in candidate.relative_to(artifacts).parts[:-1]:
+  try:
+    metadata=current.lstat()
+  except OSError:
+    raise SystemExit("artifact output parent must already exist")
+  if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+    raise SystemExit("artifact output parent traversal is unsafe")
+  current=current / part
+try:
+  metadata=current.lstat()
+except OSError:
+  raise SystemExit("artifact output parent must already exist")
+if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+  raise SystemExit("artifact output parent traversal is unsafe")
+try:
+  metadata=candidate.lstat()
+except FileNotFoundError:
+  pass
+else:
+  if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit("existing artifact output is unsafe")
+PY
+}
+
+verify_jj_custody() {
+  local jj_root at_empty parents parent_count diff_names
+  command -v jj >/dev/null 2>&1 || {
+    echo "jj is required for acceptance custody" >&2
+    return 1
+  }
+  jj_root="$(jj root 2>/dev/null)" || return 1
+  [[ "$jj_root" == "$root" ]] || {
+    echo "acceptance runner is not at the expected jj workspace root" >&2
+    return 1
+  }
+  at_empty="$(jj log -r '@' --no-graph -T 'if(empty, "true", "false") ++ "\n"' 2>/dev/null)" || return 1
+  [[ "$at_empty" == true ]] || {
+    echo "acceptance requires a clean empty jj child" >&2
+    return 1
+  }
+  parents="$(jj log -r 'parents(@)' --no-graph -T 'commit_id ++ "\n"' 2>/dev/null)" || return 1
+  parent_count="$(printf '%s\n' "$parents" | awk 'NF { count += 1 } END { print count + 0 }')"
+  [[ "$parent_count" == 1 && "$parents" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "acceptance requires exactly one full-commit jj parent" >&2
+    return 1
+  }
+  custody_parent_commit="$parents"
+  diff_names="$(jj diff --from @- --to @ --name-only 2>/dev/null)" || return 1
+  [[ -z "$diff_names" ]] || {
+    echo "acceptance jj child contains changes" >&2
+    return 1
+  }
+}
 
 [[ "$project" == "swan-interop-alpha" ]] || {
   echo "SWAN_REFERENCE_RELAY_PROJECT must be swan-interop-alpha" >&2
@@ -43,6 +117,8 @@ fi
   echo "SWAN_INTEROP_SECRETS_DIR is required" >&2
   exit 64
 }
+validate_artifact_output_path
+verify_jj_custody
 command -v docker >/dev/null 2>&1 || { echo "Docker is required" >&2; exit 69; }
 docker version >/dev/null
 SWAN_INTEROP_SECRETS_DIR="$(./interop/verify-secret-source.sh "$root" "$SWAN_INTEROP_SECRETS_DIR")"
@@ -686,7 +762,7 @@ output_temporary="$(mktemp "$(dirname "$output")/.reference-relay-acceptance.XXX
 chmod 0600 "$output_temporary"
 image_id="$(docker inspect --format '{{.Id}}' "$relay_image")"
 image_id="${image_id#sha256:}"
-swan_head="$(jj log -r '@-' --no-graph -T 'commit_id' | tr -d '\r\n')"
+swan_head="$custody_parent_commit"
 python3 - "$output_temporary" "${temporary_directory}/manifest.json" "$inspection" "$verification" \
   "$swan_head" "$image_id" "$first_sequence" "$fresh_did" "$admission_sync_count" \
   "$public_host_observed" "$capture_running_through_final_frame" <<'PY'

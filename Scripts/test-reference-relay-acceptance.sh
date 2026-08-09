@@ -10,7 +10,14 @@ capture_helper="${root}/interop/reference-relay-capture.go"
 relay_compose="${root}/interop/docker-compose.reference-relay.yml"
 serve_command="${root}/Sources/swan/SwanCommand.swift"
 temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/swan-reference-relay-test.XXXXXX")"
-trap 'rm -rf "$temporary_directory"' EXIT
+symlink_parent=""
+dirty_custody=""
+cleanup_test() {
+  [[ -z "$symlink_parent" || ! -L "$symlink_parent" ]] || unlink "$symlink_parent"
+  [[ -z "$dirty_custody" || ! -e "$dirty_custody" ]] || unlink "$dirty_custody"
+  rm -rf "$temporary_directory"
+}
+trap cleanup_test EXIT
 
 bash -n "$runner"
 python3 - "$runner" <<'PY'
@@ -18,6 +25,16 @@ import pathlib
 import sys
 
 source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+custody = source.index('verify_jj_custody()')
+custody_call = source.index('verify_jj_custody', custody + len('verify_jj_custody()'))
+docker_check = source.index('command -v docker')
+first_output_removal = source.index('rm -f "$output"')
+assert custody < custody_call < docker_check
+assert custody_call < first_output_removal
+assert 'validate_artifact_output_path' in source[:docker_check]
+assert "jj log -r '@'" in source[custody:custody_call]
+assert "jj log -r 'parents(@)'" in source[custody:custody_call]
+assert 'jj diff --from @- --to @ --name-only' in source[custody:custody_call]
 crawl = source.index("com.atproto.sync.requestCrawl")
 live_open = source.index("poll_until 'Swan live subscribeRepos observation'", crawl)
 seed = source.index("seed_relay_host_admission", live_open)
@@ -295,5 +312,48 @@ if SWAN_REFERENCE_RELAY_PROJECT='swan-interop-alpha' \
   echo "runner accepted a relative artifact path" >&2
   exit 1
 fi
+
+fake_bin="${temporary_directory}/fake-bin"
+mkdir -m 0700 "$fake_bin"
+docker_marker="${temporary_directory}/docker-reached"
+python3 - "$fake_bin/docker" "$docker_marker" <<'PY'
+import os,shlex,sys
+path,marker=sys.argv[1:]
+with open(path,"x",encoding="utf-8") as out:
+  out.write(f"#!/bin/sh\n: >{shlex.quote(marker)}\nexit 99\n")
+os.chmod(path,0o700)
+PY
+
+if PATH="${fake_bin}:$PATH" SWAN_REFERENCE_RELAY_PROJECT='swan-interop-alpha' \
+  SWAN_INTEROP_SECRETS_DIR="$temporary_directory" \
+  SWAN_REFERENCE_RELAY_OUTPUT="${temporary_directory}/outside.json" \
+  "$runner" >/dev/null 2>&1; then
+  echo "runner accepted an absolute outside artifact path" >&2
+  exit 1
+fi
+[[ ! -e "$docker_marker" ]] || { echo "outside output reached Docker" >&2; exit 1; }
+
+symlink_parent="${root}/artifacts/.task6c-output-link-$$"
+ln -s "$temporary_directory" "$symlink_parent"
+if PATH="${fake_bin}:$PATH" SWAN_REFERENCE_RELAY_PROJECT='swan-interop-alpha' \
+  SWAN_INTEROP_SECRETS_DIR="$temporary_directory" \
+  SWAN_REFERENCE_RELAY_OUTPUT="${symlink_parent}/artifact.json" \
+  "$runner" >/dev/null 2>&1; then
+  echo "runner accepted artifact symlink traversal" >&2
+  exit 1
+fi
+[[ ! -e "$docker_marker" ]] || { echo "symlink output reached Docker" >&2; exit 1; }
+unlink "$symlink_parent"
+
+dirty_custody="${root}/task6c-custody-dirty-$$"
+printf 'dirty\n' >"$dirty_custody"
+if PATH="${fake_bin}:$PATH" SWAN_REFERENCE_RELAY_PROJECT='swan-interop-alpha' \
+  SWAN_INTEROP_SECRETS_DIR="$temporary_directory" \
+  "$runner" >/dev/null 2>&1; then
+  echo "runner accepted dirty jj custody" >&2
+  exit 1
+fi
+unlink "$dirty_custody"
+[[ ! -e "$docker_marker" ]] || { echo "dirty custody reached Docker" >&2; exit 1; }
 
 echo "REFERENCE RELAY ACCEPTANCE MUTATION TESTS OK"
