@@ -21,6 +21,9 @@ override_names=(
   SWAN_INTEROP_REFERENCE_RELAY_TOXIPROXY_CONFIG_FILE
   SWAN_INTEROP_PUBLIC_FIREHOSE_ROUTE
   SWAN_INTEROP_BOOTSTRAP_SCRIPT
+  SWAN_INTEROP_REFERENCE_RELAY_CAPTURE
+  SWAN_INTEROP_REFERENCE_RELAY_ACCEPTANCE_RUNNER
+  SWAN_INTEROP_REFERENCE_RELAY_ACCEPTANCE_VALIDATOR
 )
 for override_name in "${override_names[@]}"; do
   if [[ -n "${!override_name:-}" ]] \
@@ -62,6 +65,9 @@ relay_toxiproxy_config="${SWAN_INTEROP_REFERENCE_RELAY_TOXIPROXY_CONFIG_FILE:-in
 relay_toxiproxy_dockerfile="interop/Dockerfile.toxiproxy.reference-relay"
 public_firehose_route="${SWAN_INTEROP_PUBLIC_FIREHOSE_ROUTE:-Sources/SwanHTTP/PublicFirehoseStreamingRoute.swift}"
 bootstrap_script="${SWAN_INTEROP_BOOTSTRAP_SCRIPT:-interop/bootstrap-local-space.sh}"
+relay_capture="${SWAN_INTEROP_REFERENCE_RELAY_CAPTURE:-interop/reference-relay-capture.go}"
+relay_acceptance_runner="${SWAN_INTEROP_REFERENCE_RELAY_ACCEPTANCE_RUNNER:-Scripts/run-reference-relay-acceptance.sh}"
+relay_acceptance_validator="${SWAN_INTEROP_REFERENCE_RELAY_ACCEPTANCE_VALIDATOR:-Scripts/validate-reference-relay-artifact.py}"
 
 for required_file in \
   "$compose_file" \
@@ -94,13 +100,20 @@ for required_file in \
   "$relay_toxiproxy_config" \
   "$relay_toxiproxy_dockerfile" \
   "$public_firehose_route" \
-  "$bootstrap_script"
+  "$bootstrap_script" \
+  "$relay_capture" \
+  "$relay_acceptance_runner" \
+  "$relay_acceptance_validator"
 do
   if [[ ! -f "$required_file" ]]; then
     echo "interop verifier input is missing: ${required_file}" >&2
     exit 1
   fi
 done
+if [[ ! -x "$relay_acceptance_runner" || ! -x "$relay_acceptance_validator" ]]; then
+  echo "reference relay acceptance runner and validator must be executable" >&2
+  exit 1
+fi
 if [[ ! -x "$notification_restart_scenario" ]]; then
   echo "notification restart scenario must be executable" >&2
   exit 1
@@ -247,6 +260,25 @@ reject_contains "$relay_block" 'ports:' "reference relay must not publish a host
 reject_contains "$relay_block" 'RELAY_ADMIN_' "reference relay must not inject admin credentials through Compose"
 reject_contains "$relay_block" 'PASSWORD' "reference relay must not inject credentials through Compose"
 reject_contains "$relay_block" 'TOKEN' "reference relay must not inject credentials through Compose"
+for capture_contract in \
+  'COPY interop/reference-relay-capture.go /tmp/reference-relay-capture.go' \
+  '-o /out/reference-relay-capture /tmp/reference-relay-capture.go' \
+  'COPY --from=build /out/reference-relay-capture /usr/local/bin/reference-relay-capture'
+do
+  if ! rg -Fq -- "$capture_contract" "$relay_dockerfile"; then
+    echo "reference relay image must contain the offline frame capture helper" >&2
+    exit 1
+  fi
+done
+if ! rg -Fq '!interop/reference-relay-capture.go' "$relay_dockerignore"; then
+  echo "reference relay Docker allowlist must contain only the capture helper source" >&2
+  exit 1
+fi
+if ! rg -Fq 'reference-relay-swan' "$relay_acceptance_runner" \
+  || ! rg -Fq 'REFERENCE RELAY ACCEPTANCE OK' "$relay_acceptance_validator"; then
+  echo "reference relay ordered runner or aggregate validator is incomplete" >&2
+  exit 1
+fi
 require_contains "$relay_swan_block" 'SWAN_PUBLIC_CRAWLERS: http://reference-relay:2470' "relay topology must wire Swan crawlers to the internal reference relay"
 require_contains "$relay_swan_block" '--enable-public-firehose' "relay topology must explicitly enable the public firehose"
 require_contains "$relay_caddy_block" 'dockerfile: interop/Dockerfile.caddy.reference-relay' "relay topology must use its Caddy route override"
@@ -723,6 +755,7 @@ rg -q 'install -o "\$owner" -g "\$group" -m 0400' interop/prepare-interop-secret
 rg -q 'prepare_directory "\$runtime_directory" swan swan' interop/prepare-interop-secrets.sh
 rg -q 'prepare_directory "\$pds_directory" 1000 1000' interop/prepare-interop-secrets.sh
 rg -q 'source_certificate="/caddy-data/caddy/pki/authorities/local/root\.crt"' interop/prepare-caddy-trust.sh
+rg -q 'install -d -o root -g root -m 0755 "\$trust_directory"' interop/prepare-caddy-trust.sh
 rg -q 'install -o swan -g swan -m 0444' interop/prepare-caddy-trust.sh
 rg -q 'verify-secret-source\.sh "\$root" "\$SWAN_INTEROP_SECRETS_DIR"' interop/compose.sh
 

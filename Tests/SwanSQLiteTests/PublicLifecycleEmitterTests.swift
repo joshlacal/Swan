@@ -4,6 +4,7 @@ import Petrel
 import SwanCore
 import SwanPublicFirehose
 import SwanPublicRepository
+import SwanStorage
 import XCTest
 @testable import SwanSQLite
 
@@ -12,6 +13,30 @@ private struct FixedLifecycleAccountSource: PublicFirehoseAccountDatabaseSource 
 
   func publicFirehoseAccountDatabases() async throws -> [PublicFirehoseAccountDatabase] {
     accounts
+  }
+}
+
+private actor ManualAuthorizationBarrier {
+  private var parked = false
+  private var parkedWaiters: [CheckedContinuation<Void, Never>] = []
+  private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+  func park() async {
+    parked = true
+    let waiters = parkedWaiters
+    parkedWaiters.removeAll()
+    waiters.forEach { $0.resume() }
+    await withCheckedContinuation { releaseWaiter = $0 }
+  }
+
+  func waitUntilParked() async {
+    if parked { return }
+    await withCheckedContinuation { parkedWaiters.append($0) }
+  }
+
+  func release() {
+    releaseWaiter?.resume()
+    releaseWaiter = nil
   }
 }
 
@@ -35,6 +60,17 @@ final class PublicLifecycleEmitterTests: XCTestCase {
     )
     self.root = root
     control = try await SQLiteControlDatabase(dataDirectory: root)
+    _ = try await control.createAccount(
+      AccountControlRegistration(
+        did: did,
+        canonicalHandle: "lifecycle-emitter.example.com",
+        passwordVerifier:
+          "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+        signingKey: .init(purpose: .signing, generation: 1),
+        rotationKey: .init(purpose: .rotation, generation: 1),
+        createdAt: epoch
+      )
+    )
     firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
     account = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
     let key = P256.Signing.PrivateKey()
@@ -125,6 +161,37 @@ final class PublicLifecycleEmitterTests: XCTestCase {
     let pending = try await account.pendingPublicFirehoseOutbox()
     XCTAssertEqual(pending.count, 1, "the exact retry must not insert a second sync row")
     XCTAssertEqual(pending[0].sourceKey, PublicFirehoseSourceKey.syncActivation(did: did, operationID: "req-1"))
+  }
+
+  func testEmitActivationExactRetryAcceptsCanonicalMillisecondTimestamp()
+    async throws
+  {
+    // ISO8601DateFormatter parses this canonical .166 timestamp to a Date
+    // whose floating-point calendar projection can report .165999889. Stored
+    // validation must validate the canonical wire syntax, not require an
+    // unstable Date round trip.
+    let millisecondBoundary = Date(
+      timeIntervalSince1970: 1_786_245_951.1661
+    )
+    XCTAssertEqual(
+      PublicFirehoseTime.encode(millisecondBoundary),
+      "2026-08-09T03:25:51.166Z"
+    )
+    try await emitter.emitActivation(
+      did: did, operationID: "req-millisecond", plcOperationCID: "bafyplc-ms",
+      handle: "alice.example", materialTime: millisecondBoundary,
+      now: millisecondBoundary
+    )
+    try await emitter.emitActivation(
+      did: did, operationID: "req-millisecond", plcOperationCID: "bafyplc-ms",
+      handle: "alice.example", materialTime: millisecondBoundary,
+      now: millisecondBoundary.addingTimeInterval(1)
+    )
+
+    let generation = try await control.currentLifecycleGeneration(did: did)
+    let pending = try await account.pendingPublicFirehoseOutbox()
+    XCTAssertEqual(generation, 1)
+    XCTAssertEqual(pending.count, 1)
   }
 
   func testEmitActivationReusesByteIdenticalMaterialWithLaterInvocationClock() async throws {
@@ -257,6 +324,88 @@ final class PublicLifecycleEmitterTests: XCTestCase {
       PublicFirehoseSourceKey.syncManual(did: did, requestUUID: "d0c0ffee")
     )
     XCTAssertEqual(manual.lifecycleGeneration, 1)
+  }
+
+  func testEmitManualSyncExactRetryKeepsOneDurableSourceRow() async throws {
+    let requestID = "123e4567-e89b-42d3-a456-426614174000"
+    try await emitter.emitManualSync(did: did, requestUUID: requestID, now: epoch)
+    try await emitter.emitManualSync(
+      did: did, requestUUID: requestID, now: epoch.addingTimeInterval(1)
+    )
+    let pending = try await account.pendingPublicFirehoseOutbox()
+    XCTAssertEqual(pending.count, 1)
+    XCTAssertEqual(
+      pending.first?.sourceKey,
+      PublicFirehoseSourceKey.syncManual(did: did, requestUUID: requestID)
+    )
+    let leasedValue = try await account.leaseNextPublicFirehoseOutbox(
+      now: epoch, leaseDuration: 30
+    )
+    let leased = try XCTUnwrap(leasedValue)
+    let completed = try await account.completePublicFirehoseOutboxLease(
+      id: leased.row.id, token: leased.token
+    )
+    XCTAssertTrue(completed)
+    try await account.close()
+    account = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+    emitter = SQLitePublicLifecycleEmitter(
+      control: control,
+      accounts: FixedLifecycleAccountSource(
+        accounts: [PublicFirehoseAccountDatabase(did: did, database: account)]
+      )
+    )
+    try await emitter.emitManualSync(
+      did: did, requestUUID: requestID, now: epoch.addingTimeInterval(2)
+    )
+    let pendingAfterRestart = try await account.pendingPublicFirehoseOutbox()
+    XCTAssertEqual(pendingAfterRestart.count, 0)
+
+    let secondRequestID = "123e4567-e89b-42d3-a456-426614174001"
+    try await emitter.emitManualSync(
+      did: did, requestUUID: secondRequestID, now: epoch.addingTimeInterval(3)
+    )
+    let secondPending = try await account.pendingPublicFirehoseOutbox()
+    XCTAssertEqual(secondPending.count, 1)
+    XCTAssertEqual(
+      secondPending.first?.sourceKey,
+      PublicFirehoseSourceKey.syncManual(did: did, requestUUID: secondRequestID)
+    )
+  }
+
+  func testManualSyncLosesDeterministicRaceToDeactivation() async throws {
+    let barrier = ManualAuthorizationBarrier()
+    let racingEmitter = SQLitePublicLifecycleEmitter(
+      control: control,
+      accounts: FixedLifecycleAccountSource(
+        accounts: [PublicFirehoseAccountDatabase(did: did, database: account)]
+      ),
+      hooks: .init(beforeManualAuthorization: { await barrier.park() })
+    )
+    let accountDID = did
+    let eventTime = epoch
+    let emission = Task {
+      try await racingEmitter.emitManualSync(
+        did: accountDID,
+        requestUUID: "123e4567-e89b-42d3-a456-426614174002",
+        now: eventTime
+      )
+    }
+    await barrier.waitUntilParked()
+    _ = try await control.transitionStatus(
+      did: did,
+      to: .deactivated,
+      declaration: .init(),
+      now: epoch.addingTimeInterval(1)
+    )
+    await barrier.release()
+    do {
+      try await emission.value
+      XCTFail("deactivated account emitted a manual sync")
+    } catch let error as AccountControlStoreError {
+      XCTAssertEqual(error, .invalidTransition)
+    }
+    let pending = try await account.pendingPublicFirehoseOutbox()
+    XCTAssertTrue(pending.isEmpty)
   }
 
   func testEmitRotationIdentityBumpsGenerationAndEmitsIdentityItemOnly() async throws {

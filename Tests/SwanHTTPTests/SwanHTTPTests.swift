@@ -549,6 +549,116 @@ final class SwanHTTPTests: XCTestCase {
         }
     }
 
+    func testManagementFirehoseSyncIsCapabilityGatedAuthorizedValidatedAndRetryable() async throws {
+        let disabled = try await makeManagementServer()
+        defer { try? FileManager.default.removeItem(at: disabled.root) }
+        do {
+            let app = disabled.server.buildApplication(
+                logger: Logger(label: "SwanManagementFirehoseSyncDisabledTests")
+            )
+            try await app.test(.live) { client in
+                try await client.execute(
+                    uri: "/v1/firehose/sync", method: .post,
+                    headers: Self.jsonBearerHeaders("operator-secret"),
+                    body: ByteBuffer(string: "{}")
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                }
+            }
+            try await disabled.control.close()
+        } catch {
+            try? await disabled.control.close()
+            throw error
+        }
+
+        let sync = TestManagementFirehoseSync()
+        let fixture = try await makeManagementServer(firehoseSync: sync)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let requestID = "123e4567-e89b-42d3-a456-426614174000"
+        let body = ByteBuffer(
+            string: #"{"did":"did:plc:abcdefghijklmnopqrstuvwx","requestId":"\#(requestID)"}"#
+        )
+        do {
+            let app = fixture.server.buildApplication(
+                logger: Logger(label: "SwanManagementFirehoseSyncTests")
+            )
+            try await app.test(.live) { client in
+                try await client.execute(
+                    uri: "/v1/firehose/sync", method: .post, body: body
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+                try await client.execute(
+                    uri: "/v1/firehose/sync", method: .post,
+                    headers: Self.jsonBearerHeaders("operator-secret"),
+                    body: ByteBuffer(string: #"{"did":"not-a-did","requestId":"bad"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                }
+                await sync.setFailure(.inactiveAccount)
+                try await client.execute(
+                    uri: "/v1/firehose/sync", method: .post,
+                    headers: Self.jsonBearerHeaders("operator-secret"), body: body
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                }
+                await sync.setFailure(nil)
+                for _ in 0 ..< 2 {
+                    try await client.execute(
+                        uri: "/v1/firehose/sync", method: .post,
+                        headers: Self.jsonBearerHeaders("operator-secret"), body: body
+                    ) { response in
+                        XCTAssertEqual(response.status, .ok)
+                        XCTAssertEqual(response.headers[.cacheControl], "no-store")
+                        let object = try XCTUnwrap(
+                            JSONSerialization.jsonObject(with: Data(buffer: response.body))
+                                as? [String: Any]
+                        )
+                        XCTAssertEqual(Set(object.keys), ["did", "requestId", "status"])
+                        XCTAssertEqual(object["requestId"] as? String, requestID)
+                        XCTAssertEqual(object["status"] as? String, "accepted")
+                    }
+                }
+            }
+            let requestCount = await sync.requests.count
+            XCTAssertEqual(requestCount, 3)
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
+    func testManagementFirehoseSyncRuntimeRequiresActiveLiveAccount() async throws {
+        let fixture = try await makeManagementServer()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let live = TestManagementLiveAccountChecker(isLive: true)
+        let emitter = TestManagementLifecycleEmitter()
+        let runtime = SwanManagementFirehoseSyncRuntime(
+            controlStore: fixture.control,
+            liveAccounts: live,
+            emitter: emitter
+        )
+        let input = SwanManagementFirehoseSyncInput(
+            did: Self.aliceDID,
+            requestID: "123e4567-e89b-42d3-a456-426614174000"
+        )
+        let first = try await runtime.sync(input)
+        let retry = try await runtime.sync(input)
+        XCTAssertEqual(first, retry)
+        let emittedRequestIDs = await emitter.manualRequestIDs()
+        XCTAssertEqual(emittedRequestIDs, [input.requestID, input.requestID])
+
+        await live.setIsLive(false)
+        do {
+            _ = try await runtime.sync(input)
+            XCTFail("non-live account was accepted")
+        } catch {
+            XCTAssertEqual(error as? SwanManagementFirehoseSyncError, .inactiveAccount)
+        }
+        try await fixture.control.close()
+    }
+
     func testManagementPLCProvisioningAuthorizesBeforeDecodeAndValidatesModes() async throws {
         let provisioning = TestManagementPLCProvisioning()
         let fixture = try await makeManagementServer(plcProvisioning: provisioning)
@@ -730,6 +840,7 @@ final class SwanHTTPTests: XCTestCase {
 
     private func makeManagementServer(
         plcProvisioning: (any SwanManagementPLCProvisioning)? = nil,
+        firehoseSync: (any SwanManagementFirehoseSyncing)? = nil,
         permanentDeletionCoordinator:
             (any AccountPermanentDeletionCoordinating)? = nil,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .managementProcessShared,
@@ -759,6 +870,7 @@ final class SwanHTTPTests: XCTestCase {
                 controlStore: control,
                 operatorSecretVerifier: verifier,
                 plcProvisioning: plcProvisioning,
+                firehoseSync: firehoseSync,
                 permanentDeletionCoordinator:
                     permanentDeletionCoordinator,
                 jsonWriteAdmission: jsonWriteAdmission,
@@ -820,6 +932,51 @@ final class SwanHTTPTests: XCTestCase {
 
     private static let aliceDID = "did:plc:abcdefghijklmnopqrstuvwx"
     private static let testVerifier = "$argon2id$v=19$m=65536,t=3,p=1$bcdefghijklmnopqrstuvw$BCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq"
+}
+
+private actor TestManagementFirehoseSync: SwanManagementFirehoseSyncing {
+    private(set) var requests: [SwanManagementFirehoseSyncInput] = []
+    private var failure: SwanManagementFirehoseSyncError?
+
+    func setFailure(_ failure: SwanManagementFirehoseSyncError?) {
+        self.failure = failure
+    }
+
+    func sync(
+        _ input: SwanManagementFirehoseSyncInput
+    ) async throws -> SwanManagementFirehoseSyncResult {
+        requests.append(input)
+        if let failure { throw failure }
+        return .init(did: input.did, requestId: input.requestID, status: "accepted")
+    }
+}
+
+private actor TestManagementLiveAccountChecker: SwanManagementLiveAccountChecking {
+    private var isLive: Bool
+
+    init(isLive: Bool) { self.isLive = isLive }
+    func setIsLive(_ value: Bool) { isLive = value }
+    func containsLiveAccount(did _: String) async throws -> Bool { isLive }
+}
+
+private actor TestManagementLifecycleEmitter: PublicLifecycleEventEmitting {
+    private var manual: [String] = []
+
+    func manualRequestIDs() -> [String] { manual }
+    func emitActivation(
+        did _: String, operationID _: String, plcOperationCID _: String,
+        handle _: String?, materialTime _: Date, now _: Date
+    ) async throws {}
+    func emitRotationIdentity(
+        did _: String, plcOperationCID _: String, handle _: String?,
+        materialTime _: Date, now _: Date
+    ) async throws {}
+    func emitReactivationSync(
+        did _: String, operationID _: String, now _: Date
+    ) async throws {}
+    func emitManualSync(
+        did _: String, requestUUID: String, now _: Date
+    ) async throws { manual.append(requestUUID) }
 }
 
 private actor TestPermanentDeletionCoordinator:

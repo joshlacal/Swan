@@ -191,12 +191,12 @@ public enum RelayEvent: Sendable, Equatable {
 }
 
 public struct RelayReconnectEvidence: Sendable, Equatable, Codable {
-  public let cursor: Int64
-  public let firstDeliveredSequence: Int64
+  public let upstreamCursor: Int64
+  public let firstDeliveredRelaySequence: Int64
 
-  public init(cursor: Int64, firstDeliveredSequence: Int64) {
-    self.cursor = cursor
-    self.firstDeliveredSequence = firstDeliveredSequence
+  public init(upstreamCursor: Int64, firstDeliveredRelaySequence: Int64) {
+    self.upstreamCursor = upstreamCursor
+    self.firstDeliveredRelaySequence = firstDeliveredRelaySequence
   }
 }
 

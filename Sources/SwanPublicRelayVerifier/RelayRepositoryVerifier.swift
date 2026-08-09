@@ -17,6 +17,70 @@ public struct RelayVerifiedFullRepository: Sendable, Equatable {
 }
 
 public enum RelayFullRepositoryVerifier {
+  /// Structurally inspects a self-contained CAR so a live runner can bind the
+  /// expected head before the authenticated verifier independently checks it.
+  /// This makes no signature claim and must never be used as acceptance by
+  /// itself.
+  public static func inspect(car: Data) async throws -> RelayRepositorySnapshot {
+    guard car.count <= PublicRepositoryLimits.standard.maximumCARBytes else {
+      throw RelayVerifierError.repositoryCARTooLarge
+    }
+    let sink = RelayCARCollector()
+    let parsed: PublicRepositoryCARParseResult
+    do {
+      parsed = try await PublicRepositoryCAR.parseIncrementally(
+        from: RelayCARDataSource(car),
+        to: sink
+      )
+    } catch {
+      throw mapRepositoryError(error)
+    }
+    let blocks = await sink.blocks
+    guard let commitBytes = blocks[parsed.rootCID] else {
+      throw RelayVerifierError.invalidRepositoryCAR
+    }
+    let commit: StructurallyValidatedPublicRepositorySignedCommit
+    do {
+      commit = try PublicRepositoryCommitCodec.structurallyValidate(
+        signedCommitBytes: commitBytes,
+        expectedCommitCID: parsed.rootCID
+      )
+    } catch {
+      throw mapRepositoryError(error)
+    }
+    let repository: ValidatedPublicRepositoryMST
+    do {
+      repository = try await RepositoryMSTValidation.validate(
+        rootCID: commit.descriptor.dataCID,
+        blocks: RelayDictionaryBlockSource(storage: blocks)
+      )
+    } catch {
+      throw mapRepositoryError(error)
+    }
+    let required = Set(repository.reachableMSTBlocks.keys)
+      .union(repository.reachableRecordCIDs)
+      .union([parsed.rootCID])
+    guard required.isSubset(of: Set(blocks.keys)) else {
+      throw RelayVerifierError.invalidRepositoryCAR
+    }
+    var records: [String: CID] = [:]
+    for leaf in repository.leaves {
+      guard records.updateValue(leaf.recordCID, forKey: leaf.path.mstKey) == nil else {
+        throw RelayVerifierError.invalidRepositoryCAR
+      }
+    }
+    return RelayRepositorySnapshot(
+      did: commit.descriptor.did,
+      revision: commit.descriptor.revision.value,
+      commitCID: parsed.rootCID,
+      dataCID: commit.descriptor.dataCID,
+      records: records,
+      mstDigest: RelayRepositoryVerificationState.mstDigest(
+        repository.reachableMSTBlocks
+      )
+    )
+  }
+
   public static func verify(
     car: Data,
     expected: RelayRepositoryHead,
@@ -302,7 +366,7 @@ public struct RelayRepositoryVerificationState: Sendable {
     }
   }
 
-  private static func mstDigest(_ blocks: [CID: Data]) -> String {
+  fileprivate static func mstDigest(_ blocks: [CID: Data]) -> String {
     var input = Data()
     for cid in blocks.keys.sorted(by: { $0.string < $1.string }) {
       input.append(cid.bytes)

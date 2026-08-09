@@ -352,6 +352,9 @@ public actor SQLitePLCAccountPreparationStoreOpener:
     /// the live account directory after activation has durably registered the
     /// account. This never opens a request-selected path and removes the
     /// database from this opener so exactly one lifecycle owner closes it.
+    /// The receiver must discard the replay token after either a successful
+    /// admission or a rejection; a later exact retry then opens a redundant
+    /// actor that the live directory reconciles against its canonical path.
     public func takeActivatedAccountAdmission(
         did: String
     ) throws -> SQLiteActivatedAccountAdmission {
@@ -372,8 +375,9 @@ public actor SQLitePLCAccountPreparationStoreOpener:
     /// directory closes a rejected database before returning its error, so the
     /// closed actor must not remain in `transferredDatabases`; an exact retry
     /// needs to reopen the durable account database instead of receiving the
-    /// stale closed actor. A successful admission never calls this method: the
-    /// live directory owns that database after publication.
+    /// stale closed actor. A successful admission also calls this method after
+    /// the live directory has taken ownership, preventing the opener from
+    /// retaining an unbounded second ownership reference.
     public func discardActivatedAccountAdmission(did: String) {
         transferredDatabases.removeValue(forKey: did)
     }

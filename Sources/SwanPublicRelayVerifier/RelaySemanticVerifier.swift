@@ -28,10 +28,9 @@ public enum RelaySequenceVerifier {
       previous = sequence
     }
     for reconnect in reconnects {
-      guard reconnect.cursor >= 0,
-            reconnect.cursor <= FirehoseFrameLimits.maximumSequence,
-            reconnect.firstDeliveredSequence == reconnect.cursor + 1,
-            seen.contains(reconnect.firstDeliveredSequence) else {
+      guard reconnect.upstreamCursor >= 0,
+            reconnect.upstreamCursor <= FirehoseFrameLimits.maximumSequence,
+            seen.contains(reconnect.firstDeliveredRelaySequence) else {
         throw RelayVerifierError.reconnectCursorOutOfBounds
       }
     }
@@ -45,6 +44,11 @@ public enum RelaySequenceVerifier {
       guard ranged.count == range.count,
             offlineCount == expectedOfflineCommitCount else {
         throw RelayVerifierError.offlineCommitCountMismatch
+      }
+      guard reconnects.contains(where: {
+        $0.firstDeliveredRelaySequence == range.lowerBound
+      }) else {
+        throw RelayVerifierError.reconnectCursorOutOfBounds
       }
     } else {
       offlineCount = 0

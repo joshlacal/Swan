@@ -40,8 +40,21 @@ final class PublicRelayVerifierCLIParseTests: XCTestCase {
     ))
     XCTAssertEqual(accepted.offlineSequenceRange, 13 ... 17)
     XCTAssertEqual(accepted.reconnects.count, 1)
-    XCTAssertEqual(accepted.reconnects[0].cursor, 12)
-    XCTAssertEqual(accepted.reconnects[0].firstDeliveredSequence, 13)
+    XCTAssertEqual(accepted.reconnects[0].upstreamCursor, 12)
+    XCTAssertEqual(accepted.reconnects[0].firstDeliveredRelaySequence, 13)
+
+    let lagged = try RelayVerifierManifest.decode(manifestData(
+      reconnects: [(900, 13)],
+      offlineStart: 13,
+      offlineEnd: 17
+    ))
+    XCTAssertEqual(lagged.reconnects[0].upstreamCursor, 900)
+
+    XCTAssertThrowsError(try RelayVerifierManifest.decode(manifestData(
+      reconnects: [(13, 12)],
+      offlineStart: 13,
+      offlineEnd: 17
+    )))
   }
 
   func testRelayVerifierManifestRejectsReconnectUnrelatedToOfflineRecoveryRange() throws {
@@ -108,7 +121,8 @@ final class PublicRelayVerifierCLIParseTests: XCTestCase {
       "finalCommitCID": "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "finalDataCID": "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "reconnects": reconnects.map {
-        ["cursor": $0.cursor, "firstDeliveredSequence": $0.firstDeliveredSequence]
+        ["upstreamCursor": $0.cursor,
+         "firstDeliveredRelaySequence": $0.firstDeliveredSequence]
       },
       "getRepo": [
         "mode": "cursor-only",

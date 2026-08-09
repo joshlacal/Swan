@@ -604,6 +604,16 @@ private struct ServePublicMutationDirectory: PublicRepositoryMutationDirectory {
     }
 }
 
+private struct ServeManagementLiveAccountChecker: SwanManagementLiveAccountChecking {
+    let directory: SQLitePreMigratedAccountDirectory
+
+    func containsLiveAccount(did: String) async throws -> Bool {
+        try await directory.publicFirehoseAccountDatabases().contains { account in
+            account.did == did
+        }
+    }
+}
+
 private struct ServePublicMutationSignerProvider: PublicRepositoryMutationSignerProvider {
     let accounts: DurableAccountDirectory
     let keyStore: any AccountKeyStore
@@ -1137,8 +1147,9 @@ struct RelayVerifierManifest: Decodable {
               offlineStart <= FirehoseFrameLimits.maximumSequence - 4,
               offlineEnd == offlineStart + 4,
               decoded.reconnects.contains(where: {
-                  $0.cursor == offlineStart - 1 &&
-                      $0.firstDeliveredSequence == offlineStart
+                  $0.upstreamCursor >= 0 &&
+                      $0.upstreamCursor <= FirehoseFrameLimits.maximumSequence &&
+                      $0.firstDeliveredRelaySequence == offlineStart
               }) else {
             throw RelayVerifierError.invalidCaptureManifest
         }
@@ -1302,8 +1313,32 @@ extension SwanCommand {
         static let configuration = CommandConfiguration(
             commandName: "firehose",
             abstract: "Operator tools for the durable public firehose",
-            subcommands: [ForceSync.self, VerifyRelayCapture.self]
+            subcommands: [ForceSync.self, InspectRelayCAR.self, VerifyRelayCapture.self]
         )
+
+        struct InspectRelayCAR: AsyncParsableCommand {
+            static let configuration = CommandConfiguration(
+                commandName: "inspect-relay-car",
+                abstract: "Structurally inspect an ephemeral final repository CAR"
+            )
+
+            @Option(name: .long, help: "Owner-controlled final repository CAR")
+            var car: String
+
+            func run() async throws {
+                do {
+                    let bytes = try readBoundedRegularFileNoFollow(
+                        URL(fileURLWithPath: car).standardizedFileURL,
+                        maximumBytes: PublicRepositoryLimits.standard.maximumCARBytes,
+                        validationMessage: "relay CAR is unavailable"
+                    )
+                    let snapshot = try await RelayFullRepositoryVerifier.inspect(car: bytes)
+                    try AccountCommandSupport.write(RelayCARInspectionView(snapshot: snapshot))
+                } catch {
+                    throw ValidationError("relay CAR inspection failed")
+                }
+            }
+        }
 
         struct VerifyRelayCapture: AsyncParsableCommand {
             static let configuration = CommandConfiguration(
@@ -1820,6 +1855,9 @@ extension SwanCommand {
         @Flag(name: .customLong("enable-management-permanent-deletion"), help: "Enable resumable PLC-tombstoning permanent deletion on the separate management listener")
         var enableManagementPermanentDeletion = false
 
+        @Flag(name: .customLong("enable-management-firehose-sync"), help: "Enable authenticated in-process public firehose sync emission on the separate management listener")
+        var enableManagementFirehoseSync = false
+
         @Option(name: .customLong("management-deletion-plc-origin"), help: "PLC directory origin used only for permanent deletion")
         var managementDeletionPLCOrigin: String?
 
@@ -2071,6 +2109,12 @@ extension SwanCommand {
             }
             guard !enableManagementPermanentDeletion || managementPort != nil else {
                 throw ValidationError("--enable-management-permanent-deletion requires --management-port")
+            }
+            guard !enableManagementFirehoseSync || managementPort != nil else {
+                throw ValidationError("--enable-management-firehose-sync requires --management-port")
+            }
+            guard !enableManagementFirehoseSync || enablePublicFirehose else {
+                throw ValidationError("--enable-management-firehose-sync requires --enable-public-firehose")
             }
             let managementNeedsAccountKeyStore =
                 enableManagementPLCProvisioning
@@ -2778,11 +2822,22 @@ extension SwanCommand {
                     } catch {
                         throw ValidationError("management operator secret is unavailable")
                     }
+                    let managementFirehoseSync: (any SwanManagementFirehoseSyncing)?
+                    if enableManagementFirehoseSync {
+                        managementFirehoseSync = SwanManagementFirehoseSyncRuntime(
+                            controlStore: controlDatabase,
+                            liveAccounts: ServeManagementLiveAccountChecker(directory: directory),
+                            emitter: lifecycleEmitter
+                        )
+                    } else {
+                        managementFirehoseSync = nil
+                    }
                     let managementServer = SwanManagementHTTPServer(
                         configuration: managementConfiguration,
                         controlStore: controlDatabase,
                         operatorSecretVerifier: verifier,
                         plcProvisioning: managementPLCProvisioning,
+                        firehoseSync: managementFirehoseSync,
                         permanentDeletionCoordinator:
                             permanentDeletionRuntime?.coordinator,
                         lifecycleEmitter: lifecycleEmitter
@@ -7505,6 +7560,24 @@ private struct ForumPostArtifact: Encodable {
         self.status = status
         self.errorCode = errorCode
         fixturePolicy = "counts, DIDs, CIDs, and record keys only; no credentials, tokens, or DPoP proofs"
+    }
+}
+
+private struct RelayCARInspectionView: Encodable {
+    let did: String
+    let revision: String
+    let commitCID: String
+    let dataCID: String
+    let mstDigest: String
+    let projectionDigest: String
+
+    init(snapshot: RelayRepositorySnapshot) {
+        did = snapshot.did
+        revision = snapshot.revision
+        commitCID = snapshot.commitCID.string
+        dataCID = snapshot.dataCID.string
+        mstDigest = snapshot.mstDigest
+        projectionDigest = RelayRepositoryDigest.projection(snapshot.records)
     }
 }
 

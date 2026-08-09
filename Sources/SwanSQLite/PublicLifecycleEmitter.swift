@@ -9,6 +9,10 @@ public enum PublicLifecycleEmitterError: Error, Equatable {
     case missingCommitBlock(String)
 }
 
+struct PublicLifecycleEmitterHooks: Sendable {
+    var beforeManualAuthorization: (@Sendable () async -> Void)?
+}
+
 /// The durable lifecycle emitter for confirmed PLC account operations.
 ///
 /// Every emission is idempotent by exact source key: the control-side batch
@@ -20,6 +24,7 @@ public enum PublicLifecycleEmitterError: Error, Equatable {
 public struct SQLitePublicLifecycleEmitter: PublicLifecycleEventEmitting {
     private let control: SQLiteControlDatabase
     private let accounts: any PublicFirehoseAccountDatabaseSource
+    private let hooks: PublicLifecycleEmitterHooks
 
     public init(
         control: SQLiteControlDatabase,
@@ -27,6 +32,17 @@ public struct SQLitePublicLifecycleEmitter: PublicLifecycleEventEmitting {
     ) {
         self.control = control
         self.accounts = accounts
+        hooks = .init()
+    }
+
+    init(
+        control: SQLiteControlDatabase,
+        accounts: any PublicFirehoseAccountDatabaseSource,
+        hooks: PublicLifecycleEmitterHooks
+    ) {
+        self.control = control
+        self.accounts = accounts
+        self.hooks = hooks
     }
 
     public func emitActivation(
@@ -92,19 +108,33 @@ public struct SQLitePublicLifecycleEmitter: PublicLifecycleEventEmitting {
     }
 
     public func emitManualSync(did: String, requestUUID: String, now: Date) async throws {
-        let generation = try await control.currentLifecycleGeneration(did: did)
-        try await enqueueHeadSync(
-            did: did,
-            sourceKey: PublicFirehoseSourceKey.syncManual(did: did, requestUUID: requestUUID),
-            lifecycleGeneration: generation,
-            materialTime: now,
-            now: now
-        )
+        do {
+            await hooks.beforeManualAuthorization?()
+            try await control.withActiveAccountFirehoseAuthorization(did: did) {
+                generation in
+                try await enqueueHeadSync(
+                    did: did,
+                    sourceKey: PublicFirehoseSourceKey.syncManual(
+                        did: did, requestUUID: requestUUID
+                    ),
+                    lifecycleGeneration: generation,
+                    materialTime: now,
+                    now: now,
+                    authoritativeManualRetry: true
+                )
+            }
+        } catch let error as AccountControlStoreError {
+            if case .notFound = error {
+                throw PublicLifecycleEmitterError.accountUnavailable(did)
+            }
+            throw error
+        }
     }
 
     private func enqueueHeadSync(
         did: String, sourceKey: String, lifecycleGeneration: Int64,
-        materialTime: Date, now: Date
+        materialTime: Date, now: Date,
+        authoritativeManualRetry: Bool = false
     ) async throws {
         guard let account = try await accounts.publicFirehoseAccountDatabases()
             .first(where: { $0.did == did }) else {
@@ -125,13 +155,24 @@ public struct SQLitePublicLifecycleEmitter: PublicLifecycleEventEmitting {
             commitCID: state.commitCID.string,
             time: PublicFirehoseTime.encode(materialTime)
         )
-        _ = try await account.database.enqueuePublicFirehoseEvent(
-            sourceKey: sourceKey,
-            kind: .sync,
-            lifecycleGeneration: lifecycleGeneration,
-            payload: try PersistedPublicFirehoseJSON.encode(material),
-            carBytes: car,
-            now: now
-        )
+        let payload = try PersistedPublicFirehoseJSON.encode(material)
+        if authoritativeManualRetry {
+            _ = try await account.database.enqueueAuthoritativeManualSyncEvent(
+                sourceKey: sourceKey,
+                lifecycleGeneration: lifecycleGeneration,
+                payload: payload,
+                carBytes: car,
+                now: now
+            )
+        } else {
+            _ = try await account.database.enqueuePublicFirehoseEvent(
+                sourceKey: sourceKey,
+                kind: .sync,
+                lifecycleGeneration: lifecycleGeneration,
+                payload: payload,
+                carBytes: car,
+                now: now
+            )
+        }
     }
 }

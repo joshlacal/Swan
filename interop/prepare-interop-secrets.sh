@@ -39,6 +39,7 @@ prepare_directory "$pds_directory" 1000 1000
 for name in oauth-server-key account-kek email-proof-key; do
     copy_secret "$name" "$runtime_directory" swan swan
 done
+copy_secret "operator-secret" "$runtime_directory" swan swan
 
 for name in \
     account-kek \

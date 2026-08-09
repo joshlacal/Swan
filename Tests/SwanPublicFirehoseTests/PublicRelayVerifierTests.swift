@@ -149,13 +149,55 @@ final class PublicRelayVerifierTests: XCTestCase {
     }
     let result = try RelaySequenceVerifier.verify(
       events: events,
-      reconnects: [.init(cursor: 12, firstDeliveredSequence: 13)],
+      reconnects: [.init(upstreamCursor: 120, firstDeliveredRelaySequence: 13)],
       offlineCommitRange: 13 ... 17,
       expectedOfflineCommitCount: 5
     )
     XCTAssertEqual(result.firstSequence, 10)
     XCTAssertEqual(result.lastSequence, 17)
     XCTAssertEqual(result.offlineCommitCount, 5)
+  }
+
+  func testSequenceVerifierKeepsUpstreamCursorAndRelayDeliveryDomainsSeparate() throws {
+    let events: [RelayEvent] = [
+      .identity(.init(seq: 10, did: did, time: time, handle: "alice.test")),
+      .account(.init(seq: 11, did: did, time: time, active: true, status: nil)),
+      .sync(.init(seq: 12, did: did, blocks: Data(), rev: rev0, time: time)),
+      .commit(.init(
+        seq: 13, repo: did, commitCID: sampleCID(13), rev: rev1,
+        since: rev0, blocks: Data(), ops: [], prevDataCID: sampleCID(0), time: time
+      )),
+    ] + (14 ... 18).map {
+      .commit(.init(
+        seq: Int64($0), repo: did, commitCID: sampleCID($0), rev: rev1,
+        since: rev0, blocks: Data(), ops: [], prevDataCID: sampleCID(0), time: time
+      ))
+    }
+    XCTAssertNoThrow(try RelaySequenceVerifier.verify(
+      events: events,
+      reconnects: [.init(upstreamCursor: 900, firstDeliveredRelaySequence: 14)],
+      offlineCommitRange: 14 ... 18,
+      expectedOfflineCommitCount: 5
+    ))
+
+    let mutations: [([RelayEvent], [RelayReconnectEvidence], RelayVerifierError)] = [
+      (events, [], .reconnectCursorOutOfBounds),
+      (events, [.init(upstreamCursor: 900, firstDeliveredRelaySequence: 13)], .reconnectCursorOutOfBounds),
+      (events, [.init(upstreamCursor: FirehoseFrameLimits.maximumSequence + 1,
+                      firstDeliveredRelaySequence: 14)], .reconnectCursorOutOfBounds),
+      (Array(events.prefix(4)) + [events[3]] + Array(events.dropFirst(4)),
+       [.init(upstreamCursor: 900, firstDeliveredRelaySequence: 14)], .duplicateSequence),
+    ]
+    for (candidate, reconnects, expected) in mutations {
+      XCTAssertThrowsError(try RelaySequenceVerifier.verify(
+        events: candidate,
+        reconnects: reconnects,
+        offlineCommitRange: 14 ... 18,
+        expectedOfflineCommitCount: 5
+      )) {
+        XCTAssertEqual($0 as? RelayVerifierError, expected)
+      }
+    }
   }
 
   func testSequenceVerifierRejectsDuplicateGapCursorAndOfflineCountMatrix() throws {
@@ -167,8 +209,8 @@ final class PublicRelayVerifierTests: XCTestCase {
     let cases: [([RelayEvent], [RelayReconnectEvidence], ClosedRange<Int64>?, Int, RelayVerifierError)] = [
       (base + [.sync(.init(seq: 3, did: did, blocks: Data(), rev: rev0, time: time))], [], nil, 0, .duplicateSequence),
       ([base[0], base[2]], [], nil, 0, .sequenceGap),
-      (base, [.init(cursor: 3, firstDeliveredSequence: 3)], nil, 0, .reconnectCursorOutOfBounds),
-      (base, [.init(cursor: 4, firstDeliveredSequence: 5)], nil, 0, .reconnectCursorOutOfBounds),
+      (base, [.init(upstreamCursor: -1, firstDeliveredRelaySequence: 3)], nil, 0, .reconnectCursorOutOfBounds),
+      (base, [.init(upstreamCursor: 4, firstDeliveredRelaySequence: 5)], nil, 0, .reconnectCursorOutOfBounds),
       (base, [], 4 ... 8, 5, .offlineCommitCountMismatch),
     ]
     for (events, reconnects, range, expectedCount, expected) in cases {
@@ -316,6 +358,10 @@ final class PublicRelayVerifierTests: XCTestCase {
     )
     XCTAssertEqual(verified.head, expected)
     XCTAssertEqual(verified.records, [:])
+    let inspected = try await RelayFullRepositoryVerifier.inspect(car: genesis.car)
+    XCTAssertEqual(inspected.head, expected)
+    XCTAssertEqual(inspected.records, [:])
+    XCTAssertEqual(inspected.mstDigest, verified.snapshot.mstDigest)
 
     await assertAsyncError(.repositoryCARTooLarge) {
       _ = try await RelayFullRepositoryVerifier.verify(

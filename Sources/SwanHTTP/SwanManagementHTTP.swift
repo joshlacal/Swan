@@ -119,6 +119,96 @@ public enum SwanManagementPeerPolicy {
     }
 }
 
+public enum SwanManagementFirehoseSyncError: Error, Sendable, Equatable {
+    case inactiveAccount
+    case unavailable
+}
+
+public struct SwanManagementFirehoseSyncInput: Sendable, Equatable {
+    public let did: String
+    public let requestID: String
+
+    public init(did: String, requestID: String) {
+        self.did = did
+        self.requestID = requestID
+    }
+}
+
+public struct SwanManagementFirehoseSyncResult: Sendable, Equatable, Encodable {
+    public let did: String
+    public let requestId: String
+    public let status: String
+
+    public init(did: String, requestId: String, status: String = "accepted") {
+        self.did = did
+        self.requestId = requestId
+        self.status = status
+    }
+}
+
+public protocol SwanManagementFirehoseSyncing: Sendable {
+    func sync(
+        _ input: SwanManagementFirehoseSyncInput
+    ) async throws -> SwanManagementFirehoseSyncResult
+}
+
+public protocol SwanManagementLiveAccountChecking: Sendable {
+    func containsLiveAccount(did: String) async throws -> Bool
+}
+
+/// Executes the operator sync inside the serving process so SQLite's WAL has
+/// one process owner. The request UUID is the emitter's durable source key;
+/// an exact HTTP retry therefore converges through the outbox's uniqueness
+/// constraint and returns the same acknowledgement.
+public actor SwanManagementFirehoseSyncRuntime: SwanManagementFirehoseSyncing {
+    private let controlStore: any AccountControlStore
+    private let liveAccounts: any SwanManagementLiveAccountChecking
+    private let emitter: any PublicLifecycleEventEmitting
+
+    public init(
+        controlStore: any AccountControlStore,
+        liveAccounts: any SwanManagementLiveAccountChecking,
+        emitter: any PublicLifecycleEventEmitting
+    ) {
+        self.controlStore = controlStore
+        self.liveAccounts = liveAccounts
+        self.emitter = emitter
+    }
+
+    public func sync(
+        _ input: SwanManagementFirehoseSyncInput
+    ) async throws -> SwanManagementFirehoseSyncResult {
+        guard AccountControlIdentifiers.isDID(input.did),
+              input.requestID.utf8.count == 36,
+              UUID(uuidString: input.requestID)?.uuidString.lowercased()
+                == input.requestID else {
+            throw SwanManagementFirehoseSyncError.inactiveAccount
+        }
+        do {
+            guard let account = try await controlStore.account(did: input.did),
+                  account.status.authorizesAccount,
+                  try await liveAccounts.containsLiveAccount(did: input.did) else {
+                throw SwanManagementFirehoseSyncError.inactiveAccount
+            }
+            try await emitter.emitManualSync(
+                did: input.did,
+                requestUUID: input.requestID,
+                now: Date()
+            )
+            return .init(did: input.did, requestId: input.requestID)
+        } catch let error as SwanManagementFirehoseSyncError {
+            throw error
+        } catch let error as AccountControlStoreError {
+            if case .invalidTransition = error {
+                throw SwanManagementFirehoseSyncError.inactiveAccount
+            }
+            throw SwanManagementFirehoseSyncError.unavailable
+        } catch {
+            throw SwanManagementFirehoseSyncError.unavailable
+        }
+    }
+}
+
 /// A narrow authenticated operator API. It uses `AccountOperatorService` and
 /// `AccountControlStore` exclusively; no raw control.sqlite tables or account
 /// private material are exposed here.
@@ -129,6 +219,7 @@ public struct SwanManagementHTTPServer: Sendable {
     private let accounts: AccountOperatorService
     private let operatorSecretVerifier: OperatorSecretVerifier
     private let plcProvisioning: (any SwanManagementPLCProvisioning)?
+    private let firehoseSync: (any SwanManagementFirehoseSyncing)?
     private let requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
     private let rejectedBodyAdmission: SwanRequestBodyAdmissionConfiguration
 
@@ -137,6 +228,7 @@ public struct SwanManagementHTTPServer: Sendable {
         controlStore: any AccountControlStore,
         operatorSecretVerifier: OperatorSecretVerifier,
         plcProvisioning: (any SwanManagementPLCProvisioning)? = nil,
+        firehoseSync: (any SwanManagementFirehoseSyncing)? = nil,
         permanentDeletionCoordinator:
             (any AccountPermanentDeletionCoordinating)? = nil,
         lifecycleEmitter: (any PublicLifecycleEventEmitting)? = nil,
@@ -153,6 +245,7 @@ public struct SwanManagementHTTPServer: Sendable {
         )
         self.operatorSecretVerifier = operatorSecretVerifier
         self.plcProvisioning = plcProvisioning
+        self.firehoseSync = firehoseSync
         requestBodyAdmission = .init(
             admission: jsonWriteAdmission,
             policy: jsonWriteBodyPolicy
@@ -170,6 +263,7 @@ public struct SwanManagementHTTPServer: Sendable {
         let accounts = accounts
         let verifier = operatorSecretVerifier
         let plcProvisioning = plcProvisioning
+        let firehoseSync = firehoseSync
         let requestBodyAdmission = requestBodyAdmission
         let rejectedBodyAdmission = rejectedBodyAdmission
 
@@ -296,13 +390,41 @@ public struct SwanManagementHTTPServer: Sendable {
             registerDisabledPLCProvisioningGuards(on: router)
         }
 
+        if let firehoseSync {
+            router.post("/v1/firehose/sync") { request, context async -> Response in
+                guard authorize(request: request, context: context, verifier: verifier) != nil else {
+                    if let failure = await drainManagementRejectedBody(
+                        request, context: context,
+                        requestBodyAdmission: rejectedBodyAdmission
+                    ) { return failure }
+                    return managementError(.unauthorized)
+                }
+                do {
+                    let requestBody: ManagementFirehoseSyncRequest =
+                        try await decodeManagementJSON(
+                            from: request, context: context,
+                            requestBodyAdmission: requestBodyAdmission
+                        )
+                    return managementJSON(
+                        .ok,
+                        try await firehoseSync.sync(requestBody.validatedInput())
+                    )
+                } catch {
+                    return managementError(status(for: error))
+                }
+            }
+        } else {
+            registerDisabledManagementFirehoseSyncGuards(on: router)
+        }
+
         // Make wrong verbs and unknown management paths return the same small,
         // no-store JSON closure as every other management error. The public
         // router intentionally has no corresponding fallback.
         registerMethodGuards(
             on: router,
             verifier: verifier,
-            plcProvisioningEnabled: plcProvisioning != nil
+            plcProvisioningEnabled: plcProvisioning != nil,
+            firehoseSyncEnabled: firehoseSync != nil
         )
         registerUnknownManagementGuards(on: router)
         return router
@@ -351,6 +473,27 @@ private struct ManagementDIDRequest: Decodable {
         try validateKeys(container, allowed: ["did"])
         did = try container.decode(String.self, forKey: .init("did"))
         guard !did.isEmpty, did.utf8.count <= 2_048 else { throw ManagementRequestError.malformed }
+    }
+}
+
+private struct ManagementFirehoseSyncRequest: Decodable {
+    let did: String
+    let requestID: String
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: ManagementCodingKey.self)
+        try validateKeys(container, allowed: ["did", "requestId"])
+        did = try container.decode(String.self, forKey: .init("did"))
+        requestID = try container.decode(String.self, forKey: .init("requestId"))
+    }
+
+    func validatedInput() throws -> SwanManagementFirehoseSyncInput {
+        guard AccountControlIdentifiers.isDID(did),
+              requestID.utf8.count == 36,
+              UUID(uuidString: requestID)?.uuidString.lowercased() == requestID else {
+            throw ManagementRequestError.malformed
+        }
+        return .init(did: did, requestID: requestID)
     }
 }
 
@@ -691,7 +834,8 @@ private func drainManagementRejectedBody(
 private func registerMethodGuards(
     on router: Router<SwanManagementRequestContext>,
     verifier: OperatorSecretVerifier,
-    plcProvisioningEnabled: Bool
+    plcProvisioningEnabled: Bool,
+    firehoseSyncEnabled: Bool
 ) {
     var routes: [(RouterPath, Set<HTTPRequest.Method>)] = [
         ("/v1/accounts", [.get]),
@@ -703,6 +847,9 @@ private func registerMethodGuards(
         routes.append(("/v1/accounts/plc/prepare", [.post]))
         routes.append(("/v1/accounts/plc/activate", [.post]))
     }
+    if firehoseSyncEnabled {
+        routes.append(("/v1/firehose/sync", [.post]))
+    }
     let methods: [HTTPRequest.Method] = [.get, .head, .post, .put, .patch, .delete, .options, .connect, .trace]
     for (path, allowed) in routes {
         for method in methods where !allowed.contains(method) {
@@ -712,6 +859,19 @@ private func registerMethodGuards(
                 }
                 return managementError(.methodNotAllowed)
             }
+        }
+    }
+}
+
+private func registerDisabledManagementFirehoseSyncGuards(
+    on router: Router<SwanManagementRequestContext>
+) {
+    let methods: [HTTPRequest.Method] = [
+        .get, .head, .post, .put, .patch, .delete, .options, .connect, .trace,
+    ]
+    for method in methods {
+        router.on("/v1/firehose/sync", method: method) { _, _ -> Response in
+            managementError(.notFound)
         }
     }
 }
@@ -756,6 +916,8 @@ private func status(for error: any Error) -> HTTPResponse.Status {
     case let error as PLCAccountPreparationError:
         return error == .unavailable ? .serviceUnavailable : .badRequest
     case let error as PLCAccountActivationError:
+        return error == .unavailable ? .serviceUnavailable : .badRequest
+    case let error as SwanManagementFirehoseSyncError:
         return error == .unavailable ? .serviceUnavailable : .badRequest
     case let error as SwanError:
         if case .unavailable = error { return .serviceUnavailable }

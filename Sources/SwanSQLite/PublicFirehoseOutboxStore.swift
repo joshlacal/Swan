@@ -117,6 +117,48 @@ extension SQLiteAccountDatabase {
     }
   }
 
+  /// Manual operator sync retries use the request UUID as an idempotency key.
+  /// Once accepted, the stored row is authoritative even if a later retry has
+  /// a different invocation clock or the repository head has advanced.
+  func enqueueAuthoritativeManualSyncEvent(
+    sourceKey: String,
+    lifecycleGeneration: Int64,
+    payload: Data,
+    carBytes: Data,
+    now: Date
+  ) async throws -> Bool {
+    let createdAt = Int64(try firehoseTimestamp(now))
+    return try await withConnectionGate {
+      try await transaction {
+        let existing = try await connection.query(
+          """
+          SELECT id, source_key, kind, lifecycle_generation, payload, car_bytes,
+                 attempts, created_at, available_at, lease_token, lease_expires_at
+          FROM public_event_outbox WHERE source_key = ?
+          """,
+          [.text(sourceKey)]
+        )
+        if let row = existing.first {
+          let stored = try decodeFirehoseOutboxRow(row)
+          guard stored.sourceKey == sourceKey, stored.kind == .sync else {
+            throw SQLiteRepositoryError.corruptDatabase(
+              "manual sync idempotency key collides with another event"
+            )
+          }
+          return false
+        }
+        return try await enqueuePublicFirehoseEventInTransaction(
+          sourceKey: sourceKey,
+          kind: .sync,
+          lifecycleGeneration: lifecycleGeneration,
+          payload: payload,
+          carBytes: carBytes,
+          createdAt: createdAt
+        )
+      }
+    }
+  }
+
   /// Non-leasing peek used only by the sequencer's causal merge. Returns the
   /// smallest `id` regardless of availability or lease state.
   public func oldestPendingPublicFirehoseOutbox() async throws -> PublicFirehoseOutboxRow? {
@@ -377,11 +419,40 @@ extension SQLiteAccountDatabase {
   }
 
   private func validateStoredFirehoseTime(_ value: String) throws {
+    let bytes = Array(value.utf8)
+    guard bytes.count == 24 else {
+      throw StoredFirehoseReplayValidationError.invalidMaterial
+    }
+    for (index, byte) in bytes.enumerated() {
+      let expected: UInt8?
+      switch index {
+      case 4, 7:
+        expected = UInt8(ascii: "-")
+      case 10:
+        expected = UInt8(ascii: "T")
+      case 13, 16:
+        expected = UInt8(ascii: ":")
+      case 19:
+        expected = UInt8(ascii: ".")
+      case 23:
+        expected = UInt8(ascii: "Z")
+      default:
+        expected = nil
+      }
+      if let expected {
+        guard byte == expected else {
+          throw StoredFirehoseReplayValidationError.invalidMaterial
+        }
+      } else {
+        guard byte >= UInt8(ascii: "0"), byte <= UInt8(ascii: "9") else {
+          throw StoredFirehoseReplayValidationError.invalidMaterial
+        }
+      }
+    }
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     formatter.timeZone = TimeZone(secondsFromGMT: 0)
-    guard let date = formatter.date(from: value),
-          PublicFirehoseTime.encode(date) == value else {
+    guard formatter.date(from: value) != nil else {
       throw StoredFirehoseReplayValidationError.invalidMaterial
     }
   }

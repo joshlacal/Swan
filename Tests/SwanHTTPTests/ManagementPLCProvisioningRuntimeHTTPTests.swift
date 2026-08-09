@@ -11,6 +11,33 @@ import SwanStorage
 import XCTest
 
 final class ManagementPLCProvisioningRuntimeHTTPTests: XCTestCase {
+    func testConcreteRuntimeRejectsUnpairedLiveLifecycleDependencies() async throws {
+        let plc = try ManagementPLCDirectoryFixture()
+        defer { plc.shutdown() }
+        let fixture = try await ConcreteManagementFixture(plc: plc)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        XCTAssertThrowsError(try SwanManagementPLCProvisioningRuntime(
+            controlDatabase: fixture.control,
+            dataDirectory: fixture.data,
+            keyStore: fixture.keyStore,
+            liveAccountDirectory: fixture.liveDirectory,
+            lifecycleEmitter: nil
+        ))
+        XCTAssertThrowsError(try SwanManagementPLCProvisioningRuntime(
+            controlDatabase: fixture.control,
+            dataDirectory: fixture.data,
+            keyStore: fixture.keyStore,
+            liveAccountDirectory: nil,
+            lifecycleEmitter: SQLitePublicLifecycleEmitter(
+                control: fixture.control,
+                accounts: fixture.liveDirectory
+            )
+        ))
+
+        try await fixture.close()
+    }
+
     func testConcreteRuntimeSingleFlightForcesRealOverlappingActivation() async throws {
         let plc = try ManagementPLCDirectoryFixture()
         defer { plc.shutdown() }
@@ -186,6 +213,25 @@ final class ManagementPLCProvisioningRuntimeHTTPTests: XCTestCase {
                 XCTAssertEqual(plc.submitCount, 1)
                 let activeAccount = try await fixture.control.account(did: did)
                 XCTAssertEqual(activeAccount?.status, .active)
+                let lifecycleGeneration = try await fixture.control
+                    .currentLifecycleGeneration(did: did)
+                XCTAssertEqual(
+                    lifecycleGeneration,
+                    1,
+                    "exact activation retries must not allocate another lifecycle generation"
+                )
+                let publicAccounts = try await fixture.liveDirectory
+                    .publicFirehoseAccountDatabases()
+                let publicAccount = try XCTUnwrap(publicAccounts.first {
+                    $0.did == did
+                })
+                let pendingSyncs = try await publicAccount.database
+                    .pendingPublicFirehoseOutbox()
+                XCTAssertEqual(
+                    pendingSyncs.count,
+                    1,
+                    "exact activation retries must not enqueue another activation sync"
+                )
 
                 // The public resource process directory was bootstrapped while
                 // the inventory was empty. Successful management activation
@@ -205,6 +251,91 @@ final class ManagementPLCProvisioningRuntimeHTTPTests: XCTestCase {
                     Data(ManagementPLCFixtureState.proofBodySentinel.utf8),
                 ]
             )
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
+    func testConcreteRuntimeExactRetryClosesAdmissionBeforeLifecycleEmissionGap() async throws {
+        let plc = try ManagementPLCDirectoryFixture()
+        defer { plc.shutdown() }
+        let fixture = try await ConcreteManagementFixture(
+            plc: plc,
+            failFirstActivationLifecycleEmission: true
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        do {
+            let plcOrigin = try XCTUnwrap(URL(
+                string: "http://127.0.0.1:\(plc.port)"
+            ))
+            let plcConfiguration = try PLCClientConfiguration.laboratory(
+                origin: plcOrigin,
+                submitSuccessResponsePolicy: .didPLCServer001
+            )
+            let handlePolicy = try ATHandleResolutionPolicy.laboratory(
+                origin: plcOrigin
+            )
+            let prepared = try await fixture.runtime.prepare(.init(
+                requestID: fixture.requestID,
+                handle: "alice.test",
+                pdsOrigin: try XCTUnwrap(URL(string: "https://pds.example")),
+                repositoryRevision: "3lqby3xuo4k2a",
+                plcConfiguration: plcConfiguration
+            ))
+            let activation = SwanManagementPLCActivateInput(
+                requestID: fixture.requestID,
+                password: fixture.password,
+                plcConfiguration: plcConfiguration,
+                handlePolicy: handlePolicy
+            )
+
+            do {
+                _ = try await fixture.runtime.activate(activation)
+                XCTFail("the injected first lifecycle emission must fail activation")
+            } catch let error as PLCAccountActivationError {
+                XCTAssertEqual(error, .unavailable)
+            }
+
+            // The durable account and its live database transfer precede the
+            // intentionally failed announcement. This is the exact crash gap
+            // that the management retry path must close.
+            try await fixture.liveDirectory.requireActivePreopenedAccount(prepared.did)
+            let activeAccount = try await fixture.control.account(did: prepared.did)
+            XCTAssertEqual(activeAccount?.status, .active)
+            let generationBeforeRetry = try await fixture.control
+                .currentLifecycleGeneration(did: prepared.did)
+            XCTAssertEqual(generationBeforeRetry, 0)
+
+            let retried = try await fixture.runtime.activate(activation)
+            XCTAssertEqual(retried.did, prepared.did)
+            XCTAssertEqual(retried.status, "active")
+            let generationAfterRetry = try await fixture.control
+                .currentLifecycleGeneration(did: prepared.did)
+            XCTAssertEqual(generationAfterRetry, 1)
+            let activationAttempts = await fixture.lifecycleFailureProbe?
+                .activationAttempts
+            XCTAssertEqual(activationAttempts, 2)
+
+            _ = try await fixture.runtime.activate(activation)
+            let generationAfterConvergence = try await fixture.control
+                .currentLifecycleGeneration(did: prepared.did)
+            XCTAssertEqual(
+                generationAfterConvergence,
+                1,
+                "a retry after convergence must preserve the source-key generation"
+            )
+            let publicAccounts = try await fixture.liveDirectory
+                .publicFirehoseAccountDatabases()
+            let publicAccount = try XCTUnwrap(publicAccounts.first {
+                $0.did == prepared.did
+            })
+            let pendingSyncs = try await publicAccount.database
+                .pendingPublicFirehoseOutbox()
+            XCTAssertEqual(pendingSyncs.count, 1)
+
             try await fixture.close()
         } catch {
             try? await fixture.close()
@@ -398,6 +529,8 @@ private final class ConcreteManagementFixture: @unchecked Sendable {
     let rawKEK = Data(repeating: 0xD7, count: 32)
     let control: SQLiteControlDatabase
     let liveDirectory: SQLitePreMigratedAccountDirectory
+    let keyStore: FileAccountKeyStore
+    let lifecycleFailureProbe: FailFirstActivationLifecycleEmitter?
     let runtime: SwanManagementPLCProvisioningRuntime
     let server: SwanManagementHTTPServer
     let prepareBody: Data
@@ -419,7 +552,10 @@ private final class ConcreteManagementFixture: @unchecked Sendable {
         ]
     }
 
-    init(plc: ManagementPLCDirectoryFixture) async throws {
+    init(
+        plc: ManagementPLCDirectoryFixture,
+        failFirstActivationLifecycleEmission: Bool = false
+    ) async throws {
         root = FileManager.default.temporaryDirectory
             .appending(path: "SwanConcreteManagementHTTP-\(UUID().uuidString)")
         data = root.appending(path: "data")
@@ -442,18 +578,34 @@ private final class ConcreteManagementFixture: @unchecked Sendable {
             controlStore: control,
             publicIdentityVerifier: SwanPublicPLCGenesisVerifier()
         )
-        let keyStore = try FileAccountKeyStore(
+        keyStore = try FileAccountKeyStore(
             root: keyRoot,
             configuration: try AccountKeyEncryptionConfiguration(
                 activeKeyID: "test-primary",
                 activeKey: rawKEK
             )
         )
+        let concreteLifecycleEmitter = SQLitePublicLifecycleEmitter(
+            control: control,
+            accounts: liveDirectory
+        )
+        let selectedLifecycleEmitter: any PublicLifecycleEventEmitting
+        if failFirstActivationLifecycleEmission {
+            let probe = FailFirstActivationLifecycleEmitter(
+                forwardingTo: concreteLifecycleEmitter
+            )
+            lifecycleFailureProbe = probe
+            selectedLifecycleEmitter = probe
+        } else {
+            lifecycleFailureProbe = nil
+            selectedLifecycleEmitter = concreteLifecycleEmitter
+        }
         runtime = try SwanManagementPLCProvisioningRuntime(
             controlDatabase: control,
             dataDirectory: data,
             keyStore: keyStore,
-            liveAccountDirectory: liveDirectory
+            liveAccountDirectory: liveDirectory,
+            lifecycleEmitter: selectedLifecycleEmitter
         )
         server = SwanManagementHTTPServer(
             configuration: try SwanManagementHTTPConfiguration(
@@ -543,4 +695,79 @@ private actor ManagementHTTPTestCapture {
 private enum ManagementHTTPTestCaptureError: Error {
     case missingResponse
     case nonIdempotentResponse
+}
+
+private actor FailFirstActivationLifecycleEmitter: PublicLifecycleEventEmitting {
+    private let downstream: any PublicLifecycleEventEmitting
+    private(set) var activationAttempts = 0
+
+    init(forwardingTo downstream: any PublicLifecycleEventEmitting) {
+        self.downstream = downstream
+    }
+
+    func emitActivation(
+        did: String,
+        operationID: String,
+        plcOperationCID: String,
+        handle: String?,
+        materialTime: Date,
+        now: Date
+    ) async throws {
+        activationAttempts += 1
+        if activationAttempts == 1 {
+            throw FailFirstActivationLifecycleEmitterError.injectedFailure
+        }
+        try await downstream.emitActivation(
+            did: did,
+            operationID: operationID,
+            plcOperationCID: plcOperationCID,
+            handle: handle,
+            materialTime: materialTime,
+            now: now
+        )
+    }
+
+    func emitRotationIdentity(
+        did: String,
+        plcOperationCID: String,
+        handle: String?,
+        materialTime: Date,
+        now: Date
+    ) async throws {
+        try await downstream.emitRotationIdentity(
+            did: did,
+            plcOperationCID: plcOperationCID,
+            handle: handle,
+            materialTime: materialTime,
+            now: now
+        )
+    }
+
+    func emitReactivationSync(
+        did: String,
+        operationID: String,
+        now: Date
+    ) async throws {
+        try await downstream.emitReactivationSync(
+            did: did,
+            operationID: operationID,
+            now: now
+        )
+    }
+
+    func emitManualSync(
+        did: String,
+        requestUUID: String,
+        now: Date
+    ) async throws {
+        try await downstream.emitManualSync(
+            did: did,
+            requestUUID: requestUUID,
+            now: now
+        )
+    }
+}
+
+private enum FailFirstActivationLifecycleEmitterError: Error {
+    case injectedFailure
 }

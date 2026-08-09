@@ -135,6 +135,12 @@ public protocol SwanManagementPLCProvisioning: Sendable {
     ) async throws -> SwanManagementPLCActivateResult
 }
 
+public enum SwanManagementPLCProvisioningRuntimeError:
+    Error, Sendable, Equatable
+{
+    case invalidLiveLifecycleConfiguration
+}
+
 /// The single process-local composition root for both the CLI and management
 /// PLC workflows. Domain services own the durable state machine. This runtime
 /// only selects a validated remote policy and wires those services together.
@@ -177,6 +183,10 @@ public actor SwanManagementPLCProvisioningRuntime:
         liveAccountDirectory: SQLitePreMigratedAccountDirectory? = nil,
         lifecycleEmitter: (any PublicLifecycleEventEmitting)? = nil
     ) throws {
+        guard (liveAccountDirectory == nil) == (lifecycleEmitter == nil) else {
+            throw SwanManagementPLCProvisioningRuntimeError
+                .invalidLiveLifecycleConfiguration
+        }
         let passwordHasher = try LibsodiumArgon2idHasher()
         self.controlDatabase = controlDatabase
         opener = SQLitePLCAccountPreparationStoreOpener(dataDirectory: dataDirectory)
@@ -262,7 +272,11 @@ public actor SwanManagementPLCProvisioningRuntime:
             plcClient: try PLCDirectoryClient(configuration: input.plcConfiguration),
             handleVerifier: handleVerifier,
             directory: directory,
-            lifecycleEmitter: lifecycleEmitter
+            // A live activation must transfer its already-open account
+            // database before the lifecycle emitter resolves the head sync
+            // through that directory. Offline callers have no transfer and
+            // retain the service's original emission order.
+            lifecycleEmitter: liveAccountDirectory == nil ? lifecycleEmitter : nil
         )
         let installation = try await service.activate(
             requestID: input.requestID,
@@ -279,6 +293,9 @@ public actor SwanManagementPLCProvisioningRuntime:
             }
             do {
                 try await liveAccountDirectory.admitActivatedAccount(admission)
+                await opener.discardActivatedAccountAdmission(
+                    did: installation.account.did
+                )
             } catch {
                 // `admitActivatedAccount` closes a rejected transfer. Drop
                 // the opener's replay token as well, otherwise an exact
@@ -286,6 +303,33 @@ public actor SwanManagementPLCProvisioningRuntime:
                 await opener.discardActivatedAccountAdmission(
                     did: installation.account.did
                 )
+                throw PLCAccountActivationError.unavailable
+            }
+        }
+        if liveAccountDirectory != nil, let lifecycleEmitter {
+            do {
+                guard let intent = try await controlDatabase
+                    .plcAccountPreparationIntent(requestID: input.requestID),
+                      intent.stage == .submitted,
+                      intent.did == installation.account.did,
+                      intent.canonicalHandle == installation.account.canonicalHandle
+                else {
+                    throw PLCAccountActivationError.unavailable
+                }
+                try await lifecycleEmitter.emitActivation(
+                    did: installation.account.did,
+                    operationID: input.requestID,
+                    plcOperationCID: intent.operationCID,
+                    handle: installation.account.canonicalHandle,
+                    materialTime: installation.account.createdAt,
+                    now: Date()
+                )
+            } catch let error as PLCAccountActivationError {
+                throw error
+            } catch {
+                // Admission and account installation are already durable.
+                // Return the retryable management closure; an exact retry
+                // reuses both and converges through emitter source-key dedupe.
                 throw PLCAccountActivationError.unavailable
             }
         }

@@ -26,6 +26,16 @@ services:
       - /run/secrets/swan-runtime/account-kek
       - --public-account-kek-id
       - primary
+      - --management-port
+      - "3001"
+      - --management-operator-secret-file
+      - /run/secrets/swan-runtime/operator-secret
+      - --enable-management-plc-provisioning
+      - --enable-management-firehose-sync
+      - --management-account-kek-file
+      - /run/secrets/swan-runtime/account-kek
+      - --management-account-kek-id
+      - primary
       - --enable-public-firehose
       - --oauth-server-key-file
       - /run/secrets/swan-runtime/oauth-server-key

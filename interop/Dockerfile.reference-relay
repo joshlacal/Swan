@@ -7,6 +7,7 @@ COPY .interop-cache/indigo-vendor-8b43a326dbbb394f63b6d68761553cdfe25532de/indig
 COPY interop/reference-relay-overlay/reference-relay-private-upstream.patch /tmp/reference-relay-private-upstream.patch
 COPY interop/apply-reference-relay-overlay.go /tmp/apply-reference-relay-overlay.go
 COPY interop/reference-relay-healthcheck.go /tmp/reference-relay-healthcheck.go
+COPY interop/reference-relay-capture.go /tmp/reference-relay-capture.go
 
 # The source, module closure, and narrow lab-only overlay are verified before
 # extraction. BuildKit networking stays disabled for every build action.
@@ -21,11 +22,13 @@ RUN --network=none echo "bc6f57e6211560220ac49dc7d6b55c5a43291f1e1193113ce413ffe
     && ! grep -q 'ssrf\.PublicOnlyDialer' /src/cmd/relay/relay/slurper.go \
     && cd /src \
     && go build -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags "-static"' -o /out/reference-relay ./cmd/relay \
-    && go build -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags "-static"' -o /out/reference-relay-healthcheck /tmp/reference-relay-healthcheck.go
+    && go build -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags "-static"' -o /out/reference-relay-healthcheck /tmp/reference-relay-healthcheck.go \
+    && go build -tags 'timetzdata netgo osusergo sqlite_omit_load_extension' -ldflags '-linkmode external -extldflags "-static"' -o /out/reference-relay-capture /tmp/reference-relay-capture.go
 
 FROM docker.io/library/golang@sha256:727cfc3c40be55cd1bc9a4a059406b28a059857e3be752aa9d09531e12c20c56
 COPY --from=build /out/reference-relay /usr/local/bin/reference-relay
 COPY --from=build /out/reference-relay-healthcheck /usr/local/bin/reference-relay-healthcheck
+COPY --from=build /out/reference-relay-capture /usr/local/bin/reference-relay-capture
 RUN --network=none mkdir /data && chown 65532:65532 /data && chmod 0700 /data
 USER 65532:65532
 WORKDIR /data

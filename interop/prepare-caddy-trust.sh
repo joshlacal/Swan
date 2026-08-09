@@ -20,7 +20,9 @@ if [ ! -s "$system_bundle" ]; then
     exit 1
 fi
 
-install -d -o swan -g swan -m 0700 "$trust_directory"
+# The trust volume contains public CA material and is shared with reference
+# services that deliberately run under non-Swan UIDs.
+install -d -o root -g root -m 0755 "$trust_directory"
 install -o swan -g swan -m 0444 "$source_certificate" "$destination_certificate"
 temporary_bundle="$(mktemp "$trust_directory/.ca-certificates.XXXXXX")"
 cat "$system_bundle" > "$temporary_bundle"

@@ -289,9 +289,14 @@ public actor SQLitePreMigratedAccountDirectory:
                 return
             }
             try? await database.close()
-            throw SwanError.unavailable(
-                "authenticated space directory is unavailable"
-            )
+            guard !isClosed,
+                  !permanentlyRevokedDIDs.contains(did),
+                  databases[did] === installed else {
+                throw SwanError.unavailable(
+                    "authenticated space directory is unavailable"
+                )
+            }
+            return
         }
         let account: AccountControlAccount
         do {
@@ -382,9 +387,14 @@ public actor SQLitePreMigratedAccountDirectory:
                 return
             }
             try? await database.close()
-            throw SwanError.unavailable(
-                "authenticated space directory is unavailable"
-            )
+            guard !isClosed,
+                  !permanentlyRevokedDIDs.contains(did),
+                  databases[did] === installed else {
+                throw SwanError.unavailable(
+                    "authenticated space directory is unavailable"
+                )
+            }
+            return
         }
         databases[did] = database
         publicReadGenerations[did] = publicGeneration

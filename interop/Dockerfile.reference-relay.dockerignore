@@ -25,3 +25,4 @@
 !interop/reference-relay-overlay/reference-relay-private-upstream.patch
 !interop/apply-reference-relay-overlay.go
 !interop/reference-relay-healthcheck.go
+!interop/reference-relay-capture.go

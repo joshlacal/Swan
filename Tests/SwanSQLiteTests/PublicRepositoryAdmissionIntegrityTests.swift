@@ -337,6 +337,99 @@ final class PublicRepositoryAdmissionIntegrityTests: XCTestCase {
         }
     }
 
+    // A process restart bootstraps actor A from the durable active account.
+    // An exact management activation retry opens actor B for that same
+    // canonical DID/path. Admission must close B and preserve A as a
+    // successful idempotent replay, while still rejecting mismatched inputs.
+    func testRestartedDirectoryIdempotentlyAdmitsCanonicalRetryOnly()
+        async throws
+    {
+        let root = try temporaryDirectory(label: "restart-admission-retry")
+        let foreignRoot = try temporaryDirectory(label: "restart-admission-foreign")
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: foreignRoot)
+        }
+        try await installEmptyDatabase(root: root, did: alice)
+        try await installEmptyDatabase(root: root, did: bob)
+        try await installEmptyDatabase(root: foreignRoot, did: alice)
+        let control = try await activeControlStore(
+            root: root,
+            did: alice,
+            handle: "alice.example.com",
+            genesisCID: nil
+        )
+        let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+            dataDirectory: root,
+            controlStore: control,
+            publicIdentityVerifier: nil
+        )
+        let bootstrappedStore = await directory
+            .preopenedPublicMutationStore(did: alice)
+        let installed = try XCTUnwrap(
+            bootstrappedStore as? SQLiteAccountDatabase
+        )
+
+        let canonicalRetry = try await SQLiteAccountDatabase(
+            dataDirectory: root,
+            did: alice
+        )
+        let canonicalRetryResult = await admissionResult(
+            directory: directory,
+            admission: .init(did: alice, database: canonicalRetry)
+        )
+        let canonicalRetryStore = await directory
+            .preopenedPublicMutationStore(did: alice)
+        let afterCanonicalRetry = try XCTUnwrap(
+            canonicalRetryStore as? SQLiteAccountDatabase
+        )
+        XCTAssertTrue(afterCanonicalRetry === installed)
+        if case .success = canonicalRetryResult {
+            do {
+                _ = try await canonicalRetry.loadPublicRepositoryState()
+                XCTFail("the redundant retry actor must be closed")
+            } catch {}
+        }
+
+        let wrongDID = try await SQLiteAccountDatabase(
+            dataDirectory: root,
+            did: bob
+        )
+        let wrongDIDResult = await admissionResult(
+            directory: directory,
+            admission: .init(did: alice, database: wrongDID)
+        )
+        assertUnavailable(wrongDIDResult)
+
+        let wrongRoot = try await SQLiteAccountDatabase(
+            dataDirectory: foreignRoot,
+            did: alice
+        )
+        let wrongRootResult = await admissionResult(
+            directory: directory,
+            admission: .init(did: alice, database: wrongRoot)
+        )
+        assertUnavailable(wrongRootResult)
+
+        let afterRejectedStore = await directory
+            .preopenedPublicMutationStore(did: alice)
+        let afterRejectedInputs = try XCTUnwrap(
+            afterRejectedStore as? SQLiteAccountDatabase
+        )
+        XCTAssertTrue(afterRejectedInputs === installed)
+        _ = try await installed.loadPublicRepositoryState()
+
+        try await directory.close()
+        try? await canonicalRetry.close()
+        try? await wrongDID.close()
+        try? await wrongRoot.close()
+        try await control.close()
+
+        if case let .failure(error) = canonicalRetryResult {
+            XCTFail("canonical restart retry must succeed, got \(error)")
+        }
+    }
+
     // Production mutation caught: activation validates the supplied database
     // internally but never binds its account DID to the admission DID.
     func testActivatedAccountAdmissionRejectsDatabaseBoundToDifferentDID()
