@@ -19,6 +19,8 @@ override_names=(
   SWAN_INTEROP_REFERENCE_RELAY_OVERLAY_PATCH
   SWAN_INTEROP_REFERENCE_RELAY_OVERLAY_APPLY
   SWAN_INTEROP_REFERENCE_RELAY_TOXIPROXY_CONFIG_FILE
+  SWAN_INTEROP_PUBLIC_FIREHOSE_ROUTE
+  SWAN_INTEROP_BOOTSTRAP_SCRIPT
 )
 for override_name in "${override_names[@]}"; do
   if [[ -n "${!override_name:-}" ]] \
@@ -58,6 +60,8 @@ relay_caddyfile="interop/Caddyfile.reference-relay"
 relay_caddy_dockerfile="interop/Dockerfile.caddy.reference-relay"
 relay_toxiproxy_config="${SWAN_INTEROP_REFERENCE_RELAY_TOXIPROXY_CONFIG_FILE:-interop/toxiproxy.reference-relay.json}"
 relay_toxiproxy_dockerfile="interop/Dockerfile.toxiproxy.reference-relay"
+public_firehose_route="${SWAN_INTEROP_PUBLIC_FIREHOSE_ROUTE:-Sources/SwanHTTP/PublicFirehoseStreamingRoute.swift}"
+bootstrap_script="${SWAN_INTEROP_BOOTSTRAP_SCRIPT:-interop/bootstrap-local-space.sh}"
 
 for required_file in \
   "$compose_file" \
@@ -88,7 +92,9 @@ for required_file in \
   "$relay_caddyfile" \
   "$relay_caddy_dockerfile" \
   "$relay_toxiproxy_config" \
-  "$relay_toxiproxy_dockerfile"
+  "$relay_toxiproxy_dockerfile" \
+  "$public_firehose_route" \
+  "$bootstrap_script"
 do
   if [[ ! -f "$required_file" ]]; then
     echo "interop verifier input is missing: ${required_file}" >&2
@@ -380,6 +386,41 @@ for relay_preflight in './interop/verify-reference-indigo.sh' './interop/verify-
     echo "relay override Compose preflight must verify pinned Indigo source and vendor" >&2
     exit 1
   fi
+done
+
+public_firehose_route_contents="$(<"$public_firehose_route")"
+for required_observation_event in \
+  '"swan.public_firehose.subscribe_repos.open"' \
+  '"swan.public_firehose.subscribe_repos.close"'
+do
+  require_contains \
+    "$public_firehose_route_contents" \
+    "$required_observation_event" \
+    "relay subscription observation contract is missing"
+done
+
+bootstrap_script_contents="$(<"$bootstrap_script")"
+for required_fresh_account_input in \
+  '--request-id)' \
+  '--handle)' \
+  '--password-file)' \
+  '--account-label)' \
+  '--identity-file)'
+do
+  require_contains \
+    "$bootstrap_script_contents" \
+    "$required_fresh_account_input" \
+    "fresh-account bootstrap input contract is missing"
+done
+for required_fresh_account_safety in \
+  'require_explicit_password_file' \
+  'require_explicit_identity_file' \
+  'require_owner_only_directory'
+do
+  require_contains \
+    "$bootstrap_script_contents" \
+    "$required_fresh_account_safety" \
+    "fresh-account bootstrap safety contract is missing"
 done
 
 for service in \

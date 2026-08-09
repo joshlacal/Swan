@@ -38,7 +38,8 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
   private func makeFixture(
     limits: PublicFirehoseStreamingLimits? = nil,
     includeRuntime: Bool = true,
-    port: Int = 3_000
+    port: Int = 3_000,
+    observeSubscription: @escaping @Sendable (PublicFirehoseSubscriptionObservation) async -> Void = { _ in }
   ) async throws -> Fixture {
     let root = FileManager.default.temporaryDirectory
       .appending(path: "swan-firehose-http-\(UUID().uuidString)")
@@ -66,7 +67,8 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
           database: firehose,
           hub: hub,
           limits: limits ?? PublicFirehoseStreamingLimits.standard,
-          logger: logger
+          logger: logger,
+          observeSubscription: observeSubscription
         )
       } else {
         streamingRuntime = nil
@@ -152,6 +154,66 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
     func snapshot() -> [WebSocketDataFrame] {
       frames
     }
+  }
+
+  private actor SubscriptionObservationRecorder {
+    private var observations: [PublicFirehoseSubscriptionObservation] = []
+    private var waiters: [
+      (count: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+
+    func record(_ observation: PublicFirehoseSubscriptionObservation) {
+      observations.append(observation)
+      var remaining: [
+        (count: Int, continuation: CheckedContinuation<Void, Never>)
+      ] = []
+      for waiter in waiters {
+        if observations.count >= waiter.count {
+          waiter.continuation.resume()
+        } else {
+          remaining.append(waiter)
+        }
+      }
+      waiters = remaining
+    }
+
+    func waitForCount(_ count: Int) async {
+      if observations.count >= count { return }
+      await withCheckedContinuation { continuation in
+        waiters.append((count, continuation))
+      }
+    }
+
+    func snapshot() -> [PublicFirehoseSubscriptionObservation] {
+      observations
+    }
+  }
+
+  private func assertSubscriptionObservations(
+    _ observations: [PublicFirehoseSubscriptionObservation],
+    cursorMode: PublicFirehoseSubscriptionObservation.CursorMode,
+    cursorValue: Int64?,
+    closeCategory: PublicFirehoseSubscriptionObservation.CloseCategory,
+    closeReason: PublicFirehoseSubscriptionObservation.CloseReason,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) {
+    XCTAssertEqual(observations.count, 2, file: file, line: line)
+    guard observations.count == 2 else { return }
+    let opened = observations[0]
+    let closed = observations[1]
+    XCTAssertEqual(opened.event, .opened, file: file, line: line)
+    XCTAssertEqual(opened.cursorMode, cursorMode, file: file, line: line)
+    XCTAssertEqual(opened.cursorValue, cursorValue, file: file, line: line)
+    XCTAssertNil(opened.closeCategory, file: file, line: line)
+    XCTAssertNil(opened.closeReason, file: file, line: line)
+    XCTAssertEqual(closed.event, .closed, file: file, line: line)
+    XCTAssertEqual(closed.connectionID, opened.connectionID, file: file, line: line)
+    XCTAssertEqual(closed.closeCategory, closeCategory, file: file, line: line)
+    XCTAssertEqual(closed.closeReason, closeReason, file: file, line: line)
+    XCTAssertNil(closed.cursorMode, file: file, line: line)
+    XCTAssertNil(closed.cursorValue, file: file, line: line)
+    XCTAssertNotNil(UUID(uuidString: opened.connectionID), file: file, line: line)
   }
 
   /// Captures the ephemeral port handed to `onServerRunning` when a fixture
@@ -655,7 +717,10 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
   // MARK: - Cursor semantics and slow consumer
 
   func testSubscribeReposNoCursorStreamsLiveOnly() async throws {
-    let fixture = try await makeFixture()
+    let observations = SubscriptionObservationRecorder()
+    let fixture = try await makeFixture(observeSubscription: {
+      await observations.record($0)
+    })
     defer { try? FileManager.default.removeItem(at: fixture.root) }
     do {
       // Seeded before connect: `maxSequencedSeq()` at connect is 3, so the
@@ -708,6 +773,14 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
           delivered,
           stored.map(\.frameBytes),
           "exactly the 2 live events must arrive, in order"
+        )
+        await observations.waitForCount(2)
+        await self.assertSubscriptionObservations(
+          observations.snapshot(),
+          cursorMode: .live,
+          cursorValue: nil,
+          closeCategory: .completed,
+          closeReason: .clientClosed
         )
       }
       try await fixture.control.close()
@@ -771,7 +844,10 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
   }
 
   func testSubscribeReposBackfillThenLiveBoundaryNoGapNoDuplicate() async throws {
-    let fixture = try await makeFixture()
+    let observations = SubscriptionObservationRecorder()
+    let fixture = try await makeFixture(observeSubscription: {
+      await observations.record($0)
+    })
     defer { try? FileManager.default.removeItem(at: fixture.root) }
     do {
       for index in 1 ... 5 {
@@ -820,6 +896,14 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
           delivered,
           backfillBytes + liveSix.map(\.frameBytes),
           "backfill 4, 5 then live 6 with no gap and no duplicate"
+        )
+        await observations.waitForCount(2)
+        await self.assertSubscriptionObservations(
+          observations.snapshot(),
+          cursorMode: .backfill,
+          cursorValue: 3,
+          closeCategory: .completed,
+          closeReason: .clientClosed
         )
       }
       try await fixture.control.close()
@@ -884,7 +968,10 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
   }
 
   func testSubscribeReposFutureCursorErrorFrameAndClose() async throws {
-    let fixture = try await makeFixture()
+    let observations = SubscriptionObservationRecorder()
+    let fixture = try await makeFixture(observeSubscription: {
+      await observations.record($0)
+    })
     defer { try? FileManager.default.removeItem(at: fixture.root) }
     do {
       try await self.appendCommit(
@@ -914,6 +1001,14 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
         try self.assertErrorFrame(frames[0], error: "FutureCursor")
         let closeFrame = try await self.awaitWithDeadline { try await wsTask.value }
         XCTAssertEqual(closeFrame?.closeCode, .normalClosure)
+        await observations.waitForCount(2)
+        await self.assertSubscriptionObservations(
+          observations.snapshot(),
+          cursorMode: .backfill,
+          cursorValue: 13,
+          closeCategory: .failure,
+          closeReason: .futureCursor
+        )
       }
       try await fixture.control.close()
       try await fixture.firehose.close()
@@ -1343,7 +1438,11 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
   /// `RawTestClient` below reproduces that same wrapper locally, purely to
   /// reach `TestClientProtocol`'s `.ws(...)` helper.
   func testPublicFirehoseGracefulShutdownSendsNormalCloseFrame() async throws {
-    let fixture = try await makeFixture(port: 0)
+    let observations = SubscriptionObservationRecorder()
+    let fixture = try await makeFixture(
+      port: 0,
+      observeSubscription: { await observations.record($0) }
+    )
     defer { try? FileManager.default.removeItem(at: fixture.root) }
     do {
       let portBox = PortBox()
@@ -1372,6 +1471,71 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
       let closeFrame = try await awaitWithDeadline { try await wsTask.value }
       XCTAssertEqual(closeFrame?.closeCode, .normalClosure)
       _ = try await serviceTask.value
+      await observations.waitForCount(2)
+      await self.assertSubscriptionObservations(
+        observations.snapshot(),
+        cursorMode: .live,
+        cursorValue: nil,
+        closeCategory: .completed,
+        closeReason: .clientClosed
+      )
+      try await fixture.control.close()
+      try await fixture.firehose.close()
+    } catch {
+      try? await fixture.control.close()
+      try? await fixture.firehose.close()
+      throw error
+    }
+  }
+
+  /// Cancelling the service task closes the handler's channel input through
+  /// Hummingbird's cancellation hook. This is distinct from graceful
+  /// shutdown, whose normal close handshake completes the inbound stream.
+  func testPublicFirehoseServiceCancellationIsObservedAsCancellation() async throws {
+    let observations = SubscriptionObservationRecorder()
+    let fixture = try await makeFixture(
+      port: 0,
+      observeSubscription: { await observations.record($0) }
+    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let portBox = PortBox()
+      let quietLogger = Logger(
+        label: "PublicFirehoseStreamingHTTPTests.service-cancellation",
+        factory: SwiftLogNoOpLogHandler.init
+      )
+      let application = fixture.server.buildApplication(
+        logger: quietLogger,
+        onServerRunning: { channel in
+          await portBox.set(channel.localAddress?.port)
+        }
+      )
+      let serviceGroup = SwanHTTPServiceLifecycle.makeServiceGroup(
+        services: [application],
+        logger: quietLogger
+      )
+      let serviceTask = Task { try await serviceGroup.run() }
+      let port = try await portBox.wait()
+      let client = RawTestClient(port: port)
+
+      let wsTask = Task {
+        try await client.ws(self.subscribePath) { inbound, _, _ in
+          for try await _ in inbound {}
+        }
+      }
+      try await waitUntil { await fixture.hub.subscriberCount() == 1 }
+      serviceTask.cancel()
+
+      _ = try? await awaitWithDeadline { try await wsTask.value }
+      _ = try? await serviceTask.value
+      await observations.waitForCount(2)
+      await self.assertSubscriptionObservations(
+        observations.snapshot(),
+        cursorMode: .live,
+        cursorValue: nil,
+        closeCategory: .cancellation,
+        closeReason: .serverShutdown
+      )
       try await fixture.control.close()
       try await fixture.firehose.close()
     } catch {

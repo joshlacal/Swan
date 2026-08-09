@@ -724,5 +724,40 @@ mutate_file_and_require_rejection \
   SWAN_INTEROP_SWAN_DOCKERIGNORE \
   'the Swan image build context must allow only the pinned Indigo source and vendor archives'
 
+# Phase 5 acceptance must not silently regress to inferring a relay connection
+# or reusing one of the two fixed bootstrap identities. These mutations guard
+# only Task 6A's observation and fresh-account input prerequisites.
+mutate_file_and_require_rejection \
+  missing-relay-subscription-open-observation \
+  Sources/SwanHTTP/PublicFirehoseStreamingRoute.swift \
+  'swan.public_firehose.subscribe_repos.open' \
+  'swan.public_firehose.subscribe_repos.open.disabled' \
+  SWAN_INTEROP_PUBLIC_FIREHOSE_ROUTE \
+  'relay subscription observation contract is missing'
+
+mutate_file_and_require_rejection \
+  missing-relay-subscription-close-observation \
+  Sources/SwanHTTP/PublicFirehoseStreamingRoute.swift \
+  'swan.public_firehose.subscribe_repos.close' \
+  'swan.public_firehose.subscribe_repos.close.disabled' \
+  SWAN_INTEROP_PUBLIC_FIREHOSE_ROUTE \
+  'relay subscription observation contract is missing'
+
+mutate_file_and_require_rejection \
+  missing-fresh-account-request-id-input \
+  interop/bootstrap-local-space.sh \
+  '--request-id)' \
+  '--request-id-disabled)' \
+  SWAN_INTEROP_BOOTSTRAP_SCRIPT \
+  'fresh-account bootstrap input contract is missing'
+
+mutate_file_and_require_rejection \
+  missing-fresh-account-identity-file-input \
+  interop/bootstrap-local-space.sh \
+  '--identity-file)' \
+  '--identity-file-disabled)' \
+  SWAN_INTEROP_BOOTSTRAP_SCRIPT \
+  'fresh-account bootstrap input contract is missing'
+
 ./Scripts/test-bootstrap-local-space.sh
 echo "INTEROP LAB VERIFIER MUTATION TESTS OK"
