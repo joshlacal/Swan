@@ -128,14 +128,16 @@ compiled source tree is identical. Toolchain: Apple Swift 6.4
   search-path warnings from the `petrel` dependency; none from Swan source).
 - Step 1, lifecycle idempotence regression, 25 separate process invocations of
   `xcrun swift test --skip-build --filter PublicLifecycleEmitterTests`: every
-  run exit 0, executed 42, failures 0, skips 0 (25/25 identical).
+  run exit 0, executed 14 (class-suite summary), failures 0, skips 0
+  (25/25 identical).
 - Step 2, focused suites (`--skip-build`, sequential; exit 0 / failures 0 /
-  skips 0 for every suite): PublicLifecycleEmitterTests 42,
-  LifecycleEventOutboxStoreTests 60, PublicFirehoseOutboxStoreTests 57,
-  PublicFirehoseCommitEnqueueTests 30, PublicFirehoseSequencerTests 54,
-  AccountAuthorizationLeaseTests 12, PLCAccountRotationServiceTests 12,
-  PLCAccountPreparationServiceTests 33, AccountOperatorServiceTests 27,
-  PublicRepositoryMutationHTTPTests 60.
+  skips 0 for every suite; class-suite executed counts):
+  PublicLifecycleEmitterTests 14, LifecycleEventOutboxStoreTests 20,
+  PublicFirehoseOutboxStoreTests 19, PublicFirehoseCommitEnqueueTests 10,
+  PublicFirehoseSequencerTests 18, AccountAuthorizationLeaseTests 4,
+  PLCAccountRotationServiceTests 4, PLCAccountPreparationServiceTests 11
+  (the file's other class, PLCAccountActivationServiceTests, is outside the
+  filter), AccountOperatorServiceTests 9, PublicRepositoryMutationHTTPTests 20.
 - Step 3 `xcrun swift build`: exit 0, warnings 2 (same pkg-config pair).
 - Step 4 full unfiltered `xcrun swift test`: exit 0; 3,993 XCTest tests, 0
   failures, 0 skipped; 6 Swift Testing tests, 0 failures.
@@ -147,11 +149,18 @@ compiled source tree is identical. Toolchain: Apple Swift 6.4
   `Scripts/public-wire-generation-common.sh`, `Sources/SwanPublicWire/`:
   zero changed-file rows.
 
-No flake occurred in any step. Receipt-transparency note: a first gate pass
-the same hour produced identical exit codes but its per-run count extraction
-read the wrong (empty) bundle summary line; steps 1–2 were re-executed with
-summed per-bundle counts and a zero-executed guard, and the receipts above are
-from that corrected run. Task 0's standalone reproduced-failure record was
+No flake occurred in any step. Receipt-transparency notes (two numeric
+corrections, both caught during the whole-branch review loop): a first gate
+pass the same hour produced identical exit codes but its per-run count
+extraction read the wrong (empty) bundle summary line, so steps 1–2 were
+re-executed with a zero-executed guard; that rerun's extraction then summed
+XCTest's three per-run summary levels (class suite, `.xctest` bundle,
+"Selected tests"), overstating every count by exactly 3x — the counts above
+are the class-suite summary values (verified directly, e.g.
+`Test Suite 'PublicLifecycleEmitterTests' passed … Executed 14 tests`), which
+is the correct extraction. Exit codes, 0-failure/0-skip results, nonzero
+execution, and 25/25 identical runs were unaffected by either extraction
+defect. Task 0's standalone reproduced-failure record was
 likewise never retained; the reproduction survives as the Task 1 RED
 regressions (activation/rotation retry with later invocation time, retry
 after sequencing with unchanged generation and global-event count) in
