@@ -93,7 +93,80 @@ stopped and the corrupted `.build/out` was moved aside, the suite ran clean.)
   directory. The scenario's own fresh-state guarantee (relay volume removal)
   was additionally enforced by the runner as designed.
 
-## 7. Still unproven / open gates
+## 7. Review remediation amendments (2026-08-10, whole-branch review findings)
+
+The independent whole-branch review returned REJECT on two record gaps (no
+code defects; every code-level invariant it tested held). This section
+remediates both, plus one minor reconciliation.
+
+### 7a. Completion-anchor storage/retention ruling (plan Task 1.5)
+
+Ruling: completed lifecycle batches and public-firehose source-key completion
+anchors are retained **indefinitely**. They exist as exact-replay idempotence
+and conflict-detection anchors: a retry after the global append has committed
+must still prove exact idempotence against the retained material, and exact
+source-key reuse with any non-time semantic difference must still fail closed
+as a conflict. Completed rows contain only already-public firehose material,
+so indefinite retention has no confidentiality cost. Pending scans, FIFO
+leasing, and sequencer selection all filter `completed = 0`; replay lookups
+intentionally do not. Any future pruning requires a separately designed
+tombstone that preserves the same conflict checks — a pruning change without
+that design must be rejected in review. Code contract:
+`SwanSQLite.migratePublicFirehoseCompletionAnchorsIfNeeded` and
+`LifecycleEventOutboxStore.completeLifecycleBatch` doc comments.
+
+### 7b. Task 3 corrective exit-gate receipts (re-executed)
+
+The corrective wave's original Task 3 gate receipts were not retained in the
+repository, so the gate was re-executed in full on 2026-08-10 (22:23–22:32 Z),
+foreground and sequential with no overlapping SwiftPM invocations, at commit
+`75f4684d` — whose only delta from `55aa5d51` is this record document; the
+compiled source tree is identical. Toolchain: Apple Swift 6.4
+(swiftlang-6.4.0.27.1). Literal receipts:
+
+- Step 0 `xcrun swift build --build-tests`: exit 0, warnings 2 (pkg-config
+  search-path warnings from the `petrel` dependency; none from Swan source).
+- Step 1, lifecycle idempotence regression, 25 separate process invocations of
+  `xcrun swift test --skip-build --filter PublicLifecycleEmitterTests`: every
+  run exit 0, executed 42, failures 0, skips 0 (25/25 identical).
+- Step 2, focused suites (`--skip-build`, sequential; exit 0 / failures 0 /
+  skips 0 for every suite): PublicLifecycleEmitterTests 42,
+  LifecycleEventOutboxStoreTests 60, PublicFirehoseOutboxStoreTests 57,
+  PublicFirehoseCommitEnqueueTests 30, PublicFirehoseSequencerTests 54,
+  AccountAuthorizationLeaseTests 12, PLCAccountRotationServiceTests 12,
+  PLCAccountPreparationServiceTests 33, AccountOperatorServiceTests 27,
+  PublicRepositoryMutationHTTPTests 60.
+- Step 3 `xcrun swift build`: exit 0, warnings 2 (same pkg-config pair).
+- Step 4 full unfiltered `xcrun swift test`: exit 0; 3,993 XCTest tests, 0
+  failures, 0 skipped; 6 Swift Testing tests, 0 failures.
+- Step 5 profile hash and generated-wire manifest checks: `verify-profile.sh`
+  exit 0 ("profile lexicons verified"); `verify-wire-generation.sh` and
+  `verify-public-wire-generation.sh` exit 0 ("verified without worktree
+  mutation") against the pinned generator workspace.
+- Step 6 protected-path diff `a9bbd311..55aa5d51` over `Profiles/`,
+  `Scripts/public-wire-generation-common.sh`, `Sources/SwanPublicWire/`:
+  zero changed-file rows.
+
+No flake occurred in any step. Receipt-transparency note: a first gate pass
+the same hour produced identical exit codes but its per-run count extraction
+read the wrong (empty) bundle summary line; steps 1–2 were re-executed with
+summed per-bundle counts and a zero-executed guard, and the receipts above are
+from that corrected run. Task 0's standalone reproduced-failure record was
+likewise never retained; the reproduction survives as the Task 1 RED
+regressions (activation/rotation retry with later invocation time, retry
+after sequencing with unchanged generation and global-event count) in
+`PublicLifecycleEmitterTests` and `PublicFirehoseOutboxStoreTests`.
+
+### 7c. Artifact field reconciliation
+
+The acceptance artifact intentionally emits digest-only fields (DID digest,
+`orderedKinds`, aggregate counts) instead of the plan's literal "ordered
+source keys" and per-commit five-commit deltas: the artifact policy is
+aggregate/digest-only with no DID, handle, path, or record value, and the
+per-commit deltas are proven inside the independent verifier's
+`repository_commits` check rather than serialized into the artifact.
+
+## 8. Still unproven / open gates
 
 - **Independent whole-branch review** of the Phase 4 corrective + Phase 5
   work: OPEN. Phase 5 may not be called complete until it passes.
