@@ -178,7 +178,34 @@ per-commit deltas are proven inside the independent verifier's
 ## 8. Still unproven / open gates
 
 - **Independent whole-branch review** of the Phase 4 corrective + Phase 5
-  work: OPEN. Phase 5 may not be called complete until it passes.
+  work: **CLOSED — PASSED 2026-08-10.** Two independent reviewers examined
+  range `f49fdb69..55aa5d51` plus this record. The first found no Critical
+  findings and no code defects, verifying and accepting the completion-anchor
+  semantics, both rotation TOCTOU closures, lock ordering, absence of network
+  I/O inside SQLite transactions, indigo pin custody, overlay-patch
+  containment, Compose topology constraints, the relay verifier performing
+  real cryptographic/structural computation, the fail-closed `getRepo?since`
+  branch, artifact secrecy hygiene, protected-path byte-identity, and that no
+  existing test was weakened. Its findings were three record gaps, all
+  remediated here: the retention ruling (§7a), the Task 3 gate receipts (§7b),
+  the artifact-field reconciliation (§7c), and a 3x test-count extraction
+  defect in §7b corrected to class-suite values. The closing reviewer
+  independently re-derived all ten per-class counts (14/20/19/10/18/4/4/11/9/20,
+  including the two-class `PLCAccountPreparationServiceTests` discriminating
+  case), confirmed the correction commit is documentation-only, judged the
+  receipt-transparency disclosure complete and its unaffected-results reasoning
+  sound, confirmed no open-gate statement was weakened across the amendments,
+  and re-verified the artifact digest and mode. Verdict: ACCEPT, with no
+  findings. Non-blocking follow-ups recorded by the first reviewer and not
+  remediated here: `emitReactivationSync` takes material time from the
+  invocation clock (convergence currently relies on `reactivate()` minting a
+  fresh operationID per call; a durable-operationID change plus a
+  reactivation-retry RED test is suggested), `matchExactFirehoseReplay`'s
+  catch-all can label a cancelled retry as `corruptDatabase` in logs (no
+  durable harm; the transaction still rolls back), and the artifact's
+  `relay*`/`swan*` final-repository field naming implies two independent
+  measurements where one CAR inspection plus verifier/`getLatestCommit`
+  cross-checks are what actually back it.
 - Public Linux deployment: no Linux-native execution of the relay acceptance
   scenario; all runtime proof above is macOS/colima (linux/arm64 containers).
 - `bsky.network` / real-crawler interoperability: unproven; only the pinned
