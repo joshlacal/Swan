@@ -329,11 +329,16 @@ private func handleSwanXRPCPipethrough(
         )
 
         // 3. Routing. `.denied`/`.unrouted` are 404; a malformed proxy header
-        //    is 400 and never silently becomes the default AppView.
+        //    is 400 and never silently becomes the default AppView. Header
+        //    extraction is deliberately outside the inner `do`: an unusable
+        //    header must reach the 400 path, not the routing failure switch.
+        let proxyHeader = try pipethroughProxyHeader(request.headers)
         let route: SwanXRPCProxyRoute
         do {
-            route = try SwanXRPCProxyRouter(appViewDID: capability.appView.did)
-                .route(nsid: nsid, proxyHeader: pipethroughProxyHeader(request.headers))
+            route = try SwanXRPCProxyRouter(
+                appViewDID: capability.appView.did,
+                appViewServiceFragment: capability.appView.serviceFragment
+            ).route(nsid: nsid, proxyHeader: proxyHeader)
         } catch let failure as SwanXRPCProxyRoutingFailure {
             switch failure {
             case .denied, .unrouted:
@@ -442,11 +447,26 @@ func pipethroughNSID(from path: String) -> String? {
     return candidate
 }
 
-private func pipethroughProxyHeader(_ headers: HTTPFields) -> String? {
+/// Reads the single `atproto-proxy` header, distinguishing "absent" from
+/// "sent more than once".
+///
+/// `HTTPFields[values:]` returns one entry per header line and does not
+/// comma-split, so a `nil` for `count > 1` would mean "absent" and let a
+/// request carrying two conflicting `atproto-proxy` lines fall through to the
+/// default AppView route — forwarding the account's traffic to a service the
+/// client did not unambiguously name. That is the same silent fallback the
+/// malformed-header path exists to prevent, so a duplicate is a 400.
+private func pipethroughProxyHeader(_ headers: HTTPFields) throws -> String? {
     guard let name = HTTPField.Name("atproto-proxy") else { return nil }
     let values = headers[values: name]
-    guard values.count == 1 else { return nil }
-    return values[0]
+    switch values.count {
+    case 0:
+        return nil
+    case 1:
+        return values[0]
+    default:
+        throw SwanXRPCPipethroughFailure.invalidRequest
+    }
 }
 
 private func authorizedPipethroughSubject(

@@ -44,9 +44,16 @@ public struct SwanXRPCProxyRouter: Sendable {
     private static let appViewPrefix = "app.bsky."
 
     private let appViewDID: String
+    private let appViewServiceFragment: String
 
-    public init(appViewDID: String) {
+    /// Both halves of the configured AppView's service reference are required.
+    /// There is deliberately no default for the fragment: the configuration
+    /// shortcut below is only sound when the client named *this* service, and
+    /// a defaulted fragment would let a call site silently keep the older
+    /// DID-only match.
+    public init(appViewDID: String, appViewServiceFragment: String) {
         self.appViewDID = appViewDID
+        self.appViewServiceFragment = appViewServiceFragment
     }
 
     public func route(nsid: String, proxyHeader: String?) throws -> SwanXRPCProxyRoute {
@@ -57,7 +64,15 @@ public struct SwanXRPCProxyRouter: Sendable {
         }
         if let proxyHeader {
             let (did, fragment) = try Self.parseProxyHeader(proxyHeader)
-            if did == appViewDID { return .configuredAppView(did: did) }
+            // The configured-endpoint shortcut applies only when the client
+            // named the exact service Swan has an endpoint for. Matching on the
+            // DID alone would send a request for, say,
+            // `did:web:api.bsky.app#atproto_labeler` to the AppView — a service
+            // the client did not ask for. A different fragment at the same DID
+            // takes the resolve path, where the DID document decides.
+            if did == appViewDID, fragment == appViewServiceFragment {
+                return .configuredAppView(did: did)
+            }
             return .resolvedService(did: did, fragment: fragment)
         }
         guard nsid.hasPrefix(Self.appViewPrefix) else {

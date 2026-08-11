@@ -348,6 +348,173 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(sender.recorded().count, 0)
     }
 
+    /// `HTTPFields[values:]` yields one entry per header line, so a request
+    /// carrying two `atproto-proxy` lines is ambiguous, not absent. Treating it
+    /// as absent would drop it onto the default `app.bsky.` route and forward
+    /// the account's traffic to the AppView — the exact silent fallback the
+    /// malformed-header rule exists to prevent.
+    func testDuplicateProxyHeaderIsRejectedWithoutContactingUpstream() async throws {
+        let sender = RecordingProxySender()
+        let headers: HTTPFields = {
+            var headers = HTTPFields()
+            let name = HTTPField.Name("atproto-proxy")!
+            headers.append(HTTPField(name: name, value: "did:web:feeds.example#bsky_fg"))
+            headers.append(HTTPField(name: name, value: "did:web:feeds.example#bsky_fg"))
+            return headers
+        }()
+        try await withPipethrough(sender: sender) { client in
+            try await client.execute(
+                uri: "/xrpc/app.bsky.feed.getFeedSkeleton",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest)
+            }
+        }
+        XCTAssertEqual(sender.recorded().count, 0)
+    }
+
+    /// Two *conflicting* lines must fail the same way; there is no
+    /// "first one wins" or "last one wins" here.
+    func testConflictingDuplicateProxyHeadersAreRejected() async throws {
+        let sender = RecordingProxySender()
+        let headers: HTTPFields = {
+            var headers = HTTPFields()
+            let name = HTTPField.Name("atproto-proxy")!
+            headers.append(HTTPField(name: name, value: "did:web:a.example#bsky_fg"))
+            headers.append(HTTPField(name: name, value: "did:web:b.example#bsky_fg"))
+            return headers
+        }()
+        try await withPipethrough(sender: sender) { client in
+            try await client.execute(
+                uri: "/xrpc/app.bsky.feed.getFeedSkeleton",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest)
+            }
+        }
+        XCTAssertEqual(sender.recorded().count, 0)
+    }
+
+    /// The configured-endpoint shortcut is keyed on DID *and* fragment, so a
+    /// client naming a different service at the AppView's own DID is not
+    /// silently handed the AppView. Here the AppView's DID document has no
+    /// `#atproto_labeler` entry, so it fails closed at 400 rather than being
+    /// answered by a service the client did not ask for.
+    func testDifferentFragmentAtTheAppViewDIDIsNotSilentlyTheAppView() async throws {
+        let sender = RecordingProxySender()
+        let documents = StubDIDDocuments(
+            documents: [
+                "did:web:api.bsky.app": Data(
+                    """
+                    {"id":"did:web:api.bsky.app","service":[
+                      {"id":"#bsky_appview","type":"BskyAppView",
+                       "serviceEndpoint":"https://api.bsky.app"}]}
+                    """.utf8
+                )
+            ]
+        )
+        let headers: HTTPFields = {
+            var headers = HTTPFields()
+            headers[HTTPField.Name("atproto-proxy")!] = "did:web:api.bsky.app#atproto_labeler"
+            return headers
+        }()
+        try await withPipethrough(sender: sender, documents: documents) { client in
+            try await client.execute(
+                uri: "/xrpc/app.bsky.feed.getTimeline",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest)
+            }
+        }
+        XCTAssertEqual(sender.recorded().count, 0)
+    }
+
+    /// A different fragment at the AppView DID that *does* resolve goes to the
+    /// service the client named, not to the configured AppView URL.
+    func testDifferentFragmentAtTheAppViewDIDResolvesToTheNamedService() async throws {
+        let sender = RecordingProxySender()
+        let documents = StubDIDDocuments(
+            documents: [
+                "did:web:api.bsky.app": Data(
+                    """
+                    {"id":"did:web:api.bsky.app","service":[
+                      {"id":"#bsky_appview","type":"BskyAppView",
+                       "serviceEndpoint":"https://api.bsky.app"},
+                      {"id":"#atproto_labeler","type":"AtprotoLabeler",
+                       "serviceEndpoint":"https://labeler.bsky.app"}]}
+                    """.utf8
+                )
+            ]
+        )
+        let headers: HTTPFields = {
+            var headers = HTTPFields()
+            headers[HTTPField.Name("atproto-proxy")!] = "did:web:api.bsky.app#atproto_labeler"
+            return headers
+        }()
+        try await withPipethrough(sender: sender, documents: documents) { client in
+            try await client.execute(
+                uri: "/xrpc/app.bsky.feed.getTimeline",
+                method: .get,
+                headers: headers
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+        let outbound = try XCTUnwrap(sender.recorded().first)
+        XCTAssertEqual(outbound.url.host, "labeler.bsky.app")
+    }
+
+    /// `--appview-service-fragment` is load-bearing, not inert: an operator who
+    /// configures a different fragment changes which service reference takes
+    /// the no-resolution shortcut.
+    func testConfiguredServiceFragmentSelectsTheShortcut() async throws {
+        let sender = RecordingProxySender()
+        let appView = try SwanAppViewConfiguration(
+            did: "did:web:api.bsky.app",
+            url: URL(string: "https://api.bsky.app")!,
+            serviceFragment: "custom_appview"
+        )
+        let matching: HTTPFields = {
+            var headers = HTTPFields()
+            headers[HTTPField.Name("atproto-proxy")!] = "did:web:api.bsky.app#custom_appview"
+            return headers
+        }()
+        try await withPipethrough(sender: sender, appView: appView) { client in
+            // Matches the configured fragment: answered from configuration,
+            // with no DID document available at all (the stub is empty).
+            try await client.execute(
+                uri: "/xrpc/app.bsky.feed.getTimeline",
+                method: .get,
+                headers: matching
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+        XCTAssertEqual(sender.recorded().first?.url.host, "api.bsky.app")
+
+        // The stock fragment is no longer the shortcut under this
+        // configuration, so it needs resolution and fails closed.
+        let stale = RecordingProxySender()
+        let notMatching: HTTPFields = {
+            var headers = HTTPFields()
+            headers[HTTPField.Name("atproto-proxy")!] = "did:web:api.bsky.app#bsky_appview"
+            return headers
+        }()
+        try await withPipethrough(sender: stale, appView: appView) { client in
+            try await client.execute(
+                uri: "/xrpc/app.bsky.feed.getTimeline",
+                method: .get,
+                headers: notMatching
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest)
+            }
+        }
+        XCTAssertEqual(stale.recorded().count, 0)
+    }
+
     // MARK: Additional coverage
 
     func testUnroutedNamespaceIs404WithoutContactingUpstream() async throws {
@@ -380,7 +547,16 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(sender.recorded().count, 0)
     }
 
-    func testResolvedServiceGoesThroughTheResolverAndPeerPinnedSender() async throws {
+    /// Covers endpoint selection and audience binding for the resolve path.
+    ///
+    /// It deliberately does NOT cover peer pinning: the injected
+    /// `RecordingProxySender` replaces `SwanPeerPinnedProxySender`, so no
+    /// resolve → policy-check → pin step runs here at all. That control is
+    /// exercised by `SwanPeerPinnedProxySender`'s own tests and the live-TLS
+    /// transport coverage in `SwanOAuthTests`. What this test does prove is
+    /// that the handler hands the *resolved* endpoint to whatever sender it
+    /// was given, rather than bypassing it or falling back to the AppView.
+    func testResolvedServiceUsesTheResolvedEndpointAndAudience() async throws {
         let sender = RecordingProxySender()
         let documents = StubDIDDocuments(
             documents: [
@@ -408,9 +584,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
             }
         }
         let outbound = try XCTUnwrap(sender.recorded().first)
-        // The resolved endpoint went through the peer-pinned sender: it is the
-        // only control stopping a hostile serviceEndpoint from reaching an
-        // internal address.
+        // The resolved endpoint reached the sender, not the AppView URL.
         XCTAssertEqual(outbound.url.host, "feeds.example")
         let authorization = try XCTUnwrap(
             outbound.headers.first { $0.name.lowercased() == "authorization" }?.value
@@ -588,20 +762,31 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
                 logger: Logger(label: "SwanXRPCPipethroughTests.main-server")
             )
             try await app.test(.live) { client in
-                // A Swan-owned permissioned route still answers locally.
+                // A Swan-owned permissioned route still answers locally, with
+                // its own exact closed-route shape. Asserting the specific
+                // status and body matters: a bare "not 200" would also pass if
+                // the proxy fallback had answered 404.
                 try await client.execute(
                     uri: "/xrpc/com.atproto.space.getSpace",
                     method: .get
                 ) { response in
-                    XCTAssertNotEqual(response.status, .ok)
-                    XCTAssertNotEqual(response.status, .badGateway)
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    XCTAssertEqual(
+                        self.body(response),
+                        #"{"error":"permissioned_data_pending"}"#
+                    )
                 }
-                // A generated public route still answers locally.
+                // A generated public route still answers locally, likewise
+                // with its own body rather than the fallback's.
                 try await client.execute(
                     uri: "/xrpc/com.atproto.repo.getRecord",
                     method: .get
                 ) { response in
-                    XCTAssertNotEqual(response.status, .ok)
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    XCTAssertEqual(
+                        self.body(response),
+                        #"{"error":"public_data_pending"}"#
+                    )
                 }
                 // Preferences are answered by the local capability, not by the
                 // fallback: 200 with the PDS's own empty-array shape, never
@@ -658,6 +843,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         sender: RecordingProxySender,
         authorizer: PipethroughAuthorizer? = nil,
         documents: StubDIDDocuments = StubDIDDocuments(documents: [:]),
+        appView: SwanAppViewConfiguration? = nil,
         limits: SwanXRPCPipethroughLimits = .default
     ) throws -> SwanXRPCPipethroughServer {
         SwanXRPCPipethroughServer(
@@ -668,7 +854,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
             tokens: TestProxyServiceTokenIssuer(),
             sender: sender,
             resolver: SwanServiceEndpointResolver(documents: documents),
-            appView: try SwanAppViewConfiguration(),
+            appView: try appView ?? SwanAppViewConfiguration(),
             limits: limits
         )
     }
@@ -688,6 +874,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         sender: RecordingProxySender,
         authorizer: PipethroughAuthorizer? = nil,
         documents: StubDIDDocuments = StubDIDDocuments(documents: [:]),
+        appView: SwanAppViewConfiguration? = nil,
         limits: SwanXRPCPipethroughLimits = .default,
         _ body: @escaping @Sendable (any TestClientProtocol) async throws -> Void
     ) async throws {
@@ -696,6 +883,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
             sender: sender,
             authorizer: authorizer,
             documents: documents,
+            appView: appView,
             limits: limits
         ).register(on: router)
         try await makeApp(router).test(.live, body)

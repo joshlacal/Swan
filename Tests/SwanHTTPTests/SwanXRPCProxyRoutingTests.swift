@@ -2,7 +2,10 @@
 import XCTest
 
 final class SwanXRPCProxyRoutingTests: XCTestCase {
-    private let router = SwanXRPCProxyRouter(appViewDID: "did:web:api.bsky.app")
+    private let router = SwanXRPCProxyRouter(
+        appViewDID: "did:web:api.bsky.app",
+        appViewServiceFragment: "bsky_appview"
+    )
 
     func testAppBskyDefaultsToConfiguredAppView() throws {
         let route = try router.route(nsid: "app.bsky.actor.getProfile", proxyHeader: nil)
@@ -75,6 +78,35 @@ final class SwanXRPCProxyRoutingTests: XCTestCase {
             proxyHeader: "did:web:api.bsky.app#bsky_appview"
         )
         XCTAssertEqual(route, .configuredAppView(did: "did:web:api.bsky.app"))
+    }
+
+    /// The configured-endpoint shortcut is keyed on the whole service
+    /// reference, not just the DID. A client naming a *different* service at
+    /// the AppView's DID asked for that service, and must not be silently
+    /// handed the AppView: it takes the resolve path, where the DID document
+    /// decides (and a missing entry becomes a 400 at the HTTP boundary).
+    func testDifferentFragmentAtTheAppViewDIDIsNotTheConfiguredAppView() throws {
+        let route = try router.route(
+            nsid: "app.bsky.actor.getProfile",
+            proxyHeader: "did:web:api.bsky.app#atproto_labeler"
+        )
+        XCTAssertEqual(
+            route,
+            .resolvedService(did: "did:web:api.bsky.app", fragment: "atproto_labeler")
+        )
+    }
+
+    /// And the shortcut still requires the DID to match: the same fragment at
+    /// another DID is a different service.
+    func testConfiguredFragmentAtAnotherDIDIsNotTheConfiguredAppView() throws {
+        let route = try router.route(
+            nsid: "app.bsky.actor.getProfile",
+            proxyHeader: "did:web:other.example#bsky_appview"
+        )
+        XCTAssertEqual(
+            route,
+            .resolvedService(did: "did:web:other.example", fragment: "bsky_appview")
+        )
     }
 
     func testExplicitProxyHeaderForOtherServiceRequiresResolution() throws {
