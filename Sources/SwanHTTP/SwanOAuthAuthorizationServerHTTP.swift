@@ -220,6 +220,20 @@ private func handleOAuthServerPAR(
     guard client.metadata.matchesRedirectURI(form.redirectURI),
       form.scopes.isSubset(of: client.metadata.scopes)
     else {
+      // `invalid_request` is deliberately opaque on the wire; record the
+      // distinguishing detail server-side so an operator can tell a redirect
+      // mismatch from a scope mismatch without instrumenting the client.
+      context.logger.info(
+        "oauth par rejected",
+        metadata: [
+          "stage": .string("client_binding"),
+          "client_id": .string(form.clientID.absoluteString),
+          "redirect_matches": .string(
+            client.metadata.matchesRedirectURI(form.redirectURI) ? "true" : "false"),
+          "scopes_subset": .string(
+            form.scopes.isSubset(of: client.metadata.scopes) ? "true" : "false"),
+        ]
+      )
       return oauthServerPARJSON(.badRequest, OAuthServerPARError(error: "invalid_request"))
     }
     let assertion = try await validateOAuthServerClientAssertion(
@@ -247,11 +261,25 @@ private func handleOAuthServerPAR(
       .created, OAuthServerPARSuccess(requestURI: requestURI, expiresIn: 90))
   } catch let error as SwanError {
     if case .unavailable = error {
+      context.logger.info(
+        "oauth par unavailable", metadata: ["reason": .string(error.description)])
       return oauthServerPARJSON(
         .serviceUnavailable, OAuthServerPARError(error: "temporarily_unavailable"))
     }
+    // Same rationale as the client-binding guard: the wire error stays
+    // opaque, but the operator gets the specific reason. `SwanError`
+    // descriptions are fixed diagnostic strings and carry no credential.
+    context.logger.info(
+      "oauth par rejected",
+      metadata: [
+        "stage": .string("client_validation"),
+        "reason": .string(error.description),
+      ]
+    )
     return oauthServerPARJSON(.badRequest, OAuthServerPARError(error: "invalid_request"))
   } catch {
+    context.logger.info(
+      "oauth par failed", metadata: ["stage": .string("unexpected")])
     return oauthServerPARJSON(
       .serviceUnavailable, OAuthServerPARError(error: "temporarily_unavailable"))
   }

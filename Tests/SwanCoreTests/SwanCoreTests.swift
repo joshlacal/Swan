@@ -43,6 +43,31 @@ final class SwanCoreTests: XCTestCase {
         XCTAssertEqual(try P256WireSignature.canonicalize(highS), canonical)
     }
 
+    // JOSE defines no canonical (r, s) encoding, so the malleability-tolerant
+    // decoder must accept the high-S variant that `decodeCanonical` rejects —
+    // while still enforcing structural scalar validation.
+    func testMalleabilityTolerantDecodeAcceptsHighSButStillValidatesScalars() throws {
+        let key = P256.Signing.PrivateKey()
+        let message = Data("JOSE ES256 has no canonical encoding".utf8)
+        let canonical = try P256WireSignature.sign(message, using: key)
+        let highS = highSVariant(of: canonical)
+
+        // Both encodings decode, and both verify against the same key.
+        for raw in [canonical, highS] {
+            let decoded = try P256WireSignature.decodeMalleabilityTolerant(raw)
+            XCTAssertTrue(key.publicKey.isValidSignature(decoded, for: message))
+        }
+        // The strict decoder still rejects high-S, so AT Protocol's own
+        // signature suites keep their canonical-encoding guarantee.
+        XCTAssertThrowsError(try P256WireSignature.decodeCanonical(highS))
+
+        // Structural validation is not weakened.
+        XCTAssertThrowsError(
+            try P256WireSignature.decodeMalleabilityTolerant(Data(repeating: 0, count: 63)))
+        XCTAssertThrowsError(
+            try P256WireSignature.decodeMalleabilityTolerant(Data(repeating: 0, count: 64)))
+    }
+
     func testP256WireSignatureUsesTheExactP256HalfOrderBoundary() {
         let r = Data(repeating: 0, count: 31) + Data([1])
         let halfOrder = Data([

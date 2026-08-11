@@ -276,6 +276,21 @@ public struct OAuthVerifiedJWT: Sendable {
 /// Minimal, strict ES256 compact JWT verification. It never accepts `none`,
 /// never infers an algorithm from a key, and scans header and payload JSON for
 /// duplicate member names before decoding either document.
+/// Which `(r, s)` encodings a compact JWT's ES256 signature may use.
+///
+/// Swan-defined tokens — notably the permissioned-data client attestation —
+/// are canonical wire values, so a second valid encoding of the same
+/// signature must be rejected. Tokens defined by JOSE itself are not: RFC
+/// 7515/7518 verify by SEC1, which accepts `(r, s)` and `(r, n - s)` alike,
+/// and conformant signers emit high-S roughly half the time.
+public enum OAuthJWTSignatureEncoding: Sendable {
+    /// Reject high-S. Correct for AT Protocol and Swan-defined JWTs.
+    case canonicalLowS
+    /// Accept either encoding. Correct for generic JOSE tokens from
+    /// third-party OAuth clients: DPoP proofs and client assertions.
+    case joseInteroperable
+}
+
 public enum OAuthCompactJWT {
     /// Reads a strict JOSE header only to locate the verification key. Callers
     /// must immediately verify the complete token before trusting any field.
@@ -287,13 +302,20 @@ public enum OAuthCompactJWT {
         _ compact: String,
         publicKey: P256.Signing.PublicKey,
         expectedType: String? = nil,
+        signatureEncoding: OAuthJWTSignatureEncoding = .canonicalLowS,
         constraints: OAuthJWTVerificationConstraints = .init()
     ) throws -> OAuthVerifiedJWT {
         let parsed = try parse(compact)
         guard parsed.header.algorithm == "ES256", parsed.header.type == expectedType || expectedType == nil else {
             throw SwanError.unauthorized("JWT type or algorithm is invalid")
         }
-        let signature = try P256WireSignature.decodeCanonical(parsed.signature)
+        let signature: P256.Signing.ECDSASignature
+        switch signatureEncoding {
+        case .canonicalLowS:
+            signature = try P256WireSignature.decodeCanonical(parsed.signature)
+        case .joseInteroperable:
+            signature = try P256WireSignature.decodeMalleabilityTolerant(parsed.signature)
+        }
         guard publicKey.isValidSignature(signature, for: parsed.signingInput) else {
             throw SwanError.unauthorized("JWT signature is invalid")
         }

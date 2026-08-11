@@ -486,6 +486,30 @@ public enum P256WireSignature {
         (try? decodeCanonical(rawRepresentation)) != nil
     }
 
+    /// Decodes a raw P-256 signature for a wire format that does **not**
+    /// define a canonical `(r, s)` encoding.
+    ///
+    /// JOSE is such a format: RFC 7515/7518 specify ES256 verification by
+    /// SEC1/X9.62, which accepts `(r, s)` and `(r, n - s)` alike, and
+    /// conformant signers emit whichever their ECDSA implementation produced
+    /// — roughly half of all signatures are high-S. Rejecting those makes
+    /// every OAuth JWT a coin flip rather than a security boundary.
+    ///
+    /// Malleating a JOSE token here buys an attacker nothing: client
+    /// assertions and DPoP proofs are replay-protected by `jti`, and a
+    /// malleated variant carries the same `jti`, so it is caught by the
+    /// existing claim. These tokens are never used as content addresses.
+    /// Structural scalar validation still applies, and AT Protocol's own
+    /// signature suites — PLC operations, repository commits, service JWTs —
+    /// keep using ``decodeCanonical(_:)`` because their wire values *are*
+    /// canonical and malleability there would be observable.
+    public static func decodeMalleabilityTolerant(
+        _ rawRepresentation: Data
+    ) throws -> P256.Signing.ECDSASignature {
+        try validateScalars(rawRepresentation)
+        return try decode(rawRepresentation)
+    }
+
     private static let order = Data([
         0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,

@@ -77,6 +77,7 @@ public struct OAuthDPoPProofValidator: Sendable {
             proof,
             publicKey: publicKey,
             expectedType: Self.proofType,
+            signatureEncoding: .joseInteroperable,
             constraints: .init(
                 now: now,
                 clockSkew: clockSkew,
@@ -219,6 +220,7 @@ public struct OAuthClientAssertionValidator: Sendable {
         let verified = try OAuthCompactJWT.verify(
             assertion,
             publicKey: try key.publicKey(),
+            signatureEncoding: .joseInteroperable,
             constraints: .init(
                 expectedIssuer: clientID,
                 expectedAudience: authorizationServerIssuer,
