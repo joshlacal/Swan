@@ -391,6 +391,11 @@ public struct SwanHTTPServer: Sendable {
     /// the caller has assembled a resource authorizer and a durable
     /// preferences store at startup.
     public let actorPreferencesXRPC: SwanActorPreferencesXRPCServer?
+    /// The `/xrpc/**` AppView proxy fallback. It is registered last and is the
+    /// lowest-priority route in the trie, so it can only ever answer a request
+    /// that no local Swan route claimed. Nil keeps Swan's pre-proxy behavior:
+    /// an unknown XRPC method is simply not found here.
+    public let xrpcPipethrough: SwanXRPCPipethroughServer?
     /// Shared process-wide/per-account admission for descriptor-backed blob
     /// responses. The CLI passes the preopened directory's instance so
     /// public CAR, upload, and blob budgets remain coordinated.
@@ -436,6 +441,7 @@ public struct SwanHTTPServer: Sendable {
         blobStreamAdmission: PublicRepositorySpoolAdmission? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
         actorPreferencesXRPC: SwanActorPreferencesXRPCServer? = nil,
+        xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         jsonReadAdmission: PublicRepositoryJSONReadAdmission? = nil,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
@@ -450,6 +456,7 @@ public struct SwanHTTPServer: Sendable {
         self.publicRepositoryReadDirectory = publicRepositoryReadDirectory
         self.accountEmailXRPC = accountEmailXRPC
         self.actorPreferencesXRPC = actorPreferencesXRPC
+        self.xrpcPipethrough = xrpcPipethrough
         self.publicFirehoseStreaming = publicFirehoseStreaming
         let resolvedJSONReadAdmission = jsonReadAdmission
             ?? PublicRepositoryJSONReadAdmission.processShared
@@ -984,6 +991,13 @@ public struct SwanHTTPServer: Sendable {
             requestBodyAdmission: requestBodyAdmission
         )
         registerUnknownPublicEndpointGuards(on: router)
+        // Registered last, and lowest priority in the trie. Every exact route
+        // and every `<prefix>.*` guard above resolves ahead of it, so this can
+        // never forward a Swan-owned lexicon to a third party.
+        xrpcPipethrough?.register(
+            on: router,
+            requestBodyAdmission: requestBodyAdmission
+        )
 
         return router
     }

@@ -941,6 +941,7 @@ struct ServePermissionedRuntime {
         localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration? = nil,
         authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
+        xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil
     ) -> SwanHTTPServer {
@@ -970,6 +971,7 @@ struct ServePermissionedRuntime {
             },
             blobStreamAdmission: directory.publicRepositorySpoolAdmission,
             accountEmailXRPC: accountEmailXRPC,
+            xrpcPipethrough: xrpcPipethrough,
             loginClientIdentityPolicy: loginClientIdentityPolicy,
             publicFirehoseStreaming: publicFirehoseStreaming
         )
@@ -1996,6 +1998,48 @@ extension SwanCommand {
         )
         var spaceAccountKeyDirectory: String?
 
+        @Option(
+            name: .customLong("appview-did"),
+            help: "Service DID of the AppView unmatched app.bsky XRPC is proxied to (default: did:web:api.bsky.app)"
+        )
+        var appViewDID: String?
+
+        @Option(
+            name: .customLong("appview-url"),
+            help: "HTTPS origin of the configured AppView (default: https://api.bsky.app)"
+        )
+        var appViewURL: String?
+
+        @Option(
+            name: .customLong("appview-service-fragment"),
+            help: "DID document service fragment naming the configured AppView (default: bsky_appview)"
+        )
+        var appViewServiceFragment: String?
+
+        @Flag(
+            name: .customLong("disable-appview-proxy"),
+            help: "Refuse every unmatched app.bsky XRPC locally instead of proxying it. Proxying is on out of the box."
+        )
+        var disableAppViewProxy = false
+
+        @Option(
+            name: .customLong("appview-proxy-account-kek-file"),
+            help: "Owner-only mounted account-KEK file the AppView proxy uses to mint per-request service tokens. Without it the proxy cannot authenticate to any service and stays closed."
+        )
+        var appViewProxyAccountKEKFile: String?
+
+        @Option(
+            name: .customLong("appview-proxy-account-kek-id"),
+            help: "Active account-KEK identifier for AppView proxy service tokens (default: primary)"
+        )
+        var appViewProxyAccountKEKID: String?
+
+        @Option(
+            name: .customLong("appview-proxy-account-key-directory"),
+            help: "Existing owner-only account key-envelope directory for AppView proxy service tokens; defaults to <data-directory>/keys"
+        )
+        var appViewProxyAccountKeyDirectory: String?
+
         func run() async throws {
             guard (1 ... 1_000_000).contains(spaceOplogRetention) else {
                 throw ValidationError(
@@ -2573,6 +2617,115 @@ extension SwanCommand {
                     accountEmailXRPC = nil
                     emailRecoveryService = nil
                 }
+                let xrpcPipethrough: SwanXRPCPipethroughServer?
+                if disableAppViewProxy {
+                    guard appViewDID == nil, appViewURL == nil,
+                          appViewServiceFragment == nil,
+                          appViewProxyAccountKEKFile == nil,
+                          appViewProxyAccountKEKID == nil,
+                          appViewProxyAccountKeyDirectory == nil else {
+                        throw ValidationError(
+                            "AppView proxy options cannot be combined with --disable-appview-proxy"
+                        )
+                    }
+                    xrpcPipethrough = nil
+                } else if let appViewProxyAccountKEKFile {
+                    do {
+                        guard let appViewOrigin = URL(
+                            string: appViewURL ?? "https://api.bsky.app"
+                        ) else {
+                            throw ValidationError("--appview-url must be a URL")
+                        }
+                        let appView = try SwanAppViewConfiguration(
+                            did: appViewDID ?? "did:web:api.bsky.app",
+                            url: appViewOrigin,
+                            serviceFragment: appViewServiceFragment ?? "bsky_appview"
+                        )
+                        let keyConfiguration = try AccountProvisioningSecrets
+                            .requiredMountedAccountKeyConfiguration(
+                                activeKeyID: appViewProxyAccountKEKID ?? "primary",
+                                secretFile: URL(
+                                    fileURLWithPath: appViewProxyAccountKEKFile
+                                )
+                            )
+                        let keyDirectory = appViewProxyAccountKeyDirectory.map {
+                            URL(fileURLWithPath: $0)
+                        } ?? dataURL.appending(path: "keys")
+                        try requireExistingOwnerOnlyKeyDirectory(keyDirectory)
+                        let keyStore = try FileAccountKeyStore(
+                            root: keyDirectory,
+                            configuration: keyConfiguration
+                        )
+                        let passwordHasher = try LibsodiumArgon2idHasher()
+                        let accounts = DurableAccountDirectory(
+                            store: controlDatabase,
+                            passwordHasher: passwordHasher,
+                            verificationExecutor: try Argon2idVerificationExecutor(
+                                hasher: passwordHasher
+                            )
+                        )
+                        // The same resolve → policy-check → pin discipline the
+                        // OAuth client-metadata loader uses. It is the only
+                        // control stopping a hostile `serviceEndpoint` or
+                        // `did:web` host from reaching an internal address.
+                        let fetchPolicy = try OAuthRemoteFetchPolicy()
+                        let documents = OAuthRemoteDocumentFetcher(
+                            policy: fetchPolicy,
+                            transport: try NIOPeerPinnedOAuthDocumentTransport(
+                                maximumTransportTimeout: fetchPolicy.timeout
+                            )
+                        )
+                        let limits = SwanXRPCPipethroughLimits()
+                        xrpcPipethrough = SwanXRPCPipethroughServer(
+                            authorizer: try SwanOAuthResourceAuthorizer(
+                                publicURL: baseURL,
+                                runtime: oauthRuntime,
+                                accountControlStore: controlDatabase
+                            ),
+                            tokens: LocalAccountProxyServiceTokenIssuer(
+                                accounts: accounts,
+                                keyStore: keyStore
+                            ),
+                            sender: SwanPeerPinnedProxySender(
+                                policy: fetchPolicy,
+                                resolver: SystemOAuthHostnameResolver(),
+                                transport: try SwanNIOPeerPinnedProxyTransport(
+                                    maximumTransportTimeout: limits.timeout,
+                                    // Stated explicitly: the proxy owns its
+                                    // inbound body bound rather than silently
+                                    // following the transport's default.
+                                    maximumRequestBodyBytes:
+                                        limits.maximumRequestBodyBytes
+                                )
+                            ),
+                            resolver: SwanServiceEndpointResolver(
+                                documents: try SwanPeerPinnedDIDDocumentFetcher(
+                                    documents: documents,
+                                    // Reuse the operator's configured PLC
+                                    // origin when there is one; otherwise the
+                                    // single canonical default constant.
+                                    plcOrigin: managementDeletionPLCConfiguration?
+                                        .origin
+                                        ?? PLCClientConfiguration
+                                        .defaultProductionOrigin
+                                )
+                            ),
+                            appView: appView,
+                            limits: limits
+                        )
+                    } catch let error as ValidationError {
+                        throw error
+                    } catch {
+                        throw ValidationError("AppView proxy runtime is unavailable")
+                    }
+                } else {
+                    // Not silent: the proxy cannot mint a service token without
+                    // account key material, so it stays closed and says so.
+                    logger.warning(
+                        "AppView proxying is closed: --appview-proxy-account-kek-file is required to mint service tokens, or pass --disable-appview-proxy"
+                    )
+                    xrpcPipethrough = nil
+                }
                 let publicFirehoseService: SwanPublicFirehoseSequencerService?
                 let publicFirehoseRetentionService: SwanPublicFirehoseRetentionService?
                 let publicFirehoseCrawlAnnouncerService: SwanPublicFirehoseCrawlAnnouncerService?
@@ -2787,6 +2940,7 @@ extension SwanCommand {
                     localhostOAuthConfiguration: localhostOAuthConfiguration,
                     authorizationServerConfiguration: authorizationServerConfiguration,
                     accountEmailXRPC: accountEmailXRPC,
+                    xrpcPipethrough: xrpcPipethrough,
                     loginClientIdentityPolicy: loginClientIdentityPolicy,
                     publicFirehoseStreaming: publicFirehoseStreamingRuntime
                 )

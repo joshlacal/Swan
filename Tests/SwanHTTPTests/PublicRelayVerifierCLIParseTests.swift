@@ -135,3 +135,43 @@ final class PublicRelayVerifierCLIParseTests: XCTestCase {
     return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
   }
 }
+
+/// The `serve` flags that select AppView proxying. Parsing is asserted here
+/// because the composition itself needs a mounted KEK and a data directory,
+/// which a parse-level test must not require.
+final class ServeAppViewProxyCLIParseTests: XCTestCase {
+  func testServeParsesAppViewProxyOptions() throws {
+    let command = try SwanCommand.parseAsRoot([
+      "serve",
+      "--data-directory", "/tmp/swan-appview-proxy-parse",
+      "--appview-did", "did:web:appview.example",
+      "--appview-url", "https://appview.example",
+      "--appview-service-fragment", "bsky_appview",
+      "--appview-proxy-account-kek-file", "/tmp/kek",
+    ])
+    let serve = try XCTUnwrap(command as? SwanCommand.Serve)
+    XCTAssertEqual(serve.appViewDID, "did:web:appview.example")
+    XCTAssertEqual(serve.appViewURL, "https://appview.example")
+    XCTAssertEqual(serve.appViewServiceFragment, "bsky_appview")
+    XCTAssertEqual(serve.appViewProxyAccountKEKFile, "/tmp/kek")
+    XCTAssertFalse(serve.disableAppViewProxy)
+  }
+
+  /// Proxying is on out of the box, so the flag that turns it off must exist
+  /// and must default to false.
+  func testServeDefaultsToProxyingEnabled() throws {
+    let command = try SwanCommand.parseAsRoot([
+      "serve", "--data-directory", "/tmp/swan-appview-proxy-parse",
+    ])
+    let serve = try XCTUnwrap(command as? SwanCommand.Serve)
+    XCTAssertFalse(serve.disableAppViewProxy)
+    XCTAssertNil(serve.appViewDID)
+
+    let disabled = try SwanCommand.parseAsRoot([
+      "serve",
+      "--data-directory", "/tmp/swan-appview-proxy-parse",
+      "--disable-appview-proxy",
+    ])
+    XCTAssertTrue(try XCTUnwrap(disabled as? SwanCommand.Serve).disableAppViewProxy)
+  }
+}

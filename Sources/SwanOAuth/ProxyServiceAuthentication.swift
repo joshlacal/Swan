@@ -1,5 +1,6 @@
 import Crypto
 import Foundation
+import SwanAccounts
 import SwanCore
 
 /// Inter-service auth for proxied XRPC, mirroring
@@ -79,6 +80,12 @@ public enum ProxyServiceJWT {
             && !value.contains("#")
     }
 
+    /// The same NSID grammar this type binds into `lxm`, exposed so a caller
+    /// can reject a non-NSID request target *before* it reaches routing. A
+    /// second, subtly different validator in the HTTP layer would let a shape
+    /// through here that `create` then refuses at signing time.
+    public static func isNSID(_ value: String) -> Bool { isValidNSID(value) }
+
     /// Dotted segments of alphanumerics/hyphen, at least three segments.
     private static func isValidNSID(_ value: String) -> Bool {
         guard value.utf8.count <= 317 else { return false }
@@ -93,5 +100,72 @@ public enum ProxyServiceJWT {
                         || $0 == UInt8(ascii: "-")
                 }
         }
+    }
+}
+
+/// Mints the one short-lived service token a proxied XRPC request carries.
+///
+/// This is the same shape as ``SpaceDelegationTokenIssuer``: the HTTP layer
+/// receives only "give me a token for this already-authorized subject and this
+/// exact audience/method", never an account signing key or a database handle.
+public protocol SwanProxyServiceTokenIssuing: Sendable {
+    func issueProxyServiceToken(
+        issuer: String,
+        audience: String,
+        method: String,
+        now: Date
+    ) async throws -> String
+}
+
+/// Local issuer backed by the encrypted account key store. The control
+/// database contributes only lifecycle state and a key reference; the signing
+/// scalar is decrypted immediately before the compact ES256 JWT is built and
+/// never becomes representable in configuration, SQLite, or HTTP state.
+public struct LocalAccountProxyServiceTokenIssuer: SwanProxyServiceTokenIssuing {
+    private let accounts: DurableAccountDirectory
+    private let keyStore: any AccountKeyStore
+
+    public init(
+        accounts: DurableAccountDirectory,
+        keyStore: any AccountKeyStore
+    ) {
+        self.accounts = accounts
+        self.keyStore = keyStore
+    }
+
+    public func issueProxyServiceToken(
+        issuer: String,
+        audience: String,
+        method: String,
+        now: Date = Date()
+    ) async throws -> String {
+        let issuer = try AccountIdentifiers.validateDID(issuer)
+        guard let account = try await accounts.account(did: issuer),
+              account.status.authorizesAccount,
+              let references = try await accounts.keyReferences(did: issuer) else {
+            throw SwanError.unauthorized("proxy service token issuer is unavailable")
+        }
+
+        // Do not perform an await after this point. The scalar is read only
+        // after every account/lifecycle/reference decision has completed and
+        // is used immediately to construct the one bounded token.
+        let material = try await keyStore.key(for: references.signing)
+        let privateKey: P256.Signing.PrivateKey
+        do {
+            privateKey = try P256.Signing.PrivateKey(rawRepresentation: material)
+        } catch {
+            throw SwanError.unavailable("proxy service signing key is unavailable")
+        }
+        return try ProxyServiceJWT.create(
+            issuer: issuer,
+            audience: audience,
+            method: method,
+            // A fresh jti per request. The remote service uses it for replay
+            // rejection, so it must never be derived from the request.
+            eventID: UUID().uuidString,
+            key: privateKey,
+            now: now,
+            lifetime: ProxyServiceJWT.maximumLifetime
+        )
     }
 }
