@@ -28,11 +28,15 @@ final class PLCClientTests: XCTestCase {
         let fixture = try operationFixture()
         let transport = RecordingPLCTransport(responses: [
             .init(status: 200, headers: [:], body: Data(), finalURL: nil, redirectCount: 0),
+            jsonResponse(try auditJSON(did: fixture.did, operation: fixture.operation)),
         ])
         let client = try PLCDirectoryClient(configuration: .production(origin: URL(string: "https://plc.example.com")!), transport: transport)
         try await client.submit(did: fixture.did, operation: fixture.operation)
 
         let recorded = await transport.requests
+        // The second request is the confirmation read the production contract
+        // requires; state that dependence rather than leaving it incidental.
+        XCTAssertEqual(recorded.count, 2)
         let request = try XCTUnwrap(recorded.first)
         XCTAssertEqual(request.method, .post)
         XCTAssertEqual(request.url.absoluteString, "https://plc.example.com/\(fixture.did)")
@@ -114,7 +118,10 @@ final class PLCClientTests: XCTestCase {
         XCTAssertEqual(requested.path, "/\(fixture.did)")
     }
 
-    func testStrictProductionSubmitPreservesGenericTwoXXEmptyAndJSONResponses() async throws {
+    // No submit acknowledgement is self-authenticating, so a production
+    // submit is confirmed against the audit log whatever the body shape —
+    // an empty 204 and a `{}` 202 are proven no differently from plain text.
+    func testStrictProductionSubmitConfirmsGenericTwoXXEmptyAndJSONResponses() async throws {
         let fixture = try operationFixture()
         let responses: [PLCHTTPResponse] = [
             .init(
@@ -134,14 +141,203 @@ final class PLCClientTests: XCTestCase {
         ]
 
         for response in responses {
+            let transport = RecordingPLCTransport(responses: [
+                response,
+                jsonResponse(try auditJSON(did: fixture.did, operation: fixture.operation)),
+            ])
             let client = try PLCDirectoryClient(
                 configuration: .production(
                     origin: URL(string: "https://plc.example.com")!
                 ),
-                transport: RecordingPLCTransport(responses: [response])
+                transport: transport
             )
             try await client.submit(did: fixture.did, operation: fixture.operation)
+
+            let recorded = await transport.requests
+            XCTAssertEqual(recorded.count, 2)
+            XCTAssertEqual(recorded[1].method, .get)
         }
+    }
+
+    // The terminal predicate itself, not merely "an audit exists": the log is
+    // valid, same-DID and fully verified, but its active terminal is a later
+    // operation than the one submitted. Also kills the `audit.first` mutant.
+    func testStrictProductionSubmitRejectsAuditWhoseTerminalIsNotTheSubmittedOperation() async throws {
+        let fixture = try operationFixture()
+        let successor = try update(
+            previous: fixture.operation,
+            signer: rotationKey,
+            rotationKeys: [rotationKey],
+            pdsOrigin: "https://pds2.example.com"
+        )
+        let transport = RecordingPLCTransport(responses: [
+            .init(
+                status: 200,
+                headers: ["content-type": "text/plain; charset=utf-8"],
+                body: Data([0x4F, 0x4B]),
+                finalURL: nil,
+                redirectCount: 0
+            ),
+            jsonResponse(
+                try auditJSON(did: fixture.did, operations: [fixture.operation, successor])
+            ),
+        ])
+        let client = try PLCDirectoryClient(
+            configuration: .production(origin: URL(string: "https://plc.example.com")!),
+            transport: transport
+        )
+
+        await XCTAssertThrowsErrorAsync(
+            try await client.submit(did: fixture.did, operation: fixture.operation)
+        )
+    }
+
+    // The mirror of the above: submitting the successor against the very same
+    // two-entry log succeeds, proving the rejection is the terminal check and
+    // not some incidental property of the multi-entry fixture.
+    func testStrictProductionSubmitAcceptsAuditWhoseTerminalIsTheSubmittedOperation() async throws {
+        let fixture = try operationFixture()
+        let successor = try update(
+            previous: fixture.operation,
+            signer: rotationKey,
+            rotationKeys: [rotationKey],
+            pdsOrigin: "https://pds2.example.com"
+        )
+        let transport = RecordingPLCTransport(responses: [
+            .init(
+                status: 200,
+                headers: ["content-type": "text/plain; charset=utf-8"],
+                body: Data([0x4F, 0x4B]),
+                finalURL: nil,
+                redirectCount: 0
+            ),
+            jsonResponse(
+                try auditJSON(did: fixture.did, operations: [fixture.operation, successor])
+            ),
+        ])
+        let client = try PLCDirectoryClient(
+            configuration: .production(origin: URL(string: "https://plc.example.com")!),
+            transport: transport
+        )
+
+        try await client.submit(did: fixture.did, operation: successor)
+    }
+
+    // The production directory answers a successful submit with the pinned
+    // Express `sendStatus(200)` shape, which carries no JSON to validate. The
+    // submit is therefore treated as unverified and confirmed by re-reading
+    // the directory's own audit log, whose terminal operation must be exactly
+    // the operation just submitted.
+    func testStrictProductionSubmitConfirmsUnverifiableSuccessAgainstAuditTerminal() async throws {
+        let fixture = try operationFixture()
+        let transport = RecordingPLCTransport(responses: [
+            .init(
+                status: 200,
+                headers: ["content-type": "text/plain; charset=utf-8"],
+                body: Data([0x4F, 0x4B]),
+                finalURL: nil,
+                redirectCount: 0
+            ),
+            jsonResponse(try auditJSON(did: fixture.did, operation: fixture.operation)),
+        ])
+        let client = try PLCDirectoryClient(
+            configuration: .production(origin: URL(string: "https://plc.example.com")!),
+            transport: transport
+        )
+
+        try await client.submit(did: fixture.did, operation: fixture.operation)
+
+        let recorded = await transport.requests
+        XCTAssertEqual(recorded.count, 2)
+        XCTAssertEqual(recorded[0].method, .post)
+        XCTAssertEqual(recorded[1].method, .get)
+        XCTAssertEqual(
+            recorded[1].url.absoluteString,
+            "https://plc.example.com/\(fixture.did)/log/audit"
+        )
+    }
+
+    func testStrictProductionSubmitRejectsUnverifiableSuccessWithoutMatchingAuditTerminal() async throws {
+        let fixture = try operationFixture()
+        let other = try operationFixture(rotationKeys: [signingKey])
+        let unverifiable = PLCHTTPResponse(
+            status: 200,
+            headers: ["content-type": "text/plain; charset=utf-8"],
+            body: Data([0x4F, 0x4B]),
+            finalURL: nil,
+            redirectCount: 0
+        )
+        let confirmations: [PLCHTTPResponse] = [
+            // Terminal operation belongs to a different submission.
+            jsonResponse(try auditJSON(did: other.did, operation: other.operation)),
+            // Directory has no log for this DID at all.
+            jsonResponse(Data("[]".utf8)),
+            // Confirmation read itself fails.
+            .init(status: 500, headers: [:], body: Data(), finalURL: nil, redirectCount: 0),
+        ]
+
+        for confirmation in confirmations {
+            let client = try PLCDirectoryClient(
+                configuration: .production(origin: URL(string: "https://plc.example.com")!),
+                transport: RecordingPLCTransport(responses: [unverifiable, confirmation])
+            )
+            await XCTAssertThrowsErrorAsync(
+                try await client.submit(did: fixture.did, operation: fixture.operation)
+            )
+        }
+    }
+
+    // Deferring to a confirmation read is a production-only accommodation.
+    // Strict against a laboratory origin must still reject the pinned
+    // reference server's plain-text acknowledgement outright, so reaching it
+    // without `didPLCServer001` stays an explicit operator error.
+    func testStrictLaboratorySubmitRejectsPlainTextWithoutConfirming() async throws {
+        let fixture = try operationFixture()
+        let transport = RecordingPLCTransport(responses: [
+            .init(
+                status: 200,
+                headers: ["content-type": "text/plain; charset=utf-8"],
+                body: Data([0x4F, 0x4B]),
+                finalURL: nil,
+                redirectCount: 0
+            ),
+            jsonResponse(try auditJSON(did: fixture.did, operation: fixture.operation)),
+        ])
+        let client = try PLCDirectoryClient(
+            configuration: .laboratory(origin: URL(string: "http://127.0.0.1:2582")!),
+            transport: transport
+        )
+
+        await XCTAssertThrowsErrorAsync(
+            try await client.submit(did: fixture.did, operation: fixture.operation)
+        )
+        let recorded = await transport.requests
+        XCTAssertEqual(recorded.count, 1)
+    }
+
+    func testStrictProductionSubmitStillRejectsNonSuccessStatusWithoutConfirming() async throws {
+        let fixture = try operationFixture()
+        let transport = RecordingPLCTransport(responses: [
+            .init(
+                status: 400,
+                headers: ["content-type": "text/plain; charset=utf-8"],
+                body: Data([0x4F, 0x4B]),
+                finalURL: nil,
+                redirectCount: 0
+            ),
+            jsonResponse(try auditJSON(did: fixture.did, operation: fixture.operation)),
+        ])
+        let client = try PLCDirectoryClient(
+            configuration: .production(origin: URL(string: "https://plc.example.com")!),
+            transport: transport
+        )
+
+        await XCTAssertThrowsErrorAsync(
+            try await client.submit(did: fixture.did, operation: fixture.operation)
+        )
+        // A non-success submit must never trigger a confirmation read.
+        let recorded = await transport.requests
+        XCTAssertEqual(recorded.count, 1)
     }
 
     func testFetchAuditUsesExactRouteAndVerifiesOperationCIDSignatureAndDID() async throws {

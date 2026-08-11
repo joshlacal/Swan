@@ -154,6 +154,8 @@ public struct PLCClientConfiguration: Sendable, Equatable {
     public let maximumAuditBytes: Int
     public let maximumSubmitResponseBytes: Int
     public let submitSuccessResponsePolicy: PLCSubmitSuccessResponsePolicy
+    /// Whether this configuration targets a laboratory origin.
+    public let isLaboratory: Bool
 
     private init(
         origin: URL,
@@ -186,6 +188,7 @@ public struct PLCClientConfiguration: Sendable, Equatable {
         self.maximumAuditBytes = maximumAuditBytes
         self.maximumSubmitResponseBytes = maximumSubmitResponseBytes
         self.submitSuccessResponsePolicy = submitSuccessResponsePolicy
+        self.isLaboratory = laboratory
     }
 
     public static func production(
@@ -358,7 +361,35 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
             maximumResponseBytes: configuration.maximumSubmitResponseBytes
         )
         let response = try await transport.execute(request)
-        try validateSubmitResponse(response, for: request)
+        switch try validateSubmitResponse(response, for: request) {
+        case .verified:
+            return
+        case .requiresDirectoryConfirmation:
+            try await confirmSubmittedOperation(did: did, operation: operation)
+        }
+    }
+
+    /// Confirms a submit whose response body carried nothing authenticatable
+    /// by re-reading the directory's own audit log. The active terminal
+    /// operation must be exactly the operation just submitted, so a submit is
+    /// reported as successful only against verified directory state rather
+    /// than against an unauthenticated acknowledgement body.
+    private func confirmSubmittedOperation(
+        did: String,
+        operation: PLCSignedOperation
+    ) async throws {
+        let submitted = try operation.cid.string
+        let audit = try await fetchAudit(did: did)
+        guard let terminal = audit.last(where: { !$0.nullified }),
+              terminal.cid == submitted else {
+            // `.unauthorized` matches this file's convention for an audit
+            // mismatch (see `fetchState`), and keeps the failure off the
+            // retryable `.unavailable` shape: retrying a DID-creating POST is
+            // the one response this must never invite.
+            throw SwanError.unauthorized(
+                "PLC directory did not record the submitted operation"
+            )
+        }
     }
 
     public func fetchState(did: String) async throws -> PLCDocumentData {
@@ -471,10 +502,18 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
         try StrictJSON.validate(response.body)
     }
 
+    /// Whether a submit response authenticated itself, or whether the submit
+    /// must still be confirmed against directory state before it may be
+    /// reported as successful.
+    private enum PLCSubmitAcceptance {
+        case verified
+        case requiresDirectoryConfirmation
+    }
+
     private func validateSubmitResponse(
         _ response: PLCHTTPResponse,
         for request: PLCHTTPRequest
-    ) throws {
+    ) throws -> PLCSubmitAcceptance {
         guard response.redirectCount == 0,
               response.finalURL == request.url else {
             throw SwanError.unauthorized("PLC directory redirects are forbidden")
@@ -496,7 +535,7 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
                     "PLC directory returned an incompatible submit response"
                 )
             }
-            return
+            return .verified
         case .strict:
             break
         }
@@ -504,8 +543,25 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
         guard (200 ... 299).contains(response.status) else {
             throw SwanError.unavailable("PLC directory returned a non-success status")
         }
+
+        // No submit acknowledgement authenticates anything: PLC issues no
+        // signed receipt, so an empty body, `{}`, and the production
+        // directory's `sendStatus(200)` plain text are equally unproven. A
+        // production submit is therefore never accepted on the strength of
+        // its acknowledgement; success is established only by re-reading the
+        // directory's verified audit log. Rejecting an unparseable
+        // acknowledgement outright would instead abort after the directory
+        // had already accepted the operation, stranding a registered DID with
+        // no local record.
+        guard configuration.isLaboratory else {
+            return .requiresDirectoryConfirmation
+        }
+
+        // A laboratory origin keeps the historical shape checks: reaching the
+        // pinned reference server under strict policy is an operator error,
+        // and `didPLCServer001` is the explicit opt-in for it.
         if response.body.isEmpty {
-            return
+            return .verified
         }
         guard let contentType = response.headers["content-type"],
               contentType.split(separator: ";", maxSplits: 1).first?
@@ -514,6 +570,7 @@ public struct PLCDirectoryClient: PLCClient, Sendable {
             throw SwanError.malformed("PLC directory response is not JSON")
         }
         try StrictJSON.validate(response.body)
+        return .verified
     }
 
     private func decodeState(_ data: Data, expectedDID: String) throws -> PLCDocumentData {
