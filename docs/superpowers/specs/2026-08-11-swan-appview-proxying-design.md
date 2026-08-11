@@ -157,12 +157,29 @@ caching is a later optimisation and must not be added speculatively.
 - **https only.** The endpoint comes from a resolved DID document, and is
   validated against Swan's existing SSRF discipline before any connection.
 
-This is a **new class of outbound traffic for Swan**, whose existing outbound
-HTTP is deliberately hardened (peer-pinned transports in `SwanOAuth`). The
-implementation must reuse that discipline rather than introducing an
-unrestricted client; if the peer-pinned transports cannot express
-"arbitrary AppView host", the gap must be raised before proceeding, not worked
-around with a plain client.
+**Reuse Swan's peer-pinning discipline. Do not introduce a plain HTTP client.**
+
+Peer-pinning in `SwanOAuth` is *not* a host allow-list — this was verified
+against `OAuthRemoteFetch.swift` and
+`NIOPeerPinnedOAuthDocumentTransport.swift` before writing this spec, because
+the design initially mischaracterised it. What it actually does:
+
+1. resolve the hostname to IP literals;
+2. policy-check those literals against reserved ranges — private, loopback,
+   link-local, CGNAT, documentation, multicast (`OAuthRemoteFetch.swift:65-95`);
+3. pin the TCP connection to a validated literal;
+4. let TLS validate the true hostname via SNI, so pinning cannot bypass
+   certificate name verification.
+
+That is anti-SSRF plus anti-DNS-rebinding: it defeats a hostile service DID
+whose DNS answers with a public address during validation and a private one at
+connect time. It is indifferent to *which* public host is contacted, so it
+composes with arbitrary AppViews, labelers and feed services with **no
+relaxation required**. General interoperability and this control are not in
+tension; weakening it would remove real SSRF protection and buy nothing.
+
+The proxy therefore resolves the target endpoint host through the same
+resolve → policy-check → pin path before connecting.
 
 ### Unit 4 — `SwanActorPreferencesStore`
 
@@ -218,9 +235,7 @@ screenshot and the absence of 404s in the nest log where
    routes must be verified — the catch-all must never shadow a local route. If
    precedence is not guaranteed, resolve by explicit route registration or a
    middleware that runs after route matching fails.
-2. **Peer-pinned transport fit** (see Unit 3). The likeliest source of design
-   churn.
-3. **Signing-key decryption cost** on every proxied request; measure before
+2. **Signing-key decryption cost** on every proxied request; measure before
    optimising.
 4. **`chat.bsky.*`** is deliberately unrouted in Phase 1. Catbird's chat is
    served by nest/mls-ds, not by the PDS, so this is not expected to regress
