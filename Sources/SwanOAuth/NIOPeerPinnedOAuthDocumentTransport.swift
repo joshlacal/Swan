@@ -163,6 +163,11 @@ final class OAuthDocumentResponseHandler: ChannelInboundHandler, RemovableChanne
     private let requestURL: URL
     private let maximumBodyBytes: Int
     private let timeout: TimeInterval
+    /// Only prefixes the diagnostics. `SwanNIOPeerPinnedProxyTransport` reuses
+    /// this handler verbatim rather than growing a third copy of the bounded,
+    /// peer-verifying inbound path; the default keeps the OAuth document
+    /// transport's messages byte-identical.
+    private let label: String
     private var head: HTTPResponseHead?
     private var body: ByteBuffer?
     private var timeoutTask: Scheduled<Void>?
@@ -173,13 +178,15 @@ final class OAuthDocumentResponseHandler: ChannelInboundHandler, RemovableChanne
         expectedPeer: OAuthIPAddress,
         requestURL: URL,
         maximumBodyBytes: Int,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        label: String = "OAuth document"
     ) {
         self.responsePromise = responsePromise
         self.expectedPeer = expectedPeer
         self.requestURL = requestURL
         self.maximumBodyBytes = maximumBodyBytes
         self.timeout = timeout
+        self.label = label
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
@@ -196,20 +203,20 @@ final class OAuthDocumentResponseHandler: ChannelInboundHandler, RemovableChanne
         switch unwrapInboundIn(data) {
         case let .head(head):
             guard self.head == nil else {
-                fail(context: context, error: SwanError.unauthorized("OAuth document response was malformed"))
+                fail(context: context, error: SwanError.unauthorized("\(label) response was malformed"))
                 return
             }
             self.head = head
         case let .body(part):
             guard head != nil else {
-                fail(context: context, error: SwanError.unauthorized("OAuth document response was malformed"))
+                fail(context: context, error: SwanError.unauthorized("\(label) response was malformed"))
                 return
             }
             var aggregate = body ?? context.channel.allocator.buffer(capacity: part.readableBytes)
             var copy = part
             aggregate.writeBuffer(&copy)
             guard aggregate.readableBytes <= maximumBodyBytes else {
-                fail(context: context, error: SwanError.unauthorized("OAuth document response exceeded its bound"))
+                fail(context: context, error: SwanError.unauthorized("\(label) response exceeded its bound"))
                 return
             }
             body = aggregate
@@ -217,7 +224,7 @@ final class OAuthDocumentResponseHandler: ChannelInboundHandler, RemovableChanne
             guard let head,
                   let peer = oauthDocumentSocketPeer(context.channel.remoteAddress),
                   peer == expectedPeer else {
-                fail(context: context, error: SwanError.unauthorized("OAuth document connected peer did not match its pin"))
+                fail(context: context, error: SwanError.unauthorized("\(label) connected peer did not match its pin"))
                 return
             }
             let bytes = body.flatMap { buffer in
@@ -239,13 +246,13 @@ final class OAuthDocumentResponseHandler: ChannelInboundHandler, RemovableChanne
 
     func channelInactive(context: ChannelHandlerContext) {
         if !completed {
-            fail(context: context, error: SwanError.unavailable("OAuth document connection closed before response"))
+            fail(context: context, error: SwanError.unavailable("\(label) connection closed before response"))
         }
     }
 
     func handlerRemoved(context: ChannelHandlerContext) {
         if !completed {
-            fail(context: context, error: SwanError.unavailable("OAuth document response handler was removed before response"))
+            fail(context: context, error: SwanError.unavailable("\(label) response handler was removed before response"))
         }
     }
 
@@ -262,7 +269,7 @@ final class OAuthDocumentResponseHandler: ChannelInboundHandler, RemovableChanne
         guard !completed else { return }
         completed = true
         timeoutTask = nil
-        responsePromise.fail(SwanError.unavailable("OAuth document request timed out"))
+        responsePromise.fail(SwanError.unavailable("\(label) request timed out"))
         channel.close(promise: nil)
     }
 
