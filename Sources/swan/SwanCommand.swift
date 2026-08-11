@@ -941,6 +941,7 @@ struct ServePermissionedRuntime {
         localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration? = nil,
         authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
+        actorPreferencesXRPC: SwanActorPreferencesXRPCServer? = nil,
         xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil
@@ -971,6 +972,7 @@ struct ServePermissionedRuntime {
             },
             blobStreamAdmission: directory.publicRepositorySpoolAdmission,
             accountEmailXRPC: accountEmailXRPC,
+            actorPreferencesXRPC: actorPreferencesXRPC,
             xrpcPipethrough: xrpcPipethrough,
             loginClientIdentityPolicy: loginClientIdentityPolicy,
             publicFirehoseStreaming: publicFirehoseStreaming
@@ -2617,6 +2619,23 @@ extension SwanCommand {
                     accountEmailXRPC = nil
                     emailRecoveryService = nil
                 }
+                // Composed unconditionally, and deliberately not behind a
+                // flag. Preferences are PDS-owned state that the AppView does
+                // not store, so a nil capability here would leave the routes
+                // unregistered and hand `putPreferences` to the `/xrpc/**`
+                // proxy fallback — discarding the write and disclosing the
+                // account's saved feeds, label settings, and muted words to a
+                // third party. `SwanOAuthResourceAuthorizer` construction is
+                // already a startup precondition above, so this cannot be the
+                // thing that fails here.
+                let actorPreferencesXRPC = SwanActorPreferencesXRPCServer(
+                    authorizer: try SwanOAuthResourceAuthorizer(
+                        publicURL: baseURL,
+                        runtime: oauthRuntime,
+                        accountControlStore: controlDatabase
+                    ),
+                    store: controlDatabase
+                )
                 let xrpcPipethrough: SwanXRPCPipethroughServer?
                 if disableAppViewProxy {
                     guard appViewDID == nil, appViewURL == nil,
@@ -2940,6 +2959,7 @@ extension SwanCommand {
                     localhostOAuthConfiguration: localhostOAuthConfiguration,
                     authorizationServerConfiguration: authorizationServerConfiguration,
                     accountEmailXRPC: accountEmailXRPC,
+                    actorPreferencesXRPC: actorPreferencesXRPC,
                     xrpcPipethrough: xrpcPipethrough,
                     loginClientIdentityPolicy: loginClientIdentityPolicy,
                     publicFirehoseStreaming: publicFirehoseStreamingRuntime

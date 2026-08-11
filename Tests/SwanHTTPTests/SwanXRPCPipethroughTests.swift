@@ -302,6 +302,52 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(sender.recorded().count, 0)
     }
 
+    /// Preferences are PDS-owned state the AppView does not store. If they
+    /// were proxied, a `putPreferences` would silently discard the write *and*
+    /// disclose the account's saved feeds, content-label settings, and muted
+    /// words to a third party. Asserted positively against the stub sender so
+    /// this cannot regress into a silent leak.
+    func testActorPreferencesAreNeverHandedToTheProxySender() async throws {
+        let sender = RecordingProxySender()
+        let steered: HTTPFields = {
+            var headers = HTTPFields()
+            headers[.contentType] = "application/json"
+            // Even a client that explicitly names another service must not be
+            // able to steer preferences off this host.
+            headers[HTTPField.Name("atproto-proxy")!] = "did:web:evil.example#atproto_pds"
+            return headers
+        }()
+        try await withPipethrough(sender: sender) { client in
+            // The plain form is the one that matters most: with no proxy
+            // header it would take the default `app.bsky.` route straight to
+            // the configured AppView and reach the sender.
+            try await client.execute(
+                uri: "/xrpc/app.bsky.actor.putPreferences",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(string: #"{"preferences":[{"$type":"x","mutedWords":["secret"]}]}"#)
+            ) { response in
+                XCTAssertEqual(response.status, .notFound)
+            }
+            try await client.execute(
+                uri: "/xrpc/app.bsky.actor.getPreferences",
+                method: .get
+            ) { response in
+                XCTAssertEqual(response.status, .notFound)
+            }
+            try await client.execute(
+                uri: "/xrpc/app.bsky.actor.putPreferences",
+                method: .post,
+                headers: steered,
+                body: ByteBuffer(string: #"{"preferences":[]}"#)
+            ) { response in
+                XCTAssertEqual(response.status, .notFound)
+            }
+        }
+        // Nothing left this host.
+        XCTAssertEqual(sender.recorded().count, 0)
+    }
+
     // MARK: Additional coverage
 
     func testUnroutedNamespaceIs404WithoutContactingUpstream() async throws {
@@ -526,6 +572,16 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
                     publicURL: URL(string: "http://127.0.0.1:3000")!
                 ),
                 oauthRuntime: runtime,
+                // Both halves of the preferences fix, composed together the
+                // way `serve` now composes them.
+                actorPreferencesXRPC: SwanActorPreferencesXRPCServer(
+                    authorizer: PipethroughAuthorizer(
+                        result: .success(
+                            .accountOAuth(subject: Self.did, scopes: ["atproto"])
+                        )
+                    ),
+                    store: control
+                ),
                 xrpcPipethrough: try makeCapability(sender: sender)
             )
             let app = server.buildApplication(
@@ -546,6 +602,24 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
                     method: .get
                 ) { response in
                     XCTAssertNotEqual(response.status, .ok)
+                }
+                // Preferences are answered by the local capability, not by the
+                // fallback: 200 with the PDS's own empty-array shape, never
+                // the proxied AppView body.
+                try await client.execute(
+                    uri: "/xrpc/app.bsky.actor.getPreferences",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(self.body(response), #"{"preferences":[]}"#)
+                }
+                try await client.execute(
+                    uri: "/xrpc/app.bsky.actor.putPreferences",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: ByteBuffer(string: #"{"preferences":[]}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
                 }
                 // And an app.bsky method is proxied.
                 try await client.execute(
@@ -654,7 +728,10 @@ private enum PipethroughTestFailure: Error {
 
 // MARK: - Doubles
 
-private struct PipethroughAuthorizer: SwanXRPCPipethroughResourceAuthorizing {
+private struct PipethroughAuthorizer:
+    SwanXRPCPipethroughResourceAuthorizing,
+    SwanActorPreferencesResourceAuthorizing
+{
     let result: Result<AuthorizationContext, SwanResourceAuthorizationFailure>
 
     func authorizePipethrough(
@@ -667,6 +744,17 @@ private struct PipethroughAuthorizer: SwanXRPCPipethroughResourceAuthorizing {
     }
 
     func issuePipethroughNonce(now: Date) async -> String { "test-nonce" }
+
+    func authorizeActorPreferences(
+        request: Request,
+        method: String,
+        fixedPath: String,
+        now: Date
+    ) async throws -> AuthorizationContext {
+        try result.get()
+    }
+
+    func issueActorPreferencesNonce(now: Date) async -> String { "test-nonce" }
 }
 
 /// Mints a real `ProxyServiceJWT` from a per-process test key, so the tests

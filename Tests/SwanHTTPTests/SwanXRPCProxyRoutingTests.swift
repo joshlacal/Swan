@@ -17,6 +17,39 @@ final class SwanXRPCProxyRoutingTests: XCTestCase {
         }
     }
 
+    /// Preferences are PDS state the AppView does not store. Proxying them
+    /// would discard the write *and* disclose the account's saved feeds,
+    /// content-label settings, and muted words to a third party.
+    func testActorPreferencesAreDeniedEvenThoughAppBskyIsProxied() {
+        for nsid in ["app.bsky.actor.getPreferences", "app.bsky.actor.putPreferences"] {
+            XCTAssertThrowsError(try router.route(nsid: nsid, proxyHeader: nil)) { error in
+                XCTAssertEqual(error as? SwanXRPCProxyRoutingFailure, .denied, nsid)
+            }
+            // And an explicit proxy header must not override it either.
+            XCTAssertThrowsError(
+                try router.route(nsid: nsid, proxyHeader: "did:web:evil.example#atproto_pds")
+            ) { error in
+                XCTAssertEqual(error as? SwanXRPCProxyRoutingFailure, .denied, nsid)
+            }
+        }
+    }
+
+    /// The exact-match deny entries must not become a `app.bsky.actor.` prefix:
+    /// every other method in that namespace is genuinely AppView-owned.
+    func testSiblingActorMethodsStillReachTheAppView() throws {
+        for nsid in [
+            "app.bsky.actor.getProfile",
+            "app.bsky.actor.searchActors",
+            "app.bsky.actor.getPreferencesExtended",
+        ] {
+            XCTAssertEqual(
+                try router.route(nsid: nsid, proxyHeader: nil),
+                .configuredAppView(did: "did:web:api.bsky.app"),
+                nsid
+            )
+        }
+    }
+
     func testDenyListWinsOverExplicitProxyHeader() {
         XCTAssertThrowsError(
             try router.route(

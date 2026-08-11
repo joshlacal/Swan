@@ -139,13 +139,20 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
       try await app.test(.router) { client in
         try await client.execute(uri: authorize, method: .get) { response in
           XCTAssertEqual(response.status, .ok)
+          // The login page's form submission ends in a cross-origin redirect
+          // to this client's registered redirect URI, so `form-action` must
+          // name exactly that origin alongside 'self'. A bare 'self' here is
+          // the regression that blocked the consent redirect for every client.
           self.assertStrictBrowserSecurityHeaders(
             response.headers,
-            contentType: "text/html; charset=utf-8"
+            contentType: "text/html; charset=utf-8",
+            formActionSource: "https://client.example"
           )
         }
         try await client.execute(uri: "/oauth/authorize", method: .get) { response in
           XCTAssertEqual(response.status, .badRequest)
+          // A rejected authorization request has no validated client and no
+          // redirect context, so it must still emit the bare 'self' form.
           self.assertStrictBrowserSecurityHeaders(
             response.headers,
             contentType: "text/plain; charset=utf-8"
@@ -1471,17 +1478,26 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     value?.split(separator: ";", maxSplits: 1).first?.split(separator: "=", maxSplits: 1)
       .dropFirst().first.map(String.init)
   }
+  /// - Parameter formActionSource: the client redirect origin this page's
+  ///   `form-action` is expected to name, or nil for a page with no client
+  ///   redirect context. It is spelled out by the caller and compared as an
+  ///   exact literal — never a substring match — so the pinned property stays
+  ///   "`form-action` is `'self'` plus *only* the validated redirect origin".
+  ///   A page that named a second origin, a wildcard, or `'unsafe-inline'`
+  ///   still fails here.
   private func assertStrictBrowserSecurityHeaders(
     _ headers: HTTPFields,
     contentType: String,
+    formActionSource: String? = nil,
     file: StaticString = #filePath,
     line: UInt = #line
   ) {
     XCTAssertEqual(headers[.contentType], contentType, file: file, line: line)
     XCTAssertEqual(headers[.cacheControl], "no-store", file: file, line: line)
+    let formAction = formActionSource.map { "'self' \($0)" } ?? "'self'"
     XCTAssertEqual(
       headers[contentSecurityPolicyHeader],
-      "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+      "default-src 'none'; form-action \(formAction); frame-ancestors 'none'; base-uri 'none'",
       file: file,
       line: line
     )

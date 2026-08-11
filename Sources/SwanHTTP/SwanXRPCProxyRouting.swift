@@ -29,6 +29,18 @@ public enum SwanXRPCProxyRoutingFailure: Error, Sendable, Equatable {
 /// forwarding Swan-owned traffic to a third party.
 public struct SwanXRPCProxyRouter: Sendable {
     private static let deniedPrefixes = ["com.atproto.space.", "blue.catbird."]
+    /// Exact NSIDs Swan owns inside a namespace it otherwise proxies.
+    ///
+    /// Account preferences are PDS state: the AppView does not store them, so
+    /// forwarding these would both discard the write and disclose the
+    /// account's saved feeds, content-label settings, and muted words to a
+    /// third party. They must be matched exactly — a `app.bsky.actor.` prefix
+    /// would over-match `getProfile`, `searchActors`, and every other genuinely
+    /// AppView-owned method in that namespace.
+    private static let deniedMethods: Set<String> = [
+        "app.bsky.actor.getPreferences",
+        "app.bsky.actor.putPreferences",
+    ]
     private static let appViewPrefix = "app.bsky."
 
     private let appViewDID: String
@@ -39,7 +51,8 @@ public struct SwanXRPCProxyRouter: Sendable {
 
     public func route(nsid: String, proxyHeader: String?) throws -> SwanXRPCProxyRoute {
         // Deny-list first: an explicit header must never override it.
-        guard !Self.deniedPrefixes.contains(where: { nsid.hasPrefix($0) }) else {
+        guard !Self.deniedPrefixes.contains(where: { nsid.hasPrefix($0) }),
+              !Self.deniedMethods.contains(nsid) else {
             throw SwanXRPCProxyRoutingFailure.denied
         }
         if let proxyHeader {
