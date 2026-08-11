@@ -51,10 +51,18 @@ only to prove the provisioning pipeline. An `update-identity` command belongs
 in the account-management spec, where user-driven handle changes live — handle
 changes are table stakes for a PDS, but they are not this spec's job.
 
-**First handle is `josh.swan.place`, not the apex.** It leaves `swan.place` as
-purely the PDS, it matches the shape of every future user handle, and it
-exercises the `*.swan.place` wildcard for TLS and handle resolution now, so
-signup is not the first thing to discover a problem there.
+**The first account's handle is the apex, `swan.place`.** This account exists
+to be the PDS's own identity, so the handle matching the service domain is the
+intended arrangement — and it is what runs today, where `swan.catbird.blue` is
+both the PDS and the account handle. Handle resolution for the apex is served
+from `https://swan.place/.well-known/atproto-did`, which does not conflict with
+anything: the PDS serves that path and returns this account's DID.
+
+The cost is that the `*.swan.place` handle-resolution path goes unexercised
+until signup introduces per-handle resolution. That is acceptable because
+cutover step 2 independently proves the wildcard terminates TLS and reaches
+Swan without needing an account to exist; only the proof-serving half waits.
+User handles remain first-level under `*.swan.place`.
 
 **`swan.catbird.blue` keeps serving.** Both vhosts point at the same Swan
 instance. No redirect: redirecting an OAuth issuer origin causes more problems
@@ -105,15 +113,17 @@ came from performing an irreversible action before the path was verified.
    `https://swan.place/health` returns 200 while Swan still advertises
    `swan.catbird.blue` — proving DNS, edge TLS, origin TLS and proxying before
    any identity exists.
-2. Verify an arbitrary wildcard host (`josh.swan.place`) also terminates TLS
-   and reaches Swan.
+2. Verify an arbitrary wildcard host (for example `probe.swan.place`) also
+   terminates TLS and reaches Swan. No account is needed for this check, and it
+   is the step that would otherwise fail late, during signup.
 3. Flip `--public-url` to `https://swan.place` and restart. Verify
    `describeServer` and that the OAuth metadata `issuer` is now
    `https://swan.place` — that value matters because client assertions bind
    their `aud` to it.
-4. Run `account prepare-plc` with `--handle josh.swan.place --pds-origin
+4. Run `account prepare-plc` with `--handle swan.place --pds-origin
    https://swan.place` and a fresh `--request-id`; read the staged DID from its
-   output; add the static Caddy handle-proof handler returning that DID.
+   output; add the static Caddy handle-proof handler at the apex returning that
+   DID.
 5. Run `account activate-plc` with the same `--request-id`.
 6. Re-enable `--enable-local-space-interop` and
    `--enable-public-repository-mutations`, which require an active account, and
@@ -128,12 +138,13 @@ permanent DID.
 ## Verification
 
 - `https://swan.place/health` → 200
-- `https://josh.swan.place/.well-known/atproto-did` → the new DID
+- `https://swan.place/.well-known/atproto-did` → the new DID
+- An arbitrary `*.swan.place` host terminates TLS and reaches Swan
 - `/.well-known/oauth-authorization-server` and
   `/.well-known/oauth-protected-resource` → 200, `issuer` = `https://swan.place`
 - `com.atproto.server.describeServer` → 200
-- `account show` → `status: active`, handle `josh.swan.place`
-- `plc.directory` DID document → `alsoKnownAs: at://josh.swan.place`,
+- `account show` → `status: active`, handle `swan.place`
+- `plc.directory` DID document → `alsoKnownAs: at://swan.place`,
   `serviceEndpoint: https://swan.place`
 - An actual OAuth sign-in, because that is the outcome that matters
 - All five prod services on netcup still active, and `catbird.blue` vhosts
