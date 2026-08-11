@@ -183,12 +183,26 @@ private func handleOAuthServerPAR(
     form = try await parseOAuthServerPARForm(
       request, context: context, requestBodyAdmission: requestBodyAdmission)
   } catch let failure as SwanRequestBodyCollectionFailure {
+    context.logger.info(
+      "oauth par rejected",
+      metadata: [
+        "stage": .string("body_collection"),
+        "failure": .string(String(describing: failure)),
+      ])
     return oauthServerBodyFailurePAR(failure)
   } catch let error as OAuthServerRequestError {
+    context.logger.info(
+      "oauth par rejected",
+      metadata: [
+        "stage": .string("form_parse"),
+        "reason": .string(String(describing: error)),
+      ])
     return error == .payloadTooLarge
       ? oauthServerPARJSON(.contentTooLarge, OAuthServerPARError(error: "invalid_request"))
       : oauthServerPARJSON(.badRequest, OAuthServerPARError(error: "invalid_request"))
   } catch {
+    context.logger.info(
+      "oauth par rejected", metadata: ["stage": .string("form_parse_unexpected")])
     return oauthServerPARJSON(.badRequest, OAuthServerPARError(error: "invalid_request"))
   }
   guard let proof = oauthServerSingleDPoP(from: request.headers),
@@ -307,7 +321,8 @@ private func beginOAuthServerAuthorization(
     return oauthServerHTML(
       .ok,
       oauthServerLoginPage(csrf: issued.session.csrfToken),
-      setCookie: oauthServerCookie(issued.value)
+      setCookie: oauthServerCookie(issued.value),
+      formActionSource: oauthServerFormActionSource(pushed.binding.redirectURI)
     )
   } catch {
     // Request URI existence and client metadata readiness are not a
@@ -374,18 +389,37 @@ private func loginOAuthServerAuthorization(
         clientID: pushed.binding.clientID,
         scopes: pushed.binding.scopes
       ),
-      setCookie: oauthServerCookie(issued.value)
+      setCookie: oauthServerCookie(issued.value),
+      formActionSource: oauthServerFormActionSource(pushed.binding.redirectURI)
     )
   } catch is AccountLoginAdmissionError {
+    // All four of these render identically on the wire, deliberately: a
+    // distinguishable response would be a credential oracle. Record which one
+    // actually fired so an operator is not left guessing between "wrong
+    // password", "rate limited" and "proxy peer not trusted".
+    context.logger.info(
+      "oauth authorize rejected", metadata: ["stage": .string("login_admission")])
     return oauthServerAuthorizationError(.serviceUnavailable)
   } catch is AccountLoginAuthenticationError {
+    context.logger.info(
+      "oauth authorize rejected", metadata: ["stage": .string("login_authentication")])
     return oauthServerAuthorizationError(.serviceUnavailable)
   } catch is SwanLoginClientIdentityError {
+    context.logger.info(
+      "oauth authorize rejected", metadata: ["stage": .string("login_client_identity")])
     return oauthServerAuthorizationError(.serviceUnavailable)
   } catch let failure as SwanRequestBodyCollectionFailure {
+    context.logger.info(
+      "oauth authorize rejected",
+      metadata: [
+        "stage": .string("body_collection"),
+        "failure": .string(String(describing: failure)),
+      ])
     return oauthServerAuthorizationError(
       failure == .unavailable ? .serviceUnavailable : .badRequest)
   } catch {
+    context.logger.info(
+      "oauth authorize rejected", metadata: ["stage": .string("unexpected")])
     return oauthServerAuthorizationError(.badRequest)
   }
 }
@@ -1062,12 +1096,46 @@ private func oauthServerEscape(_ value: String) -> String {
 }
 
 private func oauthServerHTML(
-  _ status: HTTPResponse.Status, _ body: String, setCookie: String? = nil
+  _ status: HTTPResponse.Status, _ body: String, setCookie: String? = nil,
+  formActionSource: String? = nil
 ) -> Response {
-  var headers = oauthServerBrowserHeaders(contentType: "text/html; charset=utf-8")
+  var headers = oauthServerBrowserHeaders(
+    contentType: "text/html; charset=utf-8", formActionSource: formActionSource)
   if let setCookie { headers[HTTPField.Name("Set-Cookie")!] = setCookie }
   return Response(
     status: status, headers: headers, body: .init(byteBuffer: ByteBuffer(string: body)))
+}
+
+/// CSP `form-action` source for a client's already-validated redirect URI.
+///
+/// The consent form's submission ends in a redirect to the client's redirect
+/// URI, which is cross-origin for every real client. WebKit and Blink apply
+/// `form-action` to the redirect that *follows* a form submission, so a bare
+/// `'self'` silently blocks the navigation carrying the authorization code:
+/// the browser stays on the consent page, no request reaches the client, and
+/// the flow never completes. The URI here is the one already checked against
+/// the client's registered metadata at PAR, so naming its origin grants no
+/// trust the request did not already have.
+///
+/// Returns `nil` rather than a permissive fallback when the URI cannot be
+/// reduced to a safe source expression — the caller then emits plain
+/// `'self'`, which fails closed exactly as before.
+private func oauthServerFormActionSource(_ redirectURI: String) -> String? {
+  guard let components = URLComponents(string: redirectURI),
+    let rawScheme = components.scheme, !rawScheme.isEmpty
+  else { return nil }
+  let scheme = rawScheme.lowercased()
+  guard
+    scheme.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "+-.".contains($0)) })
+  else { return nil }
+  // Native clients register custom-scheme redirects with no host; a
+  // scheme-only source expression is the correct CSP spelling for those.
+  guard let host = components.host, !host.isEmpty else { return "\(scheme):" }
+  guard
+    host.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || "-.:[]".contains($0)) })
+  else { return nil }
+  guard let port = components.port else { return "\(scheme)://\(host)" }
+  return "\(scheme)://\(host):\(port)"
 }
 
 private func oauthServerRedirect(_ destination: URL, clearCookie: Bool) -> Response {
@@ -1087,11 +1155,14 @@ private func oauthServerAuthorizationError(_ status: HTTPResponse.Status, clearC
     body: .init(byteBuffer: ByteBuffer(string: "authorization request rejected")))
 }
 
-private func oauthServerBrowserHeaders(contentType: String? = nil) -> HTTPFields {
+private func oauthServerBrowserHeaders(
+  contentType: String? = nil, formActionSource: String? = nil
+) -> HTTPFields {
   var headers: HTTPFields = [.cacheControl: "no-store"]
   if let contentType { headers[.contentType] = contentType }
+  let formAction = formActionSource.map { "'self' \($0)" } ?? "'self'"
   headers[HTTPField.Name("Content-Security-Policy")!] =
-    "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+    "default-src 'none'; form-action \(formAction); frame-ancestors 'none'; base-uri 'none'"
   headers[HTTPField.Name("X-Frame-Options")!] = "DENY"
   headers[HTTPField.Name("Referrer-Policy")!] = "no-referrer"
   headers[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"
