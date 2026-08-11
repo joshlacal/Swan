@@ -75,8 +75,9 @@ future relay revision starts issuing `since`.
 ## 5. Full-suite receipt on the exact head tree
 
 `xcrun swift test` (Xcode beta toolchain, Swift 6.4, macOS 27.0 SDK) on the
-head tree after the runtime proof: **3,993 XCTest tests + 6 Swift Testing
-tests, 0 failures, exit 0**. The only "failed" strings in the log are a
+head tree after the runtime proof: **1,325 XCTest cases + 6 Swift Testing
+tests across 11 bundles, 0 failures, exit 0** (count corrected 2026-08-11;
+see §7d). The only "failed" strings in the log are a
 pkg-config search-path warning and an intentional announcer-backoff test log
 line. (Four earlier suite invocations died from an unrelated concurrent
 process issuing machine-wide `pkill -9 -f swift-frontend`; after it was
@@ -139,8 +140,9 @@ compiled source tree is identical. Toolchain: Apple Swift 6.4
   (the file's other class, PLCAccountActivationServiceTests, is outside the
   filter), AccountOperatorServiceTests 9, PublicRepositoryMutationHTTPTests 20.
 - Step 3 `xcrun swift build`: exit 0, warnings 2 (same pkg-config pair).
-- Step 4 full unfiltered `xcrun swift test`: exit 0; 3,993 XCTest tests, 0
-  failures, 0 skipped; 6 Swift Testing tests, 0 failures.
+- Step 4 full unfiltered `xcrun swift test`: exit 0; 1,325 XCTest cases across
+  11 bundles, 0 failures, 0 skipped; 6 Swift Testing tests, 0 failures (count
+  corrected 2026-08-11; see §7d).
 - Step 5 profile hash and generated-wire manifest checks: `verify-profile.sh`
   exit 0 ("profile lexicons verified"); `verify-wire-generation.sh` and
   `verify-public-wire-generation.sh` exit 0 ("verified without worktree
@@ -174,6 +176,20 @@ source keys" and per-commit five-commit deltas: the artifact policy is
 aggregate/digest-only with no DID, handle, path, or record value, and the
 per-commit deltas are proven inside the independent verifier's
 `repository_commits` check rather than serialized into the artifact.
+
+### 7d. Full-suite count correction (2026-08-11)
+
+Third numeric correction to this record, and the same extraction defect as the
+second: the full-suite figure originally recorded in §5 and §7b step 4 as
+"3,993 XCTest tests" was a sum over nested suite summaries (per-class, per
+`.xctest` bundle, and the run-level roll-up), not a count of tests. Recounted
+from the two originally captured logs — the Task 7 run and the Task 3 gate's
+step 4 — by counting `Test Case '-[...]' passed` lines: both report **1,325
+distinct XCTest cases, 0 failed, across 11 bundles**, plus 6 Swift Testing
+tests. Exit codes, the zero-failure and zero-skip results, and every gate
+conclusion are unaffected; only the magnitude was wrong. The lesson is now
+recorded twice over: derive counts from per-case lines or a single named
+summary level, never by summing every `Executed N tests` line.
 
 ## 8. Still unproven / open gates
 
