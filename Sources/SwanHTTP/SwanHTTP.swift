@@ -385,6 +385,12 @@ public struct SwanHTTPServer: Sendable {
     /// capability is nil unless the caller has assembled the proof codec,
     /// control-store adapter, rate limiter, and SMTP worker at startup.
     public let accountEmailXRPC: SwanAccountEmailXRPCServer?
+    /// Local `app.bsky.actor.getPreferences` / `app.bsky.actor.putPreferences`
+    /// routes. These can never be proxied to an AppView — the AppView does
+    /// not store preferences, the PDS does — so this capability is nil unless
+    /// the caller has assembled a resource authorizer and a durable
+    /// preferences store at startup.
+    public let actorPreferencesXRPC: SwanActorPreferencesXRPCServer?
     /// Shared process-wide/per-account admission for descriptor-backed blob
     /// responses. The CLI passes the preopened directory's instance so
     /// public CAR, upload, and blob budgets remain coordinated.
@@ -429,6 +435,7 @@ public struct SwanHTTPServer: Sendable {
         publicBlobSpoolAdmission: PublicRepositorySpoolAdmission? = nil,
         blobStreamAdmission: PublicRepositorySpoolAdmission? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
+        actorPreferencesXRPC: SwanActorPreferencesXRPCServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         jsonReadAdmission: PublicRepositoryJSONReadAdmission? = nil,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
@@ -442,6 +449,7 @@ public struct SwanHTTPServer: Sendable {
         self.loginClientIdentityPolicy = loginClientIdentityPolicy
         self.publicRepositoryReadDirectory = publicRepositoryReadDirectory
         self.accountEmailXRPC = accountEmailXRPC
+        self.actorPreferencesXRPC = actorPreferencesXRPC
         self.publicFirehoseStreaming = publicFirehoseStreaming
         let resolvedJSONReadAdmission = jsonReadAdmission
             ?? PublicRepositoryJSONReadAdmission.processShared
@@ -968,6 +976,10 @@ public struct SwanHTTPServer: Sendable {
             registerUnavailablePublicEndpoint(descriptor, on: router)
         }
         accountEmailXRPC?.register(
+            on: router,
+            requestBodyAdmission: requestBodyAdmission
+        )
+        actorPreferencesXRPC?.register(
             on: router,
             requestBodyAdmission: requestBodyAdmission
         )

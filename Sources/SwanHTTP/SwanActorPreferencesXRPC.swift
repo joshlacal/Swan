@@ -8,9 +8,10 @@ import SwanSpaces
 import SwanStorage
 
 /// The 1 MiB write cap mirrors the storage layer's CHECK constraint exactly.
-/// A body over this bound is rejected here with 400 before it ever reaches
-/// the database, so the constraint itself is never the thing that fails an
-/// oversized write.
+/// A body over this bound is rejected here with 413 (`PayloadTooLarge`,
+/// matching `SwanAccountEmailXRPC.swift`'s `.contentTooLarge` mapping) before
+/// it ever reaches the database, so the constraint itself is never the thing
+/// that fails an oversized write.
 public enum SwanActorPreferencesXRPC {
     public static let maximumPreferencesJSONBytes = 1_048_576
 }
@@ -57,6 +58,49 @@ private enum ActorPreferencesXRPCFailure: Error {
     case unauthorized
     case nonce
     case unavailable
+}
+
+/// The bundled dependency capability for the two `app.bsky.actor`
+/// preferences routes, in the same shape as
+/// ``SwanAccountEmailXRPCServer``: `SwanHTTPServer` holds one optional
+/// instance of this type and registers it conditionally during
+/// `buildRouter()`, exactly like `accountEmailXRPC`. A `nil` capability at
+/// the server means the routes simply do not exist, the same as every other
+/// optional capability on `SwanHTTPServer`.
+public struct SwanActorPreferencesXRPCServer: Sendable {
+    let authorizer: any SwanActorPreferencesResourceAuthorizing
+    let store: any ActorPreferencesStore
+
+    public init(
+        authorizer: any SwanActorPreferencesResourceAuthorizing,
+        store: any ActorPreferencesStore
+    ) {
+        self.authorizer = authorizer
+        self.store = store
+    }
+
+    /// Installs the routes using the process-wide production body admission
+    /// policy. Exposed for focused standalone testing of this capability in
+    /// isolation from `SwanHTTPServer`.
+    public func register(on router: Router<SwanHTTPRequestContext>) {
+        registerSwanActorPreferencesXRPC(on: router, authorizer: authorizer, store: store)
+    }
+
+    /// Installs the routes using the caller's shared body admission policy.
+    /// `SwanHTTPServer.buildRouter()` calls this so every route in the
+    /// process shares the same admission instance, exactly like
+    /// `accountEmailXRPC?.register(on:requestBodyAdmission:)`.
+    func register(
+        on router: Router<SwanHTTPRequestContext>,
+        requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+    ) {
+        registerSwanActorPreferencesXRPC(
+            on: router,
+            authorizer: authorizer,
+            store: store,
+            requestBodyAdmission: requestBodyAdmission
+        )
+    }
 }
 
 /// Installs `app.bsky.actor.getPreferences` and `app.bsky.actor.putPreferences`

@@ -4,6 +4,8 @@ import Hummingbird
 import HummingbirdTesting
 import Logging
 import NIOCore
+import SwanCore
+import SwanOAuth
 import SwanSpaces
 import SwanSQLite
 import SwanStorage
@@ -221,7 +223,121 @@ final class SwanActorPreferencesXRPCTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// Regression guard for the routes being wired only into a standalone
+    /// test router and never into `SwanHTTPServer`'s actual production
+    /// composition. Unlike every other test in this file (which registers
+    /// via `registerSwanActorPreferencesXRPC` directly against a bare
+    /// `Router`), this builds a real `SwanHTTPServer` — the same type the
+    /// CLI constructs for a deployed Swan — and asserts the route answers
+    /// through `SwanHTTPServer.buildApplication(logger:)`. This mirrors
+    /// `AccountEmailXRPCTests.testEmailRoutesComposeIntoTheMainServerBeforeApplicationConstruction`
+    /// exactly, which is the established pattern for this exact regression
+    /// class (a capability that exists but was never composed in).
+    func testActorPreferencesRoutesComposeIntoTheMainServerBeforeApplicationConstruction() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanActorPreferencesMainServer-\(UUID().uuidString)")
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let runtime = try SwanOAuthRuntime(
+                controlStore: control,
+                serverKey: Data(repeating: 0x3D, count: 32)
+            )
+            let capability = SwanActorPreferencesXRPCServer(
+                authorizer: PreferencesAuthorizer(
+                    result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+                ),
+                store: control
+            )
+            let profile = try ProtocolProfile.load(
+                from: packageRoot().appending(
+                    path: "Profiles/permissioned-data-0016-2026-07-30.json"
+                )
+            )
+            let server = SwanHTTPServer(
+                profile: profile,
+                configuration: .init(
+                    host: "127.0.0.1",
+                    port: 3_000,
+                    publicURL: URL(string: "http://127.0.0.1:3000")!
+                ),
+                oauthRuntime: runtime,
+                actorPreferencesXRPC: capability
+            )
+            let app = server.buildApplication(
+                logger: Logger(label: "SwanActorPreferencesXRPCTests.main-server")
+            )
+            try await app.test(.live) { client in
+                try await client.execute(
+                    uri: "/xrpc/app.bsky.actor.getPreferences",
+                    method: .get
+                ) { response in
+                    // If `SwanHTTPServer` never registered this capability,
+                    // this falls through to the server's unknown-endpoint
+                    // guard and comes back 404 instead of 200.
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(self.bodyString(response), #"{"preferences":[]}"#)
+                }
+                try await client.execute(
+                    uri: "/xrpc/app.bsky.actor.putPreferences",
+                    method: .post,
+                    headers: self.jsonHeaders(),
+                    body: ByteBuffer(string: #"{"preferences":[]}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+            }
+            try await control.close()
+        } catch {
+            try? await control.close()
+            throw error
+        }
+    }
+
+    func testRejectsOversizedPreferencesBodyWith413() async throws {
+        try await withPreferencesStore { store in
+            let app = self.makeApp(
+                authorizer: PreferencesAuthorizer(
+                    result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+                ),
+                store: store
+            )
+            // One byte past the cap. The Content-Length check rejects this
+            // before the body is ever read for JSON shape, so the content
+            // does not need to be valid JSON.
+            let oversized = String(
+                repeating: "a",
+                count: SwanActorPreferencesXRPC.maximumPreferencesJSONBytes + 1
+            )
+            try await app.test(.live) { client in
+                try await client.execute(
+                    uri: "/xrpc/app.bsky.actor.putPreferences",
+                    method: .post,
+                    headers: self.jsonHeaders(),
+                    body: ByteBuffer(string: oversized)
+                ) { response in
+                    self.assertError(response, status: .contentTooLarge, code: "PayloadTooLarge")
+                }
+                // Nothing must have been persisted by the rejected write.
+                try await client.execute(
+                    uri: "/xrpc/app.bsky.actor.getPreferences",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(self.bodyString(response), #"{"preferences":[]}"#)
+                }
+            }
+        }
+    }
+
     // MARK: Helpers
+
+    private func packageRoot() -> URL {
+        URL(filePath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
 
     private func withPreferencesStore(
         _ body: (SQLiteControlDatabase) async throws -> Void

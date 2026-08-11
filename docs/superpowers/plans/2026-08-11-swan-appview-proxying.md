@@ -922,7 +922,7 @@ CREATE TABLE IF NOT EXISTS actor_preferences (
 ) WITHOUT ROWID
 ```
 
-The 1 MiB cap bounds what one account can store; `putPreferences` rejects a larger body with 400 rather than failing at the database.
+The 1 MiB cap bounds what one account can store; `putPreferences` rejects a larger body with **413 Payload Too Large** rather than failing at the database CHECK constraint. (Corrected 2026-08-11: this plan originally said 400. 413 is the correct HTTP semantic and matches the precedent already set by `SwanAccountEmailXRPC.swift:837` for oversized payloads. Ruled by Josh during execution.)
 
 - [ ] **Step 4: Implement the two routes**
 
