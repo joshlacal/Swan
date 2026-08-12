@@ -106,6 +106,19 @@ public enum PublicReadUnavailableReason: String, Sendable, Equatable, CaseIterab
     case spoolStreamFailure
     /// An underlying storage error with no more specific classification.
     case storageFailure
+
+    // MARK: Post-mutation publication
+
+    /// A mutation committed durably, but the refresh that republishes the
+    /// account's read generation refused — so the cached generation was
+    /// evicted and the next read will admit from cold.
+    ///
+    /// Unlike every case above, this never refuses a request: the write it
+    /// follows has already succeeded and is reported as such. It exists so a
+    /// write path that quietly stops publishing is visible in the journal at
+    /// all, and it is emitted *after* the line naming the guard that actually
+    /// fired — cause first, then consequence.
+    case postMutationRefreshFailed
 }
 
 public enum PublicRepositoryReadError: Error, Sendable, Equatable {

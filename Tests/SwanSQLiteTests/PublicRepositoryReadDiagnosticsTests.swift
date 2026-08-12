@@ -78,6 +78,7 @@ final class PublicRepositoryReadDiagnosticsTests: XCTestCase {
             "malformedProjectionValue",
             "spoolStreamFailure",
             "storageFailure",
+            "postMutationRefreshFailed",
         ]
         let actual = Set(PublicReadUnavailableReason.allCases.map(\.rawValue))
         XCTAssertEqual(

@@ -1413,17 +1413,109 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
+    /// Republishes an account's public read generation after a mutation, and
+    /// evicts rather than refuses when that cannot be done.
+    ///
+    /// This runs strictly *after* `applyPublicRepositoryMutation` has
+    /// committed. By then the write is durable and nothing here can unmake it,
+    /// so propagating a refresh failure was wrong twice over. It reported
+    /// failure for a request whose write had already succeeded — a client that
+    /// retries on that answer writes the record twice — and it left the
+    /// pre-mutation generation cached, pinned to a `public_repository_state`
+    /// the commit has already moved past. Every following read matched that
+    /// pin, refused with ``PublicReadUnavailableReason/repositoryStateMismatch``,
+    /// and stayed refused: the 2026-08-12 outage's shape reached through a
+    /// different door, and one that re-admission cannot rescue because only
+    /// ``PublicReadUnavailableReason/generationPinStale`` earns a retry.
+    ///
+    /// The repair is local and negative. The entry is dropped from
+    /// ``publicReadGenerations`` — the *positive* cache, the one that answers
+    /// reads — so the next read finds nothing cached and admits from cold
+    /// exactly as the first read after bootstrap does. The mutation itself is
+    /// unaffected and returns success.
+    ///
+    /// Deliberately **not** written here: a `publicReadReadmissionFailures`
+    /// entry. That negative cache exists to stop an unadmittable account from
+    /// re-paying a full admission on every anonymous read, and while it is
+    /// live it answers with a refusal. Recording one from this path would
+    /// suppress the very cold admission the eviction depends on, converting a
+    /// self-healing cache miss into a guaranteed backoff window of `503`s for
+    /// an account whose write just succeeded.
     fileprivate func refreshPublicReadGenerationAfterMutation(
         did: String,
         database: SQLiteAccountDatabase
-    ) async throws {
-        guard let account = try await controlStore.account(did: did) else {
-            throw PublicRepositoryReadError.unavailable(reason: .controlRowChanged)
+    ) async {
+        do {
+            let resolved: AccountControlAccount?
+            do {
+                resolved = try await controlStore.account(did: did)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw Self.namedPostMutationRefreshFailure(
+                    .controlStoreFailure, did: did
+                )
+            }
+            guard let account = resolved else {
+                throw Self.namedPostMutationRefreshFailure(
+                    .controlRowChanged, did: did
+                )
+            }
+            _ = try await refreshPublicReadGeneration(
+                account: account,
+                database: database
+            )
+        } catch is CancellationError {
+            // Ordered before the generic catch, as on the admission path. A
+            // cancelled refresh is not evidence that this account cannot be
+            // admitted, so the generation is still retired — it is stale
+            // either way — but nothing is journalled as a refusal.
+            publicReadGenerations.removeValue(forKey: did)
+        } catch {
+            publicReadGenerations.removeValue(forKey: did)
+            Self.logPublicReadAdmissionFailure(
+                .unavailable(reason: .postMutationRefreshFailed),
+                did: did
+            )
         }
-        _ = try await refreshPublicReadGeneration(
-            account: account,
-            database: database
-        )
+    }
+
+    /// Journals a refusal raised by this file's own pre-refresh guards and
+    /// returns it to be thrown.
+    ///
+    /// ``refreshPublicReadGeneration(account:database:)`` journals every
+    /// refusal it names itself, so the guards that run before it are the only
+    /// ones that would otherwise refuse silently. Every post-mutation refresh
+    /// failure therefore leaves exactly one line naming the cause, followed by
+    /// one naming the eviction.
+    private static func namedPostMutationRefreshFailure(
+        _ reason: PublicReadUnavailableReason,
+        did: String
+    ) -> PublicRepositoryReadError {
+        let error = PublicRepositoryReadError.unavailable(reason: reason)
+        logPublicReadAdmissionFailure(error, did: did)
+        return error
+    }
+
+    /// Test seam: the identity of the generation currently cached for one DID,
+    /// or `nil` when nothing is cached.
+    ///
+    /// Eviction and replacement are indistinguishable from the read path —
+    /// both end in a cold admission — yet the difference is exactly what
+    /// ``refreshPublicReadGenerationAfterMutation(did:database:)`` has to get
+    /// right. Read-only, and never consulted by production code.
+    func cachedPublicReadGenerationID(did: String) -> UUID? {
+        publicReadGenerations[did]?.id
+    }
+
+    /// Test seam: whether a re-admission backoff entry is live for one DID.
+    /// A failed post-mutation refresh must evict the positive generation
+    /// without writing one of these. Never consulted by production code.
+    func hasLivePublicReadReadmissionBackoff(did: String) -> Bool {
+        guard let failure = publicReadReadmissionFailures[did] else {
+            return false
+        }
+        return failure.expiresAt > ContinuousClock.now
     }
 
     private func resolvePublicAccount(
@@ -2279,7 +2371,11 @@ private actor SQLiteGenerationRefreshingPublicMutationStore:
                 prepared: prepared
             )
         }
-        try await directory.refreshPublicReadGenerationAfterMutation(
+        // Scope note: only the refresh is allowed to fail quietly. Everything
+        // above — the fence and the durable commit itself — has already
+        // propagated its own errors from this method, so a write that did not
+        // happen can never be reported as one that did.
+        await directory.refreshPublicReadGenerationAfterMutation(
             did: did,
             database: database
         )

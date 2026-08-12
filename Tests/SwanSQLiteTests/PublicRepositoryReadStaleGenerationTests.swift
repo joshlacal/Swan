@@ -301,6 +301,217 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
         )
     }
 
+    // MARK: The write side
+
+    /// The commit is durable before the refresh runs. A refresh error must not
+    /// fail a request whose write already succeeded.
+    ///
+    /// Asserted through the same seam HTTP uses — the mutation store returned
+    /// by `generationRefreshingPublicMutationStore` — so this is the *request's*
+    /// answer, not merely the absence of an internal throw. A client that is
+    /// told its write failed retries it, and a repository write retried against
+    /// a repository that already applied it is a duplicate record.
+    func testFailedPostMutationRefreshDoesNotFailTheMutation() async throws {
+        let fixture = try await makeFixture()
+
+        let warm = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        XCTAssertEqual(warm?.revision, fixture.revision)
+
+        // Every admission from here on refuses, so the post-commit refresh
+        // cannot republish. The commit itself does not go through admission.
+        fixture.verifier.rejectEverything()
+
+        let committed = try await applyOneRecord(
+            fixture, recordKey: "refresh-fails"
+        )
+        XCTAssertNotEqual(
+            committed.state.revision,
+            fixture.revision,
+            "the mutation must have advanced the repository, not been a no-op"
+        )
+        XCTAssertEqual(committed.recordResults.count, 1)
+
+        // And the write is durable: the account database agrees with what the
+        // caller was told, independently of anything the read cache holds.
+        let maybeStore = await fixture.directory
+            .generationRefreshingPublicMutationStore(did: did)
+        let store = try XCTUnwrap(maybeStore)
+        let maybePersisted = try await store.loadPublicRepositoryState()
+        let persisted = try XCTUnwrap(maybePersisted)
+        XCTAssertEqual(persisted.revision, committed.state.revision)
+    }
+
+    /// A refresh that cannot republish must leave *nothing* cached, not a
+    /// generation pinned to the pre-mutation state.
+    ///
+    /// The distinction is the whole point. A stale generation left in place
+    /// still matches its `data_version` pin — the mutation committed on the
+    /// directory's own connection, which `PRAGMA data_version` never reports —
+    /// so it fails the *state* pin instead, with `.repositoryStateMismatch`.
+    /// That reason earns no re-admission, so the account would be dark until
+    /// some later write happened to succeed at refreshing: the 2026-08-12
+    /// outage reached through the write path.
+    func testFailedPostMutationRefreshEvictsRatherThanCachingStale()
+        async throws
+    {
+        let fixture = try await makeFixture()
+
+        _ = try await fixture.directory.publicRepositoryStatus(selector: did)
+        let cachedBefore = await fixture.directory.cachedPublicReadGenerationID(
+            did: did
+        )
+        XCTAssertNotNil(
+            cachedBefore,
+            "precondition: a warm read must leave a generation cached"
+        )
+
+        fixture.verifier.rejectEverything()
+        let committed = try await applyOneRecord(fixture, recordKey: "evicted")
+
+        // Gone, not merely different. A replacement — even one pinned to the
+        // new state — would still be a published generation, and this path
+        // must never publish one it could not admit.
+        let cachedAfter = await fixture.directory.cachedPublicReadGenerationID(
+            did: did
+        )
+        XCTAssertNil(
+            cachedAfter,
+            "a failed post-mutation refresh must evict the generation, not "
+                + "leave or replace one"
+        )
+
+        // The eviction must not have been recorded as a re-admission failure:
+        // that negative entry answers refusals for the whole backoff window
+        // and would suppress the cold admission this design depends on.
+        let backoff = await fixture.directory
+            .hasLivePublicReadReadmissionBackoff(did: did)
+        XCTAssertFalse(
+            backoff,
+            "evicting the positive generation must not write a negative-cache "
+                + "entry"
+        )
+
+        // With Task 2 in place, the next read re-admits — immediately, well
+        // inside the 250 ms backoff window, because no entry was written.
+        fixture.verifier.acceptEverything()
+        let recovered = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        XCTAssertEqual(
+            recovered?.revision,
+            committed.state.revision,
+            "the next read must admit from cold and serve the state the "
+                + "mutation committed"
+        )
+    }
+
+    /// A successful post-mutation refresh must still publish. The eviction
+    /// above is the failure path only; if it became the normal one, every
+    /// write would cost the next read a full admission.
+    func testSuccessfulPostMutationRefreshPublishesRatherThanEvicting()
+        async throws
+    {
+        let fixture = try await makeFixture()
+
+        _ = try await fixture.directory.publicRepositoryStatus(selector: did)
+        let before = await fixture.directory.cachedPublicReadGenerationID(
+            did: did
+        )
+        let committed = try await applyOneRecord(fixture, recordKey: "healthy")
+
+        let after = await fixture.directory.cachedPublicReadGenerationID(
+            did: did
+        )
+        XCTAssertNotNil(after, "a successful refresh must publish")
+        XCTAssertNotEqual(after, before, "and must publish a new generation")
+
+        let baseline = fixture.verifier.admissionCount
+        let served = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        XCTAssertEqual(served?.revision, committed.state.revision)
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            0,
+            "the published generation must serve the next read outright"
+        )
+    }
+
+    private enum MutationFixtureFailure: Error {
+        /// The fixture's own write could not be set up. Reported as a fixture
+        /// fault rather than folded into the assertions under test.
+        case reservationWasNotFresh(String)
+    }
+
+    /// Drives one real record write through the same generation-refreshing
+    /// store the HTTP mutation path uses, and returns what that request
+    /// reports back to its caller.
+    @discardableResult
+    private func applyOneRecord(
+        _ fixture: Fixture,
+        recordKey: String
+    ) async throws -> CommittedPublicRepositoryMutation {
+        let maybeStore = await fixture.directory
+            .generationRefreshingPublicMutationStore(did: did)
+        let store = try XCTUnwrap(maybeStore)
+        let maybeCurrent = try await store.loadPublicRepositoryState()
+        let current = try XCTUnwrap(maybeCurrent)
+        let collection = "app.bsky.feed.post"
+        let request = try PublicRepositoryMutationRequest(
+            id: "post-mutation-refresh-\(recordKey)",
+            canonicalDigest: Data(
+                SHA256.hash(data: Data(recordKey.utf8))
+            ),
+            baseCommitCID: current.commitCID
+        )
+        guard case let .reserved(reservation) = try await store
+            .reservePublicRepositoryRevision(
+                request,
+                wallClockMicroseconds: nextWallClockMicroseconds()
+            ) else {
+            throw MutationFixtureFailure.reservationWasNotFresh(recordKey)
+        }
+        let record: PublicRecord = [
+            "$type": .string(collection),
+            "text": .string("post-mutation refresh \(recordKey)"),
+            "createdAt": .string("2025-06-15T12:00:00.000Z"),
+        ]
+        let prepared = try await PublicRepositoryEngine.apply(
+            repositoryDID: did,
+            currentState: current,
+            blocks: store,
+            revision: reservation.nextRevision,
+            batch: try PublicRepositoryWriteBatch(
+                writes: [
+                    .create(
+                        path: try PublicRepositoryPath(
+                            collection: collection, recordKey: recordKey
+                        ),
+                        record: record
+                    ),
+                ],
+                expectedCommitCID: current.commitCID
+            ),
+            signer: P256PublicRepositoryCommitSigner(
+                privateKey: fixture.signingKey
+            )
+        )
+        return try await store.applyPublicRepositoryMutation(
+            reservation: reservation, prepared: prepared
+        )
+    }
+
+    private let wallClock = Mutex<UInt64>(1_750_000_002_000_000)
+
+    private func nextWallClockMicroseconds() -> UInt64 {
+        wallClock.withLock { current in
+            current += 1_000_000
+            return current
+        }
+    }
+
     // MARK: Read shapes
 
     private enum PublicReadShape: CaseIterable, CustomStringConvertible {
@@ -428,6 +639,9 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
         let directory: SQLitePreMigratedAccountDirectory
         let verifier: CountingPLCVerifier
         let revision: String
+        /// The genesis signing key, retained so the write-side tests can sign
+        /// a real commit against the repository this fixture installed.
+        let signingKey: P256.Signing.PrivateKey
     }
 
     private func makeFixture() async throws -> Fixture {
@@ -561,7 +775,8 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
             control: control,
             directory: directory,
             verifier: verifier,
-            revision: revision
+            revision: revision,
+            signingKey: key
         )
     }
 }
