@@ -435,6 +435,24 @@ extension SQLiteAccountDatabase {
                     collections: collections,
                     identity: identity
                 )
+                // Both pins are re-read before the generation is minted, but
+                // they are not equally load-bearing and must not be read as if
+                // they were.
+                //
+                // `data_version` cannot move here: this whole admission runs
+                // inside one `readTransaction`, and SQLite freezes the pragma
+                // for the life of a read transaction that has already read —
+                // it advances only once the snapshot is released. The guard is
+                // kept because it stops being dead the moment admission is
+                // split across transactions, and because it is now demoted:
+                // `.generationPinStale` is change detection, so it is never
+                // recorded in the re-admission negative cache and the next read
+                // simply admits again.
+                //
+                // The `fileIdentity` re-check is live. `lstat` is not
+                // transaction-scoped, so the account database file really can
+                // be swapped underneath an in-flight admission, and that is a
+                // genuine disagreement rather than a race.
                 guard try await publicRepositoryDataVersionWithoutGate()
                     == dataVersion else {
                     throw PublicRepositoryReadError.unavailable(

@@ -109,6 +109,183 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
         XCTAssertEqual(third?.revision, before?.revision)
     }
 
+    /// `data_version` is a hint that *something* committed, never a verdict on
+    /// the repository — so drift on its own must re-admit and serve, and must
+    /// leave the account in the same steady state it was in before.
+    ///
+    /// The sibling above proves the account is still readable. This one pins
+    /// *how*: the repository state is independently observed to be byte-for-byte
+    /// unchanged across the foreign commit, so the only thing that moved is the
+    /// pin; the read then costs exactly one admission and replaces the cached
+    /// generation. Zero admissions would mean the pin is no longer checked at
+    /// all — the guard deleted rather than demoted — and a surviving generation
+    /// ID would mean the drifted pin was served rather than re-admitted.
+    func testDataVersionDriftAloneTriggersReAdmissionNotRejection() async throws {
+        let fixture = try await makeFixture()
+
+        let warm = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        XCTAssertEqual(warm?.revision, fixture.revision)
+        let generationBefore = await fixture.directory
+            .cachedPublicReadGenerationID(did: did)
+        XCTAssertNotNil(
+            generationBefore,
+            "precondition: a warm read must leave a generation cached"
+        )
+
+        // Observe both pins from a third connection that is neither the
+        // directory nor the writer, so the two claims this test rests on —
+        // "data_version moved" and "repository state did not" — are measured,
+        // not assumed. Without the first, everything below passes vacuously.
+        let observer = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root, did: did
+        )
+        let pinBefore: Int64
+        let pinAfter: Int64
+        let stateBefore: PublicRepositoryState?
+        let stateAfter: PublicRepositoryState?
+        do {
+            pinBefore = try await observedDataVersion(observer)
+            stateBefore = try await observer.loadPublicRepositoryState()
+            try await commitFromSecondConnection(root: fixture.root)
+            pinAfter = try await observedDataVersion(observer)
+            stateAfter = try await observer.loadPublicRepositoryState()
+        } catch {
+            try? await observer.close()
+            throw error
+        }
+        try await observer.close()
+        XCTAssertNotEqual(
+            pinBefore,
+            pinAfter,
+            "precondition: a foreign commit must move PRAGMA data_version"
+        )
+        XCTAssertEqual(
+            stateBefore,
+            stateAfter,
+            "precondition: the foreign commit must touch no repository state, "
+                + "so drift is the only thing this test changes"
+        )
+
+        let baseline = fixture.verifier.admissionCount
+        let served = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        XCTAssertEqual(
+            served?.revision,
+            fixture.revision,
+            "drift alone must be re-admitted and served, never refused"
+        )
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            1,
+            "drift must cost exactly one re-admission — zero would mean the "
+                + "pin is no longer checked at all"
+        )
+        let generationAfter = await fixture.directory
+            .cachedPublicReadGenerationID(did: did)
+        XCTAssertNotNil(generationAfter)
+        XCTAssertNotEqual(
+            generationAfter,
+            generationBefore,
+            "the drifted generation must be replaced, not served"
+        )
+
+        // Re-admission is recovery, not failure: nothing about drift may leave
+        // a negative-cache entry behind, and the replacement generation pins
+        // the new value, so steady state costs nothing.
+        let backoff = await fixture.directory
+            .hasLivePublicReadReadmissionBackoff(did: did)
+        XCTAssertFalse(
+            backoff,
+            "a drifted pin is change detection — it must never be recorded as "
+                + "an admission failure"
+        )
+        let steady = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        XCTAssertEqual(steady?.revision, fixture.revision)
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            1,
+            "the re-admitted generation must pin the new data_version, so the "
+                + "next read re-admits nothing"
+        )
+    }
+
+    /// A stale pin must never be written into the negative cache.
+    ///
+    /// `.generationPinStale` is the one reason the read path defines as
+    /// "re-admit", and the negative cache means "refuse for 250 ms without
+    /// admitting". Recording it therefore inverts its meaning and suppresses
+    /// the exact admission that clears the staleness: the account goes dark for
+    /// a backoff window on the strength of a pragma that says only that *some*
+    /// connection committed *something*. That is a time-boxed replay of the
+    /// 2026-08-12 outage, reached through the recovery path built to end it.
+    ///
+    /// The failing admission is driven through the injected verifier because
+    /// that is the only seam that can make an *admission* refuse with a chosen
+    /// reason; what matters is what the directory does with a
+    /// `.generationPinStale` admission failure, not which line produced it.
+    func testStalePinIsNeverRecordedAsAnAdmissionFailure() async throws {
+        let fixture = try await makeFixture()
+
+        _ = try await fixture.directory.publicRepositoryStatus(selector: did)
+        try await commitFromSecondConnection(root: fixture.root)
+        fixture.verifier.rejectEverything(with: .generationPinStale)
+
+        let baseline = fixture.verifier.admissionCount
+        let refused = await captureRefusal(fixture.directory, .status)
+        XCTAssertEqual(refused, .generationPinStale)
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            1,
+            "precondition: the read must have attempted a real re-admission"
+        )
+        let recordedStalePin = await fixture.directory
+            .hasLivePublicReadReadmissionBackoff(did: did)
+        XCTAssertFalse(
+            recordedStalePin,
+            "a stale pin must not be recorded as evidence that the account "
+                + "cannot be admitted"
+        )
+
+        // Immediately — well inside the 250 ms window a recorded entry would
+        // have opened — the next read must do the work and serve.
+        fixture.verifier.acceptEverything()
+        let recovered = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        XCTAssertEqual(
+            recovered?.revision,
+            fixture.revision,
+            "a stale pin must never make an admittable account dark for a "
+                + "backoff window"
+        )
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            2,
+            "the recovering read must have run its own admission rather than "
+                + "being suppressed"
+        )
+
+        // The exclusion is exactly one reason wide. A genuine identity failure
+        // still records, or the demotion has quietly disabled the bound that
+        // keeps an unadmittable account from costing a full record-index walk
+        // and PLC verification on every anonymous read.
+        try await commitFromSecondConnection(root: fixture.root)
+        fixture.verifier.rejectEverything(with: .identityFactsMalformed)
+        let identity = await captureRefusal(fixture.directory, .status)
+        XCTAssertEqual(identity, .identityFactsMalformed)
+        let recordedIdentityFailure = await fixture.directory
+            .hasLivePublicReadReadmissionBackoff(did: did)
+        XCTAssertTrue(
+            recordedIdentityFailure,
+            "a real admission failure must still be recorded"
+        )
+    }
+
     // MARK: The limits
 
     /// Re-admission must not become a way to serve a broken account.
@@ -895,7 +1072,8 @@ private final class CountingPLCVerifier:
 
     private struct State {
         var admissions = 0
-        var rejects = false
+        /// The reason every admission refuses with, or `nil` to accept.
+        var rejection: PublicReadUnavailableReason?
     }
 
     private let state = Mutex(State())
@@ -910,23 +1088,33 @@ private final class CountingPLCVerifier:
     }
 
     func rejectEverything() {
-        state.withLock { $0.rejects = true }
+        rejectEverything(with: .identityFactsMalformed)
+    }
+
+    /// Refuses every admission with a chosen reason. Some tests care which
+    /// reason an *admission* failed with — notably `.generationPinStale`, whose
+    /// handling differs from every other refusal — and this is the only seam
+    /// that can produce one on demand.
+    func rejectEverything(with reason: PublicReadUnavailableReason) {
+        state.withLock { $0.rejection = reason }
     }
 
     func acceptEverything() {
-        state.withLock { $0.rejects = false }
+        state.withLock { $0.rejection = nil }
     }
 
     func verifyGenesis(
         facts: PublicPLCGenesisFacts,
         expectedDID _: String
     ) throws -> String {
-        let rejects = state.withLock { current -> Bool in
+        let rejection = state.withLock { current -> PublicReadUnavailableReason? in
             current.admissions += 1
-            return current.rejects
+            return current.rejection
         }
-        guard !rejects,
-              facts.signingDIDKey == Self.signingDIDKey,
+        if let rejection {
+            throw PublicRepositoryReadError.unavailable(reason: rejection)
+        }
+        guard facts.signingDIDKey == Self.signingDIDKey,
               facts.rotationDIDKey == Self.rotationDIDKey,
               facts.signature == Self.signature else {
             throw PublicRepositoryReadError.unavailable(

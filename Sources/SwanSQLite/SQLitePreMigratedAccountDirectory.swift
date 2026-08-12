@@ -1631,10 +1631,14 @@ public actor SQLitePreMigratedAccountDirectory:
     /// `503` permanently; the live incident cleared only because an unrelated
     /// record write happened to run the post-commit refresh three hours later.
     ///
-    /// `.generationPinStale` is the only reason that earns a second attempt.
-    /// Every other refusal — identity, projection, control row, corruption —
-    /// propagates from the first attempt untouched, so re-admission can never
-    /// launder a real failure into a success or into a different reason.
+    /// A reason earns a second attempt exactly when it is change detection —
+    /// ``PublicReadUnavailableReason/isChangeDetection``, which is
+    /// `.generationPinStale` and nothing else. Every other refusal — identity,
+    /// projection, control row, corruption — propagates from the first attempt
+    /// untouched, so re-admission can never launder a real failure into a
+    /// success or into a different reason. The same property gates
+    /// ``recordPublicReadReadmissionFailure(did:error:)``, so the reason this
+    /// retries is by construction the reason that is never cached as a refusal.
     ///
     /// The second attempt runs against a generation produced by the same
     /// ``refreshPublicReadGeneration(account:database:)`` that admits a cold
@@ -1659,7 +1663,7 @@ public actor SQLitePreMigratedAccountDirectory:
         do {
             return try await attempt(database, admitted)
         } catch let error as PublicRepositoryReadError
-            where error.unavailableReason == .generationPinStale
+            where error.unavailableReason?.isChangeDetection == true
         {
             stale = admitted
         }
@@ -1793,11 +1797,25 @@ public actor SQLitePreMigratedAccountDirectory:
     /// and the same body it would have produced by re-running the admission.
     /// Cancellation is deliberately not recorded — a caller hanging up is not
     /// evidence about the account.
+    ///
+    /// Neither is change detection. `PRAGMA data_version` moving says only that
+    /// some connection committed something, so an admission that refuses with
+    /// ``PublicReadUnavailableReason/isChangeDetection`` is reporting a race,
+    /// not an account that cannot be admitted. Recording it would invert the
+    /// reason's meaning at the worst possible moment: the entry is consulted by
+    /// ``admitPublicReadGenerationForRequest(account:database:)``, which is the
+    /// admission ``withPublicReadGeneration(_:_:)`` runs *because* the pin went
+    /// stale — so a stale pin would suppress its own recovery and leave the
+    /// account dark for the whole window. That is the 2026-08-12 outage again,
+    /// reached through the path built to end it, merely time-boxed to 250 ms.
+    /// The exclusion costs at most one redone admission per read in a race that
+    /// resolves itself.
     private func recordPublicReadReadmissionFailure(
         did: String,
         error: PublicRepositoryReadError
     ) {
-        guard let reason = error.unavailableReason else { return }
+        guard let reason = error.unavailableReason,
+              !reason.isChangeDetection else { return }
         let now = ContinuousClock.now
         if publicReadReadmissionFailures[did] == nil,
            publicReadReadmissionFailures.count

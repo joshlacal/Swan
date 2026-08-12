@@ -121,6 +121,69 @@ public enum PublicReadUnavailableReason: String, Sendable, Equatable, CaseIterab
     case postMutationRefreshFailed
 }
 
+extension PublicReadUnavailableReason {
+    /// Whether this reason is *change detection* — a report that something
+    /// committed — rather than a verdict on the account.
+    ///
+    /// Exactly one guard qualifies, and the distinction is the whole of the
+    /// 2026-08-12 fix. `PRAGMA data_version` is monotonic, advances on any
+    /// commit from any other connection to any table in the account database
+    /// including one that touches no repository state at all, and never returns
+    /// to its prior value. It can therefore only ever say that *something*
+    /// committed — never that the repository stopped being valid.
+    /// ``fileIdentityMismatch`` and ``repositoryStateMismatch`` keep their
+    /// meaning: a swapped database file and a moved head are real
+    /// disagreements with the pinned generation, and neither is listed here.
+    ///
+    /// Two call sites in `SQLitePreMigratedAccountDirectory` consume this and
+    /// have to agree, which is why it is one property rather than a literal
+    /// repeated at each. `withPublicReadGeneration` retries exactly the
+    /// reasons that are change detection; `recordPublicReadReadmissionFailure`
+    /// refuses to record exactly those reasons in the negative cache. If the
+    /// second ever recorded what the first retries, a stale pin would suppress
+    /// the admission that clears it and the account would go dark for the
+    /// backoff window — the outage again, merely time-boxed.
+    ///
+    /// The switch is exhaustive on purpose. A new reason must be classified
+    /// deliberately rather than inheriting an answer from a `default`.
+    public var isChangeDetection: Bool {
+        switch self {
+        case .generationPinStale:
+            true
+        case .identityRowCount,
+             .identityStageNotSubmitted,
+             .genesisCIDMismatch,
+             .missingKeyMaterial,
+             .keyReferenceMismatch,
+             .historyVerifierUnavailable,
+             .terminalIdentityMismatch,
+             .repositoryAuthenticatorUnavailable,
+             .commitAuthenticationFailed,
+             .identityFactsMalformed,
+             .recordIndexMalformed,
+             .projectionMismatch,
+             .intentVerificationFailed,
+             .fileIdentityMismatch,
+             .repositoryStateMismatch,
+             .repositoryStateMissing,
+             .generationIdentityMismatch,
+             .directoryClosed,
+             .accountNotPreopened,
+             .accountNotActive,
+             .controlRowChanged,
+             .controlStoreFailure,
+             .publicIdentityVerifierUnconfigured,
+             .blockMaterializationFailed,
+             .admissionBudgetExhausted,
+             .malformedProjectionValue,
+             .spoolStreamFailure,
+             .storageFailure,
+             .postMutationRefreshFailed:
+            false
+        }
+    }
+}
+
 public enum PublicRepositoryReadError: Error, Sendable, Equatable {
     case invalidSelector
     case invalidLimit
