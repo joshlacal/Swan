@@ -654,16 +654,45 @@ func registerPublicRepositoryReadEndpoints(
             let did: DID = try publicReadWireParameters {
                 try DID(didString: rawDID)
             }
-            let output = try await latestCommitHandler.handle(
-                parameters: try publicReadWireParameters {
-                    .init(did: did)
-                },
-                input: (),
-                context: request
-            )
-            return publicReadJSON(
-                .ok, output, method: "com.atproto.sync.getLatestCommit", selector: selector
-            )
+            // Same lease the JSON repo reads take, and for the same reason: a
+            // cache miss or a drifted generation pin sends this call into a
+            // full admission — a paginated walk of up to
+            // `maximumGenerationIndexEntries` index rows, an MST projection
+            // verify, and PLC `verifyGenesis`. Unleased, each ~50-byte
+            // anonymous GET bought one of those, and this is one of the three
+            // methods a relay calls against a PDS.
+            guard let lease = jsonReadAdmission.reserve(
+                maximumResponseBytes: PublicRepositoryJSONReadLimits
+                    .maximumGetRecordResponseBytes
+            ) else {
+                return publicReadUnavailable(
+                    reason: PublicReadHandlerGuard
+                        .responseAdmissionExhausted.rawValue,
+                    method: "com.atproto.sync.getLatestCommit",
+                    selector: selector
+                )
+            }
+            do {
+                let output = try await latestCommitHandler.handle(
+                    parameters: try publicReadWireParameters {
+                        .init(did: did)
+                    },
+                    input: (),
+                    context: request
+                )
+                return publicReadJSON(
+                    .ok,
+                    output,
+                    maximumBytes: PublicRepositoryJSONReadLimits
+                        .maximumGetRecordResponseBytes,
+                    lease: lease,
+                    method: "com.atproto.sync.getLatestCommit",
+                    selector: selector
+                )
+            } catch {
+                lease.release()
+                throw error
+            }
         } catch let failure as PublicReadHandlerFailure {
             return publicReadResponse(
                 failure,
@@ -694,16 +723,42 @@ func registerPublicRepositoryReadEndpoints(
             let did: DID = try publicReadWireParameters {
                 try DID(didString: rawDID)
             }
-            let output = try await repoStatusHandler.handle(
-                parameters: try publicReadWireParameters {
-                    .init(did: did)
-                },
-                input: (),
-                context: request
-            )
-            return publicReadJSON(
-                .ok, output, method: "com.atproto.sync.getRepoStatus", selector: selector
-            )
+            // Leased for the same reason as `getLatestCommit`, and more
+            // urgently: `getRepoStatus` is one of the three XRPC methods
+            // indigo's relay calls against a PDS, so this is the route network
+            // traffic arrives on first.
+            guard let lease = jsonReadAdmission.reserve(
+                maximumResponseBytes: PublicRepositoryJSONReadLimits
+                    .maximumGetRecordResponseBytes
+            ) else {
+                return publicReadUnavailable(
+                    reason: PublicReadHandlerGuard
+                        .responseAdmissionExhausted.rawValue,
+                    method: "com.atproto.sync.getRepoStatus",
+                    selector: selector
+                )
+            }
+            do {
+                let output = try await repoStatusHandler.handle(
+                    parameters: try publicReadWireParameters {
+                        .init(did: did)
+                    },
+                    input: (),
+                    context: request
+                )
+                return publicReadJSON(
+                    .ok,
+                    output,
+                    maximumBytes: PublicRepositoryJSONReadLimits
+                        .maximumGetRecordResponseBytes,
+                    lease: lease,
+                    method: "com.atproto.sync.getRepoStatus",
+                    selector: selector
+                )
+            } catch {
+                lease.release()
+                throw error
+            }
         } catch let failure as PublicReadHandlerFailure {
             return publicReadResponse(
                 failure,

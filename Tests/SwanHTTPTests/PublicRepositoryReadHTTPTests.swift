@@ -474,6 +474,88 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
         try await fixture.control.close()
     }
 
+    // Production mutation caught: `getLatestCommit` and `getRepoStatus` reach
+    // the account directory — and through it a full public-read admission,
+    // including a paginated walk of the whole record index — without reserving
+    // the process-wide response budget their JSON siblings reserve. Both are
+    // anonymous, and `getRepoStatus` is one of the three methods a relay calls
+    // against a PDS.
+    func testSyncReadRoutesShareBoundedProcessAdmission() async throws {
+        let admission = try PublicRepositoryJSONReadAdmission(
+            maximumConcurrentReads: 1,
+            maximumReservedResponseBytes:
+                PublicRepositoryJSONReadLimits.maximumListRecordsResponseBytes
+        )
+        let fixture = try await makeFixture(
+            nonEmpty: true,
+            jsonReadAdmission: admission
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let directory = fixture.server.publicRepositoryReadDirectory
+            as! TestPublicRepositoryReadDirectory
+        let app = fixture.server.buildApplication(
+            logger: Logger(
+                label: "PublicRepositoryReadHTTPTests.sync-admission"
+            )
+        )
+        let held = try XCTUnwrap(admission.reserve(
+            maximumResponseBytes:
+                PublicRepositoryJSONReadLimits.maximumGetRecordResponseBytes
+        ))
+        let latestCommitURI =
+            "/xrpc/com.atproto.sync.getLatestCommit?did=\(did)"
+        let repoStatusURI = "/xrpc/com.atproto.sync.getRepoStatus?did=\(did)"
+
+        try await app.test(.router) { client in
+            for uri in [latestCommitURI, repoStatusURI] {
+                do {
+                    try await client.execute(uri: uri, method: .get) {
+                        response in
+                        XCTAssertEqual(response.status, .serviceUnavailable)
+                        XCTAssertEqual(
+                            try self.object(response.body)["error"] as? String,
+                            "temporarily_unavailable"
+                        )
+                    }
+                } catch {
+                    held.release()
+                    throw error
+                }
+            }
+            let entered = await directory.syncOutcomeRequestCount
+            XCTAssertEqual(
+                entered,
+                0,
+                "a sync read refused by admission must not reach the directory"
+            )
+
+            // The refusal is admission pressure, not a permanent state: once
+            // the budget frees both routes serve exactly as before.
+            held.release()
+            try await client.execute(uri: repoStatusURI, method: .get) {
+                response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertEqual(
+                    try self.object(response.body)["did"] as? String,
+                    self.did
+                )
+            }
+            try await client.execute(uri: latestCommitURI, method: .get) {
+                response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertEqual(
+                    try self.object(response.body)["rev"] as? String,
+                    fixture.state.revision
+                )
+            }
+            let served = await directory.syncOutcomeRequestCount
+            XCTAssertEqual(served, 2)
+        }
+        XCTAssertEqual(admission.snapshot.activeLeases, 0)
+        XCTAssertEqual(admission.snapshot.reservedResponseBytes, 0)
+        try await fixture.control.close()
+    }
+
     // Production mutation caught: the route releases admission with a handler
     // scope `defer`, before Hummingbird drains the returned response body.
     func testJSONAdmissionLeaseIsHeldUntilResponseBodyDrain() async throws {
@@ -706,6 +788,11 @@ private actor TestPublicRepositoryReadDirectory: PublicRepositoryReadDirectory {
     private var carBytes: Data?
     private let jsonReadBarrier: PublicJSONReadBarrier?
     private(set) var jsonOutcomeRequestCount = 0
+    /// Entries through the two `com.atproto.sync` JSON reads. In production
+    /// both reach a full public-read admission, so a route that reaches this
+    /// counter without an admission lease is the unbounded-work path
+    /// `testSyncReadRoutesShareBoundedProcessAdmission` exists to forbid.
+    private(set) var syncOutcomeRequestCount = 0
 
     init(
         description: PublicRepositoryReadDescription,
@@ -732,6 +819,7 @@ private actor TestPublicRepositoryReadDirectory: PublicRepositoryReadDirectory {
 
     func publicRepositoryStatus(selector: String) async throws -> PublicRepositoryReadStatus? {
         guard [description.did, description.canonicalHandle].contains(selector) else { return nil }
+        syncOutcomeRequestCount += 1
         return try .init(
             did: description.did,
             status: lifecycleStatus,
@@ -814,6 +902,10 @@ private actor TestPublicRepositoryReadDirectory: PublicRepositoryReadDirectory {
         guard recognizes(selector) else { return .notFound }
         let status = try currentStatus()
         guard status.status == .active else { return .lifecycle(status) }
+        // `describeRepo` and `getLatestCommit` share this outcome, so the
+        // counter is only meaningful to a test that issues neither by any
+        // other route.
+        syncOutcomeRequestCount += 1
         return .active(description)
     }
 
