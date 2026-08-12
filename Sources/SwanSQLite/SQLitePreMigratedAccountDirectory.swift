@@ -38,6 +38,13 @@ public actor SQLitePreMigratedAccountDirectory:
         [String: SQLiteVerifiedPublicRepositoryGeneration]
     private var permanentlyRevokedDIDs: Set<String> = []
     private var drainingDatabases: [String: SQLiteAccountDatabase] = [:]
+    /// At most one in-flight public-read re-admission per DID. A foreign
+    /// commit invalidates one account's generation pin for every concurrent
+    /// reader at the same instant, so without this every one of them would
+    /// run its own full admission against the single SQLite connection they
+    /// all share. See ``readmitPublicReadGeneration(account:database:replacing:)``.
+    private var publicReadReadmissions:
+        [String: Task<SQLiteVerifiedPublicRepositoryGeneration, any Error>] = [:]
     private var isClosed = false
 
     /// Returns only a startup-preopened public mutation store. HTTP adapters
@@ -1011,6 +1018,11 @@ public actor SQLitePreMigratedAccountDirectory:
         }
         permanentlyRevokedDIDs.insert(did)
         publicReadGenerations.removeValue(forKey: did)
+        // Drop the shared re-admission handle rather than cancelling it: the
+        // task's own post-await guards already refuse to publish a generation
+        // once this DID leaves `databases`, and cancelling a live SQLite query
+        // buys nothing but a second failure mode.
+        publicReadReadmissions.removeValue(forKey: did)
         let database: SQLiteAccountDatabase
         if let draining = drainingDatabases[did] {
             database = draining
@@ -1042,6 +1054,7 @@ public actor SQLitePreMigratedAccountDirectory:
         databases.removeAll()
         drainingDatabases.removeAll()
         publicReadGenerations.removeAll()
+        publicReadReadmissions.removeAll()
 
         var failed = false
         for database in opened {
@@ -1086,22 +1099,26 @@ public actor SQLitePreMigratedAccountDirectory:
                 did: account.did, status: account.status, revision: nil
             )
         }
-        let (database, generation) = try await activePublicReadContext(account)
-        do {
-            _ = try await database.readPublicRepositoryDescription(
-                generation: generation
+        return try await withPublicReadGeneration(account) {
+            database, generation in
+            do {
+                _ = try await database.readPublicRepositoryDescription(
+                    generation: generation
+                )
+            } catch let error as PublicRepositoryReadError {
+                throw error
+            } catch {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .storageFailure
+                )
+            }
+            try await recheckPublicAccount(account, generation: generation)
+            return try PublicRepositoryReadStatus(
+                did: account.did,
+                status: account.status,
+                revision: generation.description.state.revision
             )
-        } catch let error as PublicRepositoryReadError {
-            throw error
-        } catch {
-            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
         }
-        try await recheckPublicAccount(account, generation: generation)
-        return try PublicRepositoryReadStatus(
-            did: account.did,
-            status: account.status,
-            revision: generation.description.state.revision
-        )
     }
 
     public func describePublicRepository(
@@ -1130,19 +1147,22 @@ public actor SQLitePreMigratedAccountDirectory:
                 revision: nil
             ))
         }
-        let (database, generation) = try await activePublicReadContext(account)
-        let description: PublicRepositoryReadDescription
-        do {
-            description = try await database.readPublicRepositoryDescription(
-                generation: generation
-            )
-        } catch let error as PublicRepositoryReadError {
-            throw error
-        } catch {
-            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
+        return try await withPublicReadGeneration(account) {
+            database, generation in
+            let description: PublicRepositoryReadDescription
+            do {
+                description = try await database
+                    .readPublicRepositoryDescription(generation: generation)
+            } catch let error as PublicRepositoryReadError {
+                throw error
+            } catch {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .storageFailure
+                )
+            }
+            try await recheckPublicAccount(account, generation: generation)
+            return .active(description)
         }
-        try await recheckPublicAccount(account, generation: generation)
-        return .active(description)
     }
 
     private func verifyPublicIdentityIntent(
@@ -1204,25 +1224,29 @@ public actor SQLitePreMigratedAccountDirectory:
                 revision: nil
             ))
         }
-        let (database, generation) = try await activePublicReadContext(account)
-        let read: SQLitePublicRepositoryRecordRead
-        do {
-            read = try await database.readPublicRepositoryRecord(
-                path: path,
-                expectedCID: expectedCID,
-                generation: generation
-            )
-        } catch let error as PublicRepositoryReadError {
-            throw error
-        } catch {
-            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
+        return try await withPublicReadGeneration(account) {
+            database, generation in
+            let read: SQLitePublicRepositoryRecordRead
+            do {
+                read = try await database.readPublicRepositoryRecord(
+                    path: path,
+                    expectedCID: expectedCID,
+                    generation: generation
+                )
+            } catch let error as PublicRepositoryReadError {
+                throw error
+            } catch {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .storageFailure
+                )
+            }
+            try await recheckPublicAccount(account, generation: generation)
+            return .active(try PublicRepositoryReadRecordResult(
+                did: account.did,
+                state: read.state,
+                record: read.record
+            ))
         }
-        try await recheckPublicAccount(account, generation: generation)
-        return .active(try PublicRepositoryReadRecordResult(
-            did: account.did,
-            state: read.state,
-            record: read.record
-        ))
     }
 
     public func listPublicRepositoryRecords(
@@ -1263,27 +1287,31 @@ public actor SQLitePreMigratedAccountDirectory:
                 revision: nil
             ))
         }
-        let (database, generation) = try await activePublicReadContext(account)
-        let read: SQLitePublicRepositoryPageRead
-        do {
-            read = try await database.readPublicRepositoryRecords(
-                collection: collection,
-                limit: limit,
-                cursor: cursor,
-                reverse: reverse,
-                generation: generation
-            )
-        } catch let error as PublicRepositoryReadError {
-            throw error
-        } catch {
-            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
+        return try await withPublicReadGeneration(account) {
+            database, generation in
+            let read: SQLitePublicRepositoryPageRead
+            do {
+                read = try await database.readPublicRepositoryRecords(
+                    collection: collection,
+                    limit: limit,
+                    cursor: cursor,
+                    reverse: reverse,
+                    generation: generation
+                )
+            } catch let error as PublicRepositoryReadError {
+                throw error
+            } catch {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .storageFailure
+                )
+            }
+            try await recheckPublicAccount(account, generation: generation)
+            return .active(try PublicRepositoryReadPageResult(
+                did: account.did,
+                state: read.state,
+                page: read.page
+            ))
         }
-        try await recheckPublicAccount(account, generation: generation)
-        return .active(try PublicRepositoryReadPageResult(
-            did: account.did,
-            state: read.state,
-            page: read.page
-        ))
     }
 
     public func publicRepositoryCAR(
@@ -1310,32 +1338,41 @@ public actor SQLitePreMigratedAccountDirectory:
                 revision: nil
             ))
         }
-        let (database, generation) = try await activePublicReadContext(account)
-        guard let lease = publicRepositorySpoolAdmission.reserve(
-            accountDID: account.did,
-            maximumBytes: PublicRepositoryLimits.standard.maximumCARBytes
-        ) else {
-            throw PublicRepositoryReadError.unavailable(reason: .admissionBudgetExhausted)
-        }
-        let result: PublicRepositoryReadCAR
-        do {
-            result = try await database.preparePublicRepositoryCAR(
-                lease: lease,
-                generation: generation
-            )
-        } catch let error as PublicRepositoryReadError {
-            lease.release()
-            throw error
-        } catch {
-            lease.release()
-            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
-        }
-        do {
-            try await recheckPublicAccount(account, generation: generation)
-            return .active(result)
-        } catch {
-            result.spool.cleanup()
-            throw error
+        return try await withPublicReadGeneration(account) {
+            database, generation in
+            // The lease is reserved inside the attempt so a re-admitted retry
+            // starts from a released budget rather than double-charging the
+            // account against the shared spool admission.
+            guard let lease = publicRepositorySpoolAdmission.reserve(
+                accountDID: account.did,
+                maximumBytes: PublicRepositoryLimits.standard.maximumCARBytes
+            ) else {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .admissionBudgetExhausted
+                )
+            }
+            let result: PublicRepositoryReadCAR
+            do {
+                result = try await database.preparePublicRepositoryCAR(
+                    lease: lease,
+                    generation: generation
+                )
+            } catch let error as PublicRepositoryReadError {
+                lease.release()
+                throw error
+            } catch {
+                lease.release()
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .storageFailure
+                )
+            }
+            do {
+                try await recheckPublicAccount(account, generation: generation)
+                return .active(result)
+            } catch {
+                result.spool.cleanup()
+                throw error
+            }
         }
     }
 
@@ -1419,6 +1456,113 @@ public actor SQLitePreMigratedAccountDirectory:
             database,
             generation
         )
+    }
+
+    /// Runs one generation-validated public read, re-admitting at most once.
+    ///
+    /// This is the fix for the 2026-08-12 outage. A published generation pins
+    /// `PRAGMA data_version`. That pragma is monotonic, advances on **any**
+    /// commit from **any other** connection to the account database — even a
+    /// commit that touches no repository state at all — and never returns to
+    /// its prior value. Swan holds more than one descriptor per account
+    /// database in the live process, so such a commit is routine. Nothing on
+    /// the read path ever replaced a generation whose pin had drifted, so the
+    /// first foreign commit made every public read for that account return
+    /// `503` permanently; the live incident cleared only because an unrelated
+    /// record write happened to run the post-commit refresh three hours later.
+    ///
+    /// `.generationPinStale` is the only reason that earns a second attempt.
+    /// Every other refusal — identity, projection, control row, corruption —
+    /// propagates from the first attempt untouched, so re-admission can never
+    /// launder a real failure into a success or into a different reason.
+    ///
+    /// The second attempt runs against a generation produced by the same
+    /// ``refreshPublicReadGeneration(account:database:)`` that admits a cold
+    /// account: PLC identity, preparation intent, commit authentication,
+    /// projection, database path, and the exact active control row are all
+    /// re-checked on both sides. Re-admission therefore accepts exactly the
+    /// set a cold start accepts, and the retried read re-validates every pin
+    /// against the new generation before a byte is served.
+    ///
+    /// The bound is structural, not incidental: `attempt` appears exactly
+    /// twice on a straight line, with no loop and no recursion. Whatever the
+    /// second attempt throws is what the caller sees.
+    private func withPublicReadGeneration<T>(
+        _ account: AccountControlAccount,
+        _ attempt: (
+            SQLiteAccountDatabase,
+            SQLiteVerifiedPublicRepositoryGeneration
+        ) async throws -> T
+    ) async throws -> T {
+        let (database, admitted) = try await activePublicReadContext(account)
+        let stale: SQLiteVerifiedPublicRepositoryGeneration
+        do {
+            return try await attempt(database, admitted)
+        } catch let error as PublicRepositoryReadError
+            where error.unavailableReason == .generationPinStale
+        {
+            stale = admitted
+        }
+        let readmitted = try await readmitPublicReadGeneration(
+            account: account,
+            database: database,
+            replacing: stale
+        )
+        return try await attempt(database, readmitted)
+    }
+
+    /// Re-admits one account's public read generation, collapsing concurrent
+    /// re-admissions for the same DID onto a single admission.
+    ///
+    /// A foreign commit invalidates the pin for every in-flight reader of that
+    /// account at once, so the naive shape is a stampede: N concurrent public
+    /// reads each running a full admission — record-index walk, block
+    /// materialization, commit authentication — against the one SQLite
+    /// connection that serializes them anyway. Single-flighting is both
+    /// cheaper and no weaker than admitting per request: the shared result is
+    /// a fully verified generation, the joining request still checks that it
+    /// was admitted against its own resolved control row, and the retried read
+    /// re-validates every pin. A joiner that resolved a different control row
+    /// is refused rather than served.
+    private func readmitPublicReadGeneration(
+        account: AccountControlAccount,
+        database: SQLiteAccountDatabase,
+        replacing stale: SQLiteVerifiedPublicRepositoryGeneration
+    ) async throws -> SQLiteVerifiedPublicRepositoryGeneration {
+        if let current = publicReadGenerations[account.did],
+           current.id != stale.id,
+           current.controlAccount == account {
+            // Someone already re-admitted this account while this request was
+            // reading. That generation went through the full admission, so
+            // spending another one here would buy nothing.
+            return current
+        }
+        let readmission: Task<SQLiteVerifiedPublicRepositoryGeneration, any Error>
+        if let inFlight = publicReadReadmissions[account.did] {
+            readmission = inFlight
+        } else {
+            // The store below runs before this closure's first suspension —
+            // actor-isolated code continues synchronously past `Task { }` —
+            // so a second caller in the same turn always sees the handle.
+            let started = Task { [self] in
+                defer { publicReadReadmissions.removeValue(forKey: account.did) }
+                return try await refreshPublicReadGeneration(
+                    account: account,
+                    database: database
+                )
+            }
+            publicReadReadmissions[account.did] = started
+            readmission = started
+        }
+        let generation = try await readmission.value
+        guard generation.controlAccount == account else {
+            // The shared admission verified a control row this request did not
+            // resolve. Fail closed instead of serving another row's account.
+            throw PublicRepositoryReadError.unavailable(
+                reason: .controlRowChanged
+            )
+        }
+        return generation
     }
 
     /// Re-admits the existing account database when the control row changed
