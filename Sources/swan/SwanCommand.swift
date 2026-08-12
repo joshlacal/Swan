@@ -1799,6 +1799,19 @@ extension SwanCommand {
         @Option(name: .long, help: "Pinned protocol profile JSON")
         var profile: String = "Profiles/permissioned-data-0016-2026-07-30.json"
 
+        /// The public route surface is a separate contract family from
+        /// `--profile`, and gets a separate flag rather than a widened one.
+        /// `ProtocolProfile` requires a `permissioned-data-` id plus the crypto
+        /// suite, oplog retention, and proposal pin that only that family
+        /// carries; teaching one flag to mean two families would mean loosening
+        /// invariants that existing checks were written against, which is the
+        /// exact shape that has produced silent surface changes here before.
+        @Option(
+            name: .customLong("public-profile"),
+            help: "Pinned public-data protocol profile JSON selecting the public XRPC route surface"
+        )
+        var publicProfile: String = "Profiles/public-data-testing-2026-07-27.json"
+
         @Option(name: .long)
         var host: String = "127.0.0.1"
 
@@ -2042,6 +2055,24 @@ extension SwanCommand {
         )
         var appViewProxyAccountKeyDirectory: String?
 
+        /// Turns `--public-profile` into the route surface the router will
+        /// register, or into a startup refusal.
+        ///
+        /// There is deliberately no default-on-failure branch. A profile this
+        /// build has no descriptor registry for cannot be served honestly:
+        /// registering some other profile's method set would leave the process
+        /// advertising one contract in `describeServer` and answering another,
+        /// which is worse than not booting and is invisible from the outside.
+        static func resolvePublicRouteSurface(path: String) throws -> SwanPublicRouteSurface {
+            do {
+                return try SwanPublicRouteSurface.load(
+                    profileURL: URL(fileURLWithPath: path)
+                )
+            } catch let error as SwanPublicRouteSurfaceError {
+                throw ValidationError("--public-profile is unusable: \(error)")
+            }
+        }
+
         func run() async throws {
             guard (1 ... 1_000_000).contains(spaceOplogRetention) else {
                 throw ValidationError(
@@ -2211,6 +2242,10 @@ extension SwanCommand {
                 managementDeletionPLCConfiguration = nil
             }
             let loadedProfile = try ProtocolProfile.load(from: URL(fileURLWithPath: profile))
+            // Resolved before any listener, database, or key store is touched.
+            // An unregistered public profile is a refusal to boot, not a
+            // narrower surface an operator has to notice from traffic.
+            let publicRouteSurface = try Self.resolvePublicRouteSurface(path: publicProfile)
             let baseURL = try publicURL.map { value in
                 guard let url = URL(string: value) else { throw ValidationError("--public-url must be a URL") }
                 return url
@@ -2949,7 +2984,12 @@ extension SwanCommand {
                 }
                 let server = permissionedRuntime.makeServer(
                     profile: loadedProfile,
-                    configuration: .init(host: host, port: port, publicURL: baseURL),
+                    configuration: .init(
+                        host: host,
+                        port: port,
+                        publicURL: baseURL,
+                        publicRouteSurface: publicRouteSurface
+                    ),
                     oauthRuntime: oauthRuntime,
                     directory: directory,
                     accountControlStore: controlDatabase,
@@ -3025,7 +3065,12 @@ extension SwanCommand {
                     }
                     managementApplication = nil
                 }
-                logger.info("starting Swan", metadata: ["profile": .string(loadedProfile.id), "address": .string("\(host):\(port)")])
+                logger.info("starting Swan", metadata: [
+                    "profile": .string(loadedProfile.id),
+                    "publicProfile": .string(publicRouteSurface.profileID),
+                    "publicMethodCount": .string(String(publicRouteSurface.methods.count)),
+                    "address": .string("\(host):\(port)"),
+                ])
                 var services: [any ServiceLifecycle.Service] = [publicApplication]
                 if permissionedRuntime.notificationConfiguration != nil {
                     logger.info("space notification receiver routes enabled")

@@ -118,6 +118,12 @@ public struct SwanHTTPConfiguration: Sendable, Equatable {
     /// is switched on by the same assembly that switches on the enforcement
     /// instead of by editing a route body.
     public let inviteCodeRequired: Bool
+    /// The public XRPC method contract this process registers, selected by
+    /// profile id rather than named as a literal at the registration site. The
+    /// default preserves the historical hardcoded surface; `swan serve` derives
+    /// it from `--public-profile` and refuses to boot when that profile has no
+    /// registered surface.
+    public let publicRouteSurface: SwanPublicRouteSurface
 
     public init(
         host: String = "127.0.0.1",
@@ -125,7 +131,8 @@ public struct SwanHTTPConfiguration: Sendable, Equatable {
         publicURL: URL = URL(string: "http://127.0.0.1:3000")!,
         maximumConnections: Int = 256,
         idleTimeoutSeconds: Int = 60,
-        inviteCodeRequired: Bool = false
+        inviteCodeRequired: Bool = false,
+        publicRouteSurface: SwanPublicRouteSurface = .default
     ) {
         precondition(maximumConnections > 0)
         precondition(idleTimeoutSeconds > 0)
@@ -135,6 +142,7 @@ public struct SwanHTTPConfiguration: Sendable, Equatable {
         self.maximumConnections = maximumConnections
         self.idleTimeoutSeconds = idleTimeoutSeconds
         self.inviteCodeRequired = inviteCodeRequired
+        self.publicRouteSurface = publicRouteSurface
     }
 }
 
@@ -1017,7 +1025,10 @@ public struct SwanHTTPServer: Sendable {
                 runtime: publicFirehoseStreaming
             )
         }
-        for descriptor in PublicDataTesting20260727.methods {
+        // The one iteration that decides which public methods exist at all.
+        // It reads the selected surface rather than naming a registry as a
+        // literal, so `--public-profile` is the control it claims to be.
+        for descriptor in configuration.publicRouteSurface.methods {
             if accountEmailXRPC != nil,
                Self.isInstalledAccountEmailMethod(descriptor.nsid) {
                 continue

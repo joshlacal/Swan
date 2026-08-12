@@ -273,6 +273,10 @@ let package = Package(
             name: "SwanHTTPTests",
             dependencies: [
                 "swan", "SwanAccounts", "SwanHTTP", "SwanOAuth", "SwanPublicFirehose", "SwanPublicRepository", "SwanPublicWire", "SwanSQLite", "SwanSpacesWire", "SwanStorage",
+                // `swan`'s startup refusals are ArgumentParser `ValidationError`s.
+                // Asserting the concrete type is the difference between "it
+                // threw" and "the operator gets a clean startup refusal".
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
