@@ -1705,7 +1705,12 @@ public actor SQLitePreMigratedAccountDirectory:
     /// The bound is structural, not incidental: `attempt` appears exactly
     /// twice on a straight line, with no loop and no recursion. Whatever the
     /// second attempt throws is what the caller sees.
-    private func withPublicReadGeneration<T>(
+    /// `T` is constrained to `Sendable` because `attempt` is a nonisolated
+    /// closure invoked from this actor: the Linux Swift 6.1 toolchain rejects
+    /// sending an unconstrained result across that boundary, while the macOS
+    /// toolchain accepts it. The deployment target is Linux, so the stricter
+    /// reading governs.
+    private func withPublicReadGeneration<T: Sendable>(
         _ account: AccountControlAccount,
         _ attempt: (
             SQLiteAccountDatabase,
