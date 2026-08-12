@@ -104,7 +104,19 @@ public struct NIOPeerPinnedOAuthDocumentTransport: OAuthRemoteTransport {
                 }
             }
 
-        let channel = try await bootstrap.connect(host: peer.description, port: port).get()
+        // If the connect fails, the response handler was never added to a live
+        // pipeline, so nothing else will ever complete `responsePromise` and
+        // NIO would trap on the leak in debug builds. Completing it here cannot
+        // double-complete: the response handler is added last, so any
+        // initializer failure happens before it exists, and a failure after it
+        // exists would have gone through `handlerRemoved`.
+        let channel: Channel
+        do {
+            channel = try await bootstrap.connect(host: peer.description, port: port).get()
+        } catch {
+            responsePromise.fail(error)
+            throw error
+        }
         do {
             guard oauthDocumentSocketPeer(channel.remoteAddress) == peer else {
                 throw SwanError.unauthorized("OAuth document connected peer did not match its pin")

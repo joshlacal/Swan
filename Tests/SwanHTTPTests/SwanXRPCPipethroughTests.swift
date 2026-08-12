@@ -716,6 +716,291 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         XCTAssertNotNil(admission.acquire())
     }
 
+    // MARK: Query-string admission
+
+    /// The client's query reaches `URLComponents.percentEncodedQuery`, whose
+    /// setter refuses characters outside the RFC 3986 query grammar with a
+    /// **`fatalError`** — so a byte admitted here does not produce a bad
+    /// outbound URL, it terminates the PDS process for every session.
+    ///
+    /// These are driven through the real registered route rather than through
+    /// `pipethroughOutboundRequest`: the crash lived on the handler's path, and
+    /// a helper-level test would have exercised the same guard from the wrong
+    /// side of the wire and proved nothing about what a client can send.
+    ///
+    /// None of this needs an attacker. `cursor=100%` is what a truncated cursor
+    /// looks like, and `q="foo"` is what a quoted phrase search looks like.
+    func testUnforwardableQueryStringsAreRejectedWithoutContactingUpstream() async throws {
+        let sender = RecordingProxySender()
+        let rejected = [
+            // The reproduction from the review: a trailing `%` in a cursor.
+            "cursor=100%",
+            // A lone `%` as the entire query.
+            "%",
+            // `%` with too few following characters to be an escape.
+            "cursor=abc%",
+            "cursor=abc%A",
+            // `%` followed by two non-hex characters.
+            "cursor=%zz",
+            "cursor=%2z",
+            // Brackets are gen-delims reserved for the host component. They are
+            // not in the review's list, but they are the second reachable form
+            // of the same crash: `llhttp` passes them through and the
+            // `percentEncodedQuery` setter then rejects them fatally.
+            "q=a[b]",
+            "cursor=[",
+        ]
+        try await withPipethrough(sender: sender) { client in
+            for query in rejected {
+                try await client.execute(
+                    uri: "/xrpc/app.bsky.feed.getAuthorFeed?" + query,
+                    method: .get
+                ) { response in
+                    // A 400, and above all a live server: the next iteration
+                    // reaching this assertion at all is the process-kill guard.
+                    XCTAssertEqual(response.status, .badRequest, "for query \(query)")
+                }
+            }
+            // The server is still answering normally afterwards.
+            try await client.execute(
+                uri: "/xrpc/app.bsky.feed.getAuthorFeed?actor=alice.test",
+                method: .get
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+        // Exactly the one well-formed request left this host.
+        XCTAssertEqual(sender.recorded().count, 1)
+    }
+
+    /// The review also listed `q="foo"` and `q=a|b`. Measured against this
+    /// stack they never reach the handler at all: NIO's HTTP/1.1 parser refuses
+    /// `"`, `<`, `>`, `\`, `^`, `` ` ``, `{`, `|`, and `}` in a request target
+    /// and fails the connection, so the guard added for C1 is not what stops
+    /// them. That is recorded here rather than asserted as a 400, because
+    /// asserting the wrong mechanism would quietly stop testing anything if the
+    /// parser ever loosened: this test fails loudly the moment one of these
+    /// starts being delivered, which is the point at which the handler-level
+    /// guard has to catch it — and it does, since none of these bytes are in
+    /// the RFC 3986 query grammar.
+    func testParserRefusedQueryBytesNeverReachTheHandler() async throws {
+        let sender = RecordingProxySender()
+        for query in [#"q="foo""#, "q=a|b", "q=a^b", "q=a`b", "q=a{b}", "q=a\\b", "q=a<b>c"] {
+            let delivered = PipethroughFlag()
+            do {
+                try await withPipethrough(sender: sender) { client in
+                    try await client.execute(
+                        uri: "/xrpc/app.bsky.feed.getAuthorFeed?" + query,
+                        method: .get
+                    ) { _ in
+                        delivered.set()
+                    }
+                }
+            } catch {
+                // Refused by the HTTP parser before routing. Expected.
+            }
+            XCTAssertFalse(delivered.isSet, "expected \(query) to be refused by the HTTP parser")
+            // Whichever layer refused it, nothing left this host.
+            XCTAssertEqual(sender.recorded().count, 0, "for query \(query)")
+        }
+        // And the guard itself rejects every one of them, so a future parser
+        // that did deliver them would still get a 400 rather than a crash.
+        for query in [#"q="foo""#, "q=a|b", "q=a^b", "q=a`b", "q=a{b}", "q=a\\b", "q=a<b>c"] {
+            XCTAssertFalse(isPercentEncodedQuery(query), query)
+        }
+    }
+
+    /// The counterpart the fix must not break. `%` is legal when it introduces
+    /// a valid escape, so the guard validates rather than re-encodes: an
+    /// already-percent-encoded cursor has to arrive upstream byte for byte, or
+    /// pagination silently breaks. Every reserved character the grammar admits
+    /// is exercised alongside it.
+    func testLegitimatelyPercentEncodedQueryReachesUpstreamByteIdentical() async throws {
+        let sender = RecordingProxySender()
+        let queries = [
+            "cursor=abc%3D%3D",
+            "cursor=3jui%2Fabc%3d%3D&limit=50&actor=alice.test",
+            // Every unescaped octet RFC 3986 admits in a query.
+            "q=!$&'()*+,;=:@/?-._~ABCyz019&e=%F0%9F%90%A6",
+        ]
+        try await withPipethrough(sender: sender) { client in
+            for query in queries {
+                try await client.execute(
+                    uri: "/xrpc/app.bsky.feed.getAuthorFeed?" + query,
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok, "for query \(query)")
+                }
+            }
+        }
+        let recorded = sender.recorded()
+        XCTAssertEqual(recorded.count, queries.count)
+        for (index, query) in queries.enumerated() {
+            let components = try XCTUnwrap(
+                URLComponents(url: recorded[index].url, resolvingAgainstBaseURL: false)
+            )
+            // Byte-identical, including the case of the hex digits: the
+            // upstream service must see exactly what the client sent.
+            XCTAssertEqual(components.percentEncodedQuery, query)
+        }
+    }
+
+    /// An upstream 3xx is useless without its `Location`. The forwarded set
+    /// stays otherwise closed, so nothing the proxy has not reasoned about
+    /// reaches the client.
+    func testUpstreamLocationIsForwardedAndOtherHeadersAreNot() async throws {
+        let sender = RecordingProxySender(
+            result: .success(
+                OAuthRemoteHTTPResponse(
+                    status: 302,
+                    headers: [
+                        "Location": ["https://cdn.bsky.app/img/feed_thumbnail/x.jpg"],
+                        "Set-Cookie": ["upstream-session=leak"],
+                        "Content-Type": ["text/plain"],
+                    ],
+                    body: Data(),
+                    responseURL: URL(string: "https://api.bsky.app/xrpc/app.bsky.feed.getTimeline")!
+                )
+            )
+        )
+        try await withPipethrough(sender: sender) { client in
+            try await client.execute(
+                uri: "/xrpc/app.bsky.feed.getTimeline",
+                method: .get
+            ) { response in
+                XCTAssertEqual(response.status, .found)
+                XCTAssertEqual(
+                    response.headers[.location],
+                    "https://cdn.bsky.app/img/feed_thumbnail/x.jpg"
+                )
+                XCTAssertEqual(response.headers[.contentType], "text/plain")
+                XCTAssertNil(response.headers[.setCookie])
+            }
+        }
+        XCTAssertEqual(sender.recorded().count, 1)
+    }
+
+    // MARK: Proxyable-namespace allow-list
+
+    /// Proxyability used to mean "no local route matched and not explicitly
+    /// denied". Local routes are registered conditionally, so a nil capability
+    /// or an off feature flag silently widened the proxy surface — toward
+    /// whatever destination the client happened to name. The gate is now an
+    /// allow-list of proxyable namespaces, so a route that disappears fails
+    /// closed.
+    ///
+    /// `com.atproto.server.resetPassword` is the review's own example, and
+    /// `createSession` shows the stakes: its body carries a password.
+    func testNonProxyableNamespacesAreNotForwardedEvenWithAProxyHeader() async throws {
+        let sender = RecordingProxySender()
+        // The attacker's DID document resolves. Without it these requests would
+        // fail closed at 400 for want of an endpoint, and the test would pass
+        // for a reason that has nothing to do with the allow-list.
+        let documents = StubDIDDocuments(
+            documents: [
+                "did:web:attacker.example": Data(
+                    """
+                    {"id":"did:web:attacker.example","service":[
+                      {"id":"#svc","type":"AtprotoPersonalDataServer",
+                       "serviceEndpoint":"https://attacker.example"}]}
+                    """.utf8
+                )
+            ]
+        )
+        let steered: HTTPFields = {
+            var headers = HTTPFields()
+            headers[.contentType] = "application/json"
+            headers[HTTPField.Name("atproto-proxy")!] = "did:web:attacker.example#svc"
+            return headers
+        }()
+        try await withPipethrough(sender: sender, documents: documents) { client in
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.resetPassword",
+                method: .post,
+                headers: steered,
+                body: ByteBuffer(string: #"{"token":"ABCDE-FGHIJ","password":"hunter2"}"#)
+            ) { response in
+                XCTAssertEqual(response.status, .notFound)
+            }
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.createSession",
+                method: .post,
+                headers: steered,
+                body: ByteBuffer(string: #"{"identifier":"alice.test","password":"hunter2"}"#)
+            ) { response in
+                XCTAssertEqual(response.status, .notFound)
+            }
+            for uri in [
+                "/xrpc/com.atproto.identity.resolveHandle?handle=alice.test",
+                "/xrpc/com.atproto.admin.getAccountInfo?did=did:plc:x",
+                "/xrpc/com.example.custom.method",
+                // A near-miss on an allow-listed prefix is not a match.
+                "/xrpc/app.bskyx.feed.getTimeline",
+            ] {
+                try await client.execute(uri: uri, method: .get, headers: steered) { response in
+                    XCTAssertEqual(response.status, .notFound, "for \(uri)")
+                }
+            }
+        }
+        // Nothing — no password, no handle — left this host.
+        XCTAssertEqual(sender.recorded().count, 0)
+    }
+
+    /// The allow-list closes the set of methods, not the set of destinations.
+    /// A client naming an arbitrary labeler or chat service must still be
+    /// proxied there: general interoperability is the point of the feature.
+    func testAllowListedNamespacesStillProxyToTheNamedService() async throws {
+        let sender = RecordingProxySender()
+        let documents = StubDIDDocuments(
+            documents: [
+                "did:web:labeler.example": Data(
+                    """
+                    {"id":"did:web:labeler.example","service":[
+                      {"id":"#atproto_labeler","type":"AtprotoLabeler",
+                       "serviceEndpoint":"https://labeler.example"}]}
+                    """.utf8
+                ),
+                "did:web:api.bsky.chat": Data(
+                    """
+                    {"id":"did:web:api.bsky.chat","service":[
+                      {"id":"#bsky_chat","type":"BskyChatService",
+                       "serviceEndpoint":"https://api.bsky.chat"}]}
+                    """.utf8
+                )
+            ]
+        )
+        let labeler: HTTPFields = {
+            var headers = HTTPFields()
+            headers[HTTPField.Name("atproto-proxy")!] = "did:web:labeler.example#atproto_labeler"
+            return headers
+        }()
+        let chat: HTTPFields = {
+            var headers = HTTPFields()
+            headers[HTTPField.Name("atproto-proxy")!] = "did:web:api.bsky.chat#bsky_chat"
+            return headers
+        }()
+        try await withPipethrough(sender: sender, documents: documents) { client in
+            try await client.execute(
+                uri: "/xrpc/tools.ozone.moderation.getRepo?did=did:plc:x",
+                method: .get,
+                headers: labeler
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+            try await client.execute(
+                uri: "/xrpc/chat.bsky.convo.listConvos",
+                method: .get,
+                headers: chat
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+        let recorded = sender.recorded()
+        XCTAssertEqual(recorded.count, 2)
+        XCTAssertEqual(recorded.first?.url.host, "labeler.example")
+        XCTAssertEqual(recorded.last?.url.host, "api.bsky.chat")
+    }
+
     // MARK: Composition
 
     /// Regression guard for the fallback existing but never being composed
@@ -756,7 +1041,23 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
                     ),
                     store: control
                 ),
-                xrpcPipethrough: try makeCapability(sender: sender)
+                // The attacker's document resolves, so a fail-open route
+                // really would reach the sender rather than stalling at a
+                // 400 for want of an endpoint.
+                xrpcPipethrough: try makeCapability(
+                    sender: sender,
+                    documents: StubDIDDocuments(
+                        documents: [
+                            "did:web:attacker.example": Data(
+                                """
+                                {"id":"did:web:attacker.example","service":[
+                                  {"id":"#svc","type":"AtprotoPersonalDataServer",
+                                   "serviceEndpoint":"https://attacker.example"}]}
+                                """.utf8
+                            )
+                        ]
+                    )
+                )
             )
             let app = server.buildApplication(
                 logger: Logger(label: "SwanXRPCPipethroughTests.main-server")
@@ -805,6 +1106,24 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
                     body: ByteBuffer(string: #"{"preferences":[]}"#)
                 ) { response in
                     XCTAssertEqual(response.status, .ok)
+                }
+                // An NSID nothing in the production router claims must still
+                // not become proxyable. `com.atproto.server.createSession` has
+                // no local registration at all here, so before the
+                // proxyable-namespace allow-list a client could steer it — and
+                // the password in its body — at any service it named.
+                var steered = HTTPFields()
+                steered[.contentType] = "application/json"
+                steered[HTTPField.Name("atproto-proxy")!] = "did:web:attacker.example#svc"
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.server.createSession",
+                    method: .post,
+                    headers: steered,
+                    body: ByteBuffer(
+                        string: #"{"identifier":"alice.test","password":"hunter2"}"#
+                    )
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
                 }
                 // And an app.bsky method is proxied.
                 try await client.execute(
@@ -912,6 +1231,24 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
 
 private enum PipethroughTestFailure: Error {
     case malformedJWT
+}
+
+/// A one-way flag settable from inside a `@Sendable` response assertion.
+private final class PipethroughFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    func set() {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+
+    var isSet: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
 }
 
 // MARK: - Doubles

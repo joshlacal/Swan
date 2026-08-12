@@ -348,6 +348,14 @@ private func handleSwanXRPCPipethrough(
             }
         }
 
+        // 3b. The query string is validated here, before the resolver, the
+        //     token issuer, or the sender can be reached, so an unforwardable
+        //     query costs the host nothing outbound. `pipethroughOutbound
+        //     Request` re-checks it — it is a separate entry point, and the
+        //     consequence of admitting a bad byte there is a process kill, not
+        //     a bad request.
+        _ = try pipethroughForwardableQuery(request.uri.query)
+
         // The body is buffered only once the request is known to be
         // authenticated and routable.
         consumedBody = true
@@ -543,6 +551,91 @@ private func pipethroughRequestBody(
     return Data(bytes)
 }
 
+/// The client's query string, verbatim, once it is known to be a query string
+/// `URLComponents.percentEncodedQuery` will accept — or `nil` when there is
+/// none. Anything else throws, which the handler turns into a 400.
+///
+/// This check cannot be skipped or deferred. The setter validates the RFC 3986
+/// query grammar with a **`fatalError`, not a throw**, so handing it a byte it
+/// rejects terminates the whole PDS process for every session. The previous
+/// `0x21 ... 0x7E` byte-range guard admitted `%`, `"`, `<`, `>`, `\`, `^`,
+/// `` ` ``, `{`, `|`, `}`, `[`, and `]`, none of which are legal in a query —
+/// so an ordinary `?cursor=100%` or `?q="foo"` was a remote process kill.
+///
+/// Re-encoding rather than validating is deliberately NOT the fix: `%` is
+/// legal input when it introduces a valid escape, so escaping it would corrupt
+/// every already-percent-encoded cursor. Preserving the client's query byte for
+/// byte is a requirement of the feature — the upstream service must see exactly
+/// what the client sent — so the only sound option is to admit exactly the
+/// grammar and refuse the rest.
+func pipethroughForwardableQuery(_ query: String?) throws -> String? {
+    guard let query, !query.isEmpty else { return nil }
+    guard query.utf8.count <= 4_096, isPercentEncodedQuery(query) else {
+        throw SwanXRPCPipethroughFailure.invalidRequest
+    }
+    return query
+}
+
+/// RFC 3986 `query = *( pchar / "/" / "?" )`, where
+/// `pchar = unreserved / pct-encoded / sub-delims / ":" / "@"` and
+/// `pct-encoded = "%" HEXDIG HEXDIG`.
+///
+/// Matched against the byte sequence rather than `Character`s: the grammar is
+/// defined over octets, and a multi-byte scalar must be rejected byte by byte
+/// rather than treated as one unit.
+func isPercentEncodedQuery(_ query: String) -> Bool {
+    let bytes = Array(query.utf8)
+    var index = 0
+    while index < bytes.count {
+        let byte = bytes[index]
+        if byte == UInt8(ascii: "%") {
+            // Exactly two hex digits, and both must exist: a trailing `%` or
+            // `%A` at the end of a cursor is the crash that motivated this.
+            guard index + 2 < bytes.count,
+                  isASCIIHexDigit(bytes[index + 1]),
+                  isASCIIHexDigit(bytes[index + 2]) else {
+                return false
+            }
+            index += 3
+            continue
+        }
+        guard isRFC3986QueryByte(byte) else { return false }
+        index += 1
+    }
+    return true
+}
+
+private func isASCIIHexDigit(_ byte: UInt8) -> Bool {
+    switch byte {
+    case 0x30 ... 0x39, 0x41 ... 0x46, 0x61 ... 0x66: true
+    default: false
+    }
+}
+
+/// One unescaped query octet: `unreserved`, `sub-delims`, `:`, `@`, `/`, `?`.
+/// `%` is excluded here on purpose — it is only ever valid as the head of a
+/// `pct-encoded` triple, which the caller handles.
+private func isRFC3986QueryByte(_ byte: UInt8) -> Bool {
+    switch byte {
+    // ALPHA / DIGIT
+    case 0x30 ... 0x39, 0x41 ... 0x5A, 0x61 ... 0x7A:
+        true
+    // unreserved: "-" / "." / "_" / "~"
+    case UInt8(ascii: "-"), UInt8(ascii: "."), UInt8(ascii: "_"), UInt8(ascii: "~"):
+        true
+    // sub-delims: "!" / "$" / "&" / "'" / "(" / ")" / "*" / "+" / "," / ";" / "="
+    case UInt8(ascii: "!"), UInt8(ascii: "$"), UInt8(ascii: "&"), UInt8(ascii: "'"),
+         UInt8(ascii: "("), UInt8(ascii: ")"), UInt8(ascii: "*"), UInt8(ascii: "+"),
+         UInt8(ascii: ","), UInt8(ascii: ";"), UInt8(ascii: "="):
+        true
+    // pchar additions plus "/" and "?"
+    case UInt8(ascii: ":"), UInt8(ascii: "@"), UInt8(ascii: "/"), UInt8(ascii: "?"):
+        true
+    default:
+        false
+    }
+}
+
 func pipethroughOutboundRequest(
     _ request: Request,
     method: String,
@@ -562,11 +655,7 @@ func pipethroughOutboundRequest(
     // a configured endpoint must not produce `//xrpc/...`.
     let base = components.percentEncodedPath == "/" ? "" : components.percentEncodedPath
     components.percentEncodedPath = base + nsidPath
-    if let query = request.uri.query, !query.isEmpty {
-        guard query.utf8.count <= 4_096,
-              query.utf8.allSatisfy({ (0x21 ... 0x7E).contains($0) }) else {
-            throw SwanXRPCPipethroughFailure.invalidRequest
-        }
+    if let query = try pipethroughForwardableQuery(request.uri.query) {
         components.percentEncodedQuery = query
     } else {
         components.percentEncodedQuery = nil
@@ -609,10 +698,20 @@ private func pipethroughResponse(_ response: OAuthRemoteHTTPResponse) throws -> 
         output[item.key.lowercased(), default: []].append(contentsOf: item.value)
     }
     var headers: HTTPFields = [.cacheControl: "no-store"]
-    if let values = canonical["content-type"], values.count == 1,
-       values[0].utf8.count <= 256,
-       values[0].utf8.allSatisfy({ $0 == 0x09 || (0x20 ... 0x7E).contains($0) }) {
-        headers[.contentType] = values[0]
+    // Deliberately narrow. `location` is here because without it an upstream
+    // 3xx reaches the client bodyless and unfollowable; every other upstream
+    // header stays dropped so nothing the proxy has not reasoned about (cookies,
+    // auth challenges, caching directives) is relayed.
+    let forwarded: [(String, HTTPField.Name)] = [
+        ("content-type", .contentType),
+        ("location", .location),
+    ]
+    for (name, field) in forwarded {
+        guard let values = canonical[name], values.count == 1,
+              values[0].utf8.count <= 256,
+              values[0].utf8.allSatisfy({ $0 == 0x09 || (0x20 ... 0x7E).contains($0) })
+        else { continue }
+        headers[field] = values[0]
     }
     return Response(
         status: status,

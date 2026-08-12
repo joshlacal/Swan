@@ -129,6 +129,73 @@ final class SwanXRPCProxyRoutingTests: XCTestCase {
         XCTAssertEqual(route, .resolvedService(did: "did:web:mod.example", fragment: "atproto_labeler"))
     }
 
+    /// Proxyability must be an allow-list, not "whatever no local route
+    /// claimed". Local routes are registered conditionally, so a nil capability
+    /// or an off feature flag used to widen the proxy surface silently — and it
+    /// widened it toward whatever destination the client named.
+    func testNonProxyableNamespacesAreUnroutedEvenWithAnExplicitProxyHeader() {
+        for nsid in [
+            "com.atproto.server.resetPassword",
+            "com.atproto.server.createSession",
+            "com.atproto.identity.resolveHandle",
+            "com.atproto.admin.deleteAccount",
+            "com.example.custom.method",
+            // A near-miss on an allow-listed prefix must not squeak through.
+            "app.bskyx.feed.getTimeline",
+            "tools.ozonex.moderation.emitEvent",
+        ] {
+            XCTAssertThrowsError(
+                try router.route(nsid: nsid, proxyHeader: "did:web:attacker.example#atproto_pds"),
+                "expected \(nsid) to be unrouted"
+            ) { error in
+                XCTAssertEqual(error as? SwanXRPCProxyRoutingFailure, .unrouted, nsid)
+            }
+        }
+    }
+
+    /// The allow-list closes the set of *methods*, not the set of services:
+    /// naming an arbitrary labeler, feed generator, or chat service is the
+    /// whole point of `atproto-proxy` and must keep working.
+    func testAllowListedNamespacesStillProxyToArbitraryServices() throws {
+        let cases: [(nsid: String, header: String, expected: SwanXRPCProxyRoute)] = [
+            (
+                "tools.ozone.moderation.emitEvent",
+                "did:web:labeler.example#atproto_labeler",
+                .resolvedService(did: "did:web:labeler.example", fragment: "atproto_labeler")
+            ),
+            (
+                "chat.bsky.convo.listConvos",
+                "did:web:api.bsky.chat#bsky_chat",
+                .resolvedService(did: "did:web:api.bsky.chat", fragment: "bsky_chat")
+            ),
+            (
+                "app.bsky.feed.getFeedSkeleton",
+                "did:web:feeds.example#bsky_fg",
+                .resolvedService(did: "did:web:feeds.example", fragment: "bsky_fg")
+            ),
+        ]
+        for item in cases {
+            XCTAssertEqual(
+                try router.route(nsid: item.nsid, proxyHeader: item.header),
+                item.expected,
+                item.nsid
+            )
+        }
+    }
+
+    /// The deny-list still runs first, so an allow-listed namespace's
+    /// Swan-owned exceptions report `.denied`, not `.unrouted`.
+    func testDenyListStillPrecedesTheAllowList() {
+        XCTAssertThrowsError(
+            try router.route(
+                nsid: "app.bsky.actor.putPreferences",
+                proxyHeader: "did:web:attacker.example#atproto_pds"
+            )
+        ) { error in
+            XCTAssertEqual(error as? SwanXRPCProxyRoutingFailure, .denied)
+        }
+    }
+
     func testMalformedProxyHeaderIsRejectedAndNeverFallsBack() {
         // Each of these must fail closed rather than silently using the AppView.
         let malformed = [

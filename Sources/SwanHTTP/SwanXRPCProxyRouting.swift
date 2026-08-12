@@ -24,9 +24,12 @@ public enum SwanXRPCProxyRoutingFailure: Error, Sendable, Equatable {
 /// Decides where an XRPC request goes. Pure: no I/O, no network.
 ///
 /// Only consulted when no local Swan route matched, so local routes always
-/// win. The deny-list is deliberately redundant with that ordering — a future
-/// refactor that drops or renames a local route must not silently begin
-/// forwarding Swan-owned traffic to a third party.
+/// win. That ordering is not trusted on its own: local routes are registered
+/// conditionally, so "no local route matched" can mean "the capability is nil
+/// or its flag is off" rather than "Swan does not own this". Two independent
+/// gates cover that — a deny-list for Swan-owned namespaces inside otherwise
+/// proxyable space, and an allow-list of the namespaces that may be proxied at
+/// all, so dropping or disabling a local route fails closed.
 public struct SwanXRPCProxyRouter: Sendable {
     private static let deniedPrefixes = ["com.atproto.space.", "blue.catbird."]
     /// Exact NSIDs Swan owns inside a namespace it otherwise proxies.
@@ -42,6 +45,41 @@ public struct SwanXRPCProxyRouter: Sendable {
         "app.bsky.actor.putPreferences",
     ]
     private static let appViewPrefix = "app.bsky."
+
+    /// The closed set of lexicon namespaces this host is willing to forward.
+    ///
+    /// The deny-list above cannot be the only gate. "Proxyable" used to mean
+    /// "no local route matched and not explicitly denied", and local routes are
+    /// registered *conditionally* — a `nil` capability or an off feature flag
+    /// removes one, and the namespace it owned silently becomes proxyable.
+    /// Measured against the composed production router, the reachable instance
+    /// was `com.atproto.server.createSession`: nothing registers it locally, so
+    /// a request naming `atproto-proxy: did:web:attacker.example#svc` was
+    /// forwarded there — with the account identifier and password in its body.
+    /// (`com.atproto.server.resetPassword` turns out to be covered either way,
+    /// because the `PublicDataTesting20260727` descriptor loop registers an
+    /// unavailable stub for it when the email capability is absent. That is a
+    /// local route surviving by coincidence, which is exactly the thing not to
+    /// depend on.)
+    ///
+    /// Inverting the gate makes disabling a route fail closed: an NSID outside
+    /// this list is a 404 no matter what the client asks for. The *destination*
+    /// stays deliberately open — naming an arbitrary labeler, feed generator, or
+    /// alternate AppView is the point of `atproto-proxy` — so what is closed
+    /// here is the set of methods, not the set of services.
+    ///
+    /// `com.atproto.*` is absent on purpose. It is the PDS's own lexicon space,
+    /// which is exactly the space where a conditionally-registered local route
+    /// can vanish, so admitting any of it would reintroduce the hazard this
+    /// list exists to remove. The one real cost is
+    /// `com.atproto.moderation.createReport`, which clients proxy to a labeler:
+    /// that stays unsupported until Swan implements it locally and forwards
+    /// deliberately, rather than by absence of a route.
+    private static let proxyablePrefixes = [
+        "app.bsky.",
+        "chat.bsky.",
+        "tools.ozone.",
+    ]
 
     private let appViewDID: String
     private let appViewServiceFragment: String
@@ -63,6 +101,13 @@ public struct SwanXRPCProxyRouter: Sendable {
             throw SwanXRPCProxyRoutingFailure.denied
         }
         if let proxyHeader {
+            // Allow-list before the header is even parsed. A namespace Swan
+            // does not proxy is unrouted whether or not the client named a
+            // destination, and it reports the same 404 an unknown namespace
+            // gets so this cannot be used to enumerate what Swan reserves.
+            guard Self.proxyablePrefixes.contains(where: { nsid.hasPrefix($0) }) else {
+                throw SwanXRPCProxyRoutingFailure.unrouted
+            }
             let (did, fragment) = try Self.parseProxyHeader(proxyHeader)
             // The configured-endpoint shortcut applies only when the client
             // named the exact service Swan has an endpoint for. Matching on the
@@ -75,6 +120,10 @@ public struct SwanXRPCProxyRouter: Sendable {
             }
             return .resolvedService(did: did, fragment: fragment)
         }
+        // With no header the destination is the configured AppView, so the
+        // admissible set is narrower still than `proxyablePrefixes`: only the
+        // AppView's own namespace. `chat.bsky.` and `tools.ozone.` live at
+        // other services and a client must name them explicitly.
         guard nsid.hasPrefix(Self.appViewPrefix) else {
             throw SwanXRPCProxyRoutingFailure.unrouted
         }
