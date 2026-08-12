@@ -789,6 +789,39 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
             let delivered = PipethroughFlag()
             do {
                 try await withPipethrough(sender: sender) { client in
+                    // One well-formed round trip first, and it is load-bearing
+                    // twice over.
+                    //
+                    // It is what makes the assertion below mean anything: a
+                    // completed response proves the server accepted this
+                    // connection and is reading it, so "not delivered" reports
+                    // on bytes the parser saw and refused rather than on a
+                    // connection that was never served at all.
+                    //
+                    // It also closes a teardown race that used to kill the
+                    // whole xctest process. `client.execute` throws for these
+                    // queries, and `HummingbirdTesting`'s live framework turns
+                    // that throw into cancellation of the service group rather
+                    // than a graceful shutdown. A connection that the event
+                    // loop has accepted but not yet delivered to the server's
+                    // async inbound stream at that instant is dropped by
+                    // `NIOAsyncChannelHandler._deliverReads`, taking its
+                    // `NIOAsyncChannel` — and that channel's never-finished
+                    // `NIOAsyncWriter` — with it; the writer's `deinit` is a
+                    // `preconditionFailure`, not a test failure, so the process
+                    // died with the rest of the target unrun. Completing a
+                    // request first means the accept is already delivered and
+                    // being served before anything can cancel.
+                    //
+                    // `com.example.unknown.method` is unrouted, so it answers
+                    // 404 from Swan itself and leaves the recorded count below
+                    // untouched.
+                    try await client.execute(
+                        uri: "/xrpc/com.example.unknown.method",
+                        method: .get
+                    ) { response in
+                        XCTAssertEqual(response.status, .notFound, "for query \(query)")
+                    }
                     try await client.execute(
                         uri: "/xrpc/app.bsky.feed.getAuthorFeed?" + query,
                         method: .get
