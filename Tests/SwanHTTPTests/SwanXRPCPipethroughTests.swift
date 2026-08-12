@@ -1001,6 +1001,59 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(recorded.last?.url.host, "api.bsky.chat")
     }
 
+    /// The two lexicons the allow-list fix restores: content reports and
+    /// label queries are how a client talks to a third-party labeler about
+    /// moderation, and both were bare `com.atproto.*` NSIDs with no local
+    /// route — collateral damage from the allow-list migration having no
+    /// `com.atproto.` entry at all. They come back as exact NSIDs (see the
+    /// sibling-method regression guard in `SwanXRPCProxyRoutingTests`), not a
+    /// prefix, so this must keep routing to whatever service the client
+    /// names, exactly like every other allow-listed namespace.
+    func testModerationReportingAndLabelQueryingAreProxiedToTheNamedService() async throws {
+        let sender = RecordingProxySender()
+        let documents = StubDIDDocuments(
+            documents: [
+                "did:web:labeler.example": Data(
+                    """
+                    {"id":"did:web:labeler.example","service":[
+                      {"id":"#atproto_labeler","type":"AtprotoLabeler",
+                       "serviceEndpoint":"https://labeler.example"}]}
+                    """.utf8
+                )
+            ]
+        )
+        let labeler: HTTPFields = {
+            var headers = HTTPFields()
+            headers[.contentType] = "application/json"
+            headers[HTTPField.Name("atproto-proxy")!] = "did:web:labeler.example#atproto_labeler"
+            return headers
+        }()
+        try await withPipethrough(sender: sender, documents: documents) { client in
+            try await client.execute(
+                uri: "/xrpc/com.atproto.moderation.createReport",
+                method: .post,
+                headers: labeler,
+                body: ByteBuffer(string: #"""
+                {"reasonType":"com.atproto.moderation.defs#reasonSpam",
+                 "subject":{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:x"}}
+                """#)
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+            try await client.execute(
+                uri: "/xrpc/com.atproto.label.queryLabels?uriPatterns=at://did:plc:x/*",
+                method: .get,
+                headers: labeler
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+        let recorded = sender.recorded()
+        XCTAssertEqual(recorded.count, 2)
+        XCTAssertEqual(recorded.first?.url.host, "labeler.example")
+        XCTAssertEqual(recorded.last?.url.host, "labeler.example")
+    }
+
     // MARK: Composition
 
     /// Regression guard for the fallback existing but never being composed

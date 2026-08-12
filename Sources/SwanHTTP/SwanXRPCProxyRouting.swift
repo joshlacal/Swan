@@ -71,14 +71,32 @@ public struct SwanXRPCProxyRouter: Sendable {
     /// `com.atproto.*` is absent on purpose. It is the PDS's own lexicon space,
     /// which is exactly the space where a conditionally-registered local route
     /// can vanish, so admitting any of it would reintroduce the hazard this
-    /// list exists to remove. The one real cost is
-    /// `com.atproto.moderation.createReport`, which clients proxy to a labeler:
-    /// that stays unsupported until Swan implements it locally and forwards
-    /// deliberately, rather than by absence of a route.
+    /// list exists to remove.
     private static let proxyablePrefixes = [
         "app.bsky.",
         "chat.bsky.",
         "tools.ozone.",
+    ]
+
+    /// Exact NSIDs proxyable despite living outside every prefix above.
+    ///
+    /// Both are `com.atproto.*`, which the prefix list deliberately excludes,
+    /// but both are also methods a client proxies to a third-party labeler as
+    /// part of ordinary content moderation: reporting content
+    /// (`createReport`) and reading label state (`queryLabels`). Neither has
+    /// a local Swan route, so under the old fail-open deny-list they were
+    /// reachable; the allow-list migration 404'd them as collateral damage.
+    ///
+    /// These must be exact NSIDs, never a `com.atproto.` (or even
+    /// `com.atproto.moderation.`/`com.atproto.label.`) prefix. A prefix here
+    /// would readmit the exact hazard the allow-list exists to close: an NSID
+    /// like `com.atproto.server.createSession` — or any future
+    /// `com.atproto.moderation.*`/`com.atproto.label.*` method that turns out
+    /// to carry a credential — would become forwardable the moment it lost
+    /// its local route, with no gate left to catch it.
+    private static let proxyableMethods: Set<String> = [
+        "com.atproto.moderation.createReport",
+        "com.atproto.label.queryLabels",
     ]
 
     private let appViewDID: String
@@ -105,7 +123,9 @@ public struct SwanXRPCProxyRouter: Sendable {
             // does not proxy is unrouted whether or not the client named a
             // destination, and it reports the same 404 an unknown namespace
             // gets so this cannot be used to enumerate what Swan reserves.
-            guard Self.proxyablePrefixes.contains(where: { nsid.hasPrefix($0) }) else {
+            guard Self.proxyablePrefixes.contains(where: { nsid.hasPrefix($0) })
+                || Self.proxyableMethods.contains(nsid)
+            else {
                 throw SwanXRPCProxyRoutingFailure.unrouted
             }
             let (did, fragment) = try Self.parseProxyHeader(proxyHeader)

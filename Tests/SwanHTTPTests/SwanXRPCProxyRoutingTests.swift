@@ -183,6 +183,41 @@ final class SwanXRPCProxyRoutingTests: XCTestCase {
         }
     }
 
+    /// Restores the two lexicons a client proxies to a third-party labeler:
+    /// reporting content and reading label state. Exact NSIDs, never a
+    /// `com.atproto.` (or `com.atproto.moderation.`/`com.atproto.label.`)
+    /// prefix — that would reopen the `createSession` hazard the allow-list
+    /// exists to close.
+    func testModerationReportingAndLabelQueryingAreExactlyAllowed() throws {
+        for nsid in ["com.atproto.moderation.createReport", "com.atproto.label.queryLabels"] {
+            XCTAssertEqual(
+                try router.route(
+                    nsid: nsid,
+                    proxyHeader: "did:web:labeler.example#atproto_labeler"
+                ),
+                .resolvedService(did: "did:web:labeler.example", fragment: "atproto_labeler"),
+                nsid
+            )
+        }
+    }
+
+    /// A sibling method in the same two namespaces must stay unrouted: the
+    /// addition above is two exact NSIDs, not a `com.atproto.moderation.` or
+    /// `com.atproto.label.` prefix.
+    func testSiblingModerationAndLabelMethodsRemainUnrouted() {
+        for nsid in ["com.atproto.moderation.createReportBatch", "com.atproto.label.subscribeLabels"] {
+            XCTAssertThrowsError(
+                try router.route(
+                    nsid: nsid,
+                    proxyHeader: "did:web:labeler.example#atproto_labeler"
+                ),
+                "expected \(nsid) to be unrouted"
+            ) { error in
+                XCTAssertEqual(error as? SwanXRPCProxyRoutingFailure, .unrouted, nsid)
+            }
+        }
+    }
+
     /// The deny-list still runs first, so an allow-listed namespace's
     /// Swan-owned exceptions report `.denied`, not `.unrouted`.
     func testDenyListStillPrecedesTheAllowList() {
