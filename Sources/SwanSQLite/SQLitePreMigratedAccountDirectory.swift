@@ -90,9 +90,18 @@ public actor SQLitePreMigratedAccountDirectory:
         return databases[did]
     }
 
-    /// Runtime mutation surface. A successful commit is not returned to HTTP
-    /// until the new state has been fully re-admitted and atomically published
-    /// as the directory's next public-read generation.
+    /// Runtime mutation surface. Every commit made through this store runs a
+    /// post-commit republication step before the response is returned, so the
+    /// read directory is never left pinned to the pre-mutation state.
+    ///
+    /// That step publishes rather than blocks. It is **not** a precondition of
+    /// the response: the commit is already durable by the time it runs, so
+    /// when the new state cannot be re-admitted the store evicts the cached
+    /// generation instead of failing a write that succeeded, and the next
+    /// public read admits from cold. A successful commit is therefore returned
+    /// to HTTP either with the new generation published or with no generation
+    /// cached — never with the old one still answering reads. See
+    /// ``refreshPublicReadGenerationAfterMutation(did:database:)``.
     public func generationRefreshingPublicMutationStore(
         did: String,
         firehoseFence: PublicFirehoseCommitFence? = nil
@@ -1435,12 +1444,28 @@ public actor SQLitePreMigratedAccountDirectory:
     /// unaffected and returns success.
     ///
     /// Deliberately **not** written here: a `publicReadReadmissionFailures`
-    /// entry. That negative cache exists to stop an unadmittable account from
-    /// re-paying a full admission on every anonymous read, and while it is
-    /// live it answers with a refusal. Recording one from this path would
-    /// suppress the very cold admission the eviction depends on, converting a
+    /// entry. That negative cache is consulted by
+    /// ``admitPublicReadGenerationForRequest(account:database:)``, which is
+    /// the path the post-eviction cold read takes, and while an entry is live
+    /// that path refuses without admitting. Writing one here would therefore
+    /// suppress the very cold admission this eviction depends on, converting a
     /// self-healing cache miss into a guaranteed backoff window of `503`s for
     /// an account whose write just succeeded.
+    ///
+    /// Nor would the reason recorded be true. Entries in that cache name a
+    /// *read* refusal — the answer a read would have got by re-running the
+    /// admission — and are cleared only by a publisher. An entry written from
+    /// here names a write-path publication failure that no read ever asked
+    /// about, and no cold-path failure would clear it: the only clearing site
+    /// is `refreshPublicReadGeneration`'s publish. It would go on to suppress
+    /// a legitimate later re-admission with a reason that was never a read's.
+    ///
+    /// Both halves are pinned by tests:
+    /// `testFailedPostMutationRefreshEvictsRatherThanCachingStale` asserts no
+    /// entry is written, and `testColdCacheReadsAreBoundedByTheBackoff`
+    /// asserts that an entry, once a *read* writes one, does suppress the cold
+    /// path — which is what makes writing one from here harmful rather than
+    /// merely untidy.
     fileprivate func refreshPublicReadGenerationAfterMutation(
         did: String,
         database: SQLiteAccountDatabase
@@ -1577,7 +1602,13 @@ public actor SQLitePreMigratedAccountDirectory:
            generation.controlAccount == account {
             return (database, generation)
         }
-        let generation = try await refreshPublicReadGeneration(
+        // Cold cache. Reached when the control row moved out from under the
+        // cached generation, and — since Task 3 — when a failed post-mutation
+        // refresh evicted it. That second case is a *steady* state for an
+        // account whose refresh keeps failing for a persistent reason, so this
+        // path carries the same request-time bounds as re-admission rather
+        // than calling `refreshPublicReadGeneration` bare.
+        let generation = try await admitPublicReadGenerationForRequest(
             account: account,
             database: database
         )
@@ -1640,19 +1671,11 @@ public actor SQLitePreMigratedAccountDirectory:
         return try await attempt(database, readmitted)
     }
 
-    /// Re-admits one account's public read generation, collapsing concurrent
-    /// re-admissions for the same DID onto a single admission.
+    /// Re-admits one account's public read generation after its pin drifted.
     ///
-    /// A foreign commit invalidates the pin for every in-flight reader of that
-    /// account at once, so the naive shape is a stampede: N concurrent public
-    /// reads each running a full admission — record-index walk, block
-    /// materialization, commit authentication — against the one SQLite
-    /// connection that serializes them anyway. Single-flighting is both
-    /// cheaper and no weaker than admitting per request: the shared result is
-    /// a fully verified generation, the joining request still checks that it
-    /// was admitted against its own resolved control row, and the retried read
-    /// re-validates every pin. A joiner that resolved a different control row
-    /// is refused rather than served.
+    /// Only the short-circuit lives here; the bounded admission itself is
+    /// ``admitPublicReadGenerationForRequest(account:database:)``, shared with
+    /// the cold-cache read.
     private func readmitPublicReadGeneration(
         account: AccountControlAccount,
         database: SQLiteAccountDatabase,
@@ -1668,6 +1691,43 @@ public actor SQLitePreMigratedAccountDirectory:
             // must win over a window that has not expired yet.
             return current
         }
+        return try await admitPublicReadGenerationForRequest(
+            account: account,
+            database: database
+        )
+    }
+
+    /// The one request-time admission path, collapsing concurrent admissions
+    /// for the same DID onto a single one and bounding how often a DID that
+    /// cannot be admitted is allowed to re-pay for finding that out.
+    ///
+    /// A foreign commit invalidates the pin for every in-flight reader of that
+    /// account at once, so the naive shape is a stampede: N concurrent public
+    /// reads each running a full admission — record-index walk, block
+    /// materialization, commit authentication — against the one SQLite
+    /// connection that serializes them anyway. Single-flighting is both
+    /// cheaper and no weaker than admitting per request: the shared result is
+    /// a fully verified generation, the joining request still checks that it
+    /// was admitted against its own resolved control row, and the retried read
+    /// re-validates every pin. A joiner that resolved a different control row
+    /// is refused rather than served.
+    ///
+    /// Both callers arrive from an anonymous public read, so both get those
+    /// bounds. The cold-cache caller is not the cheaper case it looks like:
+    /// since Task 3's post-mutation eviction, "database open, no generation
+    /// cached" is a state an account can sit in indefinitely when its refresh
+    /// keeps failing for a persistent reason — `accountNotActive`,
+    /// `identityFactsMalformed`, `accountNotPreopened`. Routed around the
+    /// negative cache, every anonymous read for such a DID would pay a full
+    /// record-index walk, MST projection verify and PLC `verifyGenesis`,
+    /// forever. That is precisely the unbounded per-read cost
+    /// ``recordPublicReadReadmissionFailure(did:error:)`` exists to cap, on
+    /// endpoints the whole network can reach once Swan is announced to a
+    /// relay.
+    private func admitPublicReadGenerationForRequest(
+        account: AccountControlAccount,
+        database: SQLiteAccountDatabase
+    ) async throws -> SQLiteVerifiedPublicRepositoryGeneration {
         if let failure = publicReadReadmissionFailures[account.did] {
             if failure.expiresAt > ContinuousClock.now {
                 // Suppress the work, never the refusal. The caller sees the
@@ -1683,9 +1743,9 @@ public actor SQLitePreMigratedAccountDirectory:
             }
             publicReadReadmissionFailures.removeValue(forKey: account.did)
         }
-        let readmission: Task<SQLiteVerifiedPublicRepositoryGeneration, any Error>
+        let admission: Task<SQLiteVerifiedPublicRepositoryGeneration, any Error>
         if let inFlight = publicReadReadmissions[account.did] {
-            readmission = inFlight
+            admission = inFlight
         } else {
             // The store below runs before this closure's first suspension —
             // actor-isolated code continues synchronously past `Task { }` —
@@ -1698,11 +1758,11 @@ public actor SQLitePreMigratedAccountDirectory:
                 )
             }
             publicReadReadmissions[account.did] = started
-            readmission = started
+            admission = started
         }
         let generation: SQLiteVerifiedPublicRepositoryGeneration
         do {
-            generation = try await readmission.value
+            generation = try await admission.value
         } catch let error as PublicRepositoryReadError {
             recordPublicReadReadmissionFailure(did: account.did, error: error)
             throw error
@@ -1717,12 +1777,13 @@ public actor SQLitePreMigratedAccountDirectory:
         return generation
     }
 
-    /// Remembers, briefly, that re-admitting this DID did not work.
+    /// Remembers, briefly, that admitting this DID did not work.
     ///
-    /// A failed admission never publishes a generation, so
-    /// `activePublicReadContext` keeps handing back the same stale one and
-    /// every following read re-enters the re-admission path. Without this,
-    /// one unadmittable account turns each anonymous public read into a full
+    /// A failed admission never publishes a generation, so the next read finds
+    /// the cache in exactly the state that sent this one down the admission
+    /// path — the same stale generation, or nothing at all after a
+    /// post-mutation eviction — and re-enters it. Without this, one
+    /// unadmittable account turns each anonymous public read into a full
     /// record-index walk plus PLC verification — a fast 503 becomes a slow
     /// one, on endpoints the whole network can reach once Swan is announced
     /// to a relay.
@@ -2391,10 +2452,12 @@ private actor SQLiteGenerationRefreshingPublicMutationStore:
     // Public repository mutation targets are deliberately exposed through the
     // narrow mutation-store protocol above.  The HTTP upload/getBlob paths
     // need the separate streaming capability as well, but must retain the
-    // generation-refreshing wrapper so a successful mutation is published to
-    // the read directory before the response is returned.  Delegate the
-    // blob surface here rather than handing the raw account database to the
-    // request path (which would bypass that publication boundary).
+    // generation-refreshing wrapper so a successful mutation still runs the
+    // post-commit republication step — publish the new generation, or evict
+    // the one the commit just invalidated — before the response is returned.
+    // Delegate the blob surface here rather than handing the raw account
+    // database to the request path, which would skip that step entirely and
+    // leave the pre-mutation generation cached and answering reads.
     func put(
         _ data: Data,
         namespace: BlobNamespace

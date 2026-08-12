@@ -382,9 +382,13 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
                 + "leave or replace one"
         )
 
-        // The eviction must not have been recorded as a re-admission failure:
-        // that negative entry answers refusals for the whole backoff window
-        // and would suppress the cold admission this design depends on.
+        // The eviction must not have been recorded as an admission failure:
+        // the cold read below goes through
+        // `admitPublicReadGenerationForRequest`, which consults that negative
+        // cache and refuses outright while an entry is live — see
+        // `testColdCacheReadsAreBoundedByTheBackoff`, which pins that
+        // suppression. An entry written here would make the account dark for
+        // the whole window on the strength of a write-path failure.
         let backoff = await fixture.directory
             .hasLivePublicReadReadmissionBackoff(did: did)
         XCTAssertFalse(
@@ -393,8 +397,8 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
                 + "entry"
         )
 
-        // With Task 2 in place, the next read re-admits — immediately, well
-        // inside the 250 ms backoff window, because no entry was written.
+        // So the next read admits from cold immediately, without waiting out a
+        // 250 ms window it was never put into.
         fixture.verifier.acceptEverything()
         let recovered = try await fixture.directory.publicRepositoryStatus(
             selector: did
@@ -436,6 +440,98 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
             fixture.verifier.admissionCount - baseline,
             0,
             "the published generation must serve the next read outright"
+        )
+    }
+
+    /// Eviction must not open a hole in the backoff.
+    ///
+    /// The post-mutation eviction created a state nothing else in this file
+    /// can produce: an open database with *no* cached generation. `bootstrap`
+    /// admits every active account or fails startup, `installAccount` writes
+    /// both maps together, and revoke/close remove the database as well — so
+    /// before Task 3 the cold-cache branch of `activePublicReadContext` was
+    /// reachable only via a control-row change. It is now a steady state for
+    /// an account whose refresh keeps failing for a persistent reason, and
+    /// every anonymous read lands on it.
+    ///
+    /// If that branch admitted bare, each of those reads would pay a full
+    /// record-index walk, MST projection verify and PLC `verifyGenesis` —
+    /// forever, on an endpoint the whole network can reach. The bound has to
+    /// cover the cold path, not just re-admission after a stale pin.
+    func testColdCacheReadsAreBoundedByTheBackoff() async throws {
+        let fixture = try await makeFixture()
+
+        _ = try await fixture.directory.publicRepositoryStatus(selector: did)
+
+        // Drive the account into "open database, nothing cached" through the
+        // only door that produces it: a post-mutation refresh that fails.
+        fixture.verifier.rejectEverything()
+        _ = try await applyOneRecord(fixture, recordKey: "cold-backoff")
+        let cached = await fixture.directory.cachedPublicReadGenerationID(
+            did: did
+        )
+        XCTAssertNil(
+            cached,
+            "precondition: the failed refresh must have evicted the generation"
+        )
+        let evictionWroteBackoff = await fixture.directory
+            .hasLivePublicReadReadmissionBackoff(did: did)
+        XCTAssertFalse(
+            evictionWroteBackoff,
+            "precondition: the write path must not have primed the negative "
+                + "cache — otherwise the first read below is suppressed and "
+                + "this test proves nothing about the cold path"
+        )
+
+        let baseline = fixture.verifier.admissionCount
+        let first = await captureRefusal(fixture.directory, .status)
+        XCTAssertEqual(first, .identityFactsMalformed)
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            1,
+            "the first cold read pays exactly one admission"
+        )
+        let recorded = await fixture.directory
+            .hasLivePublicReadReadmissionBackoff(did: did)
+        XCTAssertTrue(
+            recorded,
+            "a failed cold admission must record the backoff entry, not only "
+                + "a failed re-admission"
+        )
+
+        // Every read shape, immediately, well inside the window. Each one
+        // takes the cold branch — there is still nothing cached — and each one
+        // must be suppressed by the entry the first read wrote.
+        for shape in PublicReadShape.allCases {
+            let reason = await captureRefusal(fixture.directory, shape)
+            XCTAssertEqual(
+                reason,
+                .identityFactsMalformed,
+                "\(shape) must refuse with the same reason while the backoff "
+                    + "window suppresses the work"
+            )
+        }
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            1,
+            "cold reads inside the backoff window must add no admissions"
+        )
+
+        // And the bound must not become a second way to stay dark: past the
+        // window the account is served again, from cold, with one admission.
+        fixture.verifier.acceptEverything()
+        try await Task.sleep(for: .milliseconds(500))
+        let recovered = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        XCTAssertNotNil(
+            recovered,
+            "an account that became admittable again must be served"
+        )
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            2,
+            "recovery costs exactly one further admission"
         )
     }
 
