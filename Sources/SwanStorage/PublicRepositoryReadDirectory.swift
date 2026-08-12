@@ -100,6 +100,23 @@ public enum PublicReadUnavailableReason: String, Sendable, Equatable, CaseIterab
     case blockMaterializationFailed
     /// A process-wide response, spool, or request-body budget refused a lease.
     case admissionBudgetExhausted
+    /// A static per-account projection bound refused the admission: the record
+    /// index exceeds ``PublicRepositoryReadLimits/maximumGenerationIndexEntries``,
+    /// or the account's collection set exceeds the `describeRepo` count or byte
+    /// caps.
+    ///
+    /// Deliberately distinct from ``admissionBudgetExhausted``. That one is a
+    /// shared, load-dependent lease and clears on its own when traffic drops;
+    /// this one is a property of the account's own data and will refuse
+    /// identically on every attempt until an operator changes the data or the
+    /// limit. Collapsing them would send the next incident at load shedding
+    /// when the cause is a single oversized account.
+    ///
+    /// This is the classification for ``PublicRepositoryReadError``'s
+    /// reason-less ``PublicRepositoryReadError/resourceLimitExceeded``, which
+    /// otherwise reaches the journal and the re-admission bound carrying no
+    /// name at all. See ``PublicRepositoryReadError/admissionFailureReason``.
+    case projectionBoundExceeded
     /// A public projection value failed its own construction invariants.
     case malformedProjectionValue
     /// A descriptor-backed CAR spool could not be sized, read, or drained.
@@ -175,6 +192,7 @@ extension PublicReadUnavailableReason {
              .publicIdentityVerifierUnconfigured,
              .blockMaterializationFailed,
              .admissionBudgetExhausted,
+             .projectionBoundExceeded,
              .malformedProjectionValue,
              .spoolStreamFailure,
              .storageFailure,
@@ -198,6 +216,43 @@ extension PublicRepositoryReadError {
     public var unavailableReason: PublicReadUnavailableReason? {
         guard case let .unavailable(reason) = self else { return nil }
         return reason
+    }
+
+    /// The guard name to journal, and to bound, when this error is raised while
+    /// **admitting** an account.
+    ///
+    /// ``unavailableReason`` answers `nil` for every case that carries no
+    /// reason, and the two consumers of that answer in
+    /// `SQLitePreMigratedAccountDirectory` both treat `nil` as "do nothing":
+    /// the admission failure is neither journalled nor recorded in the
+    /// re-admission negative cache. For ``resourceLimitExceeded`` that is a
+    /// live fault, not a theoretical one. Admission's projection preflight
+    /// raises it after paginating the whole
+    /// `public_repository_record_index`, so an account that is over a static
+    /// bound is *permanently* unadmittable, produces zero journal lines — the
+    /// three-hour-blind-outage mode this whole series exists to remove — and
+    /// escapes the bound that stops one unadmittable account from turning every
+    /// anonymous public read into a full index walk. Naming it here fixes both
+    /// halves at once.
+    ///
+    /// The request-shape cases answer `nil` on purpose. They are decided from
+    /// the request, never from the account: no admission path can raise one
+    /// today, and recording one would let a single malformed request turn that
+    /// DID's `400` into a `503` for every other caller for the backoff window.
+    /// The switch is exhaustive so a case added later must choose.
+    ///
+    /// Server-side classification only. Every value here maps to the same
+    /// `503 {"error":"temporarily_unavailable"}`, and the thrown error itself
+    /// is unchanged — this only names it.
+    public var admissionFailureReason: PublicReadUnavailableReason? {
+        switch self {
+        case let .unavailable(reason):
+            reason
+        case .resourceLimitExceeded:
+            .projectionBoundExceeded
+        case .invalidSelector, .invalidLimit, .invalidCursor:
+            nil
+        }
     }
 }
 

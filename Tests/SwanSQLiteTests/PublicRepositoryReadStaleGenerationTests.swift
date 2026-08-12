@@ -286,6 +286,89 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
         )
     }
 
+    /// An admission failure that carries no reason must still be named and
+    /// still be bounded.
+    ///
+    /// `PublicRepositoryReadError.resourceLimitExceeded` has no associated
+    /// ``PublicReadUnavailableReason``, and admission raises it: the projection
+    /// preflight paginates the entire `public_repository_record_index` before
+    /// refusing an account over `maximumGenerationIndexEntries` or over the
+    /// `describeRepo` collection caps. Read through `unavailableReason` alone
+    /// that refusal was invisible twice over — nothing journalled, which is the
+    /// three-hour-blind failure mode this file exists to prevent, and nothing
+    /// recorded, so an over-budget account stayed *permanently* unadmittable
+    /// **and** unbounded: every anonymous read for that DID redid the full
+    /// index walk, on endpoints a relay hammers.
+    ///
+    /// The refusal the caller sees must not change — this names an error, it
+    /// does not reclassify one.
+    func testReasonlessAdmissionFailureIsNamedAndBounded() async throws {
+        let fixture = try await makeFixture()
+
+        _ = try await fixture.directory.publicRepositoryStatus(selector: did)
+        try await commitFromSecondConnection(root: fixture.root)
+        fixture.verifier.rejectEverything(throwing: .resourceLimitExceeded)
+
+        let baseline = fixture.verifier.admissionCount
+        let refused = await captureRefusalError(fixture.directory, .status)
+        XCTAssertEqual(
+            refused,
+            .resourceLimitExceeded,
+            "the thrown error must reach the caller unchanged — this is a "
+                + "diagnostic classification, not a reclassification"
+        )
+        XCTAssertNil(
+            refused?.unavailableReason,
+            "precondition: this refusal must be one that carries no reason, "
+                + "or it exercises the already-covered path"
+        )
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            1,
+            "precondition: the read must have attempted a real admission"
+        )
+
+        let recorded = await fixture.directory
+            .hasLivePublicReadReadmissionBackoff(did: did)
+        XCTAssertTrue(
+            recorded,
+            "an admission failure that arrived without a reason is still an "
+                + "admission failure, and the most permanent kind there is"
+        )
+
+        // The bound is what was missing. Inside the window every read shape
+        // must refuse from the recorded entry and buy no further index walks.
+        for shape in PublicReadShape.allCases {
+            let reason = await captureRefusal(fixture.directory, shape)
+            XCTAssertEqual(
+                reason,
+                .projectionBoundExceeded,
+                "\(shape) must refuse with the name the reason-less failure "
+                    + "was classified under"
+            )
+        }
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            1,
+            "reads inside the backoff window must add no admissions — an "
+                + "unnamed refusal was the one failure that stayed unbounded"
+        )
+
+        // And the bound is still a window, not a wall: past it the account is
+        // allowed to try again, exactly like every named failure.
+        try await Task.sleep(for: .milliseconds(500))
+        fixture.verifier.acceptEverything()
+        let recovered = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        XCTAssertEqual(recovered?.revision, fixture.revision)
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            2,
+            "past the window the read must run its own admission"
+        )
+    }
+
     // MARK: The limits
 
     /// Re-admission must not become a way to serve a broken account.
@@ -809,6 +892,17 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
         _ directory: SQLitePreMigratedAccountDirectory,
         _ shape: PublicReadShape
     ) async -> PublicReadUnavailableReason? {
+        await captureRefusalError(directory, shape)?.unavailableReason
+    }
+
+    /// The whole refusal, not just its reason. A read error that carries no
+    /// ``PublicReadUnavailableReason`` is exactly the case
+    /// ``captureRefusal(_:_:)`` cannot distinguish from "did not refuse",
+    /// and it is the case under test below.
+    private func captureRefusalError(
+        _ directory: SQLitePreMigratedAccountDirectory,
+        _ shape: PublicReadShape
+    ) async -> PublicRepositoryReadError? {
         do {
             switch shape {
             case .status:
@@ -840,7 +934,7 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
             XCTFail("\(shape) must refuse an unadmittable account")
             return nil
         } catch let error as PublicRepositoryReadError {
-            return error.unavailableReason
+            return error
         } catch {
             XCTFail("\(shape) threw an untyped error: \(error)")
             return nil
@@ -1072,8 +1166,8 @@ private final class CountingPLCVerifier:
 
     private struct State {
         var admissions = 0
-        /// The reason every admission refuses with, or `nil` to accept.
-        var rejection: PublicReadUnavailableReason?
+        /// The error every admission refuses with, or `nil` to accept.
+        var rejection: PublicRepositoryReadError?
     }
 
     private let state = Mutex(State())
@@ -1096,7 +1190,16 @@ private final class CountingPLCVerifier:
     /// handling differs from every other refusal — and this is the only seam
     /// that can produce one on demand.
     func rejectEverything(with reason: PublicReadUnavailableReason) {
-        state.withLock { $0.rejection = reason }
+        rejectEverything(throwing: .unavailable(reason: reason))
+    }
+
+    /// Refuses every admission with a chosen `PublicRepositoryReadError`,
+    /// including the cases that carry no reason at all. Admission's projection
+    /// preflight really does throw `resourceLimitExceeded`, and how the
+    /// directory journals and bounds an *unnamed* refusal is a distinct
+    /// behaviour from how it handles a named one.
+    func rejectEverything(throwing error: PublicRepositoryReadError) {
+        state.withLock { $0.rejection = error }
     }
 
     func acceptEverything() {
@@ -1107,12 +1210,12 @@ private final class CountingPLCVerifier:
         facts: PublicPLCGenesisFacts,
         expectedDID _: String
     ) throws -> String {
-        let rejection = state.withLock { current -> PublicReadUnavailableReason? in
+        let rejection = state.withLock { current -> PublicRepositoryReadError? in
             current.admissions += 1
             return current.rejection
         }
         if let rejection {
-            throw PublicRepositoryReadError.unavailable(reason: rejection)
+            throw rejection
         }
         guard facts.signingDIDKey == Self.signingDIDKey,
               facts.rotationDIDKey == Self.rotationDIDKey,

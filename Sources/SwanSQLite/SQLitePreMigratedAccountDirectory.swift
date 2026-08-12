@@ -1810,11 +1810,22 @@ public actor SQLitePreMigratedAccountDirectory:
     /// reached through the path built to end it, merely time-boxed to 250 ms.
     /// The exclusion costs at most one redone admission per read in a race that
     /// resolves itself.
+    ///
+    /// Everything else is recorded, including the admission failures that carry
+    /// no ``PublicReadUnavailableReason`` of their own. `resourceLimitExceeded`
+    /// is raised by admission's own projection preflight *after* it paginates
+    /// the entire `public_repository_record_index`, and it is the most
+    /// permanent refusal there is — it repeats identically until an operator
+    /// changes the data. Skipping it because it arrived unnamed left precisely
+    /// the account this cache exists for unbounded, so classification runs
+    /// through ``PublicRepositoryReadError/admissionFailureReason``, which
+    /// names it. Only request-shape errors are still passed over, and those no
+    /// admission can raise.
     private func recordPublicReadReadmissionFailure(
         did: String,
         error: PublicRepositoryReadError
     ) {
-        guard let reason = error.unavailableReason,
+        guard let reason = error.admissionFailureReason,
               !reason.isChangeDetection else { return }
         let now = ContinuousClock.now
         if publicReadReadmissionFailures[did] == nil,
@@ -1960,11 +1971,18 @@ public actor SQLitePreMigratedAccountDirectory:
     /// Server-side only: the DID and the failed guard's name are written to the
     /// service journal and never to a response body. The 2026-08-12 outage ran
     /// for three hours with zero `journalctl` lines because this did not exist.
+    ///
+    /// Classification goes through
+    /// ``PublicRepositoryReadError/admissionFailureReason``, not
+    /// ``PublicRepositoryReadError/unavailableReason``: an admission can refuse
+    /// with `resourceLimitExceeded`, which carries no reason of its own, and
+    /// reading the bare reason here reproduced the silent-503 the outage was
+    /// about for exactly that failure.
     private static func logPublicReadAdmissionFailure(
         _ error: PublicRepositoryReadError,
         did: String
     ) {
-        guard let reason = error.unavailableReason else { return }
+        guard let reason = error.admissionFailureReason else { return }
         publicReadDiagnosticLog.warning(
             "public read admission refused",
             fields: ["did": did, "reason": reason.rawValue]

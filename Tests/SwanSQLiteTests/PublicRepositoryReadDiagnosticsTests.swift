@@ -75,6 +75,7 @@ final class PublicRepositoryReadDiagnosticsTests: XCTestCase {
             "publicIdentityVerifierUnconfigured",
             "blockMaterializationFailed",
             "admissionBudgetExhausted",
+            "projectionBoundExceeded",
             "malformedProjectionValue",
             "spoolStreamFailure",
             "storageFailure",
@@ -91,6 +92,49 @@ final class PublicRepositoryReadDiagnosticsTests: XCTestCase {
             [],
             "journal token(s) renamed or removed — this breaks operator greps"
         )
+    }
+
+    /// The journal must not go quiet just because a refusal arrived without a
+    /// reason attached.
+    ///
+    /// `resourceLimitExceeded` is raised inside admission by the projection
+    /// preflight, and it is the one refusal that repeats forever — it names an
+    /// account whose own data is over a static bound. Classified as `nil` it
+    /// wrote no journal line at all, which is exactly the silent-503 state the
+    /// rest of this file exists to prevent. The request-shape errors stay `nil`
+    /// on purpose: they are decided from the request, no admission raises one,
+    /// and naming one would let it be recorded against the account.
+    func testReasonlessReadErrorsAreClassifiedForTheJournal() {
+        XCTAssertEqual(
+            PublicRepositoryReadError.resourceLimitExceeded
+                .admissionFailureReason,
+            .projectionBoundExceeded
+        )
+        XCTAssertNotEqual(
+            PublicRepositoryReadError.resourceLimitExceeded
+                .admissionFailureReason,
+            .admissionBudgetExhausted,
+            "a per-account static bound and a shared load-dependent lease "
+                + "must not share a journal token"
+        )
+        for shapeError in [
+            PublicRepositoryReadError.invalidSelector,
+            .invalidLimit,
+            .invalidCursor,
+        ] {
+            XCTAssertNil(
+                shapeError.admissionFailureReason,
+                "\(shapeError) is decided from the request, not the account"
+            )
+        }
+        // Availability failures keep answering with the guard that fired.
+        for reason in PublicReadUnavailableReason.allCases {
+            XCTAssertEqual(
+                PublicRepositoryReadError.unavailable(reason: reason)
+                    .admissionFailureReason,
+                reason
+            )
+        }
     }
 
     // MARK: Fixture
