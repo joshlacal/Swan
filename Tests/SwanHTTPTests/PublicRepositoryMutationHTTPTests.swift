@@ -1068,6 +1068,7 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
             oauthRuntime: runtime,
             authenticatedGetSpaceDirectory: NoopSimpleSpaceDirectory(),
             accountControlStore: control,
+            publicRepositoryReadDirectory: directory,
             publicRepositoryMutationDirectory: directory,
             publicRepositoryMutationSignerProvider: TestSignerProvider(signer: signer),
             publicBlobSpoolAdmission: publicBlobSpoolAdmission,
@@ -1395,7 +1396,12 @@ func contentLengthRejectionCases(maximum: Int) -> [(String, [String])] {
     ]
 }
 
-private actor TestMutationDirectory: PublicRepositoryMutationDirectory {
+/// Backs both public surfaces. `getBlob` is served from the *read* surface
+/// now, so a fixture that uploads a blob and then reads it back has to supply
+/// a read directory as well as a mutation one.
+private actor TestMutationDirectory:
+    PublicRepositoryMutationDirectory, PublicRepositoryReadDirectory
+{
     let did: String
     let database: SQLiteAccountDatabase
     let barrier: MutationTargetBarrier?
@@ -1421,6 +1427,81 @@ private actor TestMutationDirectory: PublicRepositoryMutationDirectory {
             store: database
         )
     }
+
+    // MARK: - PublicRepositoryReadDirectory
+
+    /// Deliberately does not arrive at `barrier`: the barrier synchronizes
+    /// concurrent *mutations*, and a blob read consuming an arrival would
+    /// change what the concurrency tests are measuring.
+    func publicRepositoryBlobOutcome(
+        did selector: String
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadBlobTarget>
+    {
+        guard selector == did else { return .notFound }
+        return .active(
+            try PublicRepositoryReadBlobTarget(
+                did: did, status: .active, store: database
+            )
+        )
+    }
+
+    func publicRepositoryStatus(
+        selector _: String
+    ) async throws -> PublicRepositoryReadStatus? { nil }
+
+    func describePublicRepository(
+        selector _: String
+    ) async throws -> PublicRepositoryReadDescription? { nil }
+
+    func publicRepositoryRecord(
+        selector _: String,
+        path _: PublicRepositoryPath,
+        expectedCID _: CID?
+    ) async throws -> PublicRepositoryReadRecord? { nil }
+
+    func listPublicRepositoryRecords(
+        selector _: String,
+        collection _: String,
+        limit _: Int,
+        cursor _: String?,
+        reverse _: Bool
+    ) async throws -> PublicRepositoryReadPage {
+        try .init(records: [], cursor: nil)
+    }
+
+    func publicRepositoryCAR(
+        selector _: String
+    ) async throws -> PublicRepositoryReadCAR? { nil }
+
+    func publicRepositoryDescriptionOutcome(
+        selector _: String
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadDescription>
+    { .notFound }
+
+    func publicRepositoryRecordOutcome(
+        selector _: String,
+        path _: PublicRepositoryPath,
+        expectedCID _: CID?
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadRecordResult>
+    { .notFound }
+
+    func publicRepositoryRecordsOutcome(
+        selector _: String,
+        collection _: String,
+        limit _: Int,
+        cursor _: String?,
+        reverse _: Bool
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadPageResult>
+    { .notFound }
+
+    func publicRepositoryCAROutcome(
+        selector _: String
+    ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadCAR>
+    { .notFound }
 }
 
 struct RealSocketDripResponse: Sendable {

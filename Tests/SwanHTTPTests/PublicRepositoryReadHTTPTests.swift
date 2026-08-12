@@ -210,11 +210,24 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
             for (path, method): (String, HTTPRequest.Method) in [
                 ("/xrpc/com.atproto.repo.createRecord", .post),
                 ("/xrpc/com.atproto.repo.uploadBlob", .post),
-                ("/xrpc/com.atproto.sync.getBlob", .get),
             ] {
                 try await client.execute(uri: path, method: method) { response in
                     XCTAssertEqual(response.status, .serviceUnavailable)
                 }
+            }
+            // `getBlob` is no longer deferred on a read-enabled server: it is
+            // a read, and it is installed by the read directory rather than by
+            // the mutation capability. A live route answers the request it was
+            // given — here, one with no `did` or `cid` at all.
+            try await client.execute(
+                uri: "/xrpc/com.atproto.sync.getBlob",
+                method: .get
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest)
+                XCTAssertEqual(
+                    try self.object(response.body)["error"] as? String,
+                    "InvalidRequest"
+                )
             }
             try await client.execute(
                 uri: "/xrpc/com.atproto.repo.describeRepo?repo=\(did)",
@@ -863,6 +876,20 @@ private actor TestPublicRepositoryReadDirectory: PublicRepositoryReadDirectory {
             throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
         }
         return .active(car)
+    }
+
+    /// This fixture hosts records, not blobs. `getBlob` behaviour — including
+    /// that it is served with public mutations disabled — is covered by
+    /// `PublicBlobReadRegistrationTests` and `PublicBlobDIDBindingTests`.
+    func publicRepositoryBlobOutcome(
+        did: String
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadBlobTarget>
+    {
+        guard recognizes(did) else { return .notFound }
+        let status = try currentStatus()
+        guard status.status == .active else { return .lifecycle(status) }
+        return .notFound
     }
 
     private func recognizes(_ selector: String) -> Bool {

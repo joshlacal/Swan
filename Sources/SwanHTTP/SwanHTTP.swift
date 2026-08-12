@@ -550,7 +550,6 @@ public struct SwanHTTPServer: Sendable {
                     directory: mutationDirectory,
                     signerProvider: signerProvider,
                     publicBlobSpoolAdmission: publicBlobSpoolAdmission,
-                    blobStreamAdmission: self.blobStreamAdmission,
                     jsonWriteAdmission: resolvedJSONWriteAdmission,
                     jsonWriteBodyPolicy: resolvedJSONWriteBodyPolicy
                 )
@@ -962,7 +961,10 @@ public struct SwanHTTPServer: Sendable {
                 directory: publicRepositoryReadDirectory,
                 publicURL: configuration.publicURL,
                 jsonReadAdmission: jsonReadAdmission,
-                handleResolution: publicHandleResolution
+                handleResolution: publicHandleResolution,
+                blobStreamAdmission: blobStreamAdmission,
+                blobRequestBodyAdmission: jsonWriteAdmission,
+                blobRequestBodyPolicy: jsonWriteBodyPolicy
             )
         }
         if let publicRepositoryMutations {
@@ -996,10 +998,10 @@ public struct SwanHTTPServer: Sendable {
                Self.isInstalledPublicMutationMethod(descriptor.nsid) {
                 continue
             }
-            if publicRepositoryMutations != nil,
-               descriptor.nsid == "com.atproto.sync.getBlob" {
-                continue
-            }
+            // `com.atproto.sync.getBlob` had its own clause here, keyed on the
+            // *mutation* capability. It is a read; it is covered by
+            // `isInstalledPublicReadMethod` above now, so turning public
+            // writes off no longer replaces image serving with a 503.
             registerUnavailablePublicEndpoint(descriptor, on: router)
         }
         accountEmailXRPC?.register(

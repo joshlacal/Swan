@@ -443,7 +443,10 @@ func requiredPublicBlobContentLength(_ headers: HTTPFields) throws -> Int {
     return length
 }
 
-private let maximumPublicBlobTransferBytes = 256 * 1024 * 1024
+/// Shared with the public blob *read* route, which lives on the read surface
+/// in `SwanPublicRepositoryReadXRPC.swift`. Upload and download must agree on
+/// this bound or a blob could be accepted and then never served.
+let maximumPublicBlobTransferBytes = 256 * 1024 * 1024
 
 func registerPublicRepositoryMutationEndpoints(
     on router: Router<BasicRequestContext>,
@@ -533,82 +536,10 @@ func registerPublicRepositoryMutationEndpoints(
             router.on(path, method: method) { _, _ in publicMutationError(.notFound, "public_endpoint_unavailable") }
         }
     }
-    let blobPath: RouterPath = "/xrpc/com.atproto.sync.getBlob"
-    router.get(blobPath) { request, context async -> Response in
-        guard await publicBlobRequestHasNoBody(
-            request,
-            context: context,
-            capability: capability
-        ) else {
-            return publicMutationError(.badRequest, "InvalidRequest")
-        }
-        let parameters: PublicBlobParameters
-        do {
-            parameters = try publicBlobParameters(request)
-        } catch {
-            return publicMutationError(.badRequest, "InvalidRequest")
-        }
-        let target: PublicRepositoryMutationTarget
-        do {
-            guard let resolved = try await capability.directory
-                .publicRepositoryMutationTarget(selector: parameters.did),
-                resolved.did == parameters.did else {
-                return publicMutationError(.badRequest, "RepoNotFound")
-            }
-            target = resolved
-        } catch {
-            return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
-        }
-        guard target.status == .active else {
-            return publicBlobLifecycleError(target.status)
-        }
-        guard let streamLease = capability.blobStreamAdmission.reserve(
-            accountDID: target.did,
-            maximumBytes: maximumPublicBlobTransferBytes
-        ) else {
-            return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
-        }
-        guard let blobStore = target.store as? any StreamingBlobStore else {
-            streamLease.release()
-            return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
-        }
-        let blob: PublicBlob?
-        do {
-            blob = try await blobStore.publicBlob(cid: parameters.cid)
-        } catch {
-            streamLease.release()
-            return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
-        }
-        guard let blob else {
-            streamLease.release()
-            return publicMutationError(.notFound, "BlobNotFound")
-        }
-        guard blob.body.contentLength > 0,
-              blob.body.contentLength <= maximumPublicBlobTransferBytes else {
-            streamLease.release()
-            return publicMutationError(.serviceUnavailable, "temporarily_unavailable")
-        }
-        var headers: HTTPFields = [
-            .contentType: safePublicBlobMIMEType(blob.mimeType),
-            .cacheControl: "no-store",
-        ]
-        headers[.contentLength] = String(blob.body.contentLength)
-        headers[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"
-        return Response(status: .ok, headers: headers, body: .init { writer in
-            defer { streamLease.release() }
-            try await blob.body.streamBody(maximumChunkBytes: 64 * 1_024) { chunk in
-                try await writer.write(ByteBuffer(data: chunk))
-            }
-            try await writer.finish(nil)
-        })
-    }
-    for method: HTTPRequest.Method in [
-        .head, .post, .put, .patch, .delete, .options, .connect, .trace,
-    ] {
-        router.on(blobPath, method: method) { _, _ -> Response in
-            publicMutationError(.notFound, "public_endpoint_unavailable")
-        }
-    }
+    // `com.atproto.sync.getBlob` is deliberately NOT registered here. It is a
+    // read, and registering it in this block gated avatar and image serving
+    // for the entire network behind `--enable-public-repository-mutations`.
+    // It now lives in `registerPublicRepositoryReadEndpoints`.
 }
 
 private func publicMutationResponse(_ error: BlobQuotaError) -> Response {
@@ -616,67 +547,6 @@ private func publicMutationResponse(_ error: BlobQuotaError) -> Response {
     case .uniqueBytesExceeded, .referenceCountExceeded:
         return publicMutationError(.contentTooLarge, "AccountBlobQuotaExceeded")
     }
-}
-
-private struct PublicBlobParameters {
-    let did: String
-    let cid: String
-}
-
-private func publicBlobParameters(_ request: Request) throws -> PublicBlobParameters {
-    let query = try strictAuthenticatedRecordQuery(
-        request,
-        required: ["did", "cid"],
-        optional: []
-    )
-    guard let rawDID = query["did"],
-          rawDID.utf8.count <= 2_048,
-          let did = try? DID(didString: rawDID),
-          did.didString() == rawDID,
-          let rawCID = query["cid"],
-          rawCID.utf8.count <= 256,
-          let cid = try? CID.parse(rawCID),
-          cid.string == rawCID,
-          cid.codec == .raw,
-          cid.multihash.algorithm == Multihash.sha256Code,
-          cid.multihash.length == Multihash.sha256Length,
-          cid.multihash.digest.count == Int(Multihash.sha256Length) else {
-        throw PublicMutationFailure.invalidRequest
-    }
-    return PublicBlobParameters(did: rawDID, cid: rawCID)
-}
-
-private func publicBlobRequestHasNoBody(
-    _ request: Request,
-    context: SwanHTTPRequestContext,
-    capability: SwanPublicRepositoryMutationCapability
-) async -> Bool {
-    do {
-        let body = try await collectAdmittedRequestBody(
-            request,
-            mediaType: .unspecified,
-            admission: capability.jsonWriteAdmission,
-            policy: capability.jsonWriteBodyPolicy,
-            maximumBytes: 1,
-            termination: context.jsonWriteBodyTermination
-        )
-        defer { withExtendedLifetime(body) {} }
-        return body.readableBytes == 0
-    } catch {
-        return false
-    }
-}
-
-private func publicBlobLifecycleError(_ status: AccountControlStatus) -> Response {
-    let code = switch status {
-    case .deactivated: "RepoDeactivated"
-    case .suspended: "RepoSuspended"
-    case .takendown: "RepoTakendown"
-    case .active: "InvalidRequest"
-    case .deleting, .deleted, .desynchronized, .throttled, .unknown:
-        "RepoNotFound"
-    }
-    return publicMutationError(.badRequest, code)
 }
 
 private func withPublicMutationInput<Value: Decodable>(
@@ -806,7 +676,8 @@ private func publicMutationError(_ status: HTTPResponse.Status, _ code: String) 
     authenticatedGetSpaceJSON(status, ["error": code])
 }
 
-private func safePublicBlobMIMEType(_ value: String?) -> String {
+/// Shared with the public blob read route on the read surface.
+func safePublicBlobMIMEType(_ value: String?) -> String {
     guard let value,
           !value.isEmpty,
           value.utf8.count <= 255,

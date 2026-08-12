@@ -26,10 +26,13 @@ private let publicReadNSIDs: Set<String> = [
     "com.atproto.repo.describeRepo",
     "com.atproto.repo.getRecord",
     "com.atproto.repo.listRecords",
+    "com.atproto.sync.getBlob",
     "com.atproto.sync.getLatestCommit",
     "com.atproto.sync.getRepo",
     "com.atproto.sync.getRepoStatus",
 ]
+
+private let getBlobNSID = "com.atproto.sync.getBlob"
 
 private let resolveHandleNSID = "com.atproto.identity.resolveHandle"
 
@@ -82,6 +85,17 @@ private enum PublicReadHandlerGuard: String {
     /// this route never consults the public read directory, so none of the
     /// generation-admission guards can possibly be the cause.
     case handleDirectoryUnavailable
+    /// `getBlob`: the per-account/process blob streaming reservation was
+    /// refused. Distinct from `responseAdmissionExhausted`, which names the
+    /// JSON response-byte budget — a saturated blob budget and a saturated
+    /// JSON budget call for different operator responses.
+    case blobStreamAdmissionExhausted
+    /// `getBlob`: the account's blob store failed to open a blob it reported
+    /// as reachable.
+    case blobStorageFailure
+    /// `getBlob`: the opened blob declared a length outside the transfer bound
+    /// this service will stream, so it is refused before a single byte leaves.
+    case blobLengthOutOfBounds
 }
 
 private enum PublicReadHandlerFailure: Error {
@@ -378,7 +392,10 @@ func registerPublicRepositoryReadEndpoints(
     jsonReadAdmission: PublicRepositoryJSONReadAdmission = .processShared,
     handleResolution: SwanPublicHandleResolutionCapability? = nil,
     handleResolutionAdmission: PublicRepositoryJSONReadAdmission =
-        publicHandleResolutionAdmission
+        publicHandleResolutionAdmission,
+    blobStreamAdmission: PublicRepositorySpoolAdmission = .shared,
+    blobRequestBodyAdmission: PublicRepositoryJSONWriteAdmission = .processShared,
+    blobRequestBodyPolicy: SwanJSONWriteBodyPolicy = .productionDefault
 ) {
     let describeHandler = PublicDescribeRepoHandler(
         directory: directory, publicURL: publicURL
@@ -722,10 +739,118 @@ func registerPublicRepositoryReadEndpoints(
         }
     }
 
+    // `com.atproto.sync.getBlob` is a read, and it belongs here.
+    //
+    // It used to be registered inside the *mutation* endpoint block, so
+    // `--enable-public-repository-mutations` was silently also the switch for
+    // avatar and image serving: an operator who turned public writes off
+    // turned every image this PDS hosts off for the whole network, with no
+    // error and nothing in the journal. It is registered here now, from the
+    // single condition that governs the rest of the public read surface.
+    //
+    // Like `resolveHandle` it needs no repository *generation*: a blob is
+    // content-addressed and carries no MST revision, so it stays out of the
+    // admission machinery the other routes depend on.
+    router.get("/xrpc/\(getBlobNSID)") { request, context async -> Response in
+        guard await publicBlobRequestHasNoBody(
+            request,
+            context: context,
+            admission: blobRequestBodyAdmission,
+            policy: blobRequestBodyPolicy
+        ) else {
+            return publicReadError(.badRequest, "InvalidRequest")
+        }
+        let parameters: PublicBlobParameters
+        do {
+            parameters = try publicBlobParameters(request)
+        } catch {
+            return publicReadError(.badRequest, "InvalidRequest")
+        }
+        let target: PublicRepositoryReadBlobTarget
+        do {
+            switch try await directory.publicRepositoryBlobOutcome(
+                did: parameters.did
+            ) {
+            case .notFound:
+                return publicReadError(.badRequest, "RepoNotFound")
+            case let .lifecycle(status):
+                return publicLifecycleError(status.status)
+            case let .active(resolved):
+                // Defence in depth: the directory is asked for one exact DID,
+                // and an implementation that answered with another account's
+                // store would serve one account's blobs under another's name.
+                guard resolved.did == parameters.did else {
+                    return publicReadError(.badRequest, "RepoNotFound")
+                }
+                target = resolved
+            }
+        } catch PublicRepositoryReadError.invalidSelector {
+            return publicReadError(.badRequest, "InvalidRequest")
+        } catch {
+            return publicReadUnavailable(
+                error,
+                method: getBlobNSID,
+                selector: parameters.did
+            )
+        }
+        // Reserved before the store opens anything and released only when the
+        // response writer finishes, so a stalled reader cannot hold bytes
+        // outside the budget.
+        guard let streamLease = blobStreamAdmission.reserve(
+            accountDID: target.did,
+            maximumBytes: maximumPublicBlobTransferBytes
+        ) else {
+            return publicReadUnavailable(
+                reason: PublicReadHandlerGuard
+                    .blobStreamAdmissionExhausted.rawValue,
+                method: getBlobNSID,
+                selector: target.did
+            )
+        }
+        let blob: PublicBlob?
+        do {
+            blob = try await target.store.publicBlob(cid: parameters.cid)
+        } catch {
+            streamLease.release()
+            return publicReadUnavailable(
+                reason: PublicReadHandlerGuard.blobStorageFailure.rawValue,
+                method: getBlobNSID,
+                selector: target.did
+            )
+        }
+        guard let blob else {
+            streamLease.release()
+            return publicReadError(.notFound, "BlobNotFound")
+        }
+        guard blob.body.contentLength > 0,
+              blob.body.contentLength <= maximumPublicBlobTransferBytes else {
+            streamLease.release()
+            return publicReadUnavailable(
+                reason: PublicReadHandlerGuard.blobLengthOutOfBounds.rawValue,
+                method: getBlobNSID,
+                selector: target.did
+            )
+        }
+        var headers: HTTPFields = [
+            .contentType: safePublicBlobMIMEType(blob.mimeType),
+            .cacheControl: "no-store",
+        ]
+        headers[.contentLength] = String(blob.body.contentLength)
+        headers[HTTPField.Name("X-Content-Type-Options")!] = "nosniff"
+        return Response(status: .ok, headers: headers, body: .init { writer in
+            defer { streamLease.release() }
+            try await blob.body.streamBody(maximumChunkBytes: 64 * 1_024) { chunk in
+                try await writer.write(ByteBuffer(data: chunk))
+            }
+            try await writer.finish(nil)
+        })
+    }
+
     for path: RouterPath in [
         "/xrpc/com.atproto.repo.describeRepo",
         "/xrpc/com.atproto.repo.getRecord",
         "/xrpc/com.atproto.repo.listRecords",
+        "/xrpc/com.atproto.sync.getBlob",
         "/xrpc/com.atproto.sync.getLatestCommit",
         "/xrpc/com.atproto.sync.getRepo",
         "/xrpc/com.atproto.sync.getRepoStatus",
@@ -874,6 +999,71 @@ package func publicRepositoryCARHTTPResponse(
             try await writer.finish(nil)
         }
     )
+}
+
+/// `com.atproto.sync.getBlob`'s entire request.
+///
+/// Both values are kept in their exact wire spelling after being proved
+/// canonical, so the account the bytes are read from is the account the caller
+/// literally named — never a re-encoding of it.
+private struct PublicBlobParameters {
+    let did: String
+    let cid: String
+}
+
+/// Strict, canonical-only parsing for `getBlob`.
+///
+/// Anything short of an exactly-canonical DID and an exactly-canonical raw
+/// sha-256 CID is a request fault. Accepting a re-encoding of either would
+/// make two spellings address one blob, and the CID codec/multihash checks
+/// keep a caller from asking for a repository block through the blob route.
+private func publicBlobParameters(_ request: Request) throws -> PublicBlobParameters {
+    let query = try strictAuthenticatedRecordQuery(
+        request,
+        required: ["did", "cid"],
+        optional: []
+    )
+    guard let rawDID = query["did"],
+          rawDID.utf8.count <= 2_048,
+          let did = try? DID(didString: rawDID),
+          did.didString() == rawDID,
+          let rawCID = query["cid"],
+          rawCID.utf8.count <= 256,
+          let cid = try? CID.parse(rawCID),
+          cid.string == rawCID,
+          cid.codec == .raw,
+          cid.multihash.algorithm == Multihash.sha256Code,
+          cid.multihash.length == Multihash.sha256Length,
+          cid.multihash.digest.count == Int(Multihash.sha256Length) else {
+        throw PublicReadHandlerFailure.invalidRequest
+    }
+    return PublicBlobParameters(did: rawDID, cid: rawCID)
+}
+
+/// `getBlob` is a query and carries no body. The body is still *collected*
+/// under the shared write-body admission — a caller who sends one anyway must
+/// not be able to stream unmetered bytes at an anonymous route — and a request
+/// that carries any body at all is refused.
+private func publicBlobRequestHasNoBody(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    admission: PublicRepositoryJSONWriteAdmission,
+    policy: SwanJSONWriteBodyPolicy
+) async -> Bool {
+    do {
+        let body = try await collectAdmittedRequestBody(
+            request,
+            mediaType: .unspecified,
+            admission: admission,
+            policy: policy,
+            maximumBytes: 1,
+            termination: context.jsonWriteBodyTermination
+        )
+        defer { withExtendedLifetime(body) {} }
+        return body.readableBytes == 0
+    } catch {
+        return false
+    }
 }
 
 private func publicReadQuery(

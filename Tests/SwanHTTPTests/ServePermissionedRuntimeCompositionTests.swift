@@ -120,6 +120,11 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                     "/xrpc/com.atproto.repo.describeRepo",
                     "/xrpc/com.atproto.repo.getRecord",
                     "/xrpc/com.atproto.repo.listRecords",
+                    // A read, installed by the read directory. It used to sit
+                    // in the deferred list below because it was registered
+                    // from the mutation block, which meant this composition —
+                    // public reads on, public writes off — served no blobs.
+                    "/xrpc/com.atproto.sync.getBlob",
                     "/xrpc/com.atproto.sync.getLatestCommit",
                     "/xrpc/com.atproto.sync.getRepo",
                     "/xrpc/com.atproto.sync.getRepoStatus",
@@ -132,7 +137,6 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 for (path, method): (String, HTTPRequest.Method) in [
                     ("/xrpc/com.atproto.repo.createRecord", .post),
                     ("/xrpc/com.atproto.repo.uploadBlob", .post),
-                    ("/xrpc/com.atproto.sync.getBlob", .get),
                 ] {
                     try await client.execute(uri: path, method: method) { response in
                         XCTAssertEqual(response.status, .serviceUnavailable, path)

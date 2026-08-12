@@ -69,10 +69,6 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
     /// size before `putStreaming` creates an anonymous descriptor, so a
     /// mutation capability cannot bypass the directory's disk budget.
     let publicBlobSpoolAdmission: PublicRepositorySpoolAdmission?
-    /// Shared process-wide/per-account admission for descriptor-backed public
-    /// blob responses. A GET reserves before the store opens and verifies the
-    /// payload, and holds the lease until the response writer finishes.
-    let blobStreamAdmission: PublicRepositorySpoolAdmission
     /// Shared with permissioned JSON commands. Every buffered mutation body
     /// reserves before collection so anonymous callers cannot multiply the
     /// per-request limit by the listener's connection budget.
@@ -86,7 +82,6 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
         signerProvider: any PublicRepositoryMutationSignerProvider,
         blobStore: (any BlobStore)? = nil,
         publicBlobSpoolAdmission: PublicRepositorySpoolAdmission? = nil,
-        blobStreamAdmission: PublicRepositorySpoolAdmission = .shared,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission = .processShared,
         jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy = .productionDefault
     ) {
@@ -95,7 +90,6 @@ public struct SwanPublicRepositoryMutationCapability: Sendable {
         self.signerProvider = signerProvider
         self.blobStore = blobStore
         self.publicBlobSpoolAdmission = publicBlobSpoolAdmission
-        self.blobStreamAdmission = blobStreamAdmission
         self.jsonWriteAdmission = jsonWriteAdmission
         self.jsonWriteBodyPolicy = jsonWriteBodyPolicy
     }

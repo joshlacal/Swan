@@ -5,6 +5,7 @@ import HummingbirdTesting
 import HTTPTypes
 import Logging
 import NIOCore
+import Petrel
 import SwanCore
 @testable import SwanHTTP
 import SwanOAuth
@@ -277,6 +278,7 @@ final class PublicBlobDIDBindingTests: XCTestCase, @unchecked Sendable {
                 oauthRuntime: runtime,
                 authenticatedGetSpaceDirectory: PublicBlobNoopSpaceDirectory(),
                 accountControlStore: control,
+                publicRepositoryReadDirectory: directory,
                 publicRepositoryMutationDirectory: directory,
                 publicRepositoryMutationSignerProvider: PublicBlobTestSignerProvider(
                     signer: P256PublicRepositoryCommitSigner(
@@ -338,7 +340,15 @@ final class PublicBlobDIDBindingTests: XCTestCase, @unchecked Sendable {
     }
 }
 
-private actor PublicBlobTestDirectory: PublicRepositoryMutationDirectory {
+/// Backs both public surfaces from one inventory.
+///
+/// `getBlob` is served from the *read* surface, and `uploadBlob` from the
+/// mutation surface, so a fixture that exercises both has to supply both. The
+/// blob projection is the only read method this fixture implements; the
+/// repository read methods answer "not found" because it hosts no records.
+private actor PublicBlobTestDirectory:
+    PublicRepositoryMutationDirectory, PublicRepositoryReadDirectory
+{
     private let stores: [String: SQLiteAccountDatabase]
     private var statuses: [String: AccountControlStatus]
     private var unavailableStores: Set<String> = []
@@ -376,6 +386,92 @@ private actor PublicBlobTestDirectory: PublicRepositoryMutationDirectory {
             store: store
         )
     }
+
+    // MARK: - PublicRepositoryReadDirectory
+
+    /// The preopened check precedes the lifecycle check, exactly as the SQLite
+    /// directory orders them: an account with no preopened store must be
+    /// indistinguishable from one this server never hosted.
+    func publicRepositoryBlobOutcome(
+        did: String
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadBlobTarget>
+    {
+        guard let store = stores[did],
+              let status = statuses[did],
+              !unavailableStores.contains(did) else {
+            return .notFound
+        }
+        guard status == .active else {
+            return .lifecycle(
+                try PublicRepositoryReadStatus(
+                    did: did, status: status, revision: nil
+                )
+            )
+        }
+        return .active(
+            try PublicRepositoryReadBlobTarget(
+                did: did, status: status, store: store
+            )
+        )
+    }
+
+    func publicRepositoryStatus(
+        selector _: String
+    ) async throws -> PublicRepositoryReadStatus? { nil }
+
+    func describePublicRepository(
+        selector _: String
+    ) async throws -> PublicRepositoryReadDescription? { nil }
+
+    func publicRepositoryRecord(
+        selector _: String,
+        path _: PublicRepositoryPath,
+        expectedCID _: CID?
+    ) async throws -> PublicRepositoryReadRecord? { nil }
+
+    func listPublicRepositoryRecords(
+        selector _: String,
+        collection _: String,
+        limit _: Int,
+        cursor _: String?,
+        reverse _: Bool
+    ) async throws -> PublicRepositoryReadPage {
+        try .init(records: [], cursor: nil)
+    }
+
+    func publicRepositoryCAR(
+        selector _: String
+    ) async throws -> PublicRepositoryReadCAR? { nil }
+
+    func publicRepositoryDescriptionOutcome(
+        selector _: String
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadDescription>
+    { .notFound }
+
+    func publicRepositoryRecordOutcome(
+        selector _: String,
+        path _: PublicRepositoryPath,
+        expectedCID _: CID?
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadRecordResult>
+    { .notFound }
+
+    func publicRepositoryRecordsOutcome(
+        selector _: String,
+        collection _: String,
+        limit _: Int,
+        cursor _: String?,
+        reverse _: Bool
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadPageResult>
+    { .notFound }
+
+    func publicRepositoryCAROutcome(
+        selector _: String
+    ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadCAR>
+    { .notFound }
 }
 
 private actor PublicBlobNoopSpaceDirectory: AuthorizedSimpleSpaceDirectory {

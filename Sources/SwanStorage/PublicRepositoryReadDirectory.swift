@@ -1105,6 +1105,34 @@ public struct PublicRepositoryReadCAR: Sendable {
     }
 }
 
+/// One account's blob-read projection, resolved from the startup-preopened
+/// inventory before any byte of a blob is opened.
+///
+/// It carries the account's lifecycle status so `getBlob` can answer
+/// `RepoDeactivated`/`RepoTakendown`/`RepoNotFound` without touching blob
+/// storage at all, and a ``PublicRepositoryReadBlobStore`` — one read-only
+/// method — rather than the account's writable store.
+public struct PublicRepositoryReadBlobTarget: Sendable {
+    public let did: String
+    public let status: AccountControlStatus
+    public let store: any PublicRepositoryReadBlobStore
+
+    public init(
+        did: String,
+        status: AccountControlStatus,
+        store: any PublicRepositoryReadBlobStore
+    ) throws {
+        guard AccountControlIdentifiers.isDID(did), status.isCanonicalValue else {
+            throw PublicRepositoryReadError.unavailable(
+                reason: .malformedProjectionValue
+            )
+        }
+        self.did = did
+        self.status = status
+        self.store = store
+    }
+}
+
 /// Request-time selectors can only address the startup-preopened inventory.
 /// Implementations must never resolve over DNS, PLC, DID, or HTTP.
 public protocol PublicRepositoryReadDirectory: Sendable {
@@ -1145,4 +1173,24 @@ public protocol PublicRepositoryReadDirectory: Sendable {
     func publicRepositoryCAROutcome(
         selector: String
     ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadCAR>
+
+    /// Resolves one account's blob-read projection for
+    /// `com.atproto.sync.getBlob`.
+    ///
+    /// A requirement rather than a defaulted extension on purpose. A default
+    /// returning `.notFound` would let a conformer silently serve no avatars
+    /// or images at all, which is precisely the failure this method exists to
+    /// end: `getBlob` used to be registered inside the *mutation* block, so
+    /// turning public writes off turned image serving off for the whole
+    /// network with no error anywhere.
+    ///
+    /// The selector is a DID, never a handle: the lexicon's parameter is
+    /// `did`, and the route rejects anything else before reaching storage.
+    /// Implementations must not admit or pin a repository generation for this
+    /// — a blob is content-addressed and carries no MST revision, so gating it
+    /// on generation admission would put image serving behind the machinery
+    /// that failed permanently on 2026-08-12 while adding nothing.
+    func publicRepositoryBlobOutcome(
+        did: String
+    ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadBlobTarget>
 }

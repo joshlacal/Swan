@@ -1167,6 +1167,50 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
+    /// The blob-read projection behind `com.atproto.sync.getBlob`.
+    ///
+    /// Deliberately does not call ``withPublicReadGeneration``. Every other
+    /// method on this directory has to admit and pin a repository generation
+    /// before it can answer; a blob has no MST revision to pin, so requiring
+    /// one would place avatar and image serving behind the exact admission
+    /// gate that stopped returning on 2026-08-12 and would buy nothing.
+    ///
+    /// An account with no startup-preopened database is reported exactly as an
+    /// unhosted one. This route must never scan the data directory or open a
+    /// database on demand for an anonymous caller, and the preopened check
+    /// precedes the lifecycle check so a non-preopened account cannot be
+    /// distinguished from one this server has never hosted.
+    public func publicRepositoryBlobOutcome(
+        did: String
+    ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadBlobTarget> {
+        guard AccountControlIdentifiers.isDID(did) else {
+            throw PublicRepositoryReadError.invalidSelector
+        }
+        guard let account = try await resolvePublicAccount(did) else {
+            return .notFound
+        }
+        guard !isClosed else {
+            throw PublicRepositoryReadError.unavailable(reason: .directoryClosed)
+        }
+        guard let database = databases[account.did] else { return .notFound }
+        guard account.status == .active else {
+            return .lifecycle(
+                try PublicRepositoryReadStatus(
+                    did: account.did,
+                    status: account.status,
+                    revision: nil
+                )
+            )
+        }
+        return .active(
+            try PublicRepositoryReadBlobTarget(
+                did: account.did,
+                status: account.status,
+                store: database
+            )
+        )
+    }
+
     public func describePublicRepository(
         selector: String
     ) async throws -> PublicRepositoryReadDescription? {

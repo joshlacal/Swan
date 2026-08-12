@@ -717,4 +717,10 @@ private struct PermanentlyUnadmittablePublicReadDirectory:
         selector _: String
     ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadCAR>
     { throw refusal }
+
+    func publicRepositoryBlobOutcome(
+        did _: String
+    ) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadBlobTarget>
+    { throw refusal }
 }

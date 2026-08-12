@@ -89,11 +89,26 @@ public struct PublicBlobMetadata: Sendable, Equatable {
     }
 }
 
+/// The only blob capability the unauthenticated public read surface is ever
+/// handed.
+///
+/// ``StreamingBlobStore`` and ``BlobStore`` can also write, adopt, and delete.
+/// Passing one of those to an anonymous route and relying on the route to call
+/// only the read method is the conditional-trust shape that has already
+/// produced two production bugs in this codebase. This is the allow-list
+/// instead: one method, read-only, public namespace only, no path, descriptor,
+/// database, or namespace reference reachable through it.
+public protocol PublicRepositoryReadBlobStore: Sendable {
+    /// The sanitized public-namespace projection for a content-addressed blob,
+    /// or nil when this account has no reachable public blob at that CID.
+    func publicBlob(cid: String) async throws -> PublicBlob?
+}
+
 /// Optional streaming extension for durable blob stores. The source closure
 /// is called once and must feed serial chunks to the supplied sink. The store
 /// owns staging, hashing, content-addressed adoption, and cleanup; callers
 /// only choose the byte limit and namespace.
-public protocol StreamingBlobStore: BlobStore {
+public protocol StreamingBlobStore: BlobStore, PublicRepositoryReadBlobStore {
     func putStreaming(
         namespace: BlobNamespace,
         mimeType: String?,
@@ -103,7 +118,8 @@ public protocol StreamingBlobStore: BlobStore {
         ) async throws -> Void
     ) async throws -> BlobReference
 
-    func publicBlob(cid: String) async throws -> PublicBlob?
+    // `publicBlob(cid:)` is inherited from `PublicRepositoryReadBlobStore`,
+    // which is the projection the anonymous read surface is handed.
 
     /// Metadata-only reachability check for public record references. This
     /// must not open or materialize the blob body.
