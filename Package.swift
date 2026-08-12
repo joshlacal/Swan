@@ -272,7 +272,7 @@ let package = Package(
         .testTarget(
             name: "SwanHTTPTests",
             dependencies: [
-                "swan", "SwanAccounts", "SwanHTTP", "SwanOAuth", "SwanPublicFirehose", "SwanPublicRepository", "SwanPublicWire", "SwanSQLite", "SwanSpacesWire", "SwanStorage",
+                "swan", "SwanAccounts", "SwanHTTP", "SwanInterop", "SwanOAuth", "SwanPublicFirehose", "SwanPublicRepository", "SwanPublicWire", "SwanSQLite", "SwanSpacesWire", "SwanStorage",
                 // `swan`'s startup refusals are ArgumentParser `ValidationError`s.
                 // Asserting the concrete type is the difference between "it
                 // threw" and "the operator gets a clean startup refusal".

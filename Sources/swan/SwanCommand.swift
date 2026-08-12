@@ -1806,11 +1806,29 @@ extension SwanCommand {
         /// carries; teaching one flag to mean two families would mean loosening
         /// invariants that existing checks were written against, which is the
         /// exact shape that has produced silent surface changes here before.
+        ///
+        /// Deliberately optional, and deliberately not a path by default. The
+        /// first version of this flag defaulted to
+        /// `Profiles/public-data-testing-2026-07-27.json`, a working-directory
+        /// relative path: the runtime container's `WORKDIR` is the data volume
+        /// and carries no `Profiles/` directory, so every containerized
+        /// `swan serve` refused to start before binding a listener. Omitting
+        /// the flag now selects `SwanPublicRouteSurface.default` — the profile
+        /// this build attests — with no filesystem access at all.
+        ///
+        /// The value may be either a registered profile id
+        /// (`public-data-testing-2026-08-06`) or a path to a profile artifact.
+        /// The id form exists so a deployment that does not mount `Profiles/`
+        /// can still pin its surface explicitly.
         @Option(
             name: .customLong("public-profile"),
-            help: "Pinned public-data protocol profile JSON selecting the public XRPC route surface"
+            help: """
+            Public-data protocol profile selecting the public XRPC route \
+            surface: either a registered profile id or a path to a profile \
+            JSON. Omit to use this build's attested public profile.
+            """
         )
-        var publicProfile: String = "Profiles/public-data-testing-2026-07-27.json"
+        var publicProfile: String?
 
         @Option(name: .long)
         var host: String = "127.0.0.1"
@@ -2058,19 +2076,52 @@ extension SwanCommand {
         /// Turns `--public-profile` into the route surface the router will
         /// register, or into a startup refusal.
         ///
+        /// `nil` — the flag omitted — is the *only* non-refusal branch that
+        /// does no I/O, and it yields this build's attested public profile. It
+        /// is not a fallback: nothing reaches it after a failed read or a
+        /// rejected id, so a selector that cannot be honoured still stops the
+        /// process.
+        ///
+        /// A selector that names a file is read; a selector that names an id is
+        /// looked up directly, so a deployment with no `Profiles/` directory
+        /// mounted can still pin its surface. The two forms are distinguished
+        /// syntactically rather than by trying one and falling back to the
+        /// other: a fallback would report "unreadable file" for a misspelled id
+        /// and hide which of the two the operator got wrong.
+        ///
         /// There is deliberately no default-on-failure branch. A profile this
         /// build has no descriptor registry for cannot be served honestly:
         /// registering some other profile's method set would leave the process
         /// advertising one contract in `describeServer` and answering another,
         /// which is worse than not booting and is invisible from the outside.
-        static func resolvePublicRouteSurface(path: String) throws -> SwanPublicRouteSurface {
+        static func resolvePublicRouteSurface(
+            selector: String?
+        ) throws -> SwanPublicRouteSurface {
+            guard let selector else { return .default }
             do {
+                guard Self.isProfilePath(selector) else {
+                    guard let surface = SwanPublicRouteSurface(
+                        profileID: selector
+                    ) else {
+                        throw SwanPublicRouteSurfaceError
+                            .unregisteredProfile(id: selector)
+                    }
+                    return surface
+                }
                 return try SwanPublicRouteSurface.load(
-                    profileURL: URL(fileURLWithPath: path)
+                    profileURL: URL(fileURLWithPath: selector)
                 )
             } catch let error as SwanPublicRouteSurfaceError {
                 throw ValidationError("--public-profile is unusable: \(error)")
             }
+        }
+
+        /// A selector is a path when it looks like one. A profile id is a
+        /// dotted-and-dashed lexicon-style token: it contains no path separator
+        /// and no `.json` suffix, so neither form can be mistaken for the
+        /// other.
+        static func isProfilePath(_ selector: String) -> Bool {
+            selector.contains("/") || selector.hasSuffix(".json")
         }
 
         func run() async throws {
@@ -2245,7 +2296,9 @@ extension SwanCommand {
             // Resolved before any listener, database, or key store is touched.
             // An unregistered public profile is a refusal to boot, not a
             // narrower surface an operator has to notice from traffic.
-            let publicRouteSurface = try Self.resolvePublicRouteSurface(path: publicProfile)
+            let publicRouteSurface = try Self.resolvePublicRouteSurface(
+                selector: publicProfile
+            )
             let baseURL = try publicURL.map { value in
                 guard let url = URL(string: value) else { throw ValidationError("--public-url must be a URL") }
                 return url
@@ -3068,7 +3121,18 @@ extension SwanCommand {
                 logger.info("starting Swan", metadata: [
                     "profile": .string(loadedProfile.id),
                     "publicProfile": .string(publicRouteSurface.profileID),
+                    // Declared by the profile, and — separately — the complete
+                    // set of public NSIDs this router may install a handler
+                    // for. The two differ by
+                    // `SwanPublicRouteSurface.outOfProfilePublicMethods`
+                    // (`resolveHandle`), which no profile declares. Logging
+                    // only the first would understate the served surface by
+                    // one, which is the class of thing this line exists to
+                    // stop.
                     "publicMethodCount": .string(String(publicRouteSurface.methods.count)),
+                    "publicServedMethodCount": .string(
+                        String(publicRouteSurface.servedMethodNSIDs.count)
+                    ),
                     "address": .string("\(host):\(port)"),
                 ])
                 var services: [any ServiceLifecycle.Service] = [publicApplication]

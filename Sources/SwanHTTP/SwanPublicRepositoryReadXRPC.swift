@@ -391,9 +391,19 @@ private struct PublicResolveHandleOutput: Encodable {
     let did: String
 }
 
+/// Installs the public read surface, filtered by the selected public route
+/// surface.
+///
+/// `servedMethods` is required rather than defaulted. It used to be absent
+/// entirely, which meant every one of these routes existed on any assembly that
+/// had a read directory, whatever profile the operator selected — the selection
+/// only added 503 gates and never removed a handler. A default here would
+/// restore exactly that: the one production call site would keep working while
+/// silently serving the full set again.
 func registerPublicRepositoryReadEndpoints(
     on router: Router<BasicRequestContext>,
     directory: any PublicRepositoryReadDirectory,
+    servedMethods: Set<String>,
     publicURL: URL,
     jsonReadAdmission: PublicRepositoryJSONReadAdmission = .processShared,
     handleResolution: SwanPublicHandleResolutionCapability? = nil,
@@ -412,7 +422,9 @@ func registerPublicRepositoryReadEndpoints(
     let latestCommitHandler = PublicLatestCommitHandler(directory: directory)
     let repoStatusHandler = PublicRepoStatusHandler(directory: directory)
 
-    router.get("/xrpc/com.atproto.repo.describeRepo") { request, _ async -> Response in
+    router.getIfServed(
+        "com.atproto.repo.describeRepo", in: servedMethods
+    ) { request, _ async -> Response in
         var selector: String?
         do {
             let query = try publicReadQuery(request, required: ["repo"])
@@ -469,7 +481,9 @@ func registerPublicRepositoryReadEndpoints(
         }
     }
 
-    router.get("/xrpc/com.atproto.repo.getRecord") { request, _ async -> Response in
+    router.getIfServed(
+        "com.atproto.repo.getRecord", in: servedMethods
+    ) { request, _ async -> Response in
         var selector: String?
         do {
             let query = try publicReadQuery(
@@ -546,7 +560,9 @@ func registerPublicRepositoryReadEndpoints(
         }
     }
 
-    router.get("/xrpc/com.atproto.repo.listRecords") { request, _ async -> Response in
+    router.getIfServed(
+        "com.atproto.repo.listRecords", in: servedMethods
+    ) { request, _ async -> Response in
         var selector: String?
         do {
             let query = try publicReadQuery(
@@ -625,7 +641,9 @@ func registerPublicRepositoryReadEndpoints(
         }
     }
 
-    router.get("/xrpc/com.atproto.sync.getLatestCommit") { request, _ async -> Response in
+    router.getIfServed(
+        "com.atproto.sync.getLatestCommit", in: servedMethods
+    ) { request, _ async -> Response in
         var selector: String?
         do {
             let query = try publicReadQuery(request, required: ["did"])
@@ -663,7 +681,9 @@ func registerPublicRepositoryReadEndpoints(
         }
     }
 
-    router.get("/xrpc/com.atproto.sync.getRepoStatus") { request, _ async -> Response in
+    router.getIfServed(
+        "com.atproto.sync.getRepoStatus", in: servedMethods
+    ) { request, _ async -> Response in
         var selector: String?
         do {
             let query = try publicReadQuery(request, required: ["did"])
@@ -701,7 +721,9 @@ func registerPublicRepositoryReadEndpoints(
         }
     }
 
-    router.get("/xrpc/com.atproto.sync.getRepo") { request, _ async -> Response in
+    router.getIfServed(
+        "com.atproto.sync.getRepo", in: servedMethods
+    ) { request, _ async -> Response in
         var selector: String?
         do {
             let query = try publicReadQuery(
@@ -758,7 +780,7 @@ func registerPublicRepositoryReadEndpoints(
     // Like `resolveHandle` it needs no repository *generation*: a blob is
     // content-addressed and carries no MST revision, so it stays out of the
     // admission machinery the other routes depend on.
-    router.get("/xrpc/\(getBlobNSID)") { request, context async -> Response in
+    router.getIfServed(getBlobNSID, in: servedMethods) { request, context async -> Response in
         switch await publicBlobRequestBody(
             request,
             context: context,
@@ -900,22 +922,35 @@ func registerPublicRepositoryReadEndpoints(
         })
     }
 
-    for path: RouterPath in [
-        "/xrpc/com.atproto.repo.describeRepo",
-        "/xrpc/com.atproto.repo.getRecord",
-        "/xrpc/com.atproto.repo.listRecords",
-        "/xrpc/com.atproto.sync.getBlob",
-        "/xrpc/com.atproto.sync.getLatestCommit",
-        "/xrpc/com.atproto.sync.getRepo",
-        "/xrpc/com.atproto.sync.getRepoStatus",
-    ] {
-        registerPublicReadWrongMethodGuards(on: router, path: path)
+    // Only the routes that were actually installed above claim their own verb.
+    // A method the selected surface does not serve must look exactly like a
+    // method this build does not implement — one 404 from the namespace guard,
+    // not a wrong-method guard that quietly proves the endpoint is known here.
+    for nsid in [
+        "com.atproto.repo.describeRepo",
+        "com.atproto.repo.getRecord",
+        "com.atproto.repo.listRecords",
+        "com.atproto.sync.getBlob",
+        "com.atproto.sync.getLatestCommit",
+        "com.atproto.sync.getRepo",
+        "com.atproto.sync.getRepoStatus",
+    ] where servedMethods.contains(nsid) {
+        registerPublicReadWrongMethodGuards(
+            on: router, path: RouterPath("/xrpc/\(nsid)")
+        )
     }
 
     // Part of the public read surface, and registered from here so a server
     // that exposes no public reads exposes no anonymous handle->DID oracle
     // either. It still needs no *generation*: see below.
-    if let handleResolution {
+    //
+    // `resolveHandle` appears in no public profile artifact's `endpoints`
+    // array, so it reaches `servedMethods` through
+    // `SwanPublicRouteSurface.outOfProfilePublicMethods` rather than through a
+    // profile. That is deliberate and enumerated there: gating it on a profile
+    // declaration instead would delete handle resolution from every deployment,
+    // and no profile could ever restore it.
+    if let handleResolution, servedMethods.contains(resolveHandleNSID) {
         registerPublicHandleResolutionEndpoint(
             on: router,
             capability: handleResolution,

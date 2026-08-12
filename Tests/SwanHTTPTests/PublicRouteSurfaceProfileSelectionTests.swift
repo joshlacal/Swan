@@ -5,11 +5,18 @@ import HummingbirdTesting
 import HTTPTypes
 import Logging
 import NIOCore
+import Petrel
+import SwanAccounts
 import SwanCore
 @testable import SwanHTTP
+import SwanInterop
 import SwanOAuth
+import SwanPublicFirehose
+import SwanPublicRepository
 import SwanPublicWire
+import SwanSpaces
 import SwanSQLite
+import SwanStorage
 @testable import swan
 import XCTest
 
@@ -135,16 +142,29 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
         }
     }
 
-    /// An assembly that names no profile keeps serving exactly what it served
-    /// before the selection existed.
-    func testDefaultConfigurationServesTheHistoricalSurfaceUnchanged() async throws {
+    /// An assembly that names no profile serves the profile this build
+    /// *attests*, not a historical one.
+    ///
+    /// `swan verify` and `PublicRepositoryCARReplication` both read
+    /// `OfflineProtocolProfileVerifier.publicProfileID`. When the default
+    /// surface named `2026-07-27` instead, an operator could run `verify` green
+    /// and then `serve` with no new flag and get a process whose attested
+    /// contract declared nineteen endpoints while its router served twelve,
+    /// with nothing in the build reconciling the two. Pinning the default to
+    /// the verifier's constant makes that disagreement impossible to
+    /// reintroduce without failing here.
+    func testDefaultSurfaceIsTheProfileThisBuildAttests() async throws {
         XCTAssertEqual(
             SwanPublicRouteSurface.default.profileID,
-            PublicDataTesting20260727.profileID
+            OfflineProtocolProfileVerifier.publicProfileID
+        )
+        XCTAssertEqual(
+            SwanPublicRouteSurface.default.profileID,
+            SwanPublicRouteSurface.successorProfileID
         )
         XCTAssertEqual(
             SwanPublicRouteSurface.default.methods,
-            PublicDataTesting20260727.methods
+            PublicDataTesting20260805.methods
         )
         // The default is built from the same constants the allow-list entry is
         // built from, so it cannot drift into naming a surface the allow-list
@@ -157,15 +177,64 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
             SwanHTTPConfiguration().publicRouteSurface,
             SwanPublicRouteSurface.default
         )
+        // The attested surface is a strict superset of the historical one, so
+        // moving the default forward removes nothing an existing deployment
+        // served: it adds the six account-email gates and the subscription.
+        XCTAssertTrue(
+            Set(PublicDataTesting20260727.methods.map(\.nsid))
+                .isSubset(of: SwanPublicRouteSurface.default.declaredMethodNSIDs)
+        )
 
         try await withRouter(surface: nil) { client in
+            // Declared by the attested profile, and no account-email runtime is
+            // assembled here: a method-correct fail-closed gate, where the
+            // historical default left a bare 404.
             try await client.execute(uri: Self.confirmEmailPath, method: .post) { response in
-                XCTAssertEqual(response.status, .notFound)
+                XCTAssertEqual(response.status, .serviceUnavailable)
             }
             try await client.execute(uri: Self.getRecordPath, method: .get) { response in
                 XCTAssertEqual(response.status, .serviceUnavailable)
             }
         }
+    }
+
+    /// `resolveHandle` is served by every assembly with a read directory and is
+    /// declared by no profile, so it reaches registration through the named
+    /// out-of-profile constant rather than through a profile's `endpoints`.
+    /// Pin that it is the *only* such route: anything else added to that set
+    /// would be a public route no profile can ever remove.
+    func testTheOnlyRouteOutsideEveryProfileIsResolveHandle() throws {
+        XCTAssertEqual(
+            SwanPublicRouteSurface.outOfProfilePublicMethods,
+            ["com.atproto.identity.resolveHandle"]
+        )
+        for profileID in SwanPublicRouteSurface.registeredProfileIDs.sorted() {
+            let surface = try XCTUnwrap(SwanPublicRouteSurface(profileID: profileID))
+            XCTAssertTrue(
+                surface.declaredMethodNSIDs
+                    .isDisjoint(with: SwanPublicRouteSurface.outOfProfilePublicMethods),
+                profileID
+            )
+            XCTAssertEqual(
+                surface.servedMethodNSIDs,
+                surface.declaredMethodNSIDs.union(["com.atproto.identity.resolveHandle"]),
+                profileID
+            )
+        }
+    }
+
+    /// The firehose gate keys on a literal, because the wire generator emits no
+    /// enum for a subscription. A typo would silently disable the route.
+    func testSubscribeReposLiteralMatchesTheShippedDescriptor() throws {
+        XCTAssertTrue(
+            SwanPublicRouteSurface.default.declaredMethodNSIDs
+                .contains(publicSubscribeReposNSID)
+        )
+        XCTAssertEqual(
+            PublicDataTesting20260805.methods
+                .first { $0.nsid == publicSubscribeReposNSID }?.kind,
+            .subscription
+        )
     }
 
     // MARK: - Fail loudly for a profile with no registry
@@ -195,7 +264,7 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
         // The CLI seam: an unusable `--public-profile` is an ArgumentParser
         // validation failure carrying the offending id, not a default surface.
         XCTAssertThrowsError(
-            try SwanCommand.Serve.resolvePublicRouteSurface(path: unregistered.path)
+            try SwanCommand.Serve.resolvePublicRouteSurface(selector: unregistered.path)
         ) { error in
             let validation = error as? ValidationError
             XCTAssertNotNil(validation)
@@ -240,7 +309,7 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
             XCTAssertEqual(error as? SwanPublicRouteSurfaceError, .unreadableProfile)
         }
         XCTAssertThrowsError(
-            try SwanCommand.Serve.resolvePublicRouteSurface(path: missing.path)
+            try SwanCommand.Serve.resolvePublicRouteSurface(selector: missing.path)
         ) { XCTAssertTrue($0 is ValidationError) }
 
         let malformed = root.appending(path: "malformed.json")
@@ -249,7 +318,7 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
             XCTAssertEqual(error as? SwanPublicRouteSurfaceError, .malformedProfile)
         }
         XCTAssertThrowsError(
-            try SwanCommand.Serve.resolvePublicRouteSurface(path: malformed.path)
+            try SwanCommand.Serve.resolvePublicRouteSurface(selector: malformed.path)
         ) { XCTAssertTrue($0 is ValidationError) }
     }
 
@@ -315,11 +384,17 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
     func testServeParsesPublicProfileWithoutDisturbingTheProfileOption() throws {
         let parsed = try SwanCommand.parseAsRoot(["serve"])
         let serve = try XCTUnwrap(parsed as? SwanCommand.Serve)
-        XCTAssertEqual(serve.publicProfile, "Profiles/public-data-testing-2026-07-27.json")
+        // Omitted, not a path. The first version of this flag defaulted to the
+        // working-directory-relative `Profiles/public-data-testing-2026-07-27
+        // .json`; the runtime container's WORKDIR is the data volume and ships
+        // no `Profiles/` directory, so that default turned every containerized
+        // `swan serve` into an exit-64 startup refusal before any listener
+        // bound. A `nil` default resolves with no filesystem access at all.
+        XCTAssertNil(serve.publicProfile)
         XCTAssertEqual(serve.profile, "Profiles/permissioned-data-0016-2026-07-30.json")
         XCTAssertEqual(
-            try SwanCommand.Serve.resolvePublicRouteSurface(path: serve.publicProfile).profileID,
-            SwanPublicRouteSurface.default.profileID
+            try SwanCommand.Serve.resolvePublicRouteSurface(selector: serve.publicProfile),
+            SwanPublicRouteSurface.default
         )
 
         let overridden = try XCTUnwrap(
@@ -337,7 +412,263 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
         XCTAssertEqual(overridden.profile, "Profiles/permissioned-data-0016-2026-07-30.json")
     }
 
+    /// The deployment case the path-shaped default broke: a process whose
+    /// working directory has no `Profiles/` directory at all.
+    ///
+    /// Every checked-in `swan serve` invocation — `docker-compose.yml`, the
+    /// reference-relay compose file, the acceptance scripts, the netcup unit —
+    /// passes an absolute `--profile` and no `--public-profile`, and the
+    /// runtime image's `WORKDIR` is `/var/lib/swan`, the data volume. Resolving
+    /// the omitted flag must therefore touch no path, and an operator who wants
+    /// to pin the surface explicitly must be able to do it without a file.
+    func testThePublicSurfaceIsSelectableWithNoProfilesDirectoryOnDisk() throws {
+        let empty = FileManager.default.temporaryDirectory
+            .appending(path: "PublicRouteSurfaceProfileSelectionTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: empty) }
+        XCTAssertFalse(
+            FileManager.default
+                .fileExists(atPath: empty.appending(path: "Profiles").path)
+        )
+
+        // Omitted: the attested surface, no I/O.
+        XCTAssertEqual(
+            try SwanCommand.Serve.resolvePublicRouteSurface(selector: nil),
+            SwanPublicRouteSurface.default
+        )
+
+        // A bare profile id: allow-list lookup, still no I/O. This is the form
+        // a container without a mounted `Profiles/` can use.
+        for profileID in SwanPublicRouteSurface.registeredProfileIDs.sorted() {
+            XCTAssertFalse(SwanCommand.Serve.isProfilePath(profileID), profileID)
+            let surface = try SwanCommand.Serve
+                .resolvePublicRouteSurface(selector: profileID)
+            XCTAssertEqual(surface.profileID, profileID)
+            XCTAssertEqual(
+                surface,
+                try XCTUnwrap(SwanPublicRouteSurface(profileID: profileID))
+            )
+        }
+
+        // A misspelled id is refused as an *id*, naming the id — not reported
+        // as an unreadable file, which would send the operator looking for a
+        // path they never wrote.
+        XCTAssertThrowsError(
+            try SwanCommand.Serve
+                .resolvePublicRouteSurface(selector: "public-data-testing-2099-01-01")
+        ) { error in
+            let message = (error as? ValidationError)?.message ?? "\(error)"
+            XCTAssertTrue(message.contains("public-data-testing-2099-01-01"), message)
+            XCTAssertTrue(message.contains("no registered route surface"), message)
+            XCTAssertFalse(message.contains("unreadable"), message)
+        }
+
+        // The path form is still a path, and a path that does not exist is
+        // still a refusal rather than a silent default.
+        XCTAssertTrue(
+            SwanCommand.Serve
+                .isProfilePath("Profiles/public-data-testing-2026-08-06.json")
+        )
+        XCTAssertThrowsError(
+            try SwanCommand.Serve.resolvePublicRouteSurface(
+                selector: empty.appending(path: "Profiles/absent.json").path
+            )
+        ) { error in
+            let message = (error as? ValidationError)?.message ?? "\(error)"
+            XCTAssertTrue(message.contains("unreadable"), message)
+        }
+    }
+
+    // MARK: - The selection removes real handlers, not only gates
+
+    /// The failure this family of tests exists for.
+    ///
+    /// The first version of this mechanism drove only the fail-closed gate
+    /// loop. `registerPublicRepositoryReadEndpoints`,
+    /// `registerPublicRepositoryMutationEndpoints`,
+    /// `registerPublicFirehoseStreamingEndpoint` and
+    /// `accountEmailXRPC.register` all installed real handlers unconditionally,
+    /// so selecting a narrower profile removed nothing — the control worked in
+    /// the widening direction only. It was invisible because every existing
+    /// case assembled a router with no runtimes at all, which is the one
+    /// configuration where the gap cannot be seen.
+    ///
+    /// This assembles the runtimes: a read directory, a mutation directory and
+    /// signer, an account-email server, and a firehose streaming runtime. Then
+    /// it selects a profile that declares fewer methods than those runtimes can
+    /// serve and asserts the undeclared ones are *gone*, not merely ungated.
+    func testANarrowerProfileRemovesRealHandlersNotOnlyGates() async throws {
+        let narrow = try XCTUnwrap(
+            SwanPublicRouteSurface(profileID: PublicDataTesting20260727.profileID)
+        )
+        let attested = SwanPublicRouteSurface.default
+        // Premise of the differential, asserted rather than assumed: the narrow
+        // profile declares neither the email methods nor the subscription, and
+        // both surfaces declare the repository methods.
+        XCTAssertFalse(narrow.declaredMethodNSIDs.contains(Self.requestPasswordResetNSID))
+        XCTAssertTrue(attested.declaredMethodNSIDs.contains(Self.requestPasswordResetNSID))
+        XCTAssertFalse(narrow.declaredMethodNSIDs.contains(publicSubscribeReposNSID))
+        XCTAssertTrue(attested.declaredMethodNSIDs.contains(publicSubscribeReposNSID))
+
+        try await withFullyWiredRouter(surface: narrow) { client in
+            // The account-email runtime IS assembled. Before this fix the live
+            // route was registered anyway and this POST reached the handler and
+            // sent mail, while the startup log reported twelve public methods.
+            try await client.execute(
+                uri: Self.requestPasswordResetPath,
+                method: .post,
+                headers: Self.jsonHeaders,
+                body: ByteBuffer(string: #"{"email":"alice@example.com"}"#)
+            ) { response in
+                XCTAssertEqual(response.status, .notFound)
+            }
+            // The firehose runtime IS assembled; the subscription is undeclared,
+            // so no upgrade route exists and the `com.atproto.sync.*` guard
+            // answers instead.
+            try await client.execute(
+                uri: "/xrpc/\(publicSubscribeReposNSID)",
+                method: .get
+            ) { response in
+                XCTAssertEqual(response.status, .notFound)
+            }
+            // Declared by this profile, so the real handlers stay live. Each
+            // probe is deliberately malformed — no required query, no JSON
+            // content type — so it is refused by the route's own request
+            // validation before any storage is consulted. A live route answers
+            // 400; an absent one answers 404 and a 503 placeholder gate answers
+            // 503, so one status distinguishes all three.
+            try await client.execute(uri: Self.getRecordPath, method: .get) { response in
+                XCTAssertEqual(response.status, .badRequest)
+            }
+            // A well-formed JSON envelope that is not a `putRecord` input: the
+            // route decodes, refuses, and answers 400 without terminating the
+            // request body, which an omitted content type would do.
+            try await client.execute(
+                uri: Self.putRecordPath,
+                method: .post,
+                headers: Self.jsonHeaders,
+                body: ByteBuffer(string: "{}")
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest)
+            }
+            // Declared by no profile at all, and still served, because it
+            // reaches registration through `outOfProfilePublicMethods`.
+            try await client.execute(uri: Self.resolveHandlePath, method: .get) { response in
+                XCTAssertEqual(response.status, .badRequest)
+            }
+        }
+
+        try await withFullyWiredRouter(surface: attested) { client in
+            // Same assembly, wider profile: now the email route is live.
+            try await client.execute(
+                uri: Self.requestPasswordResetPath,
+                method: .post,
+                headers: Self.jsonHeaders,
+                body: ByteBuffer(string: #"{"email":"alice@example.com"}"#)
+            ) { response in
+                XCTAssertNotEqual(response.status, .notFound)
+            }
+            // ...and the subscription route exists: a non-upgrade GET is
+            // answered by the route itself rather than by the namespace guard.
+            try await client.execute(
+                uri: "/xrpc/\(publicSubscribeReposNSID)",
+                method: .get
+            ) { response in
+                XCTAssertNotEqual(response.status, .notFound)
+            }
+            try await client.execute(uri: Self.getRecordPath, method: .get) { response in
+                XCTAssertEqual(response.status, .badRequest)
+            }
+        }
+    }
+
+    /// The registration functions themselves refuse to install anything outside
+    /// the served set, independent of which profiles happen to ship.
+    ///
+    /// Every shipped profile declares all five mutation methods and all seven
+    /// repository reads, so no profile pair can express "reads off, writes on".
+    /// Driving the functions directly with an empty served set is the only way
+    /// to pin that the filter is the gate rather than a coincidence of the
+    /// current artifacts.
+    func testRegistrationFunctionsInstallNothingOutsideTheServedSet() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "PublicRouteSurfaceProfileSelectionTests-\(UUID().uuidString)")
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let runtime = try SwanOAuthRuntime(
+                controlStore: control,
+                serverKey: Data(repeating: 0x5A, count: 32)
+            )
+            let router = Router(context: SwanHTTPRequestContext.self)
+            registerPublicRepositoryReadEndpoints(
+                on: router,
+                directory: SurfaceGateReadDirectory(),
+                servedMethods: [],
+                publicURL: Self.publicURL,
+                handleResolution: SwanPublicHandleResolutionCapability(
+                    controlStore: control
+                )
+            )
+            registerPublicRepositoryMutationEndpoints(
+                on: router,
+                capability: SwanPublicRepositoryMutationCapability(
+                    authorizer: try SwanOAuthResourceAuthorizer(
+                        publicURL: Self.publicURL,
+                        runtime: runtime,
+                        accountControlStore: control
+                    ),
+                    directory: SurfaceGateMutationDirectory(),
+                    signerProvider: SurfaceGateSignerProvider()
+                ),
+                servedMethods: []
+            )
+            Self.emailServer().register(
+                on: router,
+                requestBodyAdmission: .init(
+                    admission: .processShared,
+                    policy: .productionDefault
+                ),
+                servedMethods: []
+            )
+            // Nothing was registered above, so every one of these paths is
+            // unknown to this router — including `resolveHandle`, which an
+            // empty served set excludes as well. No namespace guards are
+            // installed here, so a 404 can only mean "no route".
+            let app = Application(router: router)
+            try await app.test(.router) { client in
+                for path in [
+                    Self.getRecordPath,
+                    Self.putRecordPath,
+                    Self.resolveHandlePath,
+                    "/xrpc/com.atproto.sync.getRepo",
+                    "/xrpc/com.atproto.repo.uploadBlob",
+                    Self.requestPasswordResetPath,
+                ] {
+                    for method: HTTPRequest.Method in [.get, .post] {
+                        try await client.execute(uri: path, method: method) { response in
+                            XCTAssertEqual(response.status, .notFound, "\(method) \(path)")
+                        }
+                    }
+                }
+            }
+            try await control.close()
+        } catch {
+            try? await control.close()
+            throw error
+        }
+    }
+
     // MARK: - Fixtures
+
+    private static let requestPasswordResetNSID =
+        "com.atproto.server.requestPasswordReset"
+    private static let requestPasswordResetPath =
+        "/xrpc/com.atproto.server.requestPasswordReset"
+    private static let putRecordPath = "/xrpc/com.atproto.repo.putRecord"
+    private static let resolveHandlePath =
+        "/xrpc/com.atproto.identity.resolveHandle"
+    private static let jsonHeaders: HTTPFields = [.contentType: "application/json"]
 
     private struct PublicProfileArtifact: Decodable {
         let id: String
@@ -408,4 +739,228 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
             throw error
         }
     }
+
+    // MARK: - The fully wired fixture
+
+    private static let publicURL = URL(string: "https://swan.place")!
+
+    private static func emailServer() -> SwanAccountEmailXRPCServer {
+        SwanAccountEmailXRPCServer(
+            authorizer: SurfaceGateEmailAuthorizer(),
+            recovery: SurfaceGateEmailRecovery(),
+            rateLimiter: SurfaceGateEmailRateLimiter(),
+            loginClientIdentityPolicy: .direct
+        )
+    }
+
+    /// A router with every public runtime assembled: a read directory, a
+    /// mutation directory and signer, an account-email server, and a firehose
+    /// streaming runtime.
+    ///
+    /// This is the configuration the original mechanism could not be tested in.
+    /// `withRouter` above deliberately assembles none of these, which is
+    /// exactly why it could not see that a narrower profile removed no real
+    /// handler — the only public routes it had were the gates.
+    ///
+    /// Runs in `.live` mode because the account-email routes read the client
+    /// peer through `SwanLoginClientIdentityPolicy`.
+    private func withFullyWiredRouter(
+        surface: SwanPublicRouteSurface,
+        _ body: @escaping @Sendable (any TestClientProtocol) async throws -> Void
+    ) async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "PublicRouteSurfaceProfileSelectionTests-\(UUID().uuidString)")
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
+            do {
+                let runtime = try SwanOAuthRuntime(
+                    controlStore: control,
+                    serverKey: Data(repeating: 0x64, count: 32)
+                )
+                let profile = try ProtocolProfile.load(
+                    from: Self.packageRoot()
+                        .appending(path: "Profiles/permissioned-data-0016-2026-07-30.json")
+                )
+                let directory = SurfaceGateReadDirectory()
+                let server = SwanHTTPServer(
+                    profile: profile,
+                    configuration: SwanHTTPConfiguration(
+                        host: "127.0.0.1",
+                        port: 0,
+                        publicURL: Self.publicURL,
+                        publicRouteSurface: surface
+                    ),
+                    oauthRuntime: runtime,
+                    // Required for the public *mutation* capability to form at
+                    // all: `SwanHTTPServer` builds the shared resource
+                    // authorizer from it, and without one public writes stay
+                    // off however the profile is selected.
+                    authenticatedGetSpaceDirectory: SurfaceGateSpaceDirectory(),
+                    accountControlStore: control,
+                    publicRepositoryReadDirectory: directory,
+                    publicRepositoryMutationDirectory: SurfaceGateMutationDirectory(),
+                    publicRepositoryMutationSignerProvider: SurfaceGateSignerProvider(),
+                    accountEmailXRPC: Self.emailServer(),
+                    publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime(
+                        database: firehose,
+                        hub: PublicFirehoseWakeupHub(),
+                        limits: .standard,
+                        logger: Logger(label: "PublicRouteSurfaceProfileSelectionTests.firehose")
+                    )
+                )
+                let app = server.buildApplication(
+                    logger: Logger(label: "PublicRouteSurfaceProfileSelectionTests.wired")
+                )
+                try await app.test(.live, body)
+                try await firehose.close()
+                try await control.close()
+            } catch {
+                try? await firehose.close()
+                throw error
+            }
+        } catch {
+            try? await control.close()
+            throw error
+        }
+    }
+}
+
+// MARK: - Stubs
+
+/// None of these are reached by the probes above: every probe is refused by its
+/// route's own request validation before storage is consulted, which is what
+/// makes "400" mean "the real handler is installed" and nothing more.
+private enum SurfaceGateStubFailure: Error { case unused }
+
+private struct SurfaceGateReadDirectory: PublicRepositoryReadDirectory {
+    func publicRepositoryStatus(selector _: String) async throws
+        -> PublicRepositoryReadStatus?
+    { throw SurfaceGateStubFailure.unused }
+
+    func describePublicRepository(selector _: String) async throws
+        -> PublicRepositoryReadDescription?
+    { throw SurfaceGateStubFailure.unused }
+
+    func publicRepositoryRecord(
+        selector _: String,
+        path _: PublicRepositoryPath,
+        expectedCID _: CID?
+    ) async throws -> PublicRepositoryReadRecord? {
+        throw SurfaceGateStubFailure.unused
+    }
+
+    func listPublicRepositoryRecords(
+        selector _: String,
+        collection _: String,
+        limit _: Int,
+        cursor _: String?,
+        reverse _: Bool
+    ) async throws -> PublicRepositoryReadPage {
+        throw SurfaceGateStubFailure.unused
+    }
+
+    func publicRepositoryCAR(selector _: String) async throws
+        -> PublicRepositoryReadCAR?
+    { throw SurfaceGateStubFailure.unused }
+
+    func publicRepositoryDescriptionOutcome(selector _: String) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadDescription>
+    { throw SurfaceGateStubFailure.unused }
+
+    func publicRepositoryRecordOutcome(
+        selector _: String,
+        path _: PublicRepositoryPath,
+        expectedCID _: CID?
+    ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadRecordResult> {
+        throw SurfaceGateStubFailure.unused
+    }
+
+    func publicRepositoryRecordsOutcome(
+        selector _: String,
+        collection _: String,
+        limit _: Int,
+        cursor _: String?,
+        reverse _: Bool
+    ) async throws -> PublicRepositoryReadOutcome<PublicRepositoryReadPageResult> {
+        throw SurfaceGateStubFailure.unused
+    }
+
+    func publicRepositoryCAROutcome(selector _: String) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadCAR>
+    { throw SurfaceGateStubFailure.unused }
+
+    func publicRepositoryBlobOutcome(did _: String) async throws
+        -> PublicRepositoryReadOutcome<PublicRepositoryReadBlobTarget>
+    { throw SurfaceGateStubFailure.unused }
+}
+
+private actor SurfaceGateSpaceDirectory: AuthorizedSimpleSpaceDirectory {
+    func space(
+        _: SpaceURI,
+        authorization _: AuthorizationContext
+    ) async throws -> AuthenticatedSimpleSpaceDescription? { nil }
+
+    func close() async throws {}
+}
+
+private struct SurfaceGateMutationDirectory: PublicRepositoryMutationDirectory {
+    func publicRepositoryMutationTarget(selector _: String) async throws
+        -> PublicRepositoryMutationTarget?
+    { throw SurfaceGateStubFailure.unused }
+}
+
+private struct SurfaceGateSignerProvider: PublicRepositoryMutationSignerProvider {
+    func signer(for _: String) async throws -> PublicRepositoryMutationSigner {
+        throw SurfaceGateStubFailure.unused
+    }
+}
+
+private struct SurfaceGateEmailAuthorizer: SwanAccountEmailResourceAuthorizing {
+    func authorizeAccountEmail(
+        request _: Request,
+        method _: String,
+        fixedPath _: String,
+        now _: Date
+    ) async throws -> AuthorizationContext {
+        throw SwanResourceAuthorizationFailure.denied
+    }
+
+    func issueAccountEmailNonce(now _: Date) async -> String { "surface-gate-nonce" }
+}
+
+private struct SurfaceGateEmailRecovery: SwanAccountEmailXRPCRecovering {
+    func requestEmailConfirmation(did _: String, now _: Date) async throws {
+        throw SurfaceGateStubFailure.unused
+    }
+
+    func confirmEmail(
+        did _: String,
+        email _: AccountEmailAddress,
+        proof _: String,
+        now _: Date
+    ) async throws -> AccountEmailConfirmationOutcome {
+        throw SurfaceGateStubFailure.unused
+    }
+
+    func requestPasswordRecovery(
+        email _: AccountEmailAddress,
+        now _: Date
+    ) async throws {}
+
+    func resetPassword(
+        proof _: String,
+        password _: String,
+        now _: Date
+    ) async throws -> AccountPasswordResetOutcome {
+        throw SurfaceGateStubFailure.unused
+    }
+}
+
+private struct SurfaceGateEmailRateLimiter: SwanAccountEmailXRPCRateLimiting {
+    func permits(
+        _: SwanAccountEmailRateLimitRequest,
+        now _: Date
+    ) async throws -> Bool { true }
 }

@@ -351,13 +351,38 @@ public struct SwanAccountEmailXRPCServer: Sendable {
             requestBodyAdmission: .init(
                 admission: .processShared,
                 policy: .productionDefault
-            )
+            ),
+            // A standalone account-email assembly has no public route surface
+            // to consult; it is this service's own contract, so it serves its
+            // own complete method set. Spelled out rather than defaulted so the
+            // composed server below cannot silently inherit "everything".
+            servedMethods: Self.methodNSIDs
         )
     }
 
+    /// The six methods this service owns, and the set a composed router filters
+    /// against when the selected public profile declares only some of them.
+    static let methodNSIDs: Set<String> = [
+        ComAtprotoServerRequestEmailConfirmation.endpointDescriptor.nsid,
+        ComAtprotoServerConfirmEmail.endpointDescriptor.nsid,
+        ComAtprotoServerRequestEmailUpdate.endpointDescriptor.nsid,
+        ComAtprotoServerUpdateEmail.endpointDescriptor.nsid,
+        ComAtprotoServerRequestPasswordReset.endpointDescriptor.nsid,
+        ComAtprotoServerResetPassword.endpointDescriptor.nsid,
+    ]
+
+    /// Installs the account-email routes the selected public route surface
+    /// serves, and no others.
+    ///
+    /// `servedMethods` is required rather than defaulted. These six routes used
+    /// to be installed on every assembly that had an email runtime, whatever
+    /// public profile was selected — which is how a process could log
+    /// `publicMethodCount=12` for a surface declaring no `com.atproto.server.*`
+    /// method while serving all six of them live.
     func register(
         on router: Router<SwanHTTPRequestContext>,
-        requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+        requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
+        servedMethods: Set<String>
     ) {
         let handlers = SwanAccountEmailXRPCHandlers(
             authorizer: authorizer,
@@ -368,64 +393,59 @@ public struct SwanAccountEmailXRPCServer: Sendable {
                 minimumPasswordRecoveryResponseDuration,
             requestBodyAdmission: requestBodyAdmission
         )
-        let requestConfirmationPath = Self.path(
+        let requestConfirmationNSID =
             ComAtprotoServerRequestEmailConfirmation.endpointDescriptor.nsid
-        )
-        let confirmationPath = Self.path(
+        let confirmationNSID =
             ComAtprotoServerConfirmEmail.endpointDescriptor.nsid
-        )
-        let requestUpdatePathString =
-            "/xrpc/\(ComAtprotoServerRequestEmailUpdate.endpointDescriptor.nsid)"
-        let requestUpdatePath = RouterPath(requestUpdatePathString)
-        let updatePathString =
-            "/xrpc/\(ComAtprotoServerUpdateEmail.endpointDescriptor.nsid)"
-        let updatePath = RouterPath(updatePathString)
-        let requestResetPath = Self.path(
+        let requestUpdateNSID =
+            ComAtprotoServerRequestEmailUpdate.endpointDescriptor.nsid
+        let requestUpdatePathString = "/xrpc/\(requestUpdateNSID)"
+        let updateNSID = ComAtprotoServerUpdateEmail.endpointDescriptor.nsid
+        let updatePathString = "/xrpc/\(updateNSID)"
+        let requestResetNSID =
             ComAtprotoServerRequestPasswordReset.endpointDescriptor.nsid
-        )
-        let resetPath = Self.path(
-            ComAtprotoServerResetPassword.endpointDescriptor.nsid
-        )
+        let resetNSID = ComAtprotoServerResetPassword.endpointDescriptor.nsid
 
-        router.post(requestConfirmationPath) { request, context async -> Response in
+        router.postIfServed(requestConfirmationNSID, in: servedMethods) { request, context async -> Response in
             await handlers.requestEmailConfirmation(request, context: context)
         }
-        router.post(confirmationPath) { request, context async -> Response in
+        router.postIfServed(confirmationNSID, in: servedMethods) { request, context async -> Response in
             await handlers.confirmEmail(request, context: context)
         }
-        router.post(requestUpdatePath) { request, context async -> Response in
+        router.postIfServed(requestUpdateNSID, in: servedMethods) { request, context async -> Response in
             await handlers.rejectRequestEmailUpdate(
                 request,
                 context: context,
                 path: requestUpdatePathString
             )
         }
-        router.post(updatePath) { request, context async -> Response in
+        router.postIfServed(updateNSID, in: servedMethods) { request, context async -> Response in
             await handlers.rejectUpdateEmail(
                 request,
                 context: context,
                 path: updatePathString
             )
         }
-        router.post(requestResetPath) { request, context async -> Response in
+        router.postIfServed(requestResetNSID, in: servedMethods) { request, context async -> Response in
             await handlers.requestPasswordReset(request, context: context)
         }
-        router.post(resetPath) { request, context async -> Response in
+        router.postIfServed(resetNSID, in: servedMethods) { request, context async -> Response in
             await handlers.resetPassword(request, context: context)
         }
 
-        let paths = [
-            requestConfirmationPath,
-            confirmationPath,
-            requestUpdatePath,
-            updatePath,
-            requestResetPath,
-            resetPath,
-        ]
         let wrongMethods: [HTTPRequest.Method] = [
             .get, .head, .put, .patch, .delete, .options, .connect, .trace,
         ]
-        for path in paths {
+        // Only installed routes claim their own verb.
+        for nsid in [
+            requestConfirmationNSID,
+            confirmationNSID,
+            requestUpdateNSID,
+            updateNSID,
+            requestResetNSID,
+            resetNSID,
+        ] where servedMethods.contains(nsid) {
+            let path = Self.path(nsid)
             for method in wrongMethods {
                 router.on(path, method: method) { _, _ -> Response in
                     accountEmailError(.notFound, "EndpointUnavailable")

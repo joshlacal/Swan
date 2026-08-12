@@ -71,6 +71,13 @@ public struct SwanPublicRouteSurface: Sendable, Equatable {
 
     /// `public-data-testing-2026-08-06`, spelled here rather than imported
     /// because `SwanPublicWire` deliberately declares no enum for it.
+    ///
+    /// This is also the id `OfflineProtocolProfileVerifier.publicProfileID`
+    /// pins — the profile `swan verify` attests and
+    /// `PublicRepositoryCARReplication` treats as the live public contract —
+    /// which is why ``default`` selects it. A test in `SwanHTTPTests` asserts
+    /// the two constants agree, so a future profile bump cannot leave `verify`
+    /// attesting one contract while `serve` registers another.
     public static let successorProfileID = "public-data-testing-2026-08-06"
 
     /// Every profile id this build can register a public route surface for.
@@ -78,8 +85,43 @@ public struct SwanPublicRouteSurface: Sendable, Equatable {
         Set(registry.keys)
     }
 
+    /// Public routes this build serves that **no** public profile declares.
+    ///
+    /// Exactly one, and it is not an oversight:
+    /// `com.atproto.identity.resolveHandle` is not in any
+    /// `Profiles/public-data-testing-*.json` `endpoints` array, yet the read
+    /// surface registers it, because login on every client depends on it and
+    /// no profile family has ever carried it. Naming it here keeps the served
+    /// set enumerable in one place instead of leaving one route silently
+    /// outside the selection: ``servedMethodNSIDs`` is the complete allow-list
+    /// of public NSIDs any assembly may install a real handler for, and route
+    /// registration consults that and nothing else.
+    ///
+    /// It is a constant rather than a parameter for the same reason the
+    /// registry is: a caller must not be able to widen the served set.
+    public static let outOfProfilePublicMethods: Set<String> = [
+        "com.atproto.identity.resolveHandle",
+    ]
+
     public let profileID: String
     public let methods: [PublicXRPCMethodDescriptor]
+
+    /// The NSIDs the selected profile artifact declares, and only those.
+    public var declaredMethodNSIDs: Set<String> {
+        Set(methods.map(\.nsid))
+    }
+
+    /// Every public NSID this process may register a live route for.
+    ///
+    /// Route registration used to ignore the surface entirely: the read,
+    /// mutation, firehose, and account-email registrations installed real
+    /// handlers unconditionally, so selecting a narrower profile removed
+    /// nothing — the selection only ever *added* fail-closed gates. This is the
+    /// set every one of those registrations now filters against, so a method
+    /// the selected profile does not declare has no handler at all.
+    public var servedMethodNSIDs: Set<String> {
+        declaredMethodNSIDs.union(Self.outOfProfilePublicMethods)
+    }
 
     private init(profileID: String, methods: [PublicXRPCMethodDescriptor]) {
         self.profileID = profileID
@@ -95,14 +137,28 @@ public struct SwanPublicRouteSurface: Sendable, Equatable {
 
     /// The surface used when an assembly names no public profile at all.
     ///
-    /// This is the profile the process registered before the selection existed,
-    /// so an existing deployment's served surface does not change underneath it
-    /// on upgrade. It is built from the same two constants the registry entry
-    /// is built from, and a test asserts the two agree, so the default cannot
-    /// drift into naming a surface the allow-list would refuse.
+    /// This is `public-data-testing-2026-08-06` — the profile
+    /// `OfflineProtocolProfileVerifier.publicProfileID` pins, which is what
+    /// `swan verify` attests and what `PublicRepositoryCARReplication` already
+    /// treats as the live public contract. It deliberately is **not** the
+    /// historical `2026-07-27` surface: defaulting to that left an operator who
+    /// ran `swan verify` green and then `swan serve` with a process whose
+    /// attested profile declared nineteen endpoints while its router installed
+    /// gates for twelve, with nothing in the build reconciling the two.
+    ///
+    /// The default must also be reachable with no file on disk. A path-shaped
+    /// default is not a default: the runtime container's working directory
+    /// holds the data volume, not `Profiles/`, so a default that had to be read
+    /// from the filesystem turned every containerized `swan serve` into a
+    /// startup refusal. This constant is the answer when no selector is given,
+    /// and no I/O happens on that path.
+    ///
+    /// It is built from the same two constants the registry entry is built
+    /// from, and a test asserts the two agree, so the default cannot drift into
+    /// naming a surface the allow-list would refuse.
     public static let `default` = SwanPublicRouteSurface(
-        profileID: PublicDataTesting20260727.profileID,
-        methods: PublicDataTesting20260727.methods
+        profileID: successorProfileID,
+        methods: PublicDataTesting20260805.methods
     )
 
     /// Reads an operator-supplied public profile artifact and resolves it

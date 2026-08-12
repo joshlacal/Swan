@@ -998,10 +998,16 @@ public struct SwanHTTPServer: Sendable {
         // handle->DID oracle an operator never opted into. It still depends on
         // none of the directory's health: it reads one control row and answers
         // even when no repository generation can be admitted at all.
+        // The complete allow-list of public NSIDs this process may install a
+        // live handler for. Every public registration below filters against
+        // it, so `--public-profile` removes routes as well as adding gates.
+        let servedPublicMethods = configuration.publicRouteSurface
+            .servedMethodNSIDs
         if let publicRepositoryReadDirectory {
             registerPublicRepositoryReadEndpoints(
                 on: router,
                 directory: publicRepositoryReadDirectory,
+                servedMethods: servedPublicMethods,
                 publicURL: configuration.publicURL,
                 jsonReadAdmission: jsonReadAdmission,
                 handleResolution: publicHandleResolution,
@@ -1013,13 +1019,22 @@ public struct SwanHTTPServer: Sendable {
         if let publicRepositoryMutations {
             registerPublicRepositoryMutationEndpoints(
                 on: router,
-                capability: publicRepositoryMutations
+                capability: publicRepositoryMutations,
+                servedMethods: servedPublicMethods
             )
         }
         // The exact ws route beats the `com.atproto.sync.*` wildcard guard
         // below (exact paths have higher precedence). When the runtime is
         // absent the wildcard 404 remains the endpoint's only shape.
-        if let publicFirehoseStreaming {
+        // Gated at the call site rather than inside the registration function:
+        // `subscribeRepos` is a single route, and the streaming file is the one
+        // public-surface file written in the 2-space style, so keeping the
+        // condition here avoids mixing indentation inside it. A profile that
+        // does not declare the subscription installs no WebSocket upgrade even
+        // when the runtime exists — the `com.atproto.sync.*` guard answers 404,
+        // exactly as it does when the runtime is absent.
+        if let publicFirehoseStreaming,
+           servedPublicMethods.contains(publicSubscribeReposNSID) {
             registerPublicFirehoseStreamingEndpoint(
                 on: router,
                 runtime: publicFirehoseStreaming
@@ -1052,7 +1067,8 @@ public struct SwanHTTPServer: Sendable {
         }
         accountEmailXRPC?.register(
             on: router,
-            requestBodyAdmission: requestBodyAdmission
+            requestBodyAdmission: requestBodyAdmission,
+            servedMethods: servedPublicMethods
         )
         actorPreferencesXRPC?.register(
             on: router,

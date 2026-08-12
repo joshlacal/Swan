@@ -448,17 +448,25 @@ func requiredPublicBlobContentLength(_ headers: HTTPFields) throws -> Int {
 /// this bound or a blob could be accepted and then never served.
 let maximumPublicBlobTransferBytes = 256 * 1024 * 1024
 
+/// Installs the public write surface, filtered by the selected public route
+/// surface.
+///
+/// `servedMethods` is required rather than defaulted for the same reason it is
+/// on the read surface: these five handlers used to be installed on any
+/// assembly that opted into public writes, whatever profile was selected, so a
+/// narrower profile removed nothing.
 func registerPublicRepositoryMutationEndpoints(
     on router: Router<BasicRequestContext>,
-    capability: SwanPublicRepositoryMutationCapability
+    capability: SwanPublicRepositoryMutationCapability,
+    servedMethods: Set<String>
 ) {
     let handlers = PublicMutationHandlers(capability: capability)
-    let putPath: RouterPath = "/xrpc/com.atproto.repo.putRecord"
-    let createPath: RouterPath = "/xrpc/com.atproto.repo.createRecord"
-    let applyPath: RouterPath = "/xrpc/com.atproto.repo.applyWrites"
-    let uploadPath: RouterPath = "/xrpc/com.atproto.repo.uploadBlob"
-    let deletePath: RouterPath = "/xrpc/com.atproto.repo.deleteRecord"
-    router.post(putPath) { request, context async -> Response in
+    let putNSID = SwanPublicWire.ComAtprotoRepoPutRecord.typeIdentifier
+    let createNSID = SwanPublicWire.ComAtprotoRepoCreateRecord.typeIdentifier
+    let applyNSID = SwanPublicWire.ComAtprotoRepoApplyWrites.typeIdentifier
+    let uploadNSID = SwanPublicWire.ComAtprotoRepoUploadBlob.typeIdentifier
+    let deleteNSID = SwanPublicWire.ComAtprotoRepoDeleteRecord.typeIdentifier
+    router.postIfServed(putNSID, in: servedMethods) { request, context async -> Response in
         await withPublicMutationInput(
             request,
             context: context,
@@ -471,7 +479,7 @@ func registerPublicRepositoryMutationEndpoints(
             )
         }
     }
-    router.post(createPath) { request, context async -> Response in
+    router.postIfServed(createNSID, in: servedMethods) { request, context async -> Response in
         await withPublicMutationInput(
             request,
             context: context,
@@ -484,7 +492,7 @@ func registerPublicRepositoryMutationEndpoints(
             )
         }
     }
-    router.post(applyPath) { request, context async -> Response in
+    router.postIfServed(applyNSID, in: servedMethods) { request, context async -> Response in
         await withPublicMutationInput(
             request,
             context: context,
@@ -497,7 +505,7 @@ func registerPublicRepositoryMutationEndpoints(
             )
         }
     }
-    router.post(uploadPath) { request, context async -> Response in
+    router.postIfServed(uploadNSID, in: servedMethods) { request, context async -> Response in
         do {
             return publicMutationJSON(
                 .ok,
@@ -518,7 +526,7 @@ func registerPublicRepositoryMutationEndpoints(
             return publicMutationError(.badRequest, "InvalidRequest")
         }
     }
-    router.post(deletePath) { request, context async -> Response in
+    router.postIfServed(deleteNSID, in: servedMethods) { request, context async -> Response in
         await withPublicMutationInput(
             request,
             context: context,
@@ -531,7 +539,12 @@ func registerPublicRepositoryMutationEndpoints(
             )
         }
     }
-    for path in [putPath, createPath, applyPath, uploadPath, deletePath] {
+    // Only installed routes claim their own verb; an unserved method must be
+    // indistinguishable from one this build does not implement.
+    for nsid in [putNSID, createNSID, applyNSID, uploadNSID, deleteNSID]
+        where servedMethods.contains(nsid)
+    {
+        let path = RouterPath("/xrpc/\(nsid)")
         for method: HTTPRequest.Method in [.get, .head, .put, .patch, .delete, .options, .connect, .trace] {
             router.on(path, method: method) { _, _ in publicMutationError(.notFound, "public_endpoint_unavailable") }
         }

@@ -45,6 +45,27 @@ func registerUnknownPublicEndpointGuards(on router: Router<BasicRequestContext>)
         // operation request.
         "/xrpc/com.atproto.identity.*",
         "/xrpc/com.atproto.repo.*",
+        // `com.atproto.server.*` is Swan's own namespace in exactly the same
+        // sense as the three around it: account creation, sessions, email
+        // confirmation, and password reset are PDS methods, never a third
+        // party's. It is closed here so a method the selected public profile
+        // does not declare — or one an assembly's account-email runtime does
+        // not install — answers a flat 404 from Swan rather than reaching the
+        // pipethrough's routing decision with its request body still attached.
+        //
+        // `SwanXRPCProxyRouter` already refuses the whole `com.atproto.*` space
+        // (its `proxyablePrefixes` are `app.bsky.`, `chat.bsky.`,
+        // `tools.ozone.`, plus two exact moderation NSIDs), so this is not the
+        // gate that stops forwarding today — it is the second one, added
+        // because that allow-list is the only thing standing between a
+        // conditionally-registered `com.atproto.server.*` route and the proxy,
+        // and this codebase has already shipped a credential-forwarding bug of
+        // exactly that shape once.
+        //
+        // `com.atproto.server.describeServer` registers an exact route above
+        // and keeps it: exact paths outrank a `<prefix>.*` guard in
+        // Hummingbird's trie regardless of registration order.
+        "/xrpc/com.atproto.server.*",
         "/xrpc/com.atproto.sync.*",
     ] {
         for method in publicGuardedHTTPMethods {
