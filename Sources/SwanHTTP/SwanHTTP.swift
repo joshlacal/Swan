@@ -377,6 +377,12 @@ public struct SwanHTTPServer: Sendable {
     /// Public-only read capability selected from the startup-preopened account
     /// inventory. It contains no authorization or permissioned-data fallback.
     public let publicRepositoryReadDirectory: (any PublicRepositoryReadDirectory)?
+    /// Unauthenticated `com.atproto.identity.resolveHandle`. It is formed
+    /// whenever an account control store is configured and is deliberately
+    /// independent of ``publicRepositoryReadDirectory``: handle resolution
+    /// reads one control row and must keep working when repository generation
+    /// admission does not.
+    public let publicHandleResolution: SwanPublicHandleResolutionCapability?
     /// Explicitly opt-in public mutation capability. Public reads never imply
     /// this capability, and it is only formed alongside the server-bound
     /// OAuth resource authorizer.
@@ -454,6 +460,9 @@ public struct SwanHTTPServer: Sendable {
         self.oauthRuntime = oauthRuntime
         self.loginClientIdentityPolicy = loginClientIdentityPolicy
         self.publicRepositoryReadDirectory = publicRepositoryReadDirectory
+        publicHandleResolution = accountControlStore.map {
+            SwanPublicHandleResolutionCapability(controlStore: $0)
+        }
         self.accountEmailXRPC = accountEmailXRPC
         self.actorPreferencesXRPC = actorPreferencesXRPC
         self.xrpcPipethrough = xrpcPipethrough
@@ -948,6 +957,15 @@ public struct SwanHTTPServer: Sendable {
                 jsonReadAdmission: jsonReadAdmission
             )
         }
+        // Registered outside the read-directory block on purpose: resolveHandle
+        // must answer even when no public repository read generation can be
+        // admitted at all.
+        if let publicHandleResolution {
+            registerPublicHandleResolutionEndpoint(
+                on: router,
+                capability: publicHandleResolution
+            )
+        }
         if let publicRepositoryMutations {
             registerPublicRepositoryMutationEndpoints(
                 on: router,
@@ -970,6 +988,10 @@ public struct SwanHTTPServer: Sendable {
             }
             if publicRepositoryReadDirectory != nil,
                isInstalledPublicReadMethod(descriptor.nsid) {
+                continue
+            }
+            if publicHandleResolution != nil,
+               isInstalledPublicHandleResolutionMethod(descriptor.nsid) {
                 continue
             }
             if publicRepositoryMutations != nil,

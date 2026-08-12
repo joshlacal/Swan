@@ -36,6 +36,14 @@ func registerUnavailablePublicEndpoint(
 
 func registerUnknownPublicEndpointGuards(on router: Router<BasicRequestContext>) {
     for path: RouterPath in [
+        // `com.atproto.identity.*` is closed here for the same reason the two
+        // below are: every method in the namespace is Swan's own to implement
+        // or refuse. `resolveHandle` registers an exact route ahead of this
+        // guard; `updateHandle`, `signPlcOperation`, and the rest are not
+        // implemented and must answer 404 from Swan rather than be swept into
+        // the AppView proxy, which would hand a third party a handle or a PLC
+        // operation request.
+        "/xrpc/com.atproto.identity.*",
         "/xrpc/com.atproto.repo.*",
         "/xrpc/com.atproto.sync.*",
     ] {

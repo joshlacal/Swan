@@ -13,6 +13,14 @@ import SwanStorage
 /// identifiers only — never payloads, credentials, or repository content.
 private let publicReadDiagnosticLog = SwanLog(label: "swan.public-read")
 
+/// The methods installed by the public repository *read directory*.
+///
+/// `com.atproto.identity.resolveHandle` is deliberately absent. It is a public
+/// read method, but its installer is the account control store, not this
+/// directory, and the single consumer of this set gates on the directory's
+/// presence. Listing it here would let a profile that declares the NSID skip
+/// its method-correct unavailable gate on a server that never registered the
+/// route. See ``isInstalledPublicHandleResolutionMethod``.
 private let publicReadNSIDs: Set<String> = [
     "com.atproto.repo.describeRepo",
     "com.atproto.repo.getRecord",
@@ -21,6 +29,15 @@ private let publicReadNSIDs: Set<String> = [
     "com.atproto.sync.getRepo",
     "com.atproto.sync.getRepoStatus",
 ]
+
+private let resolveHandleNSID = "com.atproto.identity.resolveHandle"
+
+/// The response body budget for `resolveHandle`. Its output is one DID, and
+/// `AccountControlIdentifiers` already bounds a DID at 2 KiB, so this is a
+/// generous ceiling rather than a working limit. It exists so the encode path
+/// carries an honest bound instead of inheriting the 16 MiB `listRecords`
+/// default, and so the route never reserves a shared read lease it cannot use.
+private let resolveHandleMaximumResponseBytes = 4 * 1_024
 
 /// Names an HTTP-layer guard that refuses a read after storage has already
 /// answered. These are the 503 causes that never reach
@@ -37,6 +54,11 @@ private enum PublicReadHandlerGuard: String {
     case responseAdmissionExhausted
     /// The response could not be encoded, or exceeded its byte budget.
     case responseEncodingFailed
+    /// `resolveHandle`: the account control store failed to answer the one
+    /// handle lookup it is asked for. Distinct from every reason above because
+    /// this route never consults the public read directory, so none of the
+    /// generation-admission guards can possibly be the cause.
+    case handleDirectoryUnavailable
 }
 
 private enum PublicReadHandlerFailure: Error {
@@ -268,6 +290,57 @@ private struct PublicRepoStatusHandler:
 
 func isInstalledPublicReadMethod(_ nsid: String) -> Bool {
     publicReadNSIDs.contains(nsid)
+}
+
+/// Whether ``registerPublicHandleResolutionEndpoint`` claims this NSID, so a
+/// profile that declares it does not also install a 503 gate over the live
+/// route.
+func isInstalledPublicHandleResolutionMethod(_ nsid: String) -> Bool {
+    nsid == resolveHandleNSID
+}
+
+/// The single storage question `com.atproto.identity.resolveHandle` is allowed
+/// to ask, and the only reason the account control store reaches the
+/// unauthenticated route surface at all.
+///
+/// The control store is a very wide type — credentials, recovery envelopes,
+/// email delivery leases, key references. None of that may be reachable from an
+/// anonymous request, so the store is held privately here and exactly one
+/// projection escapes: an active account's DID, given its canonical handle.
+/// This is an allow-list of one, not a store handed to a public handler that
+/// promises to only call one method on it.
+public struct SwanPublicHandleResolutionCapability: Sendable {
+    private let controlStore: any AccountControlStore
+
+    public init(controlStore: any AccountControlStore) {
+        self.controlStore = controlStore
+    }
+
+    /// Resolves a *canonical* handle to a hosted, active account's DID.
+    ///
+    /// Only `.active` accounts resolve. A deactivated, suspended, taken-down,
+    /// deleting, or deleted handle is reported exactly as an unhosted one is —
+    /// the caller learns "not resolvable here", never which of those it was.
+    /// That matches the rest of Swan's public surface and the reference PDS,
+    /// whose `resolveHandle` likewise excludes deactivated and taken-down
+    /// accounts.
+    ///
+    /// This performs no DNS, PLC, DID, or HTTP resolution: a handle this
+    /// service does not host is simply unresolvable here.
+    func activeDID(forCanonicalHandle handle: String) async throws -> String? {
+        guard AccountControlIdentifiers.isCanonicalHandle(handle) else {
+            return nil
+        }
+        guard let account = try await controlStore.account(
+            canonicalHandle: handle
+        ), account.status.authorizesAccount else { return nil }
+        return account.did
+    }
+}
+
+/// `com.atproto.identity.resolveHandle`'s entire output.
+private struct PublicResolveHandleOutput: Encodable {
+    let did: String
 }
 
 func registerPublicRepositoryReadEndpoints(
@@ -626,15 +699,95 @@ func registerPublicRepositoryReadEndpoints(
         "/xrpc/com.atproto.sync.getRepo",
         "/xrpc/com.atproto.sync.getRepoStatus",
     ] {
-        for method: HTTPRequest.Method in [
-            .head, .post, .put, .patch, .delete, .options, .connect, .trace,
-        ] {
-            router.on(path, method: method) { _, _ -> Response in
-                jsonResponseWithStatus(
-                    .notFound,
-                    body: ["error": "public_endpoint_unavailable"]
-                )
+        registerPublicReadWrongMethodGuards(on: router, path: path)
+    }
+}
+
+/// Unauthenticated `com.atproto.identity.resolveHandle`.
+///
+/// Deliberately independent of the public read directory. Every other route in
+/// this file has to admit a generation before it can answer, and on 2026-08-12
+/// a stale `PRAGMA data_version` pin made that admission fail permanently. A
+/// handle lookup needs none of it: it reads one control row and returns one
+/// DID. Keeping it on its own capability means the method that clients, other
+/// PDSes, and login flows depend on most cannot be taken out by a repository
+/// projection fault.
+///
+/// It is also why this route reserves no JSON read lease. Its response is one
+/// DID; reserving the shared multi-megabyte read budget would let concurrent
+/// `listRecords` traffic starve handle resolution for no benefit.
+func registerPublicHandleResolutionEndpoint(
+    on router: Router<BasicRequestContext>,
+    capability: SwanPublicHandleResolutionCapability
+) {
+    router.get("/xrpc/\(resolveHandleNSID)") { request, _ async -> Response in
+        var selector: String?
+        do {
+            let query = try publicReadQuery(request, required: ["handle"])
+            guard let rawHandle = query["handle"] else {
+                throw PublicReadHandlerFailure.invalidRequest
             }
+            // Handles are case-insensitive on the wire and canonical in
+            // storage, so fold before looking up. A handle that is not a
+            // well-formed handle at all is a request fault, not a lookup miss.
+            guard let canonicalHandle = try? AccountIdentifiers
+                .canonicalHandle(rawHandle) else {
+                throw PublicReadHandlerFailure.invalidRequest
+            }
+            selector = canonicalHandle
+            guard let did = try await capability.activeDID(
+                forCanonicalHandle: canonicalHandle
+            ) else {
+                // The reference PDS answers an unhosted or non-active handle
+                // with InvalidRequest, not 404, and callers depend on that.
+                throw PublicReadHandlerFailure.invalidRequest
+            }
+            return publicReadJSON(
+                .ok,
+                PublicResolveHandleOutput(did: did),
+                maximumBytes: resolveHandleMaximumResponseBytes,
+                method: resolveHandleNSID,
+                selector: canonicalHandle
+            )
+        } catch let failure as PublicReadHandlerFailure {
+            return publicReadResponse(
+                failure,
+                method: resolveHandleNSID,
+                selector: selector
+            )
+        } catch PublicRepositoryReadError.invalidSelector {
+            return publicReadError(.badRequest, "InvalidRequest")
+        } catch {
+            // Only the control store can fail here. Name it rather than let a
+            // storage fault arrive in the journal as "unclassified".
+            return publicReadUnavailable(
+                reason: PublicReadHandlerGuard
+                    .handleDirectoryUnavailable.rawValue,
+                method: resolveHandleNSID,
+                selector: selector
+            )
+        }
+    }
+    registerPublicReadWrongMethodGuards(
+        on: router, path: "/xrpc/\(resolveHandleNSID)"
+    )
+}
+
+/// A public read path answers its own verb and nothing else. Without these the
+/// exact path would only claim GET, and a POST to it would fall through to a
+/// wildcard guard — or, worse, to whatever lower-priority route exists.
+private func registerPublicReadWrongMethodGuards(
+    on router: Router<BasicRequestContext>,
+    path: RouterPath
+) {
+    for method: HTTPRequest.Method in [
+        .head, .post, .put, .patch, .delete, .options, .connect, .trace,
+    ] {
+        router.on(path, method: method) { _, _ -> Response in
+            jsonResponseWithStatus(
+                .notFound,
+                body: ["error": "public_endpoint_unavailable"]
+            )
         }
     }
 }
