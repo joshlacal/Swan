@@ -14,6 +14,18 @@ public final class SwanJSONWriteBodyPolicy: Sendable {
         totalBodyTimeout: .seconds(30)
     )
 
+    /// The bound for a route that expects *no* body at all.
+    ///
+    /// `com.atproto.sync.getBlob` is an anonymous query. There is nothing
+    /// legitimate to wait for beyond the end of the request stream, so the
+    /// 30-second allowance a 1 MiB command needs is pure attacker budget
+    /// here: it is how long an unterminated body holds this route's admission
+    /// lease. Two seconds is far beyond any real client's stream-end latency
+    /// and far below what makes stalling worthwhile.
+    public static let noRequestBodyDefault = try! SwanJSONWriteBodyPolicy(
+        totalBodyTimeout: .seconds(2)
+    )
+
     public let totalBodyTimeout: Duration
 
     public init(totalBodyTimeout: Duration) throws {

@@ -94,8 +94,14 @@ private enum PublicReadHandlerGuard: String {
     /// as reachable.
     case blobStorageFailure
     /// `getBlob`: the opened blob declared a length outside the transfer bound
-    /// this service will stream, so it is refused before a single byte leaves.
+    /// this service will stream, or a length other than the one its metadata
+    /// declared, so it is refused before a single byte leaves.
     case blobLengthOutOfBounds
+    /// `getBlob`: the route's own request-body admission — the pool that
+    /// bounds how many inbound streams may be proved empty at once — refused
+    /// the reservation. Distinct from `blobStreamAdmissionExhausted`, which
+    /// names the outbound transfer budget.
+    case blobRequestBodyAdmissionExhausted
 }
 
 private enum PublicReadHandlerFailure: Error {
@@ -394,8 +400,9 @@ func registerPublicRepositoryReadEndpoints(
     handleResolutionAdmission: PublicRepositoryJSONReadAdmission =
         publicHandleResolutionAdmission,
     blobStreamAdmission: PublicRepositorySpoolAdmission = .shared,
-    blobRequestBodyAdmission: PublicRepositoryJSONWriteAdmission = .processShared,
-    blobRequestBodyPolicy: SwanJSONWriteBodyPolicy = .productionDefault
+    blobRequestBodyAdmission: PublicRepositoryJSONWriteAdmission =
+        .publicBlobReadProcessShared,
+    blobRequestBodyPolicy: SwanJSONWriteBodyPolicy = .noRequestBodyDefault
 ) {
     let describeHandler = PublicDescribeRepoHandler(
         directory: directory, publicURL: publicURL
@@ -752,13 +759,25 @@ func registerPublicRepositoryReadEndpoints(
     // content-addressed and carries no MST revision, so it stays out of the
     // admission machinery the other routes depend on.
     router.get("/xrpc/\(getBlobNSID)") { request, context async -> Response in
-        guard await publicBlobRequestHasNoBody(
+        switch await publicBlobRequestBody(
             request,
             context: context,
             admission: blobRequestBodyAdmission,
             policy: blobRequestBodyPolicy
-        ) else {
+        ) {
+        case .absent:
+            break
+        case .present:
             return publicReadError(.badRequest, "InvalidRequest")
+        case .unavailable:
+            // The route's own inbound pool is saturated. Never a 400: the
+            // caller's request is well formed and this is a capacity refusal.
+            return publicReadUnavailable(
+                reason: PublicReadHandlerGuard
+                    .blobRequestBodyAdmissionExhausted.rawValue,
+                method: getBlobNSID,
+                selector: nil
+            )
         }
         let parameters: PublicBlobParameters
         do {
@@ -793,12 +812,45 @@ func registerPublicRepositoryReadEndpoints(
                 selector: parameters.did
             )
         }
+        // The blob's true length, read without opening or materializing a
+        // body, so the transfer budget below is reserved for the bytes this
+        // response will actually stream.
+        //
+        // Reserving the 256 MiB ceiling for every blob instead would make a
+        // 5 KiB avatar cost a quarter of the per-account budget: two
+        // concurrent image reads per account, four across the service, and
+        // `com.atproto.sync.getRepo` starved out of the same pool. That bound
+        // was inherited from the old mutation-surface route; this is the
+        // network-facing image path now.
+        let metadata: PublicBlobMetadata?
+        do {
+            metadata = try await target.store.publicBlobMetadata(
+                cid: parameters.cid
+            )
+        } catch {
+            return publicReadUnavailable(
+                reason: PublicReadHandlerGuard.blobStorageFailure.rawValue,
+                method: getBlobNSID,
+                selector: target.did
+            )
+        }
+        guard let metadata else {
+            return publicReadError(.notFound, "BlobNotFound")
+        }
+        guard metadata.size > 0,
+              metadata.size <= maximumPublicBlobTransferBytes else {
+            return publicReadUnavailable(
+                reason: PublicReadHandlerGuard.blobLengthOutOfBounds.rawValue,
+                method: getBlobNSID,
+                selector: target.did
+            )
+        }
         // Reserved before the store opens anything and released only when the
         // response writer finishes, so a stalled reader cannot hold bytes
         // outside the budget.
         guard let streamLease = blobStreamAdmission.reserve(
             accountDID: target.did,
-            maximumBytes: maximumPublicBlobTransferBytes
+            maximumBytes: metadata.size
         ) else {
             return publicReadUnavailable(
                 reason: PublicReadHandlerGuard
@@ -822,8 +874,10 @@ func registerPublicRepositoryReadEndpoints(
             streamLease.release()
             return publicReadError(.notFound, "BlobNotFound")
         }
-        guard blob.body.contentLength > 0,
-              blob.body.contentLength <= maximumPublicBlobTransferBytes else {
+        // A blob is content-addressed and immutable, so the opened body must
+        // declare exactly the length the metadata did. Anything else means the
+        // reservation does not cover the transfer, and the bytes do not leave.
+        guard blob.body.contentLength == metadata.size else {
             streamLease.release()
             return publicReadUnavailable(
                 reason: PublicReadHandlerGuard.blobLengthOutOfBounds.rawValue,
@@ -1040,16 +1094,46 @@ private func publicBlobParameters(_ request: Request) throws -> PublicBlobParame
     return PublicBlobParameters(did: rawDID, cid: rawCID)
 }
 
-/// `getBlob` is a query and carries no body. The body is still *collected*
-/// under the shared write-body admission — a caller who sends one anyway must
-/// not be able to stream unmetered bytes at an anonymous route — and a request
-/// that carries any body at all is refused.
-private func publicBlobRequestHasNoBody(
+/// What the inbound stream of an anonymous `getBlob` turned out to carry.
+private enum PublicBlobRequestBody {
+    /// Proved empty. The only case the route proceeds from.
+    case absent
+    /// A body was declared or delivered. A request fault: 400.
+    case present
+    /// The route's own inbound admission refused, or the body deadline
+    /// expired. A capacity refusal, not a caller fault: 503.
+    case unavailable
+}
+
+/// `getBlob` is a query and carries no body, and a request that carries one is
+/// refused.
+///
+/// Two properties matter here beyond the refusal itself.
+///
+/// A body that is *declared* in the headers is refused from the headers alone,
+/// before any lease is taken and without reading a byte. `Transfer-Encoding`
+/// is the shape that mattered: it declares a body with no length, so the
+/// generic collector could not reject it up front and instead admitted it and
+/// waited out the body deadline.
+///
+/// The reservation used for everything else is this route's **own** pool, not
+/// the shared JSON *write* pool. On the shared pool a handful of anonymous
+/// unterminated GETs could hold every one of its eight leases and deny the
+/// authenticated space, account-email, and preferences commands that reserve
+/// from it — an anonymous read starving authenticated writes on a server with
+/// public writes turned off.
+private func publicBlobRequestBody(
     _ request: Request,
     context: SwanHTTPRequestContext,
     admission: PublicRepositoryJSONWriteAdmission,
     policy: SwanJSONWriteBodyPolicy
-) async -> Bool {
+) async -> PublicBlobRequestBody {
+    if request.headers[values: .transferEncoding].isEmpty == false
+        || request.headers[values: .contentLength].contains(where: { $0 != "0" })
+    {
+        context.jsonWriteBodyTermination.terminate()
+        return .present
+    }
     do {
         let body = try await collectAdmittedRequestBody(
             request,
@@ -1060,9 +1144,11 @@ private func publicBlobRequestHasNoBody(
             termination: context.jsonWriteBodyTermination
         )
         defer { withExtendedLifetime(body) {} }
-        return body.readableBytes == 0
+        return body.readableBytes == 0 ? .absent : .present
+    } catch SwanRequestBodyCollectionFailure.unavailable {
+        return .unavailable
     } catch {
-        return false
+        return .present
     }
 }
 

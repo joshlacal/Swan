@@ -1053,6 +1053,189 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
         try await fixture.control.close()
     }
 
+    /// The production `publicRepositoryBlobOutcome` — the one every avatar on
+    /// a deployed server goes through — against the real preopened directory
+    /// rather than a hand-written fake that re-implements its ordering.
+    ///
+    /// Both halves matter. The projection must resolve the account's own
+    /// startup-preopened database (a `return .notFound`, or keying the
+    /// inventory on the raw selector rather than the resolved control row,
+    /// answers `RepoNotFound` for every image the service hosts), and the
+    /// store it hands back must be able to produce the exact bytes and the
+    /// exact declared length — the length the HTTP route reserves its
+    /// transfer budget from.
+    func testPublicBlobOutcomeServesRealPreopenedAccountBytesAndTrueLength() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let payload = Data("real-directory-avatar-bytes".utf8)
+        let store = await fixture.directory.preopenedPublicMutationStore(did: did)
+        let database = try XCTUnwrap(store as? SQLiteAccountDatabase)
+        let reference = try await database.putStreaming(
+            namespace: .public,
+            mimeType: "image/png",
+            maximumBytes: PublicRepositoryLimits.requiredStreamingCARBytes
+        ) { sink in
+            try await sink(payload)
+        }
+
+        guard case let .active(target) = try await fixture.directory
+            .publicRepositoryBlobOutcome(did: did) else {
+            try await fixture.directory.close()
+            try await fixture.control.close()
+            return XCTFail("an active preopened account must resolve a blob target")
+        }
+        XCTAssertEqual(target.did, did)
+        XCTAssertEqual(target.status, .active)
+
+        let metadata = try await target.store.publicBlobMetadata(
+            cid: reference.cid
+        )
+        XCTAssertEqual(metadata?.size, payload.count)
+        XCTAssertEqual(metadata?.mimeType, "image/png")
+
+        let maybeBlob = try await target.store.publicBlob(cid: reference.cid)
+        let blob = try XCTUnwrap(maybeBlob)
+        XCTAssertEqual(blob.body.contentLength, payload.count)
+        XCTAssertEqual(blob.mimeType, "image/png")
+        let collector = PublicReadCARCollector()
+        try await blob.body.streamBody(maximumChunkBytes: 1_024) { chunk in
+            await collector.append(chunk)
+        }
+        let served = await collector.data
+        XCTAssertEqual(served, payload)
+
+        // A blob this account holds only in a permissioned namespace is
+        // absent from the public projection, not served under it.
+        let permissioned = try await database.putStreaming(
+            namespace: .space(
+                try SpaceURI(
+                    authority: did,
+                    spaceType: "app.swan.private",
+                    skey: "absent"
+                )
+            ),
+            mimeType: "image/png",
+            maximumBytes: PublicRepositoryLimits.requiredStreamingCARBytes
+        ) { sink in
+            try await sink(Data("permissioned-only-bytes".utf8))
+        }
+        XCTAssertNotEqual(permissioned.cid, reference.cid)
+        let absent = try await target.store.publicBlob(cid: permissioned.cid)
+        XCTAssertNil(absent)
+        let absentMetadata = try await target.store.publicBlobMetadata(
+            cid: permissioned.cid
+        )
+        XCTAssertNil(absentMetadata)
+
+        try await fixture.directory.close()
+        try await fixture.control.close()
+    }
+
+    /// Every refusal path of the production projection, on the real
+    /// directory: an unhosted DID, an account that is active in the control
+    /// store but was never startup-preopened, a non-DID selector, a
+    /// non-active account, and a closed directory.
+    ///
+    /// The non-preopened account is asserted twice — active and deactivated —
+    /// because the ordering is the claim: the preopened check runs *before*
+    /// the lifecycle check, so an account this process never opened stays
+    /// indistinguishable from one the service has never hosted.
+    func testPublicBlobOutcomeRefusesUnhostedNonPreopenedNonDIDAndClosedDirectory() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        // Never registered at all.
+        guard case .notFound = try await fixture.directory
+            .publicRepositoryBlobOutcome(
+                did: "did:plc:zzzzzzzzzzzzzzzzzzzzzzzz"
+            ) else {
+            try await fixture.directory.close()
+            try await fixture.control.close()
+            return XCTFail("an unhosted DID must be notFound")
+        }
+
+        // Registered as active *after* bootstrap, so it has a control row and
+        // no preopened database.
+        let latecomer = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+        _ = try await fixture.control.createAccount(
+            try AccountControlRegistration(
+                did: latecomer,
+                canonicalHandle: "latecomer.example.com",
+                passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                signingKey: AccountControlKeyReference(
+                    purpose: .signing, generation: 1
+                ),
+                rotationKey: AccountControlKeyReference(
+                    purpose: .rotation, generation: 1
+                ),
+                publicGenesisCommitCID: nil,
+                createdAt: Date(timeIntervalSince1970: 1_750_000_020)
+            )
+        )
+        guard case .notFound = try await fixture.directory
+            .publicRepositoryBlobOutcome(did: latecomer) else {
+            try await fixture.directory.close()
+            try await fixture.control.close()
+            return XCTFail("a non-preopened account must be notFound")
+        }
+        _ = try await fixture.control.transitionStatus(
+            did: latecomer,
+            to: .deactivated,
+            declaration: .init(),
+            now: Date(timeIntervalSince1970: 1_750_000_021)
+        )
+        guard case .notFound = try await fixture.directory
+            .publicRepositoryBlobOutcome(did: latecomer) else {
+            try await fixture.directory.close()
+            try await fixture.control.close()
+            return XCTFail(
+                "the preopened check must precede the lifecycle check"
+            )
+        }
+
+        // The lexicon parameter is a DID. A handle — which every other read
+        // route accepts as a selector — is a request fault here.
+        do {
+            _ = try await fixture.directory.publicRepositoryBlobOutcome(
+                did: handle
+            )
+            XCTFail("a handle selector must be rejected")
+        } catch let error as PublicRepositoryReadError {
+            XCTAssertEqual(error, .invalidSelector)
+        }
+
+        // A preopened account that is no longer active reports its lifecycle
+        // instead of a blob store.
+        _ = try await fixture.control.transitionStatus(
+            did: did,
+            to: .deactivated,
+            declaration: .init(),
+            now: Date(timeIntervalSince1970: 1_750_000_022)
+        )
+        guard case let .lifecycle(status) = try await fixture.directory
+            .publicRepositoryBlobOutcome(did: did) else {
+            try await fixture.directory.close()
+            try await fixture.control.close()
+            return XCTFail("a deactivated preopened account must be lifecycle")
+        }
+        XCTAssertEqual(status.did, did)
+        XCTAssertEqual(status.status, .deactivated)
+        XCTAssertNil(status.revision)
+
+        _ = try await fixture.control.transitionStatus(
+            did: did,
+            to: .active,
+            declaration: .init(),
+            now: Date(timeIntervalSince1970: 1_750_000_023)
+        )
+        try await fixture.directory.close()
+        await XCTAssertThrowsPublicReadUnavailable(
+            try await fixture.directory.publicRepositoryBlobOutcome(did: did)
+        )
+        try await fixture.control.close()
+    }
+
     private func makeFixture(
         admission: PublicRepositorySpoolAdmission? = nil,
         tamperJournalSignature: Bool = false,

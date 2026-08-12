@@ -102,6 +102,19 @@ public protocol PublicRepositoryReadBlobStore: Sendable {
     /// The sanitized public-namespace projection for a content-addressed blob,
     /// or nil when this account has no reachable public blob at that CID.
     func publicBlob(cid: String) async throws -> PublicBlob?
+
+    /// The sanitized metadata for a reachable public blob — its true length
+    /// and MIME type — without opening or materializing its body.
+    ///
+    /// Part of the read-only allow-list because the anonymous read route must
+    /// reserve the blob's *actual* length from the shared transfer budget.
+    /// Without a metadata-only accessor the route can only reserve the
+    /// 256 MiB worst case for a 5 KiB avatar, which caps the whole service at
+    /// two concurrent image reads per account and four in total, and starves
+    /// `com.atproto.sync.getRepo` out of the same budget. This exposes no
+    /// body, path, descriptor, database, or namespace reference, so it does
+    /// not widen what the anonymous surface can reach.
+    func publicBlobMetadata(cid: String) async throws -> PublicBlobMetadata?
 }
 
 /// Optional streaming extension for durable blob stores. The source closure
@@ -118,16 +131,13 @@ public protocol StreamingBlobStore: BlobStore, PublicRepositoryReadBlobStore {
         ) async throws -> Void
     ) async throws -> BlobReference
 
-    // `publicBlob(cid:)` is inherited from `PublicRepositoryReadBlobStore`,
-    // which is the projection the anonymous read surface is handed.
+    // `publicBlob(cid:)` and `publicBlobMetadata(cid:)` are inherited from
+    // `PublicRepositoryReadBlobStore`, which is the projection the anonymous
+    // read surface is handed.
 
     /// Metadata-only reachability check for public record references. This
     /// must not open or materialize the blob body.
     func publicBlobExists(cid: String) async throws -> Bool
-
-    /// Returns the sanitized metadata for a reachable public blob without
-    /// opening or materializing its body.
-    func publicBlobMetadata(cid: String) async throws -> PublicBlobMetadata?
 }
 
 /// Local immutable content-addressed blobs. File contents are shared, while

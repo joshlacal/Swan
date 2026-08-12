@@ -416,6 +416,11 @@ public struct SwanHTTPServer: Sendable {
     /// Shared aggregate bound for buffered public and permissioned JSON
     /// command bodies.
     public let jsonWriteAdmission: PublicRepositoryJSONWriteAdmission
+    /// The anonymous `com.atproto.sync.getBlob` route's own inbound-body
+    /// admission. Deliberately not ``jsonWriteAdmission``: an anonymous read
+    /// must not be able to hold the leases the authenticated JSON commands
+    /// reserve from.
+    public let publicBlobRequestBodyAdmission: PublicRepositoryJSONWriteAdmission
     /// Shared finite total elapsed-time policy for admitted JSON command
     /// bodies. This is distinct from the listener's resettable idle timeout.
     public let jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy
@@ -453,6 +458,7 @@ public struct SwanHTTPServer: Sendable {
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
         jsonReadAdmission: PublicRepositoryJSONReadAdmission? = nil,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
+        publicBlobRequestBodyAdmission: PublicRepositoryJSONWriteAdmission? = nil,
         jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil,
         publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil
     ) {
@@ -475,6 +481,9 @@ public struct SwanHTTPServer: Sendable {
         let resolvedJSONWriteAdmission = jsonWriteAdmission
             ?? PublicRepositoryJSONWriteAdmission.processShared
         self.jsonWriteAdmission = resolvedJSONWriteAdmission
+        let resolvedPublicBlobRequestBodyAdmission = publicBlobRequestBodyAdmission
+            ?? PublicRepositoryJSONWriteAdmission.publicBlobReadProcessShared
+        self.publicBlobRequestBodyAdmission = resolvedPublicBlobRequestBodyAdmission
         let resolvedJSONWriteBodyPolicy = jsonWriteBodyPolicy
             ?? SwanJSONWriteBodyPolicy.productionDefault
         self.jsonWriteBodyPolicy = resolvedJSONWriteBodyPolicy
@@ -963,8 +972,8 @@ public struct SwanHTTPServer: Sendable {
                 jsonReadAdmission: jsonReadAdmission,
                 handleResolution: publicHandleResolution,
                 blobStreamAdmission: blobStreamAdmission,
-                blobRequestBodyAdmission: jsonWriteAdmission,
-                blobRequestBodyPolicy: jsonWriteBodyPolicy
+                blobRequestBodyAdmission: publicBlobRequestBodyAdmission,
+                blobRequestBodyPolicy: .noRequestBodyDefault
             )
         }
         if let publicRepositoryMutations {

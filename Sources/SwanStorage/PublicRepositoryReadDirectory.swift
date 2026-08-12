@@ -679,6 +679,29 @@ public final class PublicRepositoryJSONWriteAdmission: @unchecked Sendable {
         maximumReservedRequestBytes: 2 * 8 * 1_024
     )
 
+    /// Separate capacity for the anonymous `com.atproto.sync.getBlob` no-body
+    /// check.
+    ///
+    /// `getBlob` is a query: it carries no body, and the bytes it reserves
+    /// here are one per request. It nonetheless has to *read* the inbound
+    /// stream far enough to prove no body arrived, and a caller who opens a
+    /// body and never terminates it owns that reservation until the route's
+    /// body deadline expires. On ``processShared`` — eight leases, shared with
+    /// every authenticated space, account-email, and preferences command — a
+    /// handful of anonymous chunked GETs could hold every lease and deny
+    /// authenticated JSON commands on a server with public writes disabled.
+    /// This instance keeps that blast radius inside the public blob route.
+    ///
+    /// The byte dimension is inert: each check reserves one byte. The
+    /// concurrency dimension is the operative bound, and it is deliberately
+    /// wider than ``processShared`` because a stalled reader here holds only a
+    /// single byte and its own listener slot, which the connection limit
+    /// already bounds.
+    public static let publicBlobReadProcessShared = try! PublicRepositoryJSONWriteAdmission(
+        maximumConcurrentWrites: 64,
+        maximumReservedRequestBytes: 64 * 1_024
+    )
+
     private let maximumConcurrentWrites: Int
     private let maximumReservedRequestBytes: Int
     private let lock = NSLock()
