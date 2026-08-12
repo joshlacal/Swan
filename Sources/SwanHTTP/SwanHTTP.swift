@@ -110,13 +110,22 @@ public struct SwanHTTPConfiguration: Sendable, Equatable {
     /// Idle HTTP/1 channels are closed after this interval. Response-stream
     /// admission remains the primary bound for slow blob/CAR consumers.
     public let idleTimeoutSeconds: Int
+    /// What `com.atproto.server.describeServer` reports for
+    /// `inviteCodeRequired`. Swan has no invite-code issuance, redemption, or
+    /// enforcement anywhere in the process, so the only truthful value today
+    /// is `false` and that is the default. The value is configuration rather
+    /// than a literal so that if enforcement is ever added, the advertisement
+    /// is switched on by the same assembly that switches on the enforcement
+    /// instead of by editing a route body.
+    public let inviteCodeRequired: Bool
 
     public init(
         host: String = "127.0.0.1",
         port: Int = 3000,
         publicURL: URL = URL(string: "http://127.0.0.1:3000")!,
         maximumConnections: Int = 256,
-        idleTimeoutSeconds: Int = 60
+        idleTimeoutSeconds: Int = 60,
+        inviteCodeRequired: Bool = false
     ) {
         precondition(maximumConnections > 0)
         precondition(idleTimeoutSeconds > 0)
@@ -125,6 +134,7 @@ public struct SwanHTTPConfiguration: Sendable, Equatable {
         self.publicURL = publicURL
         self.maximumConnections = maximumConnections
         self.idleTimeoutSeconds = idleTimeoutSeconds
+        self.inviteCodeRequired = inviteCodeRequired
     }
 }
 
@@ -749,6 +759,22 @@ public struct SwanHTTPServer: Sendable {
         let publicURL = configuration.publicURL
         let profile = profile
         let oauthPublicationGate = oauthPublicationGate
+        // One derivation, read by both the DID document and describeServer.
+        // A resolver reads `describeServer.did`, fetches the document that DID
+        // names, and compares the two; formatting the identity twice is how
+        // those two answers silently drift apart.
+        let serviceIdentity = SwanServiceIdentity(publicURL: publicURL)
+        let inviteCodeRequired = configuration.inviteCodeRequired
+        // `did:web:<authority>` resolves to
+        // `https://<authority>/.well-known/did.json`, so this route is the
+        // other half of the DID Swan publishes everywhere else. The body is
+        // public, static, non-secret identity data.
+        router.get("/.well-known/did.json") { _, _ -> Response in
+            oauthMetadataJSONResponse(SwanServiceDIDDocument(identity: serviceIdentity))
+        }
+        router.on("/.well-known/did.json", method: .options) { _, _ -> Response in
+            oauthMetadataCORSPreflightResponse()
+        }
         router.get("/.well-known/oauth-protected-resource") { _, _ -> Response in
             guard let metadata = oauthPublicationGate.protectedResourceMetadata() else {
                 return oauthUnavailable()
@@ -825,9 +851,9 @@ public struct SwanHTTPServer: Sendable {
 
         router.get("/xrpc/com.atproto.server.describeServer") { _, _ -> Response in
             jsonResponse(ServerDescription(
-                did: "did:web:\(publicURL.host ?? "localhost")",
+                did: serviceIdentity.did,
                 availableUserDomains: [],
-                inviteCodeRequired: true,
+                inviteCodeRequired: inviteCodeRequired,
                 swanProfile: profile.id
             ))
         }
@@ -1135,6 +1161,72 @@ private struct ServerDescription: Encodable {
         case inviteCodeRequired
         case swanProfile
     }
+}
+
+/// The one derivation of Swan's own service identity from its configured
+/// public URL.
+///
+/// This is the server's identity as a service, not any account's identity: no
+/// account signing key, rotation key, or handle participates. Both
+/// `/.well-known/did.json` and `com.atproto.server.describeServer` read this
+/// value so that a resolver following the DID from one to the other cannot
+/// observe two identities for a single deployment.
+struct SwanServiceIdentity: Sendable, Equatable {
+    /// `did:web:<host>` — with `%3A<port>` appended when the public URL names
+    /// a port other than its scheme's default. Dropping a non-default port
+    /// would publish an identity that resolves to a *different* origin than
+    /// the one actually serving, which is a silent misdirection rather than a
+    /// visible failure.
+    let did: String
+    /// The scheme/host/port origin, with no path, query, or trailing slash.
+    /// This is what the `AtprotoPersonalDataServer` service entry advertises.
+    let serviceEndpoint: String
+
+    init(publicURL: URL) {
+        let scheme = publicURL.scheme?.lowercased() ?? "https"
+        let host = (publicURL.host ?? "localhost").lowercased()
+        let defaultPort = scheme == "http" ? 80 : 443
+        if let port = publicURL.port, port != defaultPort {
+            did = "did:web:\(host)%3A\(port)"
+            serviceEndpoint = "\(scheme)://\(host):\(port)"
+        } else {
+            did = "did:web:\(host)"
+            serviceEndpoint = "\(scheme)://\(host)"
+        }
+    }
+}
+
+/// The DID document served at `/.well-known/did.json`.
+///
+/// It carries no `verificationMethod`: Swan holds no service-level signing key
+/// whose public half it could publish here, and emitting an empty or invented
+/// one would let a verifier believe a key was checked. Account signing keys
+/// belong to account DID documents, which this route never serves.
+private struct SwanServiceDIDDocument: Encodable {
+    let context = ["https://www.w3.org/ns/did/v1"]
+    let id: String
+    let service: [SwanServiceDIDServiceEntry]
+
+    init(identity: SwanServiceIdentity) {
+        id = identity.did
+        service = [SwanServiceDIDServiceEntry(
+            id: "#atproto_pds",
+            type: "AtprotoPersonalDataServer",
+            serviceEndpoint: identity.serviceEndpoint
+        )]
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case context = "@context"
+        case id
+        case service
+    }
+}
+
+private struct SwanServiceDIDServiceEntry: Encodable {
+    let id: String
+    let type: String
+    let serviceEndpoint: String
 }
 
 private func jsonResponse(_ body: some Encodable) -> Response {
