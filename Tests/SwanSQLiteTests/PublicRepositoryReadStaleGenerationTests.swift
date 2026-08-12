@@ -795,6 +795,74 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
         )
     }
 
+    /// The window bounds work; it must bound the journal by the same shape.
+    ///
+    /// Re-emitting the full admission line for every request the window
+    /// suppresses makes journal volume a function of inbound request rate with
+    /// no ceiling, and that rate is set by anonymous callers: one dark account
+    /// plus a relay backfill retrying `getRepo` is a disk-fill path on the
+    /// production box. Nothing is lost by counting instead — the failure that
+    /// opened the window already journalled this DID and this reason in full —
+    /// so each window costs the named failure that opened it plus one rollup
+    /// naming how much traffic ran into it.
+    func testSuppressedReadsAreCountedRatherThanJournalledPerRequest()
+        async throws
+    {
+        let fixture = try await makeFixture()
+
+        _ = try await fixture.directory.publicRepositoryStatus(selector: did)
+        try await commitFromSecondConnection(root: fixture.root)
+        fixture.verifier.rejectEverything()
+
+        let baselineAdmissions = fixture.verifier.admissionCount
+        let baselineLines = await fixture.directory
+            .publicReadAdmissionJournalLineCount()
+        let first = await captureRefusal(fixture.directory, .status)
+        XCTAssertEqual(first, .identityFactsMalformed)
+        let afterFirst = await fixture.directory
+            .publicReadAdmissionJournalLineCount()
+        XCTAssertEqual(
+            afterFirst - baselineLines,
+            1,
+            "the admission that failed must still name itself, once"
+        )
+
+        for _ in 0 ..< 16 {
+            let reason = await captureRefusal(fixture.directory, .status)
+            XCTAssertEqual(reason, .identityFactsMalformed)
+        }
+        // Asserted so a window that expired mid-loop fails the test rather
+        // than quietly making the line count below prove nothing.
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baselineAdmissions,
+            1,
+            "precondition: every read above ran inside one backoff window"
+        )
+        let afterSuppressed = await fixture.directory
+            .publicReadAdmissionJournalLineCount()
+        XCTAssertEqual(
+            afterSuppressed - baselineLines,
+            1,
+            "reads suppressed by the window must not each write a warning"
+        )
+
+        // Retirement reports what the window absorbed — once, with a count,
+        // rather than sixteen times.
+        fixture.verifier.acceptEverything()
+        try await Task.sleep(for: .milliseconds(500))
+        let recovered = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        XCTAssertNotNil(recovered)
+        let afterRetirement = await fixture.directory
+            .publicReadAdmissionJournalLineCount()
+        XCTAssertEqual(
+            afterRetirement - baselineLines,
+            2,
+            "one rollup line for the whole window, not one per suppressed read"
+        )
+    }
+
     private enum MutationFixtureFailure: Error {
         /// The fixture's own write could not be set up. Reported as a fixture
         /// fault rather than folded into the assertions under test.

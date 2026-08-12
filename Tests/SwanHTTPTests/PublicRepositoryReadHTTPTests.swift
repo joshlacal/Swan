@@ -694,6 +694,109 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    // Production mutation caught: every 503 on these anonymous routes wrote a
+    // `.warning`, so one persistently unavailable account let any caller set
+    // the service journal's growth rate — a disk-fill path with no ceiling.
+    func testPublicReadDiagnosticThrottleReportsRepeatsOncePerWindow() {
+        let throttle = PublicReadDiagnosticThrottle(window: .seconds(1))
+        let start = ContinuousClock.now
+
+        XCTAssertEqual(
+            throttle.admit(method: "m", reason: "r", now: start),
+            0,
+            "the first refusal of a distinct pair is always journalled"
+        )
+        for offset in 1 ... 5 {
+            XCTAssertNil(
+                throttle.admit(
+                    method: "m",
+                    reason: "r",
+                    now: start.advanced(by: .milliseconds(offset * 100))
+                ),
+                "an identical refusal inside the window is counted, not logged"
+            )
+        }
+
+        // A different failure is never delayed or hidden by an ongoing one:
+        // the bound is per distinct failure, not global.
+        XCTAssertEqual(
+            throttle.admit(
+                method: "m",
+                reason: "other",
+                now: start.advanced(by: .milliseconds(100))
+            ),
+            0
+        )
+        XCTAssertEqual(
+            throttle.admit(
+                method: "other",
+                reason: "r",
+                now: start.advanced(by: .milliseconds(100))
+            ),
+            0
+        )
+
+        // Past the window the repeats are reported once, with their count,
+        // and the count is not carried forward a second time.
+        XCTAssertEqual(
+            throttle.admit(
+                method: "m", reason: "r", now: start.advanced(by: .seconds(2))
+            ),
+            5
+        )
+        XCTAssertEqual(
+            throttle.admit(
+                method: "m", reason: "r", now: start.advanced(by: .seconds(4))
+            ),
+            0
+        )
+    }
+
+    // Production mutation caught: the throttle above bounds nothing unless the
+    // one function every public-read 503 leaves through consults it.
+    func testRepeatedUnavailableReadsJournalOnceNotOncePerRequest() async throws {
+        let fixture = try await makeFixture(
+            identityOrigin: "https://other.example"
+        )
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let app = fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryReadHTTPTests.log-volume")
+        )
+        publicReadDiagnosticThrottle.resetForTesting()
+        let baseline = publicReadDiagnosticJournalLines.withLock { $0 }
+
+        try await app.test(.router) { client in
+            for _ in 0 ..< 12 {
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.repo.describeRepo?repo=\(self.did)",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    XCTAssertEqual(
+                        try self.object(response.body)["error"] as? String,
+                        "temporarily_unavailable",
+                        "the client-visible body must not change"
+                    )
+                }
+            }
+        }
+
+        let emitted = publicReadDiagnosticJournalLines.withLock { $0 }
+            - baseline
+        XCTAssertGreaterThanOrEqual(
+            emitted,
+            1,
+            "the refusal must still be journalled — a suppressed 503 is a "
+                + "silent one, which is the outage this series exists to end"
+        )
+        XCTAssertLessThanOrEqual(
+            emitted,
+            2,
+            "journal volume must track distinct failures, not request rate"
+        )
+        try await fixture.control.close()
+    }
+
     // Production mutation caught: the HTTP layer classified its 503 log line
     // through `unavailableReason`, which answers nil for the one admission
     // refusal that carries no reason of its own. A read refused by the

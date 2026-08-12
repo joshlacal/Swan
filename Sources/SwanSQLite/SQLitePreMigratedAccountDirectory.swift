@@ -50,10 +50,20 @@ public actor SQLitePreMigratedAccountDirectory:
     private struct PublicReadReadmissionFailure {
         let reason: PublicReadUnavailableReason
         let expiresAt: ContinuousClock.Instant
+        /// Reads this entry refused without re-running the admission. Counted
+        /// rather than journalled per request; see
+        /// ``retirePublicReadReadmissionFailure(did:)``.
+        var suppressedReads = 0
     }
 
     private var publicReadReadmissionFailures:
         [String: PublicReadReadmissionFailure] = [:]
+    /// Test seam: how many public-read admission lines this directory has
+    /// written to the service journal. Incremented at the two sites that emit
+    /// one and nowhere else, so a test can assert that journal volume tracks
+    /// distinct admission failures rather than inbound request rate. Never
+    /// consulted by production code.
+    private var publicReadAdmissionJournalLines = 0
     private var isClosed = false
 
     /// How long a failed re-admission suppresses the next one for that DID.
@@ -1521,12 +1531,12 @@ public actor SQLitePreMigratedAccountDirectory:
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                throw Self.namedPostMutationRefreshFailure(
+                throw namedPostMutationRefreshFailure(
                     .controlStoreFailure, did: did
                 )
             }
             guard let account = resolved else {
-                throw Self.namedPostMutationRefreshFailure(
+                throw namedPostMutationRefreshFailure(
                     .controlRowChanged, did: did
                 )
             }
@@ -1542,7 +1552,7 @@ public actor SQLitePreMigratedAccountDirectory:
             publicReadGenerations.removeValue(forKey: did)
         } catch {
             publicReadGenerations.removeValue(forKey: did)
-            Self.logPublicReadAdmissionFailure(
+            logPublicReadAdmissionFailure(
                 .unavailable(reason: .postMutationRefreshFailed),
                 did: did
             )
@@ -1557,7 +1567,7 @@ public actor SQLitePreMigratedAccountDirectory:
     /// ones that would otherwise refuse silently. Every post-mutation refresh
     /// failure therefore leaves exactly one line naming the cause, followed by
     /// one naming the eviction.
-    private static func namedPostMutationRefreshFailure(
+    private func namedPostMutationRefreshFailure(
         _ reason: PublicReadUnavailableReason,
         did: String
     ) -> PublicRepositoryReadError {
@@ -1781,15 +1791,24 @@ public actor SQLitePreMigratedAccountDirectory:
                 // Suppress the work, never the refusal. The caller sees the
                 // same reason it would have seen from a re-run admission, and
                 // the client sees the same 503 body; the record-index walk is
-                // what does not happen. Journalled exactly as a live admission
-                // failure is, so the reason stays greppable per request.
-                let error = PublicRepositoryReadError.unavailable(
+                // what does not happen.
+                //
+                // The line is *not* re-emitted here. The failure that opened
+                // this window was already journalled in full by the admission
+                // that failed, with this same reason and DID, so a second
+                // line per suppressed request carries no new information and
+                // scales with inbound request rate rather than with distinct
+                // failures. One dark account plus a relay retrying `getRepo`
+                // is then a disk-fill path on the production box. The reads
+                // are counted instead and reported once, when the window
+                // retires.
+                publicReadReadmissionFailures[account.did]?
+                    .suppressedReads += 1
+                throw PublicRepositoryReadError.unavailable(
                     reason: failure.reason
                 )
-                Self.logPublicReadAdmissionFailure(error, did: account.did)
-                throw error
             }
-            publicReadReadmissionFailures.removeValue(forKey: account.did)
+            retirePublicReadReadmissionFailure(did: account.did)
         }
         let admission: Task<SQLiteVerifiedPublicRepositoryGeneration, any Error>
         if let inFlight = publicReadReadmissions[account.did] {
@@ -1980,7 +1999,7 @@ public actor SQLitePreMigratedAccountDirectory:
             // clears it — a cold-cache refresh, a successful re-admission, and
             // `refreshPublicReadGenerationAfterMutation` alike. Recovery that
             // has an event to hang off never waits out the window.
-            publicReadReadmissionFailures.removeValue(forKey: account.did)
+            retirePublicReadReadmissionFailure(did: account.did)
             return generation
         } catch is CancellationError {
             // A caller hanging up is not an admission refusal. Rethrow it
@@ -1988,7 +2007,7 @@ public actor SQLitePreMigratedAccountDirectory:
             // happen.
             throw CancellationError()
         } catch let error as PublicRepositoryReadError {
-            Self.logPublicReadAdmissionFailure(error, did: account.did)
+            logPublicReadAdmissionFailure(error, did: account.did)
             throw error
         } catch let error as PublicRepositoryMutationStoreError
             where error == .corruptRepository
@@ -1999,13 +2018,13 @@ public actor SQLitePreMigratedAccountDirectory:
             let named = PublicRepositoryReadError.unavailable(
                 reason: .blockMaterializationFailed
             )
-            Self.logPublicReadAdmissionFailure(named, did: account.did)
+            logPublicReadAdmissionFailure(named, did: account.did)
             throw named
         } catch {
             let named = PublicRepositoryReadError.unavailable(
                 reason: .storageFailure
             )
-            Self.logPublicReadAdmissionFailure(named, did: account.did)
+            logPublicReadAdmissionFailure(named, did: account.did)
             throw named
         }
     }
@@ -2022,15 +2041,61 @@ public actor SQLitePreMigratedAccountDirectory:
     /// with `resourceLimitExceeded`, which carries no reason of its own, and
     /// reading the bare reason here reproduced the silent-503 the outage was
     /// about for exactly that failure.
-    private static func logPublicReadAdmissionFailure(
+    private func logPublicReadAdmissionFailure(
         _ error: PublicRepositoryReadError,
         did: String
     ) {
         guard let reason = error.admissionFailureReason else { return }
+        publicReadAdmissionJournalLines += 1
         publicReadDiagnosticLog.warning(
             "public read admission refused",
             fields: ["did": did, "reason": reason.rawValue]
         )
+    }
+
+    /// Drops one negative-cache entry and reports, once, how many reads it
+    /// refused without re-running the admission.
+    ///
+    /// The window bounds *work*; this bounds the journal for the same reason
+    /// and by the same shape. A persistently unadmittable account is read by
+    /// the whole network once Swan is announced to a relay, so a line per
+    /// suppressed request makes journal volume a function of inbound request
+    /// rate with no ceiling — a disk-fill path, and one an anonymous caller
+    /// controls. What an operator needs is already carried by the full line
+    /// the failed admission wrote when it opened the window; the only thing
+    /// missing from it is how much traffic ran into that window, which is one
+    /// integer. So each window costs at most two lines: the named failure that
+    /// opened it, and this rollup. Volume tracks distinct admission failures,
+    /// which is what a diagnosis is made of.
+    ///
+    /// Retirement is lazy — the next read past the expiry runs it, and that
+    /// read then pays a real admission whose own outcome is journalled — and
+    /// it also runs from the publish site, so a recovered account reports its
+    /// suppressed reads immediately rather than at some later read.
+    ///
+    /// The teardown paths (`revokeAndDrainAccount`, `close`) deliberately drop
+    /// entries without a rollup. An account being revoked or a directory
+    /// closing is not a diagnosis moment, and every read those entries
+    /// suppressed was already refused with the reason the opening line names.
+    private func retirePublicReadReadmissionFailure(did: String) {
+        guard let failure = publicReadReadmissionFailures
+            .removeValue(forKey: did),
+            failure.suppressedReads > 0 else { return }
+        publicReadAdmissionJournalLines += 1
+        publicReadDiagnosticLog.warning(
+            "public read admission refusals suppressed",
+            fields: [
+                "did": did,
+                "reason": failure.reason.rawValue,
+                "suppressedReads": String(failure.suppressedReads),
+            ]
+        )
+    }
+
+    /// Test seam: journal lines this directory has emitted for public-read
+    /// admission failures. Never consulted by production code.
+    func publicReadAdmissionJournalLineCount() -> Int {
+        publicReadAdmissionJournalLines
     }
 
     private func recheckPublicAccount(

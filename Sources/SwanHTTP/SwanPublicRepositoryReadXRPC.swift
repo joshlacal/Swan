@@ -8,6 +8,7 @@ import SwanCore
 import SwanPublicRepository
 import SwanPublicWire
 import SwanStorage
+import Synchronization
 
 /// Server-side diagnostics for the unauthenticated public read path. Stable
 /// identifiers only — never payloads, credentials, or repository content.
@@ -1358,15 +1359,115 @@ private func publicReadUnavailable(
     method: String,
     selector: String?
 ) -> Response {
+    guard let suppressed = publicReadDiagnosticThrottle.admit(
+        method: method, reason: reason
+    ) else {
+        return publicReadError(.serviceUnavailable, "temporarily_unavailable")
+    }
     var fields = ["method": method, "reason": reason]
     if let selector,
        AccountControlIdentifiers.isDID(selector)
        || AccountControlIdentifiers.isCanonicalHandle(selector) {
         fields["selector"] = selector
     }
+    if suppressed > 0 {
+        fields["suppressedRepeats"] = String(suppressed)
+    }
+    publicReadDiagnosticJournalLines.withLock { $0 += 1 }
     publicReadDiagnosticLog.warning("public read unavailable", fields: fields)
     return publicReadError(.serviceUnavailable, "temporarily_unavailable")
 }
+
+/// Test seam: public-read 503 lines this module has written, counted at the one
+/// site that writes them. Never read by production code — it exists so a route
+/// test can assert that journal volume stops tracking request count, which is
+/// invisible from a response body.
+let publicReadDiagnosticJournalLines = Mutex(0)
+
+/// One window per distinct public-read refusal, so journal volume tracks
+/// distinct failures rather than inbound request rate.
+///
+/// Every 503 on these routes writes a `.warning`, and every one of these routes
+/// is anonymous. A persistently unadmittable account therefore let any caller —
+/// or a relay backfill retrying `getRepo` and `listRecords` — set the service
+/// journal's growth rate directly, with no ceiling. That is a disk-fill path on
+/// the production box, and it arrived through the very work that made these
+/// refusals loud.
+///
+/// The information the line carries is the pair (method, reason): which route
+/// refused and which guard refused it. Repeating that pair adds nothing, so the
+/// first refusal in a window is journalled in full and the rest are counted,
+/// with the count folded into the next window's line as `suppressedRepeats`. A
+/// *new* pair is never delayed or dropped: a route or guard that has not been
+/// seen in this window journals immediately, so a second, different failure
+/// arriving during an ongoing one stays visible. The 503 itself is unaffected —
+/// the client sees the same body on every request, journalled or not.
+///
+/// The key space is bounded by construction: `method` is a literal at each call
+/// site and `reason` is a `PublicReadUnavailableReason` or a
+/// `PublicReadHandlerGuard` raw value, so it cannot be grown by request input.
+/// ``maximumKeys`` restates that as an invariant rather than an argument, and
+/// declines to *track* rather than declining to log if it is ever reached: the
+/// fallback is the unbounded-line behaviour that shipped before, which only a
+/// build with hundreds of distinct guards could reach.
+final class PublicReadDiagnosticThrottle: Sendable {
+    private struct Window {
+        var expiresAt: ContinuousClock.Instant
+        var suppressed: Int
+    }
+
+    private let window: Duration
+    private let maximumKeys: Int
+    private let windows = Mutex([String: Window]())
+
+    init(window: Duration, maximumKeys: Int = 512) {
+        self.window = window
+        self.maximumKeys = maximumKeys
+    }
+
+    /// The number of repeats to report alongside this line, or `nil` when the
+    /// line must not be written because an identical one is already live.
+    func admit(
+        method: String,
+        reason: String,
+        now: ContinuousClock.Instant = .now
+    ) -> Int? {
+        let key = "\(method)|\(reason)"
+        return windows.withLock { windows in
+            if let live = windows[key], live.expiresAt > now {
+                windows[key]?.suppressed += 1
+                return nil
+            }
+            let suppressed = windows[key]?.suppressed ?? 0
+            if windows[key] == nil, windows.count >= maximumKeys {
+                windows = windows.filter { $0.value.expiresAt > now }
+                guard windows.count < maximumKeys else { return 0 }
+            }
+            windows[key] = Window(
+                expiresAt: now.advanced(by: window), suppressed: 0
+            )
+            return suppressed
+        }
+    }
+
+    /// Test seam: forgets every window. Production has no reason to call this;
+    /// a test does, because the throttle is process-wide and a window opened by
+    /// one test would otherwise silence the next.
+    func resetForTesting() {
+        windows.withLock { $0 = [:] }
+    }
+}
+
+/// How long one distinct (method, reason) refusal stays journalled-once.
+///
+/// Short enough that an operator watching a live incident sees the refusal
+/// reappear at a readable cadence, long enough that a saturating anonymous
+/// caller cannot push line rate past one per second per distinct failure.
+private let publicReadDiagnosticWindow = Duration.seconds(1)
+
+let publicReadDiagnosticThrottle = PublicReadDiagnosticThrottle(
+    window: publicReadDiagnosticWindow
+)
 
 /// Names the guard behind one 503 for the journal line above.
 ///
