@@ -156,11 +156,17 @@ a profile has no matching registry.
   relay never calls them. They were ranked P0 on the assumption that relays
   enumerate a PDS during onboarding; reading indigo's source disproved that.
   Revisit when a consumer that actually needs them appears.
-- The `createSession` / app-password family — this needs a **decision** before
-  code: is Swan OAuth-only? The code strongly implies yes, and leaving
-  `createSession` proxyable once leaked account passwords to a caller-named
-  service. If yes, document it and return method-correct `501 NotImplemented`
-  so clients get an actionable error instead of 401.
+- The `createSession` / app-password family — **moved to its own design**, not
+  dropped. This spec originally proposed closing it out with `501
+  NotImplemented` on the reasoning that Swan is OAuth-only. That was overruled:
+  the official Bluesky app needs legacy auth, so it gets implemented, with
+  tranquil-style **scoped** app passwords rather than Bluesky's all-or-nothing
+  model. See `2026-08-12-swan-scoped-app-passwords-design.md`. It is a
+  week-plus of new construction — scopes are recorded but never enforced per
+  method today — so it is sequenced separately rather than folded in here.
+  (The earlier plaintext-password incident was about leaving `createSession`
+  *proxyable*; implementing it **locally** is unaffected, and `com.atproto.*`
+  remains excluded from the proxyable prefixes.)
 - Invite codes — no mechanism, and D9 removes the false advertisement.
 
 ### W3 — Relay activation
