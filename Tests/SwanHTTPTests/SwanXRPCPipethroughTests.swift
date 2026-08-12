@@ -1087,6 +1087,253 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(recorded.last?.url.host, "labeler.example")
     }
 
+    // MARK: Route before authenticating
+
+    /// Swan authenticated before it routed, so every NSID this host does not
+    /// implement answered 401 instead of 404 — indistinguishable, from the
+    /// outside, from a credential problem. That is why the missing-route list
+    /// stayed invisible: a relay, an AppView, or another PDS probing Swan
+    /// anonymously saw "unauthorized" everywhere and could not report which
+    /// methods were actually absent.
+    ///
+    /// Routing may safely run first because it is pure — no I/O, no trust
+    /// decision, no credential read. The first step that opens a socket is the
+    /// endpoint resolver, and that still runs after authentication (see
+    /// `testAnonymousCallerStillCannotCauseAnOutboundConnection`).
+    func testUnknownNSIDReturns404NotUnauthorized() async throws {
+        let sender = RecordingProxySender()
+        let attempts = PipethroughCallRecorder()
+        // No Authorization header, modelled as the `.denied` outcome
+        // `SwanOAuthResourceAuthorizer` produces for a credential-less request.
+        // If routing ran after authentication these would all be 401.
+        let authorizer = PipethroughAuthorizer(result: .failure(.denied), attempts: attempts)
+        try await withPipethrough(sender: sender, authorizer: authorizer) { client in
+            for uri in [
+                "/xrpc/com.atproto.identity.resolveHandle?handle=alice.test",
+                "/xrpc/com.atproto.sync.getRepoStatus?did=did:plc:x",
+                "/xrpc/com.atproto.server.createSession",
+                "/xrpc/com.example.unknown.method",
+            ] {
+                try await client.execute(uri: uri, method: .get) { response in
+                    XCTAssertEqual(response.status, .notFound, "for \(uri)")
+                    // The 404 is the route surface's own opaque shape, not some
+                    // other layer answering by coincidence.
+                    XCTAssertEqual(
+                        self.body(response),
+                        #"{"error":"EndpointUnavailable"}"#,
+                        "for \(uri)"
+                    )
+                }
+            }
+        }
+        // An unrouted NSID costs no credential work at all.
+        XCTAssertEqual(attempts.count, 0)
+        XCTAssertEqual(sender.recorded().count, 0)
+    }
+
+    /// `blue.catbird.*` and `com.atproto.space.*` are Swan-owned namespaces the
+    /// router denies outright. Those refusals are decided from the request
+    /// target alone, so they must cost no credential validation — asserted with
+    /// an authorizer that would *succeed* if it were consulted, because a
+    /// status-only assertion cannot tell "refused before authenticating" from
+    /// "authenticated, then refused".
+    func testDeniedNamespaceReturns404WithoutTouchingCredentials() async throws {
+        let sender = RecordingProxySender()
+        let attempts = PipethroughCallRecorder()
+        let authorizer = PipethroughAuthorizer(
+            result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"])),
+            attempts: attempts
+        )
+        let steered: HTTPFields = {
+            var headers = HTTPFields()
+            // An explicit destination must not change the answer either.
+            headers[HTTPField.Name("atproto-proxy")!] = "did:web:evil.example#atproto_pds"
+            return headers
+        }()
+        try await withPipethrough(sender: sender, authorizer: authorizer) { client in
+            for uri in [
+                "/xrpc/blue.catbird.anything.here",
+                "/xrpc/com.atproto.space.getSpace",
+                // Denied by exact NSID rather than by prefix.
+                "/xrpc/app.bsky.actor.getPreferences",
+            ] {
+                try await client.execute(uri: uri, method: .get, headers: steered) { response in
+                    XCTAssertEqual(response.status, .notFound, "for \(uri)")
+                    // The same opaque body an unrouted namespace gets: a client
+                    // still cannot enumerate which namespaces Swan reserves.
+                    XCTAssertEqual(
+                        self.body(response),
+                        #"{"error":"EndpointUnavailable"}"#,
+                        "for \(uri)"
+                    )
+                }
+            }
+        }
+        XCTAssertEqual(attempts.count, 0)
+        XCTAssertEqual(sender.recorded().count, 0)
+    }
+
+    /// The invariant the reordering must preserve. Routing first is only sound
+    /// because routing is pure; everything that reaches the network — the DID
+    /// document resolver and the proxy sender — has to stay behind
+    /// authentication. Both are instrumented here, and the route chosen is one
+    /// that genuinely needs resolution, with a DID document that genuinely
+    /// resolves, so an ordering mistake would show up as real outbound work
+    /// rather than as a failure for want of an endpoint.
+    func testAnonymousCallerStillCannotCauseAnOutboundConnection() async throws {
+        let sender = RecordingProxySender()
+        let attempts = PipethroughCallRecorder()
+        let fetches = PipethroughCallRecorder()
+        let documents = StubDIDDocuments(
+            documents: [
+                "did:web:feeds.example": Data(
+                    """
+                    {"id":"did:web:feeds.example","service":[
+                      {"id":"#bsky_fg","type":"BskyFeedGenerator",
+                       "serviceEndpoint":"https://feeds.example"}]}
+                    """.utf8
+                )
+            ],
+            fetches: fetches
+        )
+        let authorizer = PipethroughAuthorizer(result: .failure(.denied), attempts: attempts)
+        let named: HTTPFields = {
+            var headers = HTTPFields()
+            headers[HTTPField.Name("atproto-proxy")!] = "did:web:feeds.example#bsky_fg"
+            return headers
+        }()
+        try await withPipethrough(
+            sender: sender,
+            authorizer: authorizer,
+            documents: documents
+        ) { client in
+            // Routable and resolvable: only authentication stands between this
+            // request and an outbound socket.
+            try await client.execute(
+                uri: "/xrpc/app.bsky.feed.getFeedSkeleton?feed=at://x",
+                method: .get,
+                headers: named
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+            // The default AppView route, which needs no resolution at all but
+            // still reaches the sender when authenticated.
+            try await client.execute(
+                uri: "/xrpc/app.bsky.feed.getTimeline",
+                method: .get
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+            // A POST, whose body must not be buffered either.
+            try await client.execute(
+                uri: "/xrpc/app.bsky.notification.updateSeen",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(string: #"{"seenAt":"2026-08-12T00:00:00Z"}"#)
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+        // Authentication really was reached and really did refuse: these are
+        // proxyable namespaces, so routing let them through to the authorizer
+        // rather than 404ing them for an unrelated reason.
+        XCTAssertEqual(attempts.count, 3)
+        // And nothing outbound happened. The resolver is the first step that
+        // opens a socket in production; it never ran, nor did the sender.
+        XCTAssertEqual(fetches.count, 0)
+        XCTAssertEqual(sender.recorded().count, 0)
+    }
+
+    /// The same reordering, measured through the real production router rather
+    /// than through a router carrying only this capability.
+    ///
+    /// This is the shape that actually matters operationally: the reason Swan's
+    /// missing-route list was invisible is that an anonymous prober — a relay,
+    /// an AppView, another PDS, an operator with `curl` — got 401 from
+    /// `buildRouter()`'s composed surface. A capability-only test cannot show
+    /// that, because it cannot show the fallback still being reached after
+    /// every local registration has had its chance.
+    func testProductionRouterAnswers404NotUnauthorizedToAnAnonymousProbe() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "SwanXRPCPipethroughAnonymousProbe-\(UUID().uuidString)")
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let runtime = try SwanOAuthRuntime(
+                controlStore: control,
+                serverKey: Data(repeating: 0x3E, count: 32)
+            )
+            let sender = RecordingProxySender()
+            let attempts = PipethroughCallRecorder()
+            let profile = try ProtocolProfile.load(
+                from: packageRoot().appending(
+                    path: "Profiles/permissioned-data-0016-2026-07-30.json"
+                )
+            )
+            let server = SwanHTTPServer(
+                profile: profile,
+                configuration: .init(
+                    host: "127.0.0.1",
+                    port: 3_000,
+                    publicURL: URL(string: "http://127.0.0.1:3000")!
+                ),
+                oauthRuntime: runtime,
+                actorPreferencesXRPC: SwanActorPreferencesXRPCServer(
+                    authorizer: PipethroughAuthorizer(
+                        result: .success(
+                            .accountOAuth(subject: Self.did, scopes: ["atproto"])
+                        )
+                    ),
+                    store: control
+                ),
+                // Anonymous: the pipethrough authorizer refuses everything.
+                xrpcPipethrough: try makeCapability(
+                    sender: sender,
+                    authorizer: PipethroughAuthorizer(
+                        result: .failure(.denied),
+                        attempts: attempts
+                    )
+                )
+            )
+            let app = server.buildApplication(
+                logger: Logger(label: "SwanXRPCPipethroughTests.anonymous-probe")
+            )
+            try await app.test(.live) { client in
+                // Methods nothing in the composed router implements. Every one
+                // of these answered 401 before routing moved ahead of
+                // authentication.
+                for uri in [
+                    "/xrpc/com.atproto.identity.resolveHandle?handle=alice.test",
+                    "/xrpc/com.atproto.server.createSession",
+                    "/xrpc/com.atproto.admin.getAccountInfo?did=did:plc:x",
+                    "/xrpc/com.atproto.temp.checkSignupQueue",
+                    "/xrpc/com.example.unknown.method",
+                ] {
+                    try await client.execute(uri: uri, method: .get) { response in
+                        XCTAssertEqual(response.status, .notFound, "for \(uri)")
+                    }
+                }
+                // The counterpart: a namespace Swan really does proxy still
+                // demands credentials, so this is not a blanket 404.
+                try await client.execute(
+                    uri: "/xrpc/app.bsky.feed.getTimeline",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+            }
+            // Exactly one of the six probes was proxyable enough to reach the
+            // authorizer at all; the other five were answered from the request
+            // target alone.
+            XCTAssertEqual(attempts.count, 1)
+            XCTAssertEqual(sender.recorded().count, 0)
+            try await control.close()
+        } catch {
+            try? await control.close()
+            throw error
+        }
+    }
+
     // MARK: Composition
 
     /// Regression guard for the fallback existing but never being composed
@@ -1319,6 +1566,27 @@ private enum PipethroughTestFailure: Error {
     case malformedJWT
 }
 
+/// Counts how many times a test double was consulted, from inside a
+/// `@Sendable` handler. `PipethroughFlag`'s counting sibling: a boolean cannot
+/// distinguish "never reached" from "reached once", and the ordering tests
+/// below turn on exactly that distinction.
+private final class PipethroughCallRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func record() {
+        lock.lock()
+        value += 1
+        lock.unlock()
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 /// A one-way flag settable from inside a `@Sendable` response assertion.
 private final class PipethroughFlag: @unchecked Sendable {
     private let lock = NSLock()
@@ -1344,6 +1612,19 @@ private struct PipethroughAuthorizer:
     SwanActorPreferencesResourceAuthorizing
 {
     let result: Result<AuthorizationContext, SwanResourceAuthorizationFailure>
+    /// Counts `authorizePipethrough` calls only. Several tests turn on the
+    /// authorizer never being consulted at all, which is not the same claim as
+    /// "it was consulted and refused" — the status code alone cannot tell the
+    /// two apart, because both end at a 404 for a denied namespace.
+    let attempts: PipethroughCallRecorder
+
+    init(
+        result: Result<AuthorizationContext, SwanResourceAuthorizationFailure>,
+        attempts: PipethroughCallRecorder = PipethroughCallRecorder()
+    ) {
+        self.result = result
+        self.attempts = attempts
+    }
 
     func authorizePipethrough(
         request: Request,
@@ -1351,7 +1632,8 @@ private struct PipethroughAuthorizer:
         fixedPath: String,
         now: Date
     ) async throws -> AuthorizationContext {
-        try result.get()
+        attempts.record()
+        return try result.get()
     }
 
     func issuePipethroughNonce(now: Date) async -> String { "test-nonce" }
@@ -1392,8 +1674,18 @@ private struct TestProxyServiceTokenIssuer: SwanProxyServiceTokenIssuing {
 
 private struct StubDIDDocuments: SwanDIDDocumentFetching {
     let documents: [String: Data]
+    /// Resolution is the first step in the handler that would open a socket in
+    /// production, so "was the resolver reached" is the observable proxy for
+    /// "did an anonymous caller cause outbound work".
+    let fetches: PipethroughCallRecorder
+
+    init(documents: [String: Data], fetches: PipethroughCallRecorder = PipethroughCallRecorder()) {
+        self.documents = documents
+        self.fetches = fetches
+    }
 
     func documentJSON(forDID did: String) async throws -> Data {
+        fetches.record()
         guard let data = documents[did] else {
             throw SwanError.unavailable("no stub DID document")
         }

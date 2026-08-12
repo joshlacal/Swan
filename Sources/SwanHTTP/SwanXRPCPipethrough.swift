@@ -318,20 +318,24 @@ private func handleSwanXRPCPipethrough(
             throw SwanXRPCPipethroughFailure.notFound
         }
 
-        // 2. Authentication comes before routing and before any outbound work,
-        //    so an anonymous caller can never make Swan open a socket.
-        let subject = try await authorizedPipethroughSubject(
-            request,
-            method: method,
-            path: "/xrpc/\(nsid)",
-            authorizer: capability.authorizer,
-            now: now
-        )
-
-        // 3. Routing. `.denied`/`.unrouted` are 404; a malformed proxy header
-        //    is 400 and never silently becomes the default AppView. Header
-        //    extraction is deliberately outside the inner `do`: an unusable
-        //    header must reach the 400 path, not the routing failure switch.
+        // 2. Routing, which comes before authentication. `.denied`/`.unrouted`
+        //    are 404; a malformed proxy header is 400 and never silently
+        //    becomes the default AppView. Header extraction is deliberately
+        //    outside the inner `do`: an unusable header must reach the 400
+        //    path, not the routing failure switch.
+        //
+        //    Routing used to run *after* authentication, which meant every NSID
+        //    this host does not implement answered 401 rather than 404 —
+        //    indistinguishable, from outside, from a credential problem. Swan's
+        //    missing-route list stayed invisible for exactly that reason: a
+        //    relay, an AppView, or another PDS probing anonymously saw
+        //    "unauthorized" everywhere and could not report what was absent.
+        //
+        //    Nothing here reads a credential or does I/O — `SwanXRPCProxyRouter`
+        //    is pure and `pipethroughProxyHeader` only reads one inbound header
+        //    — so deciding the route first hands an anonymous caller nothing
+        //    but a status code. The first step that opens a socket is the
+        //    resolver at step 5, and it stays behind step 3.
         let proxyHeader = try pipethroughProxyHeader(request.headers)
         let route: SwanXRPCProxyRoute
         do {
@@ -348,12 +352,23 @@ private func handleSwanXRPCPipethrough(
             }
         }
 
-        // 3b. The query string is validated here, before the resolver, the
-        //     token issuer, or the sender can be reached, so an unforwardable
-        //     query costs the host nothing outbound. `pipethroughOutbound
-        //     Request` re-checks it — it is a separate entry point, and the
-        //     consequence of admitting a bad byte there is a process kill, not
-        //     a bad request.
+        // 3. Authentication, before the body is buffered, before a concurrency
+        //    slot is taken, and before any outbound work, so an anonymous
+        //    caller can never make Swan open a socket.
+        let subject = try await authorizedPipethroughSubject(
+            request,
+            method: method,
+            path: "/xrpc/\(nsid)",
+            authorizer: capability.authorizer,
+            now: now
+        )
+
+        // 4. The query string is validated here, before the resolver, the
+        //    token issuer, or the sender can be reached, so an unforwardable
+        //    query costs the host nothing outbound. `pipethroughOutbound
+        //    Request` re-checks it — it is a separate entry point, and the
+        //    consequence of admitting a bad byte there is a process kill, not
+        //    a bad request.
         _ = try pipethroughForwardableQuery(request.uri.query)
 
         // The body is buffered only once the request is known to be
@@ -372,8 +387,10 @@ private func handleSwanXRPCPipethrough(
         }
         defer { lease.release() }
 
-        // 4. Endpoint selection. The configured AppView needs no lookup; any
-        //    other service is resolved from its DID document.
+        // 5. Endpoint selection. The configured AppView needs no lookup; any
+        //    other service is resolved from its DID document. This is the
+        //    first step that can reach the network, and it is deliberately
+        //    downstream of step 3.
         let audience: String
         let endpoint: URL
         switch route {
@@ -389,7 +406,7 @@ private func handleSwanXRPCPipethrough(
             }
         }
 
-        // 5. The service token. `lxm` binds it to this exact method, so a
+        // 6. The service token. `lxm` binds it to this exact method, so a
         //    remote service cannot replay it against another endpoint.
         let token: String
         do {
@@ -403,7 +420,7 @@ private func handleSwanXRPCPipethrough(
             throw SwanXRPCPipethroughFailure.unavailable
         }
 
-        // 6. The outbound request: path and query verbatim, the minted token,
+        // 7. The outbound request: path and query verbatim, the minted token,
         //    and only allow-listed headers.
         let outbound = try pipethroughOutboundRequest(
             request,
@@ -414,7 +431,7 @@ private func handleSwanXRPCPipethrough(
             body: body
         )
 
-        // 7. Send through the peer-pinned sender. This is the only thing
+        // 8. Send through the peer-pinned sender. This is the only thing
         //    stopping a hostile `serviceEndpoint` from reaching an internal
         //    address, so a resolved endpoint must never bypass it.
         let response: OAuthRemoteHTTPResponse
