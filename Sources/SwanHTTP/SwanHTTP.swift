@@ -378,10 +378,12 @@ public struct SwanHTTPServer: Sendable {
     /// inventory. It contains no authorization or permissioned-data fallback.
     public let publicRepositoryReadDirectory: (any PublicRepositoryReadDirectory)?
     /// Unauthenticated `com.atproto.identity.resolveHandle`. It is formed
-    /// whenever an account control store is configured and is deliberately
-    /// independent of ``publicRepositoryReadDirectory``: handle resolution
-    /// reads one control row and must keep working when repository generation
-    /// admission does not.
+    /// whenever an account control store is configured, and its route is
+    /// installed only alongside ``publicRepositoryReadDirectory`` — a server
+    /// exposing no public reads must not expose an anonymous handle->DID
+    /// oracle. It depends on none of that directory's *health*: handle
+    /// resolution reads one control row and keeps working when repository
+    /// generation admission does not.
     public let publicHandleResolution: SwanPublicHandleResolutionCapability?
     /// Explicitly opt-in public mutation capability. Public reads never imply
     /// this capability, and it is only formed alongside the server-bound
@@ -949,21 +951,18 @@ public struct SwanHTTPServer: Sendable {
         // public route receives permissioned repositories or credential
         // readers, and streaming endpoints never invoke Data-shaped generated
         // handlers.
+        // resolveHandle is registered from inside this call, so it exists only
+        // on a server that already exposes public reads — it must not be a
+        // handle->DID oracle an operator never opted into. It still depends on
+        // none of the directory's health: it reads one control row and answers
+        // even when no repository generation can be admitted at all.
         if let publicRepositoryReadDirectory {
             registerPublicRepositoryReadEndpoints(
                 on: router,
                 directory: publicRepositoryReadDirectory,
                 publicURL: configuration.publicURL,
-                jsonReadAdmission: jsonReadAdmission
-            )
-        }
-        // Registered outside the read-directory block on purpose: resolveHandle
-        // must answer even when no public repository read generation can be
-        // admitted at all.
-        if let publicHandleResolution {
-            registerPublicHandleResolutionEndpoint(
-                on: router,
-                capability: publicHandleResolution
+                jsonReadAdmission: jsonReadAdmission,
+                handleResolution: publicHandleResolution
             )
         }
         if let publicRepositoryMutations {
@@ -987,11 +986,10 @@ public struct SwanHTTPServer: Sendable {
                 continue
             }
             if publicRepositoryReadDirectory != nil,
-               isInstalledPublicReadMethod(descriptor.nsid) {
-                continue
-            }
-            if publicHandleResolution != nil,
-               isInstalledPublicHandleResolutionMethod(descriptor.nsid) {
+               isInstalledPublicReadMethod(
+                   descriptor.nsid,
+                   handleResolutionInstalled: publicHandleResolution != nil
+               ) {
                 continue
             }
             if publicRepositoryMutations != nil,

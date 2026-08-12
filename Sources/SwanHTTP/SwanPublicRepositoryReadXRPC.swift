@@ -13,15 +13,16 @@ import SwanStorage
 /// identifiers only — never payloads, credentials, or repository content.
 private let publicReadDiagnosticLog = SwanLog(label: "swan.public-read")
 
-/// The methods installed by the public repository *read directory*.
+/// Every method installed by the public read surface.
 ///
-/// `com.atproto.identity.resolveHandle` is deliberately absent. It is a public
-/// read method, but its installer is the account control store, not this
-/// directory, and the single consumer of this set gates on the directory's
-/// presence. Listing it here would let a profile that declares the NSID skip
-/// its method-correct unavailable gate on a server that never registered the
-/// route. See ``isInstalledPublicHandleResolutionMethod``.
+/// `com.atproto.identity.resolveHandle` belongs to this set: it is registered
+/// from ``registerPublicRepositoryReadEndpoints`` alongside the repository
+/// routes. It differs from the rest in needing a second capability — the
+/// account control store — so membership alone does not mean a live route
+/// exists. ``isInstalledPublicReadMethod(_:handleResolutionInstalled:)`` is the
+/// predicate that knows the difference; nothing may consult this set directly.
 private let publicReadNSIDs: Set<String> = [
+    "com.atproto.identity.resolveHandle",
     "com.atproto.repo.describeRepo",
     "com.atproto.repo.getRecord",
     "com.atproto.repo.listRecords",
@@ -38,6 +39,28 @@ private let resolveHandleNSID = "com.atproto.identity.resolveHandle"
 /// carries an honest bound instead of inheriting the 16 MiB `listRecords`
 /// default, and so the route never reserves a shared read lease it cannot use.
 private let resolveHandleMaximumResponseBytes = 4 * 1_024
+
+/// `resolveHandle`'s own admission, deliberately a separate instance from the
+/// shared JSON read budget.
+///
+/// Separate, because reserving the multi-megabyte `listRecords` budget for a
+/// one-DID response would let repository traffic starve the method every login
+/// depends on. Bounded, because this is the only anonymous route with a path
+/// into the single-connection control-database gate that OAuth, login, and
+/// DPoP lookups also use: that gate is depth-1 and throws
+/// `SwanError.unavailable` at the *next* caller once 128 waiters are queued, so
+/// an unmetered anonymous route could deny login without presenting a
+/// credential. Eight concurrent reads is exactly the ceiling anonymous traffic
+/// already had through the shared read admission before this route existed.
+///
+/// The byte dimension is inert here — the initializer's floor is the
+/// `listRecords` ceiling, and a 4 KiB reservation never approaches it. The
+/// concurrency dimension is the operative bound.
+let publicHandleResolutionAdmission = try! PublicRepositoryJSONReadAdmission(
+    maximumConcurrentReads: 8,
+    maximumReservedResponseBytes: PublicRepositoryJSONReadLimits
+        .maximumListRecordsResponseBytes
+)
 
 /// Names an HTTP-layer guard that refuses a read after storage has already
 /// answered. These are the 503 causes that never reach
@@ -288,15 +311,20 @@ private struct PublicRepoStatusHandler:
     }
 }
 
-func isInstalledPublicReadMethod(_ nsid: String) -> Bool {
-    publicReadNSIDs.contains(nsid)
-}
-
-/// Whether ``registerPublicHandleResolutionEndpoint`` claims this NSID, so a
-/// profile that declares it does not also install a 503 gate over the live
-/// route.
-func isInstalledPublicHandleResolutionMethod(_ nsid: String) -> Bool {
-    nsid == resolveHandleNSID
+/// Whether a live public read route is registered for this NSID, so a profile
+/// that declares the method does not also install a 503 gate over it.
+///
+/// Callers have already established that a public repository read directory is
+/// present. `resolveHandle` needs one capability more than that — the account
+/// control store — and answering `true` for it without one would drop the
+/// method's method-correct unavailable gate while registering no route to
+/// replace it.
+func isInstalledPublicReadMethod(
+    _ nsid: String,
+    handleResolutionInstalled: Bool
+) -> Bool {
+    guard publicReadNSIDs.contains(nsid) else { return false }
+    return nsid != resolveHandleNSID || handleResolutionInstalled
 }
 
 /// The single storage question `com.atproto.identity.resolveHandle` is allowed
@@ -347,7 +375,10 @@ func registerPublicRepositoryReadEndpoints(
     on router: Router<BasicRequestContext>,
     directory: any PublicRepositoryReadDirectory,
     publicURL: URL,
-    jsonReadAdmission: PublicRepositoryJSONReadAdmission = .processShared
+    jsonReadAdmission: PublicRepositoryJSONReadAdmission = .processShared,
+    handleResolution: SwanPublicHandleResolutionCapability? = nil,
+    handleResolutionAdmission: PublicRepositoryJSONReadAdmission =
+        publicHandleResolutionAdmission
 ) {
     let describeHandler = PublicDescribeRepoHandler(
         directory: directory, publicURL: publicURL
@@ -701,24 +732,39 @@ func registerPublicRepositoryReadEndpoints(
     ] {
         registerPublicReadWrongMethodGuards(on: router, path: path)
     }
+
+    // Part of the public read surface, and registered from here so a server
+    // that exposes no public reads exposes no anonymous handle->DID oracle
+    // either. It still needs no *generation*: see below.
+    if let handleResolution {
+        registerPublicHandleResolutionEndpoint(
+            on: router,
+            capability: handleResolution,
+            admission: handleResolutionAdmission
+        )
+    }
 }
 
 /// Unauthenticated `com.atproto.identity.resolveHandle`.
 ///
-/// Deliberately independent of the public read directory. Every other route in
-/// this file has to admit a generation before it can answer, and on 2026-08-12
-/// a stale `PRAGMA data_version` pin made that admission fail permanently. A
-/// handle lookup needs none of it: it reads one control row and returns one
-/// DID. Keeping it on its own capability means the method that clients, other
-/// PDSes, and login flows depend on most cannot be taken out by a repository
-/// projection fault.
+/// Registered from ``registerPublicRepositoryReadEndpoints``, but deliberately
+/// independent of the read *directory* it is registered beside. Every other
+/// route in this file has to admit a generation before it can answer, and on
+/// 2026-08-12 a stale `PRAGMA data_version` pin made that admission fail
+/// permanently. A handle lookup needs none of it: it reads one control row and
+/// returns one DID. So it shares the read surface's *installation* — an
+/// operator who exposes no public reads exposes no handle oracle — while
+/// depending on none of the directory's health.
 ///
-/// It is also why this route reserves no JSON read lease. Its response is one
-/// DID; reserving the shared multi-megabyte read budget would let concurrent
-/// `listRecords` traffic starve handle resolution for no benefit.
+/// It reserves from ``publicHandleResolutionAdmission`` rather than the shared
+/// JSON read budget: its response is one DID, so taking a multi-megabyte lease
+/// would let `listRecords` traffic starve the method every login depends on,
+/// while taking *no* lease would leave the control-database gate — the same one
+/// OAuth and login queue on — reachable by unmetered anonymous traffic.
 func registerPublicHandleResolutionEndpoint(
     on router: Router<BasicRequestContext>,
-    capability: SwanPublicHandleResolutionCapability
+    capability: SwanPublicHandleResolutionCapability,
+    admission: PublicRepositoryJSONReadAdmission = publicHandleResolutionAdmission
 ) {
     router.get("/xrpc/\(resolveHandleNSID)") { request, _ async -> Response in
         var selector: String?
@@ -735,6 +781,22 @@ func registerPublicHandleResolutionEndpoint(
                 throw PublicReadHandlerFailure.invalidRequest
             }
             selector = canonicalHandle
+            // Taken before the control store is touched and held until the
+            // response value exists, so the number of anonymous requests inside
+            // the control-database gate at once is this admission's ceiling and
+            // not the listener's connection limit. The body is built eagerly,
+            // so the lease does not need to outlive the handler.
+            guard let lease = admission.reserve(
+                maximumResponseBytes: resolveHandleMaximumResponseBytes
+            ) else {
+                return publicReadUnavailable(
+                    reason: PublicReadHandlerGuard
+                        .responseAdmissionExhausted.rawValue,
+                    method: resolveHandleNSID,
+                    selector: selector
+                )
+            }
+            defer { lease.release() }
             guard let did = try await capability.activeDID(
                 forCanonicalHandle: canonicalHandle
             ) else {

@@ -270,9 +270,11 @@ final class PublicHandleResolutionHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    /// resolveHandle must not reserve the shared JSON read budget. Its response
-    /// is one DID; taking a multi-megabyte lease would let concurrent
-    /// `listRecords` traffic starve the method every login depends on.
+    /// resolveHandle must not reserve the *shared* JSON read budget. Its
+    /// response is one DID; taking a multi-megabyte lease would let concurrent
+    /// `listRecords` traffic starve the method every login depends on. It is
+    /// still bounded — by its own admission, pinned in
+    /// `testResolveHandleBoundsConcurrentControlStoreAdmission`.
     func testResolveHandleAnswersWithTheJSONReadBudgetFullyReserved() async throws {
         let admission = try PublicRepositoryJSONReadAdmission(
             maximumConcurrentReads: 1,
@@ -358,6 +360,98 @@ final class PublicHandleResolutionHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// The route ships with the public read surface, not with the account
+    /// control store. An embedding that exposes no public reads must not
+    /// acquire an anonymous "does this handle exist and is it active here"
+    /// oracle just because it configured a control store for its own login.
+    func testResolveHandleIsAbsentWithoutAPublicReadDirectory() async throws {
+        try await withFixture(label: "no-read-surface", readDirectory: nil) {
+            _, client in
+            try await client.execute(
+                uri: "\(Self.resolveHandlePath)?handle=\(Self.handle)",
+                method: .get
+            ) { response in
+                XCTAssertEqual(response.status, .notFound)
+                XCTAssertEqual(
+                    self.text(response.body),
+                    #"{"error":"public_endpoint_unavailable"}"#
+                )
+            }
+        }
+    }
+
+    /// resolveHandle is the only anonymous route with a path into the
+    /// single-connection control-database gate that OAuth, login, and DPoP
+    /// lookups also queue on. That gate is depth-1 and throws
+    /// `unavailable` at whichever caller arrives once its waiter queue is
+    /// full, so an unmetered anonymous route could deny login without ever
+    /// presenting a credential. The route therefore takes its own admission —
+    /// separate from the shared JSON read budget, but not absent.
+    func testResolveHandleBoundsConcurrentControlStoreAdmission() async throws {
+        let admission = try PublicRepositoryJSONReadAdmission(
+            maximumConcurrentReads: 1,
+            maximumReservedResponseBytes: PublicRepositoryJSONReadLimits
+                .maximumListRecordsResponseBytes
+        )
+        try await withControl { control in
+            _ = try await control.createAccount(Self.registration())
+            let router = Router(context: SwanHTTP.BasicRequestContext.self)
+            registerPublicHandleResolutionEndpoint(
+                on: router,
+                capability: SwanPublicHandleResolutionCapability(
+                    controlStore: control
+                ),
+                admission: admission
+            )
+            let app = Application(
+                router: router,
+                configuration: .init(
+                    address: .hostname("127.0.0.1", port: 0),
+                    serverName: "swan-handle-resolution-admission-tests"
+                ),
+                logger: Logger(
+                    label: "PublicHandleResolutionHTTPTests.admissionBound"
+                )
+            )
+            try await app.test(.router) { client in
+                // Control: with the bound free the route answers.
+                try await client.execute(
+                    uri: "\(Self.resolveHandlePath)?handle=\(Self.handle)",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(try self.decode(response.body).did, Self.did)
+                }
+                let lease = try XCTUnwrap(
+                    admission.reserve(maximumResponseBytes: 1)
+                )
+                // Bound reached: the request is refused above storage, with the
+                // unchanged public-read 503 body.
+                try await client.execute(
+                    uri: "\(Self.resolveHandlePath)?handle=\(Self.handle)",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                    XCTAssertEqual(
+                        self.text(response.body),
+                        #"{"error":"temporarily_unavailable"}"#
+                    )
+                }
+                XCTAssertEqual(admission.snapshot.activeLeases, 1)
+                lease.release()
+                // Released rather than leaked: the route recovers on its own.
+                try await client.execute(
+                    uri: "\(Self.resolveHandlePath)?handle=\(Self.handle)",
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(try self.decode(response.body).did, Self.did)
+                }
+                XCTAssertEqual(admission.snapshot.activeLeases, 0)
+            }
+        }
+    }
+
     // MARK: The capability, directly
 
     /// The capability is the allow-list: exactly one projection of one account
@@ -435,10 +529,16 @@ final class PublicHandleResolutionHTTPTests: XCTestCase, @unchecked Sendable {
     /// deinitializer, which aborts the whole target and truncates every result
     /// after it — a failure mode that hides real failures rather than reporting
     /// them.
+    ///
+    /// The default read directory is the permanently unadmittable one on
+    /// purpose: resolveHandle is installed beside the public read surface, so
+    /// every case here runs on a server whose repository reads are dark, and
+    /// none of them can pass by accidentally depending on a healthy directory.
     private func withFixture(
         label: String,
         installHandleResolution: Bool = true,
-        readDirectory: (any PublicRepositoryReadDirectory)? = nil,
+        readDirectory: (any PublicRepositoryReadDirectory)? =
+            PermanentlyUnadmittablePublicReadDirectory(),
         jsonReadAdmission: PublicRepositoryJSONReadAdmission? = nil,
         _ body: @escaping @Sendable (
             Fixture, any TestClientProtocol
