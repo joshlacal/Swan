@@ -40,9 +40,30 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
 
         // A second connection commits something irrelevant — a scratch table.
         // This is what PRAGMA data_version observes, and it never returns.
-        try await commitFromSecondConnection(
-            root: fixture.root,
-            touchingRepositoryState: false
+        //
+        // A third connection watches the pin across that commit. The whole
+        // outage turned on this pragma moving, so the precondition is asserted
+        // rather than assumed: if a future SQLite or schema change stopped the
+        // scratch commit from moving it, every test below would pass while
+        // testing nothing.
+        let observer = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root, did: did
+        )
+        let pinBefore: Int64
+        let pinAfter: Int64
+        do {
+            pinBefore = try await observedDataVersion(observer)
+            try await commitFromSecondConnection(root: fixture.root)
+            pinAfter = try await observedDataVersion(observer)
+        } catch {
+            try? await observer.close()
+            throw error
+        }
+        try await observer.close()
+        XCTAssertNotEqual(
+            pinBefore,
+            pinAfter,
+            "precondition: a foreign commit must move PRAGMA data_version"
         )
 
         let after = try await fixture.directory.publicRepositoryStatus(
@@ -81,10 +102,7 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
         // A second foreign commit must not be a one-shot allowance either: the
         // re-admitted generation pins the new data_version, and the next drift
         // has to be re-admitted exactly the same way.
-        try await commitFromSecondConnection(
-            root: fixture.root,
-            touchingRepositoryState: false
-        )
+        try await commitFromSecondConnection(root: fixture.root)
         let third = try await fixture.directory.publicRepositoryStatus(
             selector: did
         )
@@ -100,7 +118,7 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
     /// preparation journal below `.submitted`. The read must still refuse, and
     /// it must refuse with the identity guard that actually fired — not with
     /// `.generationPinStale`, and above all not by succeeding.
-    func testGenuinelyUnadmittableAccountStill503sAndLogsWhy() async throws {
+    func testGenuinelyUnadmittableAccountStill503sWithTheGuardThatFired() async throws {
         let fixture = try await makeFixture()
 
         let warm = try await fixture.directory.publicRepositoryStatus(
@@ -144,23 +162,103 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
         let fixture = try await makeFixture()
 
         _ = try await fixture.directory.publicRepositoryStatus(selector: did)
-        try await commitFromSecondConnection(
-            root: fixture.root,
-            touchingRepositoryState: false
-        )
+        try await commitFromSecondConnection(root: fixture.root)
         fixture.verifier.rejectEverything()
 
         let baseline = fixture.verifier.admissionCount
-        let reads = 4
-        for _ in 0 ..< reads {
-            let reason = await captureRefusal(fixture.directory, .status)
-            XCTAssertEqual(reason, .identityFactsMalformed)
+        let first = await captureRefusal(fixture.directory, .status)
+        XCTAssertEqual(first, .identityFactsMalformed)
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            1,
+            "one read may re-admit exactly once — more means a retry loop, "
+                + "fewer means the stale generation was served or skipped"
+        )
+
+        // Past the backoff window the next read is allowed its own attempt,
+        // and it too gets exactly one. The bound is per read, permanently.
+        try await Task.sleep(for: .milliseconds(500))
+        let second = await captureRefusal(fixture.directory, .status)
+        XCTAssertEqual(second, .identityFactsMalformed)
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            2,
+            "the second read must also cost exactly one admission"
+        )
+    }
+
+    /// A failed re-admission must not make every subsequent anonymous read pay
+    /// for a full record-index walk and PLC verification. Within the backoff
+    /// window the reads still refuse, with the same reason — they just do not
+    /// redo the work.
+    func testFailedReAdmissionIsNotRepeatedWithinTheBackoffWindow()
+        async throws
+    {
+        let fixture = try await makeFixture()
+
+        _ = try await fixture.directory.publicRepositoryStatus(selector: did)
+        try await commitFromSecondConnection(root: fixture.root)
+        fixture.verifier.rejectEverything()
+
+        let baseline = fixture.verifier.admissionCount
+        let first = await captureRefusal(fixture.directory, .status)
+        XCTAssertEqual(first, .identityFactsMalformed)
+        XCTAssertEqual(fixture.verifier.admissionCount - baseline, 1)
+
+        // Every read shape, immediately, well inside the window.
+        for shape in PublicReadShape.allCases {
+            let reason = await captureRefusal(fixture.directory, shape)
+            XCTAssertEqual(
+                reason,
+                .identityFactsMalformed,
+                "\(shape) must refuse with the same reason while the backoff "
+                    + "window suppresses the work"
+            )
         }
         XCTAssertEqual(
             fixture.verifier.admissionCount - baseline,
-            reads,
-            "each read may re-admit exactly once — more means a retry loop, "
-                + "fewer means the stale generation was served or skipped"
+            1,
+            "reads inside the backoff window must add no admissions"
+        )
+    }
+
+    /// The backoff must not become a second way for an account to stay dark.
+    /// Once the account is admittable again, the very next read past the
+    /// window serves it — and the successful admission retires the negative
+    /// entry, so the read after that costs nothing at all.
+    func testBackoffDoesNotDelayRecovery() async throws {
+        let fixture = try await makeFixture()
+
+        _ = try await fixture.directory.publicRepositoryStatus(selector: did)
+        try await commitFromSecondConnection(root: fixture.root)
+        fixture.verifier.rejectEverything()
+        let refused = await captureRefusal(fixture.directory, .status)
+        XCTAssertEqual(refused, .identityFactsMalformed)
+
+        fixture.verifier.acceptEverything()
+        try await Task.sleep(for: .milliseconds(500))
+
+        let baseline = fixture.verifier.admissionCount
+        let recovered = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        XCTAssertEqual(
+            recovered?.revision,
+            fixture.revision,
+            "an account that became admittable again must be served"
+        )
+        XCTAssertEqual(fixture.verifier.admissionCount - baseline, 1)
+
+        // The published generation retired both the stale pin and the negative
+        // entry, so steady state costs no admissions at all.
+        let steady = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        XCTAssertEqual(steady?.revision, fixture.revision)
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            1,
+            "a recovered account must not keep re-admitting"
         )
     }
 
@@ -172,10 +270,7 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
         let fixture = try await makeFixture()
 
         _ = try await fixture.directory.publicRepositoryStatus(selector: did)
-        try await commitFromSecondConnection(
-            root: fixture.root,
-            touchingRepositoryState: false
-        )
+        try await commitFromSecondConnection(root: fixture.root)
 
         let baseline = fixture.verifier.admissionCount
         let directory = fixture.directory
@@ -273,14 +368,18 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
     /// Commits from a second connection to the same account database. This is
     /// the minimal reproduction of the live trigger, so it deliberately writes
     /// to a scratch table and leaves repository state untouched.
-    private func commitFromSecondConnection(
-        root: URL,
-        touchingRepositoryState: Bool
-    ) async throws {
-        XCTAssertFalse(
-            touchingRepositoryState,
-            "the regression is a commit that touches NO repository state"
-        )
+    /// Reads the pin the outage turned on, from a connection that is not the
+    /// writer. `PRAGMA data_version` only reports commits made by *other*
+    /// connections, which is precisely the property under test.
+    private func observedDataVersion(
+        _ database: SQLiteAccountDatabase
+    ) async throws -> Int64 {
+        let rows = try await database.connection.query("PRAGMA data_version")
+        let value = try XCTUnwrap(rows.first?.column("data_version")?.integer)
+        return try XCTUnwrap(Int64(exactly: value))
+    }
+
+    private func commitFromSecondConnection(root: URL) async throws {
         let foreign = try await SQLiteAccountDatabase(
             dataDirectory: root, did: did
         )
@@ -501,6 +600,10 @@ private final class CountingPLCVerifier:
 
     func rejectEverything() {
         state.withLock { $0.rejects = true }
+    }
+
+    func acceptEverything() {
+        state.withLock { $0.rejects = false }
     }
 
     func verifyGenesis(

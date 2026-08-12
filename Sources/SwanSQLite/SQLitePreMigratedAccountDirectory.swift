@@ -45,7 +45,42 @@ public actor SQLitePreMigratedAccountDirectory:
     /// all share. See ``readmitPublicReadGeneration(account:database:replacing:)``.
     private var publicReadReadmissions:
         [String: Task<SQLiteVerifiedPublicRepositoryGeneration, any Error>] = [:]
+    /// Why, and until when, re-admission of one DID is not worth re-running.
+    /// See ``recordPublicReadReadmissionFailure(did:error:)``.
+    private struct PublicReadReadmissionFailure {
+        let reason: PublicReadUnavailableReason
+        let expiresAt: ContinuousClock.Instant
+    }
+
+    private var publicReadReadmissionFailures:
+        [String: PublicReadReadmissionFailure] = [:]
     private var isClosed = false
+
+    /// How long a failed re-admission suppresses the next one for that DID.
+    ///
+    /// Flat, and deliberately short. The window exists to stop an
+    /// unadmittable account from paying a full admission — a record-index
+    /// walk of up to 100k entries, an MST projection verify, and PLC
+    /// verification — on every anonymous public read. It must never become a
+    /// second way for an account to stay dark: a growing or long backoff would
+    /// reintroduce the 2026-08-12 outage in a slower form, so the worst-case
+    /// added recovery delay is a constant a quarter-second rather than
+    /// something that compounds with the number of failures.
+    ///
+    /// A quarter-second caps wasted admissions at four per second per DID no
+    /// matter how much anonymous traffic arrives — the same order as a healthy
+    /// account's own control-row churn — while staying far below any client's
+    /// or relay's retry interval. Recovery that has an event to hang off does
+    /// not wait even that long: every publisher of a generation clears the
+    /// entry outright.
+    private static let publicReadReadmissionBackoff = Duration.milliseconds(250)
+
+    /// Defence in depth on the negative cache's key space. Only DIDs that are
+    /// already active and startup-preopened can reach it — an unknown DID is
+    /// refused by `activePublicReadContext` long before — so this is bounded
+    /// by hosted accounts, not by anonymous input. The cap makes that true by
+    /// construction rather than by argument.
+    private static let maximumPublicReadReadmissionFailures = 4_096
 
     /// Returns only a startup-preopened public mutation store. HTTP adapters
     /// must still bind the selector to the OAuth subject and lifecycle status;
@@ -1023,6 +1058,7 @@ public actor SQLitePreMigratedAccountDirectory:
         // once this DID leaves `databases`, and cancelling a live SQLite query
         // buys nothing but a second failure mode.
         publicReadReadmissions.removeValue(forKey: did)
+        publicReadReadmissionFailures.removeValue(forKey: did)
         let database: SQLiteAccountDatabase
         if let draining = drainingDatabases[did] {
             database = draining
@@ -1055,6 +1091,7 @@ public actor SQLitePreMigratedAccountDirectory:
         drainingDatabases.removeAll()
         publicReadGenerations.removeAll()
         publicReadReadmissions.removeAll()
+        publicReadReadmissionFailures.removeAll()
 
         var failed = false
         for database in opened {
@@ -1534,8 +1571,25 @@ public actor SQLitePreMigratedAccountDirectory:
            current.controlAccount == account {
             // Someone already re-admitted this account while this request was
             // reading. That generation went through the full admission, so
-            // spending another one here would buy nothing.
+            // spending another one here would buy nothing. Checked before the
+            // negative cache: a published generation is proof of recovery and
+            // must win over a window that has not expired yet.
             return current
+        }
+        if let failure = publicReadReadmissionFailures[account.did] {
+            if failure.expiresAt > ContinuousClock.now {
+                // Suppress the work, never the refusal. The caller sees the
+                // same reason it would have seen from a re-run admission, and
+                // the client sees the same 503 body; the record-index walk is
+                // what does not happen. Journalled exactly as a live admission
+                // failure is, so the reason stays greppable per request.
+                let error = PublicRepositoryReadError.unavailable(
+                    reason: failure.reason
+                )
+                Self.logPublicReadAdmissionFailure(error, did: account.did)
+                throw error
+            }
+            publicReadReadmissionFailures.removeValue(forKey: account.did)
         }
         let readmission: Task<SQLiteVerifiedPublicRepositoryGeneration, any Error>
         if let inFlight = publicReadReadmissions[account.did] {
@@ -1554,7 +1608,13 @@ public actor SQLitePreMigratedAccountDirectory:
             publicReadReadmissions[account.did] = started
             readmission = started
         }
-        let generation = try await readmission.value
+        let generation: SQLiteVerifiedPublicRepositoryGeneration
+        do {
+            generation = try await readmission.value
+        } catch let error as PublicRepositoryReadError {
+            recordPublicReadReadmissionFailure(did: account.did, error: error)
+            throw error
+        }
         guard generation.controlAccount == account else {
             // The shared admission verified a control row this request did not
             // resolve. Fail closed instead of serving another row's account.
@@ -1563,6 +1623,47 @@ public actor SQLitePreMigratedAccountDirectory:
             )
         }
         return generation
+    }
+
+    /// Remembers, briefly, that re-admitting this DID did not work.
+    ///
+    /// A failed admission never publishes a generation, so
+    /// `activePublicReadContext` keeps handing back the same stale one and
+    /// every following read re-enters the re-admission path. Without this,
+    /// one unadmittable account turns each anonymous public read into a full
+    /// record-index walk plus PLC verification — a fast 503 becomes a slow
+    /// one, on endpoints the whole network can reach once Swan is announced
+    /// to a relay.
+    ///
+    /// The entry suppresses *work* only. It is never consulted to serve
+    /// anything: while it is live the read still refuses, with the same reason
+    /// and the same body it would have produced by re-running the admission.
+    /// Cancellation is deliberately not recorded — a caller hanging up is not
+    /// evidence about the account.
+    private func recordPublicReadReadmissionFailure(
+        did: String,
+        error: PublicRepositoryReadError
+    ) {
+        guard let reason = error.unavailableReason else { return }
+        let now = ContinuousClock.now
+        if publicReadReadmissionFailures[did] == nil,
+           publicReadReadmissionFailures.count
+           >= Self.maximumPublicReadReadmissionFailures {
+            publicReadReadmissionFailures = publicReadReadmissionFailures
+                .filter { $0.value.expiresAt > now }
+            guard publicReadReadmissionFailures.count
+                < Self.maximumPublicReadReadmissionFailures else {
+                // Every slot holds a live window. Decline to record rather
+                // than grow: the only consequence is that this DID redoes the
+                // admission next read, which is exactly the behaviour that
+                // shipped before this cache existed.
+                return
+            }
+        }
+        publicReadReadmissionFailures[did] = PublicReadReadmissionFailure(
+            reason: reason,
+            expiresAt: now.advanced(by: Self.publicReadReadmissionBackoff)
+        )
     }
 
     /// Re-admits the existing account database when the control row changed
@@ -1648,6 +1749,12 @@ public actor SQLitePreMigratedAccountDirectory:
                 SQLiteLayout.accountDatabase(in: dataDirectory, did: account.did)
             )
             publicReadGenerations[account.did] = generation
+            // The single line that publishes a generation is also the single
+            // line that retires the negative cache entry, so every publisher
+            // clears it — a cold-cache refresh, a successful re-admission, and
+            // `refreshPublicReadGenerationAfterMutation` alike. Recovery that
+            // has an event to hang off never waits out the window.
+            publicReadReadmissionFailures.removeValue(forKey: account.did)
             return generation
         } catch is CancellationError {
             // A caller hanging up is not an admission refusal. Rethrow it
