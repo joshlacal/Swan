@@ -44,8 +44,13 @@ public enum PublicReadUnavailableReason: String, Sendable, Equatable, CaseIterab
     /// The signed head does not authenticate against the terminal signing key,
     /// or authenticates to a different DID, revision, or data root.
     case commitAuthenticationFailed
-    /// A required identity column is missing, empty, or not a parseable value.
+    /// A required column of the PLC preparation journal is missing, empty, or
+    /// not a parseable value.
     case identityFactsMalformed
+    /// A `public_repository_record_index` column is missing, empty, or not a
+    /// parseable value. This is a projection fault, not an identity one — the
+    /// two share row-reading helpers but never share a diagnosis.
+    case recordIndexMalformed
     /// The MST projection does not reproduce the persisted record index.
     case projectionMismatch
     /// The durable preparation intent disagrees with the admitted description.
@@ -75,10 +80,19 @@ public enum PublicReadUnavailableReason: String, Sendable, Equatable, CaseIterab
     /// The selector resolves to an account with no startup-preopened database,
     /// or to a database path that is no longer a regular owner-only file.
     case accountNotPreopened
-    /// The control row changed, deactivated, or vanished mid-request.
+    /// The account's own lifecycle status is not `.active`. Distinct from
+    /// ``controlRowChanged``: nothing moved, the account simply is not
+    /// currently readable.
+    case accountNotActive
+    /// The control row changed or vanished mid-request.
     case controlRowChanged
     /// The control store itself failed to answer.
     case controlStoreFailure
+    /// The process was started without a public identity verifier, so no
+    /// generation can be admitted for any account. An operator configuration
+    /// state, not a data fault — misreporting it as a storage or account
+    /// failure sends the next investigation at the wrong subsystem.
+    case publicIdentityVerifierUnconfigured
 
     // MARK: Storage and budgets
 

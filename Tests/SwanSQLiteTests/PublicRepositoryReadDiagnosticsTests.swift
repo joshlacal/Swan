@@ -43,12 +43,53 @@ final class PublicRepositoryReadDiagnosticsTests: XCTestCase {
         )
     }
 
-    func testEveryReasonHasADistinctJournalToken() {
-        // The log line carries the raw value. Two guards sharing a token would
-        // silently reintroduce the collapse this task exists to remove.
-        let tokens = PublicReadUnavailableReason.allCases.map(\.rawValue)
-        XCTAssertEqual(Set(tokens).count, tokens.count)
-        XCTAssertTrue(tokens.allSatisfy { !$0.isEmpty })
+    /// The journal token is what an operator greps for during an incident, and
+    /// what any saved query or alert rule is written against. Renaming a case
+    /// silently retires every one of those. This is a golden list: adding a
+    /// reason means adding a line here on purpose, and renaming one fails.
+    func testJournalTokensMatchTheGoldenList() {
+        let expected: Set<String> = [
+            "identityRowCount",
+            "identityStageNotSubmitted",
+            "genesisCIDMismatch",
+            "missingKeyMaterial",
+            "keyReferenceMismatch",
+            "historyVerifierUnavailable",
+            "terminalIdentityMismatch",
+            "repositoryAuthenticatorUnavailable",
+            "commitAuthenticationFailed",
+            "identityFactsMalformed",
+            "recordIndexMalformed",
+            "projectionMismatch",
+            "intentVerificationFailed",
+            "generationPinStale",
+            "fileIdentityMismatch",
+            "repositoryStateMismatch",
+            "repositoryStateMissing",
+            "generationIdentityMismatch",
+            "directoryClosed",
+            "accountNotPreopened",
+            "accountNotActive",
+            "controlRowChanged",
+            "controlStoreFailure",
+            "publicIdentityVerifierUnconfigured",
+            "blockMaterializationFailed",
+            "admissionBudgetExhausted",
+            "malformedProjectionValue",
+            "spoolStreamFailure",
+            "storageFailure",
+        ]
+        let actual = Set(PublicReadUnavailableReason.allCases.map(\.rawValue))
+        XCTAssertEqual(
+            actual.subtracting(expected),
+            [],
+            "new reason(s) added without recording their journal token"
+        )
+        XCTAssertEqual(
+            expected.subtracting(actual),
+            [],
+            "journal token(s) renamed or removed — this breaks operator greps"
+        )
     }
 
     // MARK: Fixture

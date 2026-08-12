@@ -1404,7 +1404,7 @@ public actor SQLitePreMigratedAccountDirectory:
         generation: SQLiteVerifiedPublicRepositoryGeneration
     ) {
         guard account.status == .active else {
-            throw PublicRepositoryReadError.unavailable(reason: .controlRowChanged)
+            throw PublicRepositoryReadError.unavailable(reason: .accountNotActive)
         }
         let database = try preopenedPublicRepositoryDatabase(account.did)
         if let generation = publicReadGenerations[account.did],
@@ -1431,20 +1431,45 @@ public actor SQLitePreMigratedAccountDirectory:
         account: AccountControlAccount,
         database: SQLiteAccountDatabase
     ) async throws -> SQLiteVerifiedPublicRepositoryGeneration {
-        guard !isClosed,
-              account.status == .active,
-              databases[account.did] === database,
-              let identityVerifier = publicIdentityVerifier else {
-            throw PublicRepositoryReadError.unavailable(reason: .accountNotPreopened)
-        }
         do {
+            // This is the guard on the exact path that failed live for three
+            // hours. Four unrelated conditions shared one name until
+            // 2026-08-12; a recurrence must point the next investigation at
+            // the right subsystem, so each condition reports itself — and all
+            // four sit inside the `do` so the catch below journals them.
+            guard !isClosed else {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .directoryClosed
+                )
+            }
+            guard account.status == .active else {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .accountNotActive
+                )
+            }
+            guard databases[account.did] === database else {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .accountNotPreopened
+                )
+            }
+            guard let identityVerifier = publicIdentityVerifier else {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .publicIdentityVerifierUnconfigured
+                )
+            }
             try Self.requireExistingRegularDatabase(
                 SQLiteLayout.accountDatabase(in: dataDirectory, did: account.did)
             )
             guard let current = try await controlStore.account(did: account.did),
-                  current == account,
-                  current.status == .active else {
-                throw PublicRepositoryReadError.unavailable(reason: .controlRowChanged)
+                  current == account else {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .controlRowChanged
+                )
+            }
+            guard current.status == .active else {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .accountNotActive
+                )
             }
             let generation = try await database.admitPublicRepositoryGeneration(
                 account: account,
@@ -1454,18 +1479,37 @@ public actor SQLitePreMigratedAccountDirectory:
                 generation.description,
                 controlStore: controlStore
             )
-            guard !isClosed,
-                  databases[account.did] === database,
-                  let current = try await controlStore.account(did: account.did),
-                  current == account,
-                  current.status == .active else {
-                throw PublicRepositoryReadError.unavailable(reason: .controlRowChanged)
+            guard !isClosed else {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .directoryClosed
+                )
+            }
+            guard databases[account.did] === database else {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .accountNotPreopened
+                )
+            }
+            guard let current = try await controlStore.account(did: account.did),
+                  current == account else {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .controlRowChanged
+                )
+            }
+            guard current.status == .active else {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .accountNotActive
+                )
             }
             try Self.requireExistingRegularDatabase(
                 SQLiteLayout.accountDatabase(in: dataDirectory, did: account.did)
             )
             publicReadGenerations[account.did] = generation
             return generation
+        } catch is CancellationError {
+            // A caller hanging up is not an admission refusal. Rethrow it
+            // untouched rather than journalling a service failure that did not
+            // happen.
+            throw CancellationError()
         } catch let error as PublicRepositoryReadError {
             Self.logPublicReadAdmissionFailure(error, did: account.did)
             throw error
@@ -1520,8 +1564,11 @@ public actor SQLitePreMigratedAccountDirectory:
         } catch {
             throw PublicRepositoryReadError.unavailable(reason: .controlStoreFailure)
         }
-        guard let current, current == expected, current.status == .active else {
+        guard let current, current == expected else {
             throw PublicRepositoryReadError.unavailable(reason: .controlRowChanged)
+        }
+        guard current.status == .active else {
+            throw PublicRepositoryReadError.unavailable(reason: .accountNotActive)
         }
         guard !isClosed,
               databases[expected.did] != nil,

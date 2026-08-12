@@ -884,7 +884,37 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         }
     }
 
+    /// Historical contract, preserved exactly for direct maintenance callers:
+    /// a projection or block failure surfaces as `corruptRepository`, while a
+    /// bound violation or a malformed record-index row surfaces as its own
+    /// `PublicRepositoryReadError`. Generation admission calls
+    /// ``namedProjectionVerificationWithoutGate`` instead, which keeps the
+    /// distinction the read-path diagnostics need.
     func verifyProjectionWithoutGate(
+        state: PublicRepositoryState
+    ) async throws {
+        do {
+            try await namedProjectionVerificationWithoutGate(state: state)
+        } catch let error as PublicRepositoryReadError {
+            switch error.unavailableReason {
+            case .projectionMismatch, .blockMaterializationFailed,
+                 .storageFailure:
+                throw PublicRepositoryMutationStoreError.corruptRepository
+            default:
+                throw error
+            }
+        }
+    }
+
+    /// The same verification, reporting *which* check failed.
+    ///
+    /// One condition, one classifier: block corruption reached through the
+    /// projection walk reports `.blockMaterializationFailed` here, the same
+    /// name it gets when admission reads the commit block directly. A cancelled
+    /// request is rethrown untouched — a caller hanging up is not a repository
+    /// fault, and reporting it as one is precisely the misattribution this
+    /// diagnostic work exists to remove.
+    func namedProjectionVerificationWithoutGate(
         state: PublicRepositoryState
     ) async throws {
         do {
@@ -937,11 +967,18 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                 """
             )
             guard missing.isEmpty, extra.isEmpty else {
-                throw PublicRepositoryMutationStoreError.corruptRepository
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .projectionMismatch
+                )
             }
             _ = try await connection.query(
                 "DROP TABLE temp.swan_public_verified_index"
             )
+        } catch is CancellationError {
+            _ = try? await connection.query(
+                "DROP TABLE IF EXISTS temp.swan_public_verified_index"
+            )
+            throw CancellationError()
         } catch let error as PublicRepositoryReadError {
             _ = try? await connection.query(
                 "DROP TABLE IF EXISTS temp.swan_public_verified_index"
@@ -951,12 +988,18 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
             _ = try? await connection.query(
                 "DROP TABLE IF EXISTS temp.swan_public_verified_index"
             )
-            throw error
+            // Reached only through the block source during the projection walk.
+            guard error == .corruptRepository else { throw error }
+            throw PublicRepositoryReadError.unavailable(
+                reason: .blockMaterializationFailed
+            )
         } catch {
             _ = try? await connection.query(
                 "DROP TABLE IF EXISTS temp.swan_public_verified_index"
             )
-            throw PublicRepositoryMutationStoreError.corruptRepository
+            throw PublicRepositoryReadError.unavailable(
+                reason: .storageFailure
+            )
         }
     }
 

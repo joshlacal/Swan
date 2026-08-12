@@ -80,9 +80,11 @@ final class PublicRepositoryAdmissionIntegrityTests: XCTestCase {
             )
             XCTFail("nil-verifier mode exposed a public repository outcome")
         } catch let error as PublicRepositoryReadError {
-            XCTAssertNotNil(
+            // The refusal must name the operator configuration state, not a
+            // data or account fault — this mode has no verifier at all.
+            XCTAssertEqual(
                 error.unavailableReason,
-                "expected a named availability failure, got \(error)"
+                .publicIdentityVerifierUnconfigured
             )
         } catch {
             XCTFail("expected public read unavailable, got \(error)")

@@ -22,12 +22,29 @@ private let publicReadNSIDs: Set<String> = [
     "com.atproto.sync.getRepoStatus",
 ]
 
+/// Names an HTTP-layer guard that refuses a read after storage has already
+/// answered. These are the 503 causes that never reach
+/// `PublicReadUnavailableReason` because they are decided above the directory.
+private enum PublicReadHandlerGuard: String {
+    /// `describeRepo`: the admitted identity's `pdsOrigin` is not this service.
+    case pdsOriginMismatch
+    /// `listRecords`: the returned page violates its own ordering or cursor
+    /// invariant.
+    case listRecordsOrderingInvariant
+    /// `getRepoStatus`: the account carries a status this build cannot render.
+    case unknownAccountStatus
+    /// A process-wide response-byte reservation was refused.
+    case responseAdmissionExhausted
+    /// The response could not be encoded, or exceeded its byte budget.
+    case responseEncodingFailed
+}
+
 private enum PublicReadHandlerFailure: Error {
     case repoNotFound
     case recordNotFound
     case lifecycle(AccountControlStatus)
     case invalidRequest
-    case unavailable
+    case unavailable(PublicReadHandlerGuard)
 }
 
 private struct PublicDescribeRepoHandler:
@@ -56,7 +73,9 @@ private struct PublicDescribeRepoHandler:
         }
         guard publicReadOriginsMatch(
             description.identity.pdsOrigin, publicURL.absoluteString
-        ) else { throw PublicReadHandlerFailure.unavailable }
+        ) else {
+            throw PublicReadHandlerFailure.unavailable(.pdsOriginMismatch)
+        }
         let document = try PublicDIDDocument(
             id: description.did,
             handle: description.identity.canonicalHandle,
@@ -166,7 +185,9 @@ private struct PublicListRecordsHandler:
                   }
               }) ?? true,
               page.cursor == keys.last else {
-            throw PublicReadHandlerFailure.unavailable
+            throw PublicReadHandlerFailure.unavailable(
+                .listRecordsOrderingInvariant
+            )
         }
         let records = try page.records.map {
             SwanPublicWire.ComAtprotoRepoListRecords.Record(
@@ -234,7 +255,7 @@ private struct PublicRepoStatusHandler:
              .desynchronized, .throttled:
             status.status.rawValue
         case .unknown:
-            throw PublicReadHandlerFailure.unavailable
+            throw PublicReadHandlerFailure.unavailable(.unknownAccountStatus)
         }
         return .init(
             did: try DID(didString: status.did),
@@ -275,8 +296,11 @@ func registerPublicRepositoryReadEndpoints(
                 maximumResponseBytes: PublicRepositoryJSONReadLimits
                     .maximumListRecordsResponseBytes
             ) else {
-                return publicReadError(
-                    .serviceUnavailable, "temporarily_unavailable"
+                return publicReadUnavailable(
+                    reason: PublicReadHandlerGuard
+                        .responseAdmissionExhausted.rawValue,
+                    method: "com.atproto.repo.describeRepo",
+                    selector: selector
                 )
             }
             do {
@@ -292,14 +316,20 @@ func registerPublicRepositoryReadEndpoints(
                     output,
                     maximumBytes: PublicRepositoryJSONReadLimits
                         .maximumListRecordsResponseBytes,
-                    lease: lease
+                    lease: lease,
+                    method: "com.atproto.repo.describeRepo",
+                    selector: selector
                 )
             } catch {
                 lease.release()
                 throw error
             }
         } catch let failure as PublicReadHandlerFailure {
-            return publicReadResponse(failure)
+            return publicReadResponse(
+                failure,
+                method: "com.atproto.repo.describeRepo",
+                selector: selector
+            )
         } catch PublicRepositoryReadError.invalidSelector {
             return publicReadError(.badRequest, "InvalidRequest")
         } catch {
@@ -334,8 +364,11 @@ func registerPublicRepositoryReadEndpoints(
                 maximumResponseBytes: PublicRepositoryJSONReadLimits
                     .maximumGetRecordResponseBytes
             ) else {
-                return publicReadError(
-                    .serviceUnavailable, "temporarily_unavailable"
+                return publicReadUnavailable(
+                    reason: PublicReadHandlerGuard
+                        .responseAdmissionExhausted.rawValue,
+                    method: "com.atproto.repo.getRecord",
+                    selector: selector
                 )
             }
             do {
@@ -356,14 +389,20 @@ func registerPublicRepositoryReadEndpoints(
                     output,
                     maximumBytes: PublicRepositoryJSONReadLimits
                         .maximumGetRecordResponseBytes,
-                    lease: lease
+                    lease: lease,
+                    method: "com.atproto.repo.getRecord",
+                    selector: selector
                 )
             } catch {
                 lease.release()
                 throw error
             }
         } catch let failure as PublicReadHandlerFailure {
-            return publicReadResponse(failure)
+            return publicReadResponse(
+                failure,
+                method: "com.atproto.repo.getRecord",
+                selector: selector
+            )
         } catch PublicRepositoryReadError.invalidSelector {
             return publicReadError(.badRequest, "InvalidRequest")
         } catch PublicRepositoryDomainError.invalidCollection,
@@ -402,8 +441,11 @@ func registerPublicRepositoryReadEndpoints(
                 maximumResponseBytes: PublicRepositoryJSONReadLimits
                     .maximumListRecordsResponseBytes
             ) else {
-                return publicReadError(
-                    .serviceUnavailable, "temporarily_unavailable"
+                return publicReadUnavailable(
+                    reason: PublicReadHandlerGuard
+                        .responseAdmissionExhausted.rawValue,
+                    method: "com.atproto.repo.listRecords",
+                    selector: selector
                 )
             }
             do {
@@ -425,14 +467,20 @@ func registerPublicRepositoryReadEndpoints(
                     output,
                     maximumBytes: PublicRepositoryJSONReadLimits
                         .maximumListRecordsResponseBytes,
-                    lease: lease
+                    lease: lease,
+                    method: "com.atproto.repo.listRecords",
+                    selector: selector
                 )
             } catch {
                 lease.release()
                 throw error
             }
         } catch let failure as PublicReadHandlerFailure {
-            return publicReadResponse(failure)
+            return publicReadResponse(
+                failure,
+                method: "com.atproto.repo.listRecords",
+                selector: selector
+            )
         } catch PublicRepositoryReadError.invalidLimit,
                 PublicRepositoryReadError.invalidCursor,
                 PublicRepositoryReadError.invalidSelector,
@@ -467,9 +515,15 @@ func registerPublicRepositoryReadEndpoints(
                 input: (),
                 context: request
             )
-            return publicReadJSON(.ok, output)
+            return publicReadJSON(
+                .ok, output, method: "com.atproto.sync.getLatestCommit", selector: selector
+            )
         } catch let failure as PublicReadHandlerFailure {
-            return publicReadResponse(failure)
+            return publicReadResponse(
+                failure,
+                method: "com.atproto.sync.getLatestCommit",
+                selector: selector
+            )
         } catch PublicRepositoryReadError.invalidSelector {
             return publicReadError(.badRequest, "InvalidRequest")
         } catch {
@@ -499,9 +553,15 @@ func registerPublicRepositoryReadEndpoints(
                 input: (),
                 context: request
             )
-            return publicReadJSON(.ok, output)
+            return publicReadJSON(
+                .ok, output, method: "com.atproto.sync.getRepoStatus", selector: selector
+            )
         } catch let failure as PublicReadHandlerFailure {
-            return publicReadResponse(failure)
+            return publicReadResponse(
+                failure,
+                method: "com.atproto.sync.getRepoStatus",
+                selector: selector
+            )
         } catch PublicRepositoryReadError.invalidSelector {
             return publicReadError(.badRequest, "InvalidRequest")
         } catch {
@@ -542,7 +602,11 @@ func registerPublicRepositoryReadEndpoints(
             }
             return publicRepositoryCARHTTPResponse(car)
         } catch let failure as PublicReadHandlerFailure {
-            return publicReadResponse(failure)
+            return publicReadResponse(
+                failure,
+                method: "com.atproto.sync.getRepo",
+                selector: selector
+            )
         } catch PublicRepositoryReadError.invalidSelector {
             return publicReadError(.badRequest, "InvalidRequest")
         } catch {
@@ -659,7 +723,11 @@ private func publicLifecycleError(_ status: AccountControlStatus) -> Response {
     return publicReadError(.badRequest, code)
 }
 
-private func publicReadResponse(_ failure: PublicReadHandlerFailure) -> Response {
+private func publicReadResponse(
+    _ failure: PublicReadHandlerFailure,
+    method: String,
+    selector: String?
+) -> Response {
     switch failure {
     case .repoNotFound:
         publicReadError(.badRequest, "RepoNotFound")
@@ -670,7 +738,9 @@ private func publicReadResponse(_ failure: PublicReadHandlerFailure) -> Response
     case .invalidRequest:
         publicReadError(.badRequest, "InvalidRequest")
     case .unavailable:
-        publicReadError(.serviceUnavailable, "temporarily_unavailable")
+        // Routed through the logging helper: a handler-level refusal is a 503
+        // like any other and must not be the one that leaves no trace.
+        publicReadUnavailable(failure, method: method, selector: selector)
     }
 }
 
@@ -678,7 +748,7 @@ private func publicReadError(_ status: HTTPResponse.Status, _ code: String) -> R
     jsonResponseWithStatus(status, body: ["error": code])
 }
 
-/// The single collapse point for every public-read 503.
+/// Every public-read 503 on these routes leaves through here.
 ///
 /// The response is byte-identical to what it has always been —
 /// `503 {"error":"temporarily_unavailable"}`. What changes is that the guard
@@ -693,17 +763,41 @@ private func publicReadUnavailable(
     method: String,
     selector: String?
 ) -> Response {
-    var fields = ["method": method]
+    publicReadUnavailable(
+        reason: publicReadDiagnosticToken(error),
+        method: method,
+        selector: selector
+    )
+}
+
+/// The 503 exits that are decided rather than thrown — an admission reservation
+/// refused, a response body that will not encode — name their guard directly.
+private func publicReadUnavailable(
+    reason: String,
+    method: String,
+    selector: String?
+) -> Response {
+    var fields = ["method": method, "reason": reason]
     if let selector,
        AccountControlIdentifiers.isDID(selector)
        || AccountControlIdentifiers.isCanonicalHandle(selector) {
         fields["selector"] = selector
     }
-    fields["reason"] =
-        (error as? PublicRepositoryReadError)?.unavailableReason?.rawValue
-        ?? "unclassified"
     publicReadDiagnosticLog.warning("public read unavailable", fields: fields)
     return publicReadError(.serviceUnavailable, "temporarily_unavailable")
+}
+
+private func publicReadDiagnosticToken(_ error: any Error) -> String {
+    if let reason = (error as? PublicRepositoryReadError)?.unavailableReason {
+        return reason.rawValue
+    }
+    if case let PublicReadHandlerFailure.unavailable(guardName) = error {
+        return guardName.rawValue
+    }
+    // A cancelled request is the caller hanging up, not a service failure.
+    // Naming it keeps it out of the bucket that means "we do not know".
+    if error is CancellationError { return "requestCancelled" }
+    return "unclassified"
 }
 
 // Internal so the response-body lease lifetime can be regression-tested
@@ -713,7 +807,9 @@ func publicReadJSON(
     _ value: some Encodable,
     maximumBytes: Int = PublicRepositoryJSONReadLimits
         .maximumListRecordsResponseBytes,
-    lease: PublicRepositoryJSONReadLease? = nil
+    lease: PublicRepositoryJSONReadLease? = nil,
+    method: String = "unknown",
+    selector: String? = nil
 ) -> Response {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
@@ -721,7 +817,11 @@ func publicReadJSON(
           let data = try? encoder.encode(value),
           data.count <= maximumBytes else {
         lease?.release()
-        return publicReadError(.serviceUnavailable, "temporarily_unavailable")
+        return publicReadUnavailable(
+            reason: PublicReadHandlerGuard.responseEncodingFailed.rawValue,
+            method: method,
+            selector: selector
+        )
     }
     if let lease {
         return Response(

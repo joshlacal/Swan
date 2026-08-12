@@ -109,14 +109,19 @@ extension SQLiteAccountDatabase {
                     scannedRecords += rows.count
                     for row in rows {
                         let collection = try publicReadRequiredText(
-                            row, "collection"
+                            row, "collection", reason: .recordIndexMalformed
                         )
-                        let rkey = try publicReadRequiredText(row, "rkey")
+                        let rkey = try publicReadRequiredText(
+                            row, "rkey", reason: .recordIndexMalformed
+                        )
                         let path = try PublicRepositoryPath(
                             collection: collection, recordKey: rkey
                         )
                         let recordCID = try publicReadCID(
-                            try publicReadRequiredText(row, "record_cid")
+                            try publicReadRequiredText(
+                                row, "record_cid", reason: .recordIndexMalformed
+                            ),
+                            reason: .recordIndexMalformed
                         )
                         let bytes = try await blockBytesWithoutGate(recordCID)
                         let value = try RepositoryMSTValidation.decodeRecordBlock(
@@ -198,13 +203,20 @@ extension SQLiteAccountDatabase {
             }
             scannedRecords += rows.count
             for row in rows {
-                let collection = try publicReadRequiredText(row, "collection")
-                let recordKey = try publicReadRequiredText(row, "rkey")
+                let collection = try publicReadRequiredText(
+                    row, "collection", reason: .recordIndexMalformed
+                )
+                let recordKey = try publicReadRequiredText(
+                    row, "rkey", reason: .recordIndexMalformed
+                )
                 let path = try PublicRepositoryPath(
                     collection: collection, recordKey: recordKey
                 )
                 let recordCID = try publicReadCID(
-                    try publicReadRequiredText(row, "record_cid")
+                    try publicReadRequiredText(
+                        row, "record_cid", reason: .recordIndexMalformed
+                    ),
+                    reason: .recordIndexMalformed
                 )
                 let bytes = try await blockBytesWithoutGate(recordCID)
                 let value = try RepositoryMSTValidation.decodeRecordBlock(
@@ -239,19 +251,12 @@ extension SQLiteAccountDatabase {
                         reason: .repositoryStateMissing
                     )
                 }
-                // `verifyProjectionWithoutGate` keeps throwing
-                // `corruptRepository` for its direct maintenance callers. Name
-                // the cause here so admission failures are distinguishable from
-                // the identity guards below without changing that contract.
-                do {
-                    try await verifyProjectionWithoutGate(state: state)
-                } catch let error as PublicRepositoryReadError {
-                    throw error
-                } catch {
-                    throw PublicRepositoryReadError.unavailable(
-                        reason: .projectionMismatch
-                    )
-                }
+                // The named variant classifies its own failures — projection
+                // mismatch, block corruption, malformed index row, bound
+                // violation, cancellation — so admission does not have to guess
+                // from the outside. `verifyProjectionWithoutGate` keeps its
+                // `corruptRepository` contract for direct maintenance callers.
+                try await namedProjectionVerificationWithoutGate(state: state)
                 let rows = try await connection.query(
                     """
                     SELECT DISTINCT collection
@@ -260,7 +265,9 @@ extension SQLiteAccountDatabase {
                     """
                 )
                 let collections = try rows.map {
-                    try publicReadRequiredText($0, "collection")
+                    try publicReadRequiredText(
+                        $0, "collection", reason: .recordIndexMalformed
+                    )
                 }
                 let identityRows = try await connection.query(
                     """
@@ -274,13 +281,22 @@ extension SQLiteAccountDatabase {
                 )
                 let identityRow = identityRows.first
                 let storedSigningReference = try identityRow.map {
-                    try publicReadRequiredText($0, "signing_key_reference")
+                    try publicReadRequiredText(
+                        $0, "signing_key_reference",
+                        reason: .identityFactsMalformed
+                    )
                 }
                 let storedRotationReference = try identityRow.map {
-                    try publicReadRequiredText($0, "rotation_key_reference")
+                    try publicReadRequiredText(
+                        $0, "rotation_key_reference",
+                        reason: .identityFactsMalformed
+                    )
                 }
                 let storedGenesisCID = try identityRow.map {
-                    try publicReadRequiredText($0, "public_genesis_commit_cid")
+                    try publicReadRequiredText(
+                        $0, "public_genesis_commit_cid",
+                        reason: .identityFactsMalformed
+                    )
                 }
                 // Split deliberately: a single compound guard here is what made
                 // the 2026-08-12 outage undiagnosable from the journal.
@@ -289,7 +305,9 @@ extension SQLiteAccountDatabase {
                         reason: .identityRowCount
                     )
                 }
-                guard try publicReadRequiredInteger(identityRow, "stage")
+                guard try publicReadRequiredInteger(
+                    identityRow, "stage", reason: .identityFactsMalformed
+                )
                     == PLCAccountPreparationStage.submitted.rawValue else {
                     throw PublicRepositoryReadError.unavailable(
                         reason: .identityStageNotSubmitted
@@ -308,21 +326,28 @@ extension SQLiteAccountDatabase {
                     )
                 }
                 let plcHandle = try publicReadRequiredText(
-                    identityRow, "canonical_handle"
+                    identityRow, "canonical_handle",
+                    reason: .identityFactsMalformed
                 )
                 let signingDIDKey = try publicReadRequiredText(
-                    identityRow, "operation_signing_did_key"
+                    identityRow, "operation_signing_did_key",
+                    reason: .identityFactsMalformed
                 )
                 let genesisOperationCID = try identityVerifier.verifyGenesis(
                     facts: PublicPLCGenesisFacts(
                         signingDIDKey: signingDIDKey,
                     rotationDIDKey: try publicReadRequiredText(
-                        identityRow, "operation_rotation_did_key"
+                        identityRow, "operation_rotation_did_key",
+                        reason: .identityFactsMalformed
                     ),
                     canonicalHandle: plcHandle,
-                    pdsOrigin: try publicReadRequiredText(identityRow, "pds_origin"),
+                    pdsOrigin: try publicReadRequiredText(
+                        identityRow, "pds_origin",
+                        reason: .identityFactsMalformed
+                    ),
                     signature: try publicReadRequiredText(
-                        identityRow, "operation_signature"
+                        identityRow, "operation_signature",
+                        reason: .identityFactsMalformed
                     )
                     ),
                     expectedDID: account.did
@@ -336,11 +361,15 @@ extension SQLiteAccountDatabase {
                     }
                     identity = try PublicRepositoryReadIdentity(
                         canonicalHandle: plcHandle,
-                        pdsOrigin: try publicReadRequiredText(identityRow, "pds_origin"),
+                        pdsOrigin: try publicReadRequiredText(
+                            identityRow, "pds_origin",
+                            reason: .identityFactsMalformed
+                        ),
                         signingDIDKey: signingDIDKey,
                         handleIsCorrect: plcHandle == account.canonicalHandle,
                         preparationRequestID: try publicReadRequiredText(
-                            identityRow, "request_id"
+                            identityRow, "request_id",
+                            reason: .identityFactsMalformed
                         ),
                         genesisOperationCID: genesisOperationCID
                     )
@@ -370,7 +399,8 @@ extension SQLiteAccountDatabase {
                         signingDIDKey: terminal.signingDIDKey,
                         handleIsCorrect: terminal.canonicalHandle == account.canonicalHandle,
                         preparationRequestID: try publicReadRequiredText(
-                            identityRow, "request_id"
+                            identityRow, "request_id",
+                            reason: .identityFactsMalformed
                         ),
                         genesisOperationCID: terminal.genesisOperationCID,
                         terminalOperationCID: terminal.terminalOperationCID
@@ -484,8 +514,12 @@ extension SQLiteAccountDatabase {
                     .maximumGenerationIndexEntries else {
                     throw PublicRepositoryReadError.resourceLimitExceeded
                 }
-                let collection = try publicReadRequiredText(row, "collection")
-                let recordKey = try publicReadRequiredText(row, "rkey")
+                let collection = try publicReadRequiredText(
+                    row, "collection", reason: .recordIndexMalformed
+                )
+                let recordKey = try publicReadRequiredText(
+                    row, "rkey", reason: .recordIndexMalformed
+                )
                 _ = try PublicRepositoryPath(
                     collection: collection, recordKey: recordKey
                 )
@@ -934,32 +968,37 @@ extension SQLiteAccountDatabase {
 
 private func publicReadRequiredInteger(
     _ row: SQLiteRow,
-    _ column: String
+    _ column: String,
+    reason: PublicReadUnavailableReason
 ) throws -> Int {
     guard let value = row.column(column)?.integer,
           value >= Int64(Int.min), value <= Int64(Int.max) else {
-        throw PublicRepositoryReadError.unavailable(reason: .identityFactsMalformed)
+        throw PublicRepositoryReadError.unavailable(reason: reason)
     }
     return Int(value)
 }
 
 private func publicReadRequiredText(
     _ row: SQLiteRow,
-    _ column: String
+    _ column: String,
+    reason: PublicReadUnavailableReason
 ) throws -> String {
     guard let value = row.column(column)?.string, !value.isEmpty else {
-        throw PublicRepositoryReadError.unavailable(reason: .identityFactsMalformed)
+        throw PublicRepositoryReadError.unavailable(reason: reason)
     }
     return value
 }
 
-private func publicReadCID(_ value: String) throws -> CID {
+private func publicReadCID(
+    _ value: String,
+    reason: PublicReadUnavailableReason
+) throws -> CID {
     do {
         let cid = try CID.parse(value)
         try PublicRepositoryCID.validate(cid)
         return cid
     } catch {
-        throw PublicRepositoryReadError.unavailable(reason: .identityFactsMalformed)
+        throw PublicRepositoryReadError.unavailable(reason: reason)
     }
 }
 
