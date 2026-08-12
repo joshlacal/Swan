@@ -56,11 +56,18 @@ public struct SwanXRPCProxyRouter: Sendable {
     /// was `com.atproto.server.createSession`: nothing registers it locally, so
     /// a request naming `atproto-proxy: did:web:attacker.example#svc` was
     /// forwarded there — with the account identifier and password in its body.
-    /// (`com.atproto.server.resetPassword` turns out to be covered either way,
-    /// because the `PublicDataTesting20260727` descriptor loop registers an
-    /// unavailable stub for it when the email capability is absent. That is a
-    /// local route surviving by coincidence, which is exactly the thing not to
-    /// depend on.)
+    ///
+    /// This comment used to claim `com.atproto.server.resetPassword` was
+    /// "covered either way" because the `PublicDataTesting20260727` descriptor
+    /// loop left an unavailable stub over it. That was false when it was
+    /// written and false since: `20260727` declares twelve methods and not one
+    /// `com.atproto.server.*` entry, so no stub was ever registered for it. A
+    /// comment claiming a second layer that does not exist is worse than no
+    /// comment, in this file most of all. The real second layer arrived later
+    /// and is a different mechanism: `registerUnknownPublicEndpointGuards` now
+    /// closes `/xrpc/com.atproto.server.*` with an explicit 404, alongside
+    /// `identity.*`, `repo.*`, and `sync.*`. `admin.*` and `temp.*` still rest
+    /// on this allow-list alone.
     ///
     /// Inverting the gate makes disabling a route fail closed: an NSID outside
     /// this list is a 404 no matter what the client asks for. The *destination*
