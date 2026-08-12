@@ -8,12 +8,107 @@ import Darwin
 import Glibc
 #endif
 
+/// Names the exact guard that refused a public repository read.
+///
+/// This is a **server-side diagnostic only**. Every case maps to the same
+/// client-visible `503 {"error":"temporarily_unavailable"}`; nothing here may
+/// ever reach an unauthenticated caller. The 2026-08-12 outage cost two rounds
+/// of forensics against copied production databases purely because a single
+/// opaque `.unavailable` erased which of eight admission guards had fired and
+/// `journalctl` recorded nothing across three hours of live failures.
+///
+/// The distinction that matters most to callers is between
+/// ``generationPinStale`` — a cached generation whose `PRAGMA data_version`
+/// moved because *some* connection committed *something*, which says nothing
+/// about whether the repository is still valid — and every other case, which
+/// names a genuine identity, projection, or lifecycle failure.
+public enum PublicReadUnavailableReason: String, Sendable, Equatable, CaseIterable {
+    // MARK: Generation admission — PLC identity
+
+    /// The account database does not hold exactly one preparation-journal row.
+    case identityRowCount
+    /// The preparation journal exists but has not reached `.submitted`.
+    case identityStageNotSubmitted
+    /// The control row's genesis commit CID disagrees with the journal's.
+    case genesisCIDMismatch
+    /// The control row carries no signing key, no rotation key, or neither.
+    case missingKeyMaterial
+    /// Stored key references disagree with the control row's key generation.
+    case keyReferenceMismatch
+    /// A PLC operation history exists but the verifier cannot validate history.
+    case historyVerifierUnavailable
+    /// The terminal PLC operation disagrees with the stored keys or genesis.
+    case terminalIdentityMismatch
+    /// The verifier cannot authenticate repository commits.
+    case repositoryAuthenticatorUnavailable
+    /// The signed head does not authenticate against the terminal signing key,
+    /// or authenticates to a different DID, revision, or data root.
+    case commitAuthenticationFailed
+    /// A required identity column is missing, empty, or not a parseable value.
+    case identityFactsMalformed
+    /// The MST projection does not reproduce the persisted record index.
+    case projectionMismatch
+    /// The durable preparation intent disagrees with the admitted description.
+    case intentVerificationFailed
+
+    // MARK: Generation pins — re-checked on every cached read
+
+    /// `PRAGMA data_version` moved: another connection committed to this
+    /// account database. Monotonic and never returns to its prior value, so
+    /// this is change *detection*, not proof that the generation is invalid.
+    case generationPinStale
+    /// The account database file's device/inode, mode, owner, or link count
+    /// no longer matches the file the generation was admitted against.
+    case fileIdentityMismatch
+    /// `public_repository_state` moved out from under the pinned generation.
+    case repositoryStateMismatch
+    /// The account database holds no `public_repository_state` row at all.
+    case repositoryStateMissing
+    /// The pinned control account, DID, status, or verification identity no
+    /// longer matches the generation that was admitted.
+    case generationIdentityMismatch
+
+    // MARK: Directory lifecycle
+
+    /// The account directory has been closed.
+    case directoryClosed
+    /// The selector resolves to an account with no startup-preopened database,
+    /// or to a database path that is no longer a regular owner-only file.
+    case accountNotPreopened
+    /// The control row changed, deactivated, or vanished mid-request.
+    case controlRowChanged
+    /// The control store itself failed to answer.
+    case controlStoreFailure
+
+    // MARK: Storage and budgets
+
+    /// A repository block could not be read at its indexed length.
+    case blockMaterializationFailed
+    /// A process-wide response, spool, or request-body budget refused a lease.
+    case admissionBudgetExhausted
+    /// A public projection value failed its own construction invariants.
+    case malformedProjectionValue
+    /// A descriptor-backed CAR spool could not be sized, read, or drained.
+    case spoolStreamFailure
+    /// An underlying storage error with no more specific classification.
+    case storageFailure
+}
+
 public enum PublicRepositoryReadError: Error, Sendable, Equatable {
     case invalidSelector
     case invalidLimit
     case invalidCursor
     case resourceLimitExceeded
-    case unavailable
+    case unavailable(reason: PublicReadUnavailableReason)
+}
+
+extension PublicRepositoryReadError {
+    /// The failed guard's name when this is an availability failure, for the
+    /// server-side log line only. Never rendered into a response body.
+    public var unavailableReason: PublicReadUnavailableReason? {
+        guard case let .unavailable(reason) = self else { return nil }
+        return reason
+    }
 }
 
 public struct PublicPLCGenesisFacts: Sendable, Equatable {
@@ -67,12 +162,12 @@ public struct PublicRepositoryCommitAuthentication: Sendable, Equatable {
         guard descriptor.did.hasPrefix("did:"),
               !verificationIdentity.isEmpty,
               verificationIdentity.utf8.count <= 256 else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .commitAuthenticationFailed)
         }
         do {
             try PublicRepositoryCID.validate(commitCID)
         } catch {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .commitAuthenticationFailed)
         }
         self.descriptor = descriptor
         self.commitCID = commitCID
@@ -128,7 +223,7 @@ public struct PublicRepositoryReadIdentity: Sendable, Equatable {
               !preparationRequestID.isEmpty,
               (try? CID.parse(genesisOperationCID)) != nil,
               (try? CID.parse(terminalOperationCID ?? genesisOperationCID)) != nil else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .identityFactsMalformed)
         }
         self.canonicalHandle = canonicalHandle
         self.pdsOrigin = pdsOrigin
@@ -189,7 +284,7 @@ public struct PublicRepositoryReadDescription: Sendable, Equatable {
                       recordKey: "validation"
                   )) != nil
               }) else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .malformedProjectionValue)
         }
         self.did = did
         self.canonicalHandle = canonicalHandle
@@ -209,7 +304,7 @@ public struct PublicRepositoryReadStatus: Sendable, Equatable {
         guard AccountControlIdentifiers.isDID(did), status.isCanonicalValue,
               revision == nil || (try? PublicRepositoryTID(revision!)) != nil,
               status == .active || revision == nil else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .malformedProjectionValue)
         }
         self.did = did
         self.status = status
@@ -229,7 +324,7 @@ public struct PublicRepositoryReadRecord: Sendable, Equatable {
                 canonicalBytes, for: path
             )
         } catch {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .malformedProjectionValue)
         }
         self.path = path
         self.cid = cid
@@ -294,13 +389,13 @@ public struct PublicRepositoryReadPage: Sendable, Equatable {
             guard !overflow,
                   next <= PublicRepositoryJSONReadLimits
                     .maximumAggregateRecordBlockBytes else {
-                throw PublicRepositoryReadError.unavailable
+                throw PublicRepositoryReadError.unavailable(reason: .malformedProjectionValue)
             }
             aggregateBytes = next
         }
         guard Set(paths).count == paths.count,
               cursor == nil || !cursor!.isEmpty else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .malformedProjectionValue)
         }
         self.records = records
         self.cursor = cursor
@@ -341,7 +436,7 @@ public final class PublicRepositoryJSONReadAdmission: @unchecked Sendable {
               maximumReservedResponseBytes
                 >= PublicRepositoryJSONReadLimits
                     .maximumListRecordsResponseBytes else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .admissionBudgetExhausted)
         }
         self.maximumConcurrentReads = maximumConcurrentReads
         self.maximumReservedResponseBytes = maximumReservedResponseBytes
@@ -450,7 +545,7 @@ public final class PublicRepositoryJSONWriteAdmission: @unchecked Sendable {
     ) throws {
         guard maximumConcurrentWrites > 0,
               maximumReservedRequestBytes > 0 else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .admissionBudgetExhausted)
         }
         self.maximumConcurrentWrites = maximumConcurrentWrites
         self.maximumReservedRequestBytes = maximumReservedRequestBytes
@@ -533,7 +628,7 @@ public struct PublicRepositoryReadRecordResult: Sendable, Equatable {
         record: PublicRepositoryReadRecord?
     ) throws {
         guard AccountControlIdentifiers.isDID(did), state.did == did else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .malformedProjectionValue)
         }
         self.did = did
         self.state = state
@@ -552,7 +647,7 @@ public struct PublicRepositoryReadPageResult: Sendable, Equatable {
         page: PublicRepositoryReadPage
     ) throws {
         guard AccountControlIdentifiers.isDID(did), state.did == did else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .malformedProjectionValue)
         }
         self.did = did
         self.state = state
@@ -601,7 +696,7 @@ public final class PublicRepositorySpoolAdmission: @unchecked Sendable {
               maximumGlobalLeases > 0,
               maximumPerAccountLeases > 0,
               maximumPerAccountLeases <= maximumGlobalLeases else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .admissionBudgetExhausted)
         }
         self.maximumGlobalBytes = maximumGlobalBytes
         self.maximumPerAccountBytes = maximumPerAccountBytes
@@ -729,7 +824,7 @@ public final class PublicRepositoryCARSpool: @unchecked Sendable {
     ) async throws {
         guard (1...Self.maximumChunkBytes).contains(maximumChunkBytes) else {
             cleanup()
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .spoolStreamFailure)
         }
         let admitted = lock.withLock {
             guard state == .available else { return false }
@@ -738,7 +833,7 @@ public final class PublicRepositoryCARSpool: @unchecked Sendable {
         }
         guard admitted else {
             cleanup()
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .spoolStreamFailure)
         }
         defer {
             try? handle.close()
@@ -760,12 +855,12 @@ public final class PublicRepositoryCARSpool: @unchecked Sendable {
                 into: &reusableChunk
             )
             guard chunkByteCount > 0 else {
-                throw PublicRepositoryReadError.unavailable
+                throw PublicRepositoryReadError.unavailable(reason: .spoolStreamFailure)
             }
             let (nextByteCount, overflow) = streamedByteCount
                 .addingReportingOverflow(chunkByteCount)
             guard !overflow, nextByteCount <= bodyByteCount else {
-                throw PublicRepositoryReadError.unavailable
+                throw PublicRepositoryReadError.unavailable(reason: .spoolStreamFailure)
             }
             streamedByteCount = nextByteCount
             if chunkByteCount == reusableChunk.count {
@@ -781,7 +876,7 @@ public final class PublicRepositoryCARSpool: @unchecked Sendable {
             maximumBytes: 1,
             into: &endProbe
         ) == 0 else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .spoolStreamFailure)
         }
     }
 
@@ -799,7 +894,7 @@ public final class PublicRepositoryCARSpool: @unchecked Sendable {
               offset >= 0,
               maximumBytes > 0,
               maximumBytes <= buffer.count else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .spoolStreamFailure)
         }
         return try buffer.withUnsafeMutableBytes { bytes in
             guard let baseAddress = bytes.baseAddress else { return 0 }
@@ -817,14 +912,14 @@ public final class PublicRepositoryCARSpool: @unchecked Sendable {
                 #endif
                 if result >= 0 { return result }
                 guard errno == EINTR else {
-                    throw PublicRepositoryReadError.unavailable
+                    throw PublicRepositoryReadError.unavailable(reason: .spoolStreamFailure)
                 }
             }
         }
     }
 
     private func spoolByteCount(fileDescriptor: Int32) throws -> Int {
-        guard fileDescriptor >= 0 else { throw PublicRepositoryReadError.unavailable }
+        guard fileDescriptor >= 0 else { throw PublicRepositoryReadError.unavailable(reason: .spoolStreamFailure) }
         #if canImport(Darwin)
         var status = Darwin.stat()
         let result = Darwin.fstat(fileDescriptor, &status)
@@ -837,7 +932,7 @@ public final class PublicRepositoryCARSpool: @unchecked Sendable {
         guard result == 0,
               status.st_size >= 0,
               status.st_size <= off_t(Int.max) else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .spoolStreamFailure)
         }
         return Int(status.st_size)
     }

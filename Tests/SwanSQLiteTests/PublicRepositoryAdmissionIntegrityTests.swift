@@ -80,7 +80,10 @@ final class PublicRepositoryAdmissionIntegrityTests: XCTestCase {
             )
             XCTFail("nil-verifier mode exposed a public repository outcome")
         } catch let error as PublicRepositoryReadError {
-            XCTAssertEqual(error, .unavailable)
+            XCTAssertNotNil(
+                error.unavailableReason,
+                "expected a named availability failure, got \(error)"
+            )
         } catch {
             XCTFail("expected public read unavailable, got \(error)")
         }

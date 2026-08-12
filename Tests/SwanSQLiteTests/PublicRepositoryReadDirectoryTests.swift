@@ -1131,7 +1131,7 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
                     wallClockMicroseconds:
                         1_750_000_001_000_000 + UInt64(index)
                 ) else {
-                throw PublicRepositoryReadError.unavailable
+                throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
             }
             let prepared = try await PublicRepositoryEngine.apply(
                 repositoryDID: did,
@@ -1329,7 +1329,7 @@ private struct TestPublicPLCGenesisVerifier:
               facts.signature
                 == "9iRdVfzU6ADbVi3zm0V5Qephpl3Dae5odEdDhUBV8aA2TdS1kezQ_9E1YFevVRGE451G_Rdg514dat4ckLGVQg",
               expectedDID == "did:plc:abcdefghijklmnopqrstuvwx" else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
         }
         return operationCID
     }
@@ -1345,7 +1345,7 @@ private struct TestPublicPLCGenesisVerifier:
             expectedCommitCID: expectedCommitCID
         )
         guard commit.descriptor.did == expectedDID else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
         }
         return try PublicRepositoryCommitAuthentication(
             descriptor: commit.descriptor,
@@ -1486,7 +1486,7 @@ private func corruptPublicProjectionIndex(
     )
     guard rows.count == 1,
           rows[0].column("record_cid")?.string == replacementCID else {
-        throw PublicRepositoryReadError.unavailable
+        throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
     }
 }
 
@@ -1521,7 +1521,12 @@ private func XCTAssertThrowsPublicReadUnavailable<T>(
         _ = try await expression()
         XCTFail("expected unavailable", file: file, line: line)
     } catch let error as PublicRepositoryReadError {
-        XCTAssertEqual(error, .unavailable, file: file, line: line)
+        XCTAssertNotNil(
+            error.unavailableReason,
+            "expected a named availability failure, got \(error)",
+            file: file,
+            line: line
+        )
     } catch {
         XCTFail("expected public read unavailable, got \(error)", file: file, line: line)
     }

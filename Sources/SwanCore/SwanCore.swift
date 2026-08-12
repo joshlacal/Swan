@@ -597,4 +597,10 @@ public struct SwanLog: Sendable {
     public func event(_ message: Logger.Message, fields: [String: String] = [:]) {
         logger.info(message, metadata: fields.mapValues(Logger.MetadataValue.string))
     }
+
+    /// An operationally significant refusal. Same contract as ``event``:
+    /// stable identifiers only, never payloads or credentials.
+    public func warning(_ message: Logger.Message, fields: [String: String] = [:]) {
+        logger.warning(message, metadata: fields.mapValues(Logger.MetadataValue.string))
+    }
 }

@@ -227,7 +227,7 @@ extension SQLiteAccountDatabase {
             """
         )
         guard missing.isEmpty, extra.isEmpty else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .projectionMismatch)
         }
 
         let stream = SQLitePublicRepositoryExportStream(
@@ -420,7 +420,7 @@ private final class SQLitePublicRepositoryExportStream:
 private func publicExportBlock(_ row: SQLiteRow) throws -> PublicRepositoryBlock {
     guard let value = row.column("bytes"),
           let bytes = Data(sqliteData: value) else {
-        throw PublicRepositoryReadError.unavailable
+        throw PublicRepositoryReadError.unavailable(reason: .blockMaterializationFailed)
     }
     return PublicRepositoryBlock(
         cid: try publicExportCID(row, "cid"),
@@ -430,14 +430,14 @@ private func publicExportBlock(_ row: SQLiteRow) throws -> PublicRepositoryBlock
 
 private func publicExportText(_ row: SQLiteRow, _ column: String) throws -> String {
     guard let value = row.column(column)?.string, !value.isEmpty else {
-        throw PublicRepositoryReadError.unavailable
+        throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
     }
     return value
 }
 
 private func publicExportInteger(_ row: SQLiteRow, _ column: String) throws -> Int {
     guard let value = row.column(column)?.integer else {
-        throw PublicRepositoryReadError.unavailable
+        throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
     }
     return value
 }
@@ -448,7 +448,7 @@ private func publicExportCID(_ row: SQLiteRow, _ column: String) throws -> CID {
         try PublicRepositoryCID.validate(cid)
         return cid
     } catch {
-        throw PublicRepositoryReadError.unavailable
+        throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
     }
 }
 

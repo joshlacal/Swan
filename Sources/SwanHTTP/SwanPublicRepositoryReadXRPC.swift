@@ -4,9 +4,14 @@ import HTTPTypes
 import NIOCore
 import Petrel
 import SwanAccounts
+import SwanCore
 import SwanPublicRepository
 import SwanPublicWire
 import SwanStorage
+
+/// Server-side diagnostics for the unauthenticated public read path. Stable
+/// identifiers only — never payloads, credentials, or repository content.
+private let publicReadDiagnosticLog = SwanLog(label: "swan.public-read")
 
 private let publicReadNSIDs: Set<String> = [
     "com.atproto.repo.describeRepo",
@@ -259,11 +264,13 @@ func registerPublicRepositoryReadEndpoints(
     let repoStatusHandler = PublicRepoStatusHandler(directory: directory)
 
     router.get("/xrpc/com.atproto.repo.describeRepo") { request, _ async -> Response in
+        var selector: String?
         do {
             let query = try publicReadQuery(request, required: ["repo"])
             guard let repo = query["repo"] else {
                 throw PublicReadHandlerFailure.invalidRequest
             }
+            selector = repo
             guard let lease = jsonReadAdmission.reserve(
                 maximumResponseBytes: PublicRepositoryJSONReadLimits
                     .maximumListRecordsResponseBytes
@@ -296,11 +303,16 @@ func registerPublicRepositoryReadEndpoints(
         } catch PublicRepositoryReadError.invalidSelector {
             return publicReadError(.badRequest, "InvalidRequest")
         } catch {
-            return publicReadError(.serviceUnavailable, "temporarily_unavailable")
+            return publicReadUnavailable(
+                error,
+                method: "com.atproto.repo.describeRepo",
+                selector: selector
+            )
         }
     }
 
     router.get("/xrpc/com.atproto.repo.getRecord") { request, _ async -> Response in
+        var selector: String?
         do {
             let query = try publicReadQuery(
                 request,
@@ -312,6 +324,7 @@ func registerPublicRepositoryReadEndpoints(
                   let recordKeyQuery = query["rkey"] else {
                 throw PublicReadHandlerFailure.invalidRequest
             }
+            selector = repo
             let path = try PublicRepositoryPath(
                 collection: collectionQuery,
                 recordKey: recordKeyQuery
@@ -358,11 +371,16 @@ func registerPublicRepositoryReadEndpoints(
                 PublicRepositoryDomainError.pathTooLong {
             return publicReadError(.badRequest, "InvalidRequest")
         } catch {
-            return publicReadError(.serviceUnavailable, "temporarily_unavailable")
+            return publicReadUnavailable(
+                error,
+                method: "com.atproto.repo.getRecord",
+                selector: selector
+            )
         }
     }
 
     router.get("/xrpc/com.atproto.repo.listRecords") { request, _ async -> Response in
+        var selector: String?
         do {
             let query = try publicReadQuery(
                 request,
@@ -373,6 +391,7 @@ func registerPublicRepositoryReadEndpoints(
                   let collectionQuery = query["collection"] else {
                 throw PublicReadHandlerFailure.invalidRequest
             }
+            selector = repo
             _ = try PublicRepositoryPath(
                 collection: collectionQuery,
                 recordKey: "validation"
@@ -422,16 +441,22 @@ func registerPublicRepositoryReadEndpoints(
                 PublicRepositoryDomainError.pathTooLong {
             return publicReadError(.badRequest, "InvalidRequest")
         } catch {
-            return publicReadError(.serviceUnavailable, "temporarily_unavailable")
+            return publicReadUnavailable(
+                error,
+                method: "com.atproto.repo.listRecords",
+                selector: selector
+            )
         }
     }
 
     router.get("/xrpc/com.atproto.sync.getLatestCommit") { request, _ async -> Response in
+        var selector: String?
         do {
             let query = try publicReadQuery(request, required: ["did"])
             guard let rawDID = query["did"] else {
                 throw PublicReadHandlerFailure.invalidRequest
             }
+            selector = rawDID
             let did: DID = try publicReadWireParameters {
                 try DID(didString: rawDID)
             }
@@ -448,16 +473,22 @@ func registerPublicRepositoryReadEndpoints(
         } catch PublicRepositoryReadError.invalidSelector {
             return publicReadError(.badRequest, "InvalidRequest")
         } catch {
-            return publicReadError(.serviceUnavailable, "temporarily_unavailable")
+            return publicReadUnavailable(
+                error,
+                method: "com.atproto.sync.getLatestCommit",
+                selector: selector
+            )
         }
     }
 
     router.get("/xrpc/com.atproto.sync.getRepoStatus") { request, _ async -> Response in
+        var selector: String?
         do {
             let query = try publicReadQuery(request, required: ["did"])
             guard let rawDID = query["did"] else {
                 throw PublicReadHandlerFailure.invalidRequest
             }
+            selector = rawDID
             let did: DID = try publicReadWireParameters {
                 try DID(didString: rawDID)
             }
@@ -474,11 +505,16 @@ func registerPublicRepositoryReadEndpoints(
         } catch PublicRepositoryReadError.invalidSelector {
             return publicReadError(.badRequest, "InvalidRequest")
         } catch {
-            return publicReadError(.serviceUnavailable, "temporarily_unavailable")
+            return publicReadUnavailable(
+                error,
+                method: "com.atproto.sync.getRepoStatus",
+                selector: selector
+            )
         }
     }
 
     router.get("/xrpc/com.atproto.sync.getRepo") { request, _ async -> Response in
+        var selector: String?
         do {
             let query = try publicReadQuery(
                 request, required: ["did"], optional: ["since"]
@@ -489,6 +525,7 @@ func registerPublicRepositoryReadEndpoints(
             guard let rawDID = query["did"] else {
                 throw PublicReadHandlerFailure.invalidRequest
             }
+            selector = rawDID
             let did: DID = try publicReadWireParameters {
                 try DID(didString: rawDID)
             }
@@ -509,7 +546,11 @@ func registerPublicRepositoryReadEndpoints(
         } catch PublicRepositoryReadError.invalidSelector {
             return publicReadError(.badRequest, "InvalidRequest")
         } catch {
-            return publicReadError(.serviceUnavailable, "temporarily_unavailable")
+            return publicReadUnavailable(
+                error,
+                method: "com.atproto.sync.getRepo",
+                selector: selector
+            )
         }
     }
 
@@ -635,6 +676,34 @@ private func publicReadResponse(_ failure: PublicReadHandlerFailure) -> Response
 
 private func publicReadError(_ status: HTTPResponse.Status, _ code: String) -> Response {
     jsonResponseWithStatus(status, body: ["error": code])
+}
+
+/// The single collapse point for every public-read 503.
+///
+/// The response is byte-identical to what it has always been —
+/// `503 {"error":"temporarily_unavailable"}`. What changes is that the guard
+/// that refused the read is now written to the service journal. Three hours of
+/// live 503s on 2026-08-12 produced zero journal lines, and diagnosing them
+/// required copying the production databases to a laptop.
+///
+/// The selector is logged only when it is already a well-formed DID or handle,
+/// so an arbitrary query value can never be reflected into the journal.
+private func publicReadUnavailable(
+    _ error: any Error,
+    method: String,
+    selector: String?
+) -> Response {
+    var fields = ["method": method]
+    if let selector,
+       AccountControlIdentifiers.isDID(selector)
+       || AccountControlIdentifiers.isCanonicalHandle(selector) {
+        fields["selector"] = selector
+    }
+    fields["reason"] =
+        (error as? PublicRepositoryReadError)?.unavailableReason?.rawValue
+        ?? "unclassified"
+    publicReadDiagnosticLog.warning("public read unavailable", fields: fields)
+    return publicReadError(.serviceUnavailable, "temporarily_unavailable")
 }
 
 // Internal so the response-body lease lifetime can be regression-tested

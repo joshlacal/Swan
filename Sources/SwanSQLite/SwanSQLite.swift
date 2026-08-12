@@ -1940,7 +1940,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         throws -> SQLitePublicRepositoryFileIdentity
     {
         guard databaseFileDescriptor >= 0 else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .fileIdentityMismatch)
         }
         var metadata = stat()
         guard fstat(databaseFileDescriptor, &metadata) == 0,
@@ -1948,7 +1948,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
               metadata.st_uid == geteuid(),
               (metadata.st_mode & 0o777) == 0o600,
               metadata.st_nlink == 1 else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .fileIdentityMismatch)
         }
         return SQLitePublicRepositoryFileIdentity(
             device: UInt64(metadata.st_dev),

@@ -182,7 +182,7 @@ final class PublicRepositoryCARSpoolRSSRegressionTests: XCTestCase {
                         request,
                         wallClockMicroseconds: 1_760_000_000_000_000 + UInt64(index)
                     ) else {
-                    throw PublicRepositoryReadError.unavailable
+                    throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
                 }
                 let path = try PublicRepositoryPath(
                     collection: collection,

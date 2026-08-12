@@ -5,6 +5,10 @@ import SwanPublicRepository
 import SwanSpaces
 import SwanStorage
 
+/// Server-side diagnostics for the unauthenticated public read path. Stable
+/// identifiers only — never payloads, credentials, or repository content.
+private let publicReadDiagnosticLog = SwanLog(label: "swan.public-read")
+
 /// A startup-owned directory of account databases that were opened and
 /// migrated before the service accepted traffic. It intentionally has no
 /// fallback construction path: a request can select only a database that was
@@ -1075,7 +1079,7 @@ public actor SQLitePreMigratedAccountDirectory:
         let account = try await resolvePublicAccount(selector)
         guard let account else { return nil }
         guard !isClosed else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .directoryClosed)
         }
         if account.status != .active {
             return try PublicRepositoryReadStatus(
@@ -1087,8 +1091,10 @@ public actor SQLitePreMigratedAccountDirectory:
             _ = try await database.readPublicRepositoryDescription(
                 generation: generation
             )
+        } catch let error as PublicRepositoryReadError {
+            throw error
         } catch {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
         }
         try await recheckPublicAccount(account, generation: generation)
         return try PublicRepositoryReadStatus(
@@ -1130,8 +1136,10 @@ public actor SQLitePreMigratedAccountDirectory:
             description = try await database.readPublicRepositoryDescription(
                 generation: generation
             )
+        } catch let error as PublicRepositoryReadError {
+            throw error
         } catch {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
         }
         try await recheckPublicAccount(account, generation: generation)
         return .active(description)
@@ -1160,7 +1168,7 @@ public actor SQLitePreMigratedAccountDirectory:
               intent.pdsOrigin == description.identity.pdsOrigin,
               intent.operationCID == description.identity.genesisOperationCID,
               intent.stage == .submitted else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .intentVerificationFailed)
         }
     }
 
@@ -1204,8 +1212,10 @@ public actor SQLitePreMigratedAccountDirectory:
                 expectedCID: expectedCID,
                 generation: generation
             )
+        } catch let error as PublicRepositoryReadError {
+            throw error
         } catch {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
         }
         try await recheckPublicAccount(account, generation: generation)
         return .active(try PublicRepositoryReadRecordResult(
@@ -1266,7 +1276,7 @@ public actor SQLitePreMigratedAccountDirectory:
         } catch let error as PublicRepositoryReadError {
             throw error
         } catch {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
         }
         try await recheckPublicAccount(account, generation: generation)
         return .active(try PublicRepositoryReadPageResult(
@@ -1305,7 +1315,7 @@ public actor SQLitePreMigratedAccountDirectory:
             accountDID: account.did,
             maximumBytes: PublicRepositoryLimits.standard.maximumCARBytes
         ) else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .admissionBudgetExhausted)
         }
         let result: PublicRepositoryReadCAR
         do {
@@ -1313,9 +1323,12 @@ public actor SQLitePreMigratedAccountDirectory:
                 lease: lease,
                 generation: generation
             )
+        } catch let error as PublicRepositoryReadError {
+            lease.release()
+            throw error
         } catch {
             lease.release()
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
         }
         do {
             try await recheckPublicAccount(account, generation: generation)
@@ -1331,7 +1344,7 @@ public actor SQLitePreMigratedAccountDirectory:
         database: SQLiteAccountDatabase
     ) async throws {
         guard let account = try await controlStore.account(did: did) else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .controlRowChanged)
         }
         _ = try await refreshPublicReadGeneration(
             account: account,
@@ -1342,7 +1355,7 @@ public actor SQLitePreMigratedAccountDirectory:
     private func resolvePublicAccount(
         _ selector: String
     ) async throws -> AccountControlAccount? {
-        guard !isClosed else { throw PublicRepositoryReadError.unavailable }
+        guard !isClosed else { throw PublicRepositoryReadError.unavailable(reason: .directoryClosed) }
         let account: AccountControlAccount?
         do {
             if selector.hasPrefix("did:") {
@@ -1361,25 +1374,25 @@ public actor SQLitePreMigratedAccountDirectory:
         } catch let error as PublicRepositoryReadError {
             throw error
         } catch {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .controlStoreFailure)
         }
-        guard !isClosed else { throw PublicRepositoryReadError.unavailable }
+        guard !isClosed else { throw PublicRepositoryReadError.unavailable(reason: .directoryClosed) }
         return account
     }
 
     private func preopenedPublicRepositoryDatabase(
         _ did: String
     ) throws -> SQLiteAccountDatabase {
-        guard !isClosed else { throw PublicRepositoryReadError.unavailable }
+        guard !isClosed else { throw PublicRepositoryReadError.unavailable(reason: .directoryClosed) }
         do {
             try Self.requireExistingRegularDatabase(
                 SQLiteLayout.accountDatabase(in: dataDirectory, did: did)
             )
         } catch {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .accountNotPreopened)
         }
         guard let database = databases[did] else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .accountNotPreopened)
         }
         return database
     }
@@ -1391,7 +1404,7 @@ public actor SQLitePreMigratedAccountDirectory:
         generation: SQLiteVerifiedPublicRepositoryGeneration
     ) {
         guard account.status == .active else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .controlRowChanged)
         }
         let database = try preopenedPublicRepositoryDatabase(account.did)
         if let generation = publicReadGenerations[account.did],
@@ -1422,7 +1435,7 @@ public actor SQLitePreMigratedAccountDirectory:
               account.status == .active,
               databases[account.did] === database,
               let identityVerifier = publicIdentityVerifier else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .accountNotPreopened)
         }
         do {
             try Self.requireExistingRegularDatabase(
@@ -1431,7 +1444,7 @@ public actor SQLitePreMigratedAccountDirectory:
             guard let current = try await controlStore.account(did: account.did),
                   current == account,
                   current.status == .active else {
-                throw PublicRepositoryReadError.unavailable
+                throw PublicRepositoryReadError.unavailable(reason: .controlRowChanged)
             }
             let generation = try await database.admitPublicRepositoryGeneration(
                 account: account,
@@ -1446,7 +1459,7 @@ public actor SQLitePreMigratedAccountDirectory:
                   let current = try await controlStore.account(did: account.did),
                   current == account,
                   current.status == .active else {
-                throw PublicRepositoryReadError.unavailable
+                throw PublicRepositoryReadError.unavailable(reason: .controlRowChanged)
             }
             try Self.requireExistingRegularDatabase(
                 SQLiteLayout.accountDatabase(in: dataDirectory, did: account.did)
@@ -1454,10 +1467,42 @@ public actor SQLitePreMigratedAccountDirectory:
             publicReadGenerations[account.did] = generation
             return generation
         } catch let error as PublicRepositoryReadError {
+            Self.logPublicReadAdmissionFailure(error, did: account.did)
             throw error
+        } catch let error as PublicRepositoryMutationStoreError
+            where error == .corruptRepository
+        {
+            // Admission's own block reads report corruption through the
+            // mutation-store error. Name it rather than folding it into the
+            // generic bucket; the client-visible 503 is unchanged.
+            let named = PublicRepositoryReadError.unavailable(
+                reason: .blockMaterializationFailed
+            )
+            Self.logPublicReadAdmissionFailure(named, did: account.did)
+            throw named
         } catch {
-            throw PublicRepositoryReadError.unavailable
+            let named = PublicRepositoryReadError.unavailable(
+                reason: .storageFailure
+            )
+            Self.logPublicReadAdmissionFailure(named, did: account.did)
+            throw named
         }
+    }
+
+    /// The one line that turns a silent 503 into a diagnosable one.
+    ///
+    /// Server-side only: the DID and the failed guard's name are written to the
+    /// service journal and never to a response body. The 2026-08-12 outage ran
+    /// for three hours with zero `journalctl` lines because this did not exist.
+    private static func logPublicReadAdmissionFailure(
+        _ error: PublicRepositoryReadError,
+        did: String
+    ) {
+        guard let reason = error.unavailableReason else { return }
+        publicReadDiagnosticLog.warning(
+            "public read admission refused",
+            fields: ["did": did, "reason": reason.rawValue]
+        )
     }
 
     private func recheckPublicAccount(
@@ -1467,21 +1512,21 @@ public actor SQLitePreMigratedAccountDirectory:
         guard !isClosed,
               databases[expected.did] != nil,
               publicReadGenerations[expected.did]?.id == generation.id else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .accountNotPreopened)
         }
         let current: AccountControlAccount?
         do {
             current = try await controlStore.account(did: expected.did)
         } catch {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .controlStoreFailure)
         }
         guard let current, current == expected, current.status == .active else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .controlRowChanged)
         }
         guard !isClosed,
               databases[expected.did] != nil,
               publicReadGenerations[expected.did]?.id == generation.id else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .accountNotPreopened)
         }
         do {
             try Self.requireExistingRegularDatabase(
@@ -1490,7 +1535,7 @@ public actor SQLitePreMigratedAccountDirectory:
                 )
             )
         } catch {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .accountNotPreopened)
         }
     }
 
@@ -1791,12 +1836,12 @@ public actor SQLitePreMigratedAccountDirectory:
             // Explicit public-read-disabled mode must not normalize partially
             // provisioned public truth into an inaccessible nil generation.
             guard state == nil, account.publicGenesisCommitCID == nil else {
-                throw PublicRepositoryReadError.unavailable
+                throw PublicRepositoryReadError.unavailable(reason: .repositoryStateMismatch)
             }
             return nil
         }
         guard state != nil, account.publicGenesisCommitCID != nil else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .repositoryStateMissing)
         }
         let generation = try await database.admitPublicRepositoryGeneration(
             account: account,

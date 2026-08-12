@@ -235,9 +235,23 @@ extension SQLiteAccountDatabase {
                 let fileIdentity = try publicRepositoryFileIdentityWithoutGate()
                 let dataVersion = try await publicRepositoryDataVersionWithoutGate()
                 guard let state = try await loadPublicRepositoryStateWithoutGate() else {
-                    throw PublicRepositoryReadError.unavailable
+                    throw PublicRepositoryReadError.unavailable(
+                        reason: .repositoryStateMissing
+                    )
                 }
-                try await verifyProjectionWithoutGate(state: state)
+                // `verifyProjectionWithoutGate` keeps throwing
+                // `corruptRepository` for its direct maintenance callers. Name
+                // the cause here so admission failures are distinguishable from
+                // the identity guards below without changing that contract.
+                do {
+                    try await verifyProjectionWithoutGate(state: state)
+                } catch let error as PublicRepositoryReadError {
+                    throw error
+                } catch {
+                    throw PublicRepositoryReadError.unavailable(
+                        reason: .projectionMismatch
+                    )
+                }
                 let rows = try await connection.query(
                     """
                     SELECT DISTINCT collection
@@ -268,15 +282,30 @@ extension SQLiteAccountDatabase {
                 let storedGenesisCID = try identityRow.map {
                     try publicReadRequiredText($0, "public_genesis_commit_cid")
                 }
-                guard identityRows.count == 1,
-                      let identityRow,
-                      try publicReadRequiredInteger(identityRow, "stage")
-                        == PLCAccountPreparationStage.submitted.rawValue,
-                      let storedGenesisCID,
-                      let signingKey = account.signingKey,
-                      let rotationKey = account.rotationKey,
+                // Split deliberately: a single compound guard here is what made
+                // the 2026-08-12 outage undiagnosable from the journal.
+                guard identityRows.count == 1, let identityRow else {
+                    throw PublicRepositoryReadError.unavailable(
+                        reason: .identityRowCount
+                    )
+                }
+                guard try publicReadRequiredInteger(identityRow, "stage")
+                    == PLCAccountPreparationStage.submitted.rawValue else {
+                    throw PublicRepositoryReadError.unavailable(
+                        reason: .identityStageNotSubmitted
+                    )
+                }
+                guard let storedGenesisCID,
                       account.publicGenesisCommitCID == storedGenesisCID else {
-                    throw PublicRepositoryReadError.unavailable
+                    throw PublicRepositoryReadError.unavailable(
+                        reason: .genesisCIDMismatch
+                    )
+                }
+                guard let signingKey = account.signingKey,
+                      let rotationKey = account.rotationKey else {
+                    throw PublicRepositoryReadError.unavailable(
+                        reason: .missingKeyMaterial
+                    )
                 }
                 let plcHandle = try publicReadRequiredText(
                     identityRow, "canonical_handle"
@@ -303,7 +332,7 @@ extension SQLiteAccountDatabase {
                 if history.isEmpty {
                     guard signingKey.reference == storedSigningReference,
                           rotationKey.reference == storedRotationReference else {
-                        throw PublicRepositoryReadError.unavailable
+                        throw PublicRepositoryReadError.unavailable(reason: .keyReferenceMismatch)
                     }
                     identity = try PublicRepositoryReadIdentity(
                         canonicalHandle: plcHandle,
@@ -318,7 +347,7 @@ extension SQLiteAccountDatabase {
                 } else {
                     guard let historyVerifier = identityVerifier
                         as? any PublicPLCIdentityVerifying else {
-                        throw PublicRepositoryReadError.unavailable
+                        throw PublicRepositoryReadError.unavailable(reason: .historyVerifierUnavailable)
                     }
                     let terminal = try historyVerifier.verifyIdentityHistory(
                         history,
@@ -333,7 +362,7 @@ extension SQLiteAccountDatabase {
                             == "\(signingKey.purpose.rawValue):\(terminal.keyGeneration)",
                           rotationKey.reference
                             == "\(rotationKey.purpose.rawValue):\(terminal.keyGeneration)" else {
-                        throw PublicRepositoryReadError.unavailable
+                        throw PublicRepositoryReadError.unavailable(reason: .terminalIdentityMismatch)
                     }
                     identity = try PublicRepositoryReadIdentity(
                         canonicalHandle: terminal.canonicalHandle,
@@ -349,7 +378,7 @@ extension SQLiteAccountDatabase {
                 }
                 guard let repositoryAuthenticator = identityVerifier
                     as? any PublicPLCRepositoryAuthenticating else {
-                    throw PublicRepositoryReadError.unavailable
+                    throw PublicRepositoryReadError.unavailable(reason: .repositoryAuthenticatorUnavailable)
                 }
                 let commitBytes = try await blockBytesWithoutGate(
                     state.commitCID
@@ -366,7 +395,7 @@ extension SQLiteAccountDatabase {
                       authentication.descriptor.revision.value
                         == state.revision,
                       authentication.descriptor.dataCID == state.dataCID else {
-                    throw PublicRepositoryReadError.unavailable
+                    throw PublicRepositoryReadError.unavailable(reason: .commitAuthenticationFailed)
                 }
                 let description = try PublicRepositoryReadDescription(
                     did: accountDID,
@@ -377,10 +406,16 @@ extension SQLiteAccountDatabase {
                     identity: identity
                 )
                 guard try await publicRepositoryDataVersionWithoutGate()
-                        == dataVersion,
-                      try publicRepositoryFileIdentityWithoutGate()
-                        == fileIdentity else {
-                    throw PublicRepositoryReadError.unavailable
+                    == dataVersion else {
+                    throw PublicRepositoryReadError.unavailable(
+                        reason: .generationPinStale
+                    )
+                }
+                guard try publicRepositoryFileIdentityWithoutGate()
+                    == fileIdentity else {
+                    throw PublicRepositoryReadError.unavailable(
+                        reason: .fileIdentityMismatch
+                    )
                 }
                 return SQLiteVerifiedPublicRepositoryGeneration(
                     id: UUID(),
@@ -527,7 +562,7 @@ extension SQLiteAccountDatabase {
                 do {
                     cid = try await tree.get(path)
                 } catch {
-                    throw PublicRepositoryReadError.unavailable
+                    throw PublicRepositoryReadError.unavailable(reason: .blockMaterializationFailed)
                 }
                 guard let cid,
                       expectedCID == nil || expectedCID == cid else {
@@ -548,7 +583,7 @@ extension SQLiteAccountDatabase {
                     publicRepositoryRecordBlockByteCountWithoutGate(cid)
                 let bytes = try await blockBytesWithoutGate(cid)
                 guard bytes.count == byteCount else {
-                    throw PublicRepositoryReadError.unavailable
+                    throw PublicRepositoryReadError.unavailable(reason: .blockMaterializationFailed)
                 }
                 let record = try PublicRepositoryReadRecord(
                     path: path,
@@ -602,7 +637,7 @@ extension SQLiteAccountDatabase {
                         reverse: reverse
                     )
                 } catch {
-                    throw PublicRepositoryReadError.unavailable
+                    throw PublicRepositoryReadError.unavailable(reason: .blockMaterializationFailed)
                 }
                 var records: [PublicRepositoryReadRecord] = []
                 records.reserveCapacity(mstPage.leaves.count)
@@ -633,7 +668,7 @@ extension SQLiteAccountDatabase {
                         leaf.recordCID
                     )
                     guard bytes.count == byteCount else {
-                        throw PublicRepositoryReadError.unavailable
+                        throw PublicRepositoryReadError.unavailable(reason: .blockMaterializationFailed)
                     }
                     records.append(try PublicRepositoryReadRecord(
                         path: leaf.path,
@@ -676,7 +711,7 @@ extension SQLiteAccountDatabase {
               let byteCount = rows[0].column("byte_count")?.integer,
               (1...PublicRepositoryLimits.standard.maximumRecordBlockBytes)
                 .contains(byteCount) else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .blockMaterializationFailed)
         }
         return byteCount
     }
@@ -703,7 +738,7 @@ extension SQLiteAccountDatabase {
                     guard commit.descriptor.did == state.did,
                           commit.descriptor.revision.value == state.revision,
                           commit.descriptor.dataCID == state.dataCID else {
-                        throw PublicRepositoryReadError.unavailable
+                        throw PublicRepositoryReadError.unavailable(reason: .repositoryStateMismatch)
                     }
                     let sink = PublicRepositoryFileSink(handle: handle)
                     try await writeBoundedPublicRepositoryCAR(
@@ -745,7 +780,7 @@ extension SQLiteAccountDatabase {
                     guard let state =
                             try await loadPublicRepositoryStateWithoutGate()
                     else {
-                        throw PublicRepositoryReadError.unavailable
+                        throw PublicRepositoryReadError.unavailable(reason: .repositoryStateMissing)
                     }
                     let commitBytes = try await blockBytesWithoutGate(
                         state.commitCID
@@ -757,7 +792,7 @@ extension SQLiteAccountDatabase {
                     guard commit.descriptor.did == state.did,
                           commit.descriptor.revision.value == state.revision,
                           commit.descriptor.dataCID == state.dataCID else {
-                        throw PublicRepositoryReadError.unavailable
+                        throw PublicRepositoryReadError.unavailable(reason: .repositoryStateMismatch)
                     }
                     let sink = PublicRepositoryFileSink(handle: handle)
                     try await writeBoundedPublicRepositoryCAR(
@@ -787,17 +822,39 @@ extension SQLiteAccountDatabase {
     private func requirePublicRepositoryGenerationWithoutGate(
         _ generation: SQLiteVerifiedPublicRepositoryGeneration
     ) async throws -> PublicRepositoryState {
+        // Three independent pins, reported independently. `data_version` is
+        // the only one that moves on an unrelated commit from any other
+        // connection to this database, so callers must be able to tell it
+        // apart from a genuine identity or repository-state failure.
         guard generation.controlAccount.did == accountDID,
               generation.description.did == accountDID,
               generation.description.status == .active,
-              !generation.repositoryVerificationIdentity.isEmpty,
-              try publicRepositoryFileIdentityWithoutGate()
-                == generation.fileIdentity,
-              try await publicRepositoryDataVersionWithoutGate()
-                == generation.dataVersion,
-              let state = try await loadPublicRepositoryStateWithoutGate(),
-              state == generation.description.state else {
-            throw PublicRepositoryReadError.unavailable
+              !generation.repositoryVerificationIdentity.isEmpty else {
+            throw PublicRepositoryReadError.unavailable(
+                reason: .generationIdentityMismatch
+            )
+        }
+        guard try publicRepositoryFileIdentityWithoutGate()
+            == generation.fileIdentity else {
+            throw PublicRepositoryReadError.unavailable(
+                reason: .fileIdentityMismatch
+            )
+        }
+        guard try await publicRepositoryDataVersionWithoutGate()
+            == generation.dataVersion else {
+            throw PublicRepositoryReadError.unavailable(
+                reason: .generationPinStale
+            )
+        }
+        guard let state = try await loadPublicRepositoryStateWithoutGate() else {
+            throw PublicRepositoryReadError.unavailable(
+                reason: .repositoryStateMissing
+            )
+        }
+        guard state == generation.description.state else {
+            throw PublicRepositoryReadError.unavailable(
+                reason: .repositoryStateMismatch
+            )
         }
         return state
     }
@@ -807,13 +864,27 @@ extension SQLiteAccountDatabase {
         expectedState: PublicRepositoryState
     ) async throws {
         guard try publicRepositoryFileIdentityWithoutGate()
-                == generation.fileIdentity,
-              try await publicRepositoryDataVersionWithoutGate()
-                == generation.dataVersion,
-              let state = try await loadPublicRepositoryStateWithoutGate(),
-              state == expectedState,
+            == generation.fileIdentity else {
+            throw PublicRepositoryReadError.unavailable(
+                reason: .fileIdentityMismatch
+            )
+        }
+        guard try await publicRepositoryDataVersionWithoutGate()
+            == generation.dataVersion else {
+            throw PublicRepositoryReadError.unavailable(
+                reason: .generationPinStale
+            )
+        }
+        guard let state = try await loadPublicRepositoryStateWithoutGate() else {
+            throw PublicRepositoryReadError.unavailable(
+                reason: .repositoryStateMissing
+            )
+        }
+        guard state == expectedState,
               state == generation.description.state else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(
+                reason: .repositoryStateMismatch
+            )
         }
     }
 
@@ -822,7 +893,7 @@ extension SQLiteAccountDatabase {
         guard rows.count == 1,
               let value = rows[0].column("data_version")?.integer,
               let dataVersion = Int64(exactly: value) else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
         }
         return dataVersion
     }
@@ -848,14 +919,14 @@ extension SQLiteAccountDatabase {
               metadata.st_uid == geteuid(),
               (metadata.st_mode & 0o777) == 0o600,
               metadata.st_nlink == 1 else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .fileIdentityMismatch)
         }
         let pathIdentity = SQLitePublicRepositoryFileIdentity(
             device: UInt64(metadata.st_dev),
             inode: UInt64(metadata.st_ino)
         )
         guard pathIdentity == descriptorIdentity else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .fileIdentityMismatch)
         }
         return descriptorIdentity
     }
@@ -867,7 +938,7 @@ private func publicReadRequiredInteger(
 ) throws -> Int {
     guard let value = row.column(column)?.integer,
           value >= Int64(Int.min), value <= Int64(Int.max) else {
-        throw PublicRepositoryReadError.unavailable
+        throw PublicRepositoryReadError.unavailable(reason: .identityFactsMalformed)
     }
     return Int(value)
 }
@@ -877,7 +948,7 @@ private func publicReadRequiredText(
     _ column: String
 ) throws -> String {
     guard let value = row.column(column)?.string, !value.isEmpty else {
-        throw PublicRepositoryReadError.unavailable
+        throw PublicRepositoryReadError.unavailable(reason: .identityFactsMalformed)
     }
     return value
 }
@@ -888,7 +959,7 @@ private func publicReadCID(_ value: String) throws -> CID {
         try PublicRepositoryCID.validate(cid)
         return cid
     } catch {
-        throw PublicRepositoryReadError.unavailable
+        throw PublicRepositoryReadError.unavailable(reason: .identityFactsMalformed)
     }
 }
 

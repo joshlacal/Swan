@@ -558,7 +558,10 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
         XCTAssertThrowsError(
             try PublicRepositoryReadPage(records: records, cursor: nil)
         ) {
-            XCTAssertEqual($0 as? PublicRepositoryReadError, .unavailable)
+            XCTAssertEqual(
+                ($0 as? PublicRepositoryReadError)?.unavailableReason,
+                .malformedProjectionValue
+            )
         }
     }
 
@@ -773,7 +776,7 @@ private actor TestPublicRepositoryReadDirectory: PublicRepositoryReadDirectory {
             contents: nil,
             attributes: [.posixPermissions: 0o600]
         ) else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
         }
         let handle = try FileHandle(forUpdating: url)
         try FileManager.default.removeItem(at: url)
@@ -783,7 +786,7 @@ private actor TestPublicRepositoryReadDirectory: PublicRepositoryReadDirectory {
         guard let lease = admission.reserve(
             accountDID: description.did,
             maximumBytes: PublicRepositoryLimits.standard.maximumCARBytes
-        ) else { throw PublicRepositoryReadError.unavailable }
+        ) else { throw PublicRepositoryReadError.unavailable(reason: .storageFailure) }
         return PublicRepositoryReadCAR(
             state: description.state,
             spool: PublicRepositoryCARSpool(fileHandle: handle, lease: lease)
@@ -857,7 +860,7 @@ private actor TestPublicRepositoryReadDirectory: PublicRepositoryReadDirectory {
         let status = try currentStatus()
         guard status.status == .active else { return .lifecycle(status) }
         guard let car = try await publicRepositoryCAR(selector: selector) else {
-            throw PublicRepositoryReadError.unavailable
+            throw PublicRepositoryReadError.unavailable(reason: .storageFailure)
         }
         return .active(car)
     }
