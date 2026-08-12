@@ -1368,8 +1368,23 @@ private func publicReadUnavailable(
     return publicReadError(.serviceUnavailable, "temporarily_unavailable")
 }
 
-private func publicReadDiagnosticToken(_ error: any Error) -> String {
-    if let reason = (error as? PublicRepositoryReadError)?.unavailableReason {
+/// Names the guard behind one 503 for the journal line above.
+///
+/// Classification goes through
+/// ``PublicRepositoryReadError/admissionFailureReason``, the same accessor the
+/// storage layer journals and bounds with. ``unavailableReason`` answers `nil`
+/// for `resourceLimitExceeded`, which carries no reason of its own, so this
+/// site used to journal `reason=unclassified` for exactly the refusal the
+/// storage layer had just journalled as `reason=projectionBoundExceeded` —
+/// two lines naming one 503 differently, in the one function whose purpose is
+/// that no 503 leaves unnamed.
+///
+/// Internal rather than private so the mapping can be asserted directly:
+/// nothing about it reaches a response body, so a route test cannot see it.
+func publicReadDiagnosticToken(_ error: any Error) -> String {
+    if let reason = (error as? PublicRepositoryReadError)?
+        .admissionFailureReason
+    {
         return reason.rawValue
     }
     if case let PublicReadHandlerFailure.unavailable(guardName) = error {

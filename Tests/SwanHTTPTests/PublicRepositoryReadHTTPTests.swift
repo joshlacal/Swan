@@ -694,6 +694,40 @@ final class PublicRepositoryReadHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    // Production mutation caught: the HTTP layer classified its 503 log line
+    // through `unavailableReason`, which answers nil for the one admission
+    // refusal that carries no reason of its own. A read refused by the
+    // projection bound journalled `reason=projectionBoundExceeded` from
+    // storage and `reason=unclassified` from HTTP — two lines, two names, one
+    // 503, in the function whose whole purpose is that no 503 goes unnamed.
+    func testPublicReadDiagnosticTokenNamesReasonlessAdmissionRefusals() {
+        struct UnrelatedFailure: Error {}
+
+        XCTAssertEqual(
+            publicReadDiagnosticToken(
+                PublicRepositoryReadError.resourceLimitExceeded
+            ),
+            PublicReadUnavailableReason.projectionBoundExceeded.rawValue,
+            "the projection bound must be named identically on both sides"
+        )
+        XCTAssertEqual(
+            publicReadDiagnosticToken(
+                PublicRepositoryReadError.unavailable(
+                    reason: .identityFactsMalformed
+                )
+            ),
+            PublicReadUnavailableReason.identityFactsMalformed.rawValue
+        )
+        XCTAssertEqual(
+            publicReadDiagnosticToken(CancellationError()),
+            "requestCancelled"
+        )
+        XCTAssertEqual(
+            publicReadDiagnosticToken(UnrelatedFailure()),
+            "unclassified"
+        )
+    }
+
     private func makeFixture(
         nonEmpty: Bool = false,
         identityHandle: String? = nil,
