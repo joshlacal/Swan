@@ -65,72 +65,22 @@ public enum ATHandleIPAddress: Hashable, Sendable, Equatable, CustomStringConver
     public var isLoopback: Bool {
         switch self {
         case let .ipv4(value):
-            return value >> 24 == 127
+            return SwanPublicAddressPolicy.isLoopback(ipv4: value)
         case let .ipv6(bytes):
-            return bytes == Data(repeating: 0, count: 15) + Data([1])
+            return SwanPublicAddressPolicy.isLoopback(ipv6: bytes)
         }
     }
 
+    /// Delegates to ``SwanPublicAddressPolicy``, which is shared with the
+    /// OAuth/DID/pipethrough classifier so a range denied here can never be
+    /// reached through those paths instead.
     public var isPublicInternetAddress: Bool {
         switch self {
         case let .ipv4(value):
-            let first = UInt8((value >> 24) & 0xff)
-            let second = UInt8((value >> 16) & 0xff)
-            let third = UInt8((value >> 8) & 0xff)
-            if first == 0 || first == 10 || first == 127 || first >= 224 { return false }
-            if first == 100, (64 ... 127).contains(second) { return false }
-            if first == 169, second == 254 { return false }
-            if first == 172, (16 ... 31).contains(second) { return false }
-            if first == 192, second == 0, third == 0 { return false }
-            if first == 192, second == 0, third == 2 { return false }
-            if first == 192, second == 88, third == 99 { return false }
-            if first == 192, second == 168 { return false }
-            if first == 198, second == 18 || second == 19 { return false }
-            if first == 198, second == 51, third == 100 { return false }
-            if first == 203, second == 0, third == 113 { return false }
-            return true
+            return SwanPublicAddressPolicy.isPublicInternetAddress(ipv4: value)
         case let .ipv6(bytes):
-            guard bytes.count == 16 else { return false }
-            if bytes.prefix(10).allSatisfy({ $0 == 0 }),
-               bytes[10] == 0xff, bytes[11] == 0xff {
-                let mapped = UInt32(bytes[12]) << 24 | UInt32(bytes[13]) << 16
-                    | UInt32(bytes[14]) << 8 | UInt32(bytes[15])
-                return Self.ipv4(mapped).isPublicInternetAddress
-            }
-            guard bytes[0] & 0xe0 == 0x20 else { return false }
-            // IANA IPv6 Special-Purpose Address Registry, last updated
-            // 2025-10-09. Swan deliberately rejects the whole 2001::/23
-            // protocol-assignment umbrella instead of maintaining exceptions
-            // for protocol anycast/tunneling ranges as fetch destinations.
-            let deniedSpecialPurposePrefixes: [(Data, Int)] = [
-                (Data([0x20, 0x01, 0x00]), 23),       // IETF assignments
-                (Data([0x20, 0x01, 0x0d, 0xb8]), 32), // documentation
-                (Data([0x20, 0x02]), 16),             // 6to4
-                (Data([0x3f, 0xff, 0x00]), 20),       // documentation
-            ]
-            return !deniedSpecialPurposePrefixes.contains {
-                Self.ipv6(bytes, hasPrefix: $0.0, bitCount: $0.1)
-            }
+            return SwanPublicAddressPolicy.isPublicInternetAddress(ipv6: bytes)
         }
-    }
-
-    private static func ipv6(
-        _ address: Data,
-        hasPrefix prefix: Data,
-        bitCount: Int
-    ) -> Bool {
-        guard address.count == 16, bitCount >= 0,
-              bitCount <= prefix.count * 8 else {
-            return false
-        }
-        let wholeBytes = bitCount / 8
-        guard address.prefix(wholeBytes) == prefix.prefix(wholeBytes) else {
-            return false
-        }
-        let remainingBits = bitCount % 8
-        guard remainingBits > 0 else { return true }
-        let mask = UInt8.max << (8 - remainingBits)
-        return address[wholeBytes] & mask == prefix[wholeBytes] & mask
     }
 }
 

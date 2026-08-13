@@ -965,6 +965,11 @@ public struct SwanPortableAccountExporter: Sendable {
                 case let .space(space):
                     type = .spaceBlob
                     path = "blobs/space/\(SwanPortableExportPath.encode(space.rawValue))/\(SwanPortableExportPath.encode(reference.cid))"
+                case .staged:
+                    // An uncommitted upload is not account data. The export
+                    // inventory already excludes staged edges; reaching here
+                    // means the inventory projection has drifted.
+                    throw SwanPortableExportError.invalidPlacement
                 }
                 let written = try await writer.writeStreaming(path: path, type: type) { consume in
                     try await database.streamBlobData(

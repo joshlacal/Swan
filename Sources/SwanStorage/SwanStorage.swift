@@ -6,6 +6,20 @@ import SwanSpaces
 public enum BlobNamespace: Sendable, Hashable {
     case `public`
     case space(SpaceURI)
+    /// Where an authenticated `com.atproto.repo.uploadBlob` lands.
+    ///
+    /// The upload wire format carries no namespace intent, so a blob destined
+    /// for a permissioned space arrives on exactly the same route as an avatar
+    /// destined for the public repository. Landing every upload in `.public`
+    /// therefore published private-intended bytes to any anonymous caller who
+    /// knew the CID — before the record commit, forever after a failed or
+    /// abandoned commit, and again on every same-CID re-upload.
+    ///
+    /// A staged edge is never served by `com.atproto.sync.getBlob`. It is
+    /// consumed by whichever commit claims it: a validated public record
+    /// promotes it to `.public`, a permissioned record promotes it to
+    /// `.space`, and an unclaimed edge expires.
+    case staged
 }
 
 public struct BlobReference: Sendable, Hashable {
@@ -138,6 +152,18 @@ public protocol StreamingBlobStore: BlobStore, PublicRepositoryReadBlobStore {
     /// Metadata-only reachability check for public record references. This
     /// must not open or materialize the blob body.
     func publicBlobExists(cid: String) async throws -> Bool
+
+    /// Metadata for a blob this account has uploaded but not yet committed to
+    /// a record, or has already published publicly.
+    ///
+    /// The authenticated mutation surface needs this to compare a record's
+    /// declared `size`/`mimeType` against the stored payload *before* signing
+    /// the commit that promotes it. It is deliberately absent from
+    /// ``PublicRepositoryReadBlobStore``: the anonymous read surface must
+    /// still see only the public namespace, so widening its allow-list would
+    /// reintroduce exactly the staged-blob disclosure this namespace exists
+    /// to prevent.
+    func uploadedBlobMetadata(cid: String) async throws -> PublicBlobMetadata?
 }
 
 /// Local immutable content-addressed blobs. File contents are shared, while
@@ -529,6 +555,27 @@ public protocol OAuthControlStore: Sendable {
     func publishClientMetadata(
         _ metadata: OAuthCachedClientMetadata,
         using ticket: OAuthClientMetadataFetchTicket,
+        now: Date
+    ) async throws -> Bool
+    /// Releases a ticket whose fetch will never publish. Without it a failed
+    /// or rejected remote document leaves a durable freshness row behind, and
+    /// an anonymous caller can fill that bounded table with client IDs it
+    /// merely named. The store deletes only while `ticket` is still the sole
+    /// outstanding generation for its client and no cached document depends on
+    /// the watermark, so a concurrent successful flight is a no-op rather than
+    /// a lost row. Abandoning a ticket that no longer qualifies is not an
+    /// error: the caller cannot know which race it lost.
+    func abandonClientMetadataFetch(
+        ticket: OAuthClientMetadataFetchTicket,
+        now: Date
+    ) async throws
+    /// True when the account currently holds a live, unrevoked token family
+    /// naming this client. It is the one client-identity fact available before
+    /// any remote document is fetched that an anonymous caller cannot
+    /// manufacture: creating it requires completing an authorization against
+    /// the account's own credentials.
+    func clientHoldsLiveAuthorization(
+        clientID: String,
         now: Date
     ) async throws -> Bool
 

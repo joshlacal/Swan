@@ -64,7 +64,14 @@ public struct SwanPeerPinnedProxySender: SwanProxySending {
             throw SwanError.malformed("proxied method is not permitted")
         }
         let host = try policy.validateURL(request.url)
-        let resolved = try await resolver.resolve(host: host)
+        // The caller holds a pipethrough lease across this call, and
+        // `getaddrinfo` has no cancellation handle, so an attacker-selected
+        // service hostname served by a blackholed nameserver would otherwise
+        // hold that lease indefinitely. Bound resolution by the same policy
+        // deadline the transport uses.
+        let resolved = try await resolveOAuthHostname(
+            resolver, host: host, timeout: policy.timeout
+        )
         try policy.validateResolved(resolved, host: host)
         return try await transport.send(
             request, approvedPeers: Set(resolved), timeout: timeout,

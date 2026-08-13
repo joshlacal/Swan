@@ -528,7 +528,7 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                       current.revision == reservation.baseRevision else {
                     throw PublicRepositoryMutationStoreError.commitCASConflict
                 }
-                try await validatePublicBlobReferencesWithoutGate(
+                try await promoteValidatedPublicBlobReferencesWithoutGate(
                     prepared.publicBlobCIDs,
                     typedReferences: prepared.publicTypedBlobReferences
                 )
@@ -738,24 +738,37 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
         try await testingHooks.afterPublicRepositoryMutatingSQL?(index)
     }
 
-    /// Recheck public blob reachability while the repository mutation's
-    /// SQLite transaction is holding the same database serialization boundary
-    /// used by permissioned promotion. The HTTP layer performs the richer
-    /// metadata validation before signing; this final fence prevents a
-    /// concurrent permissioned write from removing the last public reference
-    /// after that check but before the public record is committed.
-    private func validatePublicBlobReferencesWithoutGate(
+    /// Recheck blob reachability and publish every referenced CID while the
+    /// repository mutation's SQLite transaction is holding the same database
+    /// serialization boundary used by permissioned promotion. The HTTP layer
+    /// performs the richer metadata validation before signing; this final
+    /// fence prevents a concurrent permissioned write from removing the last
+    /// reference after that check but before the public record is committed.
+    ///
+    /// This is also the only place a public edge is created for an upload.
+    /// `com.atproto.repo.uploadBlob` stages its bytes and does not publish
+    /// them, precisely so an upload that is never committed — or is committed
+    /// to a *permissioned* record — is never anonymously readable. Promotion
+    /// therefore has to be here, inside the commit, so a rejected or
+    /// abandoned mutation leaves the blob exactly as private as it arrived.
+    private func promoteValidatedPublicBlobReferencesWithoutGate(
         _ cids: [CID],
         typedReferences: [PublicTypedBlobReference]
     ) async throws {
         for cid in cids {
+            // A CID is a payload primary key, so this is at most one row even
+            // when the blob holds both a staged and a public edge.
             let rows = try await connection.query(
                 """
                 SELECT blob_payloads.byte_count, blob_payloads.mime_type
                 FROM blob_payloads
-                JOIN blob_namespace_references USING(cid)
                 WHERE blob_payloads.cid = ?
-                  AND namespace_kind = 'public' AND space_uri = ''
+                  AND EXISTS (
+                      SELECT 1 FROM blob_namespace_references
+                      WHERE blob_namespace_references.cid = blob_payloads.cid
+                        AND namespace_kind IN ('public', 'staged')
+                        AND space_uri = ''
+                  )
                 LIMIT 2
                 """,
                 [.text(cid.string)]
@@ -776,6 +789,34 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                     throw PublicRepositoryMutationStoreError.publicBlobNotReachable
                 }
             }
+
+            // Consume the staged edge first so the account is not charged for
+            // both edges at once; a blob already public stages nothing and
+            // this deletes nothing.
+            _ = try await connection.query(
+                """
+                DELETE FROM blob_namespace_references
+                WHERE cid = ? AND namespace_kind = 'staged' AND space_uri = ''
+                """,
+                [.text(cid.string)]
+            )
+            try await admitBlobQuotaWithoutGate(
+                cid: cid.string,
+                byteCount: byteCount,
+                references: [(namespaceKind: "public", spaceURI: "")]
+            )
+            _ = try await connection.query(
+                """
+                INSERT INTO blob_namespace_references(
+                    cid, namespace_kind, space_uri, created_at
+                ) VALUES (?, 'public', '', ?)
+                ON CONFLICT(cid, namespace_kind, space_uri) DO NOTHING
+                """,
+                [
+                    .text(cid.string),
+                    .integer(Int(Date().timeIntervalSince1970)),
+                ]
+            )
         }
     }
 

@@ -140,6 +140,7 @@ func registerOAuthAuthorizationServerEndpoints(
   router.post("/oauth/token") { request, context async -> Response in
     await exchangeOAuthServerToken(
       request: request, context: context, configuration: configuration, runtime: runtime,
+      loginClientIdentityPolicy: loginClientIdentityPolicy,
       requestBodyAdmission: requestBodyAdmission)
   }
   router.on("/oauth/token", method: .options) { _, _ -> Response in
@@ -148,6 +149,7 @@ func registerOAuthAuthorizationServerEndpoints(
   router.post("/oauth/revoke") { request, context async -> Response in
     await revokeOAuthServerToken(
       request: request, context: context, configuration: configuration, runtime: runtime,
+      loginClientIdentityPolicy: loginClientIdentityPolicy,
       requestBodyAdmission: requestBodyAdmission)
   }
   router.on("/oauth/revoke", method: .options) { _, _ -> Response in
@@ -155,15 +157,23 @@ func registerOAuthAuthorizationServerEndpoints(
   }
 }
 
+/// - Parameter loginClientIdentityPolicy: How PAR resolves the requesting
+///   client's address for its admission budget. `nil` means the caller has not
+///   supplied one, and every PAR request then shares the single unidentified
+///   bucket — the budget still holds, but it is global rather than per peer.
+///   This is the degraded mode, not the intended one; pass the server's policy
+///   to get per-peer accounting.
 func registerOAuthAuthorizationServerPAREndpoint(
   on router: Router<BasicRequestContext>,
   configuration: SwanOAuthAuthorizationServerConfiguration,
   runtime: SwanOAuthRuntime,
+  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy? = nil,
   requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
   router.post("/oauth/par") { request, context async -> Response in
     await handleOAuthServerPAR(
       request: request, context: context, configuration: configuration, runtime: runtime,
+      loginClientIdentityPolicy: loginClientIdentityPolicy,
       requestBodyAdmission: requestBodyAdmission)
   }
   router.on("/oauth/par", method: .options) { _, _ -> Response in
@@ -176,6 +186,7 @@ private func handleOAuthServerPAR(
   context: SwanHTTPRequestContext,
   configuration: SwanOAuthAuthorizationServerConfiguration,
   runtime: SwanOAuthRuntime,
+  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy?,
   requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
   let form: OAuthServerPARForm
@@ -204,6 +215,19 @@ private func handleOAuthServerPAR(
     context.logger.info(
       "oauth par rejected", metadata: ["stage": .string("form_parse_unexpected")])
     return oauthServerPARJSON(.badRequest, OAuthServerPARError(error: "invalid_request"))
+  }
+  if await oauthServerPeerAdmission(
+    request: request, context: context, policy: loginClientIdentityPolicy) == .rateLimited
+  {
+    context.logger.info(
+      "oauth par rejected",
+      metadata: [
+        "stage": .string("peer_admission"),
+        "identity": .string(loginClientIdentityPolicy == nil ? "unwired" : "policy"),
+      ])
+    return oauthServerJSON(
+      .tooManyRequests, OAuthServerPARError(error: "temporarily_unavailable"),
+      headers: oauthServerRetryAfterHeaders())
   }
   guard let proof = oauthServerSingleDPoP(from: request.headers),
     let nonce = oauthServerUntrustedNonce(from: proof)
@@ -494,6 +518,7 @@ private func exchangeOAuthServerToken(
   context: SwanHTTPRequestContext,
   configuration: SwanOAuthAuthorizationServerConfiguration,
   runtime: SwanOAuthRuntime,
+  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy,
   requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
   let form: OAuthServerTokenForm
@@ -508,6 +533,15 @@ private func exchangeOAuthServerToken(
       : oauthServerTokenJSON(.badRequest, OAuthServerTokenError(error: "invalid_request"))
   } catch {
     return oauthServerTokenJSON(.badRequest, OAuthServerTokenError(error: "invalid_request"))
+  }
+  if await oauthServerPeerAdmission(
+    request: request, context: context, policy: loginClientIdentityPolicy) == .rateLimited
+  {
+    context.logger.info(
+      "oauth token rejected", metadata: ["stage": .string("peer_admission")])
+    return oauthServerJSON(
+      .tooManyRequests, OAuthServerTokenError(error: "temporarily_unavailable"),
+      headers: oauthServerRetryAfterHeaders())
   }
   guard let proof = oauthServerSingleDPoP(from: request.headers),
     let nonce = oauthServerUntrustedNonce(from: proof)
@@ -602,6 +636,7 @@ private func revokeOAuthServerToken(
   context: SwanHTTPRequestContext,
   configuration: SwanOAuthAuthorizationServerConfiguration,
   runtime: SwanOAuthRuntime,
+  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy,
   requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
   let form: OAuthServerRevocationForm
@@ -616,6 +651,15 @@ private func revokeOAuthServerToken(
       : oauthServerTokenJSON(.badRequest, OAuthServerTokenError(error: "invalid_request"))
   } catch {
     return oauthServerTokenJSON(.badRequest, OAuthServerTokenError(error: "invalid_request"))
+  }
+  if await oauthServerPeerAdmission(
+    request: request, context: context, policy: loginClientIdentityPolicy) == .rateLimited
+  {
+    context.logger.info(
+      "oauth revoke rejected", metadata: ["stage": .string("peer_admission")])
+    return oauthServerJSON(
+      .tooManyRequests, OAuthServerTokenError(error: "temporarily_unavailable"),
+      headers: oauthServerRetryAfterHeaders())
   }
   guard let proof = oauthServerSingleDPoP(from: request.headers),
     let nonce = oauthServerUntrustedNonce(from: proof)
@@ -680,6 +724,42 @@ private func revokeOAuthServerToken(
     return oauthServerTokenJSON(
       .serviceUnavailable, OAuthServerTokenError(error: "temporarily_unavailable"))
   }
+}
+
+/// Charges one request against its peer's budget for the unauthenticated
+/// OAuth protocol endpoints, before any DPoP proof is validated.
+///
+/// `OAuthDPoPProofValidator.validate` durably claims the proof's `jti` in a
+/// globally bounded replay table, and on PAR it does so before client
+/// metadata has been loaded — so the allocation happens with no client
+/// identity established, and exhausting the table denies DPoP validation on
+/// every route that uses it. Reordering the claim behind client validation is
+/// not available here: on PAR, establishing the client *is* the remote
+/// metadata fetch, so that order would put an attacker-selected outbound
+/// fetch first. Refusing the request instead leaves the replay namespace
+/// global over the `jti`, which is what RFC 9449 requires.
+///
+/// A peer whose address cannot be resolved — because the policy rejected the
+/// forwarded header, or because no policy was supplied — is charged to one
+/// shared bucket rather than admitted or rejected; see
+/// `OAuthPeerAdmissionService`.
+private func oauthServerPeerAdmission(
+  request: Request,
+  context: SwanHTTPRequestContext,
+  policy: SwanLoginClientIdentityPolicy?
+) async -> OAuthPeerAdmissionDecision {
+  let peer = try? policy?.clientIPAddress(
+    directPeer: context.remoteAddress?.ipAddress,
+    headers: request.headers
+  )
+  return await OAuthPeerAdmissionService.shared.admit(peer: peer)
+}
+
+private func oauthServerRetryAfterHeaders() -> HTTPFields {
+  var headers: HTTPFields = [.contentType: "application/json", .cacheControl: "no-store"]
+  headers[HTTPField.Name("Retry-After")!] = String(
+    Int(OAuthPeerAdmissionPolicy.defaultWindow.rounded(.up)))
+  return headers
 }
 
 private func validateOAuthServerClientAssertion(

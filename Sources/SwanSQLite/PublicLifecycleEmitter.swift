@@ -10,6 +10,8 @@ public enum PublicLifecycleEmitterError: Error, Equatable {
 }
 
 struct PublicLifecycleEmitterHooks: Sendable {
+    var beforeActivationAuthorization: (@Sendable () async -> Void)?
+    var beforeReactivationAuthorization: (@Sendable () async -> Void)?
     var beforeManualAuthorization: (@Sendable () async -> Void)?
 }
 
@@ -21,6 +23,17 @@ struct PublicLifecycleEmitterHooks: Sendable {
 /// `source_key UNIQUE` constraint. A caller that crashes between an
 /// operation's completion and its emission can therefore retry the operation
 /// and converge without duplicate generations or rows.
+///
+/// Every head `#sync` — activation, reactivation and manual alike — is
+/// inserted inside `withActiveAccountFirehoseAuthorization`, which reads the
+/// lifecycle generation in the same control transaction that proves the
+/// account still authorizes publication. A lifecycle transition therefore
+/// linearizes either before the fence (the emission fails and publishes
+/// nothing) or after the sync row is durable (the sequencer orders the row
+/// ahead of the transition's own batch). Without the fence a deactivation can
+/// drain its `#account(active:false)` while the sync insert is still in
+/// flight, and the sequencer — which has no pending batch left to order
+/// against — then appends a superseded head announcement behind it.
 public struct SQLitePublicLifecycleEmitter: PublicLifecycleEventEmitting {
     private let control: SQLiteControlDatabase
     private let accounts: any PublicFirehoseAccountDatabaseSource
@@ -66,16 +79,29 @@ public struct SQLitePublicLifecycleEmitter: PublicLifecycleEventEmitting {
             ),
             carBytes: nil
         )
-        let batch = try await control.enqueueLifecycleEventBatch(
+        _ = try await control.enqueueLifecycleEventBatch(
             did: did, operationID: operationID, items: [identity, account], now: now
         )
-        try await enqueueHeadSync(
-            did: did,
-            sourceKey: PublicFirehoseSourceKey.syncActivation(did: did, operationID: operationID),
-            lifecycleGeneration: batch.generation,
-            materialTime: materialTime,
-            now: now
-        )
+        do {
+            await hooks.beforeActivationAuthorization?()
+            try await control.withActiveAccountFirehoseAuthorization(did: did) {
+                generation in
+                try await enqueueHeadSync(
+                    did: did,
+                    sourceKey: PublicFirehoseSourceKey.syncActivation(
+                        did: did, operationID: operationID
+                    ),
+                    lifecycleGeneration: generation,
+                    materialTime: materialTime,
+                    now: now
+                )
+            }
+        } catch let error as AccountControlStoreError {
+            if case .notFound = error {
+                throw PublicLifecycleEmitterError.accountUnavailable(did)
+            }
+            throw error
+        }
     }
 
     public func emitRotationIdentity(
@@ -97,14 +123,26 @@ public struct SQLitePublicLifecycleEmitter: PublicLifecycleEventEmitting {
     }
 
     public func emitReactivationSync(did: String, operationID: String, now: Date) async throws {
-        let generation = try await control.currentLifecycleGeneration(did: did)
-        try await enqueueHeadSync(
-            did: did,
-            sourceKey: PublicFirehoseSourceKey.syncReactivation(did: did, operationID: operationID),
-            lifecycleGeneration: generation,
-            materialTime: now,
-            now: now
-        )
+        do {
+            await hooks.beforeReactivationAuthorization?()
+            try await control.withActiveAccountFirehoseAuthorization(did: did) {
+                generation in
+                try await enqueueHeadSync(
+                    did: did,
+                    sourceKey: PublicFirehoseSourceKey.syncReactivation(
+                        did: did, operationID: operationID
+                    ),
+                    lifecycleGeneration: generation,
+                    materialTime: now,
+                    now: now
+                )
+            }
+        } catch let error as AccountControlStoreError {
+            if case .notFound = error {
+                throw PublicLifecycleEmitterError.accountUnavailable(did)
+            }
+            throw error
+        }
     }
 
     public func emitManualSync(did: String, requestUUID: String, now: Date) async throws {

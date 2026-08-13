@@ -217,6 +217,30 @@ public struct LocalAccountSpaceCredentialSigningKeyResolver:
         } catch {
             throw SwanError.unavailable("space credential signing key is unavailable")
         }
+        // The key-store read above is a suspension, and the directory exposes
+        // no atomic account/key projection, so deactivation, permanent-deletion
+        // revocation, or a key rotation can commit while it runs. Re-read the
+        // account and its key references and treat any intervening change as
+        // terminal: the caller signs a two-hour credential immediately on
+        // return, and a credential signed under a revoked authority outlives
+        // the revocation that should have prevented it. The verification
+        // resolvers below apply exactly this fence twice (`:304-317`,
+        // `:397-410`); the signing path was the odd one out.
+        //
+        // This throws rather than returning `nil`. A `nil` from this resolver
+        // means "no such managed authority" and is a fall-through; a state that
+        // changed underneath us is a hard negative that must not be confused
+        // with absence. `SwanSpaceCredentialXRPC` already maps
+        // `SwanError.unavailable` without widening the client-visible body.
+        guard let currentAccount = try await accounts.account(did: authority),
+              currentAccount == account,
+              currentAccount.status.authorizesAccount,
+              let currentReferences = try await accounts.keyReferences(did: authority),
+              currentReferences.signing == references.signing,
+              currentReferences.rotation == references.rotation
+        else {
+            throw SwanError.unavailable("space credential signing key is unavailable")
+        }
         return SpaceCredentialAuthoritySigningKey(
             authority: authority,
             privateKey: privateKey
@@ -657,11 +681,27 @@ public enum SpaceCredentialClientAttestationFailure:
 /// separately verifiable attestation policy.
 public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
     public struct Configuration: Sendable, Equatable {
-        public static let standard = Configuration(uncheckedLifetime: PermissionedDataJWT.spaceCredentialLifetime)
+        /// The default lifetime Swan *issues*, deliberately far below the
+        /// proposal ceiling it *accepts*.
+        ///
+        /// A space credential carries no reader identity and is never
+        /// re-checked against membership after it is minted, so its lifetime is
+        /// the revocation window: a member removed from a space keeps reading
+        /// until the credential it already holds expires. Five minutes bounds
+        /// that window to something an operator can reason about while leaving
+        /// the exchange cheap enough to repeat.
+        ///
+        /// This changes only what this authority mints.
+        /// ``PermissionedDataJWT/spaceCredentialLifetime`` remains the two-hour
+        /// interop ceiling, so credentials minted by another proposal-0016
+        /// implementation are still accepted unchanged.
+        public static let defaultLifetime: TimeInterval = 5 * 60
+
+        public static let standard = Configuration(uncheckedLifetime: defaultLifetime)
 
         public let lifetime: TimeInterval
 
-        public init(lifetime: TimeInterval = PermissionedDataJWT.spaceCredentialLifetime) throws {
+        public init(lifetime: TimeInterval = defaultLifetime) throws {
             guard lifetime > 0,
                   lifetime <= PermissionedDataJWT.spaceCredentialLifetime,
                   lifetime.rounded(.towardZero) == lifetime else {

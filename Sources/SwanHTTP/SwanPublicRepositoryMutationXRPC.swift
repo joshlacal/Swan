@@ -62,20 +62,22 @@ private struct PublicMutationHandlers {
         } catch {
             try await drainRejectedRequestBody(
                 request,
-                admission: capability.jsonWriteAdmission,
+                admission: publicMutationRejectedDrainAdmission,
                 policy: capability.jsonWriteBodyPolicy,
                 termination: context.jsonWriteBodyTermination
             )
             throw PublicMutationFailure.invalidRequest
         }
-        let (blobStore, mimeType, lease) = try await withPublicBlobUploadPreflightDrain(
+        let (blobStore, mimeType, lease, subject) = try await withPublicBlobUploadPreflightDrain(
             request: request,
             context: context,
-            admission: capability.jsonWriteAdmission,
+            admission: publicMutationRejectedDrainAdmission,
             policy: capability.jsonWriteBodyPolicy
         ) {
-            let subject = try await authorizedSubject(
-                request: request, method: "POST", path: "/xrpc/com.atproto.repo.uploadBlob"
+            let subject = try await authorizedPublicMutationSubject(
+                request: request,
+                path: "/xrpc/" + SwanPublicWire.ComAtprotoRepoUploadBlob.typeIdentifier,
+                capability: capability
             )
             guard let target = try await capability.directory.publicRepositoryMutationTarget(selector: subject),
                   target.did == subject,
@@ -97,7 +99,7 @@ private struct PublicMutationHandlers {
                   ) else {
                 throw PublicMutationFailure.unavailable
             }
-            return (blobStore, mimeType, lease)
+            return (blobStore, mimeType, lease, subject)
         }
         defer { lease.release() }
         let counter = PublicBlobUploadCounter()
@@ -106,8 +108,13 @@ private struct PublicMutationHandlers {
             policy: capability.jsonWriteBodyPolicy,
             termination: context.jsonWriteBodyTermination
         ) {
+            // `uploadBlob` carries no namespace intent, so this one route also
+            // receives every blob destined for a permissioned space. Staging
+            // is what keeps those bytes out of the anonymous
+            // `com.atproto.sync.getBlob` namespace until a commit says where
+            // they belong; the commit that references them promotes them.
             try await blobStore.putStreaming(
-                namespace: .public,
+                namespace: .staged,
                 mimeType: mimeType,
                 maximumBytes: maximumBytes
             ) { sink in
@@ -134,7 +141,36 @@ private struct PublicMutationHandlers {
                 }
             }
         }
-        guard case .public = reference.namespace else {
+        // The lifecycle state that authorized this request is up to 256 MiB
+        // and one full body deadline stale by the time the blob is adopted.
+        // Re-resolve before reporting a usable blob, so a deactivation that
+        // landed mid-stream is not answered with success.
+        //
+        // The adopted bytes are deliberately left in place rather than
+        // removed. `blob_namespace_references` carries one row per
+        // `(cid, namespace_kind, space_uri)` with no reference count
+        // (`Sources/SwanSQLite/SwanSQLite.swift:1041-1050`) and adoption is
+        // `ON CONFLICT DO NOTHING` (`:7564-7572`), so `remove` cannot tell a
+        // blob this request created from one an already-published record
+        // shares by content address. Reclaiming here would destroy the latter.
+        // Recorded in the L4 lane report as a maintainer decision.
+        //
+        // Merge note (2026-08-13): the blob lane's staged namespace changes
+        // what "left in place" costs, without weakening the argument above.
+        // The upload now lands on a `staged` edge rather than a `public` one,
+        // and staged edges that no record promotes are reclaimed by that
+        // lane's sweep — so the bytes this guard abandons are collected
+        // rather than retained indefinitely, and they were never anonymously
+        // fetchable while they sat here. The reference-count reasoning is
+        // still why `remove` is not called; its deferred cost is now bounded
+        // by the sweep instead of being permanent.
+        guard let adopted = try await capability.directory
+            .publicRepositoryMutationTarget(selector: subject),
+            adopted.did == subject,
+            adopted.status == .active else {
+            throw PublicMutationFailure.notFound
+        }
+        guard case .staged = reference.namespace else {
             throw PublicMutationFailure.unavailable
         }
         let cid: CID
@@ -158,9 +194,9 @@ private struct PublicMutationHandlers {
     func applyWrites(
         _ input: SwanPublicWire.ComAtprotoRepoApplyWrites.Input,
         bodyDigest: Data,
-        request: Request
+        subject: String
     ) async throws -> SwanPublicWire.ComAtprotoRepoApplyWrites.Output {
-        let target = try await authorizedTarget(selector: input.repo.stringValue(), request: request, method: "POST", path: "/xrpc/com.atproto.repo.applyWrites")
+        let target = try await mutationTarget(selector: input.repo.stringValue(), subject: subject)
         var writes: [PublicRepositoryWrite] = []
         for union in input.writes {
             switch union {
@@ -229,11 +265,10 @@ private struct PublicMutationHandlers {
     func create(
         _ input: SwanPublicWire.ComAtprotoRepoCreateRecord.Input,
         bodyDigest: Data,
-        request: Request
+        subject: String
     ) async throws -> SwanPublicWire.ComAtprotoRepoCreateRecord.Output {
-        let target = try await authorizedTarget(
-            selector: input.repo.stringValue(), request: request,
-            method: "POST", path: "/xrpc/com.atproto.repo.createRecord"
+        let target = try await mutationTarget(
+            selector: input.repo.stringValue(), subject: subject
         )
         let rkey: RecordKey
         if let supplied = input.rkey {
@@ -263,11 +298,10 @@ private struct PublicMutationHandlers {
     func put(
         _ input: SwanPublicWire.ComAtprotoRepoPutRecord.Input,
         bodyDigest: Data,
-        request: Request
+        subject: String
     ) async throws -> SwanPublicWire.ComAtprotoRepoPutRecord.Output {
-        let target = try await authorizedTarget(
-            selector: input.repo.stringValue(), request: request,
-            method: "POST", path: "/xrpc/com.atproto.repo.putRecord"
+        let target = try await mutationTarget(
+            selector: input.repo.stringValue(), subject: subject
         )
         let path = try PublicRepositoryPath(
             collection: input.collection.nsidString(), recordKey: input.rkey.value
@@ -304,11 +338,10 @@ private struct PublicMutationHandlers {
     func delete(
         _ input: SwanPublicWire.ComAtprotoRepoDeleteRecord.Input,
         bodyDigest: Data,
-        request: Request
+        subject: String
     ) async throws -> SwanPublicWire.ComAtprotoRepoDeleteRecord.Output {
-        let target = try await authorizedTarget(
-            selector: input.repo.stringValue(), request: request,
-            method: "POST", path: "/xrpc/com.atproto.repo.deleteRecord"
+        let target = try await mutationTarget(
+            selector: input.repo.stringValue(), subject: subject
         )
         let path = try PublicRepositoryPath(
             collection: input.collection.nsidString(), recordKey: input.rkey.value
@@ -326,41 +359,19 @@ private struct PublicMutationHandlers {
         ))
     }
 
-    private func authorizedTarget(
+    /// Binds an already-authorized subject to the body-supplied repository
+    /// selector. This half deliberately stays here: it is the only part of
+    /// authorization that needs the decoded command, so it is also the only
+    /// part that has to run after the body has been admitted and parsed.
+    private func mutationTarget(
         selector: String,
-        request: Request,
-        method: String,
-        path: String
+        subject: String
     ) async throws -> PublicRepositoryMutationTarget {
-        let authorization = try await authorizedContext(request: request, method: method, path: path)
-        guard case let .accountOAuth(subject, scopes) = authorization,
-              scopes.contains("atproto") else { throw PublicMutationFailure.unauthorized }
         guard let target = try await capability.directory.publicRepositoryMutationTarget(selector: selector) else {
             throw PublicMutationFailure.notFound
         }
         guard target.status == .active, target.did == subject else { throw PublicMutationFailure.notFound }
         return target
-    }
-
-    private func authorizedSubject(request: Request, method: String, path: String) async throws -> String {
-        let authorization = try await authorizedContext(request: request, method: method, path: path)
-        guard case let .accountOAuth(subject, scopes) = authorization,
-              scopes.contains("atproto") else { throw PublicMutationFailure.unauthorized }
-        return subject
-    }
-
-    private func authorizedContext(request: Request, method: String, path: String) async throws -> AuthorizationContext {
-        let authorization: AuthorizationContext
-        do {
-            authorization = try await capability.authorizer.authorize(
-                request: request, method: method, fixedPath: path
-            )
-        } catch let failure as SwanResourceAuthorizationFailure {
-            throw failure == .nonceChallengeRequired ? PublicMutationFailure.nonce : .unauthorized
-        } catch {
-            throw PublicMutationFailure.unavailable
-        }
-        return authorization
     }
 
     private func validatePublicBlobLinks(
@@ -388,9 +399,14 @@ private struct PublicMutationHandlers {
         }
         var seen = Set<String>()
         for cid in cids where seen.insert(cid.string).inserted {
+            // A record may reference a blob this account has staged but not
+            // yet published — that is the ordinary upload-then-post flow, and
+            // committing this record is what publishes it. The commit
+            // transaction re-derives the same reachability under the storage
+            // serialization boundary before it promotes anything.
             let metadata: PublicBlobMetadata?
             do {
-                metadata = try await blobStore.publicBlobMetadata(cid: cid.string)
+                metadata = try await blobStore.uploadedBlobMetadata(cid: cid.string)
             } catch {
                 throw PublicMutationFailure.unavailable
             }
@@ -403,6 +419,36 @@ private struct PublicMutationHandlers {
             }
         }
     }
+}
+
+/// Header-only OAuth/DPoP admission for one fixed public write route.
+///
+/// It reads nothing but the `Authorization` and `DPoP` headers, which is what
+/// lets every route run it *before* reserving a JSON write lease. It must run
+/// exactly once per request: `OAuthDPoPProofValidator` durably claims the
+/// proof's `jti` (`Sources/SwanOAuth/OAuthProofValidation.swift:117-119`), so
+/// a second call for the same request is indistinguishable from a replay and
+/// would deny every legitimate command.
+private func authorizedPublicMutationSubject(
+    request: Request,
+    path: String,
+    capability: SwanPublicRepositoryMutationCapability
+) async throws -> String {
+    let authorization: AuthorizationContext
+    do {
+        // Every route on this surface is registered with `post`; the fixed
+        // method is the DPoP `htm` binding, never a request-derived value.
+        authorization = try await capability.authorizer.authorize(
+            request: request, method: "POST", fixedPath: path
+        )
+    } catch let failure as SwanResourceAuthorizationFailure {
+        throw failure == .nonceChallengeRequired ? PublicMutationFailure.nonce : .unauthorized
+    } catch {
+        throw PublicMutationFailure.unavailable
+    }
+    guard case let .accountOAuth(subject, scopes) = authorization,
+          scopes.contains("atproto") else { throw PublicMutationFailure.unauthorized }
+    return subject
 }
 
 private func withPublicBlobUploadPreflightDrain<Value>(
@@ -471,11 +517,12 @@ func registerPublicRepositoryMutationEndpoints(
             request,
             context: context,
             as: SwanPublicWire.ComAtprotoRepoPutRecord.Input.self,
+            path: "/xrpc/\(putNSID)",
             capability: capability
-        ) { input, digest in
+        ) { input, digest, subject in
             publicMutationJSON(
                 .ok,
-                try await handlers.put(input, bodyDigest: digest, request: request)
+                try await handlers.put(input, bodyDigest: digest, subject: subject)
             )
         }
     }
@@ -484,11 +531,12 @@ func registerPublicRepositoryMutationEndpoints(
             request,
             context: context,
             as: SwanPublicWire.ComAtprotoRepoCreateRecord.Input.self,
+            path: "/xrpc/\(createNSID)",
             capability: capability
-        ) { input, digest in
+        ) { input, digest, subject in
             publicMutationJSON(
                 .ok,
-                try await handlers.create(input, bodyDigest: digest, request: request)
+                try await handlers.create(input, bodyDigest: digest, subject: subject)
             )
         }
     }
@@ -497,11 +545,12 @@ func registerPublicRepositoryMutationEndpoints(
             request,
             context: context,
             as: SwanPublicWire.ComAtprotoRepoApplyWrites.Input.self,
+            path: "/xrpc/\(applyNSID)",
             capability: capability
-        ) { input, digest in
+        ) { input, digest, subject in
             publicMutationJSON(
                 .ok,
-                try await handlers.applyWrites(input, bodyDigest: digest, request: request)
+                try await handlers.applyWrites(input, bodyDigest: digest, subject: subject)
             )
         }
     }
@@ -531,11 +580,12 @@ func registerPublicRepositoryMutationEndpoints(
             request,
             context: context,
             as: SwanPublicWire.ComAtprotoRepoDeleteRecord.Input.self,
+            path: "/xrpc/\(deleteNSID)",
             capability: capability
-        ) { input, digest in
+        ) { input, digest, subject in
             publicMutationJSON(
                 .ok,
-                try await handlers.delete(input, bodyDigest: digest, request: request)
+                try await handlers.delete(input, bodyDigest: digest, subject: subject)
             )
         }
     }
@@ -566,8 +616,9 @@ private func withPublicMutationInput<Value: Decodable>(
     _ request: Request,
     context: SwanHTTPRequestContext,
     as type: Value.Type,
+    path: String,
     capability: SwanPublicRepositoryMutationCapability,
-    operation: (Value, Data) async throws -> Response
+    operation: (Value, Data, String) async throws -> Response
 ) async -> Response {
     let contentTypes = request.headers[values: .contentType]
     guard contentTypes.count == 1,
@@ -585,6 +636,37 @@ private func withPublicMutationInput<Value: Decodable>(
             authorizer: capability.authorizer
         )
     }
+    // Authorize on headers alone before any lease is reserved. Nothing in the
+    // OAuth/DPoP check reads the body, so the old order bought nothing and
+    // let an anonymous caller own one of eight shared JSON write leases for
+    // the whole 30-second body deadline. `uploadBlob` above has always done
+    // it this way.
+    let subject: String
+    do {
+        subject = try await authorizedPublicMutationSubject(
+            request: request,
+            path: path,
+            capability: capability
+        )
+    } catch {
+        // Discard the refused body rather than resetting the connection, so a
+        // client that sent a complete command keeps its keep-alive. The drain
+        // deliberately charges a pool that no authorized command reserves.
+        do {
+            try await drainRejectedRequestBody(
+                request,
+                admission: publicMutationRejectedDrainAdmission,
+                policy: capability.jsonWriteBodyPolicy,
+                termination: context.jsonWriteBodyTermination
+            )
+        } catch {
+            return publicMutationResponse(
+                PublicMutationFailure.unavailable,
+                authorizer: capability.authorizer
+            )
+        }
+        return publicMutationResponse(error, capability: capability)
+    }
     return await withAdmittedJSONWriteResponse(
         request.body,
         admission: capability.jsonWriteAdmission,
@@ -599,7 +681,7 @@ private func withPublicMutationInput<Value: Decodable>(
             Data(SHA256.hash(data: data))
         )
     } operation: { admitted in
-        try await operation(admitted.0, admitted.1)
+        try await operation(admitted.0, admitted.1, subject)
     } errorResponse: { error in
         publicMutationResponse(error, capability: capability)
     }

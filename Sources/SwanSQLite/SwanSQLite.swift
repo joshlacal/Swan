@@ -1040,15 +1040,31 @@ public enum SQLiteLayout {
         """
         CREATE TABLE IF NOT EXISTS blob_namespace_references (
             cid TEXT NOT NULL REFERENCES blob_payloads(cid) ON DELETE CASCADE,
-            namespace_kind TEXT NOT NULL CHECK(namespace_kind IN ('public', 'space')),
+            -- `staged` is an uploaded blob no commit has claimed yet. Only
+            -- `public` is served to an anonymous reader; a staged edge is
+            -- consumed by the public or permissioned commit that promotes it,
+            -- or it expires.
+            namespace_kind TEXT NOT NULL
+                CHECK(namespace_kind IN ('public', 'space', 'staged')),
             space_uri TEXT NOT NULL,
+            -- Unix seconds this edge was created, and the only input to both
+            -- sweeps: staged expiry, and garbage collection of a public edge
+            -- no repository record justifies. A NULL is never swept, so a
+            -- writer that forgets to stamp an edge leaks storage rather than
+            -- deleting a live blob.
+            created_at INTEGER CHECK(created_at IS NULL OR created_at >= 0),
             PRIMARY KEY(cid, namespace_kind, space_uri),
             CHECK(
                 (namespace_kind = 'public' AND space_uri = '')
                 OR (namespace_kind = 'space' AND length(space_uri) > 0)
+                OR (namespace_kind = 'staged' AND space_uri = '')
             )
         )
         """,
+        // The sweep index is created by the v15 migration, not here: a pre-v15
+        // database still has a reference table without `created_at` when these
+        // statements run, and indexing a column that does not exist yet fails
+        // the whole schema transaction.
         // This table deliberately outlives `blob_payloads` while a private
         // file is pending reclamation.  SQLite commits reachability changes
         // before any unlink; startup can then complete a crash-interrupted
@@ -1665,6 +1681,39 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let permissionedRemoteReplicaLogicalLimitMigrationVersion = 12
     private static let publicFirehoseOutboxMigrationVersion = 13
     private static let publicFirehoseCompletionAnchorMigrationVersion = 14
+    private static let stagedBlobNamespaceMigrationVersion = 15
+
+    /// How long an uploaded blob no commit has claimed stays staged.
+    ///
+    /// A staged edge is never anonymously reachable, so this bound is about
+    /// storage and the account reference quota, not confidentiality. It is
+    /// long enough that a composer holding an attachment across an app
+    /// restart still commits against the original upload, and short enough
+    /// that abandoned uploads do not accumulate into a durable ledger. A
+    /// client whose staged edge has expired simply re-uploads: the payload is
+    /// content-addressed, so the retry is idempotent.
+    static let stagedBlobReferenceLifetimeSeconds = 7 * 24 * 60 * 60
+
+    /// The per-sweep bound on expired staged edges. Reclamation takes a
+    /// per-digest lifecycle lock and can unlink a file, so a sweep stays
+    /// bounded rather than holding a request behind an unbounded cleanup.
+    static let maximumStagedBlobReferencePurge = 64
+
+    /// How long a public blob edge no repository record justifies is kept
+    /// before it can be collected.
+    ///
+    /// This is deliberately generous, and it is the only thing standing
+    /// between the sweep and a client that uploads on Monday and commits the
+    /// record on Friday. It must comfortably exceed the longest realistic
+    /// upload-to-commit gap, because the cost of being too eager (a live blob
+    /// deleted out from under a pending record) is far worse than the cost of
+    /// being too patient (storage held a little longer).
+    static let publicBlobReferenceGracePeriodSeconds = 14 * 24 * 60 * 60
+
+    /// The per-sweep bound on collectable public edges. Deliberately smaller
+    /// than the staged bound: each removal is a lifecycle-locked transaction
+    /// plus a possible unlink, and this sweep can run on an upload path.
+    static let maximumPublicBlobReferencePurge = 16
 
     /// A read credential may register notification recipients, but it must
     /// not be able to turn the later deletion fanout into an unbounded
@@ -1881,6 +1930,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     now: Int64(Date().timeIntervalSince1970)
                 )
                 try await recoverPrivateBlobLifecycle()
+                try await purgeExpiredStagedBlobReferences()
+                try await purgeUnreferencedPublicBlobReferences()
                 if !descriptorBacked {
                     try SQLiteProtectedPaths.hardenSQLiteFiles(
                         parentDescriptor: accountDescriptor,
@@ -1977,6 +2028,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             )
         }
         try await recoverPrivateBlobLifecycle()
+        try await purgeExpiredStagedBlobReferences()
+        try await purgeUnreferencedPublicBlobReferences()
     }
 
     func installTestingHooks(_ hooks: SQLiteTestingHooks) {
@@ -2011,6 +2064,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migrateFileBackedBlobLifecycleIfNeeded()
             try await migratePhysicalBlobCASLifecycleIfNeeded()
             try await migrateAccountBlobQuotaIfNeeded()
+            try await migrateStagedBlobNamespaceIfNeeded()
             try await migratePublicRepositoryRequestIntegrityIfNeeded()
             try await migratePublicRepositoryImportProjectionBindingIfNeeded()
             try await migratePermissionedRemoteReplicaResultBindingIfNeeded()
@@ -2758,6 +2812,101 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 "blob quota metadata is incomplete"
             )
         }
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
+    /// Admits the `staged` upload namespace. SQLite cannot replace a CHECK
+    /// constraint in place, so a pre-v15 reference table is rebuilt: rename,
+    /// recreate with the widened kind and the `staged_at` expiry column, copy
+    /// every row verbatim, drop the old table.
+    ///
+    /// No existing row changes meaning. Every committed row is `public` or
+    /// `space` and stays exactly that, with a NULL `staged_at`, so an account
+    /// that already serves blobs keeps serving precisely the same set. The
+    /// table is a per-account reference index bounded by
+    /// ``AccountBlobQuota/maximumReferences``, not a payload store, so the
+    /// copy is small and no blob bytes move.
+    private func migrateStagedBlobNamespaceIfNeeded() async throws {
+        let version = Self.stagedBlobNamespaceMigrationVersion
+        // Drive this off the observed table shape rather than the marker
+        // alone. A restored or repaired database can carry a marker for a
+        // shape it does not have, and a reference table without `created_at`
+        // fails every upload — so the shape is the authority and the marker
+        // only records that the work has been done.
+        let columns = try await connection.query(
+            "PRAGMA table_info(blob_namespace_references)"
+        )
+        let alreadyMigrated = columns.contains {
+            $0.column("name")?.string == "created_at"
+        }
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        if alreadyMigrated, !applied.isEmpty { return }
+
+        if !alreadyMigrated {
+            _ = try await connection.query(
+                """
+                ALTER TABLE blob_namespace_references
+                RENAME TO blob_namespace_references_v14
+                """
+            )
+            _ = try await connection.query(
+                """
+                CREATE TABLE blob_namespace_references (
+                    cid TEXT NOT NULL REFERENCES blob_payloads(cid)
+                        ON DELETE CASCADE,
+                    namespace_kind TEXT NOT NULL
+                        CHECK(namespace_kind IN ('public', 'space', 'staged')),
+                    space_uri TEXT NOT NULL,
+                    created_at INTEGER
+                        CHECK(created_at IS NULL OR created_at >= 0),
+                    PRIMARY KEY(cid, namespace_kind, space_uri),
+                    CHECK(
+                        (namespace_kind = 'public' AND space_uri = '')
+                        OR (namespace_kind = 'space' AND length(space_uri) > 0)
+                        OR (namespace_kind = 'staged' AND space_uri = '')
+                    )
+                )
+                """
+            )
+            // Existing edges are stamped with the upgrade instant, not with
+            // NULL and not with zero. Nothing an account already serves
+            // disappears when this ships — every inherited edge starts its
+            // grace period now — and the historical orphans this scan is
+            // about still become collectable one grace period later.
+            _ = try await connection.query(
+                """
+                INSERT INTO blob_namespace_references(
+                    cid, namespace_kind, space_uri, created_at
+                )
+                SELECT cid, namespace_kind, space_uri, ?
+                FROM blob_namespace_references_v14
+                """,
+                [.integer(Int(Date().timeIntervalSince1970))]
+            )
+            _ = try await connection.query(
+                "DROP TABLE blob_namespace_references_v14"
+            )
+        }
+        _ = try await connection.query(
+            """
+            CREATE INDEX IF NOT EXISTS blob_namespace_references_sweep
+            ON blob_namespace_references(namespace_kind, created_at)
+            """
+        )
+
+        guard applied.isEmpty else { return }
         _ = try await connection.query(
             """
             INSERT INTO permissioned_repository_migrations(version, applied_at)
@@ -4471,6 +4620,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             restoreRepositorySpace = nil
         case let .space(space):
             restoreRepositorySpace = space
+        case .staged:
+            // A portable export never contains a staged edge, so a manifest
+            // that claims one is not a Swan export.
+            throw SQLiteRepositoryError.corruptDatabase(
+                "portable restore blob namespace is invalid"
+            )
         }
         return try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
             try await putBlobLocked(
@@ -4544,6 +4699,10 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         switch namespace {
         case .public: restoreRepositorySpace = nil
         case let .space(space): restoreRepositorySpace = space
+        case .staged:
+            throw SQLiteRepositoryError.corruptDatabase(
+                "portable restore blob namespace is invalid"
+            )
         }
         try Task.checkCancellation()
         return try await withPrivateBlobLifecycleLock(digestHex: digestHex) {
@@ -7135,6 +7294,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         guard maximumBytes > 0 else {
             throw SwanError.malformed("blob upload limit is invalid")
         }
+        if case .staged = namespace {
+            // The account creating the pressure clears it. Sweeping before
+            // admission also means an abandoned edge cannot keep an account
+            // at its reference ceiling — the quota leak is the half of this
+            // that bites even when nothing confidential is involved.
+            try await purgeExpiredStagedBlobReferences()
+            try await purgeUnreferencedPublicBlobReferences()
+        }
         let spoolHandle = try SQLiteProtectedPaths.makeUnlinkedPublicBlobSpool(
             in: dataDirectory
         )
@@ -7279,6 +7446,158 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             return nil
         }
         return PublicBlobMetadata(mimeType: stored.mimeType, size: stored.byteCount)
+    }
+
+    /// Metadata for a staged upload or an already-public blob, so the
+    /// authenticated mutation surface can check a record's declared
+    /// `size`/`mimeType` before signing the commit that promotes it.
+    ///
+    /// This deliberately does not open a body and is not reachable from the
+    /// anonymous read allow-list; the promotion itself still happens inside
+    /// the commit transaction, which re-derives reachability under the same
+    /// serialization boundary.
+    public func uploadedBlobMetadata(cid: String) async throws -> PublicBlobMetadata? {
+        _ = try canonicalRawBlobCID(cid)
+        if let stored = try await publicBlobMetadataIfReachable(
+            cid: cid,
+            namespaceKind: "public",
+            spaceURI: ""
+        ) {
+            return PublicBlobMetadata(mimeType: stored.mimeType, size: stored.byteCount)
+        }
+        guard let staged = try await publicBlobMetadataIfReachable(
+            cid: cid,
+            namespaceKind: "staged",
+            spaceURI: ""
+        ) else {
+            return nil
+        }
+        return PublicBlobMetadata(mimeType: staged.mimeType, size: staged.byteCount)
+    }
+
+    /// Drops staged upload edges older than
+    /// ``stagedBlobReferenceLifetimeSeconds`` and reclaims any payload they
+    /// were the last reference to.
+    ///
+    /// This runs at startup and again before each new staged upload, so the
+    /// account that creates staging pressure is the one that clears it. If
+    /// neither ever happens again the residue is still bounded — a staged
+    /// edge is never anonymously reachable, and
+    /// ``AccountBlobQuota/maximumReferences`` caps how many can exist — so a
+    /// missing sweep degrades to a quota cost, never to disclosure.
+    @discardableResult
+    public func purgeExpiredStagedBlobReferences(
+        now: Date = Date()
+    ) async throws -> Int {
+        let cutoff = Int(now.timeIntervalSince1970)
+            - Self.stagedBlobReferenceLifetimeSeconds
+        let expired = try await withConnectionGate {
+            try await connection.query(
+                """
+                SELECT cid FROM blob_namespace_references
+                WHERE namespace_kind = 'staged'
+                  AND created_at IS NOT NULL AND created_at < ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                [
+                    .integer(cutoff),
+                    .integer(Self.maximumStagedBlobReferencePurge),
+                ]
+            )
+        }
+        var purged = 0
+        for row in expired {
+            guard let cid = row.column("cid")?.string else { continue }
+            // `removeBlobReference` owns the per-digest lifecycle lock, the
+            // remaining-reference check, and the crash-safe unlink. A CID a
+            // concurrent commit has already promoted simply deletes nothing.
+            try await removeBlobReference(
+                BlobReference(cid: cid, namespace: .staged)
+            )
+            purged += 1
+        }
+        return purged
+    }
+
+    /// Collects public blob edges that no public repository record justifies.
+    ///
+    /// This is the garbage collection the blob-isolation design named as owed
+    /// and never shipped: nothing but a successful permissioned commit has
+    /// ever removed a public edge, so an upload that was never committed — or
+    /// whose record was later deleted — held its edge, its CAS file, and its
+    /// slice of ``AccountBlobQuota`` forever, with no operator recourse.
+    ///
+    /// A candidate must satisfy all four of:
+    /// - `namespace_kind = 'public'`;
+    /// - `created_at` older than ``publicBlobReferenceGracePeriodSeconds``, so
+    ///   an ordinary upload-then-commit sequence is never a candidate at all;
+    /// - no `space` edge for the same CID, so a blob a permissioned record
+    ///   owns is never touched by the public sweep;
+    /// - absent from the public repository's own blob-link projection.
+    ///
+    /// The projection is computed **once per sweep** rather than per candidate.
+    /// `publicRepositoryContainsBlobCIDWithoutGate` answers the same question
+    /// but walks and decodes the entire record index for each CID it is asked
+    /// about; `publicRepositoryBlobCIDs()` is the same walk producing the whole
+    /// set, so one call decides every candidate. It is also skipped entirely
+    /// when no candidate is old enough, which is the steady state.
+    ///
+    /// Failure is never propagated to whatever triggered the sweep. This is
+    /// opportunistic maintenance: a repository too large to project, or one
+    /// with no published state yet, must not fail an upload or an account
+    /// open.
+    @discardableResult
+    public func purgeUnreferencedPublicBlobReferences(
+        now: Date = Date()
+    ) async throws -> Int {
+        let cutoff = Int(now.timeIntervalSince1970)
+            - Self.publicBlobReferenceGracePeriodSeconds
+        let candidates = try await withConnectionGate {
+            try await connection.query(
+                """
+                SELECT reference.cid AS cid
+                FROM blob_namespace_references AS reference
+                WHERE reference.namespace_kind = 'public'
+                  AND reference.created_at IS NOT NULL
+                  AND reference.created_at < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM blob_namespace_references AS owned
+                      WHERE owned.cid = reference.cid
+                        AND owned.namespace_kind = 'space'
+                  )
+                ORDER BY reference.created_at ASC
+                LIMIT ?
+                """,
+                [
+                    .integer(cutoff),
+                    .integer(Self.maximumPublicBlobReferencePurge),
+                ]
+            )
+        }
+        guard !candidates.isEmpty else { return 0 }
+
+        let referenced: Set<String>
+        do {
+            referenced = Set(try await publicRepositoryBlobCIDs().map(\.string))
+        } catch {
+            // A repository that cannot be projected right now keeps every
+            // edge. Collecting on a partial answer would delete live blobs.
+            return 0
+        }
+
+        var purged = 0
+        for row in candidates {
+            guard let cid = row.column("cid")?.string,
+                  !referenced.contains(cid) else {
+                continue
+            }
+            try await removeBlobReference(
+                BlobReference(cid: cid, namespace: .public)
+            )
+            purged += 1
+        }
+        return purged
     }
 
     public func removeBlobReference(_ reference: BlobReference) async throws {
@@ -7561,14 +7880,22 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                             mimeType.map(SQLiteData.text) ?? .null,
                         ]
                     )
+                    // Re-creating an existing edge restarts its grace period:
+                    // the second upload is a fresh, equally unclaimed intent,
+                    // and refreshing a timer can never widen reachability —
+                    // it only delays collection.
                     _ = try await connection.query(
                         """
                         INSERT INTO blob_namespace_references(
-                            cid, namespace_kind, space_uri
-                        ) VALUES (?, ?, ?)
-                        ON CONFLICT(cid, namespace_kind, space_uri) DO NOTHING
+                            cid, namespace_kind, space_uri, created_at
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(cid, namespace_kind, space_uri)
+                        DO UPDATE SET created_at = excluded.created_at
                         """,
-                        [.text(cid), .text(namespaceKind), .text(spaceURI)]
+                        [
+                            .text(cid), .text(namespaceKind), .text(spaceURI),
+                            .integer(Int(Date().timeIntervalSince1970)),
+                        ]
                     )
                     try await setBlobLifecycleStateWithoutGate(
                         digestHex: digestHex,
@@ -7595,7 +7922,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// The caller owns `BEGIN IMMEDIATE`, so two actors or processes cannot
     /// both observe the same remaining capacity and oversubscribe it. Existing
     /// payloads and exact references contribute zero, preserving CAS dedup.
-    private func admitBlobQuotaWithoutGate(
+    func admitBlobQuotaWithoutGate(
         cid: String,
         byteCount: Int,
         references: [(namespaceKind: String, spaceURI: String)]
@@ -9803,6 +10130,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             ("public", "")
         case let .space(space):
             ("space", space.rawValue)
+        case .staged:
+            ("staged", "")
         }
     }
 
@@ -9886,12 +10215,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return cids.sorted()
     }
 
-    /// Moves a freshly uploaded public blob into the private space namespace
-    /// as part of the same SQLite transaction as its permissioned record.
-    /// A staged-only public reference is removed after the private reference is
-    /// durable, while a CID still referenced by a validated public record
-    /// keeps (or restores) its public reference. Existing private references
-    /// are idempotent, including when another space already owns the CAS.
+    /// Moves a freshly uploaded blob into the private space namespace as part
+    /// of the same SQLite transaction as its permissioned record.
+    ///
+    /// The staged upload edge is consumed unconditionally: a permissioned
+    /// record has claimed those bytes, and a later same-CID re-upload creates
+    /// a fresh staged edge that is likewise never anonymously reachable. A
+    /// CID a validated public record also references keeps (or has restored)
+    /// its public reference — that blob is genuinely published and
+    /// `com.atproto.sync.getBlob` must keep serving it. Existing private
+    /// references are idempotent, including when another space already owns
+    /// the CAS.
     private func promotePermissionedBlobReferences(
         _ cids: [String],
         space: SpaceURI
@@ -9919,6 +10253,17 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 )
             }
 
+            // The upload edge is consumed by this commit. Removing it before
+            // the idempotent private insert means an existing private edge
+            // can never let a re-created staged edge survive.
+            _ = try await connection.query(
+                """
+                DELETE FROM blob_namespace_references
+                WHERE cid = ? AND namespace_kind = 'staged' AND space_uri = ''
+                """,
+                [.text(cid)]
+            )
+
             let retainPublicReference: Bool
             if let override = testingHooks
                 .permissionedBlobPublicReachabilityOverride?(cid) {
@@ -9928,9 +10273,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     publicRepositoryContainsBlobCIDWithoutGate(cid)
             }
             if !retainPublicReference {
-                // Cleanup is deliberately before the idempotent private
-                // insert. Re-uploading a CID recreates the staged public edge;
-                // an existing private edge must never bypass its removal.
+                // Repairs a public edge no validated public record justifies.
+                // Uploads no longer create one, so this now only catches a
+                // record deletion or an inherited pre-v15 edge.
                 _ = try await connection.query(
                     """
                     DELETE FROM blob_namespace_references
@@ -9951,24 +10296,25 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 byteCount: Int(byteCount),
                 references: plannedReferences
             )
+            let stamp = SQLiteData.integer(Int(Date().timeIntervalSince1970))
             _ = try await connection.query(
                 """
                 INSERT INTO blob_namespace_references(
-                    cid, namespace_kind, space_uri
-                ) VALUES (?, 'space', ?)
+                    cid, namespace_kind, space_uri, created_at
+                ) VALUES (?, 'space', ?, ?)
                 ON CONFLICT(cid, namespace_kind, space_uri) DO NOTHING
                 """,
-                [.text(cid), .text(space.rawValue)]
+                [.text(cid), .text(space.rawValue), stamp]
             )
             if retainPublicReference {
                 _ = try await connection.query(
                     """
                     INSERT INTO blob_namespace_references(
-                        cid, namespace_kind, space_uri
-                    ) VALUES (?, 'public', '')
+                        cid, namespace_kind, space_uri, created_at
+                    ) VALUES (?, 'public', '', ?)
                     ON CONFLICT(cid, namespace_kind, space_uri) DO NOTHING
                     """,
-                    [.text(cid)]
+                    [.text(cid), stamp]
                 )
             }
         }

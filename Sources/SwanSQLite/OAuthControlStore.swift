@@ -198,7 +198,18 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
     private static let migrationBusyInitialDelayNanoseconds: UInt64 = 5_000_000
     private static let migrationBusyMaximumDelayNanoseconds: UInt64 = 80_000_000
     private static let oauthCleanupBatchSize = 512
+    /// Retention for a freshness row that has published at least once. It
+    /// outlives the metadata cache entry on purpose: the watermark is what
+    /// stops a delayed older fetch from republishing stale key material.
     private static let clientMetadataFreshnessRetention: TimeInterval = 3_600
+    /// Retention for a row that only has a fetch outstanding. An unpublished
+    /// ticket is capacity an unauthenticated caller claimed by naming a URL,
+    /// so it is retained just long enough to cover the fetch that issued it —
+    /// four bounded DNS resolutions plus two bounded HTTP requests, well
+    /// under a minute at the policy maximums — and no longer. This is the
+    /// backstop for a missed `abandonClientMetadataFetch`, not a replacement
+    /// for it.
+    private static let clientMetadataFetchTicketRetention: TimeInterval = 60
     /// Blind password-recovery admission is deliberately durable, so its
     /// account-free marker table needs an independent global bound. These are
     /// internal rather than configurable per request: callers must not be able
@@ -391,7 +402,10 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                     """,
                     [.text(metadata.clientID), blob(metadata.document), .integer(expiry)]
                 )
-                try await markClientMetadataFetchPublishedLocked(ticket)
+                try await markClientMetadataFetchPublishedLocked(
+                    ticket,
+                    now: now
+                )
             }
         }
     }
@@ -476,9 +490,89 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                         .integer(expiry),
                     ]
                 )
-                try await markClientMetadataFetchPublishedLocked(ticket)
+                try await markClientMetadataFetchPublishedLocked(
+                    ticket,
+                    now: now
+                )
                 return true
             }
+        }
+    }
+
+    /// Deletes the freshness row a never-published fetch allocated.
+    ///
+    /// The predicate is deliberately narrow. `latest_generation = ?` means a
+    /// newer fetch for the same client has not started, so a delayed abandon
+    /// cannot delete the row a live flight depends on.
+    /// `published_generation = latest_generation - 1` is what "nothing has
+    /// published since this ticket was issued" actually looks like in this
+    /// schema: the ticket INSERT seeds `published_generation` to
+    /// `generation - 1`, and the generation counter is global, so the equality
+    /// can only hold while this ticket is the single outstanding one for its
+    /// client. `NOT EXISTS` keeps the watermark for any client whose cached
+    /// document is still serving.
+    ///
+    /// A row that no longer matches is left alone and this returns normally —
+    /// the caller has already lost its race and has nothing to clean up.
+    public func abandonClientMetadataFetch(
+        ticket: OAuthClientMetadataFetchTicket,
+        now: Date = Date()
+    ) async throws {
+        guard validText(ticket.clientID),
+              ticket.generation > 0,
+              ticket.generation <= Int64(Int.max) else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        _ = try timestamp(now)
+        try await withConnectionGate {
+            try await transaction {
+                _ = try await connection.query(
+                    """
+                    DELETE FROM oauth_control_client_metadata_freshness
+                    WHERE client_id = ?
+                      AND latest_generation = ?
+                      AND published_generation = latest_generation - 1
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM oauth_control_client_metadata
+                          WHERE oauth_control_client_metadata.client_id = ?
+                      )
+                    """,
+                    [
+                        .text(ticket.clientID),
+                        .integer(Int(ticket.generation)),
+                        .text(ticket.clientID),
+                    ]
+                )
+            }
+        }
+    }
+
+    /// One index-free probe of the token-family table. The table is bounded
+    /// at `tokenFamilies` rows and can only grow through a completed
+    /// authorization, so it stays small on a single-account deployment; an
+    /// anonymous caller cannot inflate it to make this scan expensive.
+    public func clientHoldsLiveAuthorization(
+        clientID: String,
+        now: Date = Date()
+    ) async throws -> Bool {
+        guard validText(clientID) else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        let nowTimestamp = try timestamp(now)
+        return try await withConnectionGate {
+            let rows = try await connection.query(
+                """
+                SELECT 1
+                FROM oauth_control_token_families
+                WHERE client_id = ?
+                  AND revoked_at IS NULL
+                  AND expires_at > ?
+                LIMIT 1
+                """,
+                [.text(clientID), .integer(nowTimestamp)]
+            )
+            return !rows.isEmpty
         }
     }
 
@@ -1233,7 +1327,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
             maximumRows: oauthControlStorageLimits.clientMetadataFreshness
         )
         let retainUntil = try timestamp(
-            now.addingTimeInterval(Self.clientMetadataFreshnessRetention)
+            now.addingTimeInterval(Self.clientMetadataFetchTicketRetention)
         )
         _ = try await connection.query(
             """
@@ -1263,6 +1357,10 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
               nextGeneration > 0 else {
             throw OAuthControlStoreError.malformedRecord
         }
+        // `MAX` is what makes the short ticket retention safe to compose:
+        // starting a new fetch for an already published client can only ever
+        // extend that client's hour-long retention, never shorten it to the
+        // 60 s unpublished window.
         _ = try await connection.query(
             """
             INSERT INTO oauth_control_client_metadata_freshness(
@@ -1290,21 +1388,30 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
     }
 
     private func markClientMetadataFetchPublishedLocked(
-        _ ticket: OAuthClientMetadataFetchTicket
+        _ ticket: OAuthClientMetadataFetchTicket,
+        now: Date
     ) async throws {
         guard ticket.generation > 0,
               ticket.generation <= Int64(Int.max) else {
             throw OAuthControlStoreError.invalidInput
         }
+        // Publication is what earns the long retention. Extending it here
+        // rather than at ticket issue means an unpublished row never holds a
+        // slot in the bounded table for more than the fetch window.
+        let retainUntil = try timestamp(
+            now.addingTimeInterval(Self.clientMetadataFreshnessRetention)
+        )
         _ = try await connection.query(
             """
             UPDATE oauth_control_client_metadata_freshness
-            SET published_generation = ?
+            SET published_generation = ?,
+                retain_until = MAX(retain_until, ?)
             WHERE client_id = ? AND latest_generation >= ?
               AND published_generation < ?
             """,
             [
                 .integer(Int(ticket.generation)),
+                .integer(retainUntil),
                 .text(ticket.clientID),
                 .integer(Int(ticket.generation)),
                 .integer(Int(ticket.generation)),

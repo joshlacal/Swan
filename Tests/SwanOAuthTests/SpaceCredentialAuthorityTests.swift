@@ -34,7 +34,12 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(inspection.header.kid, PermissionedDataJWT.spaceCredentialKeyID)
             XCTAssertEqual(inspection.claims.iss, authority)
             XCTAssertEqual(inspection.claims.sub, space.rawValue)
-            XCTAssertEqual(inspection.claims.exp - inspection.claims.iat, 7_200)
+            // Swan issues a five-minute credential, because a credential names
+            // no reader and is never re-checked against membership, so its
+            // lifetime is the revocation window. The two-hour proposal value is
+            // the ceiling this authority still *accepts*, not what it mints —
+            // see `SpaceCredentialLifetimeTests`.
+            XCTAssertEqual(inspection.claims.exp - inspection.claims.iat, 300)
             XCTAssertNotNil(UUID(uuidString: inspection.claims.jti))
 
             let verifier = DurableSpaceCredentialVerifier(

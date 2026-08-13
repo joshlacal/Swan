@@ -2810,4 +2810,8 @@ private actor SQLiteGenerationRefreshingPublicMutationStore:
     func publicBlobMetadata(cid: String) async throws -> PublicBlobMetadata? {
         try await database.publicBlobMetadata(cid: cid)
     }
+
+    func uploadedBlobMetadata(cid: String) async throws -> PublicBlobMetadata? {
+        try await database.uploadedBlobMetadata(cid: cid)
+    }
 }

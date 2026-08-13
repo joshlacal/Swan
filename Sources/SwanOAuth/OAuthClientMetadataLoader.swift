@@ -79,16 +79,28 @@ public actor OAuthClientMetadataLoader {
 
     private struct Flight: Sendable {
         let identity: UUID
+        let host: String
         let task: Task<OAuthResolvedClientMetadata, Error>
         var waiterCount: Int
     }
 
     private static let maximumConcurrentFlights = 8
+    /// The flight table is a second admission gate in front of the process
+    /// budget, and it is reached first. Splitting only the fetch pool would
+    /// leave eight anonymous flights refusing an authorized client here,
+    /// before it ever reaches the reserved fetch permits.
+    private static let generalConcurrentFlights = 6
+    /// One origin must not be able to occupy the general pool by varying only
+    /// the metadata path. Two is the number a single legitimate client can
+    /// need at once: a cache-miss load and a `bypassCache` revalidation are
+    /// separate flights for the same client ID.
+    private static let maximumConcurrentFlightsPerHost = 2
     private static let maximumWaitersPerFlight = 64
     private let fetcher: OAuthRemoteDocumentFetcher
     private let controlStore: any OAuthControlStore
     private let cacheLifetime: TimeInterval
     private var inFlight: [FlightKey: Flight] = [:]
+    private var flightsPerHost: [String: Int] = [:]
     /// Immutable construction evidence for HTTP assembly. It is safe to read
     /// without entering the actor because the value-type policy never changes
     /// after initialization; the loader remains the fetch capability.
@@ -134,10 +146,40 @@ public actor OAuthClientMetadataLoader {
         if let flight = inFlight[flightKey] {
             return try await finish(flight, for: flightKey)
         }
-        guard inFlight.count < Self.maximumConcurrentFlights else {
+        let host = (clientID.host ?? "").lowercased()
+        guard flightsPerHost[host, default: 0]
+            < Self.maximumConcurrentFlightsPerHost else {
             throw SwanError.unavailable(
                 "OAuth metadata flight capacity is exhausted"
             )
+        }
+        if inFlight.count >= Self.generalConcurrentFlights {
+            // Only a client the account currently authorizes may reach the
+            // reserved flight slots. Refuse before the durable read when
+            // there is no reserved slot left to win, so a rejected caller
+            // never costs a control-database round trip.
+            guard inFlight.count < Self.maximumConcurrentFlights else {
+                throw SwanError.unavailable(
+                    "OAuth metadata flight capacity is exhausted"
+                )
+            }
+            // The actor is yielded across this read, so every piece of state
+            // it guards is re-read afterwards.
+            let reserved = await clientHoldsLiveAuthorization(
+                clientID: key,
+                now: now
+            )
+            if let flight = inFlight[flightKey] {
+                return try await finish(flight, for: flightKey)
+            }
+            guard reserved,
+                  inFlight.count < Self.maximumConcurrentFlights,
+                  flightsPerHost[host, default: 0]
+                  < Self.maximumConcurrentFlightsPerHost else {
+                throw SwanError.unavailable(
+                    "OAuth metadata flight capacity is exhausted"
+                )
+            }
         }
 
         let fetcher = self.fetcher
@@ -160,8 +202,14 @@ public actor OAuthClientMetadataLoader {
                 cacheLifetime: cacheLifetime
             )
         }
-        let flight = Flight(identity: UUID(), task: task, waiterCount: 0)
+        let flight = Flight(
+            identity: UUID(),
+            host: host,
+            task: task,
+            waiterCount: 0
+        )
         inFlight[flightKey] = flight
+        flightsPerHost[host, default: 0] += 1
         // A caller may cancel without cancelling `task`. This observer removes
         // a completed flight even when no waiter remains to re-enter the actor.
         _ = Task.detached { [weak self] in
@@ -217,9 +265,28 @@ public actor OAuthClientMetadataLoader {
     }
 
     private func removeFlight(identity: UUID, for key: FlightKey) {
-        if inFlight[key]?.identity == identity {
-            inFlight.removeValue(forKey: key)
+        guard let flight = inFlight[key], flight.identity == identity else {
+            return
         }
+        inFlight.removeValue(forKey: key)
+        let remaining = (flightsPerHost[flight.host] ?? 1) - 1
+        if remaining > 0 {
+            flightsPerHost[flight.host] = remaining
+        } else {
+            flightsPerHost.removeValue(forKey: flight.host)
+        }
+    }
+
+    /// Fails closed: an unavailable control database classifies the caller as
+    /// general rather than granting it the reserved capacity.
+    private func clientHoldsLiveAuthorization(
+        clientID: String,
+        now: Date
+    ) async -> Bool {
+        ((try? await controlStore.clientHoldsLiveAuthorization(
+            clientID: clientID,
+            now: now
+        )) ?? false)
     }
 
     private func releaseWaiter(identity: UUID, for key: FlightKey) {
@@ -280,7 +347,14 @@ public actor OAuthClientMetadataLoader {
             }
         }
 
-        return try await fetcher.withAdmission { admittedFetcher in
+        return try await fetcher.withAdmission(
+            reservedCapacityCheck: {
+                ((try? await controlStore.clientHoldsLiveAuthorization(
+                    clientID: key,
+                    now: now
+                )) ?? false)
+            }
+        ) { admittedFetcher in
             let ticket: OAuthClientMetadataFetchTicket
             do {
                 ticket = try await controlStore.beginClientMetadataFetch(
@@ -292,56 +366,88 @@ public actor OAuthClientMetadataLoader {
                     "OAuth metadata cache unavailable"
                 )
             }
-
-            let metadataData = try await admittedFetcher.fetchJSON(
-                from: clientID
-            )
-            let metadata = try OAuthClientMetadata.decodeValidated(
-                metadataData,
-                responseURL: clientID
-            )
-            let keySet: OAuthJSONWebKeySet?
-            if let inline = metadata.jwks {
-                keySet = inline
-            } else if let jwksURI = metadata.jwksURI {
-                keySet = try OAuthJSONWebKeySet.decodeValidated(
-                    try await admittedFetcher.fetchJSON(from: jwksURI)
-                )
-            } else {
-                keySet = nil
-            }
-            let resolved = OAuthResolvedClientMetadata(
-                metadata: metadata,
-                keySet: keySet
-            )
+            // Every exit that is not a successful publication has to release
+            // the durable freshness row the ticket just claimed; otherwise
+            // naming a URL is enough to hold capacity in a bounded table.
+            // Abandoning is a no-op when a concurrent flight has taken the
+            // row over, and its own failure must not mask the real error.
             do {
-                let document = try JSONEncoder().encode(
-                    CachedDocument(metadata: metadata, keySet: keySet)
-                )
-                let published = try await controlStore.publishClientMetadata(
-                    OAuthCachedClientMetadata(
-                        clientID: key,
-                        document: document,
-                        expiresAt: now.addingTimeInterval(cacheLifetime)
-                    ),
+                return try await fetchValidateAndPublish(
+                    clientID: clientID,
+                    key: key,
+                    now: now,
                     using: ticket,
+                    fetcher: admittedFetcher,
+                    controlStore: controlStore,
+                    cacheLifetime: cacheLifetime
+                )
+            } catch {
+                try? await controlStore.abandonClientMetadataFetch(
+                    ticket: ticket,
                     now: now
                 )
-                guard published else {
-                    throw SwanError.unavailable(
-                        "OAuth metadata was superseded during validation"
-                    )
-                }
-            } catch {
-                if let error = error as? SwanError {
-                    throw error
-                }
+                throw error
+            }
+        }
+    }
+
+    private static func fetchValidateAndPublish(
+        clientID: URL,
+        key: String,
+        now: Date,
+        using ticket: OAuthClientMetadataFetchTicket,
+        fetcher admittedFetcher: OAuthAdmittedRemoteDocumentFetcher,
+        controlStore: any OAuthControlStore,
+        cacheLifetime: TimeInterval
+    ) async throws -> OAuthResolvedClientMetadata {
+        let metadataData = try await admittedFetcher.fetchJSON(
+            from: clientID
+        )
+        let metadata = try OAuthClientMetadata.decodeValidated(
+            metadataData,
+            responseURL: clientID
+        )
+        let keySet: OAuthJSONWebKeySet?
+        if let inline = metadata.jwks {
+            keySet = inline
+        } else if let jwksURI = metadata.jwksURI {
+            keySet = try OAuthJSONWebKeySet.decodeValidated(
+                try await admittedFetcher.fetchJSON(from: jwksURI)
+            )
+        } else {
+            keySet = nil
+        }
+        let resolved = OAuthResolvedClientMetadata(
+            metadata: metadata,
+            keySet: keySet
+        )
+        do {
+            let document = try JSONEncoder().encode(
+                CachedDocument(metadata: metadata, keySet: keySet)
+            )
+            let published = try await controlStore.publishClientMetadata(
+                OAuthCachedClientMetadata(
+                    clientID: key,
+                    document: document,
+                    expiresAt: now.addingTimeInterval(cacheLifetime)
+                ),
+                using: ticket,
+                now: now
+            )
+            guard published else {
                 throw SwanError.unavailable(
-                    "OAuth metadata cache unavailable"
+                    "OAuth metadata was superseded during validation"
                 )
             }
-            return resolved
+        } catch {
+            if let error = error as? SwanError {
+                throw error
+            }
+            throw SwanError.unavailable(
+                "OAuth metadata cache unavailable"
+            )
         }
+        return resolved
     }
 
     /// Forces a fresh validation pass for confidential-key rotation callers.

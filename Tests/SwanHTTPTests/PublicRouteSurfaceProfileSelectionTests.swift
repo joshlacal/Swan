@@ -540,16 +540,22 @@ final class PublicRouteSurfaceProfileSelectionTests: XCTestCase {
             try await client.execute(uri: Self.getRecordPath, method: .get) { response in
                 XCTAssertEqual(response.status, .badRequest)
             }
-            // A well-formed JSON envelope that is not a `putRecord` input: the
-            // route decodes, refuses, and answers 400 without terminating the
-            // request body, which an omitted content type would do.
+            // The write probe is anonymous, so what it proves is that a live
+            // handler answered — not which request predicate it failed. The
+            // mutation surface authorizes on headers alone before it admits or
+            // decodes a body (`SwanPublicRepositoryMutationXRPC.swift:619-649`),
+            // so a live route answers 401 here, an absent one 404, and a 503
+            // placeholder gate 503. Do not "restore" this to 400 by moving the
+            // decode back in front of authorization: that ordering let an
+            // anonymous body hold a shared JSON write lease for the whole body
+            // deadline (deep-scan F26).
             try await client.execute(
                 uri: Self.putRecordPath,
                 method: .post,
                 headers: Self.jsonHeaders,
                 body: ByteBuffer(string: "{}")
             ) { response in
-                XCTAssertEqual(response.status, .badRequest)
+                XCTAssertEqual(response.status, .unauthorized)
             }
             // Declared by no profile at all, and still served, because it
             // reaches registration through `outOfProfilePublicMethods`.
