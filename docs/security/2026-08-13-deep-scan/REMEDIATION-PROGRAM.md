@@ -132,6 +132,14 @@ F41: raise `handleAttempts` from 10 to 100 at `AccountLoginAdmission.swift:25`, 
 
 F26: hoist the header-only OAuth/DPoP check ahead of `withAdmittedJSONWriteResponse` in `withPublicMutationInput` (`:565-605`) — `authorizedContext` (`:352-364`) never touches the body, so nothing forces the current order — and drain rejections with `drainRejectedRequestBody` (`SwanJSONWriteBody.swift:230-255`) exactly as `uploadBlob` already does at `:63-79`. Keep the repo/selector binding check at `:338-342` where it is. A dedicated pool instance is the weaker fallback; it only shrinks the blast radius and still leaves the AppView pipethrough sharing a pool with anonymous writes.
 
+**Correction (2026-08-13, from L4's implementer).** The hoist alone does not close F26, and this paragraph would have accepted it as complete. `drainRejectedRequestBody` takes its lease from the **same** eight-slot pool, so hoisting authorization ahead of body admission merely moves anonymous slow bodies from the entry side of the pool to the exit side; the denial survives. The hoist must be paired with an isolated drain pool for the public write surface, mirroring `managementRejectedProcessShared` (`Sources/SwanStorage/PublicRepositoryReadDirectory.swift:698`, consumed at `Sources/SwanHTTP/SwanManagementHTTP.swift:236`), which the management listener already documents for this identical shape.
+
+Generalise it before reading the other admission lanes: **an admission control that drains its rejections through the pool it is protecting is not a control.** L1, L2 and L3 all add admission at unauthenticated boundaries; check each for the same shape.
+
+One consequence to keep in view: an isolated drain pool can itself saturate, and a rejected body whose drain blocks must not leave the connection half-read — that ties up a listener slot, which is F05 in L1.
+
+Note also that hoisting authorization changes a client-visible status: an unauthenticated `putRecord` now answers 401 before the envelope is parsed, where it previously answered 400. That is the correct answer and matches `uploadBlob` on the same route surface and the reference PDS, but it is a live-federated behaviour change and `Tests/SwanHTTPTests/PublicRouteSurfaceProfileSelectionTests.swift:552` asserts the old status.
+
 F43: after `putStreaming` returns at `:133`, re-resolve the target, re-check `status == .active`, and on failure call `blobStore.remove(reference)` (already exposed at `Sources/SwanSQLite/SQLitePreMigratedAccountDirectory.swift:2782-2784` — no edit needed there) and throw `PublicMutationFailure.notFound`. Verify `remove` is refcount-aware before wiring it in. Do **not** wrap a 256 MiB stream in the control write transaction.
 
 ### L5 — lifecycle-firehose-fence (reachable, medium)
