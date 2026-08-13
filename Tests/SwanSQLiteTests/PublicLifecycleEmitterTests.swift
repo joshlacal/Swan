@@ -16,7 +16,7 @@ private struct FixedLifecycleAccountSource: PublicFirehoseAccountDatabaseSource 
   }
 }
 
-private actor ManualAuthorizationBarrier {
+private actor LifecycleAuthorizationBarrier {
   private var parked = false
   private var parkedWaiters: [CheckedContinuation<Void, Never>] = []
   private var releaseWaiter: CheckedContinuation<Void, Never>?
@@ -373,7 +373,7 @@ final class PublicLifecycleEmitterTests: XCTestCase {
   }
 
   func testManualSyncLosesDeterministicRaceToDeactivation() async throws {
-    let barrier = ManualAuthorizationBarrier()
+    let barrier = LifecycleAuthorizationBarrier()
     let racingEmitter = SQLitePublicLifecycleEmitter(
       control: control,
       accounts: FixedLifecycleAccountSource(
@@ -406,6 +406,143 @@ final class PublicLifecycleEmitterTests: XCTestCase {
     }
     let pending = try await account.pendingPublicFirehoseOutbox()
     XCTAssertTrue(pending.isEmpty)
+  }
+
+  /// F37. The property is stated the way the relay observes it: once
+  /// `#account(active:false)` has been sequenced onto the public firehose, no
+  /// `#sync` announcing a superseded repository generation may follow it.
+  /// `emitActivation` publishes its head sync after its own lifecycle batch
+  /// has already committed, so a deactivation that linearizes in between can
+  /// drain the whole lifecycle queue before the sync row is ever inserted —
+  /// at which point the sequencer has no pending batch to order it against.
+  func testActivationSyncLosesDeterministicRaceToDeactivation() async throws {
+    let barrier = LifecycleAuthorizationBarrier()
+    let racingEmitter = SQLitePublicLifecycleEmitter(
+      control: control,
+      accounts: FixedLifecycleAccountSource(
+        accounts: [PublicFirehoseAccountDatabase(did: did, database: account)]
+      ),
+      hooks: .init(beforeActivationAuthorization: { await barrier.park() })
+    )
+    let accountDID = did
+    let eventTime = epoch
+    let emission = Task {
+      try await racingEmitter.emitActivation(
+        did: accountDID, operationID: "req-raced", plcOperationCID: "bafyplc-raced",
+        handle: "alice.example", materialTime: eventTime, now: eventTime
+      )
+    }
+    await barrier.waitUntilParked()
+    _ = try await control.transitionStatus(
+      did: did,
+      to: .deactivated,
+      declaration: .init(),
+      emitting: .init(operationID: "deact-during-activation"),
+      now: epoch.addingTimeInterval(1)
+    )
+    // Drain everything durable at this instant: the activation batch
+    // (generation 1) and the deactivation batch (generation 2). The account
+    // outbox is still empty, so #account(active:false) is the firehose tail
+    // and there is no pending batch left for the sequencer to order a late
+    // sync row against.
+    let sequencer = try makeSequencer()
+    let drainedBeforeRelease = try await sequencer.drainAll(
+      now: epoch.addingTimeInterval(1)
+    )
+    XCTAssertEqual(drainedBeforeRelease, 2)
+    await barrier.release()
+
+    do {
+      try await emission.value
+      XCTFail("a deactivated account published an activation sync")
+    } catch let error as AccountControlStoreError {
+      XCTAssertEqual(error, .invalidTransition)
+    }
+    let pending = try await account.pendingPublicFirehoseOutbox()
+    XCTAssertTrue(pending.isEmpty, "the raced activation sync must not become durable")
+    let drainedAfterRelease = try await sequencer.drainAll(
+      now: epoch.addingTimeInterval(2)
+    )
+    XCTAssertEqual(drainedAfterRelease, 0)
+    let events = try await firehose.events(after: 0, limit: 20)
+    XCTAssertEqual(
+      events.map(\.kind),
+      [.identity, .account, .account],
+      "no #sync may be sequenced after the #account(active:false) that supersedes it"
+    )
+    XCTAssertEqual(
+      events.last?.sourceKey,
+      PublicFirehoseSourceKey.account(
+        did: did, operationID: "deact-during-activation"
+      )
+    )
+  }
+
+  /// F37, reactivation half. `emitReactivationSync` reads the generation and
+  /// then performs unfenced account-database I/O before inserting the sync
+  /// row, so the same interleaving republishes an already-superseded head.
+  func testReactivationSyncLosesDeterministicRaceToDeactivation() async throws {
+    let sequencer = try makeSequencer()
+    try await emitter.emitActivation(
+      did: did, operationID: "req-1", plcOperationCID: "bafyplc1",
+      handle: "alice.example", materialTime: epoch, now: epoch
+    )
+    let drainedActivation = try await sequencer.drainAll(now: epoch)
+    XCTAssertEqual(drainedActivation, 2)
+
+    let barrier = LifecycleAuthorizationBarrier()
+    let racingEmitter = SQLitePublicLifecycleEmitter(
+      control: control,
+      accounts: FixedLifecycleAccountSource(
+        accounts: [PublicFirehoseAccountDatabase(did: did, database: account)]
+      ),
+      hooks: .init(beforeReactivationAuthorization: { await barrier.park() })
+    )
+    let accountDID = did
+    let eventTime = epoch
+    let emission = Task {
+      try await racingEmitter.emitReactivationSync(
+        did: accountDID, operationID: "react-raced", now: eventTime
+      )
+    }
+    await barrier.waitUntilParked()
+    _ = try await control.transitionStatus(
+      did: did,
+      to: .deactivated,
+      declaration: .init(),
+      emitting: .init(operationID: "deact-during-reactivation"),
+      now: epoch.addingTimeInterval(1)
+    )
+    let drainedDeactivation = try await sequencer.drainAll(
+      now: epoch.addingTimeInterval(1)
+    )
+    XCTAssertEqual(drainedDeactivation, 1)
+    await barrier.release()
+
+    do {
+      try await emission.value
+      XCTFail("a deactivated account published a reactivation sync")
+    } catch let error as AccountControlStoreError {
+      XCTAssertEqual(error, .invalidTransition)
+    }
+    let pending = try await account.pendingPublicFirehoseOutbox()
+    XCTAssertTrue(pending.isEmpty, "the raced reactivation sync must not become durable")
+    let drainedAfterRelease = try await sequencer.drainAll(
+      now: epoch.addingTimeInterval(2)
+    )
+    XCTAssertEqual(drainedAfterRelease, 0)
+    let events = try await firehose.events(after: 0, limit: 20)
+    XCTAssertEqual(
+      events.map(\.kind),
+      [.identity, .account, .sync, .account],
+      "no #sync may be sequenced after the #account(active:false) that supersedes it"
+    )
+    XCTAssertEqual(
+      events.last?.sourceKey,
+      PublicFirehoseSourceKey.account(
+        did: did, operationID: "deact-during-reactivation"
+      )
+    )
   }
 
   func testEmitRotationIdentityBumpsGenerationAndEmitsIdentityItemOnly() async throws {

@@ -359,9 +359,20 @@ public struct AccountOperatorService: Sendable {
             // batch (the second transition is same-status and emits nothing),
             // and a repeated #sync is a benign re-announcement of the same
             // head rather than a second state change.
-            try await lifecycleEmitter.emitReactivationSync(
-                did: did, operationID: operationID, now: now
-            )
+            do {
+                try await lifecycleEmitter.emitReactivationSync(
+                    did: did, operationID: operationID, now: now
+                )
+            } catch AccountControlStoreError.invalidTransition {
+                // The emitter's publication fence observed the account as no
+                // longer authorizing publication, so a further lifecycle
+                // transition linearized after the status write above had
+                // already committed. Announcing the head now would publish a
+                // #sync for a superseded generation; that transition's own
+                // #account batch is the correct announcement, and it is
+                // already durable. The reactivation itself committed, so it
+                // must not be reported to the operator as failed.
+            }
         }
         return view
     }
