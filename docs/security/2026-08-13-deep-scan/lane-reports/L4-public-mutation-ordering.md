@@ -292,12 +292,18 @@ PublicRepositoryMutationHTTPTests.swift:766: error: testAuthenticatedWriteSuccee
   XCTAssertEqual failed: ("503 Service Unavailable") is not equal to ("200 OK") - {"error":"temporarily_unavailable"}
 PublicRepositoryMutationHTTPTests.swift:698: error: testUnauthenticatedJSONMutationIsDeniedWithoutReservingAWriteLease :
   XCTAssertEqual failed: ("503 Service Unavailable") is not equal to ("401 Unauthorized") - {"error":"temporarily_unavailable"}
-PublicRepositoryMutationHTTPTests.swift:836: error: testUploadBlobRefusesAdoptionWhenAccountDeactivatesDuringStream :
+PublicRepositoryMutationHTTPTests.swift:881: error: testUploadBlobRefusesAdoptionWhenAccountDeactivatesDuringStream :
   XCTAssertEqual failed: ("200 OK") is not equal to ("404 Not Found")
-  - {"blob":{"$type":"blob","mimeType":"application/octet-stream","ref":{"$link":"bafkrei…"},"size":12}}
-PublicRepositoryMutationHTTPTests.swift:841: error: testUploadBlobRefusesAdoptionWhenAccountDeactivatesDuringStream :
+  - {"blob":{"$type":"blob","mimeType":"application/octet-stream","ref":{"$link":"bafkreigbbuwpq6myo4zjjpyfy43uc75glgoaiuzuidflvpg7asgmdxarii"},"size":12}}
+PublicRepositoryMutationHTTPTests.swift:886: error: testUploadBlobRefusesAdoptionWhenAccountDeactivatesDuringStream :
   XCTAssertEqual failed: ("nil") is not equal to ("Optional("RepoNotFound")")
 ```
+
+Three failed, one passed: `testInvalidAuthJSONMutationCompleteBodyPreservesKeepAliveForNextRequest`
+passes against the pre-fix code too, which is the point of it — see below. Note
+also the timing signature of the F26 reproduction: it takes **32.5 seconds**
+against the pre-fix code, because the authenticated write sits waiting on a pool
+the anonymous bodies own, and **0.086 seconds** after it.
 
 - `testAuthenticatedWriteSucceedsWhileUnauthenticatedSlowBodiesAreInFlight` is
   the one that matters: two real anonymous sockets hold unfinished 1 MiB bodies
@@ -325,7 +331,8 @@ PublicRepositoryMutationHTTPTests.swift:841: error: testUploadBlobRefusesAdoptio
 original name is kept as a thin wrapper so the two existing upload tests are
 untouched.
 
-**Post-fix, `PublicRepositoryMutationHTTPTests`:** exit 0, 24 passed, 0 failed.
+**Post-fix, `PublicRepositoryMutationHTTPTests`:** exit 0, 25 passed, 0 failed
+(`mutation-class-final.log`).
 
 ---
 
@@ -341,8 +348,21 @@ re-established from `/private/tmp/swan-lane-L4-public-mutation-ordering/`, which
 only this lane writes to. The F26/F43 code findings and the `:552` status change
 are code readings and never depended on a log.
 
+The same applies to the earlier Linux claim, with one correction that is mine
+rather than the shared directory's. That claim was **not** produced by the
+command in the lane brief — that command cannot run here, and this lane never
+reported a result from it. It came from a corrected invocation of my own, but it
+used a deps-preinstalled image another lane had built, and I did not check the
+container's architecture. It was `aarch64`. Both problems are fixed below: stock
+image, explicit `apt-get install`, named container, and an explicit
+`--platform linux/amd64` run for the deployed architecture.
+
+The pre-fix failures in §3 were also re-captured rather than quoted from the old
+log, by restoring `SwanPublicRepositoryMutationXRPC.swift` from `75e7b509` over
+the final test file and rebuilding.
+
 **macOS full suite** — exit 0, **1494 passed / 0 failed / 9 skipped / 11 targets**,
-reproduced on RUNS_PLACEHOLDER consecutive clean runs
+reproduced on three consecutive clean runs
 (`suite-run1.log`, `suite-run2.log`, `suite-run3.log`). Baseline was 1489 passed;
 this lane adds 5 tests and leaves nothing failing.
 
@@ -378,8 +398,8 @@ not claim it is benign.
 - Exact failure:
   `Sources/SwanOAuth/NIOPeerPinnedOAuthDocumentTransport.swift:141: error: -[SwanOAuthTests.NIOPeerPinnedOAuthPostTransportTests testDocumentTransportTimeoutCompletesAndClosesUnresponsivePeer] : failed: caught error: "I/O on closed channel"`
 - Observed **once**, in a full-suite run early in this lane's work. It did not
-  recur in RUNS_PLACEHOLDER consecutive clean full-suite runs, nor in a targeted
-  re-run of that test alone (exit 0). So: 1 failure in RUNS_TOTAL_PLACEHOLDER observations.
+  recur in three consecutive clean full-suite runs, nor in a targeted
+  re-run of that test alone (exit 0). So: 1 failure in 5 observations (4 full-suite runs, 1 targeted).
 - This lane modifies no OAuth code. Its three source-side files are
   `SwanHTTP/SwanPublicRepositoryMutationXRPC.swift`,
   `SwanHTTP/SwanJSONWriteBody.swift`, and two `SwanHTTPTests` files; nothing in
@@ -394,30 +414,51 @@ not claim it is benign.
   racing an in-flight write — and that is the behaviour the test exists to pin.
   Handing this to the file's owner rather than dismissing it.
 
-**Linux (`swift:6.1-jammy`, the image `Dockerfile:1` pins), logs in
-`linux-lib.log` / `linux-httptests.log` / `linux-buildtests.log`:**
+**Linux (`swift:6.1-jammy`, the image `Dockerfile:1` pins), log `linux.log`,
+run with the team lead's corrected invocation in a container named `swan-L4`:**
 
-- Production library: `swift build` → **exit LINUX_LIB_PLACEHOLDER**.
-- `swift build --target SwanHTTPTests` (the target that compiles every changed
-  file and its consumers) → **exit LINUX_HTTP_PLACEHOLDER**.
-- `swift build --build-tests` over the whole package → **exit
-  LINUX_ALL_PLACEHOLDER**, failing to compile
-  `Tests/SwanSQLiteTests/AccountPermanentDeletionSQLiteTests.swift:260`:
-  `error: 'async' call cannot occur in a defer body` (`defer { try? await database.close() }`).
-  Accepted by the local Swift 6.2 toolchain, rejected by the deployment image's
-  Swift 6.1. That file is byte-identical to `75e7b509` in this workspace — this
-  lane touches four files and none is in `SwanSQLiteTests` — so it is
-  pre-existing and unrelated. Worth flagging to the program: **the brief's Linux
-  command cannot currently return 0 for any lane**, so any lane reporting a
-  clean whole-package Linux build should be asked how.
+- Production library: `swift build` → **exit 0**.
+- `swift build --target SwanHTTPTests` — the target that compiles every file this
+  lane changed, plus its consumers → **exit 0**.
+- `swift build --build-tests` over the whole package → **exit 1**, and not in
+  this lane's code. See the two pre-existing whole-package failures below.
+
+**Architecture caveat, and it matters.** `uname -m` inside the default
+`swift:6.1-jammy` container on this Apple Silicon host is `aarch64`. The
+deployment target is Linux **x86_64**, so the run above validates arm64 Linux,
+not the deployed architecture — it catches platform-conditional code and
+Foundation/Glibc differences, which is most of what separates macOS from Linux,
+but not codegen or word-size differences specific to x86_64. An explicit
+`--platform linux/amd64` run was started for the deployed architecture
+(`uname -m` = `x86_64` confirmed in `linux-amd64.log`); under QEMU emulation it
+was still resolving dependencies when this report was written, and its result is
+**not claimed here**. What is claimed is the arm64 Linux result above. Lanes
+reporting "Linux green" from the brief's command are reporting arm64 unless they
+passed `--platform`.
+
+**Two pre-existing whole-package `--build-tests` failures**, neither in a file
+this lane touches, both reproducing on an unmodified tree:
+
+1. `Tests/SwanSQLiteTests/AccountPermanentDeletionSQLiteTests.swift:260`:
+   `error: 'async' call cannot occur in a defer body`
+   (`defer { try? await database.close() }`). Accepted by the local Swift 6.2
+   toolchain, rejected by the deployment image's Swift 6.1.
+2. A resource-copy failure for `Tests/SwanOAuthTests/Fixtures`
+   (`NSCocoaErrorDomain Code=512`, copying into the scratch path). Bind-mount
+   related, surfaced once the build got far enough to stage test resources.
+
+Both files are byte-identical to `75e7b509` in this workspace — this lane touches
+four files and none is in `SwanSQLiteTests` or `SwanOAuthTests`. Worth flagging
+to the program: **the brief's whole-package Linux command cannot return 0 for any
+lane**, so a lane reporting a clean whole-package Linux build should be asked how
+it got one.
 
 Mechanical notes for whoever repeats this — the Linux command distributed with
-the lane briefs cannot work as written, and four separate things had to be fixed:
+the lane briefs cannot work as written, and five separate things had to be fixed:
 
 1. `Package.swift:25` is `.package(path: "../Petrel")`, outside the bind mount.
-   The dependency has to be mounted too. Mounting the workspace at `/src` makes
-   `/src/../Petrel` resolve to `/Petrel`, so `-v ".../Petrel":/Petrel:ro` is the
-   minimal form.
+   The dependency has to be mounted too, at a path where `<workspace>/../Petrel`
+   resolves to it — `/workspace/Swan` + `/workspace/Petrel` is the clearest form.
 2. The stock `swift:6.1-jammy` image lacks `libsecret-1-dev`, `pkg-config`,
    `libsodium-dev` and `libglib2.0-dev`; without them the build dies in
    `Petrel/Sources/CLibSecretShim/shim.c:2`.
@@ -431,6 +472,8 @@ the lane briefs cannot work as written, and four separate things had to be fixed
    not part of this lane's diff. Use `--scratch-path` and never let a Linux
    container build into `.build` while a macOS `swift test` is running against
    the same directory.
+5. The default image is `aarch64` on Apple Silicon. `--platform linux/amd64` is
+   required to validate the deployed architecture.
 
 Containers were named (`--name swan-L4`) so no other lane's
 `docker kill $(docker ps -q --filter ancestor=swift:6.1-jammy)` can take them
