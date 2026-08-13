@@ -681,11 +681,27 @@ public enum SpaceCredentialClientAttestationFailure:
 /// separately verifiable attestation policy.
 public struct DurableSpaceCredentialAuthority: SpaceCredentialAuthoritySigner {
     public struct Configuration: Sendable, Equatable {
-        public static let standard = Configuration(uncheckedLifetime: PermissionedDataJWT.spaceCredentialLifetime)
+        /// The default lifetime Swan *issues*, deliberately far below the
+        /// proposal ceiling it *accepts*.
+        ///
+        /// A space credential carries no reader identity and is never
+        /// re-checked against membership after it is minted, so its lifetime is
+        /// the revocation window: a member removed from a space keeps reading
+        /// until the credential it already holds expires. Five minutes bounds
+        /// that window to something an operator can reason about while leaving
+        /// the exchange cheap enough to repeat.
+        ///
+        /// This changes only what this authority mints.
+        /// ``PermissionedDataJWT/spaceCredentialLifetime`` remains the two-hour
+        /// interop ceiling, so credentials minted by another proposal-0016
+        /// implementation are still accepted unchanged.
+        public static let defaultLifetime: TimeInterval = 5 * 60
+
+        public static let standard = Configuration(uncheckedLifetime: defaultLifetime)
 
         public let lifetime: TimeInterval
 
-        public init(lifetime: TimeInterval = PermissionedDataJWT.spaceCredentialLifetime) throws {
+        public init(lifetime: TimeInterval = defaultLifetime) throws {
             guard lifetime > 0,
                   lifetime <= PermissionedDataJWT.spaceCredentialLifetime,
                   lifetime.rounded(.towardZero) == lifetime else {
