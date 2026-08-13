@@ -878,39 +878,63 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    /// An upstream 3xx is useless without its `Location`. The forwarded set
-    /// stays otherwise closed, so nothing the proxy has not reasoned about
-    /// reaches the client.
-    func testUpstreamLocationIsForwardedAndOtherHeadersAreNot() async throws {
-        let sender = RecordingProxySender(
-            result: .success(
-                OAuthRemoteHTTPResponse(
-                    status: 302,
-                    headers: [
-                        "Location": ["https://cdn.bsky.app/img/feed_thumbnail/x.jpg"],
-                        "Set-Cookie": ["upstream-session=leak"],
-                        "Content-Type": ["text/plain"],
-                    ],
-                    body: Data(),
-                    responseURL: URL(string: "https://api.bsky.app/xrpc/app.bsky.feed.getTimeline")!
+    /// `Location` is not forwarded, matching the reference PDS
+    /// (`atproto/packages/pds/src/pipethrough.ts:527-531`, which forwards only
+    /// `atproto-repo-rev`, `atproto-content-labelers`, `retry-after` and
+    /// `content-*`). The status still reaches the client, so a caller can see
+    /// the 3xx; it just cannot be steered by it.
+    ///
+    /// The concrete risk is a *relative* `Location`: resolved against the
+    /// request URL it points back at `swan.place`, so a following client sends
+    /// its Swan credentials to a path a third-party upstream chose. The
+    /// absolute CDN redirect below is the benign case that is lost with it —
+    /// a same-host restriction would keep it, but has no principled boundary,
+    /// so the whole header goes.
+    ///
+    /// The rest of the forwarded set stays closed, so nothing the proxy has not
+    /// reasoned about reaches the client.
+    func testUpstreamLocationIsNotForwardedAndNeitherAreOtherHeaders() async throws {
+        let upstreamLocations = [
+            // The absolute CDN case the previous version of this test was
+            // written to preserve. It goes too.
+            "https://cdn.bsky.app/img/feed_thumbnail/x.jpg",
+            // The case that motivated the change: relative, so a client that
+            // resolves it against the request URL re-enters `swan.place` with
+            // Swan credentials at a path the upstream chose.
+            "/xrpc/com.atproto.server.createSession",
+        ]
+        for location in upstreamLocations {
+            let sender = RecordingProxySender(
+                result: .success(
+                    OAuthRemoteHTTPResponse(
+                        status: 302,
+                        headers: [
+                            "Location": [location],
+                            "Set-Cookie": ["upstream-session=leak"],
+                            "Content-Type": ["text/plain"],
+                        ],
+                        body: Data(),
+                        responseURL: URL(
+                            string: "https://api.bsky.app/xrpc/app.bsky.feed.getTimeline"
+                        )!
+                    )
                 )
             )
-        )
-        try await withPipethrough(sender: sender) { client in
-            try await client.execute(
-                uri: "/xrpc/app.bsky.feed.getTimeline",
-                method: .get
-            ) { response in
-                XCTAssertEqual(response.status, .found)
-                XCTAssertEqual(
-                    response.headers[.location],
-                    "https://cdn.bsky.app/img/feed_thumbnail/x.jpg"
-                )
-                XCTAssertEqual(response.headers[.contentType], "text/plain")
-                XCTAssertNil(response.headers[.setCookie])
+            try await withPipethrough(sender: sender) { client in
+                try await client.execute(
+                    uri: "/xrpc/app.bsky.feed.getTimeline",
+                    method: .get
+                ) { response in
+                    // The status is still relayed: the client can see that the
+                    // upstream redirected, it just cannot be steered by it.
+                    XCTAssertEqual(response.status, .found)
+                    XCTAssertNil(response.headers[.location], "location: \(location)")
+                    XCTAssertEqual(response.headers[.contentType], "text/plain")
+                    XCTAssertNil(response.headers[.setCookie])
+                }
             }
+            XCTAssertEqual(sender.recorded().count, 1)
         }
-        XCTAssertEqual(sender.recorded().count, 1)
     }
 
     // MARK: Proxyable-namespace allow-list
