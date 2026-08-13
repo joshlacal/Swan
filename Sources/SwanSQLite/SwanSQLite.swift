@@ -994,7 +994,11 @@ public enum SQLiteLayout {
             author_did TEXT NOT NULL,
             base_revision INTEGER NOT NULL CHECK(base_revision >= 0),
             final_revision INTEGER NOT NULL CHECK(final_revision >= base_revision),
-            event_id TEXT NOT NULL UNIQUE
+            event_id TEXT NOT NULL UNIQUE,
+            -- Receipts are retained to the same depth as the oplog. Rows
+            -- written before this column existed carry the zero default and
+            -- are therefore evicted before any stamped row.
+            created_at INTEGER NOT NULL DEFAULT 0 CHECK(created_at >= 0)
         )
         """,
         """
@@ -1682,6 +1686,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let publicFirehoseOutboxMigrationVersion = 13
     private static let publicFirehoseCompletionAnchorMigrationVersion = 14
     private static let stagedBlobNamespaceMigrationVersion = 15
+    private static let permissionedRequestReceiptRetentionMigrationVersion = 16
 
     /// How long an uploaded blob no commit has claimed stays staged.
     ///
@@ -2072,6 +2077,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migratePermissionedRemoteReplicaLogicalLimitIfNeeded()
             try await migratePublicFirehoseOutboxIfNeeded()
             try await migratePublicFirehoseCompletionAnchorsIfNeeded()
+            try await migratePermissionedRequestReceiptRetentionIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -2546,6 +2552,37 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             table: "public_event_outbox",
             column: "completed",
             definition: "INTEGER NOT NULL DEFAULT 0 CHECK(completed IN (0, 1))"
+        )
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
+    /// Gives the durable request-receipt ledger the enqueue stamp its depth
+    /// retention orders by. Existing receipts take the zero default rather than
+    /// a synthetic timestamp: their real enqueue time was never recorded, and
+    /// claiming one would let a pre-upgrade row outrank a stamped row. Zero
+    /// sorts oldest, so the first prune after the upgrade evicts them first.
+    /// The rows themselves are preserved; nothing is rewritten or dropped.
+    private func migratePermissionedRequestReceiptRetentionIfNeeded() async throws {
+        let version = Self.permissionedRequestReceiptRetentionMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        try await addAccountColumnIfMissing(
+            table: "permissioned_space_requests",
+            column: "created_at",
+            definition: "INTEGER NOT NULL DEFAULT 0 CHECK(created_at >= 0)"
         )
         _ = try await connection.query(
             """
@@ -3794,21 +3831,22 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 ]
             )
 
+            let createdAt = Int(Date().timeIntervalSince1970 * 1_000_000)
             _ = try await connection.query(
                 """
                 INSERT INTO permissioned_space_requests(
                     request_id, space_uri, author_did,
-                    base_revision, final_revision, event_id
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    base_revision, final_revision, event_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     .text(requestID.uuidString), .text(space.rawValue),
                     .text(author), .integer(try sqliteRevision(expectedRevision)),
                     .integer(storedFinalRevision), .text(eventID.uuidString),
+                    .integer(createdAt),
                 ]
             )
 
-            let createdAt = Int(Date().timeIntervalSince1970 * 1_000_000)
             let notificationPayload = opaqueNotificationPayload(eventID: eventID)
             _ = try await connection.query(
                 """
@@ -3854,6 +3892,51 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     [
                         .text(space.rawValue), .text(author),
                         .integer(try sqliteRevision(oldestRetainedRevision)),
+                    ]
+                )
+            }
+
+            // The receipt ledger is a replay reservation, not the state guard:
+            // the revision CAS above is what refuses a stale write, so a
+            // request older than this window is answered as a conflict instead
+            // of a duplicate. Retain it to the same depth as the oplog rather
+            // than by age, so one retention knob governs both and neither
+            // outlives the other. `created_at` orders the window; the final
+            // revision breaks ties and orders unstamped pre-upgrade rows.
+            let receiptCutoffRows = try await connection.query(
+                """
+                SELECT created_at, final_revision
+                FROM permissioned_space_requests
+                WHERE space_uri = ? AND author_did = ?
+                ORDER BY created_at DESC, final_revision DESC
+                LIMIT 1 OFFSET ?
+                """,
+                [
+                    .text(space.rawValue), .text(author),
+                    .integer(oplogRetention - 1),
+                ]
+            )
+            if let receiptCutoffRow = receiptCutoffRows.first {
+                let oldestRetainedStamp = try requiredNonnegativeInteger(
+                    receiptCutoffRow,
+                    "created_at"
+                )
+                let oldestRetainedReceipt = try requiredRevision(
+                    receiptCutoffRow,
+                    "final_revision"
+                )
+                _ = try await connection.query(
+                    """
+                    DELETE FROM permissioned_space_requests
+                    WHERE space_uri = ? AND author_did = ?
+                      AND (created_at < ?
+                           OR (created_at = ? AND final_revision < ?))
+                    """,
+                    [
+                        .text(space.rawValue), .text(author),
+                        .integer(oldestRetainedStamp),
+                        .integer(oldestRetainedStamp),
+                        .integer(try sqliteRevision(oldestRetainedReceipt)),
                     ]
                 )
             }
@@ -7119,6 +7202,36 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let timestamp = try simpleSpaceTimestamp(now)
         try await withConnectionGate {
             try await transaction {
+                // The deletion service JWT names no space: it carries only
+                // `iss`, `aud`, `lxm`, `jti` and time claims, and the verifier
+                // keeps no replay cache by design. The route can therefore
+                // only require that the body space's authority equals the
+                // issuer, so one valid token would otherwise mint a permanent
+                // tombstone — and a permanent receipt, since receipt identity
+                // includes `space_uri` — for every SpaceURI under that
+                // authority. The pinned receiver bounds this by no-oping
+                // unless the recipient already knows the space
+                // (`packages/pds/src/api/com/atproto/space/notifySpaceDeleted.ts:33-34`).
+                // Participation here is the same pair of facts the hosted
+                // space projection reports: an authority row this account
+                // owns, or a local repository row it authored.
+                let participation = try await connection.query(
+                    """
+                    SELECT 1
+                    FROM permissioned_repository_state
+                    WHERE space_uri = ? AND author_did = ?
+                    UNION ALL
+                    SELECT 1
+                    FROM permissioned_simple_space_authorities
+                    WHERE space_uri = ? AND owner_did = ?
+                    LIMIT 1
+                    """,
+                    [
+                        .text(space.rawValue), .text(accountDID),
+                        .text(space.rawValue), .text(accountDID),
+                    ]
+                )
+                guard !participation.isEmpty else { return }
                 let tombstones = try await connection.query(
                     """
                     SELECT 1

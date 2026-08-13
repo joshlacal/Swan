@@ -198,6 +198,79 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// A `notifySpaceDeleted` service JWT carries `iss`, `aud`, `lxm`, `jti`
+    /// and time claims only — no space. The route can therefore only check
+    /// that the body space's authority equals the issuer
+    /// (`SwanSpaceNotificationXRPC.swift:209`), so one valid token authorizes a
+    /// deletion for *any* space under that authority. Adding a space claim is a
+    /// wire change the pinned reference PDS does not emit and is deliberately
+    /// not made here; this pins the residual so the durable participation
+    /// precondition stays the control that bounds it.
+    func testDeletionTokenIsNotBoundToTheBodySpace() async throws {
+        let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
+        defer { fixture.cleanup() }
+        do {
+            let bindings = try SwanSpaceNotificationRecipientBindings(
+                bindings: [NotificationServiceVerifier.boundRecipientIdentity: writer]
+            )
+            let app = try fixture.server(recipientBindings: bindings)
+                .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.deletionBinding"))
+            let sibling = try SpaceURI(
+                authority: authority,
+                spaceType: "app.bsky.bookmarks",
+                skey: "http-sibling"
+            )
+            let headers: HTTPFields = {
+                var fields: HTTPFields = [.contentType: "application/json"]
+                fields[.authorization] = "Bearer authority-bound-recipient-token"
+                return fields
+            }()
+
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.notifySpaceDeleted",
+                    method: .post,
+                    headers: headers,
+                    body: ByteBuffer(string: "{\"space\":\"\(sibling.rawValue)\"}")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                // A space under a different authority is refused by the route.
+                let foreign = try SpaceURI(
+                    authority: writer,
+                    spaceType: "app.bsky.bookmarks",
+                    skey: "foreign"
+                )
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.notifySpaceDeleted",
+                    method: .post,
+                    headers: headers,
+                    body: ByteBuffer(string: "{\"space\":\"\(foreign.rawValue)\"}")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "Unauthorized")
+                }
+            }
+
+            let deletions = await fixture.directory.deletions()
+            XCTAssertEqual(
+                deletions,
+                [
+                    .init(
+                        space: sibling,
+                        issuer: authority,
+                        audience: writer,
+                        eventID: "service-event-5"
+                    ),
+                ]
+            )
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     func testNotificationRecoveryServiceDrainsCommittedWriterAndAuthorityQueues() async throws {
         let fixture = try NotificationRecoveryFixture()
         let database = try await fixture.open()
@@ -312,7 +385,8 @@ private struct NotificationHTTPFixture {
 
     func server(
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
-        decodeObserver: (@Sendable () async -> Void)? = nil
+        decodeObserver: (@Sendable () async -> Void)? = nil,
+        recipientBindings: SwanSpaceNotificationRecipientBindings = .empty
     ) throws -> SwanHTTPServer {
         let credentialKeys = try PinnedSpaceCredentialPublicKeyResolver(pins: [
             try .init(authority: authority, generation: 1, publicKey: key.publicKey),
@@ -331,10 +405,12 @@ private struct NotificationHTTPFixture {
             spaceNotificationConfiguration: decodeObserver.map {
                 SwanSpaceNotificationHTTPConfiguration(
                     serviceAuthentication: NotificationServiceVerifier(authority: authority, writer: writer),
+                    recipientBindings: recipientBindings,
                     notificationJSONDecodeObserver: $0
                 )
             } ?? .init(
-                serviceAuthentication: NotificationServiceVerifier(authority: authority, writer: writer)
+                serviceAuthentication: NotificationServiceVerifier(authority: authority, writer: writer),
+                recipientBindings: recipientBindings
             ),
             jsonWriteAdmission: jsonWriteAdmission
         )
@@ -602,6 +678,7 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
     private let writer: String
     private var registrationsValue: [AuthorizedSpaceNotificationRegistration] = []
     private var notificationsValue: [AuthorizedSpaceWriteNotification] = []
+    private var deletionsValue: [RecordedSpaceDeletion] = []
 
     init(authority: String, writer: String) {
         self.authority = authority
@@ -645,14 +722,28 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
     }
 
     func receiveSpaceDeletionNotification(
-        space _: SpaceURI,
-        issuer _: String,
-        audience _: String,
-        eventID _: String
-    ) async throws {}
+        space: SpaceURI,
+        issuer: String,
+        audience: String,
+        eventID: String
+    ) async throws {
+        deletionsValue.append(
+            .init(space: space, issuer: issuer, audience: audience, eventID: eventID)
+        )
+    }
 
     func registrations() -> [AuthorizedSpaceNotificationRegistration] { registrationsValue }
     func notifications() -> [AuthorizedSpaceWriteNotification] { notificationsValue }
+    func deletions() -> [RecordedSpaceDeletion] { deletionsValue }
+}
+
+/// The deletion arguments the route hands to the durable receiver. The route
+/// is the only place a space can still be substituted, so record it exactly.
+struct RecordedSpaceDeletion: Sendable, Equatable {
+    let space: SpaceURI
+    let issuer: String
+    let audience: String
+    let eventID: String
 }
 
 private struct NotificationNoSigningKeyResolver: SpaceCredentialSigningKeyResolver {
@@ -660,6 +751,11 @@ private struct NotificationNoSigningKeyResolver: SpaceCredentialSigningKeyResolv
 }
 
 private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
+    /// The pinned reference PDS registers a raw endpoint as the recipient
+    /// service identity, so the binding key is not a DID.
+    static let boundRecipientIdentity =
+        "https://receiver.example/xrpc/com.atproto.space.notifySpaceDeleted"
+
     let authority: String
     let writer: String
 
@@ -703,6 +799,14 @@ private struct NotificationServiceVerifier: SpaceServiceAuthenticationVerifier {
                 audience: "did:plc:unknownabcdefghijklmnopqr",
                 method: expectedMethod,
                 eventID: "service-event-4",
+                expiresAt: Date(timeIntervalSinceNow: 60)
+            )
+        case ("authority-bound-recipient-token", "com.atproto.space.notifySpaceDeleted"):
+            return .init(
+                issuer: authority,
+                audience: NotificationServiceVerifier.boundRecipientIdentity,
+                method: expectedMethod,
+                eventID: "service-event-5",
                 expiresAt: Date(timeIntervalSinceNow: 60)
             )
         default:
