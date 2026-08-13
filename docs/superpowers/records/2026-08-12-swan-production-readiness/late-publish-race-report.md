@@ -255,6 +255,19 @@ Note for anyone repeating this: the pass-count grep must include the closing
 quote — `Test Case '-\[.*\]' passed`. Dropping it matches nothing and reports 0
 passes on a green run. I hit this and briefly recorded 0 passes on a green suite.
 
+Counted again with a second, independently-shaped pattern to be sure the figure
+is not an artefact of one regex. Both agree on both logs:
+
+| pattern | suite2 | suite3 |
+|---|---|---|
+| `grep -c "Test Case '-\[.*\]' passed"` | 1490 | 1490 |
+| `grep -cE "^Test Case .* passed"` | 1490 | 1490 |
+| `grep -c "Test Case '-\[.*\] passed"` (missing quote) | 0 | 0 |
+
+The third row is the broken recipe, shown to demonstrate it was not the one used
+here. Exit code and the `Some test targets reported failures` grep remain the
+primary signals precisely because a bad pattern fails silently at zero.
+
 ### One unrelated hang, under load
 
 An earlier attempt at the full suite **hung for 29 minutes** in
