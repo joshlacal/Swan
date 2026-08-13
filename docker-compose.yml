@@ -14,13 +14,41 @@ services:
     environment:
       EXTERNAL_SECRETS_DIR: /external-secrets
       SWAN_RUNTIME_SECRETS_DIR: /prepared/swan-runtime
+      # The management operator secret is prepared into a volume of its own.
+      # Nothing in this base topology mounts it: it is mounted only by the
+      # dedicated Phase 5 override, the one topology that passes
+      # `--management-port`.
+      SWAN_OPERATOR_SECRETS_DIR: /prepared/swan-operator
       SWAN_BOOTSTRAP_SECRETS_DIR: /prepared/swan-bootstrap
       REFERENCE_PDS_SECRETS_DIR: /prepared/reference-pds
     volumes:
       - ${SWAN_INTEROP_SECRETS_DIR:?set the owner-only lab interop secret directory path}:/external-secrets:ro
       - swan-runtime-secrets:/prepared/swan-runtime
+      - swan-operator-secrets:/prepared/swan-operator
       - swan-bootstrap-secrets:/prepared/swan-bootstrap
       - reference-pds-secrets:/prepared/reference-pds
+    network_mode: "none"
+    restart: "no"
+
+  # The laboratory notification configuration is no longer baked into the
+  # runtime image. It lives in the `interop-notification-config` Dockerfile
+  # stage, and this network-isolated root copier is its only consumer: it
+  # publishes the file into a named volume that the Swan runtime mounts
+  # read-only. A host bind for that path is deliberately not used — the runtime
+  # must not be able to reach an operator-writable file, and the interop
+  # verifier rejects a bind for it.
+  swan-notification-config-init:
+    build:
+      context: ..
+      dockerfile: Swan/Dockerfile
+      target: interop-notification-config
+    user: root
+    entrypoint: ["/bin/sh", "-ec"]
+    # The entrypoint is `sh -ec`; keep the complete script in one argument so
+    # Compose does not split `install` flags into `$0`/`$1` shell parameters.
+    command: ["install -o swan -g swan -m 0444 /usr/local/share/swan/interop/notification-config.json /prepared/notification-config/notification-config.json"]
+    volumes:
+      - swan-notification-config:/prepared/notification-config
     network_mode: "none"
     restart: "no"
 
@@ -101,6 +129,8 @@ services:
       - "172.30.0.2"
       # This checked-in file contains only disposable lab routing and public
       # verification configuration. Secrets remain in the prepared volumes.
+      # It arrives through the read-only `swan-notification-config` volume that
+      # `swan-notification-config-init` populates, not from the runtime image.
       - --notification-config
       - /etc/swan/interop/notification-config.json
       - --enable-notification-delivery
@@ -118,11 +148,14 @@ services:
     volumes:
       - swan-data:/var/lib/swan
       - swan-runtime-secrets:/run/secrets/swan-runtime:ro
+      - swan-notification-config:/etc/swan/interop:ro
     networks:
       swan:
         ipv4_address: 172.30.0.5
     depends_on:
       swan-bootstrap:
+        condition: service_completed_successfully
+      swan-notification-config-init:
         condition: service_completed_successfully
       mailpit:
         condition: service_healthy
@@ -298,6 +331,10 @@ services:
 volumes:
   swan-data:
   swan-runtime-secrets:
+  # Prepared here, mounted only by the dedicated Phase 5 override — the one
+  # topology that enables the management listener.
+  swan-operator-secrets:
+  swan-notification-config:
   swan-bootstrap-secrets:
   reference-pds-data:
   reference-pds-secrets:

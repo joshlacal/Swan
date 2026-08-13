@@ -249,9 +249,25 @@ network-isolated `swan-secrets-init` service therefore copies the validated
 external files into named volumes with container ownership and mode `0400`.
 This root service runs only the dedicated copy wrapper; it never invokes the
 Swan executable. `swan-bootstrap` receives the bootstrap-only copy, while the
-long-running `swan` service receives only `oauth-server-key` and `account-kek`.
-The reference PDS loads its prepared files internally through an unprivileged
-wrapper, so secret values never appear in the Compose model.
+long-running `swan` service receives exactly three files —
+`oauth-server-key`, `account-kek`, and `email-proof-key` — from the
+`swan-runtime-secrets` volume. `operator-secret` is prepared into a **separate**
+`swan-operator-secrets` volume that this base topology never mounts; only the
+reference-relay overlay, the one topology that passes `--management-port`,
+mounts it, at `/run/secrets/swan-operator`. The reference PDS loads its prepared
+files internally through an unprivileged wrapper, so secret values never appear
+in the Compose model.
+
+> **Upgrading an existing lab:** `operator-secret` used to be copied into
+> `swan-runtime-secrets`. Docker never re-initialises a named volume that
+> already has content, so an operator who merely restarts keeps the stale copy
+> and the runtime keeps reading it. Destroy the volumes first:
+>
+> ```sh
+> ./interop/compose.sh down -v
+> ```
+>
+> `down` without `-v` is not sufficient.
 
 Startup is ordered as follows:
 
@@ -284,9 +300,14 @@ The same one-shot path runs the sanitized six-fault endpoint matrix.
 `Scripts/test-verify-interop-lab.sh` pressure-tests the verifier with unsafe
 privilege, dependency, interpolation, mount, runner, and readiness mutations.
 Normal Compose also loads the checked-in
-`interop/notification-config.json` from the pinned Swan image. Keeping it in
-the image avoids non-portable host file binds while preserving a read-only
-runtime path. The Swan container root filesystem is read-only; only its bounded
+`interop/notification-config.json`, but **not** from the runtime image: it is
+carried by the lab-only `interop-notification-config` Dockerfile stage, and the
+network-isolated `swan-notification-config-init` service publishes it into the
+`swan-notification-config` named volume, which `swan` mounts read-only at
+`/etc/swan/interop`. A named volume rather than a host bind keeps the path
+portable and operator-unwritable, and keeps a laboratory PLC configuration out
+of every runtime image.
+The Swan container root filesystem is read-only; only its bounded
 `/tmp` tmpfs and named data volume are writable. Normal Compose explicitly
 enables durable notification delivery, so startup installs the outbox recovery
 service instead of merely loading receiver verification material.

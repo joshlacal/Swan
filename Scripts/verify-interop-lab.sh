@@ -230,6 +230,309 @@ require_exact_line() {
   fi
 }
 
+# Prepared-secret custody, asserted from contents rather than from spelling.
+#
+# The previous version of this check was three `reject_contains` calls over the
+# `swan` service block: no `operator-secret`, no `swan-bootstrap-secrets`, no
+# `.password`. It passed for a year while the preparation script copied
+# `operator-secret` straight into `$runtime_directory` — the very volume the
+# `swan` service mounts — because the compose YAML never spells the filename;
+# it spells the volume. A text search over YAML cannot see what is inside a
+# volume, so it was reading the label on the box.
+#
+# This runs `interop/prepare-interop-secrets.sh` for real, with an `install`
+# stub that reproduces its file/directory creation without the ownership
+# changes that need root, and then asserts over the resulting trees:
+#
+#   1. every `--*-file` path in a Swan `command:` resolves to a file the
+#      preparation script actually writes into a directory that service mounts;
+#   2. the long-running public runtime reaches exactly the three runtime
+#      secrets, and no operator secret or account password;
+#   3. the operator secret is reachable only by the bootstrap job and by the
+#      one overlay that passes `--management-port`.
+#
+# The inventory of external secret names is derived from the script's own
+# `copy_secret` call sites; the *routing* — which prepared directory each name
+# lands in — is decided by executing the script, which is the part that was
+# wrong.
+verify_prepared_secret_custody() {
+  local scratch
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/swan-prepared-secret-custody.XXXXXX")"
+
+  mkdir -p "$scratch/bin"
+  cat > "$scratch/bin/install" <<'INSTALL_STUB'
+#!/usr/bin/env sh
+set -eu
+directory=0
+mode=""
+operands=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d) directory=1; shift ;;
+    -o|-g) shift 2 ;;
+    -m) mode="$2"; shift 2 ;;
+    --) shift; break ;;
+    *) operands="$operands $1"; shift ;;
+  esac
+done
+# shellcheck disable=SC2086 # Deliberate re-split of collected operands.
+set -- $operands "$@"
+if [ "$directory" -eq 1 ]; then
+  mkdir -p "$1"
+  chmod "${mode:-755}" "$1"
+else
+  cp "$1" "$2"
+  chmod "${mode:-644}" "$2"
+fi
+INSTALL_STUB
+  chmod +x "$scratch/bin/install"
+
+  if ! python3 - "interop/prepare-interop-secrets.sh" "$scratch/external" <<'PY'
+import pathlib
+import re
+import sys
+
+script_path, external_path = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+text = script_path.read_text(encoding="utf-8")
+
+names = set(re.findall(r'copy_secret\s+"([A-Za-z0-9._-]+)"', text))
+collecting = False
+for line in text.splitlines():
+    stripped = line.strip()
+    if stripped.startswith("for name in"):
+        stripped = stripped[len("for name in"):]
+        collecting = True
+    elif not collecting:
+        continue
+    for token in stripped.replace(";", " ").replace("\\", " ").split():
+        if token == "do":
+            collecting = False
+            continue
+        if token.startswith(("$", "#")):
+            continue
+        names.add(token)
+
+if not names:
+    raise SystemExit("no external secret names could be derived from the preparation script")
+
+external_path.mkdir(parents=True, exist_ok=True)
+external_path.chmod(0o700)
+for name in sorted(names):
+    target = external_path / name
+    target.write_text(f"{name}-verifier-placeholder\n", encoding="utf-8")
+    target.chmod(0o400)
+PY
+  then
+    rm -rf "$scratch"
+    echo "prepared-secret inventory could not be derived" >&2
+    exit 1
+  fi
+
+  # Diagnostics are held back until the run fails. The script's permission
+  # guard uses GNU `find -perm /077`; BSD `find` rejects that mode string, so a
+  # macOS verifier run prints one harmless error per copied secret and the
+  # guard simply does not fire. The routing this check is about is unaffected,
+  # and the real container run is Linux.
+  if ! (
+    PATH="$scratch/bin:$PATH" \
+      EXTERNAL_SECRETS_DIR="$scratch/external" \
+      SWAN_RUNTIME_SECRETS_DIR="$scratch/prepared/swan-runtime" \
+      SWAN_OPERATOR_SECRETS_DIR="$scratch/prepared/swan-operator" \
+      SWAN_BOOTSTRAP_SECRETS_DIR="$scratch/prepared/swan-bootstrap" \
+      REFERENCE_PDS_SECRETS_DIR="$scratch/prepared/reference-pds" \
+      sh interop/prepare-interop-secrets.sh \
+      >/dev/null 2>"$scratch/prepare.stderr"
+  ); then
+    cat "$scratch/prepare.stderr" >&2 || true
+    rm -rf "$scratch"
+    echo "the interop secret preparation script did not run to completion" >&2
+    exit 1
+  fi
+
+  if ! python3 - "$scratch/prepared" "$compose_file" "$relay_compose_file" <<'PY'
+import pathlib
+import sys
+
+prepared_root, compose_path, relay_path = map(pathlib.Path, sys.argv[1:4])
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+def parse_services(path):
+    """Enough of Compose's block style for this laboratory: per service, the
+    `environment` map and the `volumes` / `command` sequences. Deliberately not
+    a general YAML parser and deliberately not PyYAML — the verifier's only
+    Python dependency is the standard library."""
+    services = {}
+    service = None
+    key = None
+    in_services = False
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        if not raw.strip() or raw.strip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        stripped = raw.strip()
+        if indent == 0:
+            in_services = stripped == "services:"
+            service = key = None
+            continue
+        if not in_services:
+            continue
+        if indent == 2 and stripped.endswith(":"):
+            service = stripped[:-1]
+            services.setdefault(service, {"environment": {}, "volumes": [], "command": []})
+            key = None
+            continue
+        if service is None:
+            continue
+        if indent == 4:
+            if stripped.endswith(":"):
+                key = stripped[:-1]
+            else:
+                key = None
+            continue
+        if key in ("volumes", "command") and stripped.startswith("- "):
+            value = stripped[2:].strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            services[service][key].append(value)
+        elif key == "environment" and ":" in stripped and not stripped.startswith("- "):
+            name, _, value = stripped.partition(":")
+            services[service]["environment"][name.strip()] = value.strip()
+    return services
+
+
+def split_mount(entry):
+    mode = None
+    for suffix in (":ro", ":rw"):
+        if entry.endswith(suffix):
+            mode, entry = suffix[1:], entry[: -len(suffix)]
+            break
+    if ":" not in entry:
+        return None, None, mode
+    source, _, target = entry.rpartition(":")
+    return source, target, mode
+
+
+base = parse_services(compose_path)
+overlay = parse_services(relay_path)
+
+for required in ("swan-secrets-init", "swan", "swan-bootstrap"):
+    if required not in base:
+        fail(f"prepared-secret custody: {required} is missing from the base laboratory")
+
+# Which prepared directory the executed script filled, per preparation env var.
+executed = {
+    "SWAN_RUNTIME_SECRETS_DIR": prepared_root / "swan-runtime",
+    "SWAN_OPERATOR_SECRETS_DIR": prepared_root / "swan-operator",
+    "SWAN_BOOTSTRAP_SECRETS_DIR": prepared_root / "swan-bootstrap",
+    "REFERENCE_PDS_SECRETS_DIR": prepared_root / "reference-pds",
+}
+contents = {}
+for variable, directory in executed.items():
+    if not directory.is_dir():
+        fail(
+            "prepared-secret custody: the preparation script wrote no directory "
+            f"for {variable}"
+        )
+    contents[variable] = {entry.name for entry in directory.iterdir() if entry.is_file()}
+
+# Bind each prepared directory to the named volume the initializer publishes it
+# through, using the container path the initializer is configured with.
+initializer = base["swan-secrets-init"]
+volume_contents = {}
+for variable, files in contents.items():
+    container_path = initializer["environment"].get(variable)
+    if not container_path:
+        fail(f"prepared-secret custody: swan-secrets-init does not set {variable}")
+    matches = [
+        source
+        for source, target, _ in map(split_mount, initializer["volumes"])
+        if target == container_path
+    ]
+    if len(matches) != 1:
+        fail(
+            "prepared-secret custody: swan-secrets-init publishes no single volume "
+            f"at {container_path} ({variable})"
+        )
+    volume_contents[matches[0]] = files
+
+if not volume_contents:
+    fail("prepared-secret custody: no prepared volume could be bound to its contents")
+
+
+def reachable(*services):
+    """Every prepared secret file a service can open, keyed by container path."""
+    files = {}
+    for service in services:
+        for entry in service.get("volumes", []):
+            source, target, _ = split_mount(entry)
+            for name in volume_contents.get(source, set()):
+                files[f"{target}/{name}"] = name
+    return files
+
+
+runtime = reachable(base["swan"])
+if set(runtime.values()) != {"oauth-server-key", "account-kek", "email-proof-key"}:
+    fail(
+        "prepared-secret custody: the long-running Swan runtime reaches "
+        f"{sorted(set(runtime.values()))}, not exactly the three runtime secrets"
+    )
+
+relay_runtime = reachable(base["swan"], overlay.get("swan", {}))
+for label, files in (("swan", runtime), ("reference-relay swan", relay_runtime)):
+    passwords = sorted(name for name in files.values() if name.endswith(".password"))
+    if passwords:
+        fail(f"prepared-secret custody: {label} reaches account passwords {passwords}")
+
+if "operator-secret" in runtime.values():
+    fail(
+        "prepared-secret custody: the base laboratory runtime reaches the "
+        "operator secret; it must be prepared into a volume only the "
+        "management topology mounts"
+    )
+if "operator-secret" not in relay_runtime.values():
+    fail(
+        "prepared-secret custody: the reference-relay runtime enables the "
+        "management listener but cannot reach the operator secret"
+    )
+if "operator-secret" not in reachable(base["swan-bootstrap"]).values():
+    fail("prepared-secret custody: bootstrap cannot reach the operator secret")
+
+# Every file-backed CLI flag must name a file that actually gets written. This
+# is the assertion the old text search could not make: a `--*-file` path under
+# a mounted secret directory that the preparation script never fills is a
+# startup failure the YAML looks perfectly fine about.
+for label, service, mounts in (
+    ("swan", base["swan"], runtime),
+    ("reference-relay swan", overlay.get("swan", {}), relay_runtime),
+):
+    command = service.get("command", [])
+    secret_roots = {path.rsplit("/", 1)[0] for path in mounts}
+    for index, argument in enumerate(command):
+        if not argument.startswith("--") or not argument.endswith("-file"):
+            continue
+        if index + 1 >= len(command):
+            fail(f"prepared-secret custody: {label} passes {argument} with no path")
+        path = command[index + 1]
+        root = path.rsplit("/", 1)[0]
+        if root not in secret_roots:
+            continue
+        if path not in mounts:
+            fail(
+                f"prepared-secret custody: {label} passes {argument} {path}, which "
+                "the preparation script never writes into a mounted volume"
+            )
+PY
+  then
+    rm -rf "$scratch"
+    exit 1
+  fi
+  rm -rf "$scratch"
+}
+
 # The normal laboratory deliberately remains relay-free. Phase 5's crawler
 # and feature flag live only in the dedicated second Compose file.
 if rg -n 'reference-relay|SWAN_PUBLIC_CRAWLERS|--enable-public-firehose|relay\.test' "$compose_file"; then
@@ -457,6 +760,7 @@ done
 
 for service in \
   swan-secrets-init \
+  swan-notification-config-init \
   swan-data-init \
   swan-bootstrap \
   swan \
@@ -506,6 +810,8 @@ require_contains "$secrets_init_block" 'user: root' "secret preparation must run
 require_contains "$secrets_init_block" 'entrypoint: ["/usr/local/bin/swan-interop-prepare-secrets"]' "secret preparation wrapper is missing"
 require_contains "$secrets_init_block" ':/external-secrets:ro' "external secrets must be mounted read-only"
 require_contains "$secrets_init_block" 'swan-runtime-secrets:/prepared/swan-runtime' "runtime secret output is missing"
+require_contains "$secrets_init_block" 'swan-operator-secrets:/prepared/swan-operator' "operator secret output is missing"
+require_contains "$secrets_init_block" 'SWAN_OPERATOR_SECRETS_DIR: /prepared/swan-operator' "operator secret output directory is not configured"
 require_contains "$secrets_init_block" 'swan-bootstrap-secrets:/prepared/swan-bootstrap' "bootstrap secret output is missing"
 require_contains "$secrets_init_block" 'reference-pds-secrets:/prepared/reference-pds' "PDS secret output is missing"
 require_contains "$secrets_init_block" 'network_mode: "none"' "secret preparation must be network-isolated"
@@ -529,7 +835,7 @@ reject_contains "$bootstrap_block" 'privileged:' "bootstrap must not be privileg
 reject_contains "$bootstrap_block" '${SWAN_INTEROP_SECRETS_DIR' "bootstrap must not mount host secrets directly"
 
 # The long-running runtime is explicitly unprivileged and receives only the
-# two-file runtime volume, never bootstrap passwords/operator material.
+# runtime secret volume, never bootstrap passwords/operator material.
 require_contains "$swan_block" 'user: swan' "Swan runtime must explicitly run as swan"
 require_contains "$swan_block" 'read_only: true' "Swan runtime root filesystem must be read-only"
 require_contains "$swan_block" '/tmp:size=16m,mode=1777' "Swan runtime must have only a bounded writable temporary filesystem"
@@ -539,8 +845,9 @@ reject_contains "$swan_block" 'cap_add:' "Swan runtime must not add capabilities
 reject_contains "$swan_block" '/var/run/docker.sock' "Swan runtime must not mount the Docker socket"
 require_contains "$swan_block" 'swan-runtime-secrets:/run/secrets/swan-runtime:ro' "runtime secrets must use the read-only prepared volume"
 reject_contains "$swan_block" 'swan-bootstrap-secrets' "runtime must not receive bootstrap-only secrets"
-reject_contains "$swan_block" 'operator-secret' "runtime must not receive the operator secret"
-reject_contains "$swan_block" '.password' "runtime must not receive account passwords"
+# Custody is asserted from the files the preparation script actually writes,
+# not from the spelling of this YAML — see verify_prepared_secret_custody.
+verify_prepared_secret_custody
 # shellcheck disable=SC2016 # Reject the literal interpolation prefix.
 reject_contains "$swan_block" '${SWAN_INTEROP_SECRETS_DIR' "runtime must not mount host secrets directly"
 require_contains "$swan_block" '--oauth-server-key-file' "file-backed OAuth server key flag is missing"
@@ -558,6 +865,19 @@ require_contains "$swan_block" '/run/secrets/swan-runtime/email-proof-key' "Comp
 require_contains "$swan_block" '--email-smtp-host' "Compose email SMTP host flag is missing"
 require_contains "$swan_block" 'mailpit' "Compose email delivery must target the isolated Mailpit service"
 reject_contains "$swan_block" './interop/notification-config.json:' "Compose must not use a host file bind for notification configuration"
+# The laboratory notification configuration is no longer in the runtime image;
+# it arrives through a named volume a network-isolated initializer publishes.
+require_contains "$swan_block" 'swan-notification-config:/etc/swan/interop:ro' "Compose must mount the lab notification configuration read-only from its prepared volume"
+require_contains "$swan_block" $'swan-notification-config-init:\n        condition: service_completed_successfully' "Swan must wait for the prepared notification configuration"
+notification_config_init_block="$(service_block swan-notification-config-init)"
+require_contains "$notification_config_init_block" 'target: interop-notification-config' "notification configuration must come from the lab-only image stage"
+require_contains "$notification_config_init_block" 'swan-notification-config:/prepared/notification-config' "notification configuration output volume is missing"
+require_contains "$notification_config_init_block" 'network_mode: "none"' "notification configuration preparation must be network-isolated"
+require_contains "$notification_config_init_block" 'install -o swan -g swan -m 0444' "notification configuration must be published read-only to swan"
+reject_contains "$notification_config_init_block" 'entrypoint: ["/usr/local/bin/swan"]' "notification configuration preparation must not run Swan"
+reject_contains "$notification_config_init_block" 'privileged:' "notification configuration preparation must not be privileged"
+# shellcheck disable=SC2016 # Reject the literal interpolation prefix.
+reject_contains "$notification_config_init_block" '${' "notification configuration preparation must not interpolate environment values"
 require_contains "$swan_block" '--managing-service-audience' "Compose must enable checkUserAccess service verification"
 reject_contains "$swan_block" '--enable-localhost-oauth' "Compose must not use the narrower localhost-only OAuth bridge"
 require_contains "$swan_block" '--enable-local-space-interop' "local-space interop flag is missing"
@@ -714,8 +1034,44 @@ rg -q 'libsodium-dev pkg-config' Dockerfile
 # The runtime keeps the Swift 6.1 standard-library surface alongside the
 # release executable. A minimal Ubuntu runtime would omit those libraries and
 # fail only after the container passes image build.
-rg -qx 'FROM swift:6\.1-jammy@sha256:12be34a341945adb64914405ed7b568fcb2d35edbd63a3755007e47dce59456e' Dockerfile
+rg -qx 'FROM swift:6\.1-jammy@sha256:12be34a341945adb64914405ed7b568fcb2d35edbd63a3755007e47dce59456e AS runtime' Dockerfile
 rg -q 'libsodium23' Dockerfile
+# The laboratory notification configuration lives in a stage of its own and the
+# default (last) stage is the clean runtime, so `docker build` with no
+# `--target` cannot produce an image carrying a `laboratory: true` PLC policy.
+rg -qx 'FROM runtime AS interop-notification-config' Dockerfile
+rg -qx 'FROM runtime' Dockerfile
+if [[ "$(rg -c '^COPY Swan/interop/notification-config\.json ' Dockerfile || true)" != "1" ]]; then
+  echo "the lab notification configuration must be copied exactly once, into its own stage" >&2
+  exit 1
+fi
+python3 - Dockerfile <<'PY'
+import pathlib
+import sys
+
+lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+stage = None
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("FROM "):
+        stage = stripped.split(" AS ")[-1] if " AS " in stripped else "<default>"
+        continue
+    if "notification-config.json" in stripped and not stripped.startswith("#"):
+        if stage != "interop-notification-config":
+            raise SystemExit(
+                "the lab notification configuration must not enter stage "
+                f"{stage}; only interop-notification-config may carry it"
+            )
+    if "/etc/swan/interop" in stripped and not stripped.startswith("#"):
+        raise SystemExit(
+            "no image stage may create /etc/swan/interop; it is a mount point"
+        )
+if stage != "<default>":
+    raise SystemExit(
+        "the final Dockerfile stage must be the unnamed clean runtime, not "
+        f"{stage}"
+    )
+PY
 rg -q 'COPY Swan/interop/bootstrap-local-space\.sh /usr/local/bin/swan-interop-bootstrap' Dockerfile
 rg -q 'COPY Swan/interop/prepare-interop-secrets\.sh /usr/local/bin/swan-interop-prepare-secrets' Dockerfile
 rg -q 'COPY Swan/interop/prepare-caddy-trust\.sh /usr/local/bin/swan-interop-caddy-trust' Dockerfile
@@ -753,6 +1109,7 @@ rg -q 'prepared PLC DID does not match' interop/bootstrap-local-space.sh
 rg -q 'find "\$source" -perm /077' interop/prepare-interop-secrets.sh
 rg -q 'install -o "\$owner" -g "\$group" -m 0400' interop/prepare-interop-secrets.sh
 rg -q 'prepare_directory "\$runtime_directory" swan swan' interop/prepare-interop-secrets.sh
+rg -q 'prepare_directory "\$operator_directory" swan swan' interop/prepare-interop-secrets.sh
 rg -q 'prepare_directory "\$pds_directory" 1000 1000' interop/prepare-interop-secrets.sh
 rg -q 'source_certificate="/caddy-data/caddy/pki/authorities/local/root\.crt"' interop/prepare-caddy-trust.sh
 rg -q 'install -d -o root -g root -m 0755 "\$trust_directory"' interop/prepare-caddy-trust.sh
@@ -1255,6 +1612,7 @@ if not isinstance(services, dict):
 
 required_services = {
     "swan-secrets-init",
+    "swan-notification-config-init",
     "swan-data-init",
     "swan-bootstrap",
     "swan",
@@ -1323,6 +1681,32 @@ if (
 ):
     fail("effective Compose Swan runtime secret mount is not least privilege")
 
+# The base laboratory enables no management listener, so the resolved model
+# must give its runtime no path to the operator secret volume at all.
+if any(
+    volume.get("source") == "swan-operator-secrets"
+    for volume in swan.get("volumes", [])
+):
+    fail("effective Compose Swan runtime mounts the operator secret volume")
+
+notification_config_mounts = [
+    volume
+    for volume in swan.get("volumes", [])
+    if volume.get("target") == "/etc/swan/interop"
+]
+if (
+    len(notification_config_mounts) != 1
+    or notification_config_mounts[0].get("type") != "volume"
+    or notification_config_mounts[0].get("source") != "swan-notification-config"
+    or notification_config_mounts[0].get("read_only") is not True
+):
+    fail(
+        "effective Compose lab notification configuration must be a read-only "
+        "prepared volume, never a host bind or an image path"
+    )
+if services["swan-notification-config-init"].get("network_mode") != "none":
+    fail("effective Compose notification configuration preparation is not isolated")
+
 secret_init = services["swan-secrets-init"]
 if secret_init.get("user") != "root" or secret_init.get("network_mode") != "none":
     fail("effective Compose secret preparation boundary is invalid")
@@ -1344,6 +1728,7 @@ safe_secret_directory_variables = {
     "REFERENCE_PDS_SECRETS_DIR",
     "SWAN_BOOTSTRAP_SECRETS_DIR",
     "SWAN_INTEROP_SECRETS_DIR",
+    "SWAN_OPERATOR_SECRETS_DIR",
     "SWAN_RUNTIME_SECRETS_DIR",
 }
 for service_name, service in services.items():

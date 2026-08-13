@@ -3,6 +3,14 @@ set -eu
 
 external_directory="${EXTERNAL_SECRETS_DIR:-/external-secrets}"
 runtime_directory="${SWAN_RUNTIME_SECRETS_DIR:-/prepared/swan-runtime}"
+# The management operator secret gets a prepared directory of its own so that
+# the volume every Swan service mounts cannot carry it. It used to share
+# `$runtime_directory`, which is mounted into the long-running public runtime,
+# the bootstrap job, and every acceptance topology — so the one credential that
+# authenticates the management control plane was readable by processes that
+# have no management listener at all. Only the topology that actually enables
+# `--management-port` mounts this directory.
+operator_directory="${SWAN_OPERATOR_SECRETS_DIR:-/prepared/swan-operator}"
 bootstrap_directory="${SWAN_BOOTSTRAP_SECRETS_DIR:-/prepared/swan-bootstrap}"
 pds_directory="${REFERENCE_PDS_SECRETS_DIR:-/prepared/reference-pds}"
 
@@ -33,13 +41,14 @@ copy_secret() {
 }
 
 prepare_directory "$runtime_directory" swan swan
+prepare_directory "$operator_directory" swan swan
 prepare_directory "$bootstrap_directory" swan swan
 prepare_directory "$pds_directory" 1000 1000
 
 for name in oauth-server-key account-kek email-proof-key; do
     copy_secret "$name" "$runtime_directory" swan swan
 done
-copy_secret "operator-secret" "$runtime_directory" swan swan
+copy_secret "operator-secret" "$operator_directory" swan swan
 
 for name in \
     account-kek \
