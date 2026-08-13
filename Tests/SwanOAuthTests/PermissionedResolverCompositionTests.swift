@@ -210,6 +210,83 @@ final class PermissionedResolverCompositionTests: XCTestCase {
         XCTAssertEqual(remoteCallCount, 1)
     }
 
+    /// F16, at the composition seam. `LocalAccountSpaceServicePublicKeyResolver`
+    /// now reports a revoked managed identity as a terminal negative instead of
+    /// an absence; this pins the other half of that contract — the composite
+    /// must propagate it rather than reading it as permission to use the pin.
+    ///
+    /// The delegation and credential composites are asserted alongside it so
+    /// the three cannot drift apart again.
+    func testTerminalLocalNegativeIsNotAFallThroughToThePin() async throws {
+        let pinnedKey = P256.Signing.PrivateKey()
+        let failure = SwanError.unavailable("local authority is unavailable")
+
+        // Resolution: the pin is configured for a different issuer, so the
+        // composite is constructible; a terminal local negative for the
+        // managed DID must still surface rather than resolving as absent.
+        let serviceKeys = try await CompositeSpaceServicePublicKeyResolver(
+            local: StaticServiceKeys(keys: [:], failing: [localDID: failure]),
+            pinned: [
+                try .init(issuer: remoteMember, generation: 1, publicKey: pinnedKey.publicKey),
+            ]
+        )
+        await XCTAssertCompositionThrowsError {
+            try await serviceKeys.publicKey(for: self.localDID)
+        }
+
+        // Composition: a pin that overlaps a locally managed identity in a
+        // terminal state now fails the startup preflight instead of silently
+        // becoming the authority for it.
+        await XCTAssertCompositionThrowsError {
+            _ = try await CompositeSpaceServicePublicKeyResolver(
+                local: StaticServiceKeys(keys: [:], failing: [self.localDID: failure]),
+                pinned: [
+                    try .init(
+                        issuer: self.localDID,
+                        generation: 1,
+                        publicKey: pinnedKey.publicKey
+                    ),
+                ]
+            )
+        }
+
+        // The two sibling composites already behaved this way. Asserting them
+        // here is what stops the three drifting apart again.
+        let delegationKeys = try await CompositeSpaceDelegationPublicKeyResolver(
+            local: StaticDelegationKeys(keys: [:], failing: [
+                "\(localDID)|\(PermissionedDataJWT.delegationKeyID)": failure,
+            ]),
+            pinned: [
+                try .init(issuer: remoteMember, generation: 1, publicKey: pinnedKey.publicKey),
+            ]
+        )
+        await XCTAssertCompositionThrowsError {
+            try await delegationKeys.publicKey(
+                for: self.localDID,
+                keyID: PermissionedDataJWT.delegationKeyID
+            )
+        }
+
+        let credentialKeys = try await CompositeSpaceCredentialPublicKeyResolver(
+            local: StaticCredentialKeys(keys: [:], failing: [
+                "\(localDID)|\(PermissionedDataJWT.spaceCredentialKeyID)": failure,
+            ]),
+            pinned: [
+                try .init(
+                    authority: remoteAuthority,
+                    generation: 1,
+                    publicKey: pinnedKey.publicKey
+                ),
+            ]
+        )
+        await XCTAssertCompositionThrowsError {
+            try await credentialKeys.publicKey(
+                for: self.localDID,
+                keyID: PermissionedDataJWT.spaceCredentialKeyID
+            )
+        }
+    }
+
     private static let remoteDelegation =
         "eyJhbGciOiJFUzI1NksiLCJ0eXAiOiJhdHByb3RvLXNwYWNlLWRlbGVnYXRpb24rand0Iiwia2lkIjoiI2F0cHJvdG8ifQ.eyJpc3MiOiJkaWQ6cGxjOmJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eSIsImF1ZCI6ImRpZDpwbGM6YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4I2F0cHJvdG9fc3BhY2VfaG9zdCIsInN1YiI6ImF0Oi8vZGlkOnBsYzphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3gvc3BhY2UvYXBwLmJza3kuYm9va21hcmtzL3RzLWdvbGRlbiIsImlhdCI6MTc1MDAwMDAwMCwiZXhwIjoxNzUwMDAwMDYwLCJqdGkiOiJ0cy1ub25jZV8wMSJ9.CiWW_bplyq9ZtybzoUL9f7J_lqlcFKkmAbY2YsVlf5Bly4Ufue7e9QN6_8PioonLWqKnmm6T-RW3Mq2C_JTC6A"
     private static let remoteCredential =
@@ -220,23 +297,30 @@ final class PermissionedResolverCompositionTests: XCTestCase {
 
 private struct StaticCredentialKeys: SpaceCredentialPublicKeyResolver {
     let keys: [String: PermissionedDataJWTVerificationKey]
+    /// Terminal local negatives, keyed identically to `keys`. A resolver that
+    /// could only answer "key" or "absent" cannot express the state these
+    /// composites must refuse to paper over with a pin.
+    var failing: [String: any Error] = [:]
 
     func publicKey(
         for issuer: String,
         keyID: String
     ) async throws -> PermissionedDataJWTVerificationKey? {
-        keys["\(issuer)|\(keyID)"]
+        if let failure = failing["\(issuer)|\(keyID)"] { throw failure }
+        return keys["\(issuer)|\(keyID)"]
     }
 }
 
 private struct StaticDelegationKeys: SpaceDelegationPublicKeyResolver {
     let keys: [String: PermissionedDataJWTVerificationKey]
+    var failing: [String: any Error] = [:]
 
     func publicKey(
         for issuer: String,
         keyID: String
     ) async throws -> PermissionedDataJWTVerificationKey? {
-        keys["\(issuer)|\(keyID)"]
+        if let failure = failing["\(issuer)|\(keyID)"] { throw failure }
+        return keys["\(issuer)|\(keyID)"]
     }
 }
 
@@ -259,9 +343,11 @@ private actor CountingDelegationKeys: SpaceDelegationPublicKeyResolver {
 
 private struct StaticServiceKeys: SpaceServicePublicKeyResolver {
     let keys: [String: PermissionedDataJWTVerificationKey]
+    var failing: [String: any Error] = [:]
 
     func publicKey(for issuer: String) async throws -> PermissionedDataJWTVerificationKey? {
-        keys[issuer]
+        if let failure = failing[issuer] { throw failure }
+        return keys[issuer]
     }
 }
 

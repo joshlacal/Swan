@@ -20,8 +20,10 @@ public protocol SpaceRepositoryCommitSigner: Sendable {
 /// Local commit signer backed by the encrypted account key store.  Lifecycle
 /// and startup-preopen checks occur in the durable repository directory
 /// before this capability is invoked.  This final account/reference check is
-/// intentionally repeated before the signing scalar is read so a stale
-/// request cannot sign after deactivation or key-reference removal.
+/// intentionally repeated around the signing scalar read — before it, so a
+/// stale request never reaches the key store, and again after it, because the
+/// read is a suspension during which a deactivation or key rotation can
+/// commit.  The earlier check alone did not hold that invariant.
 public struct LocalAccountSpaceRepositoryCommitSigner:
     SpaceRepositoryCommitSigner
 {
@@ -46,16 +48,20 @@ public struct LocalAccountSpaceRepositoryCommitSigner:
         guard space.authority != "", commitment.count == 32,
               !wireRevision.isEmpty,
               wireRevision.utf8.count <= 128,
-              let account = try await accounts.account(did: author),
-              account.status.authorizesAccount,
-              let references = try await accounts.keyReferences(did: author)
+              let authorizing = try await accounts.authorizingAccount(did: author)
         else {
             throw SwanError.unauthorized("repository commit signer is unavailable")
         }
 
         // Do not retain or return the scalar.  It is decoded immediately into
         // Crypto's key value and used only for this fixed commit construction.
-        let material = try await keyStore.key(for: references.signing)
+        // The read itself suspends, so the account decision above is
+        // re-asserted before the commit is signed.
+        let material = try await keyStore.key(for: authorizing.signing)
+        try await accounts.requireUnchangedAuthorizingAccount(
+            did: author,
+            expected: authorizing
+        )
         let privateKey: P256.Signing.PrivateKey
         do {
             privateKey = try P256.Signing.PrivateKey(rawRepresentation: material)

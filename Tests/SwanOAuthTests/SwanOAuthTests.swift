@@ -356,6 +356,87 @@ final class SwanOAuthTests: XCTestCase {
         )
     }
 
+    /// F04 — the maximum-lifetime control must not be reachable only through
+    /// `iat`. `Claims.iat` is optional and the lifetime arithmetic lives inside
+    /// `if let issuedAt`, so a correctly signed token that simply omits `iat`
+    /// used to be accepted with an arbitrarily distant `exp`. The bound is now
+    /// stated on `exp` directly, which holds whether or not `iat` is present.
+    ///
+    /// This deliberately does not require `iat`: the pinned reference verifier
+    /// never inspects it, so the no-`iat` shape must keep verifying when its
+    /// expiry is inside the window.
+    func testServiceJWTWithoutIssuedAtCannotOutliveTheConfiguredMaximum() throws {
+        let key = P256.Signing.PrivateKey()
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let nowSeconds = Int64(now.timeIntervalSince1970)
+        let skew: TimeInterval = 60
+        let maximumLifetime: TimeInterval = 300
+
+        func token(exp: Int64, iat: Int64? = nil) throws -> String {
+            try testCompactJWT(
+                header: TestSpaceServiceHeader(),
+                claims: TestOptionalIssuedAtServiceClaims(
+                    iss: "did:plc:abcdefghijklmnopqrstuvwx",
+                    aud: "did:plc:zyxwvutsrqponmlkjihgfedc",
+                    iat: iat,
+                    exp: exp,
+                    lxm: "com.atproto.space.notifyWrite",
+                    jti: "absent-iat-service"
+                ),
+                key: key
+            )
+        }
+
+        func verify(_ compact: String) throws -> SpaceServiceJWT.Claims {
+            try SpaceServiceJWT.verify(
+                compact,
+                publicKey: .p256(key.publicKey),
+                now: now,
+                clockSkew: skew,
+                maximumLifetime: maximumLifetime
+            )
+        }
+
+        // The finding: no `iat`, expiry a year out, correct signature.
+        let distant = try token(exp: nowSeconds + 365 * 24 * 60 * 60)
+        XCTAssertNil(try SpaceServiceJWT.inspect(distant).claims.iat)
+        XCTAssertThrowsError(try verify(distant)) { error in
+            XCTAssertEqual(
+                error as? SwanError,
+                .unauthorized("service authentication time claims are invalid")
+            )
+        }
+
+        // One second past the skew-widened ceiling is still refused.
+        let justOver = try token(
+            exp: nowSeconds + Int64(skew) + Int64(maximumLifetime) + 1
+        )
+        XCTAssertThrowsError(try verify(justOver))
+
+        // Interop guard: a no-`iat` token inside the window still verifies.
+        let inWindow = try token(exp: nowSeconds + Int64(maximumLifetime))
+        XCTAssertEqual(try verify(inWindow).exp, nowSeconds + Int64(maximumLifetime))
+
+        // Regression: a token Swan itself minted is unaffected by the new cap.
+        let issued = try SpaceServiceJWT.create(
+            issuer: "did:plc:abcdefghijklmnopqrstuvwx",
+            audience: "did:plc:zyxwvutsrqponmlkjihgfedc",
+            method: "com.atproto.space.notifyWrite",
+            eventID: "swan-issued-service",
+            key: key,
+            now: now
+        )
+        XCTAssertEqual(try verify(issued).iat, nowSeconds)
+
+        // And the tighter `iat`-present path is unchanged: a token whose `exp`
+        // is inside the cap but whose stated lifetime exceeds it still fails.
+        let backdated = try token(
+            exp: nowSeconds + Int64(maximumLifetime),
+            iat: nowSeconds - Int64(maximumLifetime)
+        )
+        XCTAssertThrowsError(try verify(backdated))
+    }
+
     func testRemoteMetadataPolicyRejectsAllPrivateLiteralRanges() throws {
         XCTAssertThrowsError(try OAuthRemoteURLPolicy.validate(URL(string: "https://172.31.1.1/metadata")!))
         XCTAssertThrowsError(try OAuthRemoteURLPolicy.validate(URL(string: "https://169.254.169.254/latest/meta-data")!))
@@ -1770,6 +1851,33 @@ private struct TestAssertionClaims: Encodable {
 private struct TestSpaceServiceHeader: Encodable {
     let alg = "ES256"
     let typ = "JWT"
+}
+
+/// A service-JWT claim set whose `iat` is genuinely absent from the encoded
+/// payload rather than encoded as `null`. `SpaceServiceJWT.Claims` cannot
+/// express that: its synthesized encoder is what the wire shape must be tested
+/// against, not reused to produce it.
+private struct TestOptionalIssuedAtServiceClaims: Encodable {
+    let iss: String
+    let aud: String
+    let iat: Int64?
+    let exp: Int64
+    let lxm: String
+    let jti: String
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(iss, forKey: .iss)
+        try container.encode(aud, forKey: .aud)
+        try container.encodeIfPresent(iat, forKey: .iat)
+        try container.encode(exp, forKey: .exp)
+        try container.encode(lxm, forKey: .lxm)
+        try container.encode(jti, forKey: .jti)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case iss, aud, iat, exp, lxm, jti
+    }
 }
 
 private func testDPoPToken(

@@ -39,16 +39,19 @@ public struct LocalAccountSpaceDelegationTokenIssuer: SpaceDelegationTokenIssuer
         now: Date = Date()
     ) async throws -> String {
         let issuer = try AccountIdentifiers.validateDID(issuer)
-        guard let account = try await accounts.account(did: issuer),
-              account.status.authorizesAccount,
-              let references = try await accounts.keyReferences(did: issuer) else {
+        guard let authorizing = try await accounts.authorizingAccount(did: issuer) else {
             throw SwanError.unauthorized("delegation issuer is unavailable")
         }
 
-        // Do not perform an await after this point.  The scalar is read only
-        // after every account/lifecycle/reference decision has completed and
-        // is used immediately to construct the one fixed-profile token.
-        let material = try await keyStore.key(for: references.signing)
+        // The key-store read is a suspension: the account can be deactivated
+        // or rekeyed while it runs.  The scalar is used immediately below, so
+        // the account decision above is re-asserted the moment the read
+        // returns and before anything is signed.
+        let material = try await keyStore.key(for: authorizing.signing)
+        try await accounts.requireUnchangedAuthorizingAccount(
+            did: issuer,
+            expected: authorizing
+        )
         let privateKey: P256.Signing.PrivateKey
         do {
             privateKey = try P256.Signing.PrivateKey(rawRepresentation: material)

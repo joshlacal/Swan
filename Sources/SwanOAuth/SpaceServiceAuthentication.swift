@@ -74,18 +74,71 @@ public struct LocalAccountSpaceServicePublicKeyResolver: SpaceServicePublicKeyRe
     }
 
     public func publicKey(for issuer: String) async throws -> PermissionedDataJWTVerificationKey? {
-        guard let did = serviceIssuerDID(issuer),
-              let account = try await accounts.account(did: did),
-              account.status.authorizesAccount,
-              let references = try await accounts.keyReferences(did: did),
-              let encoded = try await publicKeyStore.publicKey(for: references.signing) else {
+        // Only a *proven absence* from the local account directory may return
+        // `nil`. `CompositeSpaceServicePublicKeyResolver` reads `nil` as
+        // permission to use the operator pin, so reporting a deactivated,
+        // deleted, unreadable, or key-less managed account as absence is what
+        // lets a pin overlapping that DID keep verifying service JWTs after
+        // the account it overlaps was revoked. Every other negative is
+        // terminal. The credential and delegation resolvers in
+        // `SpaceCredentialAuthority.swift` state and implement this contract;
+        // this resolver was the odd one out.
+        //
+        // `SwanSpaceNotificationXRPC` maps `SwanError.unavailable` to 503 with
+        // a fixed body, so this changes the status of an already-failing
+        // request from 401 to 503 and widens nothing.
+        guard let did = serviceIssuerDID(issuer) else {
+            // Not a service-issuer DID at all, so not a managed identity —
+            // and `PinnedSpaceServicePublicKey` rejects the same shape at
+            // construction, so this cannot fall through onto a pin either.
             return nil
         }
+        let authorizing: AuthorizingAccountSnapshot
         do {
-            return .p256(try P256.Signing.PublicKey(x963Representation: encoded))
+            guard let managed = try await accounts.account(did: did) else {
+                // The one proven absence, and so the one fall-through.
+                return nil
+            }
+            guard managed.status.authorizesAccount,
+                  let current = try await accounts.authorizingAccount(did: did),
+                  current.account == managed else {
+                throw SwanError.unavailable("service authentication key is unavailable")
+            }
+            authorizing = current
         } catch {
             throw SwanError.unavailable("service authentication key is unavailable")
         }
+
+        let encoded: Data
+        do {
+            guard let current = try await publicKeyStore.publicKey(
+                for: authorizing.signing
+            ) else {
+                throw SwanError.unavailable("service authentication key is unavailable")
+            }
+            encoded = current
+        } catch {
+            throw SwanError.unavailable("service authentication key is unavailable")
+        }
+
+        let verificationKey: PermissionedDataJWTVerificationKey
+        do {
+            verificationKey = .p256(
+                try P256.Signing.PublicKey(x963Representation: encoded)
+            )
+        } catch {
+            throw SwanError.unavailable("service authentication key is unavailable")
+        }
+
+        // The public-key read above is also a suspension. The two sibling
+        // resolvers fence it; leaving this one unfenced would let a token
+        // verify against a generation revoked while the metadata was in
+        // flight.
+        try await accounts.requireUnchangedAuthorizingAccount(
+            did: did,
+            expected: authorizing
+        )
+        return verificationKey
     }
 }
 
@@ -247,12 +300,17 @@ public struct LocalAccountSpaceServiceAuthenticationIssuer: SpaceServiceAuthenti
         guard validServiceAudience(audience),
               validServiceMethod(method),
               validServiceEventID(eventID),
-              let account = try await accounts.account(did: issuer),
-              account.status.authorizesAccount,
-              let references = try await accounts.keyReferences(did: issuer) else {
+              let authorizing = try await accounts.authorizingAccount(did: issuer) else {
             throw SwanError.unauthorized("service authentication issuer is unavailable")
         }
-        let material = try await keyStore.key(for: references.signing)
+        // The key-store read is a suspension during which a deactivation or a
+        // key rotation can commit. Re-assert the account decision before the
+        // token is signed, not only before the scalar is read.
+        let material = try await keyStore.key(for: authorizing.signing)
+        try await accounts.requireUnchangedAuthorizingAccount(
+            did: issuer,
+            expected: authorizing
+        )
         let key: P256.Signing.PrivateKey
         do {
             key = try P256.Signing.PrivateKey(rawRepresentation: material)
@@ -405,12 +463,26 @@ public enum SpaceServiceJWT {
         guard parsed.claims.exp >= expirationCutoff.partialValue else {
             throw SwanError.expired
         }
+        // The maximum-lifetime control must not be reachable only through
+        // `iat`. `Claims.iat` is optional because the pinned reference
+        // verifier never inspects it, so requiring it would be a unilateral
+        // interop cost; but a correctly signed token that simply omits it must
+        // not thereby escape the window. Stating the ceiling on `exp` alone
+        // caps every accepted token at `skew + maximumLifetime` whether or not
+        // `iat` is present, with no wire change. The `iat` branch below stays
+        // as the tighter bound for the tokens that do carry one.
+        let latestIssuedAt = nowSeconds.addingReportingOverflow(skew)
+        let latestExpiration = latestIssuedAt.partialValue
+            .addingReportingOverflow(Int64(maximumLifetime))
+        guard !latestIssuedAt.overflow,
+              !latestExpiration.overflow,
+              parsed.claims.exp <= latestExpiration.partialValue else {
+            throw SwanError.unauthorized("service authentication time claims are invalid")
+        }
         if let issuedAt = parsed.claims.iat {
-            let latestIssuedAt = nowSeconds.addingReportingOverflow(skew)
             let lifetime =
                 parsed.claims.exp.subtractingReportingOverflow(issuedAt)
-            guard !latestIssuedAt.overflow,
-                  issuedAt <= latestIssuedAt.partialValue,
+            guard issuedAt <= latestIssuedAt.partialValue,
                   parsed.claims.exp >= issuedAt,
                   !lifetime.overflow,
                   lifetime.partialValue <= Int64(maximumLifetime) else {

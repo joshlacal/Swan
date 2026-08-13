@@ -24,6 +24,26 @@ public enum AccountLoginAuthenticationError: Error, Sendable, Equatable {
     case unavailable
 }
 
+/// The exact account state one signing or key-resolution decision was
+/// authorized against: the whole control row plus the key generation that row
+/// names. It exists so a caller that suspends between the decision and the use
+/// can name what it decided on, rather than re-deriving a subset by hand.
+public struct AuthorizingAccountSnapshot: Sendable, Equatable {
+    public let account: AccountControlAccount
+    public let signing: AccountKeyReference
+    public let rotation: AccountKeyReference
+
+    public init(
+        account: AccountControlAccount,
+        signing: AccountKeyReference,
+        rotation: AccountKeyReference
+    ) {
+        self.account = account
+        self.signing = signing
+        self.rotation = rotation
+    }
+}
+
 /// Durable registry, lifecycle, and local-password service. It never stores a
 /// raw password and never returns a verifier through directory lookup APIs.
 /// DID lifecycle/PLC operations remain outside this local control-plane slice.
@@ -148,8 +168,72 @@ public actor DurableAccountDirectory {
         did: String
     ) async throws -> (signing: AccountKeyReference, rotation: AccountKeyReference)? {
         let did = try AccountIdentifiers.validateDID(did)
+        guard let account = try await store.account(did: did) else {
+            return nil
+        }
+        return try keyReferences(of: account)
+    }
+
+    /// The account together with the key generation it names, in **one**
+    /// control-store read. `keyReferences(did:)` re-reads the same row, so a
+    /// caller that needs both gets a cheaper and internally consistent answer
+    /// here.
+    ///
+    /// `nil` means proven absence or a lifecycle state that does not authorize
+    /// the account to act. Callers that must distinguish "not mine" from
+    /// "changed underneath me" pair this with
+    /// ``requireUnchangedAuthorizingAccount(did:expected:)``.
+    public func authorizingAccount(
+        did: String
+    ) async throws -> AuthorizingAccountSnapshot? {
+        let did = try AccountIdentifiers.validateDID(did)
         guard let account = try await store.account(did: did),
-              let signing = account.signingKey,
+              account.status.authorizesAccount,
+              let references = try keyReferences(of: account) else {
+            return nil
+        }
+        return AuthorizingAccountSnapshot(
+            account: account,
+            signing: references.signing,
+            rotation: references.rotation
+        )
+    }
+
+    /// The fence every local signer applies after reading key material.
+    ///
+    /// Reading the signing scalar out of the key store is a suspension, and
+    /// this directory exposes no atomic account/key projection, so a
+    /// deactivation, a permanent-deletion revocation, or a key rotation can
+    /// commit while it runs. The signer then emits a token or a signed commit
+    /// under an authority that was revoked before the signature existed.
+    ///
+    /// Any intervening change is terminal, not a retryable miss: the artefact
+    /// about to be produced outlives the revocation that should have prevented
+    /// it. Callers surface this as an opaque availability failure — no call
+    /// site widens its client-visible body with this message.
+    ///
+    /// This is one method rather than one copy per signer on purpose: four
+    /// hand-copied bodies is what produced four identical omissions and two
+    /// comments asserting an invariant the code did not hold.
+    public func requireUnchangedAuthorizingAccount(
+        did: String,
+        expected: AuthorizingAccountSnapshot
+    ) async throws {
+        let current: AuthorizingAccountSnapshot?
+        do {
+            current = try await authorizingAccount(did: did)
+        } catch {
+            throw SwanError.unavailable("account authorization is unavailable")
+        }
+        guard let current, current == expected else {
+            throw SwanError.unavailable("account authorization is unavailable")
+        }
+    }
+
+    private func keyReferences(
+        of account: AccountControlAccount
+    ) throws -> (signing: AccountKeyReference, rotation: AccountKeyReference)? {
+        guard let signing = account.signingKey,
               let rotation = account.rotationKey else {
             return nil
         }
@@ -161,12 +245,12 @@ public actor DurableAccountDirectory {
         }
         return (
             try AccountKeyReference(
-                accountDID: did,
+                accountDID: account.did,
                 purpose: .signing,
                 generation: signing.generation
             ),
             try AccountKeyReference(
-                accountDID: did,
+                accountDID: account.did,
                 purpose: .rotation,
                 generation: rotation.generation
             )
