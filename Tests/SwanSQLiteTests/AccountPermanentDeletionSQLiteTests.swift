@@ -257,7 +257,7 @@ final class AccountPermanentDeletionSQLiteTests: XCTestCase {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let database = try await SQLiteControlDatabase(dataDirectory: root)
-        defer { try? await database.close() }
+        defer { Task { try? await database.close() } }
         let createdAt = Date(timeIntervalSince1970: 1_750_000_100)
         _ = try await database.createAccount(
             try registration(
