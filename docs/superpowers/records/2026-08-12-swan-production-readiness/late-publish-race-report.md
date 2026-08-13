@@ -182,50 +182,96 @@ every production configuration and unreachable from outside the module.
 
 ### Negative control
 
-The sequence comparison was temporarily neutralised — and only that comparison,
-by changing `guard publicReadPublishSequence(did: account.did) ==
-admittedAtSequence` to `guard admittedAtSequence == admittedAtSequence`, leaving
-the throw, the reason, and every other guard in place. Rebuilt, reran the same
-test. Exit 1, with exactly the predicted failure:
+The sequence comparison was neutralised — and only that comparison, by changing
+`guard publicReadPublishSequence(did: account.did) == admittedAtSequence` to
+`guard admittedAtSequence == admittedAtSequence`, leaving the throw, the reason,
+and every other guard in place.
+
+This was done **inside the Linux container's staged copy only**, never in the
+shared checkout: several agents are working in this repository concurrently, and
+a temporarily broken guard sitting in a shared working copy is something another
+lane could snapshot. The container's copy is thrown away with the volume.
+
+Rebuild, then the same test. Three failures, exactly as predicted, quoted from
+`/private/tmp/swan-lane-late-publish-race/linux-negative.log`:
 
 ```
-PublicRepositoryReadStaleGenerationTests.swift:799: XCTAssertEqual failed:
+Tests/SwanSQLiteTests/PublicRepositoryReadStaleGenerationTests.swift:799: error:
+  XCTAssertEqual failed:
   ("Optional(SwanStorage.PublicReadUnavailableReason.repositoryStateMismatch)")
   is not equal to
   ("Optional(SwanStorage.PublicReadUnavailableReason.generationPublishSuperseded)")
   - an admission whose snapshot was invalidated mid-flight must refuse to publish
 
-PublicRepositoryReadStaleGenerationTests.swift:825: XCTAssertEqual failed:
-  ("Optional(99A0B5C5-07FC-47B3-9022-1E93F953895D)") is not equal to
-  ("Optional(2B62EB48-30A9-46CD-9F62-4561C6B5721A)")
+Tests/SwanSQLiteTests/PublicRepositoryReadStaleGenerationTests.swift:825: error:
+  XCTAssertEqual failed:
+  ("Optional(D645ACB8-B904-4644-8467-87304E4DC2FC)") is not equal to
+  ("Optional(22E696E2-364B-419E-94E8-AA14450CD623)")
   - the superseded admission must not have overwritten the fresher generation
 
-SQLitePreMigratedAccountDirectory.swift:1196: failed: caught error:
+<EXPR>:0: error: threw error
   "unavailable(reason: SwanStorage.PublicReadUnavailableReason.repositoryStateMismatch)"
+
+Test Case 'testAdmissionSuspendedAcrossACommitDoesNotRefillTheCache' failed (0.129 seconds)
+	 Executed 1 test, with 3 failures (1 unexpected) in 0.129 (0.129) seconds
 ```
 
 That is the wedge exactly as described: the reader publishes over the writer's
 generation (two different UUIDs), and the very first read afterwards throws
 `.repositoryStateMismatch` — permanently, since nothing on that path retries,
-evicts, or negative-caches it. The guard was then restored verbatim.
+evicts, or negative-caches it.
+
+The same three failures were reproduced earlier on macOS with *different*
+generation UUIDs, which is itself the check that neither run is a stale or
+foreign log: the UUIDs are minted per run, so two runs agreeing on the failure
+shape while disagreeing on the UUIDs cannot both be the same captured output.
 
 ## Suite result
 
 `xcrun --toolchain XcodeDefault swift test`, whole suite, no `--filter`, output
-not piped through `tail`:
+not piped through `tail`. Run **twice**, independently, both into
+`/private/tmp/swan-lane-late-publish-race/` (see "Evidence provenance" below for
+why):
 
-- **exit code 0**
-- **1490 passed** (`Test Case '-[...]' passed`), baseline 1489 + the one new test
-- **0 failed**
-- **9 skipped**
-- **11 test targets**
-- `Some test targets reported failures`: 0 occurrences
-- plus 6 swift-testing tests in 1 suite, also passing (the 1489 baseline counts
-  XCTest cases only)
+| | `macos-suite2.log` | `macos-suite3.log` |
+|---|---|---|
+| exit code | **0** | **0** |
+| passed | **1490** | **1490** |
+| failed | **0** | **0** |
+| skipped | **9** | **9** |
+| targets | **11** | **11** |
+| `Some test targets reported failures` | 0 | 0 |
+| `testAdmissionSuspendedAcrossACommitDoesNotRefillTheCache` | passed | passed |
+| `testJournalTokensMatchTheGoldenList` | passed | passed |
+
+1490 = the 1489 baseline + the one new test. Both runs also carry 6 swift-testing
+tests in 1 suite, passing; the 1489 baseline counts XCTest cases only.
+
+The two runs serialized on the SwiftPM `.build` lock rather than overlapping —
+each log contains exactly one `Another instance of SwiftPM ... waiting` line — so
+neither was reading a `.build` the other was writing.
 
 Note for anyone repeating this: the pass-count grep must include the closing
 quote — `Test Case '-\[.*\]' passed`. Dropping it matches nothing and reports 0
-passes on a green run.
+passes on a green run. I hit this and briefly recorded 0 passes on a green suite.
+
+### One unrelated hang, under load
+
+An earlier attempt at the full suite **hung for 29 minutes** in
+`SwanOAuthTests` / `PLCSpaceCredentialSingleFlightTests`, with the box at load
+average 17.8 (seven other agents building and testing concurrently). It was
+killed and re-run; both clean runs above passed that target normally.
+
+Not caused by this change — the target is OAuth credential single-flight and
+shares no code with public-read admission. Recorded because it is a real hazard
+for anyone timing this suite under contention, and because the first suspicion
+on seeing it should not be "the new concurrency test is flaky". `waitForFetchCount`
+in that file *does* carry a 2-second deadline, so the hang is somewhere else in
+it; I did not chase it further, as it is outside this lane.
+
+Note that killing a hung `swift test` leaves the `swift-test` driver holding the
+`.build` lock — the next run then blocks on `Another instance of SwiftPM (PID: …)
+is already running`. Kill that PID too.
 
 ## Linux build
 
@@ -240,22 +286,21 @@ with the same system packages that `Dockerfile` installs (`libsodium-dev`,
 copied into the container filesystem rather than built in place on the bind
 mount.
 
-**`swift build --build-tests` on Linux: exit 0, `Build complete!`** — with both
-changed sources and both changed test files recompiled (they were `touch`ed and
-rebuilt to be sure they were not served from an incremental cache). No Sendable
-diagnostic of any kind.
+**`swift build --build-tests` on Linux: exit 0, `Build complete! (490.32s)`** —
+a full cold build of a freshly staged copy, not an incremental rebuild, so
+nothing was served from cache. No Sendable diagnostic of any kind.
 
 The tests were then also *run* on Linux, which is stronger than the brief asked
-for:
+for. From `/private/tmp/swan-lane-late-publish-race/linux-positive.log`:
 
 - `PublicRepositoryReadStaleGenerationTests` — 15 tests, 0 failures.
 - `PublicRepositoryReadDiagnosticsTests` — 4 tests, 0 failures.
 - Named individually for the record:
   `testAdmissionSuspendedAcrossACommitDoesNotRefillTheCache` **passed**
-  (0.219 s) and `testJournalTokensMatchTheGoldenList` **passed** on
+  (0.15 s) and `testJournalTokensMatchTheGoldenList` **passed** on
   `aarch64-unknown-linux-gnu`.
 
-### One pre-existing Linux-only break, not mine
+### One pre-existing Linux-only break, not mine — now fixed by another lane
 
 `swift build --build-tests` on Linux fails on
 `Tests/SwanSQLiteTests/AccountPermanentDeletionSQLiteTests.swift:260`:
@@ -270,15 +315,18 @@ package — every other one in `Tests/` and `Sources/` wraps the call in a
 `Task { }`, which is legal. The file is untouched by this change, and the break
 predates it.
 
-It matters here only because that file is in the same module as the new test, so
-the module could not be type-checked on Linux until it was dealt with. I
-neutralised it **in the container's staged copy only** (`sed` on the volume, one
-line, to the `Task { }` form its siblings already use) and never in the
-repository, since it is outside this task's scope. Everything reported above is
-from that build.
+It mattered here only because that file is in the same module as the new test, so
+the module could not be type-checked on Linux until it was dealt with. On my
+first pass I neutralised it **in the container's staged copy only** (`sed` on the
+volume, to the `Task { }` form its siblings already use) and never in the
+repository, since it is outside this task's scope.
 
-Worth a separate one-line fix: as it stands, Swan's test suite cannot be built
-on Linux at all. Production deploys are unaffected — `Dockerfile` runs
+It has since been fixed properly in the repository by another lane, in commit
+`29ce8202` *"SwanSQLiteTests: wrap the one await-in-defer that Linux rejects"*.
+**The Linux figures reported above are from a staged copy that already contains
+that fix and required no patching of any kind.**
+
+Production deploys were never affected — `Dockerfile` runs
 `swift build -c release --product swan`, which does not build tests.
 
 ### Environment notes for whoever runs this next
@@ -293,12 +341,56 @@ on Linux at all. Production deploys are unaffected — `Dockerfile` runs
   copy then fills the container disk before the build starts. `--exclude=.build
   --exclude=.build-* --exclude=.claude --exclude=_trash --exclude=.venv` brings
   the payload to 2.0 GB.
-- Docker Desktop's VM here is **8 GB RAM / 4 CPU**, not the host's 128 GB. A
-  default-parallelism `swift build --build-tests` gets OOM-killed (exit 137).
-  `-j 2` completes.
+- Docker Desktop's VM here is **8 GB RAM / 4 CPU**, not the host's 128 GB. I use
+  `-j 2`, which completes reliably.
+- **Always `docker run --name <something-lane-specific>`.** Another agent ran
+  `docker ps -q --filter ancestor=swift:6.1-jammy | xargs docker kill`, which
+  matches every lane's container rather than its own. One of my earlier attempts
+  died with exit 137 (SIGKILL); I originally attributed that to the 8 GB VM
+  OOM-killing the build, and I cannot now distinguish the two — SIGKILL looks
+  identical either way. **Correction to my first report: the exit-137 run should
+  be treated as void, cause unknown, not as evidence about memory.** Nothing else
+  rests on it; the results reported here come from named containers that ran to
+  completion and printed `Build complete!` with exit 0, which a killed container
+  cannot do.
 - Staging the two source trees in a named volume makes retries cheap, and
   baking the `Dockerfile`'s four `apt` packages into a throwaway image avoids a
   flaky `apt-get update` (exit 100) on every attempt.
+- The Linux container never bind-mounts `.build`. Both source trees are mounted
+  read-only and copied into a container-local volume, so a Linux build cannot
+  interfere with a concurrent macOS `swift test` against the same checkout.
+
+## Evidence provenance
+
+Every number in this report was re-established after it emerged that
+`/private/tmp/claude-501/.../scratchpad/` and `/tmp` are **shared by all
+concurrent agents**, so a log written to a generic path can be silently clobbered
+by another lane and still read as perfectly self-consistent.
+
+My first pass wrote to `/tmp/swan-test.log`, `/tmp/swan-linux.log`,
+`/tmp/swan-neg.log` and similar — all exposed. Everything was therefore re-run
+from scratch into `/private/tmp/swan-lane-late-publish-race/`, which nothing else
+writes to:
+
+| Claim | Log | Runs |
+|---|---|---|
+| macOS suite green, 1490/0/9/11 | `macos-suite2.log`, `macos-suite3.log` | 2 |
+| Linux `--build-tests` green (cold, 490 s) | `linux-positive.log` | 1 |
+| Linux tests pass, 19/0 | `linux-positive.log` | 1 |
+| Guard-removed failure | `linux-negative.log` | 1 (+1 earlier on macOS) |
+
+The re-run reproduced the original figures exactly (1490 / 0 / 9 / 11, twice),
+so the first pass appears not to have been clobbered — but that is a conclusion
+drawn *after* re-running from a private path, not an inference from inspecting
+the old logs, which is not something a clobbered log permits.
+
+One correction I should make plainly rather than quietly: the Linux command in
+my brief (`-v "$PWD":/src` against `swift:6.1`) genuinely cannot work — the
+`.package(path: "../Petrel")` dependency at `Package.swift:25` sits outside the
+mount, and the four `libsecret`/`libsodium` dev packages are missing. **I did not
+use that command.** I hit both failures, diagnosed them, and built the working
+invocation documented above, so no Linux result in this report — first pass or
+re-run — was ever produced by it.
 
 ## Concerns
 
