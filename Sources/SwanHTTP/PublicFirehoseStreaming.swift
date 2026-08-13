@@ -155,7 +155,9 @@ public struct PublicFirehoseTailer: Sendable {
   ///   - lastSent: the last sequence already delivered to this consumer;
   ///     events are delivered strictly after it (`seq > lastSent`).
   ///   - outbound: writes one stored frame verbatim, in sequence order; must
-  ///     be invoked exactly once per delivered event.
+  ///     be invoked exactly once per delivered event. Every call is run under
+  ///     ``PublicFirehoseStreamingLimits/maximumWriteDuration`` as a real
+  ///     deadline, so a write that never returns cannot pin the loop.
   ///   - waitForWakeup: blocks until a new append or retention advance is
   ///     signaled, or returns `nil` when nothing is new so the loop falls
   ///     back to its bounded idle poll. Any non-`nil` signal — including a
@@ -172,7 +174,7 @@ public struct PublicFirehoseTailer: Sendable {
   /// errors.
   public func run(
     lastSent: Int64,
-    outbound: (Data) async throws -> Void,
+    outbound: @escaping @Sendable (Data) async throws -> Void,
     waitForWakeup: () async -> Int64?
   ) async throws {
     var cursor = lastSent
@@ -224,13 +226,7 @@ public struct PublicFirehoseTailer: Sendable {
         let pageClock = ContinuousClock()
         let pageStarted = pageClock.now
         for row in rows {
-          let writeStarted = pageClock.now
-          try await outbound(row.frameBytes)
-          let writeDuration = pageClock.now - writeStarted
-          if writeDuration > limits.maximumWriteDuration {
-            logger.warning("dropping slow public firehose write")
-            throw PublicFirehoseTailerError.writeTooSlow(duration: writeDuration)
-          }
+          try await writeWithinDeadline(row.frameBytes, outbound: outbound)
           cursor = row.seq
         }
         let pageElapsed = pageClock.now - pageStarted
@@ -244,5 +240,44 @@ public struct PublicFirehoseTailer: Sendable {
       return
     }
     logger.debug("public firehose tailer exited")
+  }
+
+  /// Delivers one stored frame under a hard
+  /// ``PublicFirehoseStreamingLimits/maximumWriteDuration`` deadline.
+  ///
+  /// The previous shape timed the write *after* it returned. That bounds
+  /// nothing: the case worth bounding is a peer that has stopped reading, so
+  /// the socket buffer fills and the write suspends inside the page and never
+  /// returns — at which point the comparison never runs and the connection,
+  /// its hub subscription and its listener slot are pinned for as long as the
+  /// peer likes. Racing the write against a sleeper makes the deadline the
+  /// control it was always documented to be; the peer is then dropped through
+  /// the same `ConsumerTooSlow` path a lagging peer takes.
+  ///
+  /// Cancellation of the enclosing tailer cancels both children, and the
+  /// resulting `CancellationError` is rethrown unchanged so ``run`` still
+  /// exits quietly rather than reporting a slow consumer.
+  private func writeWithinDeadline(
+    _ frameBytes: Data,
+    outbound: @escaping @Sendable (Data) async throws -> Void
+  ) async throws {
+    let deadline = limits.maximumWriteDuration
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      group.addTask { try await outbound(frameBytes) }
+      group.addTask {
+        try await Task.sleep(for: deadline)
+        throw PublicFirehoseTailerError.writeTooSlow(duration: deadline)
+      }
+      do {
+        try await group.next()
+      } catch {
+        group.cancelAll()
+        if error is PublicFirehoseTailerError {
+          logger.warning("dropping slow public firehose write")
+        }
+        throw error
+      }
+      group.cancelAll()
+    }
   }
 }

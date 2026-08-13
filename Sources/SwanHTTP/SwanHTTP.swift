@@ -446,6 +446,12 @@ public struct SwanHTTPServer: Sendable {
     /// `com.atproto.sync.subscribeRepos`. Nil keeps the legacy wildcard-404
     /// behavior for the endpoint; non-nil registers the WebSocket route.
     public let publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime?
+    /// How much of this listener's connection budget anonymous
+    /// `subscribeRepos` subscribers may hold at once. Sized here, from
+    /// ``SwanHTTPConfiguration/maximumConnections``, because the reservation
+    /// only means anything relative to the budget it reserves *from* — an
+    /// upgraded WebSocket holds its listener slot until the channel closes.
+    public let publicFirehoseSubscriberAdmission: PublicFirehoseSubscriberAdmission
 
     public init(
         profile: ProtocolProfile,
@@ -478,7 +484,8 @@ public struct SwanHTTPServer: Sendable {
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
         publicBlobRequestBodyAdmission: PublicRepositoryJSONWriteAdmission? = nil,
         jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil,
-        publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil
+        publicFirehoseStreaming: SwanPublicFirehoseStreamingRuntime? = nil,
+        publicFirehoseSubscriberAdmission: PublicFirehoseSubscriberAdmission? = nil
     ) {
         self.profile = profile
         self.configuration = configuration
@@ -493,6 +500,10 @@ public struct SwanHTTPServer: Sendable {
         self.actorPreferencesXRPC = actorPreferencesXRPC
         self.xrpcPipethrough = xrpcPipethrough
         self.publicFirehoseStreaming = publicFirehoseStreaming
+        self.publicFirehoseSubscriberAdmission = publicFirehoseSubscriberAdmission
+            ?? PublicFirehoseSubscriberAdmission(
+                listenerBudget: configuration.maximumConnections
+            )
         let resolvedJSONReadAdmission = jsonReadAdmission
             ?? PublicRepositoryJSONReadAdmission.processShared
         self.jsonReadAdmission = resolvedJSONReadAdmission
@@ -872,7 +883,16 @@ public struct SwanHTTPServer: Sendable {
         // every profile method gets an explicit, method-correct closed handler
         // until its authenticated implementation is ready.
         var installedSimpleSpaceLifecycle = false
-        for descriptor in PermissionedData0016.methods {
+        // The generated registry is the full proposal-0016 method set; the
+        // selected profile is what this deployment claims to speak. Iterating
+        // the registry unfiltered installed a gate for every method the
+        // registry knows, whether or not the profile declared it, so
+        // `--profile` did not decide the permissioned surface it names. Today
+        // this filter removes nothing (both checked-in permissioned profiles
+        // carry the same 25 NSIDs) — it is what makes a narrower profile
+        // answer 404 rather than 503 when one is written.
+        for descriptor in PermissionedData0016.methods
+            .filter({ profile.endpoints.contains($0.nsid) }) {
             if descriptor.nsid == ComAtprotoSpaceGetSpace.typeIdentifier,
                let authenticatedGetSpace {
                 registerAuthenticatedGetSpaceEndpoint(on: router, capability: authenticatedGetSpace)
@@ -1037,7 +1057,8 @@ public struct SwanHTTPServer: Sendable {
            servedPublicMethods.contains(publicSubscribeReposNSID) {
             registerPublicFirehoseStreamingEndpoint(
                 on: router,
-                runtime: publicFirehoseStreaming
+                runtime: publicFirehoseStreaming,
+                admission: publicFirehoseSubscriberAdmission
             )
         }
         // The one iteration that decides which public methods exist at all.
@@ -1158,17 +1179,30 @@ public struct SwanHTTPServer: Sendable {
 
     /// The WebSocket sub-configuration used by the public listener.
     ///
-    /// `maxFrameSize` must cover the largest stored firehose frame
-    /// (`FirehoseFrameLimits.maximumFrameBytes`); the 16 KiB default would
-    /// fail every real `#commit` with `messageTooLarge`. Auto-ping runs every
-    /// `autoPingInterval` (30 seconds in production) so a peer that never
-    /// answers a ping is closed by Hummingbird's own liveness loop; close
-    /// negotiation is bounded so a dead peer cannot pin a channel.
+    /// `maxFrameSize` is **inbound only**. It reaches exactly one place: the
+    /// `WebSocketFrameDecoder` that `NIOTypedWebSocketServerUpgrader` installs
+    /// on the upgraded channel
+    /// (`swift-nio/Sources/NIOWebSocket/NIOWebSocketServerUpgrader.swift:316-325`).
+    /// Swan's outbound path is `outbound.write(.binary(_:))`
+    /// (`PublicFirehoseStreamingRoute.swift:416`), which emits one `fin: true`
+    /// frame of whatever size it is handed and never reads this value
+    /// (`swift-websocket/Sources/WSCore/WebSocketOutboundWriter.swift:30-47`;
+    /// only `writeBinaryMessage` at `:55-71` fragments, and nothing here calls
+    /// it). Sizing this against `FirehoseFrameLimits.maximumFrameBytes` was
+    /// therefore never what kept `#commit` frames on the wire — it only let
+    /// every anonymous socket pin a 5 MB decoder accumulation buffer, one byte
+    /// per second, for a protocol that defines no client-to-server data frame.
+    /// 4 KiB is the inbound budget: control frames are capped at 125 bytes by
+    /// RFC 6455 and cannot be affected.
+    ///
+    /// Auto-ping runs every `autoPingInterval` (30 seconds in production) so a
+    /// peer that never answers a ping is closed by Hummingbird's own liveness
+    /// loop; close negotiation is bounded so a dead peer cannot pin a channel.
     static func publicFirehoseWebSocketConfiguration(
         autoPingInterval: Duration = .seconds(30)
     ) -> WebSocketServerConfiguration {
         WebSocketServerConfiguration(
-            maxFrameSize: 5_000_000,
+            maxFrameSize: 4_096,
             autoPing: .enabled(timePeriod: autoPingInterval),
             closeTimeout: .seconds(15),
             validateUTF8: true

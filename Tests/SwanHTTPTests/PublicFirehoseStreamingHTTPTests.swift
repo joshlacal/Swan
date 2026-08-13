@@ -8,6 +8,7 @@ import NIOCore
 import Petrel
 import SwanOAuth
 import SwanPublicFirehose
+import SwanSpacesWire
 import SwanSQLite
 import XCTest
 @testable import SwanCore
@@ -39,6 +40,10 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
     limits: PublicFirehoseStreamingLimits? = nil,
     includeRuntime: Bool = true,
     port: Int = 3_000,
+    maximumConnections: Int = 256,
+    subscriberAdmission: PublicFirehoseSubscriberAdmission? = nil,
+    useDefaultObservation: Bool = false,
+    profileOverride: ProtocolProfile? = nil,
     observeSubscription: @escaping @Sendable (PublicFirehoseSubscriptionObservation) async -> Void = { _ in }
   ) async throws -> Fixture {
     let root = FileManager.default.temporaryDirectory
@@ -52,7 +57,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
     let firehose = try await SQLiteFirehoseDatabase(dataDirectory: root)
     let hub = PublicFirehoseWakeupHub()
     do {
-      let profile = try ProtocolProfile.load(
+      let profile = try profileOverride ?? ProtocolProfile.load(
         from: packageRoot().appending(
           path: "Profiles/permissioned-data-0016-2026-07-03.json"
         )
@@ -68,16 +73,23 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
           hub: hub,
           limits: limits ?? PublicFirehoseStreamingLimits.standard,
           logger: logger,
-          observeSubscription: observeSubscription
+          // Nil selects the production observer — the throttled journal
+          // writer — which is the thing under test for F33.
+          observeSubscription: useDefaultObservation ? nil : observeSubscription
         )
       } else {
         streamingRuntime = nil
       }
       let server = SwanHTTPServer(
         profile: profile,
-        configuration: .init(host: "127.0.0.1", port: port),
+        configuration: .init(
+          host: "127.0.0.1",
+          port: port,
+          maximumConnections: maximumConnections
+        ),
         oauthRuntime: oauthRuntime,
-        publicFirehoseStreaming: streamingRuntime
+        publicFirehoseStreaming: streamingRuntime,
+        publicFirehoseSubscriberAdmission: subscriberAdmission
       )
       return Fixture(
         server: server,
@@ -93,7 +105,11 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
     }
   }
 
-  private func commitItem(sourceKey: String, seed: UInt8) -> FirehoseAppendItem {
+  private func commitItem(
+    sourceKey: String,
+    seed: UInt8,
+    diffCARBytes: Int = 0
+  ) -> FirehoseAppendItem {
     let commitCID = CID.fromDAGCBOR(Data([seed]))
     let material = PublicFirehoseCommitMaterial(
       did: did,
@@ -104,6 +120,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
       ops: [],
       time: time
     )
+    let diffCAR = Data(repeating: seed, count: diffCARBytes)
     return FirehoseAppendItem(
       sourceKey: sourceKey,
       batchID: nil,
@@ -113,7 +130,7 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
       try FirehoseFrameEncoder.commitFrame(
         seq: seq,
         material: material,
-        diffCAR: Data()
+        diffCAR: diffCAR
       )
     }
   }
@@ -131,10 +148,11 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
     hub: PublicFirehoseWakeupHub,
     sourceKey: String,
     seed: UInt8,
+    diffCARBytes: Int = 0,
     now: Date = Date(timeIntervalSince1970: 1_785_844_800)
   ) async throws -> FirehoseStoredEvent {
     let sequences = try await firehose.appendBatch(
-      [commitItem(sourceKey: sourceKey, seed: seed)],
+      [commitItem(sourceKey: sourceKey, seed: seed, diffCARBytes: diffCARBytes)],
       now: now
     )
     if let maxSeq = sequences.max() {
@@ -1545,13 +1563,515 @@ final class PublicFirehoseStreamingHTTPTests: XCTestCase, @unchecked Sendable {
     }
   }
 
+  // MARK: - Subscriber admission
+
+  /// The sizing rule, stated as arithmetic rather than as a literal at the
+  /// call site: anonymous subscribers may hold a quarter of the listener
+  /// budget, so three quarters stay reachable by HTTP — login, OAuth, public
+  /// reads, and the relay's own reconnect.
+  func testFirehoseReservationLeavesThreeQuartersOfTheListenerBudget() async throws {
+    XCTAssertEqual(
+      PublicFirehoseSubscriberAdmission.reservedSubscriberSlots(listenerBudget: 256),
+      64
+    )
+    XCTAssertEqual(
+      PublicFirehoseSubscriberAdmission.reservedSubscriberSlots(listenerBudget: 1),
+      1,
+      "a tiny listener must still serve subscribeRepos at all"
+    )
+    let fixture = try await makeFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    let admission = fixture.server.publicFirehoseSubscriberAdmission
+    XCTAssertEqual(admission.maximumConcurrentSubscribers, 64)
+    XCTAssertEqual(
+      256 - admission.maximumConcurrentSubscribers,
+      192,
+      "192 listener slots must remain unreachable by anonymous subscribers"
+    )
+    try await fixture.control.close()
+    try await fixture.firehose.close()
+  }
+
+  /// The property the reservation exists for, proven end to end: with the
+  /// firehose budget fully held, a further subscriber is refused *and* an
+  /// unrelated HTTP route is still served on the same listener.
+  ///
+  /// A refusal on its own would prove nothing — the hazard is not that a 65th
+  /// subscriber connects, it is that anonymous WebSockets which never close
+  /// hold listener slots that `AvailableConnectionsHandler` refunds only from
+  /// `channel.closeFuture`, so the accept socket stops being read.
+  func testSaturatedFirehoseReservationRefusesSurplusAndLeavesHTTPServable() async throws {
+    let fixture = try await makeFixture(
+      maximumConnections: 8,
+      subscriberAdmission: PublicFirehoseSubscriberAdmission(
+        maximumConcurrentSubscribers: 2
+      )
+    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "PublicFirehoseStreamingHTTPTests.admission")
+      )
+      try await app.test(.live) { client in
+        let held = (0..<2).map { _ in
+          Task {
+            try await self.runWSClientPassive(
+              client,
+              path: self.subscribePath,
+              recorder: WSFrameRecorder()
+            )
+          }
+        }
+        defer {
+          for task in held { task.cancel() }
+        }
+        try await self.waitUntil { await fixture.hub.subscriberCount() == 2 }
+        XCTAssertEqual(
+          fixture.server.publicFirehoseSubscriberAdmission.snapshot,
+          .init(activeSubscribers: 2, maximumConcurrentSubscribers: 2)
+        )
+
+        let surplus = WSFrameRecorder()
+        let closeFrame = try await self.awaitWithDeadline {
+          try await self.runWSClientPassive(
+            client,
+            path: self.subscribePath,
+            recorder: surplus
+          )
+        }
+        XCTAssertEqual(
+          closeFrame?.closeCode,
+          .unknown(1_013),
+          "a capacity refusal is 1013 Try Again Later, not a lexicon #error name"
+        )
+        let surplusFrames = await surplus.snapshot()
+        XCTAssertTrue(
+          surplusFrames.isEmpty,
+          "a refused subscriber must receive no firehose frame at all"
+        )
+        let subscribers = await fixture.hub.subscriberCount()
+        XCTAssertEqual(
+          subscribers,
+          2,
+          "a refused subscriber must never reach the wakeup hub"
+        )
+
+        // The whole point: the listener still accepts and answers HTTP while
+        // every firehose slot is held.
+        try await client.execute(uri: "/health", method: .get) { response in
+          XCTAssertEqual(response.status, .ok)
+          XCTAssertEqual(String(buffer: response.body), "OK")
+        }
+
+        for task in held { task.cancel() }
+        for task in held { _ = try? await task.value }
+        try await self.waitUntil {
+          fixture.server.publicFirehoseSubscriberAdmission
+            .snapshot.activeSubscribers == 0
+        }
+      }
+      try await fixture.control.close()
+      try await fixture.firehose.close()
+    } catch {
+      try? await fixture.control.close()
+      try? await fixture.firehose.close()
+      throw error
+    }
+  }
+
+  /// A disconnect must refund its slot, or the reservation degrades into a
+  /// permanent lockout after the first `maximumConcurrentSubscribers`
+  /// connections in the process's lifetime.
+  func testDisconnectedSubscriberRefundsItsReservation() async throws {
+    let fixture = try await makeFixture(
+      subscriberAdmission: PublicFirehoseSubscriberAdmission(
+        maximumConcurrentSubscribers: 1
+      )
+    )
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let admission = fixture.server.publicFirehoseSubscriberAdmission
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "PublicFirehoseStreamingHTTPTests.admission-refund")
+      )
+      try await app.test(.live) { client in
+        for attempt in 0..<2 {
+          try await self.appendCommit(
+            to: fixture.firehose,
+            hub: fixture.hub,
+            sourceKey: "refund-\(attempt)",
+            seed: UInt8(0x60 + attempt)
+          )
+          let recorder = WSFrameRecorder()
+          _ = try await self.awaitWithDeadline {
+            try await self.runWSClient(
+              client,
+              path: "\(self.subscribePath)?cursor=0",
+              recorder: recorder,
+              closeAfterFrames: 1
+            )
+          }
+          let delivered = await recorder.snapshot()
+          XCTAssertEqual(
+            delivered.count,
+            1,
+            "attempt \(attempt) must be admitted"
+          )
+          try await self.waitUntil { admission.snapshot.activeSubscribers == 0 }
+        }
+      }
+      try await fixture.control.close()
+      try await fixture.firehose.close()
+    } catch {
+      try? await fixture.control.close()
+      try? await fixture.firehose.close()
+      throw error
+    }
+  }
+
+  // MARK: - Outbound write deadline
+
+  /// `maximumWriteDuration` must be a deadline, not a post-mortem.
+  ///
+  /// The shape this replaces measured each write *after* it returned. Against
+  /// the case worth bounding — a peer that stopped reading, so the socket
+  /// buffer fills and the write suspends inside the page — that comparison is
+  /// never reached at all. This test discriminates the two directly: it is the
+  /// *elapsed* time, not the thrown error, that tells them apart. A write that
+  /// takes 2 s under a 50 ms limit throws `writeTooSlow` either way; only the
+  /// deadline throws it at 50 ms.
+  func testSlowOutboundWriteIsDroppedAtTheDeadlineNotAfterTheWrite() async throws {
+    let fixture = try await makeFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      try await self.appendCommit(
+        to: fixture.firehose, hub: fixture.hub, sourceKey: "slow-write", seed: 0x81
+      )
+      let limits = try PublicFirehoseStreamingLimits(
+        maximumWriteDuration: .milliseconds(50),
+        idlePollInterval: 0.01
+      )
+      let tailer = PublicFirehoseTailer(
+        database: fixture.firehose,
+        limits: limits,
+        logger: Logger(label: "PublicFirehoseStreamingHTTPTests.slow-write")
+      )
+      let clock = ContinuousClock()
+      let started = clock.now
+      do {
+        try await tailer.run(
+          lastSent: 0,
+          outbound: { _ in try await Task.sleep(for: .seconds(2)) },
+          waitForWakeup: { nil }
+        )
+        XCTFail("a write that outruns the deadline must drop the consumer")
+      } catch let error as PublicFirehoseTailerError {
+        guard case .writeTooSlow(let duration) = error else {
+          return XCTFail("expected writeTooSlow, got \(error)")
+        }
+        XCTAssertEqual(duration, .milliseconds(50))
+      }
+      let elapsed = clock.now - started
+      XCTAssertLessThan(
+        elapsed,
+        .seconds(1),
+        """
+        the drop must happen at the deadline, not once the write finally \
+        returns — took \(elapsed)
+        """
+      )
+      try await fixture.control.close()
+      try await fixture.firehose.close()
+    } catch {
+      try? await fixture.control.close()
+      try? await fixture.firehose.close()
+      throw error
+    }
+  }
+
+  // MARK: - Permissioned route surface
+
+  /// F13's route half. It lives in this file because lane ownership put
+  /// `SwanHTTP.swift` here; the property is about the permissioned surface,
+  /// not about the firehose.
+  ///
+  /// `--profile` is documented as the control that decides which permissioned
+  /// methods this deployment speaks, but the registration loop iterated the
+  /// generated registry unfiltered, so every method the registry knows got a
+  /// 503 gate whether the profile declared it or not. The filter is a no-op
+  /// against both checked-in profiles — this test is what makes it observable
+  /// at all, by narrowing a real profile by one endpoint.
+  func testPermissionedRoutesFollowTheSelectedProfile() async throws {
+    let profileURL = packageRoot().appending(
+      path: "Profiles/permissioned-data-0016-2026-07-03.json"
+    )
+    var object = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try Data(contentsOf: profileURL))
+        as? [String: Any]
+    )
+    let endpoints = try XCTUnwrap(object["endpoints"] as? [String])
+    let divergent = Set(
+      ((object["intentionalDivergences"] as? [[String: Any]]) ?? [])
+        .compactMap { $0["endpoint"] as? String }
+    )
+    // A query so the retained-versus-dropped comparison is GET on both sides.
+    let queryNSIDs = Set(
+      PermissionedData0016.methods
+        .filter { $0.kind == .query }
+        .map(\.nsid)
+    )
+    let candidates = endpoints.filter {
+      queryNSIDs.contains($0) && !divergent.contains($0)
+    }
+    let dropped = try XCTUnwrap(candidates.first)
+    let retained = try XCTUnwrap(candidates.dropFirst().first)
+    object["endpoints"] = endpoints.filter { $0 != dropped }
+    let narrowed = try ProtocolProfile(
+      data: JSONSerialization.data(withJSONObject: object)
+    )
+
+    let fixture = try await makeFixture(profileOverride: narrowed)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "PublicFirehoseStreamingHTTPTests.profile-surface")
+      )
+      try await app.test(.router) { client in
+        try await client.execute(uri: "/xrpc/\(retained)", method: .get) { response in
+          XCTAssertEqual(
+            response.status,
+            .serviceUnavailable,
+            "a declared method keeps its method-correct 503 gate"
+          )
+        }
+        try await client.execute(uri: "/xrpc/\(dropped)", method: .get) { response in
+          XCTAssertEqual(
+            response.status,
+            .notFound,
+            "a method the profile does not declare must not be advertised as pending"
+          )
+        }
+      }
+      try await fixture.control.close()
+      try await fixture.firehose.close()
+    } catch {
+      try? await fixture.control.close()
+      try? await fixture.firehose.close()
+      throw error
+    }
+  }
+
+  // MARK: - Lifecycle journal throttling
+
+  /// The defect, stated as a property of the key rather than of the log.
+  ///
+  /// Every session gets a fresh UUID, so a key that included it would make
+  /// every record unique and the throttle a no-op — which is why connection
+  /// churn could set the journal's growth rate. Two opens differing only in
+  /// connection id must collapse to one key; a genuinely different record
+  /// shape must not be delayed behind them.
+  func testLifecycleDiagnosticKeyIgnoresConnectionIdentity() {
+    publicFirehoseDiagnosticThrottle.resetForTesting()
+    let first = PublicFirehoseSubscriptionObservation(
+      event: .opened,
+      connectionID: UUID().uuidString,
+      cursorMode: .live,
+      cursorValue: nil,
+      closeCategory: nil,
+      closeReason: nil
+    )
+    let second = PublicFirehoseSubscriptionObservation(
+      event: .opened,
+      connectionID: UUID().uuidString,
+      cursorMode: .live,
+      cursorValue: nil,
+      closeCategory: nil,
+      closeReason: nil
+    )
+    XCTAssertNotEqual(first.connectionID, second.connectionID)
+    XCTAssertEqual(first.diagnosticKey, second.diagnosticKey)
+
+    let backfill = PublicFirehoseSubscriptionObservation(
+      event: .opened,
+      connectionID: first.connectionID,
+      cursorMode: .backfill,
+      cursorValue: 7,
+      closeCategory: nil,
+      closeReason: nil
+    )
+    XCTAssertNotEqual(first.diagnosticKey, backfill.diagnosticKey)
+    let closed = PublicFirehoseSubscriptionObservation(
+      event: .closed,
+      connectionID: first.connectionID,
+      cursorMode: nil,
+      cursorValue: nil,
+      closeCategory: .failure,
+      closeReason: .subscriberCapacity
+    )
+    XCTAssertEqual(closed.diagnosticKey, "failure|subscriber_capacity")
+
+    let now = ContinuousClock.now
+    XCTAssertEqual(
+      publicFirehoseDiagnosticThrottle.admit(
+        method: first.event.rawValue, reason: first.diagnosticKey, now: now
+      ),
+      0,
+      "the first record of a shape is always journalled"
+    )
+    XCTAssertNil(
+      publicFirehoseDiagnosticThrottle.admit(
+        method: second.event.rawValue, reason: second.diagnosticKey, now: now
+      ),
+      "a second open differing only in connection id must be suppressed"
+    )
+    XCTAssertEqual(
+      publicFirehoseDiagnosticThrottle.admit(
+        method: backfill.event.rawValue, reason: backfill.diagnosticKey, now: now
+      ),
+      0,
+      "a different record shape must never wait behind an ongoing window"
+    )
+    publicFirehoseDiagnosticThrottle.resetForTesting()
+  }
+
+  /// The same property through the real route: anonymous connect/disconnect
+  /// churn must stop setting the journal's growth rate.
+  func testConnectionChurnDoesNotSetTheJournalGrowthRate() async throws {
+    publicFirehoseDiagnosticThrottle.resetForTesting()
+    publicFirehoseDiagnosticJournalLines.withLock { $0 = 0 }
+    defer { publicFirehoseDiagnosticThrottle.resetForTesting() }
+    let fixture = try await makeFixture(useDefaultObservation: true)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      try await self.appendCommit(
+        to: fixture.firehose, hub: fixture.hub, sourceKey: "churn", seed: 0x71
+      )
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "PublicFirehoseStreamingHTTPTests.churn")
+      )
+      let cycles = 8
+      try await app.test(.live) { client in
+        for _ in 0..<cycles {
+          let recorder = WSFrameRecorder()
+          _ = try await self.awaitWithDeadline {
+            try await self.runWSClient(
+              client,
+              path: "\(self.subscribePath)?cursor=0",
+              recorder: recorder,
+              closeAfterFrames: 1
+            )
+          }
+        }
+      }
+      let lines = publicFirehoseDiagnosticJournalLines.withLock { $0 }
+      XCTAssertLessThanOrEqual(
+        lines,
+        4,
+        """
+        \(cycles) churn cycles produced \(cycles * 2) lifecycle records; the \
+        journal must carry at most one line per distinct record shape per \
+        window, not one per connection
+        """
+      )
+      XCTAssertGreaterThan(lines, 0, "the first record of each shape stays visible")
+      try await fixture.control.close()
+      try await fixture.firehose.close()
+    } catch {
+      try? await fixture.control.close()
+      try? await fixture.firehose.close()
+      throw error
+    }
+  }
+
   // MARK: - Configuration
 
-  func testWebSocketMaxFrameSizeAtLeastFrameLimit() {
-    XCTAssertGreaterThanOrEqual(
-      SwanHTTPServer.publicFirehoseWebSocketConfiguration().maxFrameSize,
-      FirehoseFrameLimits.maximumFrameBytes,
-      "the ws maxFrameSize must cover the largest stored firehose frame"
+  /// `maxFrameSize` reaches only the inbound `WebSocketFrameDecoder`
+  /// (`NIOTypedWebSocketServerUpgrader` at
+  /// `swift-nio/Sources/NIOWebSocket/NIOWebSocketServerUpgrader.swift:316-325`),
+  /// so it is a bound on what an anonymous client may make the server buffer
+  /// and parse — not a floor under what Swan may send. `subscribeRepos`
+  /// defines no client-to-server data frame at all, so the budget is the
+  /// smallest one that still leaves control frames (bounded at 125 bytes by
+  /// RFC 6455) and any future short client message comfortable.
+  func testWebSocketMaxFrameSizeBoundsInboundClientFrames() {
+    let configuration = SwanHTTPServer.publicFirehoseWebSocketConfiguration()
+    XCTAssertEqual(
+      configuration.maxFrameSize,
+      4_096,
+      "the ws maxFrameSize is the inbound client-frame budget, not an outbound floor"
     )
+    XCTAssertLessThan(
+      configuration.maxFrameSize,
+      FirehoseFrameLimits.maximumFrameBytes,
+      """
+      the inbound budget must not be sized against the outbound frame ceiling: \
+      a client that may pin one stored-frame-sized decoder buffer per socket is \
+      exactly the hazard this value exists to bound
+      """
+    )
+  }
+
+  /// The property the small `maxFrameSize` must not break, pinned against the
+  /// wire rather than against the configuration value.
+  ///
+  /// `WebSocketOutboundWriter.write(.binary(_:))`
+  /// (`swift-websocket/Sources/WSCore/WebSocketOutboundWriter.swift:30-47`)
+  /// emits one `fin: true` frame and never consults `maxFrameSize`; only
+  /// `writeBinaryMessage` (`:55-71`) fragments. Swan's tailer uses the former
+  /// (`PublicFirehoseStreamingRoute.swift:416`). A future switch to
+  /// `writeBinaryMessage` would silently start fragmenting every `#commit`
+  /// above 4 KiB, which no `subscribeRepos` consumer expects — this test is
+  /// what fails when that happens.
+  func testOutboundCommitFramesAboveMaxFrameSizeArriveUnfragmented() async throws {
+    let fixture = try await makeFixture()
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let inboundBudget = SwanHTTPServer
+        .publicFirehoseWebSocketConfiguration().maxFrameSize
+      let stored = try await self.appendCommit(
+        to: fixture.firehose,
+        hub: fixture.hub,
+        sourceKey: "oversize-commit",
+        seed: 0x11,
+        diffCARBytes: 64 * 1_024
+      )
+      XCTAssertGreaterThan(
+        stored.frameBytes.count,
+        inboundBudget,
+        "the fixture frame must exceed the inbound budget or this proves nothing"
+      )
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "PublicFirehoseStreamingHTTPTests.unfragmented")
+      )
+      try await app.test(.live) { client in
+        let recorder = WSFrameRecorder()
+        let wsTask = Task {
+          try await self.runWSClient(
+            client,
+            path: "\(self.subscribePath)?cursor=0",
+            recorder: recorder,
+            closeAfterFrames: 1
+          )
+        }
+        try await self.waitUntil { await recorder.snapshot().count == 1 }
+        _ = try await self.awaitWithDeadline { try await wsTask.value }
+        let frames = await recorder.snapshot()
+        XCTAssertEqual(frames.count, 1, "one stored frame must arrive as one frame")
+        let frame = try XCTUnwrap(frames.first)
+        XCTAssertEqual(frame.opcode, .binary)
+        XCTAssertTrue(frame.fin, "a #commit frame must not be fragmented")
+        XCTAssertEqual(Data(buffer: frame.data), stored.frameBytes)
+        XCTAssertFalse(
+          frames.contains { $0.opcode == .continuation },
+          "no continuation frame may appear on the subscribeRepos wire"
+        )
+      }
+      try await fixture.control.close()
+      try await fixture.firehose.close()
+    } catch {
+      try? await fixture.control.close()
+      try? await fixture.firehose.close()
+      throw error
+    }
   }
 }
