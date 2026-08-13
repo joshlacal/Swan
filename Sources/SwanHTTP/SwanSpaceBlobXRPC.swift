@@ -74,15 +74,44 @@ private struct AuthenticatedGetSpaceBlobHandler:
         )
         try requireBlobReadAuthorization(authorization, author: target.author)
 
-        guard let streamLease = capability.streamAdmission.reserve(
+        // The transfer budget is a *byte* budget, and the lease this method
+        // returns outlives the handler: it is released only when the response
+        // writer finishes, i.e. for as long as the reader takes. Reserving
+        // the 256 MiB ceiling for the whole of that window is what the
+        // finding is about — a 5 KiB avatar would cost a quarter of one
+        // author's 512 MiB allowance, so two stalled tiny reads exhaust an
+        // author and four exhaust the whole 1 GiB pool, starving the public
+        // CAR, public blob, and blob-upload streams that share it while
+        // moving almost nothing.
+        //
+        // `SwanPublicRepositoryReadXRPC` avoids this by reserving the true
+        // size up front, which it can do because `PublicRepositoryReadBlobStore`
+        // exposes `publicBlobMetadata` — a metadata-only projection. The
+        // permissioned store has no equivalent for the `space` namespace, and
+        // adding one is a change to `SQLiteAccountDatabase`, so the ceiling is
+        // instead held only across the open-and-verify step (bounded work
+        // that no client can stall) and then *exchanged* for a reservation
+        // covering exactly the bytes this response will stream. The stall
+        // window — the part a reader controls — is therefore right-sized.
+        //
+        // The exchange acquires before it releases, so a request that has
+        // already been admitted can never be turned into a refusal by the
+        // resize: the worst case is that it keeps the ceiling it already had.
+        guard let admissionLease = capability.streamAdmission.reserve(
             accountDID: target.author,
             maximumBytes: maximumPermissionedBlobTransferBytes
         ) else {
             throw AuthenticatedSpaceBlobFailure.unavailable
         }
+        // Both leases are tracked independently so no throw between the
+        // acquire and the release can leak either one.
+        var transferLease: PublicRepositorySpoolLease?
         var handedOff = false
         defer {
-            if !handedOff { streamLease.release() }
+            if !handedOff {
+                transferLease?.release()
+                admissionLease.release()
+            }
         }
 
         let blob: AuthorizedSpaceBlob?
@@ -110,12 +139,25 @@ private struct AuthenticatedGetSpaceBlobHandler:
               blob.body.contentLength <= maximumPermissionedBlobTransferBytes else {
             throw AuthenticatedSpaceBlobFailure.unavailable
         }
+        // `contentLength` is the single declared length: it sizes this
+        // reservation, it is emitted as `Content-Length`, and the response
+        // writer refuses to move a byte past it. The reservation therefore
+        // cannot under-cover the transfer it admits, which is the property a
+        // right-sized reservation has to keep — one that can under-cover is
+        // strictly worse than reserving the ceiling.
+        if blob.body.contentLength < maximumPermissionedBlobTransferBytes {
+            transferLease = capability.streamAdmission.reserve(
+                accountDID: target.author,
+                maximumBytes: blob.body.contentLength
+            )
+            if transferLease != nil { admissionLease.release() }
+        }
         handedOff = true
         return PreparedResponse(
             cid: target.cid,
             mimeType: safeResponseMIMEType(blob.mimeType),
             blob: blob,
-            streamLease: streamLease
+            streamLease: transferLease ?? admissionLease
         )
     }
 
@@ -163,10 +205,27 @@ func registerAuthenticatedGetSpaceBlobEndpoint(
                 headers: headers,
                 body: .init { writer in
                     defer { prepared.streamLease.release() }
+                    // The reservation held across this stream, the
+                    // `Content-Length` emitted above, and this bound are all
+                    // the same declared length. A body that delivered more
+                    // than it declared would move bytes the reservation does
+                    // not cover — strictly worse than reserving the ceiling —
+                    // so the surplus is refused rather than written. A body
+                    // that delivers less is refused too, rather than
+                    // completing a response whose framing lies about it.
+                    let declaredLength = prepared.blob.body.contentLength
+                    var writtenBytes = 0
                     try await prepared.blob.body.streamBody(
                         maximumChunkBytes: 64 * 1_024
                     ) { chunk in
+                        guard chunk.count <= declaredLength - writtenBytes else {
+                            throw AuthenticatedSpaceBlobFailure.unavailable
+                        }
+                        writtenBytes += chunk.count
                         try await writer.write(ByteBuffer(data: chunk))
+                    }
+                    guard writtenBytes == declaredLength else {
+                        throw AuthenticatedSpaceBlobFailure.unavailable
                     }
                     try await writer.finish(nil)
                 }

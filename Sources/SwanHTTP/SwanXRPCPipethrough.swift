@@ -715,13 +715,26 @@ private func pipethroughResponse(_ response: OAuthRemoteHTTPResponse) throws -> 
         output[item.key.lowercased(), default: []].append(contentsOf: item.value)
     }
     var headers: HTTPFields = [.cacheControl: "no-store"]
-    // Deliberately narrow. `location` is here because without it an upstream
-    // 3xx reaches the client bodyless and unfollowable; every other upstream
-    // header stays dropped so nothing the proxy has not reasoned about (cookies,
-    // auth challenges, caching directives) is relayed.
+    // Deliberately narrow, and narrower than it used to be: `location` is no
+    // longer relayed. The reference PDS forwards only `atproto-repo-rev`,
+    // `atproto-content-labelers`, `retry-after` and the `content-*` family
+    // (`atproto/packages/pds/src/pipethrough.ts:527-531` for the explicit list,
+    // and the `responseHeaders` generator immediately below it for `content-*`)
+    // — never `location`. Swan now matches that shape, forwarding a strict
+    // subset of it.
+    //
+    // The risk closed by dropping it is not a classic open redirect. It is a
+    // *relative* `Location` ("/xrpc/com.atproto.server.createSession",
+    // "../admin"): a client that resolves it against the request URL sends its
+    // next request back to `swan.place`, carrying Swan credentials, to a path an
+    // upstream third-party service chose. Every other upstream header stays
+    // dropped for the same reason it always was, so nothing the proxy has not
+    // reasoned about (cookies, auth challenges, caching directives) is relayed.
+    //
+    // A same-host restriction was considered and rejected: it forbids the
+    // legitimate CDN redirect and has no principled boundary.
     let forwarded: [(String, HTTPField.Name)] = [
         ("content-type", .contentType),
-        ("location", .location),
     ]
     for (name, field) in forwarded {
         guard let values = canonical[name], values.count == 1,

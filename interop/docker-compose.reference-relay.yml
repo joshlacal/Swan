@@ -29,7 +29,7 @@ services:
       - --management-port
       - "3001"
       - --management-operator-secret-file
-      - /run/secrets/swan-runtime/operator-secret
+      - /run/secrets/swan-operator/operator-secret
       - --enable-management-plc-provisioning
       - --enable-management-firehose-sync
       - --management-account-kek-file
@@ -57,6 +57,12 @@ services:
       - mailpit
       - --email-smtp-port
       - "1025"
+    # Compose merges service volume lists by mount target, so the base file's
+    # data, runtime-secret, and notification-config mounts are still present.
+    # This is the only mount of the operator secret anywhere in the laboratory,
+    # and it exists only in the one overlay that passes `--management-port`.
+    volumes:
+      - swan-operator-secrets:/run/secrets/swan-operator:ro
 
   caddy:
     build:

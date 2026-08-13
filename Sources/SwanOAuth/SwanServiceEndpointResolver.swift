@@ -24,6 +24,11 @@ public struct SwanServiceEndpointResolver: Sendable {
             let serviceEndpoint: String
         }
 
+        /// The document's own subject. Optional only so a document that omits
+        /// it decodes and is then *rejected* below with the same
+        /// `.unresolvableService` as everything else, rather than failing
+        /// decode and taking a different path to the same answer.
+        let id: String?
         let service: [Service]?
     }
 
@@ -43,11 +48,34 @@ public struct SwanServiceEndpointResolver: Sendable {
         guard let document = try? JSONDecoder().decode(Document.self, from: data),
               let services = document.service
         else { throw SwanServiceResolutionFailure.unresolvableService }
-        // A service id may be written "#frag" or "did:...#frag".
+        // Bind the document to the DID that was asked for. Without this the
+        // fetch path's answer is trusted on its own: a `did:web` host that
+        // serves (or is made to serve) some other subject's document — via a
+        // shared host, a stale cache entry, or a path that is not the one the
+        // method-specific id names — silently selects that subject's endpoint.
+        //
+        // The comparison is byte-exact against the DID string as received.
+        // `did:web` ids legitimately differ in `%3A` port encoding and in host
+        // case, and any normalisation applied here would be a second, weaker
+        // grammar than the one `SwanPeerPinnedDIDDocumentFetcher` already used
+        // to derive the URL — which is exactly how a mismatch gets accepted.
+        // A document with no `id` at all is rejected: `id` is required by DID
+        // Core, and a document that will not name its own subject cannot be
+        // bound to one.
+        guard document.id == did else {
+            throw SwanServiceResolutionFailure.unresolvableService
+        }
+        // A service id may be written "#frag" or "did:...#frag". Exactly one
+        // entry may match: a document that declares the same service id twice
+        // is malformed, and picking the first would let a later duplicate be
+        // appended to a document to shadow-or-be-shadowed depending only on
+        // ordering. Refuse the ambiguity instead of resolving it.
+        let matches = services.filter {
+            $0.id == "#\(fragment)" || $0.id == "\(did)#\(fragment)"
+        }
         guard
-            let match = services.first(where: {
-                $0.id == "#\(fragment)" || $0.id == "\(did)#\(fragment)"
-            }),
+            matches.count == 1,
+            let match = matches.first,
             let url = URL(string: match.serviceEndpoint),
             url.scheme?.lowercased() == "https",
             let host = url.host, !host.isEmpty,

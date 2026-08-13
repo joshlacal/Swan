@@ -127,6 +127,34 @@ struct ServeNotificationRuntime {
         case invalid
     }
 
+    /// Whether an operator-supplied notification configuration selects a
+    /// laboratory PLC policy for either the credential or the delegation
+    /// resolver.
+    ///
+    /// Decoded on its own, and deliberately non-throwing, so `serve`'s startup
+    /// interlock can refuse a laboratory PLC on a public origin *before* any
+    /// database, key store, or listener exists. A file this cannot read or
+    /// decode answers `false`, which cannot widen anything: ``load(from:continuityStore:)``
+    /// owns the diagnostics for an unusable file and refuses the same file a
+    /// few lines later with a message that names the flag.
+    static func selectsLaboratoryPLC(from url: URL) -> Bool {
+        struct LaboratorySelection: Decodable {
+            struct PLC: Decodable {
+                let laboratory: Bool?
+            }
+
+            let credentialKeyPLC: PLC?
+            let delegationKeyPLC: PLC?
+        }
+        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
+              data.count > 0, data.count <= 256 * 1_024,
+              let selection = try? JSONDecoder()
+              .decode(LaboratorySelection.self, from: data)
+        else { return false }
+        return (selection.credentialKeyPLC?.laboratory ?? false)
+            || (selection.delegationKeyPLC?.laboratory ?? false)
+    }
+
     static func load(
         from url: URL,
         continuityStore: any PLCCredentialKeyContinuityStore
@@ -1839,6 +1867,23 @@ extension SwanCommand {
         @Option(name: .long, help: "Public issuer URL")
         var publicURL: String?
 
+        /// The public listener's connection budget, and — because
+        /// ``PublicFirehoseSubscriberAdmission`` sizes itself as a quarter of
+        /// it — the anonymous `subscribeRepos` reservation too.
+        ///
+        /// The runtime already reserved a share of this budget; there was
+        /// simply no way to say what the budget was, so an operator under load
+        /// had the 256-slot compiled-in default and nothing else. 256 stays the
+        /// default so the flag changes nothing for anyone who does not pass it;
+        /// at that value 64 slots are reserved for anonymous firehose
+        /// subscribers and 192 remain permanently reachable for login, OAuth,
+        /// public reads, and the relay's own reconnect.
+        @Option(
+            name: .customLong("max-connections"),
+            help: "Maximum simultaneously accepted public listener connections (default: 256); a quarter is reserved for anonymous firehose subscribers"
+        )
+        var maxConnections: Int = 256
+
         @Flag(name: .long, help: "Enable only the localhost-development-client OAuth PAR bridge; requires an HTTPS public issuer")
         var enableLocalhostPAR = false
 
@@ -2108,9 +2153,24 @@ extension SwanCommand {
                     }
                     return surface
                 }
-                return try SwanPublicRouteSurface.load(
-                    profileURL: URL(fileURLWithPath: selector)
+                // Read once and resolve from the bytes, so the advertisement
+                // check below sees exactly the artifact the surface came from
+                // rather than re-reading a file that could have changed.
+                let data: Data
+                do {
+                    data = try Data(
+                        contentsOf: URL(fileURLWithPath: selector),
+                        options: [.mappedIfSafe]
+                    )
+                } catch {
+                    throw SwanPublicRouteSurfaceError.unreadableProfile
+                }
+                let surface = try SwanPublicRouteSurface.resolve(profileData: data)
+                try Self.requireAdvertisedEndpointsAreServed(
+                    profileData: data,
+                    surface: surface
                 )
+                return surface
             } catch let error as SwanPublicRouteSurfaceError {
                 throw ValidationError("--public-profile is unusable: \(error)")
             }
@@ -2124,10 +2184,166 @@ extension SwanCommand {
             selector.contains("/") || selector.hasSuffix(".json")
         }
 
+        /// Refuses a public profile artifact that advertises an endpoint this
+        /// build registers no route for.
+        ///
+        /// A profile artifact carries an `endpoints` array; the route surface
+        /// the router installs comes from a checked-in registry keyed on the
+        /// artifact's `id`. Nothing reconciled the two at startup, and the
+        /// registry deliberately contains an alias —
+        /// `public-data-testing-2026-08-06` maps to
+        /// `PublicDataTesting20260805`'s method list because the successor's
+        /// wire contract is byte-identical. That alias is sound only while the
+        /// two artifacts agree. Add a later successor to `Profiles/`, map it to
+        /// a stale registry entry, and the process advertises a method whose
+        /// route was never installed: `describeServer` and the profile name it,
+        /// the namespace guard answers 404, and nothing in the build says so.
+        ///
+        /// It is a **subset** test, not an equality test.
+        /// ``SwanPublicRouteSurface/outOfProfilePublicMethods`` is served
+        /// without being declared by any profile — `resolveHandle` — and that
+        /// asymmetry is intended, so only the advertise-but-do-not-serve
+        /// direction is an error.
+        ///
+        /// This is a no-op for every profile shipped today; it is a guard
+        /// against a future profile bump, which is exactly when nobody will be
+        /// looking.
+        static func requireAdvertisedEndpointsAreServed(
+            profileData: Data,
+            surface: SwanPublicRouteSurface
+        ) throws {
+            struct AdvertisedEndpoints: Decodable {
+                let endpoints: [String]?
+            }
+            let advertised: [String]
+            do {
+                advertised = try JSONDecoder()
+                    .decode(AdvertisedEndpoints.self, from: profileData)
+                    .endpoints ?? []
+            } catch {
+                throw SwanPublicRouteSurfaceError.malformedProfile
+            }
+            let served = surface.servedMethodNSIDs
+            let unserved = advertised.filter { !served.contains($0) }.sorted()
+            guard unserved.isEmpty else {
+                throw ValidationError(
+                    "--public-profile '\(surface.profileID)' advertises "
+                        + "\(unserved.count) endpoint(s) this build registers "
+                        + "no route for: \(unserved.joined(separator: ", "))"
+                )
+            }
+        }
+
+        /// Whether a resolved `--public-url` names an origin the public
+        /// Internet can actually reach.
+        ///
+        /// Two startup interlocks below refuse a laboratory-only capability on
+        /// a real deployment, and both need the same answer, so this is one
+        /// predicate rather than two hand-copied ones — that duplication is how
+        /// the two copies of the outbound-address table went on disagreeing
+        /// about 6to4 for a month.
+        ///
+        /// "Non-loopback HTTPS" alone is deliberately *not* the test, and the
+        /// difference is load-bearing. The disposable interop laboratory serves
+        /// `https://swan.test` behind Caddy, and the serve CLI regression suite
+        /// uses `https://swan.example`. Both are non-loopback HTTPS origins;
+        /// both are names RFC 6761 and RFC 2606 permanently reserve, so neither
+        /// can ever be delegated in public DNS. Refusing them would refuse the
+        /// only topologies these laboratory options exist for. What is refused
+        /// is an origin that could genuinely be resolved by a stranger.
+        static func isPubliclyReachableHTTPSOrigin(_ url: URL) -> Bool {
+            guard url.scheme?.lowercased() == "https" else { return false }
+            guard let rawHost = url.host?.lowercased(), !rawHost.isEmpty else {
+                return false
+            }
+            // A literal answers from the address table rather than from a name
+            // suffix: `https://198.51.100.7` is documentation space and
+            // `https://93.184.216.34` is not.
+            if let literal = OAuthIPAddress(literal: rawHost) {
+                return literal.isPublicInternetAddress
+            }
+            let host = rawHost.hasSuffix(".") ? String(rawHost.dropLast()) : rawHost
+            // A single label has no public delegation at all.
+            guard host.contains(".") else { return false }
+            let reserved = Self.reservedNonPublicDNSSuffixes.contains { suffix in
+                host == suffix || host.hasSuffix(".\(suffix)")
+            }
+            return !reserved
+        }
+
+        /// Suffixes that can never be delegated in public DNS: RFC 6761's
+        /// special-use domain names, RFC 6762's `.local`, RFC 8375's
+        /// `home.arpa`, RFC 2606's example domains, and the `.internal` TLD
+        /// ICANN reserved for private use.
+        static let reservedNonPublicDNSSuffixes: [String] = [
+            "example",
+            "example.com",
+            "example.net",
+            "example.org",
+            "home.arpa",
+            "internal",
+            "invalid",
+            "local",
+            "localhost",
+            "test",
+        ]
+
+        /// Refuses a laboratory PLC policy on a deployment strangers can reach.
+        ///
+        /// A laboratory PLC configuration accepts a plaintext-HTTP directory at
+        /// an explicitly allowlisted service hostname. That is correct inside a
+        /// disposable Compose network and is a mint-any-identity configuration
+        /// anywhere else: whoever answers that origin, or sits on the path to
+        /// it, chooses the credential and delegation keys Swan will trust.
+        static func requireLaboratoryPLCStaysOffPublicOrigins(
+            notificationConfigurationSelectsLaboratoryPLC: Bool,
+            publicURL: URL
+        ) throws {
+            guard notificationConfigurationSelectsLaboratoryPLC,
+                  Self.isPubliclyReachableHTTPSOrigin(publicURL)
+            else { return }
+            throw ValidationError(
+                "--notification-config selects a laboratory PLC policy, which "
+                    + "is refused when --public-url names a publicly reachable "
+                    + "HTTPS origin"
+            )
+        }
+
+        /// Refuses the laboratory OAuth metadata IP allowlist on a deployment
+        /// strangers can reach.
+        ///
+        /// The allowlist approves an address for *any* hostname that resolves
+        /// to it, and the complete authorization server hands remote callers a
+        /// `client_id` whose metadata Swan then fetches. Composed with a public
+        /// origin that is a blind SSRF into whatever the operator allowlisted.
+        /// Written to the same shape as the laboratory-PLC interlock above on
+        /// purpose: they are the same rule about the same boundary.
+        static func requireMetadataIPAllowlistStaysOffPublicOrigins(
+            allowlistedMetadataIPLiterals: [String],
+            publicURL: URL
+        ) throws {
+            guard !allowlistedMetadataIPLiterals.isEmpty,
+                  Self.isPubliclyReachableHTTPSOrigin(publicURL)
+            else { return }
+            throw ValidationError(
+                "--oauth-allow-metadata-ip is a laboratory option, which is "
+                    + "refused when --public-url names a publicly reachable "
+                    + "HTTPS origin"
+            )
+        }
+
         func run() async throws {
             guard (1 ... 1_000_000).contains(spaceOplogRetention) else {
                 throw ValidationError(
                     "--space-oplog-retention must be from 1 through 1000000"
+                )
+            }
+            // Bounded before anything reads it. `SwanHTTPConfiguration` only
+            // `precondition`s `> 0`, and a precondition failure is a crash
+            // rather than a startup refusal an operator can read.
+            guard (1 ... 65_536).contains(maxConnections) else {
+                throw ValidationError(
+                    "--max-connections must be from 1 through 65536"
                 )
             }
             let loginClientIdentityPolicy: SwanLoginClientIdentityPolicy
@@ -2316,6 +2532,23 @@ extension SwanCommand {
                     "--enable-local-space-interop requires an HTTPS --public-url"
                 )
             }
+            // Both laboratory interlocks run here: after the public origin is
+            // known and before the control database, key stores, or any
+            // listener exist, so a refused configuration leaves no state
+            // behind.
+            try Self.requireLaboratoryPLCStaysOffPublicOrigins(
+                notificationConfigurationSelectsLaboratoryPLC:
+                notificationConfig.map {
+                    ServeNotificationRuntime.selectsLaboratoryPLC(
+                        from: URL(fileURLWithPath: $0)
+                    )
+                } ?? false,
+                publicURL: baseURL
+            )
+            try Self.requireMetadataIPAllowlistStaysOffPublicOrigins(
+                allowlistedMetadataIPLiterals: oauthMetadataAllowedIPs,
+                publicURL: baseURL
+            )
             let dataURL = URL(fileURLWithPath: dataDirectory)
             let serverKey = try loadOAuthServerKey(fromFile: oauthServerKeyFile)
             let controlDatabase = try await SQLiteControlDatabase(dataDirectory: dataURL)
@@ -3041,6 +3274,11 @@ extension SwanCommand {
                         host: host,
                         port: port,
                         publicURL: baseURL,
+                        // Sizes the listener budget and, through it, the
+                        // anonymous `subscribeRepos` reservation
+                        // `PublicFirehoseSubscriberAdmission` takes as a
+                        // quarter of it.
+                        maximumConnections: maxConnections,
                         publicRouteSurface: publicRouteSurface
                     ),
                     oauthRuntime: oauthRuntime,

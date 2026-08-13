@@ -94,10 +94,17 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
             throw SwanError.malformed("notification endpoint port is invalid")
         }
 
+        // Built before the socket is opened so a target that cannot be
+        // expressed in origin form is rejected without any network contact.
+        let target = try oauthOriginFormRequestTarget(
+            components,
+            failure: SwanError.malformed("notification request target is invalid")
+        )
+
         return try await makeRequest(
             group: configuration.resources.eventLoopGroup,
             tlsContext: configuration.resources.tlsContext,
-            url: url,
+            target: target,
             hostname: hostname,
             peer: peer,
             port: port,
@@ -131,7 +138,7 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
     private func makeRequest(
         group: MultiThreadedEventLoopGroup,
         tlsContext: NIOSSLContext,
-        url: URL,
+        target: OAuthOriginFormRequestTarget,
         hostname: String,
         peer: OAuthIPAddress,
         port: Int,
@@ -164,7 +171,10 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
                         PeerPinnedHTTPResponseHandler(
                             responsePromise: responsePromise,
                             expectedPeer: peer,
-                            requestURL: url,
+                            // The URL the emitted request target denotes, not
+                            // the URL that was passed in. See
+                            // `oauthOriginFormRequestTarget`.
+                            requestURL: target.denotedURL,
                             maximumResponseBodyBytes: maximumResponseBodyBytes,
                             timeout: timeout
                         )
@@ -202,12 +212,9 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
                     requestHeaders.add(name: name, value: value)
                 }
             }
-            let path: String = {
-                let value = url.path.isEmpty ? "/" : url.path
-                guard let query = url.query, !query.isEmpty else { return value }
-                return "\(value)?\(query)"
-            }()
-            let head = HTTPRequestHead(version: .http1_1, method: .POST, uri: path, headers: requestHeaders)
+            let head = HTTPRequestHead(
+                version: .http1_1, method: .POST, uri: target.uri, headers: requestHeaders
+            )
             var buffer = channel.allocator.buffer(capacity: body.count)
             buffer.writeBytes(body)
             try await channel.writeAndFlush(HTTPClientRequestPart.head(head)).get()

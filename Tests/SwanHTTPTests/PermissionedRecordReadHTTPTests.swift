@@ -1203,12 +1203,36 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    func testConcurrentHTTPWritesExposeCASConflictsWithoutLosingCommittedFacts() async throws {
+    /// Concurrent permissioned writes to one repository are serialized by the
+    /// control-plane authorization fence, so every one of them commits in a
+    /// total order and none is lost.
+    ///
+    /// This test used to require at least one `409`. It cannot any more, and
+    /// that is by design, not by accident: `SQLitePreMigratedAccountDirectory.apply`
+    /// now runs `applyAuthorizedWrites` inside
+    /// `SQLiteControlDatabase.withActiveAccountAuthorization` (F46), which
+    /// holds the control-plane write transaction across the account-database
+    /// batch. The control database is one per process, so every request reads
+    /// a fresh repository revision and the CAS on `expectedRevision` has
+    /// nothing left to conflict with in-process. `PublicFirehoseCommitFence`
+    /// has always imposed the same serialization on the public mutation path,
+    /// so public posting has never surfaced a `409` here either — the
+    /// permissioned path now matches it rather than diverging from it.
+    ///
+    /// The `409` branch is therefore unreachable **in-process**; do not
+    /// "restore" an assertion that it happens. Cross-process CAS still exists
+    /// and still has direct coverage: `SwanSQLiteTests.testSeparateConnectionsRaceThroughSQLiteCAS`
+    /// (two separate connections, exactly one `SwanError.conflict`) and
+    /// `SwanSQLiteTests.testCASFailureAndInvalidBatchRollBackEveryFact`.
+    ///
+    /// What this test guards now is the property the fence must never break:
+    /// 16 concurrent writes, 16 commits, 16 distinct revisions, no lost fact.
+    func testConcurrentHTTPWritesAllCommitInATotalOrderUnderTheAuthorizationFence() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         do {
             let app = try makeServer(fixture).buildApplication(
-                logger: Logger(label: "PermissionedRecordWriteCASRaceTests")
+                logger: Logger(label: "PermissionedRecordWriteFenceOrderingTests")
             )
             let requestCount = 16
             let requests = try (0 ..< requestCount).map { index -> (HTTPFields, String) in
@@ -1236,10 +1260,16 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                     }
                     return await group.reduce(into: []) { $0.append($1) }
                 }
-                XCTAssertFalse(statuses.contains(-1))
-                XCTAssertTrue(statuses.allSatisfy { $0 == 200 || $0 == 409 })
-                XCTAssertGreaterThan(statuses.filter { $0 == 200 }.count, 0)
-                XCTAssertGreaterThan(statuses.filter { $0 == 409 }.count, 0)
+                XCTAssertFalse(statuses.contains(-1), "no request may fail in transport")
+                XCTAssertEqual(
+                    statuses.filter { $0 == 200 }.count,
+                    requestCount,
+                    """
+                    every concurrent permissioned write must commit under the \
+                    control-plane authorization fence; a 409 here would mean \
+                    the fence stopped serializing (statuses: \(statuses.sorted()))
+                    """
+                )
 
                 let database = try await SQLiteAccountDatabase(dataDirectory: fixture.root, did: Self.alice)
                 let facts = try await database.spaceOplog(space: fixture.space, author: Self.alice, since: 3)
@@ -1247,8 +1277,29 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                     try await database.close()
                     return XCTFail("concurrent HTTP writes unexpectedly require full recovery")
                 }
+                // Every accepted write is durable, and the accepted set is all
+                // of them: no fact may be acknowledged and then lost.
+                XCTAssertEqual(entries.count, requestCount)
                 XCTAssertEqual(entries.count, statuses.filter { $0 == 200 }.count)
+                let committedKeys = entries.map { entry -> String in
+                    switch entry.write {
+                    case let .create(uri, _, _), let .put(uri, _, _),
+                         let .update(uri, _, _), let .delete(uri):
+                        uri.rkey
+                    }
+                }
+                XCTAssertEqual(
+                    Set(committedKeys),
+                    Set((0 ..< requestCount).map { "race-\($0)" }),
+                    "each concurrent write must land exactly once"
+                )
+                XCTAssertEqual(committedKeys.count, requestCount)
+                // A total order: distinct wire revisions, and distinct,
+                // strictly increasing durable revisions with no reuse.
                 XCTAssertEqual(Set(entries.map(\.wireRevision)).count, entries.count)
+                let revisions = entries.map(\.revision)
+                XCTAssertEqual(Set(revisions).count, entries.count)
+                XCTAssertEqual(revisions, revisions.sorted())
                 try await database.close()
             }
             try await close(fixture)

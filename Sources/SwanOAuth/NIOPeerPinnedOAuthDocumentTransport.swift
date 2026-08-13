@@ -53,10 +53,17 @@ public struct NIOPeerPinnedOAuthDocumentTransport: OAuthRemoteTransport {
             throw SwanError.malformed("OAuth document URL port is invalid")
         }
 
+        // Built before the socket is opened so a target that cannot be
+        // expressed in origin form is rejected without any network contact.
+        let target = try oauthOriginFormRequestTarget(
+            components,
+            failure: SwanError.malformed("OAuth document request target is invalid")
+        )
+
         return try await makeRequest(
             group: resources.eventLoopGroup,
             tlsContext: resources.tlsContext,
-            url: url,
+            target: target,
             hostname: hostname,
             peer: peer,
             port: port,
@@ -69,7 +76,7 @@ public struct NIOPeerPinnedOAuthDocumentTransport: OAuthRemoteTransport {
     private func makeRequest(
         group: MultiThreadedEventLoopGroup,
         tlsContext: NIOSSLContext,
-        url: URL,
+        target: OAuthOriginFormRequestTarget,
         hostname: String,
         peer: OAuthIPAddress,
         port: Int,
@@ -93,7 +100,10 @@ public struct NIOPeerPinnedOAuthDocumentTransport: OAuthRemoteTransport {
                         OAuthDocumentResponseHandler(
                             responsePromise: responsePromise,
                             expectedPeer: peer,
-                            requestURL: url,
+                            // The URL the emitted request target denotes, not
+                            // the URL that was passed in. See
+                            // `oauthOriginFormRequestTarget`.
+                            requestURL: target.denotedURL,
                             maximumBodyBytes: maximumBodyBytes,
                             timeout: timeout
                         )
@@ -125,12 +135,7 @@ public struct NIOPeerPinnedOAuthDocumentTransport: OAuthRemoteTransport {
             headers.add(name: "host", value: oauthDocumentHostHeader(hostname: hostname, port: port, scheme: scheme))
             headers.add(name: "accept", value: "application/json")
             headers.add(name: "connection", value: "close")
-            let path: String = {
-                let value = url.path.isEmpty ? "/" : url.path
-                guard let query = url.query, !query.isEmpty else { return value }
-                return "\(value)?\(query)"
-            }()
-            let head = HTTPRequestHead(version: .http1_1, method: .GET, uri: path, headers: headers)
+            let head = HTTPRequestHead(version: .http1_1, method: .GET, uri: target.uri, headers: headers)
             try await channel.writeAndFlush(HTTPClientRequestPart.head(head)).get()
             try await channel.writeAndFlush(HTTPClientRequestPart.end(nil)).get()
             let response = try await responsePromise.futureResult.get()
@@ -292,6 +297,71 @@ final class OAuthDocumentResponseHandler: ChannelInboundHandler, RemovableChanne
         timeoutTask = nil
         responsePromise.succeed(response)
     }
+}
+
+/// The origin-form request target actually written to the socket, together with
+/// the URL that target denotes.
+struct OAuthOriginFormRequestTarget: Sendable {
+    /// The exact `request-target` bytes placed in the HTTP/1.1 request line.
+    let uri: String
+    /// The URL `uri` denotes when resolved against the request's origin. The
+    /// transports report this as `OAuthRemoteHTTPResponse.responseURL`.
+    let denotedURL: URL
+}
+
+/// Builds the origin-form request target for an outbound HTTP/1.1 request from
+/// the **percent-encoded** URL components.
+///
+/// `URL.path` and `URL.query` percent-DECODE. Building the target from them
+/// rewrites a path that legitimately contains `%2F`, `%3F`, `%23` or an encoded
+/// space into a *different* resource than the one that was policy-checked and
+/// peer-pinned a few lines earlier. `SwanProxyHTTPTransport` already builds its
+/// target this way; this keeps the peer-pinned NIO transports consistent with
+/// it.
+///
+/// `denotedURL` is re-parsed from the emitted target rather than echoed from
+/// the request URL. Echoing the request URL makes the callers' exact-URL
+/// comparison (`OAuthRemoteFetch`, `ATHandleVerification`) compare a value
+/// against itself, which proves nothing. Re-parsing makes that comparison a
+/// real check that the derivation below round-trips. The single normalization
+/// is RFC 3986 §6.2.3: origin form requires at least `/`, and an empty path in
+/// an http(s) URI denotes the same resource as `/`.
+///
+/// The `0x21 ... 0x7E` byte guard is defence in depth, kept for symmetry with
+/// `SwanProxyHTTPTransport`. It is **not** the control that prevents
+/// request-target header injection, and the CRLF-injection finding originally
+/// filed as F22 was REFUTED — do not re-derive it from the presence of this
+/// guard. Every one of these pipelines is built with
+/// `syncOperations.addHTTPClientHandlers()`, which unconditionally installs
+/// `NIOHTTPRequestHeadersValidator` (swift-nio 2.101.3,
+/// `Sources/NIOHTTP1/HTTPPipelineSetup.swift` `_addHTTPClientHandlers`). That
+/// handler runs before `HTTPRequestEncoder` on the outbound path and fails the
+/// write with `HTTPParserError.invalidHeaderToken` for any URI byte outside the
+/// RFC 9112 request-target grammar — CR, LF, NUL, SP, CTLs and non-ASCII all
+/// included.
+func oauthOriginFormRequestTarget(
+    _ components: URLComponents,
+    failure: SwanError
+) throws -> OAuthOriginFormRequestTarget {
+    let encodedPath = components.percentEncodedPath
+    let path = encodedPath.isEmpty ? "/" : encodedPath
+    guard path.hasPrefix("/") else { throw failure }
+    let encodedQuery = components.percentEncodedQuery.flatMap { $0.isEmpty ? nil : $0 }
+    let uri = encodedQuery.map { "\(path)?\($0)" } ?? path
+    guard uri.utf8.allSatisfy({ (0x21 ... 0x7E).contains($0) }), uri.utf8.count <= 8_192 else {
+        throw failure
+    }
+
+    // Split the emitted bytes back apart rather than reusing the inputs, so a
+    // future edit to the derivation above that stops round-tripping is caught
+    // by the callers' exact-URL comparison instead of passing silently.
+    var denoted = components
+    let separator = uri.firstIndex(of: "?")
+    let emittedPath = separator.map { String(uri[uri.startIndex ..< $0]) } ?? uri
+    denoted.percentEncodedPath = (encodedPath.isEmpty && emittedPath == "/") ? "" : emittedPath
+    denoted.percentEncodedQuery = separator.map { String(uri[uri.index(after: $0)...]) }
+    guard let denotedURL = denoted.url else { throw failure }
+    return OAuthOriginFormRequestTarget(uri: uri, denotedURL: denotedURL)
 }
 
 private func oauthDocumentSocketPeer(_ address: SocketAddress?) -> OAuthIPAddress? {

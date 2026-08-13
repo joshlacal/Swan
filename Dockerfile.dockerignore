@@ -43,6 +43,14 @@ Swan/.jj/**
 Swan/**/.jj*
 Swan/.DS_Store
 Swan/**/.DS_Store
+# Acceptance-run output and live laboratory scratch. Neither is an input to the
+# release image, and `.interop-live/` holds per-run temporary directories the
+# acceptance scripts create under the repository. These must stay above the
+# `.interop-cache` re-includes below: a later `!` re-include wins.
+Swan/artifacts
+Swan/artifacts/**
+Swan/.interop-live
+Swan/.interop-live/**
 **/.env*
 !**/.env.example
 **/.swan-data/

@@ -4,6 +4,61 @@
 
 ---
 
+## 0. Execution status (2026-08-13)
+
+Thirteen lanes ran in isolated jj workspaces across two waves and merged in
+three steps: `77bab90c` (L1-L5 + the two credential/blob lanes), `c1a71eb3`
+(L6, L10, L11), and `07b7d698` (L7, L8, L9, L12, L13).
+
+**Merged tree `07b7d698` is green on both platforms.**
+
+| | macOS | x86_64 Linux (netcup, pinned `swift:6.1-jammy`) |
+|---|---|---|
+| `c1a71eb3` | 1571 passed / 0 failed | 1556 passed / 15 failed |
+| `07b7d698` | 1608 passed / 0 failed | 1593 passed / 15 failed |
+
+Both reconcile exactly (1593 + 15 = 1608). All 15 Linux failures are the
+pre-existing `executableURL()` harness gap and are identical on the pre-merge
+tree, so nothing regressed. `swift build --product swan` and `--build-tests`
+both exit 0 on x86_64.
+
+**A hang observed in one x86_64 run did not reproduce.** Two subsequent full
+Linux suites ran to completion, and the suite it stopped in passes 14/14 in
+0.5 s in isolation. Recorded as a flake, not a deadlock — but if it recurs,
+that is a real finding and this note is the prior.
+
+**Do not read "merged" as "closed" for these three:**
+
+- **F23 — NOT closed, despite a merged commit.** The prescribed metadata-only
+  lookup is unimplementable without owning `SwanSQLite.swift`, where every
+  helper it needs is `private`. The shipped fallback also keeps the 256 MiB
+  ceiling lease for the whole stream whenever the right-sized reserve returns
+  nil (`SwanSpaceBlobXRPC.swift:148-153`), so it degrades to pre-fix behaviour
+  under exactly the concurrency the finding is about, on a path no test covers.
+  Needs a lane owning `SwanSQLite.swift`.
+- **F46 — closed, but it bought an undeclared availability coupling.** Every
+  permissioned write now runs inside the process-wide control-database
+  connection gate and `BEGIN IMMEDIATE`, head-of-line blocking OAuth and
+  account-lifecycle traffic with no timeout. It is also client-visible:
+  concurrent same-account permissioned writes no longer return 409 within a
+  single process. The public mutation path already behaved this way
+  (`PublicFirehoseCommitFence`), so this is convergence rather than a new
+  class — but it is request-rate now, where every other caller of that fence
+  is operator-rate.
+- **L9 regressed an acceptance script.** The operator-secret split leaves
+  `Scripts/run-reference-relay-acceptance.sh:369` reading the secret from a
+  runtime path it no longer occupies.
+
+**Deferred by decision, not oversight:** F21, F24, F25, F29, F34, F42, and the
+F20/F31-step-2/F13-advertising halves — see §5. F21's block GC is the highest
+risk change in the scan and is deliberately not bundled with parallel work.
+
+Maintainer decisions still open: §4 items 4 (F41 number), 8 (F03 watermark),
+9 (F18), 10 (F31 step 2), plus the `executableURL()` consolidation as test
+infrastructure.
+
+---
+
 ## 1. Verdict summary
 
 | Verdict | Count |
