@@ -320,6 +320,280 @@ final class AccountLoginHardeningTests: XCTestCase {
         try await migrated.close()
     }
 
+    /// The handle bucket only adds brute-force protection that the pair
+    /// bucket does not already provide when it is strictly larger. Equal
+    /// limits make the two indistinguishable for one source and hand that
+    /// single source a handle-wide lock on every other source.
+    func testDefaultPolicyGivesTheHandleBucketHeadroomOverOnePeerPair() throws {
+        let policy = try AccountLoginAdmissionPolicy()
+        XCTAssertGreaterThan(
+            policy.handleAttempts,
+            policy.pairAttempts,
+            "a handle bucket no larger than one pair bucket is a single-IP account lockout"
+        )
+        XCTAssertEqual(policy.pairAttempts, 10)
+        XCTAssertEqual(policy.handleAttempts, 100)
+    }
+
+    func testExhaustedPairBucketLeavesHandleHeadroomForADifferentPeer() async throws {
+        let root = try temporaryLoginDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        let policy = try AccountLoginAdmissionPolicy()
+        let service = AccountLoginAdmissionService(
+            store: database,
+            key: try AccountLoginAdmissionKey(Data(repeating: 0x5C, count: 32)),
+            policy: policy
+        )
+        let handle = "victim.example.com"
+        let attacker = "203.0.113.10"
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+
+        for attempt in 0 ..< policy.pairAttempts {
+            let decision = try await service.admit(
+                handle: handle,
+                directPeer: attacker,
+                now: start.addingTimeInterval(Double(attempt))
+            )
+            XCTAssertEqual(decision, .allowed, "attempt \(attempt)")
+        }
+        let exhausted = try await service.admit(
+            handle: handle,
+            directPeer: attacker,
+            now: start.addingTimeInterval(Double(policy.pairAttempts))
+        )
+        XCTAssertEqual(
+            exhausted,
+            .rateLimited,
+            "the pair bucket must still stop one source guessing one handle"
+        )
+
+        let elsewhere = try await service.admit(
+            handle: handle,
+            directPeer: "198.51.100.20",
+            now: start.addingTimeInterval(Double(policy.pairAttempts) + 1)
+        )
+        XCTAssertEqual(
+            elsewhere,
+            .allowed,
+            "one peer spending its own pair bucket must not lock the handle for every other source"
+        )
+        try await database.close()
+    }
+
+    /// Locking a handle must cost as many distinct sources as the handle
+    /// budget divided by the pair budget, never one.
+    func testHandleLockoutCostsTheHandleToPairRatioInDistinctPeers() async throws {
+        let root = try temporaryLoginDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        let policy = try AccountLoginAdmissionPolicy(
+            handleAttempts: 6,
+            directPeerAttempts: 100,
+            pairAttempts: 2,
+            window: 300,
+            maximumProcessEntries: 1_024,
+            maximumDurableEntries: 1_024
+        )
+        let service = AccountLoginAdmissionService(
+            store: database,
+            key: try AccountLoginAdmissionKey(Data(repeating: 0x6D, count: 32)),
+            policy: policy
+        )
+        let handle = "shared-victim.example.com"
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let requiredPeers = policy.handleAttempts / policy.pairAttempts
+        var clock = 0.0
+
+        for peer in 0 ..< requiredPeers {
+            for attempt in 0 ..< policy.pairAttempts {
+                let decision = try await service.admit(
+                    handle: handle,
+                    directPeer: "203.0.113.\(peer + 1)",
+                    now: start.addingTimeInterval(clock)
+                )
+                clock += 1
+                XCTAssertEqual(
+                    decision,
+                    .allowed,
+                    "peer \(peer) attempt \(attempt) was refused before the handle budget was spent"
+                )
+            }
+        }
+
+        let afterBudget = try await service.admit(
+            handle: handle,
+            directPeer: "203.0.113.250",
+            now: start.addingTimeInterval(clock)
+        )
+        XCTAssertEqual(
+            afterBudget,
+            .rateLimited,
+            "the handle bucket must still close once its whole budget is spent"
+        )
+        try await database.close()
+    }
+
+    func testOAuthPeerAdmissionDefaultsAreOneNamedEditAwayFromTheCDNBudget() throws {
+        let policy = try OAuthPeerAdmissionPolicy()
+        XCTAssertEqual(policy.attempts, OAuthPeerAdmissionPolicy.defaultAttempts)
+        XCTAssertEqual(policy.window, OAuthPeerAdmissionPolicy.defaultWindow)
+        XCTAssertEqual(OAuthPeerAdmissionPolicy.defaultAttempts, 600)
+        XCTAssertEqual(OAuthPeerAdmissionPolicy.defaultWindow, 10)
+    }
+
+    func testOAuthPeerAdmissionRefusesPastTheBudgetAndReopensTheNextWindow() async throws {
+        let policy = try OAuthPeerAdmissionPolicy(attempts: 3, window: 10)
+        let service = OAuthPeerAdmissionService(policy: policy)
+        let peer = "203.0.113.5"
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+
+        for attempt in 0 ..< policy.attempts {
+            let decision = await service.admit(
+                peer: peer,
+                now: start.addingTimeInterval(Double(attempt))
+            )
+            XCTAssertEqual(decision, .allowed, "attempt \(attempt)")
+        }
+        let refused = await service.admit(
+            peer: peer,
+            now: start.addingTimeInterval(3)
+        )
+        XCTAssertEqual(
+            refused,
+            .rateLimited,
+            "an unauthenticated peer must stop allocating replay capacity at its budget"
+        )
+        let nextWindow = await service.admit(
+            peer: peer,
+            now: start.addingTimeInterval(policy.window)
+        )
+        XCTAssertEqual(nextWindow, .allowed, "the window must reopen, not latch")
+    }
+
+    func testOAuthPeerAdmissionBudgetsDoNotLeakBetweenPeers() async throws {
+        let policy = try OAuthPeerAdmissionPolicy(attempts: 2, window: 10)
+        let service = OAuthPeerAdmissionService(policy: policy)
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+
+        for attempt in 0 ..< policy.attempts {
+            let decision = await service.admit(
+                peer: "203.0.113.5",
+                now: start.addingTimeInterval(Double(attempt))
+            )
+            XCTAssertEqual(decision, .allowed, "attempt \(attempt)")
+        }
+        let exhausted = await service.admit(peer: "203.0.113.5", now: start)
+        XCTAssertEqual(exhausted, .rateLimited)
+
+        let other = await service.admit(peer: "198.51.100.6", now: start)
+        XCTAssertEqual(
+            other,
+            .allowed,
+            "one peer's budget must not deny every other client"
+        )
+    }
+
+    /// A request whose client address cannot be established is neither
+    /// admitted nor rejected: it is charged to one shared bounded bucket, so
+    /// a missing forwarding header degrades the control to a single global
+    /// budget instead of removing it or taking OAuth offline.
+    func testUnresolvedClientAddressesShareOneBoundedBucket() async throws {
+        let policy = try OAuthPeerAdmissionPolicy(attempts: 2, window: 10)
+        let service = OAuthPeerAdmissionService(policy: policy)
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+
+        let firstUnresolved = await service.admit(peer: nil, now: start)
+        XCTAssertEqual(
+            firstUnresolved,
+            .allowed,
+            "an absent client address must not take OAuth offline"
+        )
+        // A value that is not a plausible address literal collapses into the
+        // same bucket rather than minting attacker-chosen bucket cardinality.
+        let malformed = await service.admit(
+            peer: "not an address, with spaces",
+            now: start.addingTimeInterval(1)
+        )
+        XCTAssertEqual(malformed, .allowed)
+        let exhausted = await service.admit(
+            peer: nil,
+            now: start.addingTimeInterval(2)
+        )
+        XCTAssertEqual(
+            exhausted,
+            .rateLimited,
+            "unresolved peers must share one bounded bucket, never bypass the budget"
+        )
+
+        let resolved = await service.admit(
+            peer: "203.0.113.5",
+            now: start.addingTimeInterval(3)
+        )
+        XCTAssertEqual(
+            resolved,
+            .allowed,
+            "an exhausted unresolved bucket must not deny identifiable clients"
+        )
+    }
+
+    func testOAuthPeerAdmissionRefusesNewPeersOnlyWhileTheTableIsLive() async throws {
+        let policy = try OAuthPeerAdmissionPolicy(
+            attempts: 10,
+            window: 10,
+            maximumTrackedPeers: 2
+        )
+        let service = OAuthPeerAdmissionService(policy: policy)
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+
+        let firstPeer = await service.admit(peer: "203.0.113.1", now: start)
+        XCTAssertEqual(firstPeer, .allowed)
+        let secondPeer = await service.admit(peer: "203.0.113.2", now: start)
+        XCTAssertEqual(secondPeer, .allowed)
+
+        let overflowPeer = await service.admit(
+            peer: "203.0.113.3",
+            now: start.addingTimeInterval(1)
+        )
+        XCTAssertEqual(
+            overflowPeer,
+            .rateLimited,
+            "a table full of live windows must refuse rather than evict a live bucket"
+        )
+        let trackedPeer = await service.admit(
+            peer: "203.0.113.1",
+            now: start.addingTimeInterval(1)
+        )
+        XCTAssertEqual(
+            trackedPeer,
+            .allowed,
+            "an already-tracked peer must keep its budget while the table is full"
+        )
+        let afterExpiry = await service.admit(
+            peer: "203.0.113.3",
+            now: start.addingTimeInterval(10)
+        )
+        XCTAssertEqual(afterExpiry, .allowed, "expired windows must be reclaimed")
+    }
+
+    func testOAuthPeerAdmissionTreatsABackwardsClockAsInsideTheOpenWindow() async throws {
+        let policy = try OAuthPeerAdmissionPolicy(attempts: 1, window: 10)
+        let service = OAuthPeerAdmissionService(policy: policy)
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+
+        let opened = await service.admit(peer: "203.0.113.5", now: start)
+        XCTAssertEqual(opened, .allowed)
+        let rewound = await service.admit(
+            peer: "203.0.113.5",
+            now: start.addingTimeInterval(-3_600)
+        )
+        XCTAssertEqual(
+            rewound,
+            .rateLimited,
+            "a backwards clock must not hand out a free window reset"
+        )
+    }
+
     func testRequestedExpiredBucketsAreReclaimedBehindBoundedGlobalCleanup() async throws {
         let root = try temporaryLoginDirectory()
         defer { try? FileManager.default.removeItem(at: root) }

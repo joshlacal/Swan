@@ -21,8 +21,24 @@ public struct AccountLoginAdmissionPolicy: Sendable, Equatable {
     public let maximumProcessEntries: Int
     public let maximumDurableEntries: Int
 
+    /// The ratio of the default `handleAttempts` to the default
+    /// `pairAttempts` is the number of distinct source addresses an attacker
+    /// needs before it can lock a handle for everybody else. Smaller values
+    /// remain constructible for tests; only the defaults are the deployed
+    /// policy.
+    ///
+    /// Equal budgets made the handle bucket contribute no brute-force
+    /// protection a single source did not already face from its own pair
+    /// bucket, while granting that one source a repeatable handle-wide
+    /// lockout: ten wrong passwords per window denied the account's real
+    /// owner from every other address. Ten times the pair budget leaves the
+    /// per-source guessing rate unchanged and raises the cost of the lockout
+    /// from one address to ten.
+    ///
+    /// The handle-wide ceiling this sets is 100 guesses per five-minute
+    /// window, i.e. 28,800 per day against Argon2id, up from 2,880.
     public init(
-        handleAttempts: Int = 10,
+        handleAttempts: Int = 100,
         directPeerAttempts: Int = 100,
         pairAttempts: Int = 10,
         window: TimeInterval = 5 * 60,
@@ -50,6 +66,147 @@ public struct AccountLoginAdmissionPolicy: Sendable, Equatable {
 public enum AccountLoginAdmissionDecision: Sendable, Equatable {
     case allowed
     case rateLimited
+}
+
+public enum OAuthPeerAdmissionDecision: Sendable, Equatable {
+    case allowed
+    case rateLimited
+}
+
+/// Per-peer request budget for the unauthenticated OAuth protocol endpoints.
+///
+/// PAR, token, and revocation each validate a DPoP proof — and therefore
+/// durably claim its `jti` in a globally bounded replay table — before any
+/// client identity exists. That capacity is shared with every other route
+/// that validates DPoP, so an unauthenticated caller allocating it is a
+/// service-wide availability cost. This budget is the earliest boundary at
+/// which the cost can be refused without reordering the claim behind an
+/// attacker-controlled remote metadata fetch.
+public struct OAuthPeerAdmissionPolicy: Sendable, Equatable {
+    /// Requests one peer may make across PAR, token, and revocation in one
+    /// window.
+    ///
+    /// This starts at the per-IP budget the deployment's CDN already applies
+    /// to `/xrpc/*`, because the routes it covers are the ones that rule does
+    /// not reach. The right number depends on how Catbird behaves when PAR
+    /// answers 429 — a client that retries tightly makes a lower budget worse
+    /// rather than better — so it is deliberately one named constant and one
+    /// edit to change.
+    public static let defaultAttempts = 600
+    public static let defaultWindow: TimeInterval = 10
+
+    public let attempts: Int
+    public let window: TimeInterval
+    public let maximumTrackedPeers: Int
+
+    public init(
+        attempts: Int = OAuthPeerAdmissionPolicy.defaultAttempts,
+        window: TimeInterval = OAuthPeerAdmissionPolicy.defaultWindow,
+        maximumTrackedPeers: Int = 50_000
+    ) throws {
+        guard (1 ... 1_000_000).contains(attempts),
+              window.isFinite,
+              (1 ... 86_400).contains(window),
+              (2 ... 1_000_000).contains(maximumTrackedPeers) else {
+            throw AccountLoginAdmissionError.invalidConfiguration
+        }
+        self.attempts = attempts
+        self.window = window
+        self.maximumTrackedPeers = maximumTrackedPeers
+    }
+}
+
+/// Process-local fixed-window admission keyed on the request's client
+/// address.
+///
+/// Deliberately not durable, unlike ``AccountLoginAdmissionService``. The
+/// window is seconds rather than minutes, so a restart resetting it is not an
+/// evasion worth a schema change; and the durable login table is globally
+/// capacity-bounded and fails *closed* into
+/// ``AccountLoginAdmissionError/unavailable``, so routing unauthenticated
+/// OAuth peers into it would give anonymous traffic a path to deny password
+/// login. Nothing here crosses a storage boundary, so the addresses are held
+/// as the already-validated literals rather than as HMAC digests.
+public actor OAuthPeerAdmissionService {
+    private struct Bucket {
+        var startedAt: Date
+        var attempts: Int
+    }
+
+    /// Every request whose client address cannot be established shares one
+    /// bucket, spelled so it cannot collide with an address literal.
+    ///
+    /// The alternative readings are both worse. Admitting an unidentifiable
+    /// request removes the control exactly when a forwarding header is
+    /// missing, which is the state an attacker would aim for. Rejecting it
+    /// turns one proxy misconfiguration into total OAuth unavailability — a
+    /// failure this deployment has already had once at the login route. A
+    /// shared bounded bucket keeps the ceiling unconditional and degrades to
+    /// a single global budget instead of an outage. This is the same
+    /// reasoning as ``AccountLoginAdmissionService``'s invalid-handle
+    /// sentinel.
+    private static let unidentifiedPeer = "\u{0}unidentified"
+
+    /// One budget for the whole process, shared across PAR, token, and
+    /// revocation. Those three routes claim from one replay table, so
+    /// splitting the budget per route would multiply what a peer can allocate
+    /// from it.
+    public static let shared = OAuthPeerAdmissionService()
+
+    private let policy: OAuthPeerAdmissionPolicy
+    private var buckets: [String: Bucket] = [:]
+
+    public init(policy: OAuthPeerAdmissionPolicy = try! .init()) {
+        self.policy = policy
+    }
+
+    /// Charges one request against `peer`'s budget.
+    ///
+    /// `peer` is the address the login client-identity policy resolved, or
+    /// `nil` when it could not resolve one. Values that are not plausible
+    /// address literals are treated as unresolved rather than as distinct
+    /// keys, so a caller cannot inflate bucket cardinality.
+    public func admit(
+        peer: String?,
+        now: Date = Date()
+    ) -> OAuthPeerAdmissionDecision {
+        let key = Self.bucketKey(for: peer)
+        if let current = buckets[key] {
+            // A backwards clock leaves the window open rather than starting a
+            // fresh one; resetting on a negative age would be a free reset.
+            if now.timeIntervalSince(current.startedAt) < policy.window {
+                guard current.attempts < policy.attempts else {
+                    return .rateLimited
+                }
+                buckets[key] = Bucket(
+                    startedAt: current.startedAt,
+                    attempts: current.attempts + 1
+                )
+                return .allowed
+            }
+        } else if buckets.count >= policy.maximumTrackedPeers {
+            buckets = buckets.filter {
+                now.timeIntervalSince($0.value.startedAt) < policy.window
+            }
+            guard buckets.count < policy.maximumTrackedPeers else {
+                // A table still full of live windows is refused rather than
+                // evicting a live attacker's bucket to make room.
+                return .rateLimited
+            }
+        }
+        buckets[key] = Bucket(startedAt: now, attempts: 1)
+        return .allowed
+    }
+
+    private static func bucketKey(for peer: String?) -> String {
+        guard let peer else { return unidentifiedPeer }
+        let bytes = Array(peer.utf8)
+        guard (2 ... 45).contains(bytes.count),
+              bytes.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+            return unidentifiedPeer
+        }
+        return peer
+    }
 }
 
 public enum AccountLoginAdmissionError: Error, Sendable, Equatable {
