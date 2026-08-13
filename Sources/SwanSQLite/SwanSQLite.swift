@@ -1047,26 +1047,24 @@ public enum SQLiteLayout {
             namespace_kind TEXT NOT NULL
                 CHECK(namespace_kind IN ('public', 'space', 'staged')),
             space_uri TEXT NOT NULL,
-            -- Unix seconds, and the only input to staged expiry. A promoted
-            -- or durable edge has no expiry and never carries one.
-            staged_at INTEGER,
+            -- Unix seconds this edge was created, and the only input to both
+            -- sweeps: staged expiry, and garbage collection of a public edge
+            -- no repository record justifies. A NULL is never swept, so a
+            -- writer that forgets to stamp an edge leaks storage rather than
+            -- deleting a live blob.
+            created_at INTEGER CHECK(created_at IS NULL OR created_at >= 0),
             PRIMARY KEY(cid, namespace_kind, space_uri),
             CHECK(
                 (namespace_kind = 'public' AND space_uri = '')
                 OR (namespace_kind = 'space' AND length(space_uri) > 0)
                 OR (namespace_kind = 'staged' AND space_uri = '')
-            ),
-            CHECK(
-                (namespace_kind = 'staged' AND staged_at IS NOT NULL
-                    AND staged_at >= 0)
-                OR (namespace_kind <> 'staged' AND staged_at IS NULL)
             )
         )
         """,
-        // The staged expiry index is created by the v15 migration, not here:
-        // a pre-v15 database still has a reference table without `staged_at`
-        // when these statements run, and indexing a column that does not
-        // exist yet fails the whole schema transaction.
+        // The sweep index is created by the v15 migration, not here: a pre-v15
+        // database still has a reference table without `created_at` when these
+        // statements run, and indexing a column that does not exist yet fails
+        // the whole schema transaction.
         // This table deliberately outlives `blob_payloads` while a private
         // file is pending reclamation.  SQLite commits reachability changes
         // before any unlink; startup can then complete a crash-interrupted
@@ -1701,6 +1699,22 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// bounded rather than holding a request behind an unbounded cleanup.
     static let maximumStagedBlobReferencePurge = 64
 
+    /// How long a public blob edge no repository record justifies is kept
+    /// before it can be collected.
+    ///
+    /// This is deliberately generous, and it is the only thing standing
+    /// between the sweep and a client that uploads on Monday and commits the
+    /// record on Friday. It must comfortably exceed the longest realistic
+    /// upload-to-commit gap, because the cost of being too eager (a live blob
+    /// deleted out from under a pending record) is far worse than the cost of
+    /// being too patient (storage held a little longer).
+    static let publicBlobReferenceGracePeriodSeconds = 14 * 24 * 60 * 60
+
+    /// The per-sweep bound on collectable public edges. Deliberately smaller
+    /// than the staged bound: each removal is a lifecycle-locked transaction
+    /// plus a possible unlink, and this sweep can run on an upload path.
+    static let maximumPublicBlobReferencePurge = 16
+
     /// A read credential may register notification recipients, but it must
     /// not be able to turn the later deletion fanout into an unbounded
     /// transaction. Keep the limit per space so one noisy space cannot grow
@@ -1917,6 +1931,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 )
                 try await recoverPrivateBlobLifecycle()
                 try await purgeExpiredStagedBlobReferences()
+                try await purgeUnreferencedPublicBlobReferences()
                 if !descriptorBacked {
                     try SQLiteProtectedPaths.hardenSQLiteFiles(
                         parentDescriptor: accountDescriptor,
@@ -2014,6 +2029,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
         try await recoverPrivateBlobLifecycle()
         try await purgeExpiredStagedBlobReferences()
+        try await purgeUnreferencedPublicBlobReferences()
     }
 
     func installTestingHooks(_ hooks: SQLiteTestingHooks) {
@@ -2823,14 +2839,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         let version = Self.stagedBlobNamespaceMigrationVersion
         // Drive this off the observed table shape rather than the marker
         // alone. A restored or repaired database can carry a marker for a
-        // shape it does not have, and a reference table without `staged_at`
+        // shape it does not have, and a reference table without `created_at`
         // fails every upload — so the shape is the authority and the marker
         // only records that the work has been done.
         let columns = try await connection.query(
             "PRAGMA table_info(blob_namespace_references)"
         )
         let alreadyMigrated = columns.contains {
-            $0.column("name")?.string == "staged_at"
+            $0.column("name")?.string == "created_at"
         }
         let applied = try await connection.query(
             "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
@@ -2853,29 +2869,31 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     namespace_kind TEXT NOT NULL
                         CHECK(namespace_kind IN ('public', 'space', 'staged')),
                     space_uri TEXT NOT NULL,
-                    staged_at INTEGER,
+                    created_at INTEGER
+                        CHECK(created_at IS NULL OR created_at >= 0),
                     PRIMARY KEY(cid, namespace_kind, space_uri),
                     CHECK(
                         (namespace_kind = 'public' AND space_uri = '')
                         OR (namespace_kind = 'space' AND length(space_uri) > 0)
                         OR (namespace_kind = 'staged' AND space_uri = '')
-                    ),
-                    CHECK(
-                        (namespace_kind = 'staged' AND staged_at IS NOT NULL
-                            AND staged_at >= 0)
-                        OR (namespace_kind <> 'staged' AND staged_at IS NULL)
                     )
                 )
                 """
             )
+            // Existing edges are stamped with the upgrade instant, not with
+            // NULL and not with zero. Nothing an account already serves
+            // disappears when this ships — every inherited edge starts its
+            // grace period now — and the historical orphans this scan is
+            // about still become collectable one grace period later.
             _ = try await connection.query(
                 """
                 INSERT INTO blob_namespace_references(
-                    cid, namespace_kind, space_uri, staged_at
+                    cid, namespace_kind, space_uri, created_at
                 )
-                SELECT cid, namespace_kind, space_uri, NULL
+                SELECT cid, namespace_kind, space_uri, ?
                 FROM blob_namespace_references_v14
-                """
+                """,
+                [.integer(Int(Date().timeIntervalSince1970))]
             )
             _ = try await connection.query(
                 "DROP TABLE blob_namespace_references_v14"
@@ -2883,9 +2901,8 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         }
         _ = try await connection.query(
             """
-            CREATE INDEX IF NOT EXISTS blob_namespace_references_staged
-            ON blob_namespace_references(staged_at)
-            WHERE namespace_kind = 'staged'
+            CREATE INDEX IF NOT EXISTS blob_namespace_references_sweep
+            ON blob_namespace_references(namespace_kind, created_at)
             """
         )
 
@@ -7278,10 +7295,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             throw SwanError.malformed("blob upload limit is invalid")
         }
         if case .staged = namespace {
-            // The account creating staging pressure clears it. Sweeping
-            // before admission also means an expired edge cannot keep an
-            // account at its reference ceiling.
+            // The account creating the pressure clears it. Sweeping before
+            // admission also means an abandoned edge cannot keep an account
+            // at its reference ceiling — the quota leak is the half of this
+            // that bites even when nothing confidential is involved.
             try await purgeExpiredStagedBlobReferences()
+            try await purgeUnreferencedPublicBlobReferences()
         }
         let spoolHandle = try SQLiteProtectedPaths.makeUnlinkedPublicBlobSpool(
             in: dataDirectory
@@ -7476,8 +7495,9 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await connection.query(
                 """
                 SELECT cid FROM blob_namespace_references
-                WHERE namespace_kind = 'staged' AND staged_at < ?
-                ORDER BY staged_at ASC
+                WHERE namespace_kind = 'staged'
+                  AND created_at IS NOT NULL AND created_at < ?
+                ORDER BY created_at ASC
                 LIMIT ?
                 """,
                 [
@@ -7494,6 +7514,86 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             // concurrent commit has already promoted simply deletes nothing.
             try await removeBlobReference(
                 BlobReference(cid: cid, namespace: .staged)
+            )
+            purged += 1
+        }
+        return purged
+    }
+
+    /// Collects public blob edges that no public repository record justifies.
+    ///
+    /// This is the garbage collection the blob-isolation design named as owed
+    /// and never shipped: nothing but a successful permissioned commit has
+    /// ever removed a public edge, so an upload that was never committed — or
+    /// whose record was later deleted — held its edge, its CAS file, and its
+    /// slice of ``AccountBlobQuota`` forever, with no operator recourse.
+    ///
+    /// A candidate must satisfy all four of:
+    /// - `namespace_kind = 'public'`;
+    /// - `created_at` older than ``publicBlobReferenceGracePeriodSeconds``, so
+    ///   an ordinary upload-then-commit sequence is never a candidate at all;
+    /// - no `space` edge for the same CID, so a blob a permissioned record
+    ///   owns is never touched by the public sweep;
+    /// - absent from the public repository's own blob-link projection.
+    ///
+    /// The projection is computed **once per sweep** rather than per candidate.
+    /// `publicRepositoryContainsBlobCIDWithoutGate` answers the same question
+    /// but walks and decodes the entire record index for each CID it is asked
+    /// about; `publicRepositoryBlobCIDs()` is the same walk producing the whole
+    /// set, so one call decides every candidate. It is also skipped entirely
+    /// when no candidate is old enough, which is the steady state.
+    ///
+    /// Failure is never propagated to whatever triggered the sweep. This is
+    /// opportunistic maintenance: a repository too large to project, or one
+    /// with no published state yet, must not fail an upload or an account
+    /// open.
+    @discardableResult
+    public func purgeUnreferencedPublicBlobReferences(
+        now: Date = Date()
+    ) async throws -> Int {
+        let cutoff = Int(now.timeIntervalSince1970)
+            - Self.publicBlobReferenceGracePeriodSeconds
+        let candidates = try await withConnectionGate {
+            try await connection.query(
+                """
+                SELECT reference.cid AS cid
+                FROM blob_namespace_references AS reference
+                WHERE reference.namespace_kind = 'public'
+                  AND reference.created_at IS NOT NULL
+                  AND reference.created_at < ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM blob_namespace_references AS owned
+                      WHERE owned.cid = reference.cid
+                        AND owned.namespace_kind = 'space'
+                  )
+                ORDER BY reference.created_at ASC
+                LIMIT ?
+                """,
+                [
+                    .integer(cutoff),
+                    .integer(Self.maximumPublicBlobReferencePurge),
+                ]
+            )
+        }
+        guard !candidates.isEmpty else { return 0 }
+
+        let referenced: Set<String>
+        do {
+            referenced = Set(try await publicRepositoryBlobCIDs().map(\.string))
+        } catch {
+            // A repository that cannot be projected right now keeps every
+            // edge. Collecting on a partial answer would delete live blobs.
+            return 0
+        }
+
+        var purged = 0
+        for row in candidates {
+            guard let cid = row.column("cid")?.string,
+                  !referenced.contains(cid) else {
+                continue
+            }
+            try await removeBlobReference(
+                BlobReference(cid: cid, namespace: .public)
             )
             purged += 1
         }
@@ -7780,25 +7880,21 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                             mimeType.map(SQLiteData.text) ?? .null,
                         ]
                     )
-                    // Re-staging an already-staged CID restarts its expiry:
+                    // Re-creating an existing edge restarts its grace period:
                     // the second upload is a fresh, equally unclaimed intent,
-                    // and refreshing a timer can never widen reachability.
-                    // A committed `public`/`space` edge passes NULL and is
-                    // left exactly as it is.
+                    // and refreshing a timer can never widen reachability —
+                    // it only delays collection.
                     _ = try await connection.query(
                         """
                         INSERT INTO blob_namespace_references(
-                            cid, namespace_kind, space_uri, staged_at
+                            cid, namespace_kind, space_uri, created_at
                         ) VALUES (?, ?, ?, ?)
                         ON CONFLICT(cid, namespace_kind, space_uri)
-                        DO UPDATE SET staged_at = excluded.staged_at
-                        WHERE excluded.staged_at IS NOT NULL
+                        DO UPDATE SET created_at = excluded.created_at
                         """,
                         [
                             .text(cid), .text(namespaceKind), .text(spaceURI),
-                            namespaceKind == "staged"
-                                ? .integer(Int(Date().timeIntervalSince1970))
-                                : .null,
+                            .integer(Int(Date().timeIntervalSince1970)),
                         ]
                     )
                     try await setBlobLifecycleStateWithoutGate(
@@ -10200,24 +10296,25 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 byteCount: Int(byteCount),
                 references: plannedReferences
             )
+            let stamp = SQLiteData.integer(Int(Date().timeIntervalSince1970))
             _ = try await connection.query(
                 """
                 INSERT INTO blob_namespace_references(
-                    cid, namespace_kind, space_uri
-                ) VALUES (?, 'space', ?)
+                    cid, namespace_kind, space_uri, created_at
+                ) VALUES (?, 'space', ?, ?)
                 ON CONFLICT(cid, namespace_kind, space_uri) DO NOTHING
                 """,
-                [.text(cid), .text(space.rawValue)]
+                [.text(cid), .text(space.rawValue), stamp]
             )
             if retainPublicReference {
                 _ = try await connection.query(
                     """
                     INSERT INTO blob_namespace_references(
-                        cid, namespace_kind, space_uri
-                    ) VALUES (?, 'public', '')
+                        cid, namespace_kind, space_uri, created_at
+                    ) VALUES (?, 'public', '', ?)
                     ON CONFLICT(cid, namespace_kind, space_uri) DO NOTHING
                     """,
-                    [.text(cid)]
+                    [.text(cid), stamp]
                 )
             }
         }

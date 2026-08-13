@@ -808,11 +808,14 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
             _ = try await connection.query(
                 """
                 INSERT INTO blob_namespace_references(
-                    cid, namespace_kind, space_uri
-                ) VALUES (?, 'public', '')
+                    cid, namespace_kind, space_uri, created_at
+                ) VALUES (?, 'public', '', ?)
                 ON CONFLICT(cid, namespace_kind, space_uri) DO NOTHING
                 """,
-                [.text(cid.string)]
+                [
+                    .text(cid.string),
+                    .integer(Int(Date().timeIntervalSince1970)),
+                ]
             )
         }
     }

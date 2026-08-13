@@ -568,9 +568,10 @@ final class PermissionedBlobRepositoryReachabilityTests: XCTestCase {
                 [.init(namespaceKind: "staged", spaceURI: "")]
             )
 
-            try await backdateStagedReference(
+            try await backdateReference(
                 fixture: fixture,
                 cid: abandoned.cid,
+                namespaceKind: "staged",
                 secondsAgo: 30 * 24 * 60 * 60
             )
             let purged = try await database.purgeExpiredStagedBlobReferences()
@@ -673,6 +674,14 @@ final class PermissionedBlobRepositoryReachabilityTests: XCTestCase {
                 "an existing public edge keeps its exact meaning across the upgrade"
             )
             XCTAssertEqual(inventory.totalReferenceCount, 2)
+            // Inherited edges are stamped with the upgrade instant, not left
+            // NULL and not zeroed. A zero would make every blob the account
+            // already serves instantly collectable by the public sweep.
+            let inheritedStamp = try await referenceCreatedAt(
+                fixture: fixture, cid: publicCID, namespaceKind: "public"
+            )
+            let stamp = try XCTUnwrap(inheritedStamp)
+            XCTAssertGreaterThan(stamp, Int(Date().timeIntervalSince1970) - 300)
             let stillServed = try await database.publicBlobExists(cid: publicCID)
             XCTAssertTrue(
                 stillServed,
@@ -686,6 +695,236 @@ final class PermissionedBlobRepositoryReachabilityTests: XCTestCase {
             let stagedIsPublic = try await database.publicBlobExists(cid: staged.cid)
             XCTAssertFalse(stagedIsPublic)
         }
+    }
+
+    // MARK: Unreferenced public edge collection
+
+    /// The garbage collection the blob-isolation design named as owed. Nothing
+    /// but a successful permissioned commit ever removed a public edge, so an
+    /// upload no record claimed held its edge, its bytes, and its quota
+    /// forever.
+    func testAgedPublicEdgeNoRecordReferencesIsCollected() async throws {
+        let fixture = try PermissionedBlobReachabilityFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        try await fixture.withDatabase { database in
+            let orphan = try await database.putBlob(
+                Data("nobody committed this".utf8),
+                namespace: .public,
+                mimeType: "application/octet-stream"
+            )
+            let servedBefore = try await database.publicBlobExists(cid: orphan.cid)
+            XCTAssertTrue(servedBefore, "precondition: the edge exists")
+
+            try await backdateReference(
+                fixture: fixture,
+                cid: orphan.cid,
+                namespaceKind: "public",
+                secondsAgo: 30 * 24 * 60 * 60
+            )
+            let collected = try await database.purgeUnreferencedPublicBlobReferences()
+            XCTAssertEqual(collected, 1)
+
+            let servedAfter = try await database.publicBlobExists(cid: orphan.cid)
+            XCTAssertFalse(
+                servedAfter,
+                "an aged public edge no record justifies stops being served"
+            )
+            let payloadExists = try await blobPayloadExists(
+                fixture: fixture, cid: orphan.cid
+            )
+            XCTAssertFalse(
+                payloadExists,
+                "the quota the abandoned upload held is returned"
+            )
+        }
+    }
+
+    /// The regression guard on the sweep. This is the failure that would take
+    /// live images off the federated network, so it is asserted directly
+    /// rather than inferred from the candidate query.
+    func testAgedPublicEdgeAPublicRecordReferencesSurvivesTheSweep() async throws {
+        let fixture = try PermissionedBlobReachabilityFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        try await fixture.withDatabase { database in
+            let payload = Data("this one is genuinely published".utf8)
+            let published = try await database.putBlob(
+                payload, namespace: .public, mimeType: "application/octet-stream"
+            )
+            try await installPublicRecordReferencing(
+                database: database,
+                fixture: fixture,
+                blobCID: try CID.parse(published.cid),
+                size: payload.count,
+                recordKey: "published"
+            )
+
+            try await backdateReference(
+                fixture: fixture,
+                cid: published.cid,
+                namespaceKind: "public",
+                secondsAgo: 365 * 24 * 60 * 60
+            )
+            let collected = try await database.purgeUnreferencedPublicBlobReferences()
+            XCTAssertEqual(
+                collected,
+                0,
+                "a blob a public record references is never collected, at any age"
+            )
+            let stillServed = try await database.publicBlobExists(cid: published.cid)
+            XCTAssertTrue(stillServed)
+            let data = try await database.publicBlobData(cid: published.cid)
+            XCTAssertEqual(data, payload)
+        }
+    }
+
+    /// The grace period is the only thing protecting a client that uploads and
+    /// commits the record later, so prove it actually gates the sweep.
+    func testPublicEdgeInsideItsGracePeriodIsNotCollected() async throws {
+        let fixture = try PermissionedBlobReachabilityFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        try await fixture.withDatabase { database in
+            let pending = try await database.putBlob(
+                Data("uploaded, record still being composed".utf8),
+                namespace: .public
+            )
+            let collected = try await database.purgeUnreferencedPublicBlobReferences()
+            XCTAssertEqual(collected, 0)
+            let stillServed = try await database.publicBlobExists(cid: pending.cid)
+            XCTAssertTrue(
+                stillServed,
+                "a fresh upload must survive long enough to be committed"
+            )
+        }
+    }
+
+    /// Content-addressed storage is shared by CID within an account. A blob a
+    /// permissioned record owns must never be reached by the public sweep,
+    /// even though its public edge is exactly what the sweep looks for.
+    func testPublicSweepNeverCollectsABlobAPermissionedRecordOwns() async throws {
+        let fixture = try PermissionedBlobReachabilityFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        try await fixture.withDatabase { database in
+            let payload = Data("owned by a space".utf8)
+            let reference = try await database.putBlob(
+                payload, namespace: .public, mimeType: "application/octet-stream"
+            )
+            _ = try await database.putBlob(
+                payload, namespace: .space(fixture.space)
+            )
+            try await backdateReference(
+                fixture: fixture,
+                cid: reference.cid,
+                namespaceKind: "public",
+                secondsAgo: 365 * 24 * 60 * 60
+            )
+
+            let collected = try await database.purgeUnreferencedPublicBlobReferences()
+            XCTAssertEqual(
+                collected,
+                0,
+                "a space edge disqualifies the CID from the public sweep"
+            )
+            let payloadExists = try await blobPayloadExists(
+                fixture: fixture, cid: reference.cid
+            )
+            XCTAssertTrue(payloadExists, "the permissioned bytes are untouched")
+        }
+    }
+}
+
+/// Installs a signed public repository commit whose record carries a typed
+/// blob reference, so the sweep's projection has something real to find.
+private func installPublicRecordReferencing(
+    database: SQLiteAccountDatabase,
+    fixture: PermissionedBlobReachabilityFixture,
+    blobCID: CID,
+    size: Int,
+    recordKey: String
+) async throws {
+    let signingKey = P256.Signing.PrivateKey()
+    let genesis = try PublicRepositoryGenesisCodec.create(
+        did: fixture.author,
+        revision: "3jzfcijpj2z2a",
+        signingKey: signingKey
+    )
+    _ = try await database.installPublicRepositoryGenesis(
+        genesis,
+        signingPublicKey: signingKey.publicKey,
+        installedAt: Date(timeIntervalSince1970: 1_750_000_000)
+    )
+    let loaded = try await database.loadPublicRepositoryState()
+    let initial = try XCTUnwrap(loaded)
+    let path = try PublicRepositoryPath(
+        collection: "app.bsky.feed.post", recordKey: recordKey
+    )
+    let request = try PublicRepositoryMutationRequest(
+        id: "sweep-\(recordKey)",
+        canonicalDigest: Data(repeating: 0x71, count: 32),
+        baseCommitCID: initial.commitCID
+    )
+    guard case let .reserved(reservation) = try await database
+        .reservePublicRepositoryRevision(
+            request, wallClockMicroseconds: 1_750_000_000_000_000
+        ) else {
+        throw PublicRecordInstallError.replayed
+    }
+    let record = PublicRecord([
+        "$type": .string("app.bsky.feed.post"),
+        "blob": .object([
+            "$type": .string("blob"),
+            "ref": .link(blobCID),
+            "mimeType": .string("application/octet-stream"),
+            "size": .integer(size),
+        ]),
+    ])
+    let prepared = try await PublicRepositoryEngine.apply(
+        repositoryDID: fixture.author,
+        currentState: initial,
+        blocks: database,
+        revision: reservation.nextRevision,
+        batch: try PublicRepositoryWriteBatch(
+            writes: [.create(path: path, record: record)],
+            expectedCommitCID: initial.commitCID
+        ),
+        signer: P256PublicRepositoryCommitSigner(privateKey: signingKey)
+    )
+    _ = try await database.applyPublicRepositoryMutation(
+        reservation: reservation, prepared: prepared
+    )
+}
+
+private enum PublicRecordInstallError: Error {
+    case replayed
+}
+
+private func referenceCreatedAt(
+    fixture: PermissionedBlobReachabilityFixture,
+    cid: String,
+    namespaceKind: String
+) async throws -> Int? {
+    let connection = try await SQLiteConnection.open(
+        storage: .file(path: SQLiteLayout.accountDatabase(
+            in: fixture.root, did: fixture.author
+        ).path)
+    )
+    do {
+        let rows = try await connection.query(
+            """
+            SELECT created_at FROM blob_namespace_references
+            WHERE cid = ? AND namespace_kind = ?
+            """,
+            [.text(cid), .text(namespaceKind)]
+        )
+        let value = rows.first?.column("created_at")?.integer
+        try await connection.close()
+        return value
+    } catch {
+        try? await connection.close()
+        throw error
     }
 }
 
@@ -739,9 +978,10 @@ private func installPreStagedBlobNamespaceSchema(
     }
 }
 
-private func backdateStagedReference(
+private func backdateReference(
     fixture: PermissionedBlobReachabilityFixture,
     cid: String,
+    namespaceKind: String,
     secondsAgo: Int
 ) async throws {
     let connection = try await SQLiteConnection.open(
@@ -753,10 +993,10 @@ private func backdateStagedReference(
         _ = try await connection.query(
             """
             UPDATE blob_namespace_references
-            SET staged_at = staged_at - ?
-            WHERE cid = ? AND namespace_kind = 'staged'
+            SET created_at = created_at - ?
+            WHERE cid = ? AND namespace_kind = ?
             """,
-            [.integer(secondsAgo), .text(cid)]
+            [.integer(secondsAgo), .text(cid), .text(namespaceKind)]
         )
         try await connection.close()
     } catch {
