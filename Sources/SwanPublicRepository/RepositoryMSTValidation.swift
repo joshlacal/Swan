@@ -29,6 +29,10 @@ public enum RepositoryMSTValidationError: Error, Sendable, Equatable {
     case invalidRecordBlock
     case nodeLimitExceeded
     case entryLimitExceeded
+    /// The repository presents more live records than the public read surface
+    /// will admit. Distinct from ``nodeLimitExceeded``, which bounds one
+    /// block's topology: this bounds the whole repository.
+    case recordLimitExceeded
     case cborDepthLimitExceeded
     case invalidReachableRepositoryByteBudget
     case reachableRepositoryByteLimitExceeded
@@ -166,6 +170,9 @@ public enum RepositoryMSTValidation {
         var seenNodes = Set<CID>()
         var mstBlocks: [CID: Data] = [:]
         var leaves: [RepositoryMSTLeaf] = []
+        /// The UTF-8 MST key of `leaves[i]`, kept alongside so the final sort
+        /// does not re-encode every key on every comparison.
+        var leafKeys: [Data] = []
         var recordCIDs = Set<CID>()
         var reachableBytes = 0
         var rootLayer: Int?
@@ -246,6 +253,16 @@ public enum RepositoryMSTValidation {
                 guard isInside(key, lower: item.lowerBound, upper: item.upperBound) else {
                     throw RepositoryMSTValidationError.subtreeOutOfRange
                 }
+                // The node and entries-per-node caps each bound one block. The
+                // aggregate leaf set they permit is their product, which is far
+                // above what the public read surface will admit; refuse here so
+                // an import can never publish a repository whose own reads
+                // fail. Checked before the append so the array never grows past
+                // the ceiling.
+                guard leaves.count < limits.maximumRepositoryRecords else {
+                    throw RepositoryMSTValidationError.recordLimitExceeded
+                }
+                leafKeys.append(key)
                 leaves.append(leaf)
                 recordCIDs.insert(leaf.recordCID)
             }
@@ -319,7 +336,7 @@ public enum RepositoryMSTValidation {
             }
         }
 
-        leaves.sort { Data($0.path.mstKey.utf8).lexicographicallyPrecedes(Data($1.path.mstKey.utf8)) }
+        leaves = Self.sortedByMSTKey(leaves, keys: leafKeys)
         for pair in zip(leaves, leaves.dropFirst()) {
             guard pair.0.path.mstKey < pair.1.path.mstKey else {
                 throw RepositoryMSTValidationError.keysNotStrictlyIncreasing
@@ -375,6 +392,9 @@ public enum RepositoryMSTValidation {
         var referencedNodes: Set<CID> = [rootCID]
         var seenNodes = Set<CID>()
         var leaves: [RepositoryMSTLeaf] = []
+        /// The UTF-8 MST key of `leaves[i]`, kept alongside so the final sort
+        /// does not re-encode every key on every comparison.
+        var leafKeys: [Data] = []
         var recordCIDs = Set<CID>()
         var reachableBytes = 0
         var rootLayer: Int?
@@ -449,6 +469,13 @@ public enum RepositoryMSTValidation {
                 guard isInside(key, lower: item.lowerBound, upper: item.upperBound) else {
                     throw RepositoryMSTValidationError.subtreeOutOfRange
                 }
+                // See `validate`: the per-block caps do not bound the aggregate
+                // leaf set, and the public read surface refuses a repository
+                // above this ceiling.
+                guard leaves.count < limits.maximumRepositoryRecords else {
+                    throw RepositoryMSTValidationError.recordLimitExceeded
+                }
+                leafKeys.append(key)
                 leaves.append(leaf)
                 recordCIDs.insert(leaf.recordCID)
             }
@@ -519,9 +546,7 @@ public enum RepositoryMSTValidation {
             }
             try await projection.recordReachableBlock(cid: cid, kind: .record)
         }
-        leaves.sort {
-            Data($0.path.mstKey.utf8).lexicographicallyPrecedes(Data($1.path.mstKey.utf8))
-        }
+        leaves = Self.sortedByMSTKey(leaves, keys: leafKeys)
         for pair in zip(leaves, leaves.dropFirst()) {
             guard pair.0.path.mstKey < pair.1.path.mstKey else {
                 throw RepositoryMSTValidationError.keysNotStrictlyIncreasing
@@ -553,6 +578,23 @@ public enum RepositoryMSTValidation {
             throw RepositoryMSTValidationError.missingBlock
         }
         return bytes
+    }
+
+    /// Orders leaves by their canonical MST key without re-encoding a key on
+    /// every comparison. The previous comparator built two `Data` values per
+    /// comparison, so a repository-sized sort allocated on the order of
+    /// `2 · n · log n` times; the keys are already known here.
+    ///
+    /// `keys[i]` must be the UTF-8 MST key of `leaves[i]`; both arrays are
+    /// appended to together at the single call site in each validator.
+    private static func sortedByMSTKey(
+        _ leaves: [RepositoryMSTLeaf],
+        keys: [Data]
+    ) -> [RepositoryMSTLeaf] {
+        precondition(leaves.count == keys.count)
+        return zip(keys, leaves)
+            .sorted { $0.0.lexicographicallyPrecedes($1.0) }
+            .map(\.1)
     }
 
     private static func isInside(_ key: Data, lower: Data?, upper: Data?) -> Bool {

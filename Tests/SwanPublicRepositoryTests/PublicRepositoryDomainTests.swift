@@ -508,4 +508,173 @@ final class PublicRepositoryDomainTests: XCTestCase {
             XCTAssertEqual($0 as? PublicRepositoryDomainError, .invalidDID)
         }
     }
+
+    // MARK: - Repository-wide record ceiling
+
+    /// The node cap and the entries-per-node cap bound one block each; neither
+    /// bounds the aggregate leaf set a validly signed repository can present.
+    /// `reachableBytes` already caps the whole walk at the CAR budget, so this
+    /// was never an unbounded allocation — but without a leaf ceiling an
+    /// import can still produce a repository whose record count the public
+    /// read path refuses, which is a repository nobody can read.
+    func testValidationRefusesMoreLeavesThanTheRepositoryRecordCeiling() async throws {
+        let tree = try makeFlatTree(recordCount: 3)
+
+        let ceilingOfTwo = try limits(maximumRepositoryRecords: 2)
+        await assertRecordLimitExceeded {
+            _ = try await RepositoryMSTValidation.validate(
+                rootCID: tree.rootCID, blocks: tree.source, limits: ceilingOfTwo
+            )
+        }
+        await assertRecordLimitExceeded {
+            _ = try await RepositoryMSTValidation.validateProjection(
+                rootCID: tree.rootCID,
+                blocks: tree.source,
+                projection: DiscardingProjectionSink(),
+                limits: ceilingOfTwo
+            )
+        }
+
+        let ceilingOfThree = try limits(maximumRepositoryRecords: 3)
+        let validated = try await RepositoryMSTValidation.validate(
+            rootCID: tree.rootCID, blocks: tree.source, limits: ceilingOfThree
+        )
+        XCTAssertEqual(validated.leaves.count, 3, "exactly at the ceiling still validates")
+        let projected = try await RepositoryMSTValidation.validateProjection(
+            rootCID: tree.rootCID,
+            blocks: tree.source,
+            projection: DiscardingProjectionSink(),
+            limits: ceilingOfThree
+        )
+        XCTAssertEqual(projected.recordCount, 3)
+    }
+
+    func testStandardPolicyCarriesTheDocumentedRecordCeiling() throws {
+        XCTAssertEqual(PublicRepositoryLimits.standard.maximumRepositoryRecords, 100_000)
+        XCTAssertThrowsError(try limits(maximumRepositoryRecords: 0)) {
+            XCTAssertEqual(
+                $0 as? PublicRepositoryLimitError,
+                .maximumRepositoryRecordsOutOfRange
+            )
+        }
+    }
+
+    // MARK: - Codec depth accounting
+
+    /// `prepare` advances depth through objects; the conversion phase feeding
+    /// it did not, so the package-public conversion API accepted documents its
+    /// own encoder would refuse. Both halves must agree on 64 accepted / 65
+    /// refused — the same bound `RepositoryRecordBlockValidator` applies to
+    /// every stored block, so nothing already durable can be refused by this.
+    func testRecordConversionAndEncodingAgreeOnObjectNestingDepth() throws {
+        let path = try PublicRepositoryPath(collection: collection, recordKey: "nesting")
+
+        let atCeiling = try PublicRepositoryRecordCodec.publicRecord(
+            from: Self.nestedObjectContainer(levels: 64),
+            collection: collection
+        )
+        XCTAssertNoThrow(try PublicRepositoryRecordCodec.prepare(atCeiling, for: path))
+
+        XCTAssertThrowsError(try PublicRepositoryRecordCodec.publicRecord(
+            from: Self.nestedObjectContainer(levels: 65),
+            collection: collection
+        )) {
+            XCTAssertEqual($0 as? PublicRepositoryDomainError, .recordNestingTooDeep)
+        }
+    }
+
+    // MARK: - Helpers
+
+    /// `levels` counts the record object itself, matching `encodeObject`'s
+    /// depth-1 entry point.
+    private static func nestedObjectContainer(levels: Int) -> ATProtocolValueContainer {
+        var value = ATProtocolValueContainer.object([:])
+        for _ in 1 ..< levels {
+            value = .object(["a": value])
+        }
+        return value
+    }
+
+    private func limits(maximumRepositoryRecords: Int) throws -> PublicRepositoryLimits {
+        try PublicRepositoryLimits(
+            maximumRecordBlockBytes: 1_000_000,
+            maximumCARBytes: PublicRepositoryLimits.requiredStreamingCARBytes,
+            maximumCARBlocks: 32,
+            maximumMSTNodes: 16,
+            maximumMSTEntriesPerNode: 16,
+            maximumCBORNestingDepth: 64,
+            maximumRepositoryRecords: maximumRepositoryRecords
+        )
+    }
+
+    private func assertRecordLimitExceeded(
+        _ operation: () async throws -> Void,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            try await operation()
+            XCTFail("expected recordLimitExceeded", file: file, line: line)
+        } catch {
+            XCTAssertEqual(
+                error as? RepositoryMSTValidationError,
+                .recordLimitExceeded,
+                file: file, line: line
+            )
+        }
+    }
+
+    /// A single layer-0 node holding `recordCount` leaves. Record keys are
+    /// filtered to key-depth 0 so the whole repository fits in one node and the
+    /// test exercises the aggregate ceiling rather than tree topology.
+    private func makeFlatTree(
+        recordCount: Int
+    ) throws -> (rootCID: CID, source: DomainTestBlockSource) {
+        var leaves: [RepositoryMSTLeaf] = []
+        var storage: [CID: Data] = [:]
+        var candidate = 0
+        while leaves.count < recordCount {
+            defer { candidate += 1 }
+            let path = try PublicRepositoryPath(
+                collection: collection,
+                recordKey: String(format: "leaf%06d", candidate)
+            )
+            guard RepositoryMSTCodec.keyDepth(for: path) == 0 else { continue }
+            let bytes = try PublicRepositoryRecordCodec.prepare(
+                PublicRecord([
+                    "$type": .string(collection),
+                    "text": .string(path.recordKey),
+                ]),
+                for: path
+            ).bytes
+            let recordCID = CID.fromDAGCBOR(bytes)
+            storage[recordCID] = bytes
+            leaves.append(RepositoryMSTLeaf(path: path, recordCID: recordCID))
+        }
+        leaves.sort { $0.path.mstKey < $1.path.mstKey }
+        let nodeBytes = try RepositoryMSTCodec.encode(
+            try RepositoryMSTCodec.node(leaves: leaves)
+        )
+        let rootCID = CID.fromDAGCBOR(nodeBytes)
+        storage[rootCID] = nodeBytes
+        return (rootCID, DomainTestBlockSource(storage: storage))
+    }
+}
+
+private struct DomainTestBlockSource: PublicRepositoryBlockSource {
+    let storage: [CID: Data]
+
+    func block(for cid: CID) async throws -> Data? { storage[cid] }
+}
+
+private struct DiscardingProjectionSink: PublicRepositoryReachableProjectionSink {
+    func recordReachableBlock(
+        cid _: CID,
+        kind _: PublicRepositoryReachableBlockKind
+    ) async throws {}
+
+    func recordRepositoryIndex(
+        path _: PublicRepositoryPath,
+        recordCID _: CID
+    ) async throws {}
 }

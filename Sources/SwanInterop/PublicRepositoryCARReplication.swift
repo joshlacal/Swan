@@ -210,6 +210,7 @@ public enum PublicRepositoryCARImportFailureCode {
         case .invalidRecordBlock: return "InvalidRecordBlock"
         case .nodeLimitExceeded: return "NodeLimitExceeded"
         case .entryLimitExceeded: return "EntryLimitExceeded"
+        case .recordLimitExceeded: return "RecordLimitExceeded"
         case .cborDepthLimitExceeded: return "CBORDepthLimitExceeded"
         case .invalidReachableRepositoryByteBudget: return "InvalidReachableRepositoryByteBudget"
         case .reachableRepositoryByteLimitExceeded: return "ReachableRepositoryByteLimitExceeded"
