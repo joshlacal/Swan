@@ -148,136 +148,165 @@ barrier (`LifecycleAuthorizationBarrier`), mirroring the existing
    over what is actually sequenced onto the public log rather than over an
    emitter-internal state.
 
+## Evidence provenance
+
+Every number below was re-established after two infrastructure problems came
+to light, and none of it is carried over from the first pass:
+
+1. The per-session scratchpad under `/private/tmp/claude-501/…/scratchpad/` is
+   **shared by all eight lanes** — I confirmed 408 files in it, spanning
+   Aug 10-13, with generic names (`baseline.log`, `build.log`, `build2.log`)
+   that several lanes chose independently. My files were `L5-`-prefixed, but a
+   clobbered log is self-consistent and undetectable by inspection, so the
+   prefix is not proof. All logs are now written to
+   `/private/tmp/swan-lane-L5-lifecycle-firehose-fence/`, which nothing else
+   writes to.
+2. This lane has been rebased onto **`29ce8202`** ("SwanSQLiteTests: wrap the
+   one await-in-defer that Linux rejects"), the central fix for the Linux
+   blocker reported below. Lane commit is now `0ad16546`.
+
+So the suite counts changed for a legitimate reason — the base moved from
+`75e7b509` to `29ce8202`, picking up seven other lanes' commits — and the
+earlier 1490 figure is superseded rather than corrected.
+
 ## Exact pre-fix failure
 
-Both tests were written and run against the unfenced emitters first (only the
-two hooks were added at that point; the fence was not). `swift test --filter
-"PublicLifecycleEmitterTests/test.*LosesDeterministicRaceToDeactivation"`,
-exit code 1 — the fenced manual-sync test passed, both new ones failed, which
-is precisely the coverage gap the scan identified:
+Re-derived on the rebased base, not quoted from the earlier run. I reverted
+**only** the fence in `PublicLifecycleEmitter.swift` (keeping the two test
+hooks, so the tests still compile), rebuilt, and ran the three race tests:
+exit code 1, **1 passed / 2 failed**. The fenced manual-sync test passed and
+both new ones failed — precisely the coverage gap the scan identified. The
+fence was then restored with `jj restore` and the working copy verified clean.
 
 ```
-Test Case '-[SwanSQLiteTests.PublicLifecycleEmitterTests testActivationSyncLosesDeterministicRaceToDeactivation]' started.
-PublicLifecycleEmitterTests.swift:457: error: ... : failed - a deactivated account published an activation sync
-PublicLifecycleEmitterTests.swift:462: error: ... : XCTAssertTrue failed - the raced activation sync must not become durable
-PublicLifecycleEmitterTests.swift:466: error: ... : XCTAssertEqual failed: ("1") is not equal to ("0")
-PublicLifecycleEmitterTests.swift:468: error: ... : XCTAssertEqual failed: ("[...identity, ...account, ...account, ...sync]") is not equal to ("[...identity, ...account, ...account]") - no #sync may be sequenced after the #account(active:false) that supersedes it
-PublicLifecycleEmitterTests.swift:473: error: ... : XCTAssertEqual failed: ("Optional("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa|sync|activation|req-raced")") is not equal to ("Optional("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa|account|deact-during-activation")")
-Test Case '-[...testActivationSyncLosesDeterministicRaceToDeactivation]' failed (3.346 seconds).
-Test Case '-[...testManualSyncLosesDeterministicRaceToDeactivation]' passed (0.065 seconds).
-Test Case '-[...testReactivationSyncLosesDeterministicRaceToDeactivation]' started.
-PublicLifecycleEmitterTests.swift:524: error: ... : failed - a deactivated account published a reactivation sync
-PublicLifecycleEmitterTests.swift:529: error: ... : XCTAssertTrue failed - the raced reactivation sync must not become durable
-PublicLifecycleEmitterTests.swift:533: error: ... : XCTAssertEqual failed: ("1") is not equal to ("0")
-PublicLifecycleEmitterTests.swift:535: error: ... : XCTAssertEqual failed: ("[...identity, ...account, ...sync, ...account, ...sync]") is not equal to ("[...identity, ...account, ...sync, ...account]") - no #sync may be sequenced after the #account(active:false) that supersedes it
-PublicLifecycleEmitterTests.swift:540: error: ... : XCTAssertEqual failed: ("Optional("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa|sync|reactivation|react-raced")") is not equal to ("Optional("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa|account|deact-during-reactivation")")
-Test Case '-[...testReactivationSyncLosesDeterministicRaceToDeactivation]' failed (0.066 seconds).
+PublicLifecycleEmitterTests.swift:468: error: -[… testActivationSyncLosesDeterministicRaceToDeactivation] : XCTAssertEqual failed:
+  ("[…identity, …account, …account, …sync]")
+  is not equal to
+  ("[…identity, …account, …account]")
+  - no #sync may be sequenced after the #account(active:false) that supersedes it
+Test Case '-[… testActivationSyncLosesDeterministicRaceToDeactivation]' failed (3.642 seconds).
+Test Case '-[… testManualSyncLosesDeterministicRaceToDeactivation]' passed (0.055 seconds).
+PublicLifecycleEmitterTests.swift:535: error: -[… testReactivationSyncLosesDeterministicRaceToDeactivation] : XCTAssertEqual failed:
+  ("[…identity, …account, …sync, …account, …sync]")
+  is not equal to
+  ("[…identity, …account, …sync, …account]")
+  - no #sync may be sequenced after the #account(active:false) that supersedes it
+Test Case '-[… testReactivationSyncLosesDeterministicRaceToDeactivation]' failed (0.062 seconds).
 ```
 
-The fourth assertion in each is the finding itself: the last frame on the
-public firehose is a `#sync` announcing a repository head for a generation the
-already-sequenced `#account(active:false)` superseded. That is what a relay
-consuming `swan.place` would have observed.
+That assertion is the finding itself: the last frame on the public firehose is
+a `#sync` announcing a repository head for a generation the already-sequenced
+`#account(active:false)` superseded. That is what a relay consuming
+`swan.place` would have observed. Full log:
+`/private/tmp/swan-lane-L5-lifecycle-firehose-fence/prefix-race.log`.
 
-After the fence, all 16 `PublicLifecycleEmitterTests` cases pass, including
-the two new ones and the pre-existing manual-sync race test.
+## Determinism — 20 consecutive runs
+
+Because this lane's deliverable is an interleaving test, and because a run
+that overlapped another lane's container being killed would read as flakiness
+rather than as signal, the two race tests were run repeatedly on the restored
+fence rather than once:
+
+- **20 consecutive invocations**, each `swift test --skip-build --filter
+  "PublicLifecycleEmitterTests/test.*LosesDeterministicRaceToDeactivation"`.
+- **20/20 exit 0. 60 passed, 0 failed** across the 20 runs (3 cases each).
+- Zero occurrences of `Some test targets reported failures` in any of the 20
+  logs.
+
+There is no timing tolerance in the tests to be lucky about: the interleaving
+is established by a continuation barrier that the emitting task cannot pass
+until the test releases it, so the sequencer drain always happens while the
+sync insert is suspended. The 20 runs confirm the harness, not the property.
 
 ## Suite result
 
 `xcrun --toolchain XcodeDefault swift test --skip-build` (after an explicit
-`swift build --build-tests`), output redirected to a file, **exit code 0**:
+`swift build --build-tests`), redirected to a file in the private log
+directory, **exit code 0**:
 
 | | |
 |---|---|
-| `Test Case '-[…]' passed` | **1490** |
-| `Test Case '-[…]' failed` | **0** |
-| `Test Case '-[…]' skipped` | **9** |
+| `^Test Case .* passed` | **1492** |
+| `^Test Case .* failed` | **0** |
+| `^Test Case .* skipped` | **9** |
 | `Test Suite '….xctest' passed` | **11** |
 | `Test Suite '….xctest' failed` | **0** |
 | `Some test targets reported failures` | **0 occurrences** |
 | swift-testing | 6 tests in 1 suite passed; 11 empty runs |
 
-Counted with `grep -c "Test Case '-\[.*\]' passed"`, not by summing
-`Executed N tests` lines. No output was piped through `tail`.
+Counted with `grep -cE "^Test Case .* passed"`. Note the counting recipe
+circulated to the lanes, `grep -c "Test Case '-\[.*\] passed"`, matches
+nothing at all — the real line has an apostrophe between `]` and ` passed`
+(`Test Case '-[Suite testName]' passed (0.004 seconds).`). It returns 0 on a
+fully green log, which is the worst possible failure shape for a counting
+recipe. I hit this early and used `…\]' passed` before reporting any figure,
+so no number in this report ever came from the broken pattern. Exit code and
+the `Some test targets reported failures` grep remain the primary signals.
+No output was piped through `tail`.
 
-One honest discrepancy to record: the brief states a 1489-passed baseline, and
-this lane adds exactly 2 test cases, so a 1489 baseline predicts 1491. The
-observed 1490 implies the sealed baseline **in this workspace** is 1488. My
-changes cannot remove a test case — no test method was deleted, and the only
-rename was of a file-private helper actor
-(`ManualAuthorizationBarrier` → `LifecycleAuthorizationBarrier`) — so the
-likeliest explanation is that the quoted 1489 was measured on a slightly
-different tree than `75e7b509`. What matters for the gate holds either way:
-0 failed, 11/11 targets green, no failure marker, and strictly more passing
-cases than the stated baseline.
+Baseline arithmetic: the brief quotes 1489 passed at the sealed base. This run
+is on a **different base** (`29ce8202`, seven lanes ahead of `75e7b509`), so
+the two are not comparable and I am not claiming a delta against 1489. What
+holds unconditionally: 0 failed, 11/11 targets green, no failure marker.
 
 ## Linux build
 
-**Result: both changed source files compile on the deployment toolchain, and
-the test target compiles too once one pre-existing line outside this lane is
-patched. The program's stated Linux recipe cannot pass as written, for a
-reason that predates this lane.**
+**`swift build --build-tests` on Swift 6.1 Linux: exit 0, `Build complete!
+(330.70s)`, zero `error:` lines, `SwanPackageTests.xctest` linked.**
+`Compiling SwanSQLiteTests …` appears 32 times, including this lane's
+`PublicLifecycleEmitterTests.swift`, with no diagnostics against it. Log:
+`/private/tmp/swan-lane-L5-lifecycle-firehose-fence/linux-final.log`.
 
-Three things had to be corrected before any Linux result was obtainable, and
-they are worth recording for the other lanes:
+Command, run after the macOS suite had finished (not concurrently) and with a
+**named** container so it cannot be caught by an image-filtered `docker kill`:
 
-1. `swift:6.1-jammy` is missing Swan's system dependencies. Swan's own
-   `Dockerfile:3-9` installs `libsodium-dev pkg-config libsecret-1-dev
-   libglib2.0-dev` before building. The stock image fails at link
-   configuration. I used `swan-linux-build:6.1-jammy`, which is exactly
-   `swift:6.1-jammy` plus that one `apt-get install` layer (verified with
-   `docker history --no-trunc`).
-2. Building **from a macOS bind mount fails** during resource copying,
-   regardless of where the scratch path points:
-   `NSCocoaErrorDomain Code=512 … NSSourceFilePathErrorKey=…/Tests/
-   SwanOAuthTests/Fixtures, NSUserStringVariant=["Copy"]`. Reproduced with the
-   scratch path on a named Docker volume and again on the container layer. The
-   fix is to copy the sources into the container first
-   (`tar -C /src --exclude=.build … | tar -C /work -xf -`) and build from
-   there.
-3. The Docker VM disk is shared and was at 93% with several lanes building
-   concurrently; a container-layer `.build` exhausted it mid-compile (`error:
-   … No space left on device`). Point `--scratch-path` at a host bind mount
-   outside the repo.
+```
+docker run --rm --name swan-L5 \
+  -v …/Petrel:/workspace/Petrel \
+  -v …/Swan-L5-lifecycle-firehose-fence:/workspace/Swan \
+  -w /workspace/Swan swift:6.1-jammy bash -lc \
+  'apt-get update && apt-get install -y --no-install-recommends \
+     libsodium-dev pkg-config libsecret-1-dev libglib2.0-dev && \
+   swift build --build-tests --scratch-path /workspace/Swan/.build-linux'
+```
 
-### What passed
+`.build-linux` is covered by `.gitignore:2` (`.build-*/`), so it leaves the
+working copy clean.
 
-- **`swift build` (library + `swan` executable), Swift 6.1 Linux — exit 0,
-  `Build complete!`.** This is the real deployment gate: `Dockerfile:14` runs
-  `swift build -c release --product swan` and never builds tests. It compiles
-  both files this lane changed (`SwanSQLite`, `SwanAccounts`).
-- **`swift build --build-tests` — exit 0, all test targets linked**, after
-  patching exactly one pre-existing line (see below). The log shows
-  `Compiling SwanSQLiteTests PublicLifecycleEmitterTests.swift` with no
-  diagnostics against it.
+### Correcting my own earlier diagnosis
 
-### The pre-existing blocker
+My first report said building **from a macOS bind mount** fails during
+resource copying, citing `NSCocoaErrorDomain Code=512 …
+NSSourceFilePathErrorKey=…/Tests/SwanOAuthTests/Fixtures`. **That diagnosis was
+wrong and I am withdrawing it.** The command above builds from a bind mount and
+copies those same fixtures without complaint.
 
-Unpatched, `swift build --build-tests` fails on Swift 6.1 Linux with `error:
-'async' call cannot occur in a defer body` at
-`Tests/SwanSQLiteTests/AccountPermanentDeletionSQLiteTests.swift:260`. Every
-error in the log comes from that one file and no other
-(`grep -o '^/work/lane/[^:]*:.*error:' | sed 's/:.*//' | sort -u` returns a
-single path). The line is `defer { try? await database.close() }`; all ~25
-sibling occurrences across the suite are written `defer { Task { try? await
-… } }`, which is legal. The macOS Xcode toolchain accepts the bare form, so
-this has been invisible on macOS.
+The actual rule is narrower: **the scratch path must be on the same filesystem
+as the sources.** My three failures all put it elsewhere — a named Docker
+volume, then the container's own layer — while the working recipe keeps it
+inside the bind-mounted workspace. Same-mount copying works; cross-mount
+directory copying out of virtiofs is what fails. The elaborate
+copy-the-tree-into-the-container workaround I described is unnecessary; use
+`--scratch-path <workspace>/.build-linux`.
 
-Consequence for the program: **the mandated
-`docker run … swift build --build-tests` gate has never passed on Swan's own
-pinned Linux toolchain.** The fix is to wrap that one line in `Task { }` to
-match its siblings. `Tests/SwanSQLiteTests/AccountPermanentDeletionSQLiteTests
-.swift` is outside this lane's file list, so I did not change it in the repo —
-I patched it only inside the throwaway container copy to prove the failure is
-confined to it. Whoever owns that file should land the one-line fix.
+### The Linux blocker, now fixed centrally
+
+Before `29ce8202`, `--build-tests` could not compile on Linux for **any** lane:
+`Tests/SwanSQLiteTests/AccountPermanentDeletionSQLiteTests.swift:260` was a
+bare `defer { try? await database.close() }`, which Swift 6.1 on Linux rejects
+with `'async' call cannot occur in a defer body` while the macOS Xcode
+toolchain accepts it. It was the only such site missing its `Task { }` wrapper.
+This lane is rebased onto that fix, which is why a Linux test build is
+obtainable here at all. My earlier "verified by patching it inside a throwaway
+container" is superseded by this real build against the real fix.
 
 ### Caveat
 
-This host is Apple Silicon, so the container built `aarch64-unknown-linux-gnu`,
-not the `x86_64` deployment target. That limitation applies to the program's
-own recipe as written and was not introduced here. Nothing in this lane is
-architecture-sensitive (no unsafe pointer work, no endianness, no
-platform-conditional code), but the claim is "Linux-green on aarch64", not
+This host is Apple Silicon, so the container built
+`aarch64-unknown-linux-gnu` (confirmed: no `x86_64` triple appears in the
+log), not the `x86_64` deployment target. Nothing in this lane is
+architecture-sensitive — no unsafe pointer work, no endianness, no
+platform-conditional code — but the claim is "Linux-green on aarch64", not
 "x86_64-verified".
 
 ## Notes for the merge
@@ -300,6 +329,10 @@ platform-conditional code), but the claim is "Linux-green on aarch64", not
   client-visible body. On `PLCAccountActivationService.swift:157-166` the
   error propagates, which the comment at `:150-156` already documents as the
   intended behaviour for a thrown emission.
+- **Linux gate.** `swift build --build-tests` is now satisfiable on the
+  pinned toolchain (post-`29ce8202`) and passes here. Note separately that
+  `Dockerfile:14` builds `swift build -c release --product swan` and never
+  builds tests, so the library/executable build is what actually ships.
 - **Coverage gap, deliberately not closed.** The `AccountOperatorService`
   swallow has no direct test: the operator-service tests live in
   `Tests/SwanCLITests/AccountOperatorServiceTests.swift`, which is outside
