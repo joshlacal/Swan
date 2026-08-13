@@ -128,11 +128,40 @@ run that never finished.
   `interop/fetch-reference-indigo.sh` (`8b43a326`), and
   `interop/materialize-reference-indigo-vendor.sh`, which needs Docker and
   pins `linux/arm64/v8` + `go1.26.4`.
-  Still not run: the live Compose lab itself. Note for whoever brings it up —
-  `docker-compose.yml` uses `context: ..` with `dockerfile: Swan/Dockerfile`,
-  so Compose builds the tree in the sibling directory literally named `Swan`,
-  **not** the workspace it is invoked from. Running it out of a jj workspace
-  such as `Swan-merge3` silently builds a different commit.
+  **The live Compose lab is also up**, on the merged tree, on this host
+  (Docker 29.5 under Colima, `linux/arm64`). All ten images build and the
+  topology reaches steady state: `reference-plc`, `reference-pds`, `mailpit`,
+  `swan`, and `caddy` all healthy, with `swan-secrets-init`,
+  `swan-notification-config-init`, `swan-data-init`, `swan-bootstrap`, and
+  `toxiproxy-setup` each exiting 0. `describeServer` answers
+  `did:web:swan.test` with `swanProfile: permissioned-data-0016-2026-07-30`,
+  and `com.atproto.space.getBlob` — F23's route — is registered and rejects a
+  credential-less request with 400 `InvalidRequest`.
+  Not done in the lab: an authenticated permissioned blob read. No scripted
+  scenario drives one (`grep -rln getBlob Scripts/ interop/` finds only
+  `public-wire-generation-common.sh`), so observing the right-sized
+  reservation against a live server would mean hand-building an OAuth and
+  space-credential flow. F23's evidence remains the seven route-level tests,
+  three of which fail against a ceiling-reserving route.
+
+  Two traps for whoever brings it up next:
+
+  - `docker-compose.yml` uses `context: ..` with `dockerfile: Swan/Dockerfile`,
+    so Compose builds the tree in the sibling directory literally named
+    `Swan`, **not** the workspace it is invoked from. Running it out of a jj
+    workspace such as `Swan-merge3` silently builds a different commit.
+  - A stale `swan-data` volume fails the run with `Error: local space interop
+    runtime is unavailable` and exit 64, which reads like a startup-interlock
+    regression and is not one. The account keys in that volume are wrapped
+    under the KEK of whichever secrets directory created them; a fresh
+    `Scripts/prepare-disposable-interop-secrets.sh` directory cannot unwrap
+    them, and `ServeLocalSpaceRuntime.make`'s error is swallowed by a generic
+    `ValidationError` at `Sources/swan/SwanCommand.swift:2600`, so the message
+    names neither the KEK nor the key store. Either pair the secrets directory
+    with its own volumes or start a new Compose project
+    (`./interop/compose.sh --file docker-compose.yml --project-name <new> up
+    -d`), which leaves the previous lab's volumes intact — preferable to
+    `down -v`, which destroys them.
 
 **Deferred by decision, not oversight:** F21, F24, F25, F29, F34, F42, and the
 F20/F31-step-2/F13-advertising halves — see §5. F21's block GC is the highest
