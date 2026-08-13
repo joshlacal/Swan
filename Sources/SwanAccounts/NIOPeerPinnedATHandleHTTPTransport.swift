@@ -54,11 +54,15 @@ public struct NIOPeerPinnedATHandleHTTPTransport: ATHandleHTTPFetching {
             throw ATHandleVerificationError.verificationFailed
         }
 
+        // Built before the socket is opened so a target that cannot be
+        // expressed in origin form is rejected without any network contact.
+        let target = try atHandleOriginFormRequestTarget(parts)
+
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         do {
             let response = try await request(
                 group: group,
-                url: url,
+                target: target,
                 hostname: hostname,
                 peer: peer,
                 port: port,
@@ -76,7 +80,7 @@ public struct NIOPeerPinnedATHandleHTTPTransport: ATHandleHTTPFetching {
 
     private func request(
         group: MultiThreadedEventLoopGroup,
-        url: URL,
+        target: ATHandleOriginFormRequestTarget,
         hostname: String,
         peer: ATHandleIPAddress,
         port: Int,
@@ -116,7 +120,10 @@ public struct NIOPeerPinnedATHandleHTTPTransport: ATHandleHTTPFetching {
                         ATHandleResponseHandler(
                             promise: promise,
                             expectedPeer: peer,
-                            requestURL: url,
+                            // The URL the emitted request target denotes, not
+                            // the URL that was passed in. See
+                            // `atHandleOriginFormRequestTarget`.
+                            requestURL: target.denotedURL,
                             maximumBodyBytes: maximumBodyBytes,
                             timeout: timeout
                         )
@@ -156,15 +163,10 @@ public struct NIOPeerPinnedATHandleHTTPTransport: ATHandleHTTPFetching {
             )
             headers.add(name: "accept", value: "text/plain, */*;q=0.1")
             headers.add(name: "connection", value: "close")
-            let path: String = {
-                let path = url.path.isEmpty ? "/" : url.path
-                guard let query = url.query, !query.isEmpty else { return path }
-                return "\(path)?\(query)"
-            }()
             let head = HTTPRequestHead(
                 version: .http1_1,
                 method: .GET,
-                uri: path,
+                uri: target.uri,
                 headers: headers
             )
             try await channel.writeAndFlush(HTTPClientRequestPart.head(head)).get()
@@ -307,6 +309,75 @@ private final class ATHandleResponseHandler:
         }
         fail(handlerContext)
     }
+}
+
+/// The origin-form request target actually written to the socket, together with
+/// the URL that target denotes.
+struct ATHandleOriginFormRequestTarget: Sendable {
+    /// The exact `request-target` bytes placed in the HTTP/1.1 request line.
+    let uri: String
+    /// The URL `uri` denotes when resolved against the request's origin. The
+    /// transport reports this as `ATHandleHTTPResponse.responseURL`.
+    let denotedURL: URL
+}
+
+/// Builds the origin-form request target for the outbound handle-resolution GET
+/// from the **percent-encoded** URL components.
+///
+/// `URL.path` and `URL.query` percent-DECODE. Building the target from them
+/// rewrites a path that legitimately contains `%2F`, `%3F`, `%23` or an encoded
+/// space into a *different* resource than the one that was policy-checked and
+/// peer-pinned a few lines earlier. This mirrors
+/// `SwanProxyHTTPTransport.makeConnectionPlan` and the SwanOAuth peer-pinned
+/// transports; the duplication exists only because SwanAccounts does not depend
+/// on SwanOAuth and the shared home would be SwanCore.
+///
+/// `denotedURL` is re-parsed from the emitted target rather than echoed from
+/// the request URL. Echoing the request URL makes the exact-URL comparison in
+/// `ATHandleVerification` compare a value against itself, which proves nothing.
+/// Re-parsing makes that comparison a real check that the derivation below
+/// round-trips. The single normalization is RFC 3986 §6.2.3: origin form
+/// requires at least `/`, and an empty path in an http(s) URI denotes the same
+/// resource as `/`.
+///
+/// The `0x21 ... 0x7E` byte guard is defence in depth, kept for symmetry with
+/// `SwanProxyHTTPTransport`. It is **not** the control that prevents
+/// request-target header injection, and the CRLF-injection finding originally
+/// filed as F22 was REFUTED — do not re-derive it from the presence of this
+/// guard. This pipeline is built with
+/// `syncOperations.addHTTPClientHandlers()`, which unconditionally installs
+/// `NIOHTTPRequestHeadersValidator` (swift-nio 2.101.3,
+/// `Sources/NIOHTTP1/HTTPPipelineSetup.swift` `_addHTTPClientHandlers`). That
+/// handler runs before `HTTPRequestEncoder` on the outbound path and fails the
+/// write with `HTTPParserError.invalidHeaderToken` for any URI byte outside the
+/// RFC 9112 request-target grammar — CR, LF, NUL, SP, CTLs and non-ASCII all
+/// included.
+func atHandleOriginFormRequestTarget(
+    _ components: URLComponents
+) throws -> ATHandleOriginFormRequestTarget {
+    let encodedPath = components.percentEncodedPath
+    let path = encodedPath.isEmpty ? "/" : encodedPath
+    guard path.hasPrefix("/") else {
+        throw ATHandleVerificationError.verificationFailed
+    }
+    let encodedQuery = components.percentEncodedQuery.flatMap { $0.isEmpty ? nil : $0 }
+    let uri = encodedQuery.map { "\(path)?\($0)" } ?? path
+    guard uri.utf8.allSatisfy({ (0x21 ... 0x7E).contains($0) }), uri.utf8.count <= 8_192 else {
+        throw ATHandleVerificationError.verificationFailed
+    }
+
+    // Split the emitted bytes back apart rather than reusing the inputs, so a
+    // future edit to the derivation above that stops round-tripping is caught
+    // by the verifier's exact-URL comparison instead of passing silently.
+    var denoted = components
+    let separator = uri.firstIndex(of: "?")
+    let emittedPath = separator.map { String(uri[uri.startIndex ..< $0]) } ?? uri
+    denoted.percentEncodedPath = (encodedPath.isEmpty && emittedPath == "/") ? "" : emittedPath
+    denoted.percentEncodedQuery = separator.map { String(uri[uri.index(after: $0)...]) }
+    guard let denotedURL = denoted.url else {
+        throw ATHandleVerificationError.verificationFailed
+    }
+    return ATHandleOriginFormRequestTarget(uri: uri, denotedURL: denotedURL)
 }
 
 private func atHandleSocketPeer(
