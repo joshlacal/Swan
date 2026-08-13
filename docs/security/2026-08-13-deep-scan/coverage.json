@@ -1,0 +1,162 @@
+{
+  "completeness": "partial",
+  "deferred": [
+    {
+      "candidateId": "candidate-a8b1cf9933918fd3",
+      "id": "candidate-a8b1cf9933918fd3",
+      "paths": [
+        "Sources/SwanSQLite/SwanSQLite.swift"
+      ],
+      "reason": "A protocol/retention decision and focused interoperability or lifecycle test are required."
+    },
+    {
+      "candidateId": "candidate-cb95fe2176260086",
+      "id": "candidate-cb95fe2176260086",
+      "paths": [
+        "Sources/SwanInterop/PublicRepositoryCARReplication.swift",
+        "Sources/SwanAccounts/PLCClient.swift",
+        "Sources/SwanInterop/PublicRepositoryDIDResolver.swift",
+        "Sources/SwanOAuth/PLCSpaceCredentialPublicKeyResolver.swift"
+      ],
+      "reason": "A protocol/retention decision and focused interoperability or lifecycle test are required."
+    },
+    {
+      "candidateId": "candidate-cb8b526aaa85b738",
+      "id": "candidate-cb8b526aaa85b738",
+      "paths": [
+        "Sources/SwanOAuth/PLCSpaceCredentialPublicKeyResolver.swift",
+        "Sources/SwanOAuth/SpaceCredentialAuthority.swift",
+        "Tests/SwanOAuthTests/PLCSpaceCredentialPublicKeyResolverTests.swift",
+        "Tests/SwanOAuthTests/SpaceCredentialAuthorityTests.swift"
+      ],
+      "reason": "A protocol/retention decision and focused interoperability or lifecycle test are required."
+    }
+  ],
+  "documentType": "codex-security.coverage",
+  "excludePaths": [],
+  "explicitExclusions": [
+    {
+      "pattern": "https://swan.place adversarial runtime testing",
+      "reason": "The user supplied the live non-federated deployment as context but authorized offensive testing only on local/disposable systems; no active adversarial requests were sent to the public service."
+    }
+  ],
+  "includePaths": [
+    "."
+  ],
+  "inventoryStrategy": "repository",
+  "mode": "deep_repository",
+  "openQuestions": [
+    {
+      "followUpPrompt": "Define and test Swan space-credential revocation semantics across member removal and managing-app policy denial.",
+      "question": "Does Proposal 0016 intentionally define removed-member space credentials as non-revocable leases until expiry, or must Swan enforce a membership/client-policy epoch on every read?"
+    },
+    {
+      "followUpPrompt": "Specify permissioned blob retention semantics and add update/delete/last-reference tests.",
+      "question": "Must permissioned blob readability track live record reachability, or are blobs intentionally retained at space scope after the last record reference is removed?"
+    },
+    {
+      "followUpPrompt": "Review Proposal 0016 key-purpose compatibility and decide whether Swan production must require a dedicated space key.",
+      "question": "Is fallback from `#atproto_space` to the ordinary `#atproto` repository key an accepted production protocol rule, and what compromise blast radius is accepted?"
+    }
+  ],
+  "scanId": "13b89cfe-905d-4732-9b0b-a63d67cb59b6",
+  "schemaVersion": "1.0",
+  "surfaces": [
+    {
+      "disposition": "reported",
+      "id": "surface_http/xrpc-public-and-authenticated-route-surface",
+      "label": "HTTP/XRPC public and authenticated route surface",
+      "notes": "Reviewed route registration and handlers; retained public firehose, OAuth/login/recovery, proxy, mutation and streaming findings.",
+      "receiptRefs": [],
+      "riskArea": "Authentication, method binding, request admission, streaming and error/resource behavior"
+    },
+    {
+      "disposition": "reported",
+      "id": "surface_oauth-dpop-session-and-service-jwt-enforcement",
+      "label": "OAuth, DPoP, session and service JWT enforcement",
+      "notes": "Reviewed issuance and verification; retained lifetime, replay-capacity, metadata-fetch, login-admission and lifecycle-race findings.",
+      "receiptRefs": [],
+      "riskArea": "Credential type, freshness, replay, scope, audience and lifecycle binding"
+    },
+    {
+      "disposition": "reported",
+      "id": "surface_permissioned-authorization-and-capability-enforcement",
+      "label": "Permissioned authorization and capability enforcement",
+      "notes": "Retained read-credential registration mutation, cross-space deletion replay, post-revocation credential use and signing-race findings.",
+      "receiptRefs": [],
+      "riskArea": "Space membership, read/write separation, delegation, notification and cross-space binding"
+    },
+    {
+      "disposition": "reported",
+      "id": "surface_public-and-permissioned-blob-isolation",
+      "label": "Public and permissioned blob isolation",
+      "notes": "Demonstrated by source and checked-in tests that permissioned-intended uploads enter the public namespace before promotion; retained streaming and reservation findings.",
+      "receiptRefs": [],
+      "riskArea": "Anonymous namespace reachability, staging, promotion, streaming and spool budgets"
+    },
+    {
+      "disposition": "needs_follow_up",
+      "id": "surface_repository-car-mst-cid-and-recovery-verification",
+      "label": "Repository, CAR, MST, CID and recovery verification",
+      "notes": "Retained deniable-binding and MST resource findings; PLC key-continuity semantics remain deferred.",
+      "receiptRefs": [],
+      "riskArea": "Exact-content authentication, import bounds, CAS and durable key continuity"
+    },
+    {
+      "disposition": "reported",
+      "id": "surface_did-plc-dns-and-outbound-request-resolution",
+      "label": "DID, PLC, DNS and outbound request resolution",
+      "notes": "Retained document-binding, IPv6 classification, URL canonicalization and proxy DNS findings; operator-only configured-origin candidate was rejected.",
+      "receiptRefs": [],
+      "riskArea": "Document identity, PLC audit state, URL/IP canonicalization, DNS pinning and timeouts"
+    },
+    {
+      "disposition": "reported",
+      "id": "surface_sqlite-durability-lifecycle-and-concurrency",
+      "label": "SQLite durability, lifecycle and concurrency",
+      "notes": "Retained public/permissioned write, signing, sync and blob lifecycle races plus unbounded durable-ledger growth.",
+      "receiptRefs": [],
+      "riskArea": "Linearization, retries, durable ledgers, publication and account/space transitions"
+    },
+    {
+      "disposition": "reported",
+      "id": "surface_notifications-and-outbound-delivery",
+      "label": "Notifications and outbound delivery",
+      "notes": "Retained service-JWT freshness, deletion-token scope and read-capability registration findings.",
+      "receiptRefs": [],
+      "riskArea": "Service authentication, space binding, registration authority, retries and deletion state"
+    },
+    {
+      "disposition": "reported",
+      "id": "surface_parser-serialization-and-resource-exhaustion",
+      "label": "Parser, serialization and resource exhaustion",
+      "notes": "Retained object-depth, WebSocket, CAR/MST, remote-fetch and admission-budget findings; lab-only parser tools were rejected.",
+      "receiptRefs": [],
+      "riskArea": "Nesting, aggregate work, body/frame rates, spool, disk, memory and response deadlines"
+    },
+    {
+      "disposition": "reported",
+      "id": "surface_production-versus-laboratory-configuration",
+      "label": "Production versus laboratory configuration",
+      "notes": "Retained production-composable lab trust/profile findings; explicitly invoked lab CLI, Mailpit and reference-relay candidates were rejected.",
+      "receiptRefs": [],
+      "riskArea": "Lab trust material, profile selection, SMTP/HTTP exceptions and reference overlays"
+    },
+    {
+      "disposition": "reported",
+      "id": "surface_secrets-docker-compose-and-build/deployment-boundary",
+      "label": "Secrets, Docker, Compose and build/deployment boundary",
+      "notes": "Retained runtime-secret and Docker-context findings; same-UID disposable credential observations were rejected.",
+      "receiptRefs": [],
+      "riskArea": "Runtime operator secrets, build context/cache and local artifact custody"
+    },
+    {
+      "disposition": "no_issue_found",
+      "id": "surface_swiftpm-dependencies-generated-profiles-and-scripts",
+      "label": "SwiftPM dependencies, generated profiles and scripts",
+      "notes": "Package manifests, lockfile, profiles, checksums and scripts were inventoried. No source-supported dependency-substitution or remote code-execution path survived.",
+      "receiptRefs": [],
+      "riskArea": "Pins, generated-wire integrity, script quoting and artifact verification"
+    }
+  ]
+}

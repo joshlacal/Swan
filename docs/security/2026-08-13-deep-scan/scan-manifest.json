@@ -1,0 +1,109 @@
+{
+  "documentType": "codex-security.scan-manifest",
+  "scan": {
+    "artifacts": [
+      {
+        "mediaType": "application/json",
+        "path": "findings.json",
+        "sha256": "f5ec364795e174320b0f39a159b23a9efb75ca242e86b2fac6528857597536a0"
+      },
+      {
+        "mediaType": "application/json",
+        "path": "coverage.json",
+        "sha256": "d60171fdef029c54fc6f42970273c44893450898d1e7c7501a10f03ccd8d206c"
+      }
+    ],
+    "completedAt": "2026-08-13T08:46:26.076948Z",
+    "coverageRef": "coverage.json",
+    "findingsRef": "findings.json",
+    "id": "13b89cfe-905d-4732-9b0b-a63d67cb59b6",
+    "producer": {
+      "name": "codex-security-plugin",
+      "version": "0.1.18"
+    },
+    "scope": {
+      "artifactsReviewed": [
+        "Sources/**",
+        "Tests/**",
+        "Scripts/**",
+        "Package.swift",
+        "Package.resolved",
+        "Dockerfile",
+        "Dockerfile.dockerignore",
+        "docker-compose*.yml",
+        "interop/**",
+        "Profiles/**",
+        "configuration and deployment documentation"
+      ],
+      "excludePaths": [],
+      "includePaths": [
+        "."
+      ],
+      "limitations": [
+        "No disposable full-stack adversarial runtime was brought up during this scan.",
+        "No active probes were sent to swan.place.",
+        "Dependency advisory freshness and external PLC/AT Protocol behavior were not independently verified over the network.",
+        "Three protocol/retention semantics remain deferred, so coverage is partial."
+      ],
+      "runtimeStatus": "Read-only static validation with checked-in test and deployment evidence; no live adversarial probing and no repository implementation edits.",
+      "summary": "Whole Swan repository at revision fc11540f4d3e9d62ace564dc4b01880aa1f47c6f, including 582 inventoried files across application source, tests, scripts, profiles, SwiftPM, Docker, Compose and interop material.",
+      "validationMode": "Deep repeated discovery followed by centralized static source/control/sink validation and attack-path calibration."
+    },
+    "sealedAt": "2026-08-13T08:46:26.076948Z",
+    "startedAt": "2026-08-13T07:10:46.316437Z",
+    "status": "completed",
+    "target": {
+      "displayName": "Swan",
+      "kind": "git_worktree",
+      "revision": "fc11540f4d3e9d62ace564dc4b01880aa1f47c6f",
+      "snapshotDigest": "codex-security-snapshot/v1:sha256:8ea6cda30cac44c46b235fb1aba87ab9a5e3f5f522ca844f2060ab802eb9c899",
+      "targetId": "target_sha256_6c9e671d113dcda773fd9a6c8e97b5b527923dc68aa3f89705c93103e6fa6f80"
+    },
+    "threatModel": {
+      "assets": [
+        "Permissioned records, blobs and metadata",
+        "Account, OAuth, DPoP, service, delegation and space credentials",
+        "Public and permissioned repository integrity",
+        "PLC/DID key continuity and service routing",
+        "SQLite durability and lifecycle authorization state",
+        "Listener, memory, disk, spool, resolver and notification availability",
+        "Production/laboratory and build/runtime secret separation"
+      ],
+      "assumptions": [
+        "A hosting PDS can observe hosted permissioned plaintext and is trusted for confidentiality",
+        "External PLC/DID and upstream protocol semantics remain residual trust dependencies",
+        "No active adversarial testing of the live swan.place deployment was performed",
+        "Static source traces and checked-in tests support findings, but operational exploitability depends on enabled configuration and infrastructure"
+      ],
+      "attackerCapabilities": [
+        "Send malformed, slow, replayed and concurrent Internet requests",
+        "Operate an authenticated account or malicious space member/writer/authority",
+        "Control a hostile or compromised remote PDS or identity/metadata response",
+        "Steal a bearer credential or retain a formerly valid signing key",
+        "Supply malicious operator configuration or use shared/remote build infrastructure"
+      ],
+      "securityObjectives": [
+        "Never make permissioned values anonymously public",
+        "Keep credential classes and scopes non-interchangeable",
+        "Keep read capabilities unable to mutate durable state",
+        "Verify exact repository state before publication",
+        "Fail closed on remote identity and endpoint resolution",
+        "Linearize authorization with security-sensitive durable effects",
+        "Bound attacker-controlled resource work and durable growth",
+        "Keep lab relaxations structurally out of production"
+      ],
+      "summary": "Swan is an Internet-facing AT Protocol PDS with shared process and identity infrastructure but distinct public and permissioned data planes. Threat actors include unauthenticated clients, malicious authenticated accounts and space members, hostile/compromised PDS peers and identity authorities, stolen-capability holders, and malicious configuration/build infrastructure.",
+      "trustBoundaries": [
+        "Internet HTTP/XRPC to route handlers",
+        "Authentication to per-object and per-operation authorization",
+        "Public versus permissioned repository/blob/sync namespaces",
+        "Lifecycle checks versus asynchronous signing, streaming and durable commits",
+        "Local PDS versus remote PDS, PLC/DID, OAuth metadata, AppView and relay responses",
+        "Parser/staging versus durable publication",
+        "Production serve versus laboratory overlays and credentials",
+        "Checkout versus Docker builder/cache and runtime"
+      ]
+    }
+  },
+  "schemaVersion": "1.0"
+}
