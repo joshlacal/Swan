@@ -139,6 +139,50 @@ Re-verified:
   `Tests/SwanHTTPTests/PublicFirehoseStreamingTests.swift` (not a lane file)
   pass actor calls or `XCTFail` and compile unchanged.
 
+**Does the refusal path spend the resource it rations?** (L4's lesson — an
+admission control that refuses *through* the resource it protects is not a
+control.) Traced statement by statement:
+
+| Resource | Cost of a refused upgrade |
+|---|---|
+| Firehose reservation slot | **none** — `reserve()` returned `nil`; no lease is created, so nothing is taken and released around the refusal |
+| Hub subscription | **none** — `subscribeWithFinish()` is after the guard. Pinned: the saturation test asserts `hub.subscriberCount() == 2` with a third subscriber refused |
+| SQLite | **none** — `maxSequencedSeq()` / `retainedFromSeq()` are after the guard |
+| Journal | one throttled line pair, bounded by F33 |
+| **Listener connection slot** | **one, for the close handshake** |
+
+That last row is a real residual and is worth stating plainly rather than
+claiming the refusal is free. The upgrade has already completed by the time
+`onUpgrade` runs, so a refused subscriber holds its listener slot until the
+channel closes. `WebSocketHandler.handle` arms a force-close after
+`closeTimeout` (`swift-websocket/Sources/WSCore/WebSocketHandler.swift:196-200`),
+which Swan sets to 15 s (`SwanHTTP.swift:1207`). A peer that echoes the close
+unwinds immediately — the saturation test, refusal round-trip included, runs in
+0.056 s — but a peer that never echoes costs one slot for 15 s.
+
+Two reasons this does not reopen F05. First, the bound is shared with every
+server-initiated close already on this route (`FutureCursor`, `ConsumerTooSlow`
+both go through `outbound.close`), so the admission introduces no new mechanism;
+it is the listener's generic close cost. Second, and the point of the fix, it
+changes the *kind* of occupancy: before, 256 responsive-idle sockets held the
+budget **indefinitely at zero sustained cost**; now, holding the listener beyond
+the 64-slot reservation requires sustained churn of roughly 17 new connections
+per second, which is a rate an external per-IP rule can see and which the
+listener's own `idleTimeout` also touches. Refusing earlier — in `shouldUpgrade`,
+before the WebSocket exists — would remove even this, but `.dontUpgrade`
+hard-codes 405 and the check there would be a TOCTOU read rather than a
+reservation, so it is not available without a library change.
+
+**Half-read connections (L4 interaction).** This lane does **not** touch how
+half-read connections are reaped: `SwanJSONWriteBodyDrainHandler` and
+`idleTimeout` (`SwanHTTP.swift:1166-1169`) are outside every hunk in this
+commit. One interaction is worth naming at merge time anyway, because it runs
+the other way: the 25% reservation guarantees ≥192 listener slots stay
+unreachable *by the firehose*. It does not reserve them *for* anything. If L4's
+isolated drain pool saturates and leaves anonymous write connections half-read,
+those connections consume slots out of that same 192 — the firehose control
+cannot and does not protect against HTTP-side occupancy.
+
 **Rejected:**
 
 - **A new `#error` name.** The lexicon defines only `FutureCursor` and
@@ -302,68 +346,139 @@ because lane ownership put `SwanHTTP.swift` in L1; a comment says so.
 
 ## Verification
 
+> **Evidence provenance.** Every number below was re-established in
+> `/private/tmp/swan-lane-L1-firehose-admission/`, which nothing else writes to.
+> An earlier round of runs went to the shared
+> `/private/tmp/claude-501/.../scratchpad/` under generic names
+> (`baseline-test.log`, `full-test.log`, `linux-build.log`) that several lanes
+> chose independently, so those logs could have been clobbered by, or clobbered,
+> another lane's. **Those earlier numbers are withdrawn**; they are not cited
+> here. A clobbered log is undetectable by inspection — it is internally
+> consistent and cites one workspace — so none of them were reasoned about,
+> they were simply re-run.
+
 - **Toolchain:** `xcrun --toolchain XcodeDefault swift build --build-tests` /
   `swift test --skip-build`. `swiftformat` was never run.
-- **Baseline measured in-lane at `75e7b509`:** exit 1, **1488 passed, 1 failed,
-  9 skipped**. The single failure is
-  `SwanOAuthTests.NIOPeerPinnedOAuthPostTransportTests.testPostTransportRejectsResponseBeyondConfiguredBound`
-  — `failed: caught error: "I/O on closed channel"` after 11.8 s, and the error
-  line names a source path in `Swan-L3-par-login-admission`, i.e. it is
-  concurrent-agent interference on a shared machine, not a property of this
-  tree. The program's stated baseline of 1489/0 is what this reduces to with
-  that one flake excluded. It is untouched by this lane (no L1 file is in
-  `SwanOAuth`).
-- **Post-change full suite:** exit **0**, **1497 passed, 0 failed, 9 skipped**,
-  **11 targets**, zero occurrences of `Some test targets reported failures`, and
-  zero `error:` lines. 1489 (the program's stated baseline) − 1 replaced test
-  + 9 new tests = 1497, exactly.
-- One earlier attempt at this run exited **143** (SIGTERM) partway through with
-  0 failures recorded. That is the machine killing the process under load from
-  the sibling lanes, not a result; it was discarded and the run repeated to
-  completion rather than reported.
+- **Base:** rebased onto **`29ce8202`** (`SwanSQLiteTests: wrap the one
+  await-in-defer that Linux rejects`), which is what makes a Linux
+  `--build-tests` possible at all. The lane's own commits still contain only
+  lane files; the one-line non-lane fix comes in through the base rather than
+  through a commit here.
+- **Post-change full suite on the rebased base:** exit **0**, **1498 passed,
+  0 failed, 9 skipped**, **11 targets**, zero occurrences of `Some test targets
+  reported failures`, zero `error:` lines.
+- **Counting.** Counts here were produced with
+  `grep -cE '^Test Case .* passed'` / `'^Test Case .* failed'` and
+  independently with `awk '/Test Case .*passed \(/'`; the two agree exactly. The
+  recipe circulated to the lanes,
+  `grep -c "Test Case '-\[.*\] passed"`, matches **nothing** — the real line is
+  `Test Case '-[Suite testName]' passed (0.004 seconds).`, with a `'` between
+  `]` and ` passed`. It was never used for any number in this report, but it
+  returns 0 silently, so anything counted with it is void rather than zero.
+- **Pre-rebase, on the sealed base `75e7b509`,** the same suite was exit 0 with
+  **1497 passed, 0 failed, 9 skipped** — 1489 (the program's stated baseline)
+  − 1 replaced test + 9 new tests = 1497, exactly. The +1 at 1498 comes from a
+  sibling lane's commit now in the base, not from this lane. All nine new tests
+  are in the pass list in both runs.
+- **A flake to know about before merge.** The first private-directory full run
+  came back **1496/1**:
+  `SwanOAuthTests.NIOPeerPinnedOAuthPostTransportTests.testDocumentTransportRejectsResponseBeyondConfiguredBound`
+  failed with `caught error: "I/O on closed channel"` after 9.7 s. It is a
+  localhost-socket test in a module this lane does not touch (the commit's six
+  files contain nothing under `SwanOAuth`). Run in isolation it passed **10/10,
+  three times in a row**, and the immediately following full run was clean. It
+  is load-induced on a machine running eight lanes, not a regression — but it is
+  recorded rather than quietly dropped, because a sibling test in the same suite
+  flaked the same way earlier, so this suite is the one to expect noise from.
+- One earlier attempt at a full run exited **143** (SIGTERM) partway through
+  with 0 failures recorded. That is the machine killing the process under load,
+  not a result; discarded and repeated to completion rather than reported.
 
 ### Linux
 
-Deployment target is Linux x86_64, so macOS green is not sufficient. Three
-things had to be worked around before the command in the brief could run at
-all, none of them caused by this lane:
+Deployment target is Linux, so macOS green is not sufficient. The Linux runs
+were serialized **after** the macOS suite finished, in a container named
+`swan-L1` so it can be targeted by name rather than by an image filter that
+matches every lane's container.
+
+> **This result is aarch64, not x86_64.** `swift:6.1-jammy` resolves to
+> `aarch64` on this host (`docker run … uname -m` → `aarch64`). It validates the
+> Linux toolchain's stricter rules — which is what the gate exists for, since
+> the risk here is a Sendable or language-rule rejection, not codegen — but it
+> does **not** validate the production architecture. The x86_64 build is being
+> run centrally on the merged result.
+
+Four things had to be worked around, none of them caused by this lane:
 
 1. `Package.swift:25` carries `.package(path: "../Petrel")`, so mounting only
    `Swan-L1-firehose-admission` fails with `the package at '/Petrel' cannot be
-   accessed`. The mount must be the workspace root, exactly as `Dockerfile:10-12`
-   copies both trees.
+   accessed`. Both repos must be mounted, exactly as `Dockerfile:10-12` copies
+   both trees.
 2. Stock `swift:6.1-jammy` lacks the system libraries `Dockerfile:4-9` installs.
    A cached `swan-linux-builder:6.1-jammy` image adds `libsodium-dev`,
    `pkg-config`, `libsecret-1-dev`, `libglib2.0-dev` — the same list.
-3. `--scratch-path /work/…/.build-linux` keeps Linux artifacts from clobbering
-   the macOS `.build`. `.build-*/` is already gitignored. **Note for the next
-   agent:** the containerised resolve rewrites `Package.resolved` (it drops
-   `swift-configuration`, which resolves only on the macOS platform condition).
-   That file is outside this lane, so it was restored with
-   `jj restore --from @- Package.resolved`, and the full macOS suite was re-run
-   afterwards against the restored tree.
+3. **The scratch path must live inside the mounted workspace, not in container
+   `/tmp`.** With `--scratch-path /tmp/linuxbuild`, SwiftPM fails copying test
+   resources across the bind mount:
+   `NSCocoaErrorDomain Code=512 … NSURL=file:///workspace/Swan/Tests/SwanOAuthTests/Fixtures
+   … NSDestinationFilePath=/tmp/linuxbuild/…/Swan_SwanOAuthTests.resources/Fixtures`.
+   That is an artifact of the scratch location, not a code problem — recording
+   it so the next agent does not debug it. `--scratch-path /workspace/Swan/.build-linux`
+   works; `.build-*/` is gitignored and is a different directory from the macOS
+   `.build`, which was never bind-mounted.
+4. Changing the mount point invalidates the scratch's module cache
+   (`PCH was compiled with module cache path '/work/…' but the path is currently
+   '/workspace/…'`, `missing required module 'SwiftShims'`). Clearing the Linux
+   build products under `.build-linux` — not the checkouts — resolves it.
 
-Results:
+**The container writes back into the workspace.** Every containerised run
+rewrote `Package.resolved` from **35 pins to 34**, dropping `swift-configuration`
+(it resolves only under the macOS platform condition). Committing that would
+break the macOS build for whoever merges. It was restored with
+`jj restore --from @- Package.resolved` and verified with
+`grep -c '"identity"' Package.resolved` → **35** after **every** Docker run and
+immediately before every `jj describe`. The lane's code commit was never
+affected; the damage always landed in the working-copy commit.
+
+Results, all on the rebased base:
 
 | Command | Result |
 |---|---|
-| `swift build` (all sources and products, incl. all four L1 source files) | **Build complete**, exit 0 |
-| `swift build --target SwanHTTPTests` (the L1 test file) | **Build of target complete**, exit 0 |
-| `swift build --build-tests` (every test target) | exit 1 — **one pre-existing, non-lane error** |
+| `swift build --build-tests` (every source, product and test target) | **Build complete**, exit 0 |
 
-The `--build-tests` failure has exactly one unique error across the whole run:
+Before the rebase this failed, for every lane on every branch including the
+sealed base, with exactly one unique error across the whole run:
 
 ```
 Tests/SwanSQLiteTests/AccountPermanentDeletionSQLiteTests.swift:260:37:
   error: 'async' call cannot occur in a defer body
 ```
 
-That is `defer { try? await database.close() }`, which the Xcode toolchain
-accepts and Swift 6.1 does not. The file is not an L1 file and is unmodified by
-this lane (`jj st` lists five source/test files, none in `SwanSQLite`), so this
-is a property of the tree at `75e7b509`, not a regression — but it does mean the
-brief's `swift build --build-tests` cannot succeed on `swift:6.1-jammy` at
-baseline either, and someone should file it. The Sendable-shaped risk that
-motivated the Linux gate is covered: every changed source file and the changed
-test file compile clean on Linux, including the `@escaping @Sendable` closure
-change on `PublicFirehoseTailer.run`.
+That is `defer { try? await database.close() }` — the one `await`-in-`defer`
+site in the repository missing its `Task { }` wrapper, which the Xcode toolchain
+accepts and Swift 6.1 rejects. It is fixed centrally at `29ce8202`, which this
+lane is now rebased onto. Recorded because a "Linux build failed" observed in
+this program before that commit was very likely this and not the lane's code.
+
+The Sendable-shaped risk that motivated the Linux gate is covered: every changed
+source file and the changed test file compile clean on Linux, including the
+`@escaping @Sendable` closure change on `PublicFirehoseTailer.run` — which is
+the one change in this lane a Linux-only Sendable rule could plausibly have
+rejected. (Isolated `swift build` and `swift build --target SwanHTTPTests` runs
+also passed before the rebase, so the lane's own files were never the blocker.)
+
+## Merge notes
+
+- Every hunk in `Sources/SwanHTTP/SwanHTTP.swift` is at original-file lines
+  446, 478, 493, 872, 1037, 1158. **None is in the OAuth endpoint registration
+  block at `:817-824`**, which L3 needs for its one additive
+  `loginClientIdentityPolicy:` argument on the
+  `registerOAuthAuthorizationServerPAREndpoint(...)` call. That block was not
+  reformatted or restructured, and nothing in this lane requires touching it.
+- `SwanJSONWriteBodyDrainHandler` and `idleTimeout` (`SwanHTTP.swift:1166-1169`)
+  are outside every hunk; this lane changes nothing about how half-read
+  connections are reaped.
+- `../Petrel` was never modified, regenerated or cleaned by this lane. It is one
+  checkout shared by all eight workspaces; the only thing done to it here was
+  bind-mounting it **read-through** into the Linux container, which SwiftPM only
+  reads from.
