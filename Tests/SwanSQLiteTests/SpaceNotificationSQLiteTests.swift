@@ -1,5 +1,6 @@
 import Foundation
 import Petrel
+import SQLiteNIO
 import SwanCore
 @testable import SwanSQLite
 import SwanSpaces
@@ -182,6 +183,10 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             did: fixture.writer
         )
         defer { Task { try? await recipient.close() } }
+        // A deletion is only recorded for a space this account already
+        // participates in, so establish that participation before measuring
+        // the receipt bound.
+        try await fixture.join(space: fixture.space, on: recipient, rkey: "receipt-bound")
         for index in 0 ..< 100 {
             try await recipient.receiveSpaceDeletionNotification(
                 space: fixture.space,
@@ -440,6 +445,299 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             XCTFail("recipient tombstone must close repository writes")
         } catch {}
     }
+
+    /// A deletion service JWT carries no space claim, and the verifier keeps no
+    /// replay cache (`Sources/SwanOAuth/SpaceServiceAuthentication.swift:40`).
+    /// The pinned reference receiver bounds that by no-oping unless the
+    /// recipient already knows the space
+    /// (`packages/pds/src/api/com/atproto/space/notifySpaceDeleted.ts:33-34`).
+    /// Without the same precondition one valid token mints a permanent
+    /// tombstone — and a permanent receipt — for every SpaceURI under the
+    /// issuer's authority, because receipt identity includes `space_uri`.
+    func testDeletionNotificationForAnUnjoinedSpaceIsANoOp() async throws {
+        let fixture = try NotificationFixture()
+        let recipient = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root,
+            did: fixture.writer
+        )
+        defer { Task { try? await recipient.close() } }
+        try await fixture.join(space: fixture.space, on: recipient, rkey: "joined")
+
+        let now = Date(timeIntervalSince1970: 1_750_000_400)
+        // Same authority, same token identity, a space this account never
+        // joined. The reference receiver answers this with a no-op.
+        try await recipient.receiveSpaceDeletionNotification(
+            space: fixture.secondarySpace,
+            issuer: fixture.authority,
+            audience: fixture.writer,
+            eventID: "cross-space-replay",
+            now: now
+        )
+        let tombstones = try await recipient.connection.query(
+            """
+            SELECT COUNT(*) AS row_count
+            FROM permissioned_space_recipient_tombstones
+            WHERE space_uri = ?
+            """,
+            [.text(fixture.secondarySpace.rawValue)]
+        )
+        XCTAssertEqual(tombstones.first?.column("row_count")?.integer, 0)
+        let receipts = try await recipient.connection.query(
+            """
+            SELECT COUNT(*) AS row_count
+            FROM permissioned_space_notification_receipts
+            WHERE space_uri = ?
+            """,
+            [.text(fixture.secondarySpace.rawValue)]
+        )
+        XCTAssertEqual(receipts.first?.column("row_count")?.integer, 0)
+
+        // The pre-emptive tombstone would also have closed the space before
+        // this account ever joined it.
+        try await fixture.join(
+            space: fixture.secondarySpace,
+            on: recipient,
+            rkey: "joined-after-replay"
+        )
+
+        // Participation restored, the same message is recorded normally.
+        try await recipient.receiveSpaceDeletionNotification(
+            space: fixture.secondarySpace,
+            issuer: fixture.authority,
+            audience: fixture.writer,
+            eventID: "cross-space-replay",
+            now: now.addingTimeInterval(1)
+        )
+        let afterJoin = try await recipient.connection.query(
+            """
+            SELECT COUNT(*) AS row_count
+            FROM permissioned_space_recipient_tombstones
+            WHERE space_uri = ?
+            """,
+            [.text(fixture.secondarySpace.rawValue)]
+        )
+        XCTAssertEqual(afterJoin.first?.column("row_count")?.integer, 1)
+    }
+
+    /// The request receipt is a replay reservation, not the state guard: the
+    /// revision CAS is what refuses a stale write. Retaining receipts to the
+    /// same depth as the oplog therefore only changes a duplicate rejection
+    /// into a conflict rejection once a request is older than the window.
+    func testRequestReceiptsPruneToRetentionDepthAndStaleReplayBecomesAConflict() async throws {
+        let fixture = try NotificationFixture()
+        let database = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root,
+            did: fixture.writer,
+            oplogRetention: 3
+        )
+        defer { Task { try? await database.close() } }
+
+        let uri = try SpaceRecordURI(
+            space: fixture.space,
+            author: fixture.writer,
+            collection: "app.bsky.feed.post",
+            rkey: "ledger"
+        )
+        var requestIDs: [UUID] = []
+        for index in 1 ... 6 {
+            let requestID = UUID()
+            requestIDs.append(requestID)
+            let value = Data([0xA1, 0x61, 0x61, UInt8(index)])
+            _ = try await database.apply(
+                space: fixture.space,
+                author: fixture.writer,
+                expectedRevision: UInt64(index - 1),
+                requestID: requestID,
+                wireRevision: try fixture.tid(index),
+                writes: [
+                    .put(
+                        uri: uri,
+                        value: value,
+                        cid: CID.fromDAGCBOR(value).string
+                    ),
+                ]
+            )
+        }
+
+        let retained = try await database.connection.query(
+            """
+            SELECT request_id, created_at
+            FROM permissioned_space_requests
+            WHERE space_uri = ? AND author_did = ?
+            ORDER BY final_revision
+            """,
+            [.text(fixture.space.rawValue), .text(fixture.writer)]
+        )
+        XCTAssertEqual(retained.count, 3)
+        XCTAssertEqual(
+            retained.compactMap { $0.column("request_id")?.string },
+            requestIDs.suffix(3).map(\.uuidString)
+        )
+        XCTAssertTrue(
+            retained.allSatisfy { ($0.column("created_at")?.integer ?? 0) > 0 }
+        )
+
+        // A retained receipt still answers a replay as a duplicate, before the
+        // revision CAS is consulted.
+        let duplicateValue = Data([0xA1, 0x61, 0x61, 0x07])
+        do {
+            _ = try await database.apply(
+                space: fixture.space,
+                author: fixture.writer,
+                expectedRevision: 5,
+                requestID: try XCTUnwrap(requestIDs.last),
+                wireRevision: try fixture.tid(7),
+                writes: [
+                    .put(
+                        uri: uri,
+                        value: duplicateValue,
+                        cid: CID.fromDAGCBOR(duplicateValue).string
+                    ),
+                ]
+            )
+            XCTFail("a retained receipt must reject its replay as a duplicate")
+        } catch {
+            XCTAssertEqual(
+                error as? SQLiteRepositoryError,
+                .duplicateRequest(try XCTUnwrap(requestIDs.last))
+            )
+        }
+
+        // A pruned receipt no longer recognises the request, and the revision
+        // CAS refuses the same stale replay instead.
+        do {
+            _ = try await database.apply(
+                space: fixture.space,
+                author: fixture.writer,
+                expectedRevision: 0,
+                requestID: try XCTUnwrap(requestIDs.first),
+                wireRevision: try fixture.tid(7),
+                writes: [
+                    .put(
+                        uri: uri,
+                        value: duplicateValue,
+                        cid: CID.fromDAGCBOR(duplicateValue).string
+                    ),
+                ]
+            )
+            XCTFail("a pruned receipt must not admit its stale replay")
+        } catch {
+            guard case let .conflict(expected, actual) = error as? SwanError else {
+                XCTFail("expected a revision conflict, got \(error)")
+                return
+            }
+            XCTAssertEqual(expected, 0)
+            XCTAssertEqual(actual, 6)
+        }
+    }
+
+    /// Receipts written before the retention column exists carry no timestamp.
+    /// They must survive the upgrade and prune first, never win retention over
+    /// a stamped row.
+    func testRequestReceiptMigrationStampsExistingRowsAsOldest() async throws {
+        let fixture = try NotificationFixture()
+        let database = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root,
+            did: fixture.writer,
+            oplogRetention: 2
+        )
+        let uri = try SpaceRecordURI(
+            space: fixture.space,
+            author: fixture.writer,
+            collection: "app.bsky.feed.post",
+            rkey: "migrated"
+        )
+        let legacyValue = Data([0xA1, 0x61, 0x61, 0x01])
+        let legacyRequestID = UUID()
+        _ = try await database.apply(
+            space: fixture.space,
+            author: fixture.writer,
+            expectedRevision: 0,
+            requestID: legacyRequestID,
+            wireRevision: try fixture.tid(1),
+            writes: [
+                .put(
+                    uri: uri,
+                    value: legacyValue,
+                    cid: CID.fromDAGCBOR(legacyValue).string
+                ),
+            ]
+        )
+        try await database.close()
+
+        let databasePath = SQLiteLayout.accountDatabase(
+            in: fixture.root,
+            did: fixture.writer
+        ).path
+        let legacy = try await SQLiteConnection.open(
+            storage: .file(path: databasePath)
+        )
+        do {
+            _ = try await legacy.query(
+                "DELETE FROM permissioned_repository_migrations WHERE version = 16"
+            )
+            _ = try await legacy.query(
+                "ALTER TABLE permissioned_space_requests DROP COLUMN created_at"
+            )
+            let preUpgradeColumns = try await legacy.query(
+                "PRAGMA table_info(permissioned_space_requests)"
+            )
+            XCTAssertFalse(
+                preUpgradeColumns.contains { $0.column("name")?.string == "created_at" }
+            )
+        } catch {
+            // An unclosed connection traps in `deinit` and would truncate the
+            // whole target's run, hiding this failure.
+            try? await legacy.close()
+            throw error
+        }
+        try await legacy.close()
+
+        let reopened = try await SQLiteAccountDatabase(
+            dataDirectory: fixture.root,
+            did: fixture.writer,
+            oplogRetention: 2
+        )
+        defer { Task { try? await reopened.close() } }
+        let migrated = try await reopened.connection.query(
+            """
+            SELECT request_id, created_at
+            FROM permissioned_space_requests
+            """
+        )
+        XCTAssertEqual(migrated.count, 1)
+        XCTAssertEqual(
+            migrated.first?.column("request_id")?.string,
+            legacyRequestID.uuidString
+        )
+        XCTAssertEqual(migrated.first?.column("created_at")?.integer, 0)
+
+        // Two stamped writes must evict the unstamped legacy row first.
+        for index in 2 ... 3 {
+            let value = Data([0xA1, 0x61, 0x61, UInt8(index)])
+            _ = try await reopened.apply(
+                space: fixture.space,
+                author: fixture.writer,
+                expectedRevision: UInt64(index - 1),
+                requestID: UUID(),
+                wireRevision: try fixture.tid(index),
+                writes: [
+                    .put(
+                        uri: uri,
+                        value: value,
+                        cid: CID.fromDAGCBOR(value).string
+                    ),
+                ]
+            )
+        }
+        let remaining = try await reopened.connection.query(
+            "SELECT request_id FROM permissioned_space_requests"
+        )
+        XCTAssertEqual(remaining.count, 2)
+        XCTAssertFalse(
+            remaining.contains { $0.column("request_id")?.string == legacyRequestID.uuidString }
+        )
+    }
 }
 
 private struct NotificationFixture {
@@ -543,6 +841,35 @@ private struct NotificationFixture {
     func tid(_ offset: Int) throws -> TID {
         let alphabet = Array("234567abcdefghijklmnopqrstuvwxyz")
         return try TID(tidString: "222222222222\(alphabet[offset])")
+    }
+
+    /// Commits the local repository row that makes this account a participant
+    /// in `space`. This is the recipient-side fact the pinned reference PDS
+    /// reads as `actorTxn.space.getSpace(space)`.
+    @discardableResult
+    func join(
+        space: SpaceURI,
+        on database: SQLiteAccountDatabase,
+        rkey: String,
+        revisionOffset: Int = 1
+    ) async throws -> PersistedRepositoryCommit {
+        let uri = try SpaceRecordURI(
+            space: space,
+            author: writer,
+            collection: "app.bsky.feed.post",
+            rkey: rkey
+        )
+        let value = Data([0xA1, 0x61, 0x61, 0x01])
+        return try await database.apply(
+            space: space,
+            author: writer,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try tid(revisionOffset),
+            writes: [
+                .put(uri: uri, value: value, cid: CID.fromDAGCBOR(value).string),
+            ]
+        )
     }
 }
 

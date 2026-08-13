@@ -61,6 +61,15 @@ public enum PublicRepositoryRecordCodec {
     /// bridge. Typed blob references are accepted only in the modern,
     /// content-addressed form used by the public blob endpoint. Unresolved
     /// typed values remain rejected.
+    ///
+    /// Depth accounting mirrors ``prepare``'s encoder exactly: `depth` names
+    /// the level a *container* occupies, the record object is level 1, and
+    /// both objects and arrays advance it. Conversion used to advance only
+    /// through arrays, which let this package-public API accept documents its
+    /// own encoder would refuse. Nothing already durable can be refused by the
+    /// stricter accounting: every stored record was either encoded through
+    /// ``prepare`` or decoded through `RepositoryRecordBlockValidator`, and
+    /// both cap object nesting at the same `maximumCBORNestingDepth`.
     public static func publicRecord(
         from value: ATProtocolValueContainer,
         collection: String,
@@ -69,7 +78,10 @@ public enum PublicRepositoryRecordCodec {
         let converted: PublicRecordValue
         switch value {
         case .knownType:
-            converted = try convertCBOR(value.toCBORValue(), depth: 1, limits: limits)
+            // Depth 0 is the level *containing* the record object, so the
+            // record object itself lands on level 1 like every other entry
+            // point here.
+            converted = try convertCBOR(value.toCBORValue(), depth: 0, limits: limits)
         case let .object(fields):
             converted = try convertObject(fields, depth: 1, limits: limits)
         case let .unknownType(type, value):
@@ -127,7 +139,8 @@ public enum PublicRepositoryRecordCodec {
             }
             return .integer(value)
         case .bigNumber: throw PublicRepositoryDomainError.invalidRecordInteger
-        case let .object(fields): return try convertObject(fields, depth: depth, limits: limits)
+        case let .object(fields):
+            return try convertObject(fields, depth: depth + 1, limits: limits)
         case let .array(values):
             guard depth < limits.maximumCBORNestingDepth else {
                 throw PublicRepositoryDomainError.recordNestingTooDeep
@@ -138,7 +151,9 @@ public enum PublicRepositoryRecordCodec {
         case let .link(link): return .link(try validatedLink(link.cid))
         case let .bytes(bytes): return .bytes(bytes.data)
         case let .unknownType(type, value):
-            return try convertUnknownType(type, value: value, depth: depth, limits: limits)
+            return try convertUnknownType(
+                type, value: value, depth: depth + 1, limits: limits
+            )
         case .decodeError:
             throw PublicRepositoryDomainError.invalidRecordType
         }
@@ -174,13 +189,22 @@ public enum PublicRepositoryRecordCodec {
         depth: Int,
         limits: PublicRepositoryLimits
     ) throws -> PublicRecordValue {
+        // `depth` is the level containing this value, so a map here occupies
+        // `depth + 1` and its own members are converted at that level. Both
+        // container branches therefore share one budget, exactly as `encode`
+        // does.
         if let map = value as? OrderedCBORMap {
+            guard depth < limits.maximumCBORNestingDepth else {
+                throw PublicRepositoryDomainError.recordNestingTooDeep
+            }
             var fields: [String: PublicRecordValue] = [:]
             for entry in map.entries {
                 guard fields[entry.key] == nil else {
                     throw PublicRepositoryDomainError.invalidRecordType
                 }
-                fields[entry.key] = try convertCBOR(entry.value, depth: depth, limits: limits)
+                fields[entry.key] = try convertCBOR(
+                    entry.value, depth: depth + 1, limits: limits
+                )
             }
             if case let .string(type)? = fields["$type"], type == "blob" {
                 try validateTypedBlob(fields)
@@ -188,9 +212,12 @@ public enum PublicRepositoryRecordCodec {
             return .object(fields)
         }
         if let map = value as? [String: Any] {
+            guard depth < limits.maximumCBORNestingDepth else {
+                throw PublicRepositoryDomainError.recordNestingTooDeep
+            }
             var fields: [String: PublicRecordValue] = [:]
             for (key, item) in map {
-                fields[key] = try convertCBOR(item, depth: depth, limits: limits)
+                fields[key] = try convertCBOR(item, depth: depth + 1, limits: limits)
             }
             if case let .string(type)? = fields["$type"], type == "blob" {
                 try validateTypedBlob(fields)

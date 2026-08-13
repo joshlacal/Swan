@@ -14,6 +14,19 @@ public struct PublicRepositoryLimits: Sendable, Equatable {
     /// The acceptance suite requires a 256 MiB CAR to stream successfully.
     public static let requiredStreamingCARBytes = 256 * 1_024 * 1_024
 
+    /// The largest live record count a repository may present.
+    ///
+    /// This is not a work budget like the others: it is the number the *read*
+    /// surface already enforces. `PublicRepositoryReadLimits`
+    /// `.maximumGenerationIndexEntries` refuses generation admission — and
+    /// therefore `getRecord`, `listRecords`, `getLatestCommit` and `getRepo` —
+    /// for any account whose record index exceeds it. Validating an import
+    /// against a smaller number than that would refuse repositories Swan can
+    /// serve; validating against a larger one would let an import produce a
+    /// repository nobody can read. The two must stay equal, which
+    /// `PublicRepositoryRecordCeilingTests` pins across the module boundary.
+    public static let standardMaximumRepositoryRecords = 100_000
+
     /// Initial Swan hostile-import policy.
     public static let standard = try! PublicRepositoryLimits(
         maximumRecordBlockBytes: 1_000_000,
@@ -32,18 +45,25 @@ public struct PublicRepositoryLimits: Sendable, Equatable {
     public let maximumMSTNodes: Int
     public let maximumMSTEntriesPerNode: Int
     public let maximumCBORNestingDepth: Int
+    public let maximumRepositoryRecords: Int
 
     /// Constructs a bounded Swan policy while preserving the pinned protocol
     /// limits. Custom policies can reduce most work budgets; the CAR byte
     /// budget cannot fall below the required 256 MiB streaming acceptance
     /// case.
+    ///
+    /// `maximumRepositoryRecords` is defaulted rather than required so that
+    /// the durable import-session rows, which persist the six work budgets
+    /// they were opened with and know nothing about a seventh, keep
+    /// reconstructing a policy that carries the standard ceiling.
     public init(
         maximumRecordBlockBytes: Int,
         maximumCARBytes: Int,
         maximumCARBlocks: Int,
         maximumMSTNodes: Int,
         maximumMSTEntriesPerNode: Int,
-        maximumCBORNestingDepth: Int
+        maximumCBORNestingDepth: Int,
+        maximumRepositoryRecords: Int = Self.standardMaximumRepositoryRecords
     ) throws {
         guard (1...Self.maximumPermittedRecordBlockBytes).contains(maximumRecordBlockBytes) else {
             throw PublicRepositoryLimitError.maximumRecordBlockBytesOutOfRange
@@ -66,7 +86,12 @@ public struct PublicRepositoryLimits: Sendable, Equatable {
         guard (1...Self.maximumPermittedCBORNestingDepth).contains(maximumCBORNestingDepth) else {
             throw PublicRepositoryLimitError.maximumCBORNestingDepthOutOfRange
         }
+        guard (1...Self.maximumPermittedRepositoryRecords)
+            .contains(maximumRepositoryRecords) else {
+            throw PublicRepositoryLimitError.maximumRepositoryRecordsOutOfRange
+        }
 
+        self.maximumRepositoryRecords = maximumRepositoryRecords
         maximumWrites = Self.pinnedMaximumWrites
         maximumRelevantBlockBytes = Self.pinnedMaximumRelevantBlockBytes
         self.maximumRecordBlockBytes = maximumRecordBlockBytes
@@ -85,6 +110,10 @@ public struct PublicRepositoryLimits: Sendable, Equatable {
     public static let maximumPermittedMSTNodes = 500_000
     public static let maximumPermittedMSTEntriesPerNode = 4_096
     public static let maximumPermittedCBORNestingDepth = 64
+    /// The public read surface refuses anything above the standard ceiling, so
+    /// a policy may only tighten this, never raise it.
+    public static let maximumPermittedRepositoryRecords =
+        standardMaximumRepositoryRecords
 
     /// A conservative encoded ceiling for one canonical repository MST node.
     /// Each entry can carry at most one complete 1,024-byte key suffix plus
@@ -113,4 +142,5 @@ public enum PublicRepositoryLimitError: Error, Sendable, Equatable {
     case mstNodesExceedCARBlocks
     case maximumMSTEntriesPerNodeOutOfRange
     case maximumCBORNestingDepthOutOfRange
+    case maximumRepositoryRecordsOutOfRange
 }

@@ -571,6 +571,10 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
                     }
                 }
 
+                try await refuseGrowthPastPublicReadCeilingWithoutGate(
+                    prepared.recordResults
+                )
+
                 for result in prepared.recordResults {
                     switch result.action {
                     case .create, .update:
@@ -1034,6 +1038,16 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
             throw PublicRepositoryReadError.unavailable(
                 reason: .blockMaterializationFailed
             )
+        } catch RepositoryMSTValidationError.recordLimitExceeded {
+            _ = try? await connection.query(
+                "DROP TABLE IF EXISTS temp.swan_public_verified_index"
+            )
+            // The MST carries more records than the read surface admits. Only
+            // reachable when the tree and the index disagree — the preflight
+            // above raises the same bound first for a consistent repository —
+            // but it is a static bound on the account's own data, not the
+            // storage fault the generic branch below would report.
+            throw PublicRepositoryReadError.resourceLimitExceeded
         } catch {
             _ = try? await connection.query(
                 "DROP TABLE IF EXISTS temp.swan_public_verified_index"
@@ -1163,6 +1177,71 @@ extension SQLiteAccountDatabase: PublicRepositoryMutationStore {
             )
         } catch {
             throw PublicRepositoryMutationStoreError.corruptRepository
+        }
+    }
+
+    /// Refuses a commit that would push the live record index past the bound
+    /// the public read surface enforces.
+    ///
+    /// Every public read admits a generation, and admission runs
+    /// `preflightPublicReadProjectionWithoutGate`, which refuses any account
+    /// whose `public_repository_record_index` exceeds
+    /// `PublicRepositoryReadLimits.maximumGenerationIndexEntries`. Nothing on
+    /// the write path used to count, so ordinary `createRecord` traffic could
+    /// walk an account past that bound and permanently break `getRecord`,
+    /// `listRecords`, `getLatestCommit` and `getRepo` while writes kept
+    /// returning 200. No attacker is required and the account cannot read its
+    /// way back out.
+    ///
+    /// Two properties this deliberately has:
+    ///
+    /// - **Only growth is refused.** `validatedProjection` has already proved
+    ///   every `.create` path is absent from the index and every `.delete`
+    ///   path is present, so `growth` is exact. A batch that shrinks or holds
+    ///   the count is admitted unconditionally, which is what keeps a
+    ///   repository that somehow ended up over the ceiling — an import, an
+    ///   older build, an operator repair — able to shrink back under it. A
+    ///   check that refused deletes on a full repository would be a trap with
+    ///   no exit.
+    /// - **No count on the common path.** Update-only and delete-only commits
+    ///   never run the query at all.
+    ///
+    /// `COUNT(*)` rather than a maintained counter column: SQLite answers it
+    /// from the covering `(collection, rkey)` primary-key index — measured at
+    /// a median of 0.66 ms over a full 100,000-row index, against a commit
+    /// that has already rebuilt an MST path, signed a commit and written CAR
+    /// bytes. A counter column would need a table rebuild on a live PDS and
+    /// would add a drift surface between the counter and the index that the
+    /// projection verification would then have to check as well. It is also
+    /// not available to this lane: the schema is declared in `SwanSQLite.swift`.
+    private func refuseGrowthPastPublicReadCeilingWithoutGate(
+        _ results: [PublicRepositoryMutationRecordResult]
+    ) async throws {
+        var growth = 0
+        for result in results {
+            switch result.action {
+            case .create: growth += 1
+            case .delete: growth -= 1
+            case .update: break
+            }
+        }
+        guard growth > 0 else { return }
+        let rows = try await connection.query(
+            "SELECT COUNT(*) AS row_count FROM public_repository_record_index"
+        )
+        guard rows.count == 1,
+              case let .integer(liveRecords) = rows[0].column("row_count"),
+              liveRecords >= 0 else {
+            throw PublicRepositoryMutationStoreError.corruptRepository
+        }
+        guard liveRecords <= PublicRepositoryReadLimits
+            .maximumGenerationIndexEntries - growth else {
+            // The same error the read path raises for the same bound. The
+            // mutation error enum lives in `SwanStorage` and gains no case for
+            // this; the HTTP layer maps anything it does not recognise to an
+            // unavailable answer, which is the correct client-visible outcome
+            // for a repository at capacity and widens no error body.
+            throw PublicRepositoryReadError.resourceLimitExceeded
         }
     }
 
