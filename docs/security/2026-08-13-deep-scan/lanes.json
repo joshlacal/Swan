@@ -1,0 +1,225 @@
+[
+ {
+  "name": "firehose-admission",
+  "findingIds": [
+   "F05",
+   "F11",
+   "F33",
+   "F13"
+  ],
+  "files": [
+   "Sources/SwanHTTP/PublicFirehoseStreamingRoute.swift",
+   "Sources/SwanHTTP/PublicFirehoseStreaming.swift",
+   "Sources/SwanHTTP/SwanHTTP.swift",
+   "Sources/SwanHTTP/PublicFirehoseSubscriberAdmission.swift",
+   "Tests/SwanHTTPTests/PublicFirehoseStreamingHTTPTests.swift"
+  ],
+  "rationale": "Only anonymous route in the tree with no resource accounting; 256 idle sockets halt accept() for the whole public listener including federation reconnect. F11 is a one-literal change (maxFrameSize is inbound-only) that deletes its own mechanism before the F05 lease work starts. F33 reuses the existing PublicReadDiagnosticThrottle shape with a separate instance. F13's route half (filter the registry by profile.endpoints at SwanHTTP.swift:875) is a no-op on today's profiles and rides along because it edits the same file. Highest reachable severity, so it goes first. --max-connections plumbing lives in L9 to keep SwanCommand.swift single-owner.",
+  "blockedOnHuman": ""
+ },
+ {
+  "name": "oauth-remote-fetch",
+  "findingIds": [
+   "F09",
+   "F19",
+   "F10",
+   "F40"
+  ],
+  "files": [
+   "Sources/SwanOAuth/OAuthRemoteFetch.swift",
+   "Sources/SwanOAuth/OAuthClientMetadataLoader.swift",
+   "Sources/SwanOAuth/SwanProxyHTTPTransport.swift",
+   "Sources/SwanAccounts/ATHandleVerification.swift",
+   "Sources/SwanCore/SwanPublicAddressPolicy.swift",
+   "Sources/SwanSQLite/OAuthControlStore.swift",
+   "Sources/SwanStorage/SwanStorage.swift",
+   "Tests/SwanOAuthTests/OAuthRemoteFetchAdmissionTests.swift",
+   "Tests/SwanOAuthTests/SwanProxyHTTPTransportTests.swift"
+  ],
+  "rationale": "Two of the three remaining high findings, both anonymously reachable through /oauth/par which sits outside the Cloudflare /xrpc/* rule, and both able to deny the one real account's token refresh because /oauth/token and /oauth/revoke call revalidate with bypassCache. F19 (missing abandon for the pre-validation freshness ticket) and F09 (unpartitioned 8-slot global fetch budget) share OAuthClientMetadataLoader.swift, so they cannot be separated. F40 and F10 both edit OAuthRemoteFetch.swift and must join. Largest lane; execute F19, then F09, then F40, then F10 internally.",
+  "blockedOnHuman": ""
+ },
+ {
+  "name": "par-and-login-admission",
+  "findingIds": [
+   "F06",
+   "F41"
+  ],
+  "files": [
+   "Sources/SwanHTTP/SwanOAuthAuthorizationServerHTTP.swift",
+   "Sources/SwanAccounts/AccountLoginAdmission.swift",
+   "Tests/SwanAccountsTests/AccountLoginHardeningTests.swift"
+  ],
+  "rationale": "Both reachable today and unauthenticated. F06 needs a per-peer admission gate on /oauth/par|token|revoke built from AccountLoginAdmissionService's bucket primitive; F41 needs the handleAttempts/pairAttempts ratio changed in the same file. Do NOT reorder the DPoP jti claim after client validation (that is the F09 hazard). No schema migration: the scope column is TEXT. F41's number needs Josh but the code change is trivial once he answers, so the lane can start on F06 immediately.",
+  "blockedOnHuman": ""
+ },
+ {
+  "name": "public-mutation-ordering",
+  "findingIds": [
+   "F26",
+   "F43"
+  ],
+  "files": [
+   "Sources/SwanHTTP/SwanPublicRepositoryMutationXRPC.swift",
+   "Sources/SwanHTTP/SwanJSONWriteBody.swift",
+   "Tests/SwanHTTPTests/PublicRepositoryMutationHTTPTests.swift"
+  ],
+  "rationale": "F26: anonymous chunked bodies hold a lease from the 8-slot pool shared with the AppView pipethrough across body collection AND authorization, when authorization is header-only. uploadBlob in the same file is the already-correct sibling to copy. F43: the same file streams 256 MiB and adopts the blob with no post-stream lifecycle recheck. Same file, so same lane. Watch the client-visible error-precedence change (400 becomes 401 for unauthenticated malformed requests).",
+  "blockedOnHuman": ""
+ },
+ {
+  "name": "lifecycle-firehose-fence",
+  "findingIds": [
+   "F37"
+  ],
+  "files": [
+   "Sources/SwanSQLite/PublicLifecycleEmitter.swift",
+   "Sources/SwanAccounts/AccountOperatorService.swift",
+   "Tests/SwanSQLiteTests/PublicLifecycleEmitterTests.swift"
+  ],
+  "rationale": "The only finding in C12 with a firehose-visible ordering violation on a live federated stream: emitActivation and emitReactivationSync enqueue head-sync outside the withActiveAccountFirehoseAuthorization fence that emitManualSync uses, so a raced deactivation can publish #sync after #account(active:false). The fenced-path deterministic race test already exists and is the template. Fifteen-line fix plus a caller catch so a raced deactivation does not make a committed reactivation report an error.",
+  "blockedOnHuman": ""
+ },
+ {
+  "name": "signer-fences-and-service-jwt",
+  "findingIds": [
+   "F04",
+   "F15",
+   "F16",
+   "F32",
+   "F44",
+   "F45"
+  ],
+  "files": [
+   "Sources/SwanOAuth/SpaceServiceAuthentication.swift",
+   "Sources/SwanOAuth/ProxyServiceAuthentication.swift",
+   "Sources/SwanOAuth/SpaceDelegationTokenIssuer.swift",
+   "Sources/SwanOAuth/SpaceRepositoryCommitSigner.swift",
+   "Sources/SwanAccounts/DurableAccountDirectory.swift",
+   "Tests/SwanOAuthTests/SwanOAuthTests.swift",
+   "Tests/SwanOAuthTests/PermissionedResolverCompositionTests.swift"
+  ],
+  "rationale": "F04 is the CONFIRMED item that justifies the lane: an unconditional exp upper bound next to the existing lower bound caps every service JWT at ~6 minutes whether or not iat is present. F16 is in the same file. F15/F32/F44/F45 are four copies of one unfenced signer body; introduce ONE requireUnchangedAuthorizingAccount helper on DurableAccountDirectory rather than four hand-copied re-reads, and fix the two comments that say 'Do not perform an await after this point' immediately before an await. Do NOT use withActiveAccountAuthorization here - its own contract forbids it and it would serialize the pipethrough hot path. SpaceCredentialAuthority.swift is deliberately NOT in this lane; F14's identical fence lives in L12 because F03 owns that file.",
+  "blockedOnHuman": ""
+ },
+ {
+  "name": "pipethrough-hygiene",
+  "findingIds": [
+   "F35",
+   "F07"
+  ],
+  "files": [
+   "Sources/SwanHTTP/SwanXRPCPipethrough.swift",
+   "Sources/SwanOAuth/SwanServiceEndpointResolver.swift",
+   "Tests/SwanHTTPTests/SwanXRPCPipethroughTests.swift",
+   "Tests/SwanOAuthTests/SwanServiceEndpointResolverTests.swift"
+  ],
+  "rationale": "Both reachable today, both low, both cheap. F35: stop relaying upstream Location, matching atproto/packages/pds/src/pipethrough.ts:527-531; the real risk is a relative Location steering the caller's next request back onto swan.place with Swan credentials, not a classic open redirect. F07: bind the fetched DID document to the requested DID with an id check and reject duplicate service ids; refuse the expensive PLC audit-chain proposal on this hot path. F35 needs Josh's yes/no but F07 can land alone, so the lane is not blocked.",
+  "blockedOnHuman": ""
+ },
+ {
+  "name": "outbound-request-target",
+  "findingIds": [
+   "F22"
+  ],
+  "files": [
+   "Sources/SwanOAuth/NIOPeerPinnedOAuthDocumentTransport.swift",
+   "Sources/SwanOAuth/NIOPeerPinnedOAuthPostTransport.swift",
+   "Sources/SwanAccounts/NIOPeerPinnedATHandleHTTPTransport.swift",
+   "Tests/SwanOAuthTests/OAuthRequestTargetTests.swift"
+  ],
+  "rationale": "Downgraded from HIGH to low: NIO installs NIOHTTPRequestHeadersValidator by default on all four client pipelines and rejects any URI byte outside the RFC 9112 grammar before the encoder runs, so there is no CRLF injection. Residual is a same-origin request-target rewrite via url.path percent-decoding. Build the target from percentEncodedPath/percentEncodedQuery in all three defective transports, keep the charset guard for symmetry with SwanProxyHTTPTransport.swift:227-229 but document NIO as the actual control, and stop reporting requestURL as responseURL so the exact-URL check is not tautological. SwanProxyHTTPTransport.swift is owned by L2 and is already correct, so it is excluded here.",
+  "blockedOnHuman": ""
+ },
+ {
+  "name": "deployment-and-startup-config",
+  "findingIds": [
+   "F12",
+   "F17",
+   "F36",
+   "F38"
+  ],
+  "files": [
+   "Sources/swan/SwanCommand.swift",
+   "Dockerfile",
+   "Dockerfile.dockerignore",
+   "docker-compose.yml",
+   "interop/prepare-interop-secrets.sh",
+   "interop/docker-compose.reference-relay.yml",
+   "Scripts/verify-interop-lab.sh",
+   "README.md"
+  ],
+  "rationale": "Single owner of SwanCommand.swift, which is why the --max-connections flag (F05 config half) and the F13 startup refusal for unknown profile endpoints also live here rather than in L1. Split the operator-secret out of the shared runtime volume BEFORE hardening the verifier or the new assertion fails against the current script; replace the YAML text search with a contents assertion derived from prepare-interop-secrets.sh, which is the control that was actually missing. Stop COPYing the laboratory notification config into every runtime image and add a laboratory-vs-HTTPS-public-URL startup interlock; use the same interlock shape for F36 so this lane never touches OAuthRemoteFetch.swift. F38 also requires a second commit in the workspace repo at /Users/joshlacalamito/Developer/Catbird+Petrel/.dockerignore, which is the larger hole and is missing the secret-extension exclusions entirely.",
+  "blockedOnHuman": ""
+ },
+ {
+  "name": "sqlite-durable-ledgers",
+  "findingIds": [
+   "F27",
+   "F31"
+  ],
+  "files": [
+   "Sources/SwanSQLite/SwanSQLite.swift",
+   "Tests/SwanSQLiteTests/SpaceNotificationSQLiteTests.swift",
+   "Tests/SwanHTTPTests/SpaceNotificationHTTPTests.swift"
+  ],
+  "rationale": "Single owner of the SwanSQLite.swift hub file. F31 step 1 only: add the reference PDS's own participation precondition to receiveSpaceDeletionNotification so an authority cannot insert permanent tombstones for spaces the recipient never joined - an interop fix, not a divergence. F27: add created_at to permissioned_space_requests and prune it depth-based in the same transaction that already prunes the oplog twenty lines later. Both unreachable today (no recipient bindings configured, no permissioned traffic) but both cheap and both need the same file. F31 step 2 (space claim in the token) is a wire change and is excluded.",
+  "blockedOnHuman": "F31 only: was omitting the reference implementation's `if (!existing) return` precondition deliberate - i.e. is a tombstone for a never-joined space a valid pre-emptive closure? That answer decides whether step 1 is a bug fix or a behaviour reversal. F27 needs no decision."
+ },
+ {
+  "name": "public-repository-bounds",
+  "findingIds": [
+   "F20",
+   "F28",
+   "F30"
+  ],
+  "files": [
+   "Sources/SwanSQLite/PublicRepositoryStore.swift",
+   "Sources/SwanPublicRepository/RepositoryMSTValidation.swift",
+   "Sources/SwanPublicRepository/PublicRepositoryLimits.swift",
+   "Sources/SwanPublicRepository/PublicRepositoryRecordCodec.swift",
+   "Tests/SwanPublicRepositoryTests/PublicRepositoryDomainTests.swift",
+   "Tests/SwanHTTPTests/StrictWriteJSONTests.swift"
+  ],
+  "rationale": "Lead item is not in the scan at all: the public read path enforces maximumGenerationIndexEntries=100_000 on every read while applyPublicRepositoryMutation counts nothing, so ~100,001 createRecord calls permanently break getRecord/listRecords/getLatestCommit/getRepo while writes keep succeeding. Add the count beside the record-index writes and align F28's import-side leaf cap to the same constant so an import can never build a repository the read path refuses. F30 contributes the only test worth writing in C13: StrictPermissionedWriteJSON, the load-bearing depth gate for five write surfaces, has zero coverage. The codec conversion-depth hardening is optional and is a read-path strictness change over durable data, so run both suites.",
+  "blockedOnHuman": ""
+ },
+ {
+  "name": "permissioned-space-directory",
+  "findingIds": [
+   "F03",
+   "F14",
+   "F18",
+   "F23",
+   "F46"
+  ],
+  "files": [
+   "Sources/SwanOAuth/SpaceCredentialAuthority.swift",
+   "Sources/SwanSpaces/SwanSpaces.swift",
+   "Sources/SwanSQLite/SQLitePreMigratedAccountDirectory.swift",
+   "Sources/SwanStorage/AuthorizedSimpleSpaceDirectory.swift",
+   "Sources/SwanHTTP/SwanSpaceXRPC.swift",
+   "Sources/SwanHTTP/SwanSpaceBlobXRPC.swift",
+   "Sources/SwanHTTP/SwanSpaceRepositorySyncXRPC.swift",
+   "Sources/SwanHTTP/SwanSpaceNotificationXRPC.swift",
+   "Tests/SwanOAuthTests/SpaceCredentialAuthorityTests.swift"
+  ],
+  "rationale": "Five findings converge on two hub files (SpaceCredentialAuthority.swift and SQLitePreMigratedAccountDirectory.swift) plus the four space route files that F03's freshness watermark must call, so they cannot be split without file conflicts. F14 (re-read the account after the keystore await, mirroring the same file's two verification fences) and F46 (wrap applyAuthorizedWrites in withActiveAccountAuthorization - the ONE place the scan's boilerplate remediation is correct) and F23 (reserve the blob's real size after a metadata-only lookup, as the public sibling already does) are unblocked and can land first. F03 and F18 wait on decisions. WARNING: SQLitePreMigratedAccountDirectory.swift is under concurrent edit by another agent in this working copy - coordinate before starting.",
+  "blockedOnHuman": "Two. (1) F03: is mint-time-only credential revocation an accepted proposal-0016 property - in which case ship only a configurable, much shorter credential lifetime - or should Swan enforce iat > authority.updated_at at its four read seams, accepting that every membership or policy edit forces all readers of that space to re-exchange a delegation mid-session? Recommendation: do both. (2) F18: does any production path still rely on the pre-activation or post-deactivation non-emitting commit fallback at SQLitePreMigratedAccountDirectory.swift:2663-2666? If only pre-activation is needed, may the fallback be gated on publicGenesisCommitCID == nil so post-deactivation commits fail? That is a client-visible reversal of a documented deliberate choice. F14/F23/F46 need no decision."
+ },
+ {
+  "name": "docs-and-comments",
+  "findingIds": [
+   "F02",
+   "F39"
+  ],
+  "files": [
+   "Sources/SwanSpaces/StreamingSpaceCARRecovery.swift",
+   "Sources/SwanInterop/PermissionedRemoteReplicaHTTPProvider.swift",
+   "docs/threat-boundaries.md",
+   "Tests/SwanSpacesTests/StreamingSpaceCARRecoveryTests.swift"
+  ],
+  "rationale": "C2's only real defect is a comment that claims more than the code proves: StreamingSpaceCARRecovery.swift:305-308 says the checks 'have authenticated the exact commit root' when they authenticate only that the author signed some commit for that (space, rev, ikm) and that the envelope producer knew the IKM. The construction itself is a byte-for-byte port of the pinned upstream reference whose own comments state the deniability property as intentional, so changing the signed bytes is an upstream protocol amendment, not a Swan patch. F39 adds one line documenting the 60s PLC key-propagation window as accepted revocation latency. Zero runtime, wire, or schema risk; can run any time.",
+  "blockedOnHuman": ""
+ }
+]
