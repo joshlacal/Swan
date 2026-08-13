@@ -1043,9 +1043,10 @@ public actor SQLitePreMigratedAccountDirectory:
     }
 
     /// Writes only through a database that was opened and migrated before the
-    /// listener accepted traffic. The actor rechecks lifecycle, terminal
-    /// shutdown, and the resolved database path around the durable operation;
-    /// it deliberately has no construction or migration fallback.
+    /// listener accepted traffic. The actor rechecks terminal shutdown and the
+    /// resolved database path around the durable operation, and commits the
+    /// batch under the control-plane authorization fence; it deliberately has
+    /// no construction or migration fallback.
     public func apply(
         space: SpaceURI,
         author: String,
@@ -1067,24 +1068,71 @@ public actor SQLitePreMigratedAccountDirectory:
                 space: space,
                 author: author
             )
-            let result = try await repository.applyAuthorizedWrites(
-                writes,
-                requestID: requestID,
-                wireRevision: try TID(tidString: wireRevision),
-                authorization: authorization
-            )
-            guard try await isActiveAccount(author) else {
-                throw SwanError.unauthorized("account repository is unavailable")
-            }
+            // Parsed outside the fence so a malformed wire revision never
+            // opens a control-plane write transaction.
+            let revision = try TID(tidString: wireRevision)
+            // The lifecycle recheck that used to follow this call could only
+            // reject a batch it had already made durable: a deactivation
+            // landing between the account-database COMMIT and the recheck
+            // produced a permanent permissioned record *and* an `unauthorized`
+            // response, with nothing able to roll the write back.
+            //
+            // `applyAuthorizedWrites` is a staged, network-free mutation,
+            // which is exactly what `withActiveAccountAuthorization`
+            // documents itself for, so holding the control write transaction
+            // across it makes a lifecycle transition linearize either before
+            // this fence — observed as non-active, nothing written — or after
+            // the batch commits.
+            //
+            // Nothing reachable from the closure re-enters the control store:
+            // `DurableSpaceRepository` holds only the account database,
+            // `SQLiteAccountDatabase` holds only its own connection and
+            // performs no network I/O, and the authorization preflight is the
+            // pure `SpaceAuthorizationPolicy`. The lock order this takes —
+            // control gate, then account-database gate — is the one
+            // `PublicFirehoseCommitFence` already takes on the public
+            // mutation path, so it introduces no new inversion.
+            let result = try await requireAuthorizationFence()
+                .withActiveAccountAuthorization(did: author) {
+                    try await repository.applyAuthorizedWrites(
+                        writes,
+                        requestID: requestID,
+                        wireRevision: revision,
+                        authorization: authorization
+                    )
+                }
             guard !isClosed else {
                 throw SwanError.unavailable("authenticated space directory is unavailable")
             }
             return result
         } catch let error as SwanError {
             throw error
+        } catch let error as AccountControlStoreError {
+            // The fence's two "this account may not write" answers carry the
+            // same client-visible body the post-commit recheck used to emit,
+            // now reached before anything is durable.
+            switch error {
+            case .invalidTransition, .notFound:
+                throw SwanError.unauthorized("account repository is unavailable")
+            default:
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
         } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
+    }
+
+    /// The control-plane publication fence used to linearize a permissioned
+    /// batch against account lifecycle. `withActiveAccountAuthorization` is a
+    /// concrete `SQLiteControlDatabase` capability rather than an
+    /// `AccountControlStore` requirement, and a directory that cannot reach it
+    /// has no way to make the batch and the lifecycle check atomic — so this
+    /// fails closed instead of silently returning to the post-commit recheck.
+    private func requireAuthorizationFence() throws -> SQLiteControlDatabase {
+        guard let fence = controlStore as? SQLiteControlDatabase else {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+        return fence
     }
 
     /// Removes one DID from every live selection path before awaiting its
@@ -1156,9 +1204,9 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
-    /// Internal failure injection for the permanent-deletion drain retry
-    /// regression. It exposes no connection or account data.
-    func installPermanentDeletionTestingHooks(
+    /// Internal failure/interleaving injection on one preopened account
+    /// database. It exposes no connection or account data.
+    func installAccountTestingHooks(
         _ hooks: SQLiteTestingHooks,
         did: String
     ) async throws {
@@ -1169,6 +1217,15 @@ public actor SQLitePreMigratedAccountDirectory:
             )
         }
         await database.installTestingHooks(hooks)
+    }
+
+    /// Internal failure injection for the permanent-deletion drain retry
+    /// regression. It exposes no connection or account data.
+    func installPermanentDeletionTestingHooks(
+        _ hooks: SQLiteTestingHooks,
+        did: String
+    ) async throws {
+        try await installAccountTestingHooks(hooks, did: did)
     }
 
     // MARK: Public repository reads
