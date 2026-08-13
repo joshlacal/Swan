@@ -175,6 +175,57 @@ final class PublicRepositoryReadDirectoryTests: XCTestCase {
         XCTAssertEqual(admission.snapshot.activeLeases, 0)
     }
 
+    /// Shrinking a lease returns capacity to both bounds and can never be
+    /// refused, which is the property that makes it usable by a caller that
+    /// is already admitted and has no way to fail.
+    ///
+    /// Its only caller today is F29's deferred streaming phase; the
+    /// permissioned blob route reserves its true size up front instead. That
+    /// makes this the primitive's only pin, so it asserts the whole contract:
+    /// growth, no-ops, released leases, and the accounting itself.
+    func testSpoolLeaseDownsizeReturnsCapacityAndRefusesToGrow() throws {
+        let admission = try PublicRepositorySpoolAdmission(
+            maximumGlobalBytes: 20,
+            maximumPerAccountBytes: 10
+        )
+        let alice = "did:plc:abcdefghijklmnopqrstuvwx"
+        let lease = try XCTUnwrap(
+            admission.reserve(accountDID: alice, maximumBytes: 10)
+        )
+        XCTAssertNil(admission.reserve(accountDID: alice, maximumBytes: 1))
+
+        XCTAssertTrue(lease.downsize(to: 4))
+        XCTAssertEqual(
+            admission.snapshot,
+            .init(
+                reservedBytes: 4,
+                activeLeases: 1,
+                reservedBytesByAccount: [alice: 4]
+            )
+        )
+        // The capacity is genuinely back in both bounds, not merely reported.
+        let second = try XCTUnwrap(
+            admission.reserve(accountDID: alice, maximumBytes: 6)
+        )
+
+        XCTAssertFalse(lease.downsize(to: 8), "a lease must never grow")
+        XCTAssertFalse(lease.downsize(to: 4), "an equal size is not a shrink")
+        XCTAssertFalse(lease.downsize(to: 0), "a lease must stay positive")
+        XCTAssertEqual(admission.snapshot.reservedBytes, 10)
+
+        second.release()
+        lease.release()
+        XCTAssertEqual(
+            admission.snapshot,
+            .init(reservedBytes: 0, activeLeases: 0, reservedBytesByAccount: [:])
+        )
+        XCTAssertFalse(
+            lease.downsize(to: 1),
+            "a released lease holds nothing left to return"
+        )
+        XCTAssertEqual(admission.snapshot.reservedBytes, 0)
+    }
+
     func testJSONWriteAdmissionBoundsAggregateReservationsAndReleasesIdempotently() throws {
         let mebibyte = 1_024 * 1_024
         let admission = try PublicRepositoryJSONWriteAdmission(

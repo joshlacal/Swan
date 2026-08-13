@@ -145,7 +145,13 @@ import pathlib
 import sys
 
 source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-assert 'copy_secret "operator-secret" "$runtime_directory" swan swan' in source
+# The operator secret is deliberately NOT in the shared runtime volume:
+# that volume is mounted by every service, so a secret placed there is
+# readable by all of them. It goes to its own prepared directory, which
+# only the relay overlay mounts. Assert both halves — the positive alone
+# would still pass if a copy into the runtime directory came back.
+assert 'copy_secret "operator-secret" "$operator_directory" swan swan' in source
+assert 'copy_secret "operator-secret" "$runtime_directory"' not in source
 PY
 python3 - "$validator" <<'PY'
 import ast

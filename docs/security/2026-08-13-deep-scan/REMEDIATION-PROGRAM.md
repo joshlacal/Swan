@@ -8,34 +8,95 @@
 
 Thirteen lanes ran in isolated jj workspaces across two waves and merged in
 three steps: `77bab90c` (L1-L5 + the two credential/blob lanes), `c1a71eb3`
-(L6, L10, L11), and `07b7d698` (L7, L8, L9, L12, L13).
+(L6, L10, L11), and `e9db9b43` (L7, L8, L9, L12, L13).
 
-**Merged tree `07b7d698` is green on both platforms.**
+**Merged tree `e9db9b43` is green on both platforms.**
 
 | | macOS | x86_64 Linux (netcup, pinned `swift:6.1-jammy`) |
 |---|---|---|
 | `c1a71eb3` | 1571 passed / 0 failed | 1556 passed / 15 failed |
-| `07b7d698` | 1608 passed / 0 failed | 1593 passed / 15 failed |
+| `e9db9b43` (merge) | 1608 passed / 0 failed | 1593 passed / 15 failed |
+| change `yzyzrzpl` (+F23, script fixes) | 1611 passed / 0 failed | 1596 passed / 15 failed |
 
-Both reconcile exactly (1593 + 15 = 1608). All 15 Linux failures are the
-pre-existing `executableURL()` harness gap and are identical on the pre-merge
-tree, so nothing regressed. `swift build --product swan` and `--build-tests`
-both exit 0 on x86_64.
+The tip is named by its jj **change** id, not a commit id: it has been amended
+in place and every commit id quoted for it so far is already dead. Only sealed,
+parented commits are quoted by commit id here. An intermediate state of
+`yzyzrzpl` — the ceiling-and-shrink form of F23, before the admission half —
+measured 1609/0 on macOS and 1594/15 on x86_64; that tree no longer exists as
+a distinct commit.
 
-**A hang observed in one x86_64 run did not reproduce.** Two subsequent full
-Linux suites ran to completion, and the suite it stopped in passes 14/14 in
-0.5 s in isolation. Recorded as a flake, not a deadlock — but if it recurs,
-that is a real finding and this note is the prior.
+Every row reconciles exactly (1596 + 15 = 1611). All 15 Linux failures are the
+pre-existing `executableURL()` harness gap, and the failing test *names* are
+byte-identical to the pre-F23 run, so nothing regressed. `swift build --product
+swan` and `--build-tests` both exit 0 on x86_64. That run did not hang.
 
-**Do not read "merged" as "closed" for these three:**
+**Open, unexplained: the full Linux suite intermittently hangs.** This was
+first recorded here as a non-reproducing flake. That was wrong — it recurred,
+and the correction matters more than the original note.
 
-- **F23 — NOT closed, despite a merged commit.** The prescribed metadata-only
-  lookup is unimplementable without owning `SwanSQLite.swift`, where every
-  helper it needs is `private`. The shipped fallback also keeps the 256 MiB
-  ceiling lease for the whole stream whenever the right-sized reserve returns
-  nil (`SwanSpaceBlobXRPC.swift:148-153`), so it degrades to pre-fix behaviour
-  under exactly the concurrency the finding is about, on a path no test covers.
-  Needs a lane owning `SwanSQLite.swift`.
+Tally across eight full x86_64 runs: **two hangs, six completions.** One hang
+was in a broken environment (wrong bind-mount path, stale PCH cache) and is
+weak evidence; the other was clean. Both stopped inside
+`PLCSpaceCredentialPublicKeyResolverTests`, but at *different* tests within
+it, and both required `timeout` to kill (`TEST_EXIT=124`, 50 min).
+
+What is established:
+
+- **Not self-contained.** That suite passes 25/25 consecutive isolated runs,
+  14 tests each, ~0.5 s. The hang needs full-run context.
+- **Not network or DNS.** The tests use a fixture PLC client, and
+  `example.invalid` returns NXDOMAIN in well under a second in the container.
+- **No suspension primitive in the resolver** — no continuation, no semaphore
+  — so "a leaked admission permit blocks a later caller" is *not* supported.
+  That suite is more likely where the process happens to be parked when
+  something else wedges than the thing that wedges.
+- At the hang: main thread in `ppoll`, ~20 threads, SQLite pool threads idle.
+- **Never observed on macOS**, across many full runs.
+- **Not attributable to the remediation work.** Three consecutive full runs on
+  the final tree completed identically (1594 passed / 15 failed each).
+
+Whoever picks this up: it is a real availability question about
+`PLCSpaceCredentialPublicKeyResolver`, which sits on the credential
+verification path, and it should not be closed as flake a second time without
+a mechanism. A dump with Swift symbols (the frames were unsymbolicated) taken
+while wedged is the obvious next step.
+
+**Do not gate CI on a single Linux suite run until this is understood** — a
+timeout is mandatory, and a hang must be reported as a hang rather than as a
+run that never finished.
+
+**Three items whose status is not what the merge alone implies:**
+
+- **F23 — CLOSED**, after being recorded here as PARTIAL. Both halves are now
+  fixed, in two steps, and the second replaced the first.
+  The route now reads the blob's declared length before it reserves anything,
+  through a metadata-only projection added the whole way down the chain —
+  `AuthorizedSpaceBlobDirectory.spaceBlobMetadata` →
+  `SQLitePreMigratedAccountDirectory` → `DurableSpaceRepository` →
+  `SQLiteAccountDatabase.permissionedBlobMetadata`, which is the same query
+  `permissionedBlob` runs with `includeLegacyPayload: false` and no
+  file-backed body. Every gate the streaming form applies is applied in the
+  same order, so it cannot answer a request the open would refuse. The 256 MiB
+  ceiling survives only as the bound on what the route will serve at all, and
+  the post-open check is now `contentLength == metadata.size` — a mismatch
+  refuses instead of streaming a transfer the reservation does not cover.
+  This is what the intermediate fix could not reach. Reserving the ceiling and
+  then shrinking the lease in place right-sized what a *stalled reader* holds,
+  but the request still had to clear the full ceiling to be admitted at all,
+  so concurrency stayed pinned at 2/account and 4/global no matter how small
+  the blobs were. `testASmallReadIsAdmittedWhenThePoolHasNoRoomForTheCeiling`
+  pins the difference: with 8 KiB free the 4 KiB read succeeds, and against a
+  ceiling-reserving route it is one of three tests in that file that fail.
+  Declared trade: the metadata read now precedes the budget check, so a
+  request refused for budget touches storage where before it did not. It is
+  one bounded indexed lookup, on an already authorized read, reachable only by
+  a caller who could drive the same query through a successful request — and
+  it is what the public blob route has always done.
+  `PublicRepositorySpoolAdmission.downsize` is no longer on this path. It is
+  kept for F29's deferred streaming phase, which §5 records as needing it, and
+  is now pinned directly by
+  `testSpoolLeaseDownsizeReturnsCapacityAndRefusesToGrow` rather than
+  indirectly through an HTTP route.
 - **F46 — closed, but it bought an undeclared availability coupling.** Every
   permissioned write now runs inside the process-wide control-database
   connection gate and `BEGIN IMMEDIATE`, head-of-line blocking OAuth and
@@ -45,9 +106,33 @@ that is a real finding and this note is the prior.
   (`PublicFirehoseCommitFence`), so this is convergence rather than a new
   class — but it is request-rate now, where every other caller of that fence
   is operator-rate.
-- **L9 regressed an acceptance script.** The operator-secret split leaves
-  `Scripts/run-reference-relay-acceptance.sh:369` reading the secret from a
-  runtime path it no longer occupies.
+- **L9's acceptance-script regressions are FIXED — there were two, not one.**
+  `Scripts/run-reference-relay-acceptance.sh:369` read the operator secret
+  from `/run/secrets/swan-runtime/`, which the split emptied; it now reads
+  `/run/secrets/swan-operator/`, the only mount of that secret in the
+  laboratory (`interop/docker-compose.reference-relay.yml:65`). The adversarial
+  pass did not catch the second: `Scripts/test-reference-relay-acceptance.sh`
+  asserted that `prepare-interop-secrets.sh` copies the operator secret into
+  `$runtime_directory` — asserting the very behaviour the split removed, so it
+  could only fail. It now asserts the copy into `$operator_directory` **and**
+  the absence of any copy into `$runtime_directory`, because the positive
+  assertion alone would still pass if the insecure copy came back.
+  `Scripts/test-reference-relay-acceptance.sh` exits 0, and
+  `Scripts/verify-interop-lab.sh` now exits 0 as well
+  (`INTEROP LAB STATIC INVARIANTS OK`). It had been recorded as needing a live
+  lab; it does not. It is a *static* verifier over the compose topology,
+  Dockerfiles, and scripts, and it was failing only because three pinned
+  caches were absent. Materialize them once, in this order — they are
+  git-ignored and each refuses to run without the previous one:
+  `interop/fetch-reference.sh` (atproto `3f6c96d5`, checksum-pinned),
+  `interop/fetch-reference-indigo.sh` (`8b43a326`), and
+  `interop/materialize-reference-indigo-vendor.sh`, which needs Docker and
+  pins `linux/arm64/v8` + `go1.26.4`.
+  Still not run: the live Compose lab itself. Note for whoever brings it up —
+  `docker-compose.yml` uses `context: ..` with `dockerfile: Swan/Dockerfile`,
+  so Compose builds the tree in the sibling directory literally named `Swan`,
+  **not** the workspace it is invoked from. Running it out of a jj workspace
+  such as `Swan-merge3` silently builds a different commit.
 
 **Deferred by decision, not oversight:** F21, F24, F25, F29, F34, F42, and the
 F20/F31-step-2/F13-advertising halves — see §5. F21's block GC is the highest

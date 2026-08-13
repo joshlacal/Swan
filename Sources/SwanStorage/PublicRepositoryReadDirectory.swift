@@ -956,6 +956,34 @@ public final class PublicRepositorySpoolAdmission: @unchecked Sendable {
             }
         }
     }
+
+    /// Atomically shrinks an existing reservation to `bytes`.
+    ///
+    /// Downsizing can never be refused: it only returns capacity, so every
+    /// bound it might violate is already satisfied by the strictly larger
+    /// reservation being replaced, and the lease count does not change.
+    /// That is what makes it safe to right-size a transfer *after*
+    /// admission. The obvious alternative — reserve the smaller amount,
+    /// then release the larger one — can lose the race to another request
+    /// that takes the freed capacity in between, and then has no way to
+    /// honour an already-admitted caller except by keeping the ceiling it
+    /// was admitted with. Keeping the ceiling is exactly the behaviour the
+    /// right-sizing exists to remove, so the fallback silently reverted to
+    /// it under precisely the contention that made right-sizing matter.
+    ///
+    /// Growing is rejected rather than supported: it would need the full
+    /// admission check, and no caller wants it.
+    fileprivate func downsize(_ id: UUID, to bytes: Int) -> Bool {
+        lock.withLock {
+            guard bytes > 0, let lease = leases[id], bytes < lease.bytes else {
+                return false
+            }
+            leases[id] = (lease.account, bytes)
+            let reserved = reservedByAccount[lease.account, default: 0]
+            reservedByAccount[lease.account] = reserved - (lease.bytes - bytes)
+            return true
+        }
+    }
 }
 
 public final class PublicRepositorySpoolLease: @unchecked Sendable {
@@ -978,6 +1006,20 @@ public final class PublicRepositorySpoolLease: @unchecked Sendable {
             return admission
         }
         target?.release(id)
+    }
+
+    /// Shrinks this lease to `bytes`, returning whether the reservation
+    /// changed. It cannot fail for want of capacity — see
+    /// `PublicRepositorySpoolAdmission.downsize`. `false` means the request
+    /// was not a shrink (already released, not smaller, or non-positive),
+    /// never that the pool refused it, so a caller that has been admitted
+    /// stays admitted either way.
+    @discardableResult
+    public func downsize(to bytes: Int) -> Bool {
+        let target = lock.withLock {
+            released ? nil as PublicRepositorySpoolAdmission? : admission
+        }
+        return target?.downsize(id, to: bytes) ?? false
     }
 }
 

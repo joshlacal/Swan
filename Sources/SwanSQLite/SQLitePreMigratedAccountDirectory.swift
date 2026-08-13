@@ -1000,6 +1000,51 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
+    /// Returns the declared length of the blob ``spaceBlob`` would open, from
+    /// the same startup-opened inventory and behind the same authorization and
+    /// lifecycle rechecks.  The transfer budget is reserved from this, so a
+    /// response holds only the bytes it will stream.
+    ///
+    /// The two calls are separate reads of an immutable, content-addressed
+    /// row, so the caller must still refuse a body whose declared length is
+    /// not the one reserved for.
+    public func spaceBlobMetadata(
+        space: SpaceURI,
+        author: String,
+        cid: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceBlobMetadata? {
+        let database = try await preopenedRepositoryDatabase(
+            for: author,
+            authorization: authorization
+        )
+        guard let database else {
+            throw SwanError.unauthorized("account repository is unavailable")
+        }
+        do {
+            let repository = try DurableSpaceRepository(
+                database: database,
+                space: space,
+                author: author
+            )
+            let metadata = try await repository.permissionedBlobMetadata(
+                cid: cid,
+                authorization: authorization
+            )
+            guard try await isActiveAccount(author) else {
+                throw SwanError.unauthorized("account repository is unavailable")
+            }
+            guard !isClosed else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return metadata
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
     /// Returns a descriptor-backed private blob only from the startup-opened
     /// account inventory.  The repository facade applies aggregate read
     /// authorization before SQLite can inspect namespace metadata, and this

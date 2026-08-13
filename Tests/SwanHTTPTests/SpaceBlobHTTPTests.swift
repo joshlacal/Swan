@@ -93,6 +93,119 @@ final class SpaceBlobHTTPTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(fixture.admission.snapshot.activeLeases, 0)
     }
 
+    /// A small read must be *admitted* when the pool has room for it but not
+    /// for the ceiling.
+    ///
+    /// This is the half of F23 that right-sizing the held lease could not
+    /// reach. Reserving the ceiling and then shrinking it keeps a stalled
+    /// reader from hogging the pool, but the request still has to clear the
+    /// ceiling to get in at all — so concurrency stayed pinned at two reads
+    /// per account and four service-wide no matter how small the blobs were.
+    ///
+    /// The account is pre-loaded to leave 8 KiB free: far too little for the
+    /// 256 MiB ceiling, ample for a 4 KiB blob. A route that reserves the
+    /// ceiling answers this request with 503.
+    func testASmallReadIsAdmittedWhenThePoolHasNoRoomForTheCeiling() async throws {
+        let fixture = try await Fixture.make(payload: Data(repeating: 0x2A, count: 4_096))
+        addTeardownBlock { await fixture.close() }
+
+        let pinnedBytes = Self.perAccountBudgetBytes - 8_192
+        let pinned = try XCTUnwrap(
+            fixture.admission.reserve(
+                accountDID: Self.author,
+                maximumBytes: pinnedBytes
+            ),
+            "the pre-load itself must be admitted, or the test proves nothing"
+        )
+        defer { pinned.release() }
+        XCTAssertNil(
+            fixture.admission.reserve(
+                accountDID: Self.author,
+                maximumBytes: Self.ceilingBytes
+            ),
+            """
+            the pre-load must leave no room for a ceiling-sized reservation, \
+            or this test cannot distinguish the two admission policies
+            """
+        )
+
+        let observed = ReservationObserver()
+        fixture.body.setOnFirstChunk { [admission = fixture.admission] in
+            await observed.record(admission.snapshot)
+        }
+
+        let app = Application(
+            router: fixture.router(),
+            logger: Logger(label: "SpaceBlobHTTPTests.contendedAdmission")
+        )
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: fixture.uri(),
+                method: .get,
+                headers: fixture.credentialHeaders()
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertEqual(Data(buffer: response.body), fixture.payload)
+            }
+        }
+
+        let recorded = await observed.snapshot
+        let inFlight = try XCTUnwrap(
+            recorded,
+            "the response must have streamed at least one chunk"
+        )
+        XCTAssertEqual(
+            inFlight.reservedBytes,
+            pinnedBytes + fixture.payload.count,
+            "the reservation must be the payload size, never the ceiling"
+        )
+        XCTAssertEqual(inFlight.activeLeases, 2, "the pre-load and this read")
+
+        pinned.release()
+        XCTAssertEqual(fixture.admission.snapshot.reservedBytes, 0)
+        XCTAssertEqual(fixture.admission.snapshot.activeLeases, 0)
+    }
+
+    /// The reservation is sized from the metadata read, so a body that then
+    /// declares a different length is not covered by it. Nothing may stream.
+    ///
+    /// A content-addressed store cannot legitimately produce this, which is
+    /// exactly why it must fail closed rather than be assumed away: the
+    /// alternative is a reservation that under-covers its transfer, which is
+    /// strictly worse than reserving the ceiling.
+    func testBodyDeclaringADifferentLengthThanItsMetadataIsRefused() async throws {
+        let fixture = try await Fixture.make(
+            payload: Data(repeating: 0x6E, count: 4_096),
+            metadataSizeOverride: 1_024
+        )
+        addTeardownBlock { await fixture.close() }
+
+        let app = Application(
+            router: fixture.router(),
+            logger: Logger(label: "SpaceBlobHTTPTests.lengthDisagreement")
+        )
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: fixture.uri(),
+                method: .get,
+                headers: fixture.credentialHeaders()
+            ) { response in
+                XCTAssertEqual(response.status, .serviceUnavailable)
+            }
+        }
+
+        XCTAssertEqual(
+            fixture.body.acceptedBytes,
+            0,
+            "no byte of a body the reservation does not cover may be written"
+        )
+        XCTAssertEqual(
+            fixture.admission.snapshot.activeLeases,
+            0,
+            "the refused read must release the reservation it took"
+        )
+    }
+
     /// The denial the finding describes, reproduced against the live budget.
     ///
     /// While a 4 KiB read is stalled mid-stream, the pool must still admit a
@@ -240,13 +353,24 @@ final class SpaceBlobHTTPTests: XCTestCase, @unchecked Sendable {
 
     /// The budget is still enforced, and it is enforced *before* the payload
     /// is opened and verified: nothing above bought the route an unbounded
-    /// transfer surface or a storage-touching refusal path.
+    /// transfer surface.
+    ///
+    /// Right-sizing does move one bounded, payload-free metadata query ahead
+    /// of the budget check — the refusal path now touches storage, where
+    /// before it did not. That query is an indexed lookup on a already
+    /// authorized read, reachable only by a caller who could drive the same
+    /// query through a successful request, and it is what the public blob
+    /// route has always done. The assertion below is deliberately about the
+    /// payload open, and the metadata count is asserted so the trade is
+    /// recorded rather than discovered later.
     func testExhaustedTransferBudgetStillRefusesTheReadBeforeOpeningIt() async throws {
         let fixture = try await Fixture.make(payload: Data(repeating: 0x11, count: 4_096))
         addTeardownBlock { await fixture.close() }
+        // The whole per-account budget: a right-sized route asks for only
+        // 4 KiB, so leaving any slack would admit it.
         let held = try XCTUnwrap(fixture.admission.reserve(
             accountDID: Self.author,
-            maximumBytes: Self.ceilingBytes
+            maximumBytes: Self.perAccountBudgetBytes
         ))
         defer { held.release() }
 
@@ -273,6 +397,15 @@ final class SpaceBlobHTTPTests: XCTestCase, @unchecked Sendable {
             0,
             "a refused read must not have opened and verified the payload"
         )
+        let metadataReads = await fixture.directory.metadataCount
+        XCTAssertEqual(
+            metadataReads,
+            1,
+            """
+            the declared metadata read is what sizes the reservation, so it \
+            necessarily precedes the budget refusal
+            """
+        )
     }
 }
 
@@ -298,7 +431,8 @@ private extension SpaceBlobHTTPTests {
         static func make(
             payload: Data,
             declaredLengthOverride: Int? = nil,
-            surplusBytes: Int = 0
+            surplusBytes: Int = 0,
+            metadataSizeOverride: Int? = nil
         ) async throws -> Fixture {
             let root = FileManager.default.temporaryDirectory
                 .appending(path: "SpaceBlobHTTPTests-\(UUID().uuidString)")
@@ -323,7 +457,10 @@ private extension SpaceBlobHTTPTests {
                     declaredLength: declaredLengthOverride ?? payload.count,
                     surplusBytes: surplusBytes
                 )
-                let directory = StubSpaceBlobDirectory(body: body)
+                let directory = StubSpaceBlobDirectory(
+                    body: body,
+                    metadataSizeOverride: metadataSizeOverride
+                )
                 let admission = try PublicRepositorySpoolAdmission(
                     maximumGlobalBytes: SpaceBlobHTTPTests.globalBudgetBytes,
                     maximumPerAccountBytes: SpaceBlobHTTPTests.perAccountBudgetBytes
@@ -405,10 +542,26 @@ private struct StubSpaceCredentialVerifier: SpaceCredentialAuthorizationVerifier
 
 private actor StubSpaceBlobDirectory: AuthorizedSpaceBlobDirectory {
     private let body: StubSpaceBlobBody
+    /// What the metadata read declares. Defaults to the body's own declared
+    /// length — the only case a content-addressed store can produce — and is
+    /// overridable so the route's disagreement guard can be exercised.
+    private let metadataSize: Int
     private(set) var openCount = 0
+    private(set) var metadataCount = 0
 
-    init(body: StubSpaceBlobBody) {
+    init(body: StubSpaceBlobBody, metadataSizeOverride: Int? = nil) {
         self.body = body
+        metadataSize = metadataSizeOverride ?? body.contentLength
+    }
+
+    func spaceBlobMetadata(
+        space _: SpaceURI,
+        author _: String,
+        cid _: String,
+        authorization _: AuthorizationContext
+    ) async throws -> AuthorizedSpaceBlobMetadata? {
+        metadataCount += 1
+        return AuthorizedSpaceBlobMetadata(size: metadataSize)
     }
 
     func spaceBlob(

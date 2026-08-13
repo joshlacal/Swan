@@ -42,6 +42,20 @@ private enum AuthenticatedSpaceBlobFailure: Error {
     case unavailable
 }
 
+/// The metadata read and the body open are separate calls into the same
+/// directory and must fail identically: a caller that can tell the two apart
+/// learns from the *first* one whether a private blob exists.
+private func blobFailure(for error: SwanError) -> AuthenticatedSpaceBlobFailure {
+    switch error {
+    case .unauthorized:
+        .denied
+    case .malformed, .invalidIdentifier:
+        .invalidRequest
+    case .unavailable, .invalidProfile, .conflict, .expired:
+        .unavailable
+    }
+}
+
 /// `getBlob`'s generated output is currently `Data`, which cannot represent
 /// the alpha's bounded-memory response.  As with `getRepo`, the generated
 /// server contract owns the typed request boundary while `prepare` returns an
@@ -76,42 +90,55 @@ private struct AuthenticatedGetSpaceBlobHandler:
 
         // The transfer budget is a *byte* budget, and the lease this method
         // returns outlives the handler: it is released only when the response
-        // writer finishes, i.e. for as long as the reader takes. Reserving
-        // the 256 MiB ceiling for the whole of that window is what the
+        // writer finishes, i.e. for as long as the reader takes. Reserving a
+        // fixed 256 MiB ceiling for the whole of that window is what the
         // finding is about — a 5 KiB avatar would cost a quarter of one
         // author's 512 MiB allowance, so two stalled tiny reads exhaust an
         // author and four exhaust the whole 1 GiB pool, starving the public
         // CAR, public blob, and blob-upload streams that share it while
         // moving almost nothing.
         //
-        // `SwanPublicRepositoryReadXRPC` avoids this by reserving the true
-        // size up front, which it can do because `PublicRepositoryReadBlobStore`
-        // exposes `publicBlobMetadata` — a metadata-only projection. The
-        // permissioned store has no equivalent for the `space` namespace, and
-        // adding one is a change to `SQLiteAccountDatabase`, so the ceiling is
-        // instead held only across the open-and-verify step (bounded work
-        // that no client can stall) and then *exchanged* for a reservation
-        // covering exactly the bytes this response will stream. The stall
-        // window — the part a reader controls — is therefore right-sized.
+        // The blob's declared length, read without opening or materializing a
+        // body, so the reservation below covers exactly the bytes this
+        // response will stream — the same shape `SwanPublicRepositoryReadXRPC`
+        // uses via `publicBlobMetadata`. The ceiling survives only as the
+        // bound on what this route will serve at all.
         //
-        // The exchange acquires before it releases, so a request that has
-        // already been admitted can never be turned into a refusal by the
-        // resize: the worst case is that it keeps the ceiling it already had.
-        guard let admissionLease = capability.streamAdmission.reserve(
+        // This is what makes the *admission* right-sized, not just the held
+        // reservation: a pool with 4 KiB free now admits a 4 KiB blob. An
+        // earlier fix reserved the ceiling and then shrank the lease in place,
+        // which right-sized the stall window but still refused that request
+        // outright, so concurrency stayed pinned at two reads per account
+        // regardless of size.
+        let metadata: AuthorizedSpaceBlobMetadata?
+        do {
+            metadata = try await capability.directory.spaceBlobMetadata(
+                space: target.space,
+                author: target.author,
+                cid: target.cid.string,
+                authorization: authorization
+            )
+        } catch let error as SwanError {
+            throw blobFailure(for: error)
+        } catch {
+            throw AuthenticatedSpaceBlobFailure.unavailable
+        }
+        guard let metadata else { throw AuthenticatedSpaceBlobFailure.blobNotFound }
+        guard metadata.size > 0,
+              metadata.size <= maximumPermissionedBlobTransferBytes else {
+            throw AuthenticatedSpaceBlobFailure.unavailable
+        }
+        guard let streamLease = capability.streamAdmission.reserve(
             accountDID: target.author,
-            maximumBytes: maximumPermissionedBlobTransferBytes
+            maximumBytes: metadata.size
         ) else {
             throw AuthenticatedSpaceBlobFailure.unavailable
         }
-        // Both leases are tracked independently so no throw between the
-        // acquire and the release can leak either one.
-        var transferLease: PublicRepositorySpoolLease?
+        // A single lease, so no throw between here and the hand-off can
+        // leak a second one.
         var handedOff = false
         defer {
-            if !handedOff {
-                transferLease?.release()
-                admissionLease.release()
-            }
+            if !handedOff { streamLease.release() }
         }
 
         let blob: AuthorizedSpaceBlob?
@@ -123,41 +150,27 @@ private struct AuthenticatedGetSpaceBlobHandler:
                 authorization: authorization
             )
         } catch let error as SwanError {
-            switch error {
-            case .unauthorized:
-                throw AuthenticatedSpaceBlobFailure.denied
-            case .malformed, .invalidIdentifier:
-                throw AuthenticatedSpaceBlobFailure.invalidRequest
-            case .unavailable, .invalidProfile, .conflict, .expired:
-                throw AuthenticatedSpaceBlobFailure.unavailable
-            }
+            throw blobFailure(for: error)
         } catch {
             throw AuthenticatedSpaceBlobFailure.unavailable
         }
         guard let blob else { throw AuthenticatedSpaceBlobFailure.blobNotFound }
-        guard blob.body.contentLength > 0,
-              blob.body.contentLength <= maximumPermissionedBlobTransferBytes else {
+        // A blob is content-addressed and immutable, so the opened body must
+        // declare exactly the length the metadata did. Anything else means the
+        // reservation does not cover the transfer it admitted — strictly worse
+        // than reserving the ceiling — so the bytes do not leave. The same
+        // declared length is what sizes the reservation, what is emitted as
+        // `Content-Length`, and what the response writer refuses to move a
+        // byte past.
+        guard blob.body.contentLength == metadata.size else {
             throw AuthenticatedSpaceBlobFailure.unavailable
-        }
-        // `contentLength` is the single declared length: it sizes this
-        // reservation, it is emitted as `Content-Length`, and the response
-        // writer refuses to move a byte past it. The reservation therefore
-        // cannot under-cover the transfer it admits, which is the property a
-        // right-sized reservation has to keep — one that can under-cover is
-        // strictly worse than reserving the ceiling.
-        if blob.body.contentLength < maximumPermissionedBlobTransferBytes {
-            transferLease = capability.streamAdmission.reserve(
-                accountDID: target.author,
-                maximumBytes: blob.body.contentLength
-            )
-            if transferLease != nil { admissionLease.release() }
         }
         handedOff = true
         return PreparedResponse(
             cid: target.cid,
             mimeType: safeResponseMIMEType(blob.mimeType),
             blob: blob,
-            streamLease: transferLease ?? admissionLease
+            streamLease: streamLease
         )
     }
 

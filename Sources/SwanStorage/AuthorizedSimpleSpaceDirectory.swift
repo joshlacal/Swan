@@ -268,7 +268,35 @@ public struct AuthorizedSpaceBlob: Sendable {
     }
 }
 
+/// The declared length of an authorized space blob, read without opening a
+/// body or materializing a payload.
+///
+/// This exists so the transfer budget can be reserved for the bytes a
+/// response will actually stream. Reserving a fixed ceiling instead makes a
+/// 5 KiB avatar cost a quarter of one author's allowance for as long as its
+/// reader takes, so a handful of stalled tiny reads exhaust the pool that the
+/// public CAR, public blob, and blob-upload streams share. It carries only the
+/// size: the MIME type a response emits is the one the opened body declares.
+public struct AuthorizedSpaceBlobMetadata: Sendable, Equatable {
+    public let size: Int
+
+    public init(size: Int) {
+        self.size = size
+    }
+}
+
 public protocol AuthorizedSpaceBlobDirectory: Sendable {
+    /// The blob's declared length under the same authorization, lifecycle, and
+    /// namespace checks `spaceBlob` applies. It must never be reachable on a
+    /// request that `spaceBlob` would refuse, or it becomes an existence and
+    /// size oracle for private content.
+    func spaceBlobMetadata(
+        space: SpaceURI,
+        author: String,
+        cid: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceBlobMetadata?
+
     func spaceBlob(
         space: SpaceURI,
         author: String,

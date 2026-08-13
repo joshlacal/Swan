@@ -7807,6 +7807,41 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         return AuthorizedSpaceBlob(mimeType: stored.mimeType, body: body)
     }
 
+    /// The declared length of the same private, exact namespace reference
+    /// ``permissionedBlob`` would open, read without selecting a payload and
+    /// without opening a file-backed body.
+    ///
+    /// Every gate ``permissionedBlob`` applies is applied here in the same
+    /// order — account ownership, canonical raw CID, the connection gate, the
+    /// read transaction, and repository readability — so this cannot answer a
+    /// request the streaming form would refuse.
+    public func permissionedBlobMetadata(
+        space: SpaceURI,
+        author: String,
+        cid: String
+    ) async throws -> AuthorizedSpaceBlobMetadata? {
+        try requireAccount(author)
+        guard author == accountDID else {
+            throw SwanError.unauthorized("account database ownership mismatch")
+        }
+        _ = try canonicalRawBlobCID(cid)
+        let stored = try await withConnectionGate {
+            try await readTransaction {
+                try await requireReadablePermissionedBlobRepository(space)
+                return try await blobPayloadIfReachableWithoutGate(
+                    cid: cid,
+                    namespaceKind: "space",
+                    spaceURI: space.rawValue,
+                    includeLegacyPayload: false
+                )
+            }
+        }
+        guard let stored else {
+            return nil
+        }
+        return AuthorizedSpaceBlobMetadata(size: stored.byteCount)
+    }
+
     private struct StoredBlobPayload: Sendable {
         enum StorageKind: String, Sendable {
             case legacySQLite = "legacy-sqlite"
@@ -11326,6 +11361,21 @@ public actor DurableSpaceRepository {
         return try await database.prepareRepositoryCARSnapshot(
             space: space,
             author: author
+        )
+    }
+
+    /// The declared length of that same blob, under the identical aggregate
+    /// repository-read check.  A collection-qualified OAuth grant cannot use
+    /// this to learn whether a blob exists any more than it can open one.
+    public func permissionedBlobMetadata(
+        cid: String,
+        authorization: AuthorizationContext
+    ) async throws -> AuthorizedSpaceBlobMetadata? {
+        try requireRead(uri: nil, authorization: authorization)
+        return try await database.permissionedBlobMetadata(
+            space: space,
+            author: author,
+            cid: cid
         )
     }
 

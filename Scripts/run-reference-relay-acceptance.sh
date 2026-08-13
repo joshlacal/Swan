@@ -366,7 +366,7 @@ management_post() {
     umask 077
     authorization="$(mktemp /tmp/task6c-management-authorization.XXXXXX)"
     trap '\''rm -f "$authorization"'\'' EXIT
-    secret="$(tr -d "\r\n" </run/secrets/swan-runtime/operator-secret)"
+    secret="$(tr -d "\r\n" </run/secrets/swan-operator/operator-secret)"
     test -n "$secret"
     printf "Authorization: Bearer %s\n" "$secret" >"$authorization"
     unset secret
