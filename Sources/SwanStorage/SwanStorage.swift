@@ -531,6 +531,27 @@ public protocol OAuthControlStore: Sendable {
         using ticket: OAuthClientMetadataFetchTicket,
         now: Date
     ) async throws -> Bool
+    /// Releases a ticket whose fetch will never publish. Without it a failed
+    /// or rejected remote document leaves a durable freshness row behind, and
+    /// an anonymous caller can fill that bounded table with client IDs it
+    /// merely named. The store deletes only while `ticket` is still the sole
+    /// outstanding generation for its client and no cached document depends on
+    /// the watermark, so a concurrent successful flight is a no-op rather than
+    /// a lost row. Abandoning a ticket that no longer qualifies is not an
+    /// error: the caller cannot know which race it lost.
+    func abandonClientMetadataFetch(
+        ticket: OAuthClientMetadataFetchTicket,
+        now: Date
+    ) async throws
+    /// True when the account currently holds a live, unrevoked token family
+    /// naming this client. It is the one client-identity fact available before
+    /// any remote document is fetched that an anonymous caller cannot
+    /// manufacture: creating it requires completing an authorization against
+    /// the account's own credentials.
+    func clientHoldsLiveAuthorization(
+        clientID: String,
+        now: Date
+    ) async throws -> Bool
 
     func storePushedAuthorizationRequest(_ request: OAuthPushedAuthorizationRequest, now: Date) async throws
     /// Returns an unexpired, unconsumed PAR selected by the keyed digest of

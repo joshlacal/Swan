@@ -1,5 +1,6 @@
 import Foundation
 import NIOHTTP1
+import SwanCore
 import XCTest
 
 @testable import SwanOAuth
@@ -31,6 +32,15 @@ private struct StubResolver: OAuthHostnameResolving {
     }
 }
 
+/// Stands in for an attacker-controlled authoritative nameserver that accepts
+/// the query and never answers.
+private struct BlackholedResolver: OAuthHostnameResolving {
+    func resolve(host _: String) async throws -> [OAuthIPAddress] {
+        try await Task.sleep(nanoseconds: 5_000_000_000)
+        return [OAuthIPAddress(literal: "93.184.216.34")!]
+    }
+}
+
 final class SwanProxyHTTPTransportTests: XCTestCase {
     private func sender(
         resolving addresses: [String], transport: any SwanProxyTransporting
@@ -55,6 +65,39 @@ final class SwanProxyHTTPTransportTests: XCTestCase {
         let (approved, sent) = await transport.recorded()
         XCTAssertEqual(approved, Set([OAuthIPAddress(literal: "93.184.216.34")!]))
         XCTAssertEqual(sent?.method, "GET")
+    }
+
+    /// The pipethrough lease is held across `send`, so an unbounded blocking
+    /// resolve holds that lease past every advertised deadline. Resolution has
+    /// to be bounded by the same policy deadline the transport uses.
+    func testHostnameResolutionIsBoundedByThePolicyDeadline() async throws {
+        let sender = try SwanPeerPinnedProxySender(
+            policy: OAuthRemoteFetchPolicy(timeout: 0.25),
+            resolver: BlackholedResolver(),
+            transport: RecordingTransport()
+        )
+        let clock = ContinuousClock()
+        let started = clock.now
+        do {
+            _ = try await sender.send(
+                SwanProxyRequest(
+                    method: "GET",
+                    url: URL(string: "https://blackholed.example/xrpc/app.bsky.actor.getProfile")!,
+                    headers: [], body: nil
+                ),
+                timeout: 5, maximumBodyBytes: 1_000_000
+            )
+            XCTFail("a blackholed resolver must not produce a proxied request")
+        } catch let error as SwanError {
+            guard case .unavailable = error else {
+                return XCTFail("expected typed unavailable, got \(error)")
+            }
+        }
+        XCTAssertLessThan(
+            clock.now - started,
+            .seconds(2),
+            "the proxy lease must be released on the policy deadline"
+        )
     }
 
     func testRejectsPrivateAndReservedAddresses() async throws {

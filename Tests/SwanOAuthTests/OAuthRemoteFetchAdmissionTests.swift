@@ -2,7 +2,7 @@ import Crypto
 import Foundation
 @testable import SwanOAuth
 import SwanCore
-import SwanSQLite
+@testable import SwanSQLite
 import SwanStorage
 import XCTest
 
@@ -449,21 +449,21 @@ final class OAuthRemoteFetchAdmissionTests: XCTestCase, @unchecked Sendable {
             "all distinct metadata callers must reach the closed gate"
         )
         await callerBarrier.release()
-        let ninthRequestWasAdmitted = await oauthEventually(
+        let seventhRequestWasAdmitted = await oauthEventually(
             within: .milliseconds(750)
         ) {
-            await transport.blockedRequestCount() >= 9
+            await transport.blockedRequestCount() >= 7
         }
         XCTAssertFalse(
-            ninthRequestWasAdmitted,
-            "the process must admit at most eight distinct remote metadata flights"
+            seventhRequestWasAdmitted,
+            "unauthorized client IDs must admit at most the general tier of six flights"
         )
         let activeBlockedRequests =
             await transport.activeBlockedRequestCount()
         XCTAssertLessThanOrEqual(
             activeBlockedRequests,
-            8,
-            "distinct client IDs must share one bounded admission budget"
+            6,
+            "distinct client IDs must share one bounded general admission budget"
         )
 
         await transport.releaseAll()
@@ -485,12 +485,12 @@ final class OAuthRemoteFetchAdmissionTests: XCTestCase, @unchecked Sendable {
         )
         XCTAssertLessThanOrEqual(
             successes,
-            8,
-            "only the bounded admitted set may reach the remote transport"
+            6,
+            "only the bounded general set may reach the remote transport"
         )
         XCTAssertGreaterThanOrEqual(
             unavailable,
-            clientIDs.count - 8,
+            clientIDs.count - 6,
             "excess distinct metadata loads must fail closed instead of queueing without bound"
         )
         XCTAssertEqual(
@@ -581,20 +581,20 @@ final class OAuthRemoteFetchAdmissionTests: XCTestCase, @unchecked Sendable {
             "all remote-JWKS callers must reach the closed gate"
         )
         await callerBarrier.release()
-        let ninthJWKSRequestWasAdmitted = await oauthEventually(
+        let seventhJWKSRequestWasAdmitted = await oauthEventually(
             within: .milliseconds(750)
         ) {
-            await transport.blockedRequestCount() >= 9
+            await transport.blockedRequestCount() >= 7
         }
         XCTAssertFalse(
-            ninthJWKSRequestWasAdmitted,
+            seventhJWKSRequestWasAdmitted,
             "remote JWKS requests must not bypass metadata admission"
         )
         let activeBlockedRequests =
             await transport.activeBlockedRequestCount()
         XCTAssertLessThanOrEqual(
             activeBlockedRequests,
-            8,
+            6,
             "metadata and remote JWKS must share one bounded remote-fetch budget"
         )
 
@@ -613,12 +613,12 @@ final class OAuthRemoteFetchAdmissionTests: XCTestCase, @unchecked Sendable {
         XCTAssertGreaterThanOrEqual(successes, 1)
         XCTAssertLessThanOrEqual(
             successes,
-            8,
-            "only the bounded admitted set may complete its JWKS fetch"
+            6,
+            "only the bounded general set may complete its JWKS fetch"
         )
         XCTAssertGreaterThanOrEqual(
             unavailable,
-            clientIDs.count - 8,
+            clientIDs.count - 6,
             "excess JWKS fetches must be rejected promptly"
         )
         XCTAssertEqual(successes + unavailable, clientIDs.count)
@@ -854,6 +854,413 @@ final class OAuthRemoteFetchAdmissionTests: XCTestCase, @unchecked Sendable {
             "the successful retry, rather than the failed task, must occupy the cache"
         )
     }
+
+    // MARK: F19 — durable freshness capacity claimed before the fetch
+
+    /// The denial this proves is of a *legitimate* operation: onboarding a
+    /// previously unseen client. Anonymous callers whose documents never
+    /// validate must not leave the durable freshness table full behind them.
+    func testFailedAnonymousMetadataFetchesCannotDenyANewLegitimateClient()
+        async throws
+    {
+        let peer = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+        let transport = OAuthMetadataBarrierTransport(
+            shouldBlock: { _ in false },
+            responder: { url, _ in
+                if url.host?.hasPrefix("hostile-") == true {
+                    throw SwanError.unauthorized(
+                        "scripted hostile metadata rejection"
+                    )
+                }
+                return oauthPublicMetadataResponse(
+                    for: url,
+                    peer: peer,
+                    clientName: "legitimate client"
+                )
+            }
+        )
+        let fixture = try await OAuthRemoteFetchAdmissionFixture(
+            transport: transport,
+            clientMetadataFreshnessLimit: 4
+        )
+        addTeardownBlock {
+            try? await fixture.database.close()
+            fixture.cleanup()
+        }
+
+        for index in 0 ..< 4 {
+            let hostile = try XCTUnwrap(URL(
+                string: "https://hostile-\(index).example/oauth/client.json"
+            ))
+            do {
+                _ = try await fixture.loader.load(clientID: hostile, now: now)
+                XCTFail("the hostile metadata document must be rejected")
+            } catch is SwanError {
+                continue
+            }
+        }
+
+        let legitimate = try XCTUnwrap(URL(
+            string: "https://legitimate.example/oauth/client-metadata.json"
+        ))
+        let resolved = try await fixture.loader.load(
+            clientID: legitimate,
+            now: now.addingTimeInterval(1)
+        )
+        XCTAssertEqual(
+            resolved.metadata.clientName,
+            "legitimate client",
+            "abandoned fetches must release the durable freshness row"
+        )
+    }
+
+    /// The abandon predicate must never take a row a live flight still needs.
+    /// This is the same invariant
+    /// `testNewerStartedFetchDoesNotStarveOlderValidPublication` protects,
+    /// stated for the release path.
+    func testAbandoningATicketNeverRemovesAConcurrentFlightsRow() async throws {
+        let fixture = try await OAuthRemoteFetchAdmissionFixture()
+        addTeardownBlock {
+            try? await fixture.database.close()
+            fixture.cleanup()
+        }
+        let contested = "https://contested.example/oauth/client.json"
+        let first = try await fixture.database.beginClientMetadataFetch(
+            clientID: contested,
+            now: now
+        )
+        let second = try await fixture.database.beginClientMetadataFetch(
+            clientID: contested,
+            now: now.addingTimeInterval(1)
+        )
+        try await fixture.database.abandonClientMetadataFetch(
+            ticket: first,
+            now: now.addingTimeInterval(2)
+        )
+        let secondPublished = try await fixture.database.publishClientMetadata(
+            OAuthCachedClientMetadata(
+                clientID: contested,
+                document: Data("second-valid".utf8),
+                expiresAt: now.addingTimeInterval(300)
+            ),
+            using: second,
+            now: now.addingTimeInterval(3)
+        )
+        XCTAssertTrue(
+            secondPublished,
+            "an abandoned older ticket must not delete a live flight's row"
+        )
+
+        // A published client keeps its watermark: abandoning a later ticket
+        // for it must not drop the row its cached document depends on, and a
+        // superseded publication must still be refused rather than erroring.
+        let third = try await fixture.database.beginClientMetadataFetch(
+            clientID: contested,
+            now: now.addingTimeInterval(4)
+        )
+        try await fixture.database.abandonClientMetadataFetch(
+            ticket: third,
+            now: now.addingTimeInterval(5)
+        )
+        let supersededPublish = try await fixture.database
+            .publishClientMetadata(
+                OAuthCachedClientMetadata(
+                    clientID: contested,
+                    document: Data("stale".utf8),
+                    expiresAt: now.addingTimeInterval(300)
+                ),
+                using: second,
+                now: now.addingTimeInterval(6)
+            )
+        XCTAssertFalse(supersededPublish)
+        let cached = try await fixture.database.cachedClientMetadata(
+            clientID: contested,
+            now: now.addingTimeInterval(7)
+        )
+        XCTAssertEqual(cached?.document, Data("second-valid".utf8))
+    }
+
+    /// An abandoned ticket is dead: it must not be able to publish afterwards.
+    func testAnAbandonedTicketCannotPublishLater() async throws {
+        let fixture = try await OAuthRemoteFetchAdmissionFixture()
+        addTeardownBlock {
+            try? await fixture.database.close()
+            fixture.cleanup()
+        }
+        let abandoned = "https://abandoned.example/oauth/client.json"
+        let ticket = try await fixture.database.beginClientMetadataFetch(
+            clientID: abandoned,
+            now: now
+        )
+        try await fixture.database.abandonClientMetadataFetch(
+            ticket: ticket,
+            now: now.addingTimeInterval(1)
+        )
+        do {
+            _ = try await fixture.database.publishClientMetadata(
+                OAuthCachedClientMetadata(
+                    clientID: abandoned,
+                    document: Data("late".utf8),
+                    expiresAt: now.addingTimeInterval(300)
+                ),
+                using: ticket,
+                now: now.addingTimeInterval(2)
+            )
+            XCTFail("an abandoned ticket must not publish")
+        } catch let error as OAuthControlStoreError {
+            XCTAssertEqual(error, .malformedRecord)
+        }
+        let cached = try await fixture.database.cachedClientMetadata(
+            clientID: abandoned,
+            now: now.addingTimeInterval(3)
+        )
+        XCTAssertNil(cached)
+    }
+
+    /// Second, independent control: even with every abandon call missing, an
+    /// unpublished ticket must not hold its slot for an hour.
+    func testUnpublishedFreshnessTicketsExpireWithinTheShortFetchWindow()
+        async throws
+    {
+        let fixture = try await OAuthRemoteFetchAdmissionFixture(
+            clientMetadataFreshnessLimit: 4
+        )
+        addTeardownBlock {
+            try? await fixture.database.close()
+            fixture.cleanup()
+        }
+        for index in 0 ..< 4 {
+            _ = try await fixture.database.beginClientMetadataFetch(
+                clientID: "https://hostile-\(index).example/oauth/client.json",
+                now: now
+            )
+        }
+        _ = try await fixture.database.beginClientMetadataFetch(
+            clientID: "https://legitimate.example/oauth/client.json",
+            now: now.addingTimeInterval(61)
+        )
+    }
+
+    /// The short unpublished window must compose with the `MAX(existing,
+    /// excluded)` upsert: a newly started fetch for an already published
+    /// client must never shorten that client's retention.
+    func testStartingAFetchDoesNotShortenAPublishedClientRetention()
+        async throws
+    {
+        let fixture = try await OAuthRemoteFetchAdmissionFixture(
+            clientMetadataFreshnessLimit: 1
+        )
+        addTeardownBlock {
+            try? await fixture.database.close()
+            fixture.cleanup()
+        }
+        let published = "https://published.example/oauth/client.json"
+        let ticket = try await fixture.database.beginClientMetadataFetch(
+            clientID: published,
+            now: now
+        )
+        let didPublish = try await fixture.database.publishClientMetadata(
+            OAuthCachedClientMetadata(
+                clientID: published,
+                document: Data("published".utf8),
+                expiresAt: now.addingTimeInterval(300)
+            ),
+            using: ticket,
+            now: now
+        )
+        XCTAssertTrue(didPublish)
+        _ = try await fixture.database.beginClientMetadataFetch(
+            clientID: published,
+            now: now.addingTimeInterval(10)
+        )
+
+        // The published watermark is still retained long after both the
+        // cached document and the 60 s unpublished window have expired.
+        do {
+            _ = try await fixture.database.beginClientMetadataFetch(
+                clientID: "https://other.example/oauth/client.json",
+                now: now.addingTimeInterval(3_001)
+            )
+            XCTFail("a published freshness row must be retained for an hour")
+        } catch let error as SwanError {
+            guard case .unavailable = error else {
+                return XCTFail("expected typed unavailable, got \(error)")
+            }
+        }
+        _ = try await fixture.database.beginClientMetadataFetch(
+            clientID: "https://other.example/oauth/client.json",
+            now: now.addingTimeInterval(3_601)
+        )
+    }
+
+    // MARK: F09 — process-global remote-document budget
+
+    /// Slow attacker-controlled origins must not deny the one account's token
+    /// refresh, which revalidates its client metadata with `bypassCache`.
+    func testSlowAnonymousOriginsCannotDenyAnAuthorizedClientRevalidation()
+        async throws
+    {
+        let peer = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+        let transport = OAuthMetadataBarrierTransport(
+            shouldBlock: { url in url.host?.hasPrefix("hostile-") == true },
+            responder: { url, _ in
+                oauthPublicMetadataResponse(
+                    for: url,
+                    peer: peer,
+                    clientName: "authorized client"
+                )
+            }
+        )
+        let fixture = try await OAuthRemoteFetchAdmissionFixture(
+            transport: transport
+        )
+        addTeardownBlock {
+            try? await fixture.database.close()
+            fixture.cleanup()
+        }
+        try await fixture.issueLiveAuthorization(
+            forClientID: fixture.clientID.absoluteString,
+            now: now
+        )
+
+        let hostileLoads = try (0 ..< 12).map { index in
+            let hostile = try XCTUnwrap(URL(
+                string: "https://hostile-\(index).example/oauth/client.json"
+            ))
+            return Task {
+                _ = try? await fixture.loader.load(
+                    clientID: hostile,
+                    now: self.now
+                )
+            }
+        }
+        let attackerSaturatedTheGeneralPool = await oauthEventually(
+            within: .seconds(2)
+        ) {
+            await transport.activeBlockedRequestCount() >= 6
+        }
+        XCTAssertTrue(
+            attackerSaturatedTheGeneralPool,
+            "the scripted attacker never filled the general fetch pool"
+        )
+
+        let refreshed = try await fixture.loader.revalidate(
+            clientID: fixture.clientID,
+            now: now.addingTimeInterval(1)
+        )
+        XCTAssertEqual(
+            refreshed.metadata.clientName,
+            "authorized client",
+            "a client the account still authorizes must keep reserved capacity"
+        )
+        // Drain before teardown closes the control database: a blocked flight
+        // is detached from its caller by design, so cancelling the callers is
+        // not enough to stop it from touching the store afterwards.
+        await transport.releaseAll()
+        for load in hostileLoads {
+            await load.value
+        }
+    }
+
+    /// One slow host must not occupy the whole general pool by varying only
+    /// the metadata path.
+    func testOneHostCannotHoldMoreThanTwoConcurrentMetadataFlights()
+        async throws
+    {
+        let peer = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+        let transport = OAuthMetadataBarrierTransport(
+            shouldBlock: { _ in true },
+            responder: { url, _ in
+                oauthPublicMetadataResponse(for: url, peer: peer)
+            }
+        )
+        let fixture = try await OAuthRemoteFetchAdmissionFixture(
+            transport: transport
+        )
+        addTeardownBlock {
+            try? await fixture.database.close()
+            fixture.cleanup()
+        }
+        let loads = try (0 ..< 8).map { index in
+            let clientID = try XCTUnwrap(URL(
+                string: "https://one-host.example/oauth/client-\(index).json"
+            ))
+            return Task {
+                _ = try? await fixture.loader.load(
+                    clientID: clientID,
+                    now: self.now
+                )
+            }
+        }
+        let thirdFlightAdmitted = await oauthEventually(
+            within: .milliseconds(750)
+        ) {
+            await transport.activeBlockedRequestCount() >= 3
+        }
+        XCTAssertFalse(
+            thirdFlightAdmitted,
+            "one host must not hold more than two concurrent metadata flights"
+        )
+        await transport.releaseAll()
+        for load in loads {
+            await load.value
+        }
+    }
+
+    // MARK: F10 — special-purpose IPv6 ranges
+
+    func testProductionOAuthIPv6PolicyRejectsSpecialPurposeRanges() throws {
+        for literal in [
+            "2001::1", // IETF protocol assignments
+            "2001:db8::1", // documentation
+            "2002::1", // 6to4
+            "3fff::1", // documentation
+            "3fff:fff::1", // upper edge of 3fff::/20
+        ] {
+            let address = try XCTUnwrap(OAuthIPAddress(literal: literal))
+            XCTAssertFalse(address.isPublicInternetAddress, literal)
+        }
+        XCTAssertTrue(
+            try XCTUnwrap(
+                OAuthIPAddress(literal: "2606:4700:4700::1111")
+            ).isPublicInternetAddress
+        )
+        let loopback = try XCTUnwrap(OAuthIPAddress(literal: "::1"))
+        XCTAssertTrue(loopback.isLoopback)
+        XCTAssertFalse(loopback.isPublicInternetAddress)
+    }
+
+    /// A 6to4 address embeds an IPv4 destination in bytes 2...5. The same
+    /// policy rejects those destinations when they are written directly, so
+    /// the tunnelled spelling must not be an alternate route to them.
+    func testOAuthPolicyRejects6to4AddressesEmbeddingRejectedIPv4Destinations()
+        throws
+    {
+        for (tunnelled, direct) in [
+            ("2002:7f00:0001::", "127.0.0.1"),
+            ("2002:0a00:0001::", "10.0.0.1"),
+            ("2002:c0a8:0001::", "192.168.0.1"),
+            ("2002:a9fe:a9fe::", "169.254.169.254"),
+        ] {
+            let embedded = try XCTUnwrap(OAuthIPAddress(literal: tunnelled))
+            let literal = try XCTUnwrap(OAuthIPAddress(literal: direct))
+            XCTAssertFalse(literal.isPublicInternetAddress, direct)
+            XCTAssertFalse(embedded.isPublicInternetAddress, tunnelled)
+        }
+    }
+
+    func testResolvedSpecialPurposeAnswersAreRejectedByFetchPolicy() throws {
+        let policy = try OAuthRemoteFetchPolicy()
+        let sixToFour = try XCTUnwrap(OAuthIPAddress(literal: "2002:7f00:1::"))
+        XCTAssertThrowsError(
+            try policy.validateResolved([sixToFour], host: "client.example")
+        ) { error in
+            guard let swanError = error as? SwanError,
+                  case .unauthorized = swanError else {
+                return XCTFail("expected typed unauthorized, got \(error)")
+            }
+        }
+    }
 }
 
 private struct OAuthRemoteFetchAdmissionFixture: Sendable {
@@ -864,7 +1271,8 @@ private struct OAuthRemoteFetchAdmissionFixture: Sendable {
     let clientID: URL
 
     init(
-        transport suppliedTransport: OAuthMetadataBarrierTransport? = nil
+        transport suppliedTransport: OAuthMetadataBarrierTransport? = nil,
+        clientMetadataFreshnessLimit: Int? = nil
     ) async throws {
         let fixtureRoot = FileManager.default.temporaryDirectory.appending(
             path: "SwanOAuthRemoteFetchAdmissionTests-\(UUID().uuidString)"
@@ -899,6 +1307,22 @@ private struct OAuthRemoteFetchAdmissionFixture: Sendable {
             let fixtureDatabase = try await SQLiteControlDatabase(
                 dataDirectory: fixtureRoot
             )
+            if let clientMetadataFreshnessLimit {
+                await fixtureDatabase
+                    .configureOAuthControlStorageLimitsForTesting(
+                        OAuthControlStorageLimits(
+                            clientMetadata: 4_096,
+                            clientMetadataFreshness:
+                                clientMetadataFreshnessLimit,
+                            pushedAuthorizationRequests: 32_768,
+                            pushedAuthorizationStateReplays: 65_536,
+                            dpopReplays: 131_072,
+                            clientAssertionReplays: 65_536,
+                            spaceDelegationReplays: 65_536,
+                            spaceClientAttestationReplays: 65_536
+                        )
+                    )
+            }
             let fixtureLoader = try OAuthClientMetadataLoader(
                 fetcher: OAuthRemoteDocumentFetcher(
                     policy: try OAuthRemoteFetchPolicy(),
@@ -917,6 +1341,38 @@ private struct OAuthRemoteFetchAdmissionFixture: Sendable {
             try? FileManager.default.removeItem(at: fixtureRoot)
             throw error
         }
+    }
+
+    /// Stands up the durable fact that separates a client the account still
+    /// authorizes from an anonymously supplied `client_id`: one live,
+    /// unrevoked token family naming that client.
+    func issueLiveAuthorization(
+        forClientID authorizedClientID: String,
+        now: Date
+    ) async throws {
+        let familyID = UUID()
+        try await database.issueTokenPair(
+            family: OAuthTokenFamily(
+                familyID: familyID,
+                subject: "did:plc:swanadmissiontestaccount",
+                binding: OAuthClientBinding(
+                    issuer: "https://swan.example",
+                    clientID: authorizedClientID,
+                    redirectURI: "https://client.example/oauth/callback",
+                    scopes: ["atproto"],
+                    dpopJKT: String(repeating: "D", count: 43)
+                ),
+                expiresAt: now.addingTimeInterval(3_600)
+            ),
+            tokens: OAuthIssuedTokenDigests(
+                familyID: familyID,
+                accessTokenDigest: Data(repeating: 0x11, count: 32),
+                refreshTokenDigest: Data(repeating: 0x22, count: 32),
+                accessExpiresAt: now.addingTimeInterval(300),
+                refreshExpiresAt: now.addingTimeInterval(3_600)
+            ),
+            now: now
+        )
     }
 
     func cleanup() {

@@ -56,49 +56,25 @@ public enum OAuthIPAddress: Hashable, Sendable, Equatable, CustomStringConvertib
 
     public var isLoopback: Bool {
         switch self {
-        case let .ipv4(value): (value >> 24) == 127
-        case let .ipv6(bytes): bytes == Data(repeating: 0, count: 15) + Data([1])
+        case let .ipv4(value): SwanPublicAddressPolicy.isLoopback(ipv4: value)
+        case let .ipv6(bytes): SwanPublicAddressPolicy.isLoopback(ipv6: bytes)
         }
     }
 
     /// True only for globally routable addresses. The intentional deny list
     /// includes private, loopback, link-local, CGNAT, documentation, multicast,
     /// and other reserved/special-purpose ranges rather than merely RFC1918.
+    ///
+    /// The table itself lives in ``SwanPublicAddressPolicy`` because the AT
+    /// handle verifier resolves attacker-selectable hostnames through the same
+    /// boundary. Keeping two copies is how this one went on accepting 6to4
+    /// after the handle copy stopped rejecting it in `b5f1610` (2026-07-27).
     public var isPublicInternetAddress: Bool {
         switch self {
         case let .ipv4(value):
-            let first = UInt8((value >> 24) & 0xFF)
-            let second = UInt8((value >> 16) & 0xFF)
-            let third = UInt8((value >> 8) & 0xFF)
-            if first == 0 || first == 10 || first == 127 || first >= 224 { return false }
-            if first == 100 && (64 ... 127).contains(second) { return false }
-            if first == 169 && second == 254 { return false }
-            if first == 172 && (16 ... 31).contains(second) { return false }
-            if first == 192 && second == 0 && third == 0 { return false }
-            if first == 192 && second == 0 && third == 2 { return false }
-            if first == 192 && second == 88 && third == 99 { return false }
-            if first == 192 && second == 168 { return false }
-            if first == 198 && (second == 18 || second == 19) { return false }
-            if first == 198 && second == 51 && third == 100 { return false }
-            if first == 203 && second == 0 && third == 113 { return false }
-            return true
+            SwanPublicAddressPolicy.isPublicInternetAddress(ipv4: value)
         case let .ipv6(bytes):
-            guard bytes.count == 16 else { return false }
-            // IPv4-mapped IPv6 inherits the IPv4 decision instead of creating
-            // an alternate spelling for an unsafe peer.
-            if bytes.prefix(10).allSatisfy({ $0 == 0 }), bytes[10] == 0xFF, bytes[11] == 0xFF {
-                let value = (UInt32(bytes[12]) << 24) | (UInt32(bytes[13]) << 16) |
-                    (UInt32(bytes[14]) << 8) | UInt32(bytes[15])
-                return OAuthIPAddress.ipv4(value).isPublicInternetAddress
-            }
-            // Global unicast is 2000::/3. Everything else includes unspecified,
-            // loopback, ULA, link-local, multicast, and reserved space.
-            guard (bytes[0] & 0xE0) == 0x20 else { return false }
-            // IETF protocol assignments and documentation prefixes are not
-            // external destinations for OAuth metadata retrieval.
-            if bytes[0] == 0x20, bytes[1] == 0x01, bytes[2] == 0x0D, bytes[3] == 0xB8 { return false }
-            if bytes[0] == 0x20, bytes[1] == 0x01, bytes[2] == 0x00, bytes[3] < 0x20 { return false }
-            return true
+            SwanPublicAddressPolicy.isPublicInternetAddress(ipv6: bytes)
         }
     }
 }
@@ -300,7 +276,11 @@ private final class OAuthDNSResolutionDeadline: @unchecked Sendable {
     }
 }
 
-private func resolveOAuthHostname(
+/// Internal rather than file-private because every caller that holds a lease
+/// or an admission permit across hostname resolution needs this deadline. The
+/// authenticated pipethrough is one of them: it resolves a request-selected
+/// service hostname while holding a proxy lease.
+func resolveOAuthHostname(
     _ resolver: any OAuthHostnameResolving,
     host: String,
     timeout: TimeInterval
@@ -344,7 +324,18 @@ private func resolveOAuthHostname(
 /// System DNS is kept behind this protocol so tests can simulate private A/AAAA
 /// answers and a future hardened connector can share the exact resolution path.
 public struct SystemOAuthHostnameResolver: OAuthHostnameResolving {
-    private static let queue = DispatchQueue(label: "blue.catbird.swan.oauth-dns", qos: .utility)
+    /// Concurrent, with ``OAuthBlockingDNSAdmission`` as the sole bound on how
+    /// many blocking `getaddrinfo` calls may be outstanding. A serial queue
+    /// made those four permits unreachable — three permit holders would sit
+    /// behind one unresponsive lookup — so a single blackholed nameserver
+    /// stalled every OAuth, did:web, and pipethrough resolution in the
+    /// process. The worst case is now four blocked dispatch threads instead
+    /// of one, which is exactly what the admission limit is sized for.
+    private static let queue = DispatchQueue(
+        label: "blue.catbird.swan.oauth-dns",
+        qos: .utility,
+        attributes: .concurrent
+    )
 
     public init() {}
 
@@ -471,45 +462,83 @@ public final class AsyncHTTPClientOAuthTransport: OAuthRemoteTransport {
 /// metadata and a metadata document's remote JWKS. Admission is deliberately
 /// non-queueing: an attacker controlling many distinct URLs cannot turn the
 /// server into an unbounded waiter or connection factory.
-private final class OAuthRemoteFetchAdmission: @unchecked Sendable {
-    static let shared = OAuthRemoteFetchAdmission(limit: 8)
+///
+/// The budget is split rather than enlarged. `generalLimit` of the `limit`
+/// permits are all an anonymous caller can reach, so slow attacker-controlled
+/// origins arriving through PAR can never take the last permits away from a
+/// client the account still holds a live authorization for — that client's
+/// token refresh and revocation both revalidate metadata with `bypassCache`,
+/// and denying them is the real damage in this finding. Enlarging the pool
+/// instead would just raise the attacker's cost linearly while multiplying
+/// concurrent outbound sockets.
+final class OAuthRemoteFetchAdmission: @unchecked Sendable {
+    static let shared = OAuthRemoteFetchAdmission(limit: 8, generalLimit: 6)
 
     private let lock = NSLock()
     private let limit: Int
+    private let generalLimit: Int
     private var active = 0
+    private var generalActive = 0
 
-    private init(limit: Int) {
-        precondition(limit > 0)
+    init(limit: Int, generalLimit: Int) {
+        precondition(generalLimit > 0 && generalLimit <= limit)
         self.limit = limit
+        self.generalLimit = generalLimit
     }
 
-    func acquire() throws -> OAuthRemoteFetchAdmissionLease {
+    /// `reserved` may be passed only after the caller has proven, against
+    /// durable state, that the client is one the account currently authorizes.
+    /// It is never derived from request-supplied values.
+    func acquire(reserved: Bool) throws -> OAuthRemoteFetchAdmissionLease {
         lock.lock()
-        guard active < limit else {
+        guard active < limit, reserved || generalActive < generalLimit else {
             lock.unlock()
             throw SwanError.unavailable(
                 "OAuth remote fetch admission capacity is exhausted"
             )
         }
         active += 1
+        if !reserved { generalActive += 1 }
         lock.unlock()
-        return OAuthRemoteFetchAdmissionLease(admission: self)
+        return OAuthRemoteFetchAdmissionLease(admission: self, reserved: reserved)
     }
 
-    fileprivate func release() {
+    fileprivate func release(reserved: Bool) {
         lock.lock()
         precondition(active > 0)
         active -= 1
+        if !reserved {
+            precondition(generalActive > 0)
+            generalActive -= 1
+        }
         lock.unlock()
+    }
+
+    /// Advisory: true when a reserved acquisition could currently succeed. It
+    /// exists so a caller can skip the durable read that proves reserved
+    /// eligibility when there is no slot left to win. `acquire` remains the
+    /// authority.
+    var mayHaveReservedCapacity: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return active < limit
+    }
+
+    var activeCountForTesting: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return active
     }
 }
 
-private final class OAuthRemoteFetchAdmissionLease: @unchecked Sendable {
+final class OAuthRemoteFetchAdmissionLease: @unchecked Sendable {
     private let lock = NSLock()
+    private let reserved: Bool
     private var admission: OAuthRemoteFetchAdmission?
 
-    fileprivate init(admission: OAuthRemoteFetchAdmission) {
+    fileprivate init(admission: OAuthRemoteFetchAdmission, reserved: Bool) {
         self.admission = admission
+        self.reserved = reserved
     }
 
     func release() {
@@ -517,7 +546,7 @@ private final class OAuthRemoteFetchAdmissionLease: @unchecked Sendable {
         let heldAdmission = admission
         admission = nil
         lock.unlock()
-        heldAdmission?.release()
+        heldAdmission?.release(reserved: reserved)
     }
 
     deinit {
@@ -562,13 +591,29 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         }
     }
 
+    /// `reservedCapacityCheck` is consulted only after the general tier is
+    /// already full, so the durable read it performs costs nothing until the
+    /// process is actually under contention. Returning false preserves the
+    /// original typed rejection rather than substituting a different one.
     func withAdmission<T: Sendable>(
+        reservedCapacityCheck: @escaping @Sendable () async -> Bool = { false },
         _ operation: @escaping @Sendable (
             OAuthAdmittedRemoteDocumentFetcher
         ) async throws -> T
     ) async throws -> T {
         try Task.checkCancellation()
-        let admission = try OAuthRemoteFetchAdmission.shared.acquire()
+        let admission: OAuthRemoteFetchAdmissionLease
+        do {
+            admission = try OAuthRemoteFetchAdmission.shared.acquire(
+                reserved: false
+            )
+        } catch {
+            guard OAuthRemoteFetchAdmission.shared.mayHaveReservedCapacity,
+                  await reservedCapacityCheck() else { throw error }
+            admission = try OAuthRemoteFetchAdmission.shared.acquire(
+                reserved: true
+            )
+        }
         defer { admission.release() }
         return try await operation(
             OAuthAdmittedRemoteDocumentFetcher(fetcher: self)
