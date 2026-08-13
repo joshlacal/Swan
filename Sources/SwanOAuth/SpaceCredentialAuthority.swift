@@ -217,6 +217,30 @@ public struct LocalAccountSpaceCredentialSigningKeyResolver:
         } catch {
             throw SwanError.unavailable("space credential signing key is unavailable")
         }
+        // The key-store read above is a suspension, and the directory exposes
+        // no atomic account/key projection, so deactivation, permanent-deletion
+        // revocation, or a key rotation can commit while it runs. Re-read the
+        // account and its key references and treat any intervening change as
+        // terminal: the caller signs a two-hour credential immediately on
+        // return, and a credential signed under a revoked authority outlives
+        // the revocation that should have prevented it. The verification
+        // resolvers below apply exactly this fence twice (`:304-317`,
+        // `:397-410`); the signing path was the odd one out.
+        //
+        // This throws rather than returning `nil`. A `nil` from this resolver
+        // means "no such managed authority" and is a fall-through; a state that
+        // changed underneath us is a hard negative that must not be confused
+        // with absence. `SwanSpaceCredentialXRPC` already maps
+        // `SwanError.unavailable` without widening the client-visible body.
+        guard let currentAccount = try await accounts.account(did: authority),
+              currentAccount == account,
+              currentAccount.status.authorizesAccount,
+              let currentReferences = try await accounts.keyReferences(did: authority),
+              currentReferences.signing == references.signing,
+              currentReferences.rotation == references.rotation
+        else {
+            throw SwanError.unavailable("space credential signing key is unavailable")
+        }
         return SpaceCredentialAuthoritySigningKey(
             authority: authority,
             privateKey: privateKey
