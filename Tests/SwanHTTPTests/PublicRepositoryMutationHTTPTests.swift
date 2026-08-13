@@ -963,6 +963,300 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    // MARK: Staged upload confidentiality
+
+    /// `com.atproto.repo.uploadBlob` carries no namespace intent, so a blob
+    /// destined for a permissioned space arrives through exactly this route.
+    /// Publishing it the instant it lands hands the bytes to any anonymous
+    /// caller who knows or can derive the CID, before the uploader has said
+    /// anything about where they belong.
+    func testUploadedBlobIsNotAnonymouslyFetchableBeforeAPublicRecordReferencesIt()
+        async throws
+    {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.staged-upload")
+        ).test(.router) { client in
+            var uploadHeaders = try fixture.headers(
+                jti: "staged-upload", method: "POST", path: Self.uploadPath
+            )
+            uploadHeaders[.contentType] = "application/octet-stream"
+            let uploaded = try await client.execute(
+                uri: Self.uploadPath,
+                method: .post,
+                headers: uploadHeaders,
+                body: ByteBuffer(data: Data("permissioned-intent".utf8))
+            )
+            XCTAssertEqual(
+                uploaded.status,
+                .ok,
+                String(decoding: uploaded.body.readableBytesView, as: UTF8.self)
+            )
+            let blob = try XCTUnwrap(
+                try self.jsonObject(uploaded.body)["blob"] as? [String: Any]
+            )
+            let cid = try XCTUnwrap(
+                (blob["ref"] as? [String: Any])?["$link"] as? String
+            )
+
+            try await client.execute(
+                uri: "/xrpc/com.atproto.sync.getBlob?did=" + Self.did
+                    + "&cid=" + cid,
+                method: .get
+            ) { response in
+                XCTAssertEqual(
+                    response.status,
+                    .notFound,
+                    "an uploaded blob must not be anonymously readable before a public record references it"
+                )
+            }
+        }
+    }
+
+    /// The apply that would have consumed the upload is rejected. The staged
+    /// bytes must stay unreachable rather than becoming a permanent public
+    /// edge nothing will ever clean up.
+    func testAbandonedUploadNeverBecomesAnonymouslyFetchable() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.abandoned-upload")
+        ).test(.router) { client in
+            var uploadHeaders = try fixture.headers(
+                jti: "abandoned-upload", method: "POST", path: Self.uploadPath
+            )
+            uploadHeaders[.contentType] = "application/octet-stream"
+            let uploaded = try await client.execute(
+                uri: Self.uploadPath,
+                method: .post,
+                headers: uploadHeaders,
+                body: ByteBuffer(data: Data("abandoned-upload".utf8))
+            )
+            XCTAssertEqual(
+                uploaded.status,
+                .ok,
+                String(decoding: uploaded.body.readableBytesView, as: UTF8.self)
+            )
+            let blob = try XCTUnwrap(
+                try self.jsonObject(uploaded.body)["blob"] as? [String: Any]
+            )
+            let cid = try XCTUnwrap(
+                (blob["ref"] as? [String: Any])?["$link"] as? String
+            )
+
+            // A declared size that does not match the stored payload is
+            // rejected by typed blob validation, so the record never commits.
+            let rejected = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "abandoned-apply", method: "POST", path: Self.mutationPath
+                ),
+                body: ByteBuffer(string: self.typedRecordBody(
+                    rkey: "abandoned", cid: cid, size: 3
+                ))
+            )
+            XCTAssertEqual(rejected.status, .badRequest)
+
+            try await client.execute(
+                uri: "/xrpc/com.atproto.sync.getBlob?did=" + Self.did
+                    + "&cid=" + cid,
+                method: .get
+            ) { response in
+                XCTAssertEqual(
+                    response.status,
+                    .notFound,
+                    "a rejected apply must not leave a durable public edge"
+                )
+            }
+        }
+    }
+
+    /// Content-addressed storage is shared by CID, so re-uploading identical
+    /// bytes is an ordinary client retry. It must not resurrect anonymous
+    /// reachability for a payload that a permissioned record already owns.
+    func testSameCIDReuploadAfterPermissionedPromotionStaysPrivate() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let payload = Data("permissioned-payload".utf8)
+        let space = try SpaceURI(
+            authority: Self.did, spaceType: "app.bsky.bookmarks", skey: "self"
+        )
+        let record = try SpaceRecordURI(
+            space: space,
+            author: Self.did,
+            collection: Self.collection,
+            rkey: "permissioned-blob"
+        )
+
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.reupload")
+        ).test(.router) { client in
+            func upload(jti: String) async throws -> String {
+                var headers = try fixture.headers(
+                    jti: jti, method: "POST", path: Self.uploadPath
+                )
+                headers[.contentType] = "application/octet-stream"
+                let response = try await client.execute(
+                    uri: Self.uploadPath,
+                    method: .post,
+                    headers: headers,
+                    body: ByteBuffer(data: payload)
+                )
+                XCTAssertEqual(
+                    response.status,
+                    .ok,
+                    String(decoding: response.body.readableBytesView, as: UTF8.self)
+                )
+                let blob = try XCTUnwrap(
+                    try self.jsonObject(response.body)["blob"] as? [String: Any]
+                )
+                return try XCTUnwrap(
+                    (blob["ref"] as? [String: Any])?["$link"] as? String
+                )
+            }
+
+            func assertNotAnonymouslyReadable(
+                _ cid: String,
+                _ message: String
+            ) async throws {
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.sync.getBlob?did=" + Self.did
+                        + "&cid=" + cid,
+                    method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound, message)
+                }
+            }
+
+            let cid = try await upload(jti: "reupload-first")
+            try await assertNotAnonymouslyReadable(
+                cid, "a staged upload is never anonymously readable"
+            )
+
+            let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+                (key: "$type", value: Self.collection),
+                (key: "blob", value: OrderedCBORMap(entries: [
+                    (key: "$type", value: "blob"),
+                    (key: "ref", value: ATProtoLink(cid: try CID.parse(cid))),
+                    (key: "mimeType", value: "application/octet-stream"),
+                    (key: "size", value: payload.count),
+                ])),
+            ]))
+            _ = try await fixture.database.apply(
+                space: space,
+                author: Self.did,
+                expectedRevision: 0,
+                requestID: UUID(),
+                wireRevision: try TID(tidString: "2222222222222"),
+                writes: [.create(uri: record, value: value, cid: CID.fromDAGCBOR(value).string)]
+            )
+            try await assertNotAnonymouslyReadable(
+                cid, "a promoted permissioned blob is not anonymously readable"
+            )
+
+            let second = try await upload(jti: "reupload-second")
+            XCTAssertEqual(second, cid)
+            try await assertNotAnonymouslyReadable(
+                second,
+                "re-uploading identical bytes must not restore anonymous reachability"
+            )
+        }
+    }
+
+    /// The regression guard on the fix itself: a blob a validated public
+    /// record does reference is part of the federated protocol surface and
+    /// must remain anonymously fetchable.
+    func testUploadedBlobIsAnonymouslyFetchableOnceAPublicRecordReferencesIt()
+        async throws
+    {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let payload = Data("published-image".utf8)
+
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.published-upload")
+        ).test(.router) { client in
+            var uploadHeaders = try fixture.headers(
+                jti: "published-upload", method: "POST", path: Self.uploadPath
+            )
+            uploadHeaders[.contentType] = "application/octet-stream"
+            let uploaded = try await client.execute(
+                uri: Self.uploadPath,
+                method: .post,
+                headers: uploadHeaders,
+                body: ByteBuffer(data: payload)
+            )
+            XCTAssertEqual(
+                uploaded.status,
+                .ok,
+                String(decoding: uploaded.body.readableBytesView, as: UTF8.self)
+            )
+            let blob = try XCTUnwrap(
+                try self.jsonObject(uploaded.body)["blob"] as? [String: Any]
+            )
+            let cid = try XCTUnwrap(
+                (blob["ref"] as? [String: Any])?["$link"] as? String
+            )
+
+            let committed = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "published-apply", method: "POST", path: Self.mutationPath
+                ),
+                body: ByteBuffer(string: self.typedRecordBody(
+                    rkey: "published", cid: cid, size: payload.count
+                ))
+            )
+            XCTAssertEqual(
+                committed.status,
+                .ok,
+                String(decoding: committed.body.readableBytesView, as: UTF8.self)
+            )
+
+            try await client.execute(
+                uri: "/xrpc/com.atproto.sync.getBlob?did=" + Self.did
+                    + "&cid=" + cid,
+                method: .get
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertEqual(Data(buffer: response.body), payload)
+                XCTAssertEqual(
+                    response.headers[.contentLength],
+                    String(payload.count)
+                )
+            }
+        }
+    }
+
     private func makeFixture(
         includePublicBlobSpoolAdmission: Bool = true,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,

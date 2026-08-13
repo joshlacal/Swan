@@ -943,6 +943,11 @@ public struct SwanOperatorAccountRestorer: Sendable {
             "public\u{0}\(reference.cid)"
         case let .space(space):
             "space\u{0}\(space.rawValue)\u{0}\(reference.cid)"
+        case .staged:
+            // An export inventory never contains a staged upload edge; keep
+            // the ordering total rather than trapping on a value the caller
+            // cannot produce.
+            "staged\u{0}\(reference.cid)"
         }
     }
 }

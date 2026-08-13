@@ -106,8 +106,13 @@ private struct PublicMutationHandlers {
             policy: capability.jsonWriteBodyPolicy,
             termination: context.jsonWriteBodyTermination
         ) {
+            // `uploadBlob` carries no namespace intent, so this one route also
+            // receives every blob destined for a permissioned space. Staging
+            // is what keeps those bytes out of the anonymous
+            // `com.atproto.sync.getBlob` namespace until a commit says where
+            // they belong; the commit that references them promotes them.
             try await blobStore.putStreaming(
-                namespace: .public,
+                namespace: .staged,
                 mimeType: mimeType,
                 maximumBytes: maximumBytes
             ) { sink in
@@ -134,7 +139,7 @@ private struct PublicMutationHandlers {
                 }
             }
         }
-        guard case .public = reference.namespace else {
+        guard case .staged = reference.namespace else {
             throw PublicMutationFailure.unavailable
         }
         let cid: CID
@@ -388,9 +393,14 @@ private struct PublicMutationHandlers {
         }
         var seen = Set<String>()
         for cid in cids where seen.insert(cid.string).inserted {
+            // A record may reference a blob this account has staged but not
+            // yet published — that is the ordinary upload-then-post flow, and
+            // committing this record is what publishes it. The commit
+            // transaction re-derives the same reachability under the storage
+            // serialization boundary before it promotes anything.
             let metadata: PublicBlobMetadata?
             do {
-                metadata = try await blobStore.publicBlobMetadata(cid: cid.string)
+                metadata = try await blobStore.uploadedBlobMetadata(cid: cid.string)
             } catch {
                 throw PublicMutationFailure.unavailable
             }
