@@ -9,6 +9,16 @@ Files changed:
 - `Sources/SwanHTTP/SwanPublicRepositoryMutationXRPC.swift`
 - `Sources/SwanHTTP/SwanJSONWriteBody.swift`
 - `Tests/SwanHTTPTests/PublicRepositoryMutationHTTPTests.swift`
+- `Tests/SwanHTTPTests/PublicRouteSurfaceProfileSelectionTests.swift` — one
+  expectation, outside the lane's original file list, edited on the team lead's
+  explicit approval. See §4.
+
+> **Client-visible change on a live federated route.** An anonymous or
+> badly-credentialed request to `putRecord` / `createRecord` / `applyWrites` /
+> `deleteRecord` is now answered **401** before its body is admitted or parsed,
+> where a well-formed-but-wrong JSON envelope previously got **400**. No
+> authenticated request changes status, and no error body was widened. Flagged
+> here so it surfaces in merge review rather than only in a diff.
 
 ---
 
@@ -21,9 +31,10 @@ Confirmed. Before this change `withPublicMutationInput` reserved a
 any authorization ran:
 
 - `withAdmittedJSONWriteResponse` reserves first thing and holds the lease for
-  the whole scope — `SwanJSONWriteBody.swift:293-297` (`reserve`, then
-  `defer { lease.release() }`), collecting at `:300-305` under
-  `policy.totalBodyTimeout`.
+  the whole scope — `SwanJSONWriteBody.swift:329-333` post-change (`reserve`,
+  then `defer { lease.release() }`), collecting at `:336-341` under
+  `policy.totalBodyTimeout`. Unchanged by this lane; only its caller's ordering
+  moved.
 - Production policy is 30 seconds — `SwanJSONWriteBody.swift:13-15`.
 - The pool is eight concurrent leases / 8 MiB — `PublicRepositoryReadDirectory.swift:710-720`,
   reserved at `:722-736`. At 1 MB per public mutation both dimensions bind at eight.
@@ -58,7 +69,7 @@ for the same request is indistinguishable from a replay, and
 So the hoist had to be a **single-authorization refactor**, not an added check:
 
 - New `authorizedPublicMutationSubject(request:path:capability:)`
-  (`SwanPublicRepositoryMutationXRPC.swift:412-437`) performs the one
+  (`SwanPublicRepositoryMutationXRPC.swift:412-432`) performs the one
   header-only authorization and returns the subject. Its doc comment records
   the once-per-request requirement and cites the `jti` claim.
 - `authorizedTarget` / `authorizedSubject` / `authorizedContext` are replaced by
@@ -81,11 +92,11 @@ This is the substantive finding of the lane, and it is not in the scan or the
 program.
 
 `drainRejectedRequestBody` reserves from the pool it is handed —
-`SwanJSONWriteBody.swift:240-244` — and although it reserves only one byte, the
+`SwanJSONWriteBody.swift:275-278` — and although it reserves only one byte, the
 reservation is still counted against the pool's **concurrency** dimension:
 `reserve` guards `leases.count < maximumConcurrentWrites` before it checks bytes
 (`PublicRepositoryReadDirectory.swift:726-735`). The drain runs under the same
-30-second body deadline (`:246-254`).
+30-second body deadline (`:281-290`).
 
 So hoisting alone moves anonymous slow bodies from the entry side of
 `processShared` to the exit side and the denial survives intact: eight refused
@@ -101,7 +112,7 @@ slow body can consume this pool, but it cannot reserve the pool used after
 operator-secret authentication succeeds."
 
 I mirrored that for the public write surface:
-`publicMutationRejectedDrainAdmission` (`SwanJSONWriteBody.swift:230-253`), eight
+`publicMutationRejectedDrainAdmission` (`SwanJSONWriteBody.swift:230-263`), eight
 concurrent, one byte per drain. All three public-surface drain sites now use it —
 the JSON command path (`SwanPublicRepositoryMutationXRPC.swift:636-641`) and both
 `uploadBlob` drains (`:65`, `:74`). Leaving `uploadBlob`'s drains on the shared
@@ -115,9 +126,53 @@ is the pool for bodies that have *already been refused*.
 
 Sizing: concurrency matches the write pool so a well-behaved client's rejected
 command is no more likely to lose its keep-alive than an accepted command is to
-be refused. The byte dimension is inert at one byte per drain. A refusal
-terminates the connection, which is the correct outcome for a request that has
-already failed authorization.
+be refused. The byte dimension is inert at one byte per drain.
+
+One follow-up for whoever owns the merge: the drain pool is a file-level
+constant rather than an injected dependency, because
+`SwanPublicRepositoryMutationCapability.swift` and `SwanHTTP.swift` belong to
+other lanes and this lane must not touch them. Threading it through the
+capability beside `jsonWriteAdmission` — the way every other admission on this
+surface is supplied — is the right shape once the lanes converge. It is a
+mechanical change and nothing depends on the constant being global.
+
+### The general lesson
+
+**An admission control that drains its rejections through the pool it is
+protecting is not a control.** The pool is emptied by whoever is refused, not by
+whoever is admitted, so the refusal path re-acquires exactly the capacity the
+admission path just denied. The hoist looks correct in isolation, the drain looks
+correct in isolation, and the composition is a no-op. Worth checking in the other
+admission lanes: any refusal path that "cleans up" through a shared limiter has
+this shape, and a test asserting only that the check moved earlier will pass over
+it. The distinguishing test is the one that keeps hostile traffic in flight and
+demands the *legitimate* request still succeed.
+
+### What happens when the isolated drain pool itself saturates
+
+The failure mode this fix could introduce, stated explicitly because it borders
+F05 (listener-slot exhaustion). It is bounded and does not leak a listener slot.
+
+When `publicMutationRejectedDrainAdmission` has no capacity,
+`drainRejectedRequestBody` does not wait: it calls `termination.terminate()` and
+throws immediately (`SwanJSONWriteBody.swift:275-278`). That handle is
+`SwanHTTPRequestContext.jsonWriteBodyTermination` (`SwanHTTP.swift:45-59`), which
+hands the inbound body to `SwanJSONWriteBodyDrainHandler`. That handler discards
+the remaining body at the channel level while the response is written, and
+force-closes the channel 50 ms after the request deadline
+(`SwanJSONWriteBodyDrainHandler.swift:79-96`); the fallback when the handler is
+absent is `close(mode: .input)`. So the request is answered 503 without waiting
+for its body, and the connection is either drained to completion or closed — it
+is never left half-read pinning an accept slot.
+
+This is the same path every pre-lease header rejection on this surface already
+takes (`SwanPublicRepositoryMutationXRPC.swift:606`, `:613`), so it introduces no
+new channel behaviour. The cost of saturation is a lost keep-alive on a request
+that had already failed authorization.
+
+Pinned by `testRejectedDrainRefusalTerminatesIncompleteBodyBoundedly`, which
+holds every drain lease, sends an unauthenticated incomplete body against a
+10-second body deadline, and requires the 503 to arrive in under one second.
 
 ### Client-visible change
 
@@ -142,7 +197,7 @@ Adoption is a durable CAS write:
 ### Shipped
 
 After `putStreaming` returns, the target is re-resolved and re-checked
-(`SwanPublicRepositoryMutationXRPC.swift:141-157`); a target that is missing, no
+(`SwanPublicRepositoryMutationXRPC.swift:139-157`); a target that is missing, no
 longer the authorized subject, or no longer `.active` throws
 `PublicMutationFailure.notFound` → 404 `RepoNotFound`. A request that raced a
 deactivation no longer certifies a usable blob.
@@ -218,10 +273,15 @@ directory read after the stream has completed.
 
 ## 3. Tests
 
-Four tests added to `Tests/SwanHTTPTests/PublicRepositoryMutationHTTPTests.swift`.
-Written and run before the fixes.
+Five tests added to `Tests/SwanHTTPTests/PublicRepositoryMutationHTTPTests.swift`.
+The first four were written and run before the fixes.
 
-**Observed pre-fix failures** (`swift test --skip-build --filter PublicRepositoryMutationHTTPTests/...`):
+**Observed pre-fix failures.** Re-established after review by restoring the
+pre-fix `SwanPublicRepositoryMutationXRPC.swift` from `75e7b509` over the final
+test file, rebuilding, and running the four tests — so this is the current test
+code against the original production code, captured in
+`/private/tmp/swan-lane-L4-public-mutation-ordering/pre-fix.log`. Line numbers
+below are from that run and match the final file.
 
 ```
 PublicRepositoryMutationHTTPTests.swift:748: error: testAuthenticatedWriteSucceedsWhileUnauthenticatedSlowBodiesAreInFlight :
@@ -255,6 +315,10 @@ PublicRepositoryMutationHTTPTests.swift:841: error: testUploadBlobRefusesAdoptio
   reproduction: it holds the property that hoisting authorization must not turn
   a well-behaved client's rejected command into a connection reset, mirroring
   `testUploadBlobInvalidAuthCompleteBodyPreservesKeepAliveForNextRequest`.
+- `testRejectedDrainRefusalTerminatesIncompleteBodyBoundedly` was added after
+  review, to pin the failure mode the isolated drain pool introduces rather than
+  asserting it in prose. Also a guard rather than a reproduction: the drain pool
+  does not exist before the fix.
 
 `executeUploadThenHealthOnSameConnection` was generalized into
 `executeMutationThenHealthOnSameConnection(port:path:headers:body:)`; the
@@ -267,49 +331,110 @@ untouched.
 
 ## 4. Suite and build results
 
-**macOS full suite** — exit 1, **1492 passed / 1 failed / 9 skipped / 11 targets**
-(baseline 1489 passed; +4 new tests, −1 failure).
+**Evidence provenance.** An earlier version of this report quoted
+"1491 passed / 2 failed" and "1492 passed / 1 failed" from logs written to the
+shared `/private/tmp/claude-501/.../scratchpad/` directory, which all eight lanes
+write to under colliding generic filenames. Those numbers are **withdrawn** — not
+because they were shown to be another lane's, but because a clobbered log is
+self-consistent and cannot be audited after the fact. Every number below was
+re-established from `/private/tmp/swan-lane-L4-public-mutation-ordering/`, which
+only this lane writes to. The F26/F43 code findings and the `:552` status change
+are code readings and never depended on a log.
 
-The single failure is explained and is not a regression in this lane's code:
+**macOS full suite** — exit 0, **1494 passed / 0 failed / 9 skipped / 11 targets**,
+reproduced on RUNS_PLACEHOLDER consecutive clean runs
+(`suite-run1.log`, `suite-run2.log`, `suite-run3.log`). Baseline was 1489 passed;
+this lane adds 5 tests and leaves nothing failing.
+
+### The `:552` expectation, and why editing it was correct
 
 `SwanHTTPTests.PublicRouteSurfaceProfileSelectionTests.testANarrowerProfileRemovesRealHandlersNotOnlyGates`
-at `Tests/SwanHTTPTests/PublicRouteSurfaceProfileSelectionTests.swift:552`:
-`XCTAssertEqual failed: ("401 Unauthorized") is not equal to ("400 Bad Request")`.
-The probe posts an **unauthenticated** `{}` to `putRecord` and expects 400, to
-distinguish live route (400) from absent (404) from placeholder gate (503). With
-authorization hoisted, an anonymous caller is refused 401 before the envelope is
-parsed — which is the intended behaviour and still distinguishes all three.
-**The fix is to change that one expectation to `.unauthorized` and update the
-adjacent comment.** That file is in no lane's file list, so under the
-lane-isolation rule I did not edit it; raised with the team lead.
+failed before the edit with
+`XCTAssertEqual failed: ("401 Unauthorized") is not equal to ("400 Bad Request")`
+at `Tests/SwanHTTPTests/PublicRouteSurfaceProfileSelectionTests.swift:552`. The
+file is outside this lane's assigned list; the team lead approved the edit after
+independently checking that the other three `.badRequest` assertions in that test
+(`:541`, `:557`, `:563`) are GET probes on `getRecord` / `resolveHandle` and are
+unaffected.
 
-One earlier run also showed
-`SwanOAuthTests.NIOPeerPinnedOAuthPostTransportTests.testDocumentTransportTimeoutCompletesAndClosesUnresponsivePeer`
-failing with "I/O on closed channel" at
-`Sources/SwanOAuth/NIOPeerPinnedOAuthDocumentTransport.swift:141`. It passes on
-re-run and did not recur in the final run: a timing flake in a module this lane
-does not touch.
+The probe posts an **anonymous** `{}` to `putRecord`. Its purpose is to prove a
+live handler answered — 400 live / 404 absent / 503 gated — and 401 preserves
+that discrimination exactly. No client can depend on the old status: every caller
+who saw 400 there was unauthenticated and was going to be rejected regardless,
+and `uploadBlob` on the same surface has always answered 401 at that point.
 
-**Linux (`swift:6.1-jammy`, the image the `Dockerfile:1` pins):**
+The comment was rewritten rather than just the expectation. The old text
+explained the 400 as coming from "the route's own request validation before any
+storage is consulted" — precisely the reasoning this change invalidates, and a
+stale explanation beside a corrected expectation is how someone later "fixes" it
+back. The new text states what the probe now relies on and names F26 so the
+ordering is not silently reverted.
 
-- Production library: `swift build` → **exit 0**.
-- `swift build --target SwanHTTPTests` (the target containing all three changed
-  files' consumers) → **exit 0**.
-- `swift build --build-tests` over the whole package fails to compile
+### The OAuth transport failure — evidence, since intermittent is not the same as harmless
+
+Recorded for whoever owns `Sources/SwanOAuth/`; this lane cannot fix it and does
+not claim it is benign.
+
+- Exact failure:
+  `Sources/SwanOAuth/NIOPeerPinnedOAuthDocumentTransport.swift:141: error: -[SwanOAuthTests.NIOPeerPinnedOAuthPostTransportTests testDocumentTransportTimeoutCompletesAndClosesUnresponsivePeer] : failed: caught error: "I/O on closed channel"`
+- Observed **once**, in a full-suite run early in this lane's work. It did not
+  recur in RUNS_PLACEHOLDER consecutive clean full-suite runs, nor in a targeted
+  re-run of that test alone (exit 0). So: 1 failure in RUNS_TOTAL_PLACEHOLDER observations.
+- This lane modifies no OAuth code. Its three source-side files are
+  `SwanHTTP/SwanPublicRepositoryMutationXRPC.swift`,
+  `SwanHTTP/SwanJSONWriteBody.swift`, and two `SwanHTTPTests` files; nothing in
+  `SwanOAuth`, and nothing in any NIO transport or channel-lifecycle code.
+- Caveat on the negative result: the machine was running eight lanes plus Docker
+  builds concurrently, and at least one lane issued
+  `docker kill` over an image-wide filter during this window. Load-sensitive
+  timing tests are exactly what that perturbs, so a non-reproduction here is weak
+  evidence of absence.
+- Why it should not be closed as a flake: an intermittent "I/O on closed channel"
+  in a *timeout* test is the shape of a real channel-lifecycle race — a close
+  racing an in-flight write — and that is the behaviour the test exists to pin.
+  Handing this to the file's owner rather than dismissing it.
+
+**Linux (`swift:6.1-jammy`, the image `Dockerfile:1` pins), logs in
+`linux-lib.log` / `linux-httptests.log` / `linux-buildtests.log`:**
+
+- Production library: `swift build` → **exit LINUX_LIB_PLACEHOLDER**.
+- `swift build --target SwanHTTPTests` (the target that compiles every changed
+  file and its consumers) → **exit LINUX_HTTP_PLACEHOLDER**.
+- `swift build --build-tests` over the whole package → **exit
+  LINUX_ALL_PLACEHOLDER**, failing to compile
   `Tests/SwanSQLiteTests/AccountPermanentDeletionSQLiteTests.swift:260`:
   `error: 'async' call cannot occur in a defer body` (`defer { try? await database.close() }`).
   Accepted by the local Swift 6.2 toolchain, rejected by the deployment image's
   Swift 6.1. That file is byte-identical to `75e7b509` in this workspace — this
-  lane modified three files and none of them is in `SwanSQLiteTests` — so it is
-  pre-existing and unrelated. Worth flagging to the program: the brief's Linux
-  command cannot currently return 0 for **any** lane.
+  lane touches four files and none is in `SwanSQLiteTests` — so it is
+  pre-existing and unrelated. Worth flagging to the program: **the brief's Linux
+  command cannot currently return 0 for any lane**, so any lane reporting a
+  clean whole-package Linux build should be asked how.
 
-Mechanical notes for whoever repeats this: the local Petrel path dependency must
-be mounted (`-v "$PWD/../Petrel":/Petrel:ro`, because `/src/../Petrel` resolves to
-`/Petrel`); Docker Desktop does not share `/private/tmp` on this machine, so a
-scratchpad mount silently appears empty inside the container; and the Linux build
-rewrites `Package.resolved` (it drops `swift-configuration`), which was restored
-with `jj restore Package.resolved` and is not part of this lane's diff.
+Mechanical notes for whoever repeats this — the Linux command distributed with
+the lane briefs cannot work as written, and four separate things had to be fixed:
+
+1. `Package.swift:25` is `.package(path: "../Petrel")`, outside the bind mount.
+   The dependency has to be mounted too. Mounting the workspace at `/src` makes
+   `/src/../Petrel` resolve to `/Petrel`, so `-v ".../Petrel":/Petrel:ro` is the
+   minimal form.
+2. The stock `swift:6.1-jammy` image lacks `libsecret-1-dev`, `pkg-config`,
+   `libsodium-dev` and `libglib2.0-dev`; without them the build dies in
+   `Petrel/Sources/CLibSecretShim/shim.c:2`.
+3. Docker Desktop on this machine does not share `/private/tmp`. A mount from
+   there appears as an **empty directory** inside the container rather than
+   failing — a snapshot of Petrel mounted that way silently produced
+   "`/Petrel/Package.swift` doesn't exist", and a mounted shell script appeared
+   as a directory. Anything a container must read has to live under `/Users`.
+4. The Linux build rewrites `Package.resolved` (SwiftPM 6.1 drops
+   `swift-configuration`). Restored with `jj restore Package.resolved`; it is
+   not part of this lane's diff. Use `--scratch-path` and never let a Linux
+   container build into `.build` while a macOS `swift test` is running against
+   the same directory.
+
+Containers were named (`--name swan-L4`) so no other lane's
+`docker kill $(docker ps -q --filter ancestor=swift:6.1-jammy)` can take them
+down, and so this lane can never take down another's.
 
 ---
 
@@ -325,5 +450,5 @@ with `jj restore Package.resolved` and is not part of this lane's diff.
   body, and it is now reached slightly earlier by the same callers. It is the
   same shape as F06 on a different route and belongs to L3, not here.
 - **Draining without a lease.** Would remove a deliberate, documented control
-  (`SwanJSONWriteBody.swift:236-239`) and would also change the management
+  (`SwanJSONWriteBody.swift:271-274`) and would also change the management
   listener's behaviour, whose drain path shares the helper.

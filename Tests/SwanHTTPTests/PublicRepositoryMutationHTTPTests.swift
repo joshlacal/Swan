@@ -803,6 +803,51 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// The failure mode an isolated drain pool introduces: the drain can now be
+    /// refused on its own capacity. It must fail fast and terminate the inbound
+    /// stream, never leave a half-read body pinning a listener slot — the
+    /// neighbouring high-severity finding (F05) is about listener slots.
+    func testRejectedDrainRefusalTerminatesIncompleteBodyBoundedly() async throws {
+        let policy = try SwanJSONWriteBodyPolicy(totalBodyTimeout: .seconds(10))
+        let fixture = try await makeFixture(jsonWriteBodyPolicy: policy)
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        var held: [PublicRepositoryJSONWriteLease] = []
+        defer { for lease in held { lease.release() } }
+        while let lease = publicMutationRejectedDrainAdmission.reserve(
+            maximumRequestBytes: 1
+        ) {
+            held.append(lease)
+        }
+        XCTAssertFalse(held.isEmpty)
+
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.drain-refusal")
+        ).test(.live) { client in
+            let started = ContinuousClock().now
+            let response = try await executeRealSocketIncompleteHTTPBody(
+                port: try XCTUnwrap(client.port),
+                path: Self.mutationPath,
+                headers: [.contentType: "application/json"],
+                declaredBodyBytes: 1_024,
+                emittedBody: "{"
+            )
+            // Answered without waiting for the body, far inside the 10-second
+            // body deadline the request would otherwise have owned.
+            XCTAssertLessThan(started.duration(to: .now), .seconds(1))
+            XCTAssertEqual(response.statusCode, 503)
+            XCTAssertEqual(
+                try self.jsonObject(response.body)["error"] as? String,
+                "temporarily_unavailable"
+            )
+        }
+    }
+
     /// F43: the lifecycle state that authorized a 256 MiB stream may be stale
     /// by the time the blob is adopted. Adoption must not be reported as a
     /// usable blob for an account that is no longer active.

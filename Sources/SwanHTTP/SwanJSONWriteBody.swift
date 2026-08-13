@@ -247,6 +247,17 @@ private func requestBodyHeaderFailure(
 /// the write pool so a well-behaved client's rejected command is no more
 /// likely to lose its keep-alive than an accepted one is to be refused; the
 /// byte dimension is inert at one byte per drain.
+///
+/// Saturating *this* pool is bounded and is not a listener-slot leak. A refused
+/// drain terminates the inbound stream and returns immediately (`:275-278`
+/// below): `SwanHTTPRequestContext.jsonWriteBodyTermination`
+/// (`SwanHTTP.swift:45-59`) hands the body to `SwanJSONWriteBodyDrainHandler`,
+/// which discards at the channel level and force-closes 50 ms after the request
+/// deadline (`SwanJSONWriteBodyDrainHandler.swift:79-96`). That is the same
+/// path every pre-lease header rejection on this surface already takes, so the
+/// worst case is a lost keep-alive on a request that had already failed
+/// authorization — never a half-read body holding an accept slot. Pinned by
+/// `testRejectedDrainRefusalTerminatesIncompleteBodyBoundedly`.
 let publicMutationRejectedDrainAdmission = try! PublicRepositoryJSONWriteAdmission(
     maximumConcurrentWrites: 8,
     maximumReservedRequestBytes: 8 * 1_024
