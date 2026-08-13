@@ -42,11 +42,26 @@ public enum PermissionedRemoteReplicaSourceFault: Sendable, Equatable {
 }
 
 /// A live HTTP source for durable permissioned-replica recovery.  The
-/// provider performs the two requests that make a recovery install safe:
-/// first it authenticates the source's current signed commit, then it opens
-/// the CAR stream from the same configured origin and repository.  The
-/// orchestrator still performs the final CAR/context/content-binding checks
-/// before publication.
+/// provider performs two requests: first it fetches and checks the source's
+/// current signed commit, then it opens the CAR stream from the same
+/// configured origin and repository.  The orchestrator still performs the
+/// final CAR/context/content-binding checks before publication.
+///
+/// Scope of the first request.  It yields a *freshness* witness, not an
+/// independent authority.  The witness is fetched from the same configured
+/// origin that then serves the CAR, so it cannot corroborate that origin —
+/// an origin that lies about the CAR can serve a matching lie here.
+///
+/// Scope of the commit checks.  `verifyLatestCommit` authenticates the signed
+/// tuple (space, author, rev, ikm) plus knowledge of the IKM.  It does not
+/// authenticate the content commitment: the commitment is outside
+/// `SpaceCommitCodec.contextSigningBytes`, and the IKM travels in the clear
+/// in the same commit block, so a substituted commitment with a recomputed
+/// MAC passes both checks under the author's original signature.  Exact-
+/// content integrity is delegated to the pinned HTTPS source origin, bounded
+/// downstream by the equivocation / high-water checks in
+/// `SQLitePermissionedRemoteReplicaRecovery`.  See the F02 note in
+/// `SpaceCARCodec.verifyStreamingRecovery` and `docs/threat-boundaries.md`.
 public struct PermissionedRemoteReplicaHTTPSourceProvider:
     PermissionedRemoteReplicaSourceProvider, Sendable
 {

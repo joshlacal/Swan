@@ -302,10 +302,35 @@ extension SpaceCARCodec {
         } catch {
             throw SpaceCARStreamingError.malformedFrame
         }
-        // Do not durably hand attacker-selected roots to staging until the
-        // signed context and deniable content binding have authenticated the
-        // exact commit root. A failed first frame therefore leaves no
-        // provisional root state for cleanup to reason about.
+        // Do not durably hand attacker-selected roots to staging until both
+        // commit checks above have run. A failed first frame therefore leaves
+        // no provisional root state for cleanup to reason about.
+        //
+        // Be precise about what those two checks establish, because it is
+        // strictly less than "the author authorized this exact commit root":
+        //
+        //   * `contextSignatureVerifier` proves the author signed the tuple
+        //     (space, author, rev, ikm) and nothing more. The content
+        //     commitment is NOT among the signed bytes — see
+        //     `SpaceCommitCodec.contextSigningBytes`, which covers only the
+        //     "atproto-space-v1" domain plus those four length-prefixed
+        //     fields.
+        //   * `verifyContentBinding` proves only that whoever produced this
+        //     envelope knew the IKM. The IKM is not a secret on this path: it
+        //     ships in the clear as the `ikm` field of the wire commit block
+        //     (`com.atproto.space.defs#signedCommit`). Any party that can
+        //     serve, relay, or replay that block can therefore substitute a
+        //     different commitment and recompute a valid MAC for it under the
+        //     author's original, untouched signature.
+        //
+        // Exact-content integrity for permissioned repository content is
+        // consequently delegated to the pinned HTTPS source origin, bounded
+        // downstream by the equivocation / high-water checks in
+        // `SQLitePermissionedRemoteReplicaRecovery`. That is a property of the
+        // pinned upstream proposal-0016 trust model, not a Swan defect;
+        // changing it requires an upstream amendment plus a coordinated
+        // re-pin. `StreamingSpaceCARRecoveryTests` pins the substitution as
+        // deliberate, tested behaviour so it is not "fixed" blind.
         try await recordSink?.receiveRoots(
             commit: roots.commit,
             index: roots.index

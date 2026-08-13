@@ -455,6 +455,208 @@ final class StreamingSpaceCARRecoveryTests: XCTestCase {
             XCTAssertEqual(error, .malformedFrame)
         }
     }
+
+    // MARK: - F02: delegated exact-content integrity
+
+    /// This test pins a DELIBERATELY ACCEPTED behaviour. Do not "fix" it.
+    ///
+    /// The pinned proposal-0016 commit envelope signs only the tuple
+    /// `(space, author, rev, ikm)`; the content commitment is outside
+    /// `SpaceCommitCodec.contextSigningBytes`. The commitment is bound only by
+    /// the deniable HMAC content binding, whose key is derived from the IKM —
+    /// and the IKM travels in the clear as the `ikm` field of the wire commit
+    /// block. So any party that can serve or relay that block can swap the
+    /// commitment, recompute the MAC, and leave the author's signature bytes
+    /// untouched, and `verifyStreamingRecovery` will accept the result.
+    ///
+    /// Exact-content integrity for permissioned content is therefore delegated
+    /// to the pinned HTTPS source origin. Changing that is an upstream
+    /// amendment plus a coordinated re-pin, not a Swan-side patch. If this
+    /// test ever starts failing because the verifier rejects the substitution,
+    /// the trust model changed and `docs/threat-boundaries.md` needs updating
+    /// with it.
+    func testStreamingRecoveryAcceptsCommitmentSubstitutionUnderTheOriginalAuthorSignature() async throws {
+        let honest = try StreamingRecoveryFixture(recordByteCount: 4)
+        let substituted = try SubstitutedCommitmentFixture(honest: honest)
+
+        // Nothing the author produced was re-signed: the signature bytes are
+        // byte-identical to the honest envelope's, and the private key is
+        // never used to build the forgery.
+        XCTAssertEqual(
+            substituted.envelope.contextSignature,
+            honest.commit.contextSignature
+        )
+        XCTAssertNotEqual(
+            substituted.envelope.commitment,
+            honest.commit.commitment
+        )
+        XCTAssertNotEqual(
+            substituted.envelope.contentBinding,
+            honest.commit.contentBinding
+        )
+        XCTAssertTrue(try SpaceCommitCodec.verifyContextSignature(
+            substituted.envelope,
+            publicKey: honest.signingKey.publicKey
+        ))
+        XCTAssertTrue(
+            SpaceCommitCodec.verifyContentBinding(substituted.envelope)
+        )
+
+        let index = InMemorySpaceRecoveryIndex()
+        let summary = try await SpaceCARCodec.verifyStreamingRecovery(
+            from: InstrumentedSpaceCARSource(
+                bytes: substituted.car.data,
+                chunkByteCount: 17
+            ),
+            space: honest.space,
+            author: honest.author,
+            contextSignatureVerifier: {
+                try SpaceCommitCodec.verifyContextSignature(
+                    $0,
+                    publicKey: honest.signingKey.publicKey
+                )
+            },
+            index: index,
+            limits: try SpaceCARRecoveryLimits(
+                maximumCARBytes: substituted.car.data.count
+            )
+        )
+
+        // Accepted, with the substituted content, at the author's original
+        // wire revision.
+        XCTAssertEqual(summary.recordCount, 1)
+        XCTAssertEqual(summary.wireRevision.toString(), honest.revision)
+        XCTAssertEqual(summary.commitment, substituted.ltHash.commitment)
+        XCTAssertNotEqual(summary.commitment, honest.ltHash.commitment)
+        XCTAssertEqual(summary.ltHash, substituted.ltHash.serialized)
+        let unconsumedCount = await index.unconsumedCount
+        XCTAssertEqual(unconsumedCount, 0)
+
+        // The pair the publish path actually adjudicates: an unchanged wire
+        // revision carrying a different commitment. That is exactly the
+        // `wireRevision == highWater && commitment != highWaterCommitment`
+        // branch in
+        // `Sources/SwanSQLite/SQLitePermissionedRemoteReplicaRecovery.swift`
+        // (`requireRemoteReplicaHighWater`, lines 1541-1548), which throws
+        // `PermissionedRemoteReplicaRecoveryError.equivocation` and leaves the
+        // installed head untouched. That rejection is proved end-to-end by
+        // `PermissionedRemoteReplicaRecoverySQLiteTests`
+        // (`same-tid-equivocation`), which owns the SQLite harness; this test
+        // owns only the verifier-level property.
+        XCTAssertEqual(summary.wireRevision.toString(), honest.revision)
+        XCTAssertNotEqual(summary.commitment, honest.ltHash.commitment)
+    }
+
+    /// The one thing that does catch the substitution inside the verifier: an
+    /// expected path/CID witness obtained out of band, from somewhere other
+    /// than the origin serving the CAR. Documented so the mitigation is not
+    /// mistaken for a property of the commit envelope.
+    func testStreamingRecoveryRejectsCommitmentSubstitutionWhenAnOutOfBandWitnessIsSupplied() async throws {
+        let honest = try StreamingRecoveryFixture(recordByteCount: 4)
+        let substituted = try SubstitutedCommitmentFixture(honest: honest)
+
+        do {
+            _ = try await SpaceCARCodec.verifyStreamingRecovery(
+                from: InstrumentedSpaceCARSource(
+                    bytes: substituted.car.data,
+                    chunkByteCount: 17
+                ),
+                space: honest.space,
+                author: honest.author,
+                contextSignatureVerifier: {
+                    try SpaceCommitCodec.verifyContextSignature(
+                        $0,
+                        publicKey: honest.signingKey.publicKey
+                    )
+                },
+                index: InMemorySpaceRecoveryIndex(),
+                expectedEntries: [
+                    SpaceCARRecoveryIndexEntry(
+                        path: "app.bsky.feed.post/only",
+                        cid: honest.recordCID
+                    ),
+                ],
+                limits: try SpaceCARRecoveryLimits(
+                    maximumCARBytes: substituted.car.data.count
+                )
+            )
+            XCTFail("substituted content passed an out-of-band CID witness")
+        } catch let error as SpaceCARStreamingError {
+            XCTAssertEqual(error, .expectedWitnessMismatch)
+        }
+    }
+}
+
+/// Builds the commitment-substituted envelope for the F02 tests using only
+/// material a CAR-serving origin already possesses: the honest envelope's
+/// verbatim signature bytes and the cleartext IKM from the same commit block.
+/// The author's private key is deliberately not used.
+private struct SubstitutedCommitmentFixture {
+    let recordValue: Data
+    let recordCID: CID
+    let ltHash: LtHash
+    let envelope: SpaceCommitEnvelope
+    let car: SpaceCAR
+
+    init(honest: StreamingRecoveryFixture) throws {
+        recordValue = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "data", value: Data("substituted by the CAR origin".utf8)),
+        ]))
+        recordCID = CID.fromDAGCBOR(recordValue)
+        var calculated = LtHash()
+        calculated.add(element: "app.bsky.feed.post/only/\(recordCID.string)")
+        ltHash = calculated
+
+        let context = honest.commit.context
+        envelope = SpaceCommitEnvelope(
+            context: context,
+            contextSignature: honest.commit.contextSignature,
+            contentBinding: Self.recomputedContentBinding(
+                context: try SpaceCommitCodec.contextSigningBytes(context),
+                ikm: context.ikm,
+                commitment: calculated.commitment
+            ),
+            commitment: calculated.commitment
+        )
+        car = try SpaceCARCodec.encode(
+            commit: envelope,
+            records: [
+                SpaceRecord(
+                    uri: try SpaceRecordURI(
+                        space: honest.space,
+                        author: honest.author,
+                        collection: "app.bsky.feed.post",
+                        rkey: "only"
+                    ),
+                    value: recordValue,
+                    cid: recordCID.string,
+                    revision: 1
+                ),
+            ]
+        )
+    }
+
+    /// The pinned one-block HKDF-Expand construction from RFC 5869, restated
+    /// here rather than called through production code: the point of the test
+    /// is that an outsider can reproduce it from the public envelope alone.
+    private static func recomputedContentBinding(
+        context: Data,
+        ikm: Data,
+        commitment: Data
+    ) -> Data {
+        var expandInput = context
+        expandInput.append(0x01)
+        let derived = SymmetricKey(data: Data(
+            HMAC<SHA256>.authenticationCode(
+                for: expandInput,
+                using: SymmetricKey(data: ikm)
+            )
+        ))
+        return Data(HMAC<SHA256>.authenticationCode(
+            for: commitment,
+            using: derived
+        ))
+    }
 }
 
 private struct StreamingRecoveryFixture {
