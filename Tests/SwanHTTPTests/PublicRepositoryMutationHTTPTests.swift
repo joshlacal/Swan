@@ -666,6 +666,198 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(admission.snapshot.reservedBytes, 0)
     }
 
+    /// An anonymous JSON command must be refused on its headers alone. The
+    /// write pool is deliberately exhausted here: a 503 would prove the body
+    /// was admitted — and a lease reserved — before authorization ran.
+    func testUnauthenticatedJSONMutationIsDeniedWithoutReservingAWriteLease() async throws {
+        let maximum = 1_000_000
+        let admission = try PublicRepositoryJSONWriteAdmission(
+            maximumConcurrentWrites: 1,
+            maximumReservedRequestBytes: maximum
+        )
+        let fixture = try await makeFixture(jsonWriteAdmission: admission)
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let held = try XCTUnwrap(admission.reserve(maximumRequestBytes: maximum))
+        defer { held.release() }
+
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.anonymous-no-lease")
+        ).test(.router) { client in
+            let response = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(string: self.putBody(rkey: "anonymous", text: "no-lease"))
+            )
+            XCTAssertEqual(
+                response.status,
+                .unauthorized,
+                String(decoding: response.body.readableBytesView, as: UTF8.self)
+            )
+        }
+    }
+
+    /// The finding that matters: unauthenticated slow bodies must not be able
+    /// to deny an authenticated write. The write pool admits two concurrent
+    /// commands and two anonymous bodies are in flight, so a pre-authorization
+    /// reservation makes the authenticated command fail.
+    func testAuthenticatedWriteSucceedsWhileUnauthenticatedSlowBodiesAreInFlight() async throws {
+        let maximum = 1_000_000
+        let admission = try PublicRepositoryJSONWriteAdmission(
+            maximumConcurrentWrites: 2,
+            maximumReservedRequestBytes: 2 * maximum
+        )
+        let policy = try SwanJSONWriteBodyPolicy(totalBodyTimeout: .seconds(10))
+        let fixture = try await makeFixture(
+            jsonWriteAdmission: admission,
+            jsonWriteBodyPolicy: policy
+        )
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.anonymous-starvation")
+        ).test(.live) { client in
+            let port = try XCTUnwrap(client.port)
+            var anonymous: [Channel] = []
+            defer { for channel in anonymous { channel.close(mode: .all, promise: nil) } }
+            for _ in 0 ..< 2 {
+                anonymous.append(try await self.openAnonymousSlowJSONBody(
+                    port: port,
+                    path: Self.mutationPath,
+                    declaredBodyBytes: maximum
+                ))
+            }
+            try await self.waitUntilBodiesAreInFlight(
+                count: 2,
+                write: admission,
+                drain: publicMutationRejectedDrainAdmission
+            )
+
+            XCTAssertEqual(
+                admission.snapshot,
+                .init(activeLeases: 0, reservedRequestBytes: 0),
+                "anonymous bodies must not hold the shared JSON write pool"
+            )
+            let authenticated = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "authenticated-during-anonymous",
+                    method: "POST",
+                    path: Self.mutationPath
+                ),
+                body: ByteBuffer(string: self.putBody(
+                    rkey: "authenticated-during-anonymous",
+                    text: "admitted"
+                ))
+            )
+            XCTAssertEqual(
+                authenticated.status,
+                .ok,
+                String(decoding: authenticated.body.readableBytesView, as: UTF8.self)
+            )
+        }
+    }
+
+    /// Hoisting authorization must not turn a well-behaved client's rejected
+    /// command into a connection reset. Same contract `uploadBlob` already
+    /// keeps for a complete body with invalid credentials.
+    func testInvalidAuthJSONMutationCompleteBodyPreservesKeepAliveForNextRequest() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.invalid-auth-keepalive")
+        ).test(.live) { client in
+            var headers: HTTPFields = [.contentType: "application/json"]
+            headers[.authorization] = "DPoP invalid"
+            let responses = try await executeMutationThenHealthOnSameConnection(
+                port: try XCTUnwrap(client.port),
+                path: Self.mutationPath,
+                headers: headers,
+                body: self.putBody(rkey: "invalid-auth-keepalive", text: "rejected")
+            )
+            XCTAssertEqual(responses.first.statusCode, 401)
+            XCTAssertEqual(responses.next.statusCode, 200)
+            XCTAssertEqual(
+                String(decoding: responses.next.body.readableBytesView, as: UTF8.self),
+                "OK"
+            )
+        }
+    }
+
+    /// F43: the lifecycle state that authorized a 256 MiB stream may be stale
+    /// by the time the blob is adopted. Adoption must not be reported as a
+    /// usable blob for an account that is no longer active.
+    func testUploadBlobRefusesAdoptionWhenAccountDeactivatesDuringStream() async throws {
+        let fixture = try await makeFixture(
+            mutationStatusSequence: [.active, .deactivated]
+        )
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.upload-deactivation-race")
+        ).test(.router) { client in
+            var headers = try fixture.headers(
+                jti: "upload-deactivation-race",
+                method: "POST",
+                path: Self.uploadPath
+            )
+            headers[.contentType] = "application/octet-stream"
+            let response = try await client.execute(
+                uri: Self.uploadPath,
+                method: .post,
+                headers: headers,
+                body: ByteBuffer(data: Data("raced-upload".utf8))
+            )
+            XCTAssertEqual(
+                response.status,
+                .notFound,
+                String(decoding: response.body.readableBytesView, as: UTF8.self)
+            )
+            XCTAssertEqual(
+                try self.jsonObject(response.body)["error"] as? String,
+                "RepoNotFound"
+            )
+        }
+
+        // Known residual, deliberately pinned rather than papered over: the
+        // adopted bytes stay. `remove` is not reference-counted per upload, so
+        // deleting the public reference here would also destroy an identical
+        // blob an earlier record already published. See the L4 lane report.
+        let connection = try await SQLiteConnection.open(storage: .file(
+            path: SQLiteLayout.accountDatabase(in: fixture.root, did: Self.did).path
+        ))
+        let rows = try await connection.query(
+            "SELECT COUNT(*) AS count FROM blob_namespace_references"
+        )
+        XCTAssertEqual(rows.first?.column("count")?.integer, 1)
+        try await connection.close()
+    }
+
     func testExplicitRKeyPutDeleteNoOpAndSwapSemantics() async throws {
         let fixture = try await makeFixture()
         defer {
@@ -963,11 +1155,49 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// Opens one anonymous command connection and leaves its declared body
+    /// unfinished. The channel is returned so the caller controls exactly how
+    /// long the server keeps the request open.
+    private func openAnonymousSlowJSONBody(
+        port: Int,
+        path: String,
+        declaredBodyBytes: Int
+    ) async throws -> Channel {
+        let channel = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
+            .connectTimeout(.seconds(2))
+            .connect(host: "localhost", port: port)
+            .get()
+        var head = "POST \(path) HTTP/1.1\r\n"
+        head += "host: 127.0.0.1:\(port)\r\n"
+        head += "content-type: application/json\r\n"
+        head += "content-length: \(declaredBodyBytes)\r\n\r\n"
+        try await channel.writeAndFlush(ByteBuffer(string: head + "{")).get()
+        return channel
+    }
+
+    /// Waits on a condition that holds both before and after the ordering fix:
+    /// the bodies are owned by *some* admission pool. Which pool is the
+    /// assertion, so it must not also be the readiness signal.
+    private func waitUntilBodiesAreInFlight(
+        count: Int,
+        write: PublicRepositoryJSONWriteAdmission,
+        drain: PublicRepositoryJSONWriteAdmission
+    ) async throws {
+        let deadline = ContinuousClock().now.advanced(by: .seconds(5))
+        while ContinuousClock().now < deadline {
+            let inFlight = write.snapshot.activeLeases + drain.snapshot.activeLeases
+            if inFlight >= count { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("anonymous bodies never reached an admission pool")
+    }
+
     private func makeFixture(
         includePublicBlobSpoolAdmission: Bool = true,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
         jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil,
         mutationBarrier: MutationTargetBarrier? = nil,
+        mutationStatusSequence: [AccountControlStatus] = [],
         blobQuota: AccountBlobQuota = .conservative
     ) async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
@@ -1005,7 +1235,8 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
             let directory = TestMutationDirectory(
                 did: Self.did,
                 database: database,
-                barrier: mutationBarrier
+                barrier: mutationBarrier,
+                statusSequence: mutationStatusSequence
             )
             let publicBlobSpoolAdmission = try PublicRepositorySpoolAdmission()
             let server = try makeServer(
@@ -1405,15 +1636,22 @@ private actor TestMutationDirectory:
     let did: String
     let database: SQLiteAccountDatabase
     let barrier: MutationTargetBarrier?
+    /// Consumed one entry per resolution, so a test can model a lifecycle
+    /// transition landing between an authorization preflight and a later
+    /// re-resolution. Exhausted or empty means "active", which is what every
+    /// test that does not care about lifecycle races expects.
+    private var statusSequence: [AccountControlStatus]
 
     init(
         did: String,
         database: SQLiteAccountDatabase,
-        barrier: MutationTargetBarrier? = nil
+        barrier: MutationTargetBarrier? = nil,
+        statusSequence: [AccountControlStatus] = []
     ) {
         self.did = did
         self.database = database
         self.barrier = barrier
+        self.statusSequence = statusSequence
     }
 
     func publicRepositoryMutationTarget(selector: String) async throws -> PublicRepositoryMutationTarget? {
@@ -1421,9 +1659,12 @@ private actor TestMutationDirectory:
         if let barrier {
             try await barrier.arriveAndWait()
         }
+        let status: AccountControlStatus = statusSequence.isEmpty
+            ? .active
+            : statusSequence.removeFirst()
         return try PublicRepositoryMutationTarget(
             did: did,
-            status: .active,
+            status: status,
             store: database
         )
     }
@@ -1624,13 +1865,27 @@ func executeUploadThenHealthOnSameConnection(
     headers: HTTPFields,
     body: String
 ) async throws -> (first: RealSocketDripResponse, next: RealSocketDripResponse) {
+    try await executeMutationThenHealthOnSameConnection(
+        port: port,
+        path: "/xrpc/com.atproto.repo.uploadBlob",
+        headers: headers,
+        body: body
+    )
+}
+
+func executeMutationThenHealthOnSameConnection(
+    port: Int,
+    path: String,
+    headers: HTTPFields,
+    body: String
+) async throws -> (first: RealSocketDripResponse, next: RealSocketDripResponse) {
     let channel = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
         .connectTimeout(.seconds(2)).connect(host: "localhost", port: port).get()
     let asyncChannel = try await channel.eventLoop.submit {
         try NIOAsyncChannel<ByteBuffer, ByteBuffer>(wrappingChannelSynchronously: channel)
     }.get()
     return try await asyncChannel.executeThenClose { inbound, outbound in
-        var head = "POST /xrpc/com.atproto.repo.uploadBlob HTTP/1.1\r\n"
+        var head = "POST \(path) HTTP/1.1\r\n"
         for field in headers { head += "\(field.name.canonicalName): \(field.value)\r\n" }
         head += "host: 127.0.0.1:\(port)\r\ncontent-length: \(body.utf8.count)\r\n\r\n"
         try await outbound.write(ByteBuffer(string: head + body))

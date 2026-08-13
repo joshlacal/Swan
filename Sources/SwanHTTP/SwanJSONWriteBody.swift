@@ -227,6 +227,31 @@ private func requestBodyHeaderFailure(
     }
 }
 
+/// Separate capacity for draining request bodies the public write surface has
+/// already refused.
+///
+/// A drain reserves one byte, but it still occupies one of the eight
+/// concurrency slots on ``PublicRepositoryJSONWriteAdmission/processShared``
+/// until the body ends or the route deadline fires. Refusing an anonymous
+/// command before it can reserve a *write* lease therefore does not, on its
+/// own, keep anonymous traffic out of the pool: eight refused slow bodies
+/// would take the same eight slots on the way out that they used to take on
+/// the way in, and `processShared` also serves the AppView pipethrough and
+/// every authenticated space, account-email, and preferences command.
+///
+/// This mirrors the decision the loopback management listener already
+/// documents for the identical shape at
+/// ``PublicRepositoryJSONWriteAdmission/managementRejectedProcessShared``: an
+/// unauthenticated slow body may consume the drain pool, but it must never
+/// reserve the pool used after authorization succeeds. Concurrency is sized to
+/// the write pool so a well-behaved client's rejected command is no more
+/// likely to lose its keep-alive than an accepted one is to be refused; the
+/// byte dimension is inert at one byte per drain.
+let publicMutationRejectedDrainAdmission = try! PublicRepositoryJSONWriteAdmission(
+    maximumConcurrentWrites: 8,
+    maximumReservedRequestBytes: 8 * 1_024
+)
+
 func drainRejectedRequestBody(
     _ request: Request,
     admission: PublicRepositoryJSONWriteAdmission,
