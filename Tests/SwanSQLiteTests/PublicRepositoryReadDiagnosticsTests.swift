@@ -67,6 +67,7 @@ final class PublicRepositoryReadDiagnosticsTests: XCTestCase {
             "repositoryStateMismatch",
             "repositoryStateMissing",
             "generationIdentityMismatch",
+            "generationPublishSuperseded",
             "directoryClosed",
             "accountNotPreopened",
             "accountNotActive",

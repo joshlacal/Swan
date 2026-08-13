@@ -72,6 +72,18 @@ public enum PublicReadUnavailableReason: String, Sendable, Equatable, CaseIterab
     /// The pinned control account, DID, status, or verification identity no
     /// longer matches the generation that was admitted.
     case generationIdentityMismatch
+    /// Another publisher invalidated this account's cached generation while
+    /// this admission was in flight, so the generation it computed describes a
+    /// snapshot that is no longer the newest one anybody has seen. It was
+    /// discarded rather than published.
+    ///
+    /// This is a race report, not a verdict: the admission itself verified
+    /// everything it was asked to verify, and it refuses only because
+    /// publishing would overwrite a strictly fresher answer — or refill a
+    /// cache entry a committed write had just evicted, which is how a stale
+    /// pin becomes a permanent ``repositoryStateMismatch`` for the whole
+    /// account. See `SQLitePreMigratedAccountDirectory`'s publish sequence.
+    case generationPublishSuperseded
 
     // MARK: Directory lifecycle
 
@@ -142,15 +154,24 @@ extension PublicReadUnavailableReason {
     /// Whether this reason is *change detection* — a report that something
     /// committed — rather than a verdict on the account.
     ///
-    /// Exactly one guard qualifies, and the distinction is the whole of the
-    /// 2026-08-12 fix. `PRAGMA data_version` is monotonic, advances on any
-    /// commit from any other connection to any table in the account database
-    /// including one that touches no repository state at all, and never returns
-    /// to its prior value. It can therefore only ever say that *something*
-    /// committed — never that the repository stopped being valid.
+    /// Two guards qualify, and the distinction is the whole of the 2026-08-12
+    /// fix. `PRAGMA data_version` is monotonic, advances on any commit from
+    /// any other connection to any table in the account database including one
+    /// that touches no repository state at all, and never returns to its prior
+    /// value. It can therefore only ever say that *something* committed — never
+    /// that the repository stopped being valid.
     /// ``fileIdentityMismatch`` and ``repositoryStateMismatch`` keep their
     /// meaning: a swapped database file and a moved head are real
     /// disagreements with the pinned generation, and neither is listed here.
+    ///
+    /// ``generationPublishSuperseded`` joins it for the same reason and must
+    /// stay joined. It reports that a *concurrent publisher* moved the cache
+    /// while this admission ran, which is a statement about scheduling and not
+    /// about the account: the losing admission verified everything and refused
+    /// only to avoid overwriting a fresher answer. Recording it as an account
+    /// failure would let one lost race suppress admissions for the whole
+    /// backoff window — a publish race turned into a small outage, which is the
+    /// precise inversion the paragraph below forbids.
     ///
     /// Two call sites in `SQLitePreMigratedAccountDirectory` consume this and
     /// have to agree, which is why it is one property rather than a literal
@@ -165,7 +186,7 @@ extension PublicReadUnavailableReason {
     /// deliberately rather than inheriting an answer from a `default`.
     public var isChangeDetection: Bool {
         switch self {
-        case .generationPinStale:
+        case .generationPinStale, .generationPublishSuperseded:
             true
         case .identityRowCount,
              .identityStageNotSubmitted,

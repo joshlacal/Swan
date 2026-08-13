@@ -703,6 +703,169 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
         )
     }
 
+    /// An admission suspended across a durable commit must lose its publish
+    /// rather than refill the cache with the pre-commit head.
+    ///
+    /// Nothing else in this file has two publishers in flight at once, and the
+    /// wedge needs exactly that. A reader's re-admission completes its database
+    /// snapshot and then suspends — really, at the control-store round trip in
+    /// `verifyPublicIdentityIntent`; here, at the barrier that stands in for
+    /// it. A write commits underneath it and republishes. The reader then
+    /// resumes and passes every guard the admission has, because not one of
+    /// them looks at `public_repository_state`: the directory is open, the
+    /// database is the same object, the control row is untouched by a
+    /// repository write, the status is active, the file is where it was. And
+    /// the commit was made on the directory's own connection, which `PRAGMA
+    /// data_version` never reports, so the pin the rest of this file is about
+    /// does not move either.
+    ///
+    /// Publishing there is the outage's shape through a third door, and the
+    /// worst one. `activePublicReadContext` compares only the control account,
+    /// so every following read hits that cached generation and fails the state
+    /// pin with ``PublicReadUnavailableReason/repositoryStateMismatch`` — which
+    /// is not change detection, so it is not retried, not evicted and not
+    /// negative-cached. The account serves `503` until the next successful
+    /// write or a process restart.
+    ///
+    /// The rendezvous makes the interleaving exact rather than probable: the
+    /// writer does not start until the reader has parked, and the reader does
+    /// not resume until the writer's refresh has published.
+    func testAdmissionSuspendedAcrossACommitDoesNotRefillTheCache()
+        async throws
+    {
+        let fixture = try await makeFixture()
+
+        let warm = try await fixture.directory.publicRepositoryStatus(
+            selector: did
+        )
+        XCTAssertEqual(warm?.revision, fixture.revision)
+
+        // Drift the pin from a second connection so the reader below must
+        // re-admit rather than answer from cache. That re-admission is the
+        // publisher the commit has to invalidate.
+        try await commitFromSecondConnection(root: fixture.root)
+
+        let rendezvous = PublishRendezvous()
+        await fixture.directory.setPublicReadPublishBarrier {
+            await rendezvous.hold()
+        }
+
+        let directory = fixture.directory
+        let selector = did
+        let baseline = fixture.verifier.admissionCount
+        let reader = Task { () -> PublicRepositoryReadError? in
+            do {
+                _ = try await directory.publicRepositoryStatus(
+                    selector: selector
+                )
+                return nil
+            } catch let error as PublicRepositoryReadError {
+                return error
+            }
+        }
+        await rendezvous.waitForArrival()
+        XCTAssertEqual(
+            fixture.verifier.admissionCount - baseline,
+            1,
+            "precondition: the parked publisher must be a real admission that "
+                + "has already taken its snapshot"
+        )
+
+        // The write commits and republishes while the reader is parked. Its
+        // refresh passes the barrier straight through — only the first arrival
+        // is held.
+        let committed: CommittedPublicRepositoryMutation
+        do {
+            committed = try await applyOneRecord(
+                fixture, recordKey: "late-publish"
+            )
+        } catch {
+            await rendezvous.release()
+            _ = try? await reader.value
+            throw error
+        }
+        let writersGeneration = await fixture.directory
+            .cachedPublicReadGenerationID(did: did)
+        XCTAssertNotNil(
+            writersGeneration,
+            "precondition: the post-mutation refresh must have published"
+        )
+
+        await rendezvous.release()
+        let readerRefusal = try await reader.value
+
+        // The losing publisher declines, and says so as a race rather than as
+        // a verdict on the account.
+        XCTAssertEqual(
+            readerRefusal?.unavailableReason,
+            .generationPublishSuperseded,
+            "an admission whose snapshot was invalidated mid-flight must "
+                + "refuse to publish"
+        )
+        XCTAssertTrue(
+            PublicReadUnavailableReason.generationPublishSuperseded
+                .isChangeDetection,
+            "the refusal reports a lost race, so it must never be recorded "
+                + "against the account"
+        )
+        let backoff = await fixture.directory
+            .hasLivePublicReadReadmissionBackoff(did: did)
+        XCTAssertFalse(
+            backoff,
+            "a lost publish race must not open a backoff window — asserted "
+                + "before the reads below, so their success cannot be the "
+                + "window merely expiring"
+        )
+
+        // The cache still holds what the writer published, not what the reader
+        // computed before the commit.
+        let cached = await fixture.directory.cachedPublicReadGenerationID(
+            did: did
+        )
+        XCTAssertEqual(
+            cached,
+            writersGeneration,
+            "the superseded admission must not have overwritten the fresher "
+                + "generation"
+        )
+
+        // And the account is not wedged: repeated reads keep serving the state
+        // the commit installed. One read could pass on a re-admission; several
+        // in a row cannot, because a refilled cache refuses permanently.
+        for attempt in 0 ..< 4 {
+            let status = try await fixture.directory.publicRepositoryStatus(
+                selector: did
+            )
+            XCTAssertEqual(
+                status?.revision,
+                committed.state.revision,
+                "read \(attempt) after the race must serve the committed state"
+            )
+        }
+        // The state pin is shared by every generation-validated read shape, so
+        // a refilled cache would wedge all of them and not just status.
+        let described = try await fixture.directory.describePublicRepository(
+            selector: did
+        )
+        XCTAssertEqual(described?.state.revision, committed.state.revision)
+        let page = try await fixture.directory.publicRepositoryRecordsOutcome(
+            selector: did,
+            collection: "app.bsky.feed.post",
+            limit: 10,
+            cursor: nil,
+            reverse: false
+        )
+        guard case .active = page else {
+            XCTFail("listRecords must not be wedged by the superseded publish")
+            return
+        }
+        let car = try await fixture.directory.publicRepositoryCAR(selector: did)
+        let spool = try XCTUnwrap(
+            car?.spool, "getRepo must not be wedged by the superseded publish"
+        )
+        spool.cleanup()
+    }
+
     /// Eviction must not open a hole in the backoff.
     ///
     /// The post-mutation eviction created a state nothing else in this file
@@ -1213,6 +1376,55 @@ final class PublicRepositoryReadStaleGenerationTests: XCTestCase {
             revision: revision,
             signingKey: key
         )
+    }
+}
+
+/// Holds the *first* publisher to reach the publish barrier and lets every
+/// later one straight through.
+///
+/// The race under test is an ordering, not a timing, so it is expressed as one:
+/// the writer does not begin until `waitForArrival()` has returned, and the
+/// held reader does not resume until `release()` has been called. No sleep is
+/// involved, and there is no interleaving in which the test passes for the
+/// wrong reason — a reader that never parked fails the admission-count
+/// precondition instead of racing the writer.
+///
+/// One-shot on purpose. The barrier is awaited by every call to
+/// `refreshPublicReadGeneration`, so a rendezvous that held all of them would
+/// deadlock on the writer's own post-mutation refresh.
+private actor PublishRendezvous {
+    private var hasArrived = false
+    private var isReleased = false
+    private var arrivalWaiter: CheckedContinuation<Void, Never>?
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    /// Called from the barrier itself.
+    func hold() async {
+        guard !hasArrived else { return }
+        hasArrived = true
+        arrivalWaiter?.resume()
+        arrivalWaiter = nil
+        guard !isReleased else { return }
+        // No suspension between the flag above and this continuation, so
+        // `release()` cannot land in the gap and be lost.
+        await withCheckedContinuation { continuation in
+            releaseWaiter = continuation
+        }
+    }
+
+    /// Returns once a publisher is parked.
+    func waitForArrival() async {
+        guard !hasArrived else { return }
+        await withCheckedContinuation { continuation in
+            arrivalWaiter = continuation
+        }
+    }
+
+    func release() {
+        guard !isReleased else { return }
+        isReleased = true
+        releaseWaiter?.resume()
+        releaseWaiter = nil
     }
 }
 

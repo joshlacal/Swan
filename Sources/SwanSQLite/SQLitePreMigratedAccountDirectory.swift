@@ -36,6 +36,26 @@ public actor SQLitePreMigratedAccountDirectory:
     private var databases: [String: SQLiteAccountDatabase]
     private var publicReadGenerations:
         [String: SQLiteVerifiedPublicRepositoryGeneration]
+    /// How many times this DID's cached public-read generation has been
+    /// invalidated: once per publish, once per eviction, and once per durable
+    /// repository commit. Monotonic per DID and never reset.
+    ///
+    /// A generation carries only a `UUID`, so two generations cannot be
+    /// ordered against each other and "is what I computed still the newest
+    /// snapshot anybody has seen?" has no answer from the generation alone.
+    /// This counter is that answer. Every admission samples it before it looks
+    /// at the database and re-reads it in the same actor turn that publishes;
+    /// a value that moved in between means some other publisher, evictor, or
+    /// commit invalidated the snapshot this admission was computed against, and
+    /// the admission discards its result rather than installing it. See
+    /// ``refreshPublicReadGeneration(account:database:)``.
+    ///
+    /// Per DID rather than directory-wide on purpose: a publish for one
+    /// account must not cost every other account's in-flight admission its
+    /// publish. Keyed by DIDs that are already active and startup-preopened,
+    /// so it is bounded by hosted accounts rather than by anonymous input —
+    /// the same bound ``publicReadReadmissionFailures`` argues for itself.
+    private var publicReadGenerationPublishSequence: [String: UInt64] = [:]
     private var permanentlyRevokedDIDs: Set<String> = []
     private var drainingDatabases: [String: SQLiteAccountDatabase] = [:]
     /// At most one in-flight public-read re-admission per DID. A foreign
@@ -462,7 +482,15 @@ public actor SQLitePreMigratedAccountDirectory:
             return
         }
         databases[did] = database
-        publicReadGenerations[did] = publicGeneration
+        // Both arms move the publish sequence: installing a transferred
+        // database replaces this DID's read answer just as a refresh does, and
+        // an admission still in flight against the pre-transfer database must
+        // not be allowed to publish over it.
+        if let publicGeneration {
+            publishPublicReadGeneration(publicGeneration, did: did)
+        } else {
+            evictPublicReadGeneration(did: did)
+        }
     }
 
     // MARK: Authenticated simple-space lifecycle
@@ -1071,7 +1099,7 @@ public actor SQLitePreMigratedAccountDirectory:
             )
         }
         permanentlyRevokedDIDs.insert(did)
-        publicReadGenerations.removeValue(forKey: did)
+        evictPublicReadGeneration(did: did)
         // Drop the shared re-admission handle rather than cancelling it: the
         // task's own post-await guards already refuse to publish a generation
         // once this DID leaves `databases`, and cancelling a live SQLite query
@@ -1108,6 +1136,9 @@ public actor SQLitePreMigratedAccountDirectory:
         let opened = Array(databases.values) + Array(drainingDatabases.values)
         databases.removeAll()
         drainingDatabases.removeAll()
+        for did in publicReadGenerations.keys {
+            advancePublicReadPublishSequence(did: did)
+        }
         publicReadGenerations.removeAll()
         publicReadReadmissions.removeAll()
         publicReadReadmissionFailures.removeAll()
@@ -1524,6 +1555,17 @@ public actor SQLitePreMigratedAccountDirectory:
         did: String,
         database: SQLiteAccountDatabase
     ) async {
+        // The commit this refresh follows is already durable, so every
+        // generation admitted against a snapshot taken before this line is
+        // stale — including one whose admission is suspended mid-flight right
+        // now, on some reader's re-admission. Recording the invalidation here,
+        // before the first suspension of this method, is what makes such an
+        // admission lose its publish rather than refill the cache this method
+        // is about to correct or evict. Without it the eviction below is
+        // undone the instant the suspended admission resumes, and the account
+        // is pinned to a pre-commit `public_repository_state` — a permanent
+        // `.repositoryStateMismatch`, the 2026-08-12 outage's shape again.
+        advancePublicReadPublishSequence(did: did)
         do {
             let resolved: AccountControlAccount?
             do {
@@ -1549,9 +1591,9 @@ public actor SQLitePreMigratedAccountDirectory:
             // cancelled refresh is not evidence that this account cannot be
             // admitted, so the generation is still retired — it is stale
             // either way — but nothing is journalled as a refusal.
-            publicReadGenerations.removeValue(forKey: did)
+            evictPublicReadGeneration(did: did)
         } catch {
-            publicReadGenerations.removeValue(forKey: did)
+            evictPublicReadGeneration(did: did)
             logPublicReadAdmissionFailure(
                 .unavailable(reason: .postMutationRefreshFailed),
                 did: did
@@ -1687,7 +1729,11 @@ public actor SQLitePreMigratedAccountDirectory:
     ///
     /// A reason earns a second attempt exactly when it is change detection —
     /// ``PublicReadUnavailableReason/isChangeDetection``, which is
-    /// `.generationPinStale` and nothing else. Every other refusal — identity,
+    /// `.generationPinStale` and `.generationPublishSuperseded` and nothing
+    /// else. The second cannot reach the retry from here — an admission that
+    /// refuses to publish throws out of `readmitPublicReadGeneration` below,
+    /// which is already the second attempt's own admission and not an
+    /// `attempt` — so the bound is unchanged. Every other refusal — identity,
     /// projection, control row, corruption — propagates from the first attempt
     /// untouched, so re-admission can never launder a real failure into a
     /// success or into a different reason. The same property gates
@@ -1916,6 +1962,64 @@ public actor SQLitePreMigratedAccountDirectory:
         )
     }
 
+    // MARK: Publish sequencing
+
+    /// The value an in-flight admission must still see when it publishes.
+    private func publicReadPublishSequence(did: String) -> UInt64 {
+        publicReadGenerationPublishSequence[did] ?? 0
+    }
+
+    /// Installs a verified generation as the answer to this DID's reads and
+    /// records the installation, so an admission still in flight against an
+    /// older snapshot loses its own publish rather than overwriting this one.
+    private func publishPublicReadGeneration(
+        _ generation: SQLiteVerifiedPublicRepositoryGeneration,
+        did: String
+    ) {
+        publicReadGenerations[did] = generation
+        advancePublicReadPublishSequence(did: did)
+    }
+
+    /// Drops this DID's cached generation and records the drop.
+    ///
+    /// Recording it is the load-bearing half. An eviction that did not move
+    /// the sequence could be silently undone by an admission that started
+    /// before it and resumed after it — which is how a committed write's
+    /// correct eviction gets refilled with the pre-commit generation.
+    private func evictPublicReadGeneration(did: String) {
+        publicReadGenerations.removeValue(forKey: did)
+        advancePublicReadPublishSequence(did: did)
+    }
+
+    /// Wrapping is deliberate and harmless. A `UInt64` counting cache
+    /// invalidations cannot realistically reach its bound, and the guard that
+    /// reads it compares for equality rather than for order, so even a wrap
+    /// would have to land back on exactly the sampled value to matter.
+    private func advancePublicReadPublishSequence(did: String) {
+        publicReadGenerationPublishSequence[did] =
+            publicReadPublishSequence(did: did) &+ 1
+    }
+
+    /// Test seam: awaited by ``refreshPublicReadGeneration(account:database:)``
+    /// immediately after the admission and before the intent verification, so
+    /// a test can hold one publisher at the exact point the live interleaving
+    /// holds it — after the database snapshot, before the publish.
+    ///
+    /// `nil` in every production configuration; there is no way to set it from
+    /// outside this module. It stands in for the control-store round trip in
+    /// `verifyPublicIdentityIntent`, which is where a publisher really does
+    /// suspend, and exists because that suspension cannot otherwise be placed
+    /// deterministically: the fixtures drive a real `SQLiteControlDatabase`.
+    private var publicReadPublishBarrier: (@Sendable () async -> Void)?
+
+    /// Test seam: installs (or clears) ``publicReadPublishBarrier``.
+    /// Never called by production code.
+    func setPublicReadPublishBarrier(
+        _ barrier: (@Sendable () async -> Void)?
+    ) {
+        publicReadPublishBarrier = barrier
+    }
+
     /// Re-admits the existing account database when the control row changed
     /// after bootstrap (for example, deactivation followed by reactivation).
     /// This is deliberately request-time refresh only: it never opens,
@@ -1926,6 +2030,10 @@ public actor SQLitePreMigratedAccountDirectory:
         account: AccountControlAccount,
         database: SQLiteAccountDatabase
     ) async throws -> SQLiteVerifiedPublicRepositoryGeneration {
+        // Sampled before this method looks at the database, so the snapshot
+        // the admission below reads is never older than this value. The
+        // symmetric re-read sits in the publishing turn at the bottom.
+        let admittedAtSequence = publicReadPublishSequence(did: account.did)
         do {
             // This is the guard on the exact path that failed live for three
             // hours. Four unrelated conditions shared one name until
@@ -1970,6 +2078,7 @@ public actor SQLitePreMigratedAccountDirectory:
                 account: account,
                 identityVerifier: identityVerifier
             )
+            await publicReadPublishBarrier?()
             try await Self.verifyPublicIdentityIntent(
                 generation.description,
                 controlStore: controlStore
@@ -1998,7 +2107,54 @@ public actor SQLitePreMigratedAccountDirectory:
             try Self.requireExistingRegularDatabase(
                 SQLiteLayout.accountDatabase(in: dataDirectory, did: account.did)
             )
-            publicReadGenerations[account.did] = generation
+            // The last guard, and the only one that is about *other*
+            // publishers rather than about this account.
+            //
+            // Every guard above re-checks something this admission read: the
+            // directory, the database identity, the control row, the status,
+            // the file. None of them looks at `public_repository_state`, and
+            // none of them can — a repository commit moves that row without
+            // touching anything they inspect, and (committed on this same
+            // connection) without moving `PRAGMA data_version` either. So an
+            // admission suspended across a commit passes all of them and then
+            // publishes a generation pinned to the pre-commit head. Once that
+            // generation is cached, `activePublicReadContext` hits it — it
+            // compares only the control row, which a repository write does not
+            // touch — and every read then fails `state == description.state`
+            // with `.repositoryStateMismatch`. That reason is not change
+            // detection, so it is not retried, not evicted and not
+            // negative-cached: the account's public repository returns `503`
+            // until the next successful write or a process restart.
+            //
+            // The sequence closes that door. It moved iff some other
+            // publisher, evictor, or durable commit invalidated this DID's
+            // cache after this admission sampled it, which is exactly the
+            // condition under which what follows would be a stale publish.
+            //
+            // Refusing here cannot wedge anything, because refusing writes
+            // nothing. The cache is left holding either a generation some
+            // other publisher installed — which passed this same guard, so it
+            // is at least as fresh — or nothing at all, in which case the next
+            // read admits from cold. Never stale-and-pinned. The refusal is
+            // reported as change detection so it is not mistaken for a verdict
+            // on the account: it is never negative-cached, and the caller's own
+            // read fails once while the next one recovers with no operator
+            // involvement. The post-mutation refresh, which is the one caller
+            // that must not merely decline, converts this throw into the
+            // eviction it already performs for every other refresh failure.
+            //
+            // There is no suspension between the check and the publish: the
+            // last `await` is the control-store round trip above, and
+            // everything from there down runs in one actor turn. A `state`
+            // re-read here would not have that property — it would itself be
+            // an `await`, reopening a narrower version of the same window.
+            guard publicReadPublishSequence(did: account.did)
+                == admittedAtSequence else {
+                throw PublicRepositoryReadError.unavailable(
+                    reason: .generationPublishSuperseded
+                )
+            }
+            publishPublicReadGeneration(generation, did: account.did)
             // The single line that publishes a generation is also the single
             // line that retires the negative cache entry, so every publisher
             // clears it — a cold-cache refresh, a successful re-admission, and
