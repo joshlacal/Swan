@@ -1167,10 +1167,8 @@ private func oauthServerConsentPage(
   clientID: String,
   scopes: Set<String>
 ) -> String {
-  let scopeItems = scopes.sorted().map {
-    "<li><code>\(oauthServerEscape($0))</code></li>"
-  }.joined()
-  return "<!doctype html><html><head><meta charset=\"utf-8\"><title>Authorize Swan client</title></head><body><main><h1>Authorize client</h1><p>Signed in as \(oauthServerEscape(subject)).</p><p>Client: <code>\(oauthServerEscape(clientID))</code></p><p>Requested access:</p><ul>\(scopeItems)</ul><form method=\"post\" action=\"/oauth/authorize/consent\"><input type=\"hidden\" name=\"csrf\" value=\"\(oauthServerEscape(csrf))\"><button name=\"decision\" value=\"approve\" type=\"submit\">Approve</button><button name=\"decision\" value=\"deny\" type=\"submit\">Deny</button></form></main></body></html>"
+  let scopeSection = ScopeDescription.render(scopes: scopes)
+  return "<!doctype html><html><head><meta charset=\"utf-8\"><title>Authorize Swan client</title></head><body><main><h1>Authorize client</h1><p>Signed in as \(oauthServerEscape(subject)).</p><p>Client: <code>\(oauthServerEscape(clientID))</code></p>\(scopeSection)<form method=\"post\" action=\"/oauth/authorize/consent\"><input type=\"hidden\" name=\"csrf\" value=\"\(oauthServerEscape(csrf))\"><button name=\"decision\" value=\"approve\" type=\"submit\">Approve</button><button name=\"decision\" value=\"deny\" type=\"submit\">Deny</button></form></main></body></html>"
 }
 
 private func oauthServerEscape(_ value: String) -> String {
