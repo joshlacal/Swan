@@ -1,11 +1,13 @@
 # Phase 2 → netcup redeploy readiness
 
-**Status: READY — all three gates closed 2026-08-14.** `swan:next` (4.97 GB,
-digest `0502bcfc…`) is built on netcup from the merged tree (`b4e7118d` synced);
-`swan:local` and the running service are untouched. **The cutover (steps 3-4:
-tag rollback → retag → restart) awaits Josh's explicit go.** Note the host
-already carries `swan:new`/`swan:rollback`/`swan:rollback-prev` tags from
-earlier deploys — the dated rollback tag in step 3 avoids colliding with them.
+**Status: DEPLOYED 2026-08-14 ~21:52 UTC, on Josh's go.** All three gates
+closed the same day. `swan:next` (image `6851d778`, built from the merged tree
+at `b4e7118d`) promoted to `swan:local`; previous image preserved as
+`swan:rollback-20260814` (`0e77c5ad`). Service restarted, started clean
+("Server started and listening"), and **all four verification endpoints
+returned 200 post-deploy** (health, describeServer, oauth-authorization-server,
+public `swan.place`). `--enable-lexicon-resolution` remains **off** — enabling
+it is a deliberate separate follow-up (see "Open decision" below).
 
 ## Live state — verified today, not remembered
 
