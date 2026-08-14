@@ -233,10 +233,20 @@ public struct SpacePermission: ScopePermission {
 /// and would invert the dependency.
 public struct SpaceScopeTarget: Sendable, Hashable {
     public enum Operation: Sendable, Hashable {
-        /// Whole-space read. Collection-independent (space-permission.ts:104-107).
-        case read
-        /// Own-repo read. Collection-independent (:108-110).
-        case readSelf
+        /// Whole-space read. Upstream is collection-independent
+        /// (space-permission.ts:104-107); Swan adds two hardenings, both
+        /// carried explicitly on the case rather than folded into the generic
+        /// matcher (§6.5.5):
+        ///   - `aggregate`: an AGGREGATE surface (e.g. listSpaces) must not
+        ///     silently censor its response, so it requires an unqualified or
+        ///     wildcard collection GRANT — SwanSpaces.swift:329-341.
+        ///   - `collection`: a caller MAY additionally scope the request to one
+        ///     collection; a grant naming no collections still satisfies this
+        ///     (reads stay collection-independent by default), matching
+        ///     upstream. `nil` means "no collection filter on the request".
+        case read(aggregate: Bool, collection: String?)
+        /// Own-repo read. Same two hardenings as `.read` (§6.5.5).
+        case readSelf(aggregate: Bool, collection: String?)
         /// Record write. `collection` is REQUIRED here by construction —
         /// upstream makes it non-optional only in the write arm (:70-74).
         case write(RecordWrite, collection: String)
@@ -245,6 +255,13 @@ public struct SpaceScopeTarget: Sendable, Hashable {
         /// The whole-space-read delegation exchange. A HARDENING of a real
         /// upstream concept (`pds/src/api/com/atproto/space/util.ts:104-126`,
         /// `assertSpaceRead`), not a Swan invention — see §5.6.3.
+        ///
+        /// **This case's grant is decided at the RESOURCE-PLANE FACADE, not
+        /// here — see `matches(_:)` below and §9-D23.** Provenance
+        /// (`wasStated`) is not durable across mint/persist/reload when read
+        /// off a re-parsed `SpacePermission`; only the facade holds it
+        /// durably, so `matches(_:)` returns `false` unconditionally for this
+        /// case rather than consulting `scopeParameters` a second time.
         case delegationExchange
 
         public enum RecordWrite: Sendable, Hashable {
@@ -305,13 +322,16 @@ extension SpacePermission {
             // Collection and action are irrelevant to a manage check (:100-102).
             return manage.contains(op)
 
-        case .read:
-            // Reads are collection-independent (:104-107).
-            return action.contains(.read)
+        case let .read(aggregate, requestCollection):
+            // Reads are collection-independent by default (:104-107); the two
+            // Swan hardenings below are opt-in via the case payload (§6.5.5).
+            guard action.contains(.read) else { return false }
+            return collectionGate(aggregate: aggregate, requestCollection: requestCollection)
 
-        case .readSelf:
+        case let .readSelf(aggregate, requestCollection):
             // `read` implies `read_self`, but not the reverse (:108-110).
-            return action.contains(.read) || action.contains(.readSelf)
+            guard action.contains(.read) || action.contains(.readSelf) else { return false }
+            return collectionGate(aggregate: aggregate, requestCollection: requestCollection)
 
         case let .write(verb, collection):
             // Writes need BOTH the verb AND a collection target (:112-115).
@@ -319,44 +339,40 @@ extension SpacePermission {
             return collectionAllows(collection)
 
         case .delegationExchange:
-            // The SINGLE most dangerous arm in this file. Must reproduce,
-            // exactly, what SwanCore.swift:270-277 enforces today:
-            //   parameters.count == 3
-            //   Set(parameters.keys) == ["authority", "skey", "action"]
-            //   parameters["action"] == "read"        // literal, single-valued
-            // The `wasStated` provenance witness (§4.6) is what makes the
-            // literal-vs-defaulted distinction expressible at all.
-            return isExactReadOnlyDelegationGrant
+            // Deliberately `false`, always — see the case's doc comment and
+            // §9-D23. The delegation fence needs the ORIGINAL parse-time
+            // provenance (`wasStated`), and a `SpacePermission` reconstructed
+            // from a persisted/re-parsed scope string cannot be trusted to
+            // carry it: mint resolves `self` -> a concrete DID and persists
+            // it, and canonical serialisation deletes stated values equal to
+            // their defaults (`skey=*`, `authority=self`) — both directions
+            // destroy exactly the bit this arm would need. The resource-plane
+            // facade (`SwanScopePermissions`, §6.1) owns this decision instead,
+            // composed from durable provenance bits held OUTSIDE the parser
+            // plus an ordinary `matches(_:, operation: .read(aggregate: false,
+            // collection: nil))` call on the resolved grant.
+            return false
         }
     }
 
-    /// The delegation fence, stated once. Every clause maps to a clause of
-    /// `permitsWholeSpaceRead` (`SwanCore.swift:270-277`); none may be dropped.
-    /// This fence is where the retired `isIssuableQualified` gate's job now
-    /// lives (§9-D21) — each of the four clauses below rejects one of the exact
-    /// amplification shapes that gate used to block, and every one of them
-    /// tests `wasStated` — a PROVENANCE test, not a value test. A defaulted
-    /// `[read]` and a stated `[read]` carry the same value and must not carry
-    /// the same authority. Deleting a clause here re-opens a hole nothing else
-    /// closes.
-    private var isExactReadOnlyDelegationGrant: Bool {
-        // 1. `action` was named explicitly, and names exactly [read].
-        //    Not "contains read"; not a defaulted list.
-        //    <- SwanCore.swift:277 `parameters["action"] == "read"`
-        guard scopeParameters.wasStated("action"), action == [.read] else { return false }
-        // 2. The grant names no collection at all — a collection-qualified
-        //    grant (INCLUDING `collection=*`) must never be amplifiable into a
-        //    credential that reads every member repository.
-        //    <- SwanCore.swift:246-257 (doc comment) and :279 (key-set equality)
-        guard collection.isEmpty, !scopeParameters.wasStated("collection") else { return false }
-        // 3. No `manage` list. Today `hasAction != hasManage` (:243) makes an
-        //    action+manage grant unparseable, so admitting one here would widen
-        //    even though the manage list is never consulted for a read.
-        guard manage.isEmpty, !scopeParameters.wasStated("manage") else { return false }
-        // 4. `authority` and `skey` were both named.
-        //    <- SwanCore.swift:279 `Set(keys) == ["authority","skey","action"]`
-        //       and :243 `requiredKeys == ["authority","skey"]`
-        return scopeParameters.wasStated("authority") && scopeParameters.wasStated("skey")
+    /// Shared post-action-gate logic for `.read` / `.readSelf` (§6.5.5). Both
+    /// Swan hardenings are opt-in via the case payload; when neither applies
+    /// the read stays collection-independent, matching upstream.
+    private func collectionGate(aggregate: Bool, requestCollection: String?) -> Bool {
+        if aggregate {
+            // SwanSpaces.swift:329-341 — an aggregate surface (e.g. listSpaces)
+            // must not silently censor its response, so it requires an
+            // unqualified or wildcard collection GRANT.
+            return collection.isEmpty || collection.contains(.any)
+        }
+        if let requestCollection {
+            // A caller MAY scope a single-space read to one collection. A
+            // grant naming no collections at all still satisfies it — reads
+            // stay collection-independent by default (upstream's rule); a
+            // grant that DOES name collections must include this one.
+            return collection.isEmpty || collectionAllows(requestCollection)
+        }
+        return true
     }
 
     /// space-permission.ts:118-123. `.any` is exact membership in the set, not
@@ -415,8 +431,9 @@ extension SpacePermission {
     ///
     /// FOUR arms, not upstream's three. `SpaceScopeTarget.Operation` carries a
     /// Swan-specific fifth case, `.delegationExchange`, which must emit the
-    /// string that `isExactReadOnlyDelegationGrant` actually accepts — all four
-    /// of `authority`, `skey`, `action=read` stated, and no `collection`:
+    /// string the resource-plane facade's delegation fence accepts (§9-D23,
+    /// §6.1) — all four of `authority`, `skey`, `action=read` stated, and no
+    /// `collection`:
     ///
     ///     space:<type>?authority=<did>&skey=<skey>&action=read
     ///
@@ -434,9 +451,14 @@ extension SpacePermission {
         values.set("authority", [target.authority])
         values.set("skey", [target.skey])
         switch target.operation {
-        case .read, .delegationExchange:
+        case .read(_, _), .delegationExchange:
+            // A bare (no-collection) grant already satisfies a collection-
+            // qualified or aggregate read request (§6.5.5's `collectionGate`
+            // treats an empty grant collection list as unrestricted), so the
+            // minimal grant never needs to state `collection` here even when
+            // the target's own `collection`/`aggregate` payload is set.
             values.set("action", [SpaceAction.read.rawValue])
-        case .readSelf:
+        case .readSelf(_, _):
             values.set("action", [SpaceAction.readSelf.rawValue])
         case let .write(verb, collection):
             values.set("collection", [collection])

@@ -90,6 +90,12 @@ struct OAuthScopesSpaceTests {
 
     // MARK: matching (M1-M24)
 
+    /// Plain, unqualified read/readSelf — neither Swan hardening (§6.5.5)
+    /// engaged. Most vectors below are upstream's, which know nothing of
+    /// `aggregate`/`collection`, so this is the right default.
+    private static let plainRead = SpaceScopeTarget.Operation.read(aggregate: false, collection: nil)
+    private static let plainReadSelf = SpaceScopeTarget.Operation.readSelf(aggregate: false, collection: nil)
+
     private func target(
         type: String = "com.atmoboards.forum", authority: String = "did:plc:abc",
         skey: String = "default", operation: SpaceScopeTarget.Operation
@@ -101,13 +107,13 @@ struct OAuthScopesSpaceTests {
     func spaceAnyAuthorityMatchesReadWhenActionRead() throws {
         // M1-M4
         let m1 = try SpacePermission.parse("space:com.atmoboards.forum?authority=*")
-        #expect(m1.matches(target(operation: .read)))
+        #expect(m1.matches(target(operation: Self.plainRead)))
 
         let m2 = try SpacePermission.parse("space:com.atmoboards.forum?authority=*&action=create")
-        #expect(!m2.matches(target(operation: .read)))
+        #expect(!m2.matches(target(operation: Self.plainRead)))
 
         let m3 = try SpacePermission.parse("space:com.atmoboards.forum?authority=*&action=read")
-        #expect(m3.matches(target(operation: .read)))
+        #expect(m3.matches(target(operation: Self.plainRead)))
         #expect(!m3.matches(target(operation: .write(.create, collection: "com.atmoboards.thread"))))
     }
 
@@ -140,16 +146,16 @@ struct OAuthScopesSpaceTests {
     func spaceReadImpliesReadSelfButNotReverse() throws {
         // M12-M15
         let readGrant = try SpacePermission.parse("space:com.atmoboards.forum?authority=*&action=read")
-        #expect(readGrant.matches(target(operation: .readSelf)))
+        #expect(readGrant.matches(target(operation: Self.plainReadSelf)))
 
         let readSelfGrant = try SpacePermission.parse("space:com.atmoboards.forum?authority=*&action=read_self")
-        #expect(readSelfGrant.matches(target(operation: .readSelf)))
-        #expect(!readSelfGrant.matches(target(operation: .read)))
+        #expect(readSelfGrant.matches(target(operation: Self.plainReadSelf)))
+        #expect(!readSelfGrant.matches(target(operation: Self.plainRead)))
 
         let qualified = try SpacePermission.parse(
             "space:com.atmoboards.forum?authority=*&action=read_self&collection=com.atmoboards.thread"
         )
-        #expect(qualified.matches(target(operation: .readSelf))) // reads are collection-independent
+        #expect(qualified.matches(target(operation: Self.plainReadSelf))) // reads are collection-independent
     }
 
     @Test
@@ -166,35 +172,73 @@ struct OAuthScopesSpaceTests {
     func spaceWildcardTypeMatchesAnyConcreteType() throws {
         // M18, M19
         let grant = try SpacePermission.parse("space:*?authority=did:plc:abc")
-        #expect(grant.matches(target(operation: .read)))
-        #expect(grant.matches(target(type: "com.example.different", operation: .read)))
+        #expect(grant.matches(target(operation: Self.plainRead)))
+        #expect(grant.matches(target(type: "com.example.different", operation: Self.plainRead)))
     }
 
     @Test
     func spaceConcreteAuthorityAndSkeyMustMatchExactly() throws {
         // M20, M21
         let grant = try SpacePermission.parse("space:com.atmoboards.forum?authority=did:plc:abc&skey=default")
-        #expect(!grant.matches(target(authority: "did:plc:other", operation: .read)))
-        #expect(!grant.matches(target(skey: "other", operation: .read)))
+        #expect(!grant.matches(target(authority: "did:plc:other", operation: Self.plainRead)))
+        #expect(!grant.matches(target(skey: "other", operation: Self.plainRead)))
     }
 
     @Test
     func spaceUnresolvedSelfFailsClosed() throws {
         // M22, M23, M24
         let unresolved = try SpacePermission.parse("space:com.atmoboards.forum")
-        #expect(!unresolved.matches(target(operation: .read)))
+        #expect(!unresolved.matches(target(operation: Self.plainRead)))
 
         let toResolve = try SpacePermission.parse("space:com.atmoboards.forum?action=read")
         let resolved = toResolve.withResolvedAuthority("did:plc:abc")
-        #expect(resolved.matches(target(operation: .read)))
-        #expect(!resolved.matches(target(authority: "did:plc:other", operation: .read)))
+        #expect(resolved.matches(target(operation: Self.plainRead)))
+        #expect(!resolved.matches(target(authority: "did:plc:other", operation: Self.plainRead)))
+    }
+
+    // MARK: §6.5.5 — the `aggregate` and `collection` hardenings on read/readSelf
+
+    @Test
+    func aggregateReadRequiresUnqualifiedOrWildcardCollectionGrant() throws {
+        // SwanSpaces.swift:329-341 — an aggregate surface (listSpaces) must not
+        // silently censor its response, so it needs an unqualified or `*`
+        // collection grant; a grant scoped to one collection must NOT satisfy it
+        // even though `create` would be a perfectly normal write grant shape.
+        let bare = try SpacePermission.parse("space:com.atmoboards.forum?authority=*&action=read")
+        #expect(bare.matches(target(operation: .read(aggregate: true, collection: nil))))
+
+        let wildcardCollection = try SpacePermission.parse(
+            "space:com.atmoboards.forum?authority=*&action=read&collection=*"
+        )
+        #expect(wildcardCollection.matches(target(operation: .read(aggregate: true, collection: nil))))
+
+        let qualified = try SpacePermission.parse(
+            "space:com.atmoboards.forum?authority=*&action=read&collection=com.atmoboards.thread"
+        )
+        #expect(!qualified.matches(target(operation: .read(aggregate: true, collection: nil))))
+    }
+
+    @Test
+    func nonAggregateCollectionQualifiedReadStaysCollectionIndependentByDefault() throws {
+        // A caller MAY additionally scope a single-space read to one
+        // collection; a grant naming no collections still satisfies it (reads
+        // are collection-independent by default), but a grant that DOES name
+        // collections must include the requested one.
+        let bare = try SpacePermission.parse("space:com.atmoboards.forum?authority=*&action=read")
+        #expect(bare.matches(target(operation: .read(aggregate: false, collection: "com.atmoboards.thread"))))
+
+        let qualified = try SpacePermission.parse(
+            "space:com.atmoboards.forum?authority=*&action=read&collection=com.atmoboards.reply"
+        )
+        #expect(!qualified.matches(target(operation: .read(aggregate: false, collection: "com.atmoboards.thread"))))
+        #expect(qualified.matches(target(operation: .read(aggregate: false, collection: "com.atmoboards.reply"))))
     }
 
     // MARK: scopeNeeded (§5.6.6)
 
     @Test
     func spaceScopeNeededMatchesUpstreamVectors() throws {
-        #expect(try SpacePermission.scopeNeeded(for: target(operation: .read))
+        #expect(try SpacePermission.scopeNeeded(for: target(operation: Self.plainRead))
             == "space:com.atmoboards.forum?authority=did:plc:abc&skey=default&action=read")
         #expect(try SpacePermission.scopeNeeded(
             for: target(operation: .write(.create, collection: "com.atmoboards.thread"))
@@ -206,7 +250,7 @@ struct OAuthScopesSpaceTests {
 
     @Test
     func spaceDelegationExchangeScopeNeededIsByteIdenticalToReadArm() throws {
-        let read = try SpacePermission.scopeNeeded(for: target(operation: .read))
+        let read = try SpacePermission.scopeNeeded(for: target(operation: Self.plainRead))
         let delegation = try SpacePermission.scopeNeeded(for: target(operation: .delegationExchange))
         #expect(read == delegation)
     }
@@ -216,12 +260,13 @@ struct OAuthScopesSpaceTests {
         // The narrowest grant scopeNeeded produces must satisfy the request it
         // was built for, and must NOT satisfy an unrelated write when no
         // collection was named.
-        for operation in [
-            SpaceScopeTarget.Operation.read,
-            .readSelf,
+        let operations: [SpaceScopeTarget.Operation] = [
+            Self.plainRead,
+            Self.plainReadSelf,
             .write(.create, collection: "com.atmoboards.thread"),
             .manage(.delete),
-        ] {
+        ]
+        for operation in operations {
             let string = try SpacePermission.scopeNeeded(for: target(operation: operation))
             let reparsed = try SpacePermission.parse(string)
             #expect(reparsed.matches(target(operation: operation)))
@@ -281,46 +326,40 @@ struct OAuthScopesSpaceTests {
         #expect(wildcard.withResolvedAuthority("did:plc:abc123xyz").authority == .any) // unchanged
     }
 
-    // MARK: §9-D23 — provenance is durable, and withResolvedAuthority preserves it
+    // MARK: §9-D23 / delegation-fence relocation — the facade owns the fence now
 
     @Test
-    func delegationFenceRequiresLiteralStatedFieldsNotDefaultedOnes() throws {
-        // The exact worked example from the operating instructions / §9-D23:
-        // a bare `space:<type>?authority=did:plc:abc` grant has `action`
-        // DEFAULTED (contains .read among the full default list) — the fence
-        // must refuse, because `action` was never literally written.
-        let defaultedAction = try SpacePermission.parse("space:com.x.y?authority=did:plc:abc")
-        #expect(!defaultedAction.matches(SpaceScopeTarget(
-            type: "com.x.y", authority: "did:plc:abc", skey: "irrelevant", operation: .delegationExchange
-        )))
+    func delegationExchangeMatchAlwaysReturnsFalseRegardlessOfGrantShape() throws {
+        // The delegation fence moved OFF the parser and onto the resource-plane
+        // facade (`SwanScopePermissions`), which composes it from DURABLE
+        // provenance bits plus an ordinary `.read` match — see this file's
+        // `Operation.delegationExchange` doc comment and §9-D23. A
+        // `SpacePermission` re-parsed from a persisted string can never be
+        // trusted to answer this question itself (mint-time `self` resolution
+        // makes a defaulted `authority` look stated; canonicalisation deletes
+        // a stated `skey=*`), so `matches(_:)` must return `false` here
+        // unconditionally — even for what LOOKS like the exact literal grant.
+        let target = { (skey: String) in
+            SpaceScopeTarget(type: "com.x.y", authority: "did:plc:abc", skey: skey, operation: .delegationExchange)
+        }
 
-        // `action` is multi-valued, so a repeated key PARSES (unlike `skey`,
-        // which is single-valued and would throw `.repeatedSingleValuedParameter`)
-        // — but the fence still refuses, because the stated action set is
-        // [read, create], not exactly [read].
-        let repeatedAction = try SpacePermission.parse(
-            "space:com.x.y?authority=did:plc:abc&skey=*&action=read&action=create"
-        )
-        #expect(repeatedAction.action == [.read, .create])
-        #expect(!repeatedAction.matches(SpaceScopeTarget(
-            type: "com.x.y", authority: "did:plc:abc", skey: "*", operation: .delegationExchange
-        )))
-
-        // A grant naming both action and manage is unparseable per §5.6 schema
-        // (no forbidden-combo rule blocks it directly, but the exact-grant
-        // fence below independently refuses any grant WITH a stated manage).
-        let withManage = try SpacePermission.parse(
-            "space:com.x.y?authority=did:plc:abc&skey=*&action=read&manage=delete"
-        )
-        #expect(!withManage.matches(SpaceScopeTarget(
-            type: "com.x.y", authority: "did:plc:abc", skey: "*", operation: .delegationExchange
-        )))
-
-        // The literal, minimal grant DOES satisfy the fence.
+        // What would have been the exact, literal, minimal grant.
         let exact = try SpacePermission.parse("space:com.x.y?authority=did:plc:abc&skey=*&action=read")
-        #expect(exact.matches(SpaceScopeTarget(
-            type: "com.x.y", authority: "did:plc:abc", skey: "*", operation: .delegationExchange
-        )))
+        #expect(!exact.matches(target("*")))
+
+        // A defaulted (never-stated) action list.
+        let defaultedAction = try SpacePermission.parse("space:com.x.y?authority=did:plc:abc")
+        #expect(!defaultedAction.matches(target("irrelevant")))
+
+        // A grant that resolved `self` -> the requested authority (the exact
+        // §9-D23 amplification scenario).
+        let resolved = try SpacePermission.parse("space:com.x.y?skey=*&action=read")
+            .withResolvedAuthority("did:plc:abc")
+        #expect(!resolved.matches(target("*")))
+
+        // A wildcard-everything grant.
+        let wildcard = try SpacePermission.parse("space:*?authority=*&skey=*&action=read")
+        #expect(!wildcard.matches(target("*")))
     }
 
     @Test
@@ -328,26 +367,24 @@ struct OAuthScopesSpaceTests {
         // This is the exact regression §9-D23 exists to prevent: resolving
         // `self` must change ONLY the value of `authority`, never whether the
         // client stated it. A grant with `authority` DEFAULTED (never written)
-        // must still show `authority` as defaulted after resolution, so the
-        // delegation fence continues to refuse it post-mint.
+        // must still show `authority` as defaulted after resolution, so a
+        // facade-level fence reading durable provenance off this grant
+        // continues to see "not stated" rather than "stated" post-mint.
         let defaultedAuthority = try SpacePermission.parse("space:com.x.y?skey=*&action=read")
         #expect(!defaultedAuthority.scopeParameters.wasStated("authority"))
 
         let resolved = defaultedAuthority.withResolvedAuthority("did:plc:USER")
         #expect(resolved.authority == .did("did:plc:USER")) // value changed
         #expect(!resolved.scopeParameters.wasStated("authority")) // statedness UNCHANGED
-        #expect(!resolved.matches(SpaceScopeTarget(
-            type: "com.x.y", authority: "did:plc:USER", skey: "*", operation: .delegationExchange
-        ))) // fence still refuses — this is the bug §9-D23 fixes
 
         // Mirror case: a LITERALLY stated authority stays stated post-resolution
         // (resolution is a no-op here since it's already concrete, but the
         // provenance-preservation contract must hold regardless).
         let statedAuthority = try SpacePermission.parse("space:com.x.y?authority=did:plc:USER&skey=*&action=read")
         #expect(statedAuthority.scopeParameters.wasStated("authority"))
-        #expect(statedAuthority.matches(SpaceScopeTarget(
-            type: "com.x.y", authority: "did:plc:USER", skey: "*", operation: .delegationExchange
-        )))
+        let noOpResolve = statedAuthority.withResolvedAuthority("did:plc:OTHER")
+        #expect(noOpResolve.authority == .did("did:plc:USER")) // unchanged (already concrete)
+        #expect(noOpResolve.scopeParameters.wasStated("authority"))
     }
 
     @Test
@@ -366,5 +403,19 @@ struct OAuthScopesSpaceTests {
         // silently changes this contract.
         let reparsed = try SpacePermission.parse(canonical)
         #expect(!reparsed.scopeParameters.wasStated("skey"))
+    }
+
+    @Test
+    func provenanceAccessorsExposeRawCaseAndStatedKeySet() throws {
+        // Accessors consumers outside SwanCore depend on (§9-D23's "expose
+        // whatever accessor the fences need"): `provenance(for:)` returns the
+        // exact case (not just a bool), and `statedKeys` enumerates every
+        // physically-written key — both are what a durable persistence layer
+        // needs to serialise "which keys were stated" beside the grant.
+        let parsed = try SpacePermission.parse("space:com.x.y?authority=did:plc:abc&action=read")
+        #expect(parsed.scopeParameters.provenance(for: "authority") == .stated)
+        #expect(parsed.scopeParameters.provenance(for: "skey") == .defaulted)
+        #expect(parsed.scopeParameters.provenance(for: "nonexistent") == nil)
+        #expect(parsed.scopeParameters.statedKeys == ["type", "authority", "action"])
     }
 }
