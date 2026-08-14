@@ -130,6 +130,55 @@ struct PermissionedScopeFixture: Sendable {
         )
     }
 
+    /// The **remote** authorization-server surface: `/oauth/par`,
+    /// `/oauth/authorize`, `/oauth/authorize/consent`, `/oauth/token`, driven
+    /// against a real `https://` client whose metadata document is served to the
+    /// AS through a stub resolver and transport.
+    ///
+    /// §7.4 Stage 2 requires this rather than a localhost virtual client. The
+    /// stubs replace only the network — the AS still fetches, parses and
+    /// validates the document through `OAuthClientMetadataLoader` exactly as it
+    /// would in production, which is the part under test.
+    func buildRemoteAuthorizationServer(
+        clientMetadata: OAuthClientMetadata,
+        scopesSupported: [String] = ["atproto"]
+    ) async throws -> SwanHTTPServer {
+        let peer = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+        let loader = try OAuthClientMetadataLoader(
+            fetcher: .init(
+                policy: try OAuthRemoteFetchPolicy(),
+                resolver: ScopeE2EHostnameResolver(answers: Array(repeating: [peer], count: 64)),
+                transport: ScopeE2ERemoteTransport(
+                    response: .init(
+                        status: 200,
+                        headers: ["content-type": ["application/json"]],
+                        body: try JSONEncoder().encode(clientMetadata),
+                        responseURL: clientMetadata.clientID,
+                        connectedPeerAddress: peer
+                    )
+                )
+            ),
+            controlStore: control
+        )
+        let profile = try ProtocolProfile.load(
+            from: Self.packageRoot()
+                .appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")
+        )
+        return SwanHTTPServer(
+            profile: profile,
+            configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: Self.issuer),
+            oauthRuntime: runtime,
+            authorizationServerConfiguration: try SwanOAuthAuthorizationServerConfiguration(
+                issuer: Self.issuer,
+                protectedResource: Self.issuer,
+                accounts: accounts,
+                clientMetadataLoader: loader,
+                scopesSupported: scopesSupported
+            ),
+            loginClientIdentityPolicy: SwanLoginClientIdentityPolicy.direct
+        )
+    }
+
     static func packageRoot() -> URL {
         URL(filePath: #filePath)
             .deletingLastPathComponent()
@@ -138,42 +187,124 @@ struct PermissionedScopeFixture: Sendable {
     }
 }
 
-/// A localhost client plus its DPoP key, built around one requested scope set.
+/// Stub DNS for the client-metadata fetch. Replaces the network, not the
+/// admission policy: the loader still applies `OAuthRemoteFetchPolicy` to the
+/// answer, so a test cannot accidentally exempt itself from the SSRF fence.
+actor ScopeE2EHostnameResolver: OAuthHostnameResolving {
+    private let answers: [[OAuthIPAddress]]
+    private var index = 0
+
+    init(answers: [[OAuthIPAddress]]) { self.answers = answers }
+
+    func resolve(host _: String) async throws -> [OAuthIPAddress] {
+        guard !answers.isEmpty else { throw SwanError.unavailable("missing test DNS response") }
+        defer { index += 1 }
+        return answers[min(index, answers.count - 1)]
+    }
+}
+
+/// Serves the one client-metadata document. Counts requests so a test can assert
+/// the AS is not refetching per request.
+actor ScopeE2ERemoteTransport: OAuthRemoteTransport {
+    private let response: OAuthRemoteHTTPResponse
+    private var requests = 0
+
+    init(response: OAuthRemoteHTTPResponse) { self.response = response }
+
+    func get(
+        url _: URL,
+        approvedPeers _: Set<OAuthIPAddress>,
+        timeout _: TimeInterval,
+        maximumBodyBytes _: Int
+    ) async throws -> OAuthRemoteHTTPResponse {
+        requests += 1
+        return response
+    }
+
+    func requestCount() -> Int { requests }
+}
+
+/// A client plus its DPoP key, built around one requested scope set — in either
+/// of the two shapes Swan admits.
 ///
-/// The localhost bridge is used deliberately: §7.4 S4.5 records that
-/// `SwanLocalhostOAuthHTTP.consentPage` is the renderer the §7.1 harness
-/// actually drives, and §9-D20's binding comparison lives on
-/// `redeemLocalhostPublicRefresh` (`DurableOAuthTokenService.swift:770`).
+/// **`.remoteHTTPS` is the default for the acceptance test, and the distinction
+/// is load-bearing.** §7.4 Stage 2 requires a genuinely remote HTTPS client
+/// (`https://bulleted.app/client-metadata.json`), because that is the shape that
+/// fails hardest today: `OAuthClientMetadata.swift:343-344` gates the issuable
+/// disjunct behind `isLocalhostDevelopmentClient &&`, so a remote client can
+/// carry only bare `atproto`. A localhost fixture would sail through every stage
+/// while proving nothing about the change under test.
+///
+/// `.localhostBridge` exists for the two places that genuinely require it:
+/// §9-D20's binding comparison lives on `redeemLocalhostPublicRefresh`
+/// (`DurableOAuthTokenService.swift:770`), and §7.4 S4.5's *second* consent
+/// renderer is `SwanLocalhostOAuthHTTP.consentPage`.
 struct PermissionedScopeClient: Sendable {
+    enum Kind: Sendable {
+        /// `https://bulleted.app/client-metadata.json`, served to the AS through
+        /// a stub resolver + transport. Not a virtual client.
+        case remoteHTTPS
+        /// `http://localhost?scope=…`, the development bridge.
+        case localhostBridge
+    }
+
+    let kind: Kind
     let clientID: URL
+    let redirectURI: URL
     let scopes: [String]
     let signingKey: P256.Signing.PrivateKey
     let jwk: OAuthJSONWebKey
 
-    init(scopes: [String]) throws {
+    static let remoteClientID = URL(string: "https://bulleted.app/client-metadata.json")!
+    static let remoteRedirectURI = URL(string: "https://bulleted.app/callback")!
+
+    init(scopes: [String], kind: Kind = .remoteHTTPS) throws {
         self.scopes = scopes
+        self.kind = kind
         signingKey = P256.Signing.PrivateKey()
         jwk = try OAuthJSONWebKey.from(signingKey)
-        let scopeParameter = scopes.joined(separator: " ")
-        clientID = try XCTUnwrap(
-            URL(
-                string: "http://localhost?scope=\(scopeFormEncode(scopeParameter))"
-                    + "&redirect_uri=\(scopeFormEncode(PermissionedScopeFixture.redirectURI.absoluteString))"
+        switch kind {
+        case .remoteHTTPS:
+            clientID = Self.remoteClientID
+            redirectURI = Self.remoteRedirectURI
+        case .localhostBridge:
+            redirectURI = PermissionedScopeFixture.redirectURI
+            let scopeParameter = scopes.joined(separator: " ")
+            clientID = try XCTUnwrap(
+                URL(
+                    string: "http://localhost?scope=\(scopeFormEncode(scopeParameter))"
+                        + "&redirect_uri=\(scopeFormEncode(PermissionedScopeFixture.redirectURI.absoluteString))"
+                )
             )
-        )
+        }
     }
 
     var scopeSet: Set<String> { Set(scopes) }
 
     func metadata() throws -> OAuthClientMetadata {
-        try OAuthClientMetadata.localhostDevelopmentMetadata(clientID: clientID)
+        switch kind {
+        case .remoteHTTPS:
+            // A public client: no JWKS, so `confidentialClientKey` is nil and the
+            // token exchange needs no client assertion. That is the shape
+            // bulleted.app actually ships.
+            try OAuthClientMetadata(
+                clientID: Self.remoteClientID,
+                redirectURIs: [Self.remoteRedirectURI],
+                grantTypes: ["authorization_code", "refresh_token"],
+                responseTypes: ["code"],
+                scopes: scopeSet,
+                dpopBoundAccessTokens: true
+            )
+        case .localhostBridge:
+            try OAuthClientMetadata.localhostDevelopmentMetadata(clientID: clientID)
+        }
     }
 
     func session(proofID: String, now: Date = Date()) throws -> OAuthValidatedSession {
         try OAuthValidatedSession(
             issuer: PermissionedScopeFixture.issuer.absoluteString,
             client: OAuthResolvedClientMetadata(metadata: try metadata(), keySet: nil),
-            redirectURI: PermissionedScopeFixture.redirectURI,
+            redirectURI: redirectURI,
             scopes: scopeSet,
             dpopProof: OAuthValidatedDPoPProof(
                 keyThumbprint: jwk.thumbprint(),
@@ -207,7 +338,7 @@ extension PermissionedScopeFixture {
         return try await runtime.tokenService.redeemAuthorizationCodeForClient(
             code,
             verifier: verifier,
-            redirectURI: Self.redirectURI,
+            redirectURI: client.redirectURI,
             authorizationServerIssuer: Self.issuer.absoluteString,
             client: OAuthResolvedClientMetadata(metadata: try client.metadata(), keySet: nil),
             dpopProof: session.dpopProof,

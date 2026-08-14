@@ -59,11 +59,14 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
     }
 
     private func assertStage0Discovery(_ fixture: PermissionedScopeFixture) async throws {
-        let app = try fixture.buildServer().buildApplication(
-            logger: Logger(label: "RemoteClientPermissionedScopeE2ETests.discovery")
-        )
-        try await app.test(.router) { client in
-            try await client.execute(
+        let client = try PermissionedScopeClient(scopes: BulletedApp.all)
+        let app = try await fixture
+            .buildRemoteAuthorizationServer(clientMetadata: try client.metadata())
+            .buildApplication(
+                logger: Logger(label: "RemoteClientPermissionedScopeE2ETests.discovery")
+            )
+        try await app.test(.router) { http in
+            try await http.execute(
                 uri: "/.well-known/oauth-authorization-server",
                 method: .get
             ) { response in
@@ -80,7 +83,9 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
         }
 
         // The inverse property, on the same fixture: a scope that never appears in
-        // `scopes_supported` is nonetheless admitted at PAR.
+        // `scopes_supported` is nonetheless admitted at PAR. Asserting only the
+        // VALUE above would leave a future reader free to "fix" the metadata
+        // instead of the grammar; this is the half that closes that hole.
         let scoped = try PermissionedScopeClient(scopes: [BulletedApp.base, BulletedApp.space])
         let session = try scoped.session(proofID: "stage0-inverse")
         let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
@@ -240,10 +245,10 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
     /// `Tests/SwanHTTPTests/ScopeDescriptionTests.swift` (lane 4). What this test
     /// owns is that the rendered consent PAGE carries them — a renderer that is
     /// correct in isolation and unreachable from the page is not consent.
-    func testStage4ConsentPageIsSemanticNotRawScopeBytes() async throws {
+    func testStage4LocalhostConsentPageIsSemanticNotRawScopeBytes() async throws {
         let fixture = try await PermissionedScopeFixture.make()
         defer { Task { await fixture.tearDown() } }
-        let client = try PermissionedScopeClient(scopes: BulletedApp.all)
+        let client = try PermissionedScopeClient(scopes: BulletedApp.all, kind: .localhostBridge)
         let session = try client.session(proofID: "stage4-consent")
         let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
             session: session,
@@ -261,37 +266,9 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
                 XCTAssertEqual(response.status, .ok)
                 let html = String(buffer: response.body)
 
-                // S4.1b — one card for the `space:` permission, in prose.
-                XCTAssertTrue(
-                    html.contains("Access permissioned spaces"),
-                    "S4.1b: a `space:` permission must render a titled card, not a scope string"
-                )
-                XCTAssertTrue(
-                    html.contains(BulletedApp.spaceType),
-                    "S4.1d: a space type Swan cannot name still shows its row, labelled by the raw NSID"
-                )
-
-                // S4.2 — the Phase-1 `include:` wording, verbatim and per NSID.
-                // Two properties: the row is PRESENT (never silently dropped) and
-                // it states plainly that nothing is granted (diverging from
-                // upstream, which grants).
-                for nsid in BulletedApp.includeNSIDs {
-                    XCTAssertTrue(
-                        html.contains("Requested permission set"),
-                        "S4.2: an unresolved include: must be shown, not suppressed"
-                    )
-                    XCTAssertTrue(html.contains(nsid), "S4.2: include: row missing for \(nsid)")
-                }
-                XCTAssertTrue(
-                    html.contains("Swan does not currently grant capabilities derived from this set"),
-                    """
-                    S4.2: the consent screen must say NOTHING IS GRANTED. Without \
-                    that half it over-states the request and the user approves a \
-                    capability Swan then denies at every call (§5.7.2, §9-D4). \
-                    This wording and the warn-log wording are ONE string, two \
-                    surfaces.
-                    """
-                )
+                // S4.1-S4.2, shared with the authorization-server renderer so the
+                // two cannot drift into two different sets of assertions.
+                Self.assertConsentPageIsSemantic(html, renderer: "localhost bridge")
 
                 // S4.4 — raw scope text survives as advanced detail, below the
                 // semantic cards. It is not deleted; it is just not consent.
@@ -308,10 +285,10 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
     /// S4.1a — bare `atproto` **alone** renders no permission card at all
     /// (`scope-description.tsx:82-85`). Today's page violates this by listing
     /// every element of `scopes.sorted()`, `atproto` included.
-    func testStage4BareAtprotoRendersNoPermissionCard() async throws {
+    func testStage4LocalhostConsentPageRendersNoCardForBareAtproto() async throws {
         let fixture = try await PermissionedScopeFixture.make()
         defer { Task { await fixture.tearDown() } }
-        let client = try PermissionedScopeClient(scopes: [BulletedApp.base])
+        let client = try PermissionedScopeClient(scopes: [BulletedApp.base], kind: .localhostBridge)
         let session = try client.session(proofID: "stage4-atproto-only")
         let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
             session: session,
@@ -345,11 +322,12 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
     /// `identity:*`-class risk family that Swan **can** grant today, which is why
     /// it is mandatory rather than aspirational (S4.3): no permission of this
     /// class ever reaches a Swan consent screen as raw scope text.
-    func testStage4UniversalSpaceGrantCarriesItsWarning() async throws {
+    func testStage4LocalhostConsentPageCarriesTheUniversalSpaceWarning() async throws {
         let fixture = try await PermissionedScopeFixture.make()
         defer { Task { await fixture.tearDown() } }
         let client = try PermissionedScopeClient(
-            scopes: [BulletedApp.base, "space:*?authority=*&skey=*&action=read"]
+            scopes: [BulletedApp.base, "space:*?authority=*&skey=*&action=read"],
+            kind: .localhostBridge
         )
         let session = try client.session(proofID: "stage4-universal")
         let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
@@ -377,6 +355,129 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
                 )
             }
         }
+    }
+
+    /// **S4.5 — the SECOND renderer.** `SwanOAuthAuthorizationServerHTTP.swift:1170-1172`
+    /// is an independent consent page from `SwanLocalhostOAuthHTTP.consentPage`,
+    /// with its own identical `scopes.sorted()` `<li>` list. The first draft of
+    /// the spec named only this one; §7.1's harness drives only the other. Both
+    /// obligations bind, so both are asserted — and because the semantic
+    /// descriptions must live in **one shared function** that both call, this
+    /// test asserts the same strings as its localhost twin. A second copy of the
+    /// consent copy is a second copy of the security-relevant wording.
+    ///
+    /// This is also the only Stage-4 path that runs against a genuinely remote
+    /// HTTPS client, so it is where the §9-D19 "no unrestricted Stage C without
+    /// the renderer" gate actually has teeth.
+    func testStage4AuthorizationServerConsentPageCarriesTheSameSemanticStrings() async throws {
+        let fixture = try await PermissionedScopeFixture.make()
+        defer { Task { await fixture.tearDown() } }
+        let client = try PermissionedScopeClient(scopes: BulletedApp.all)
+        let session = try client.session(proofID: "stage4-as-consent")
+        let requestURI = try await fixture.runtime.tokenService.createPushedAuthorizationRequest(
+            session: session,
+            state: "stage4-as-consent",
+            codeChallengeS256: String(repeating: "a", count: 43)
+        )
+        let app = try await fixture
+            .buildRemoteAuthorizationServer(clientMetadata: try client.metadata())
+            .buildApplication(
+                logger: Logger(label: "RemoteClientPermissionedScopeE2ETests.as-consent")
+            )
+        let authorize =
+            "/oauth/authorize?client_id=\(scopeFormEncode(client.clientID.absoluteString))"
+            + "&request_uri=\(scopeFormEncode(requestURI))"
+
+        try await app.test(.router) { http in
+            // The AS page signs the user in first, then renders consent.
+            var cookie: String?
+            var csrf: String?
+            try await http.execute(uri: authorize, method: .get) { response in
+                XCTAssertEqual(response.status, .ok)
+                cookie = Self.cookieValue(
+                    try XCTUnwrap(response.headers[HTTPField.Name("Set-Cookie")!])
+                )
+                csrf = try fixture.runtime.browserSessionService
+                    .verify(try XCTUnwrap(cookie)).csrfToken
+            }
+            let form = [
+                ("csrf", try XCTUnwrap(csrf)),
+                ("handle", PermissionedScopeFixture.handle),
+                ("password", PermissionedScopeFixture.password),
+            ].map { "\(scopeFormEncode($0.0))=\(scopeFormEncode($0.1))" }
+                .joined(separator: "&")
+            var headers: HTTPFields = [.contentType: "application/x-www-form-urlencoded"]
+            headers[.cookie] = "__Host-swan-oauth=\(try XCTUnwrap(cookie))"
+
+            try await http.execute(
+                uri: "/oauth/authorize",
+                method: .post,
+                headers: headers,
+                body: ByteBuffer(string: form)
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+                let html = String(buffer: response.body)
+                Self.assertConsentPageIsSemantic(html, renderer: "authorization server")
+            }
+        }
+    }
+
+    /// The obligations S4.1-S4.4 place on **either** consent renderer. Shared so
+    /// the two renderers cannot drift into two different sets of assertions —
+    /// which would be the test-side version of the exact duplication S4.5 warns
+    /// about in the production code.
+    static func assertConsentPageIsSemantic(
+        _ html: String,
+        renderer: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        // S4.1b — a titled card for the `space:` permission, in prose.
+        XCTAssertTrue(
+            html.contains("Access permissioned spaces"),
+            "S4.1b (\(renderer)): a `space:` permission must render a titled card, not a scope string",
+            file: file, line: line
+        )
+        // S4.1d — a space type Swan cannot name still shows its row.
+        XCTAssertTrue(
+            html.contains(BulletedApp.spaceType),
+            "S4.1d (\(renderer)): fall back to the raw NSID as the row label; never omit the row",
+            file: file, line: line
+        )
+        // S4.2 — the Phase-1 include: wording, both halves.
+        XCTAssertTrue(
+            html.contains("Requested permission set"),
+            "S4.2 (\(renderer)): an unresolved include: must be shown, not suppressed",
+            file: file, line: line
+        )
+        for nsid in BulletedApp.includeNSIDs {
+            XCTAssertTrue(
+                html.contains(nsid),
+                "S4.2 (\(renderer)): include: row missing for \(nsid)",
+                file: file, line: line
+            )
+        }
+        XCTAssertTrue(
+            html.contains("Swan does not currently grant capabilities derived from this set"),
+            """
+            S4.2 (\(renderer)): the screen must say NOTHING IS GRANTED. Without \
+            that half it over-states the request and the user approves a \
+            capability Swan then denies at every call (§5.7.2, §9-D4).
+            """,
+            file: file, line: line
+        )
+        // S4.1a — bare `atproto` is not a permission card.
+        XCTAssertFalse(
+            html.contains("<li><code>atproto</code>"),
+            "S4.1a (\(renderer)): `atproto` alone renders no permission card",
+            file: file, line: line
+        )
+    }
+
+    private static func cookieValue(_ setCookie: String) -> String? {
+        setCookie.split(separator: ";", maxSplits: 1).first
+            .flatMap { $0.split(separator: "=", maxSplits: 1).dropFirst().first }
+            .map(String.init)
     }
 
     // MARK: - Stage 5: token mint
