@@ -313,6 +313,44 @@ struct OAuthScopesSpaceTests {
     }
 
     @Test
+    func withDefaultCollectionsDropsDefaultedWriteVerbsButKeepsThemWhenStated() throws {
+        // The Phase-2 expansion hazard, closed by construction: an
+        // unstated-`action` grant defaults to the full read/create/update/
+        // delete list purely from the schema default (§5.6.2), never because
+        // the client typed a write verb. Materialising collections onto that
+        // grant must not arm those defaulted write verbs against every
+        // collection the space type declares.
+        let unstatedAction = try SpacePermission.parse("space:com.atmoboards.forum?authority=*")
+        #expect(!unstatedAction.scopeParameters.wasStated("action"))
+        #expect(unstatedAction.action == [.read, .create, .update, .delete]) // the default, pre-expansion
+
+        let expanded = unstatedAction.withDefaultCollections([.nsid("com.atmoboards.thread")])
+        #expect(expanded.collection == [.nsid("com.atmoboards.thread")])
+        #expect(expanded.action == [.read]) // write verbs dropped; read verbs kept
+        #expect(!expanded.matches(target(operation: .write(.create, collection: "com.atmoboards.thread"))))
+        #expect(!expanded.matches(target(operation: .write(.update, collection: "com.atmoboards.thread"))))
+        #expect(!expanded.matches(target(operation: .write(.delete, collection: "com.atmoboards.thread"))))
+        // Reads still work — the point is narrowing the write surface, not
+        // silently revoking the grant altogether.
+        #expect(expanded.matches(target(authority: "did:plc:anyone", operation: Self.plainRead)))
+
+        // Positive control: a STATED write action must survive expansion
+        // unchanged — this guard narrows only what the client never asked
+        // for, not an ordinary, explicitly-requested write grant.
+        let statedAction = try SpacePermission.parse("space:com.atmoboards.forum?authority=*&action=create")
+        #expect(statedAction.scopeParameters.wasStated("action"))
+        let statedExpanded = statedAction.withDefaultCollections([.nsid("com.atmoboards.thread")])
+        #expect(statedExpanded.action == [.create])
+        #expect(statedExpanded.matches(target(operation: .write(.create, collection: "com.atmoboards.thread"))))
+
+        // A stated `read_self` (also not a write verb) survives untouched
+        // too, since the filter only ever removes create/update/delete.
+        let statedReadSelf = try SpacePermission.parse("space:com.atmoboards.forum?authority=*&action=read_self")
+        let readSelfExpanded = statedReadSelf.withDefaultCollections([.nsid("com.atmoboards.thread")])
+        #expect(readSelfExpanded.action == [.readSelf])
+    }
+
+    @Test
     func spaceWithResolvedAuthorityIsIdempotentAndPreservesConcreteAuthority() throws {
         let selfGrant = try SpacePermission.parse("space:com.atmoboards.forum")
         let resolved = selfGrant.withResolvedAuthority("did:plc:abc123xyz")
