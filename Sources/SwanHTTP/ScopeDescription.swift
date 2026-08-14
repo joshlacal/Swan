@@ -39,6 +39,14 @@ enum ConsentScope: Sendable, Hashable {
     struct SpaceGrant: Sendable, Hashable {
         let type: String        // NSID, or "*"
         let authority: String   // DID, "self" (unresolved default), or "*"
+        /// A specific record key, or "*" (default — every record). D19 gap
+        /// found in review: dropping this field made a single-record grant
+        /// (`skey=abc123`) and an every-record grant (`skey=*`, the default)
+        /// render identically. That's not a validation gap or a bridge-parser
+        /// artifact — it's information the renderer must show regardless of
+        /// how the scope was parsed, so it survives the `AtprotoScope.parse`
+        /// swap unchanged.
+        let skey: String
         let actions: [String]   // subset of read_self/read/create/update/delete
         let manage: [String]    // subset of create/update/delete (space lifecycle)
         let collection: [String]
@@ -75,9 +83,49 @@ enum ConsentScope: Sendable, Hashable {
         return .unrecognized(raw: raw)
     }
 
+    /// A recognised prefix with a REQUIRED field genuinely absent (no
+    /// positional value and no named form of it either — `space:`, `repo:`,
+    /// an `rpc:` with no `aud`) is not "this family with an edge-case
+    /// value"; it is missing the one thing the family cannot be described
+    /// without. `.unrecognized` for those is a presence check, not a
+    /// grammar check — it costs nothing borrowed from Lane 1's validator.
+    ///
+    /// What this deliberately still does NOT check: NSID/DID/record-key
+    /// *shape* (`space:short`, `space:...?skey=a/b`), enum membership
+    /// (`account:*` — attr must be email/repo/status), MIME structure
+    /// (`blob:image`), forbidden parameter combinations (`rpc:*?aud=*`),
+    /// or unknown query keys (`space:...?unknown=1`). Catching those means
+    /// re-deriving §4/§5's grammar here — the exact second-implementation
+    /// risk this bridge exists to avoid, and worse than the gap it would
+    /// close: a byte string with one of those defects is rejected at PAR
+    /// and never reaches a consent page in production (§4.8, §9-D5), so a
+    /// half-built shadow validator would spend real complexity on strings
+    /// this renderer will never actually see, while still not matching
+    /// `AtprotoScope` exactly. `ScopeDescriptionTests` asserts this
+    /// boundary against the pinned golden corpus precisely so it stays a
+    /// stated, checked gap rather than a silent one, and closes for real
+    /// the moment `classify` becomes an `AtprotoScope.parse` adapter.
+    ///
+    /// Two further divergence classes the corpus's 16 invalid entries do
+    /// NOT exercise, found by Lane 1 reading this file against the real
+    /// grammar rather than against the fixture: (1) a positional value AND
+    /// the named form of the same key both present (`account:email?attr=repo`)
+    /// — the real grammar hard-rejects this as `.positionalAndNamedConflict`;
+    /// this classifier's `positional ?? params[...]?.first` silently prefers
+    /// the positional value instead. (2) A single-valued key repeated
+    /// (`space:x?authority=a&authority=b`) — the real grammar hard-rejects
+    /// this as `.repeatedSingleValuedParameter`; here `params[...]?.first`
+    /// silently takes the first. Both would render a confident card for a
+    /// scope `AtprotoScope.parse` refuses outright. Neither is worth a
+    /// bespoke check here for the same reason as the gaps above — they
+    /// vanish for free on the swap.
     private static func classifyFamily(
         prefix: String, positional: String?, params: [String: [String]], raw: String
     ) -> ConsentScope {
+        // A present-but-empty positional (`space:`, `repo:`) means the same
+        // thing as an absent one for a REQUIRED field — treat both as nil so
+        // the guards below see "missing", not "empty string supplied".
+        let positional = positional.flatMap { $0.isEmpty ? nil : $0 }
         switch prefix {
         case "account":
             guard let attr = positional ?? params["attr"]?.first else { return .unrecognized(raw: raw) }
@@ -98,7 +146,11 @@ enum ConsentScope: Sendable, Hashable {
             return .repo(collection: collection, actions: params["action"] ?? ["create", "update", "delete"])
         case "rpc":
             let lxm = positional.map { [$0] } ?? (params["lxm"] ?? [])
-            guard !lxm.isEmpty, let aud = params["aud"]?.first else { return .unrecognized(raw: raw) }
+            // `aud` has no default (rpc-permission.ts:67-70) — genuinely
+            // required, unlike `authority`/`skey`/`action` elsewhere.
+            guard !lxm.isEmpty, let aud = params["aud"]?.first, !aud.isEmpty else {
+                return .unrecognized(raw: raw)
+            }
             return .rpc(aud: aud, lxm: lxm)
         case "space":
             guard let type = positional ?? params["type"]?.first else { return .unrecognized(raw: raw) }
@@ -106,6 +158,7 @@ enum ConsentScope: Sendable, Hashable {
                 SpaceGrant(
                     type: type,
                     authority: params["authority"]?.first ?? "self",
+                    skey: params["skey"]?.first ?? "*",
                     actions: params["action"] ?? ["read", "create", "update", "delete"],
                     manage: params["manage"] ?? [],
                     collection: params["collection"] ?? []
@@ -309,11 +362,22 @@ enum ScopeDescription {
 
     private static func spaceLabel(_ grant: ConsentScope.SpaceGrant) -> String {
         let typeLabel = grant.type == "*" ? "All spaces" : "<code>\(escape(grant.type))</code> spaces"
+        let base: String
         switch grant.authority {
-        case "*": return "\(typeLabel) on the network"
-        case "self": return "\(typeLabel) you own"
-        default: return "\(typeLabel) on <code>\(escape(grant.authority))</code>"
+        case "*": base = "\(typeLabel) on the network"
+        case "self": base = "\(typeLabel) you own"
+        default: base = "\(typeLabel) on <code>\(escape(grant.authority))</code>"
         }
+        guard grant.skey != "*" else { return base }
+        // A specific `skey` narrows the WHOLE grant — read, write, and
+        // manage alike — to one record, not just a subset of reads (§5.6.3's
+        // match arms all consult `skey` before any operation-specific
+        // check). This has to be visible in the label itself, not buried
+        // among the per-verb detail below, since it changes what every verb
+        // there actually means: found in review as a live D19 gap — without
+        // it, `skey=abc123` (one record) and the `skey=*` default (every
+        // record in the space) rendered identically.
+        return "\(base), limited to one record (<code>\(escape(grant.skey))</code>)"
     }
 
     /// S4.2 — the ONE canonical Phase-1 `include:` wording (§5.7.2, §9-D19),

@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 
 @testable import SwanHTTP
@@ -84,10 +85,32 @@ struct ScopeDescriptionTests {
         }
         #expect(grant.type == "app.bulleted.space")
         #expect(grant.authority == "self")
+        #expect(grant.skey == "*", "skey defaults to '*' — space-permission.ts:189")
         #expect(grant.action_readSelfOnly)
         #expect(Set(grant.manage) == ["create", "update", "delete"])
         #expect(grant.collection.isEmpty)
         #expect(!grant.isUniversal)
+    }
+
+    @Test("a specific skey narrows the WHOLE grant to one record, and that must be visible in the label")
+    func specificSkeyIsDisclosedInTheSpaceLabel() {
+        // Two grants differing ONLY in skey must not render identically —
+        // one lets the app touch a single record, the other every record
+        // in the space (found in review as a live D19 gap: skey was parsed
+        // but never disclosed).
+        let scoped = ScopeDescription.render(scopes: ["space:app.bulleted.space?skey=abc123"])
+        let unscoped = ScopeDescription.render(scopes: ["space:app.bulleted.space"])
+        #expect(scoped.contains("limited to one record"))
+        #expect(scoped.contains("<code>abc123</code>"))
+        #expect(!unscoped.contains("limited to one record"))
+        #expect(scoped != unscoped)
+
+        let scope = ConsentScope.classify("space:app.bulleted.space?skey=abc123")
+        guard case let .space(grant) = scope else {
+            Issue.record("expected .space, got \(scope)")
+            return
+        }
+        #expect(grant.skey == "abc123")
     }
 
     @Test("space:*?authority=* is universal")
@@ -100,11 +123,118 @@ struct ScopeDescriptionTests {
         #expect(grant.isUniversal)
     }
 
-    @Test("a byte string this bridge parser cannot place becomes .unrecognized, never dropped")
+    @Test("a byte string with no recognised family prefix becomes .unrecognized, never dropped")
     func classifiesUnrecognizedFallback() {
         #expect(ConsentScope.classify("bogus:foo") == .unrecognized(raw: "bogus:foo"))
-        // Malformed but prefix-matching input also falls back rather than crashing.
+        #expect(ConsentScope.classify("notafamily:whatever") == .unrecognized(raw: "notafamily:whatever"))
+        #expect(ConsentScope.classify("") == .unrecognized(raw: ""))
+    }
+
+    @Test("a recognised prefix with a REQUIRED field genuinely absent falls back, not confidently wrong")
+    func missingRequiredFieldFallsBackToUnrecognized() {
+        // Bare "account" — no attr at all, not even an empty one.
         #expect(ConsentScope.classify("account") == .unrecognized(raw: "account"))
+        // rpc: with lxm but no aud — aud has no default (rpc-permission.ts:67-70).
+        #expect(ConsentScope.classify("rpc:app.bsky.feed.getFeed") == .unrecognized(raw: "rpc:app.bsky.feed.getFeed"))
+        #expect(ConsentScope.classify("space:") == .unrecognized(raw: "space:"))
+        #expect(ConsentScope.classify("repo:") == .unrecognized(raw: "repo:"))
+    }
+
+    /// `ConsentScope` is a temporary stand-in for Lane 1's `AtprotoScope`,
+    /// not a reimplementation of §4/§5's grammar (`classifyFamily`'s doc
+    /// comment states exactly what it does and does not check, and why).
+    /// So this test does NOT assert full parity with upstream's parser —
+    /// that would require this file to duplicate the grammar it is
+    /// deliberately avoiding. It asserts the two narrower properties that
+    /// are true by design and checkable without a validator:
+    ///
+    /// 1. For every corpus entry upstream's own parser marks
+    ///    `isAtprotoOauthScope: true`, `classify` lands in the matching
+    ///    family — never `.unrecognized`. A valid scope silently swallowed
+    ///    into the fallback bucket is the failure this guards against.
+    /// 2. For every entry — valid OR invalid — the renderer still shows a
+    ///    row for it (D19: never drop one, `scope-description.tsx:178`'s
+    ///    fallback discipline). This does NOT assert a confident family
+    ///    for the invalid entries; several of them (`account:*`,
+    ///    `blob:image`, `rpc:*?aud=*`, `space:short`, six `skey=` variants,
+    ///    `space:...?unknown=1`) still land in a confident family card
+    ///    because their defect is a grammar-shape or enum-membership
+    ///    violation this classifier does not check — that gap is real,
+    ///    known, and closes when `classify` becomes an `AtprotoScope.parse`
+    ///    adapter, not before.
+    ///
+    /// Re-run after that swap: property 1 becomes the regression proof the
+    /// swap preserved behavior, and property 2's "still shows a row" should
+    /// continue to hold trivially since the raw list is unconditional.
+    @Test("classify() never silently drops a valid corpus scope, and render() never drops any corpus row")
+    func classifyAndRenderAgreeWithPinnedGoldenCorpus() throws {
+        let fixtureURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // SwanHTTPTests/
+            .deletingLastPathComponent()  // Tests/
+            .appendingPathComponent("SwanOAuthTests/Fixtures/pinned-typescript-oauth-scopes.json")
+        let data = try Data(contentsOf: fixtureURL)
+        let root = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let values = try #require(root["values"] as? [[String: Any]])
+        #expect(values.count == 52, "corpus shape changed — re-check this test against it")
+
+        let knownPrefixes = ["account", "blob", "identity", "include", "repo", "rpc", "space"]
+        var trueEntriesChecked = 0
+        var allEntriesChecked = 0
+        for entry in values {
+            let input = try #require(entry["input"] as? String)
+            // Upstream's own verdict — the independent oracle, not derived
+            // from this file's own prefix logic.
+            let isValid = try #require(entry["isAtprotoOauthScope"] as? Bool)
+
+            // Property 2, for every entry regardless of validity: never
+            // silently dropped from the page.
+            let rendered = ScopeDescription.render(scopes: [input])
+            #expect(
+                rendered.contains("<code>\(htmlEscapeForTest(input))</code>"),
+                "corpus entry \(input.debugDescription) missing from the advanced raw-scope list")
+            allEntriesChecked += 1
+
+            guard isValid else { continue }
+            // Property 1, only for entries upstream itself accepts:
+            // classify() must land in the matching family, never fall back.
+            // `atproto` and the three `transition:*` statics aren't one of
+            // the seven families and have their own exact-match cases.
+            let classified = ConsentScope.classify(input)
+            switch input {
+            case "atproto":
+                #expect(classified == .atproto)
+            case "transition:email":
+                #expect(classified == .transitionEmail)
+            case "transition:generic":
+                #expect(classified == .transitionGeneric)
+            case "transition:chat.bsky":
+                #expect(classified == .transitionChatBsky)
+            default:
+                let expectedPrefix = try #require(
+                    knownPrefixes.first { input == $0 || input.hasPrefix($0 + ":") || input.hasPrefix($0 + "?") },
+                    "valid corpus entry \(input.debugDescription) matches no known family prefix")
+                switch (expectedPrefix, classified) {
+                case ("account", .account), ("blob", .blob), ("identity", .identity), ("include", .include),
+                    ("repo", .repo), ("rpc", .rpc), ("space", .space):
+                    break
+                default:
+                    Issue.record(
+                        "valid corpus entry \(input.debugDescription) expected family \(expectedPrefix), classify() returned \(classified)"
+                    )
+                }
+            }
+            trueEntriesChecked += 1
+        }
+        #expect(allEntriesChecked == 52)
+        #expect(trueEntriesChecked == 36, "expected 36 isAtprotoOauthScope:true entries in the pinned corpus")
+    }
+
+    private func htmlEscapeForTest(_ value: String) -> String {
+        value.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&#39;")
     }
 
     // MARK: - ScopeDescription.render — S4.1a
@@ -134,7 +264,7 @@ struct ScopeDescriptionTests {
         #expect(html.contains("Spaces"))
         #expect(html.contains("app.bulleted.space"))
         #expect(html.contains("read only your own data"))
-        #expect(html.contains("update the space"))
+        #expect(html.contains("Update the space"))
     }
 
     @Test("type=='*' && authority=='*' triggers the universal-space warning; a scoped grant does not")
@@ -159,10 +289,9 @@ struct ScopeDescriptionTests {
     func includeRendersCanonicalWording() {
         let html = ScopeDescription.render(scopes: ["include:com.example.bar"])
         let text = stripTags(html)
-        #expect(
-            text.contains(
-                "Requested permission set com.example.bar. "
-                    + "Swan does not currently grant capabilities derived from this set."))
+        let expected =
+            "Requested permission set com.example.bar. Swan does not currently grant capabilities derived from this set."
+        #expect(text.contains(expected))
     }
 
     // MARK: - D11 / §9-D19 — transition:* recognised, grants nothing, never raw-only
