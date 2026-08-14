@@ -46,7 +46,7 @@ final class OAuthResourceAuthorizationTests: XCTestCase {
             fixedPath: Self.fixedPath,
             now: now
         )
-        XCTAssertEqual(context, .accountOAuth(subject: Self.subject, scopes: ["atproto", "transition:generic"]))
+        XCTAssertEqual(context, .accountOAuthForTesting(subject: Self.subject, scopes: ["atproto", "transition:generic"]))
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.root.appending(path: "actors").path))
         try await fixture.control.close()
     }

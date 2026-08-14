@@ -1,6 +1,7 @@
 import Crypto
 import Foundation
 import XCTest
+@testable import SwanCore
 @testable import SwanOAuth
 @testable import SwanSQLite
 @testable import SwanSpaces
@@ -8,20 +9,119 @@ import SwanCore
 import SwanStorage
 
 final class SwanOAuthTests: XCTestCase {
-    func testLocalhostQualifiedScopeEnvelopeRejectsAmbientAndMalformedTuples() throws {
-        let valid = "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=read"
+    /// Re-aimed for §9-D21. The envelope (`localhostRequestedScopes`) used to
+    /// carry a second issuance gate — `value == "atproto" || isIssuableQualified(value)`
+    /// — and this test asserted eight shapes bounced off it. D21 **deletes**
+    /// that gate rather than re-expressing it: the envelope is now a tokenizer
+    /// and a byte budget, nothing semantic. So every one of those shapes is
+    /// admitted here.
+    ///
+    /// **None of them is thereby granted anything.** Each was re-measured against
+    /// every layer, and each is still refused — the denial moved, it did not
+    /// disappear, which is exactly the claim §6.2 says must be checked rather
+    /// than assumed. Split accordingly: five are refused by the PARSER, three
+    /// are admitted by design and refused by the FENCES.
+    func testLocalhostScopeEnvelopeIsLexicalOnlyAndSemanticsMoveDownstream() throws {
+        let subject = "did:plc:abcdefghijklmnopqrstuvwx"
+        let valid = "space:app.example.space?authority=\(subject)&skey=whole-space&action=read"
         XCTAssertEqual(try OAuthClientMetadata.localhostRequestedScopes(valid), Set([valid]))
-        for invalid in [
+
+        // ── The envelope admits every one of them (D21 layer 1) ──────────────
+        let admittedByTheEnvelope = [
             "space:app.example.space",
             "space:*?authority=*&skey=*&action=read",
             "space:app.example.space?authority=not-a-did&skey=whole-space&action=read",
-            "space:not-an-nsid?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=read",
-            "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=*&action=read",
-            "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=anything",
-            "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=read&unknown=value",
-            "space:app.example.space?authority=did:plc:abcdefghijklmnopqrstuvwx&%61uthority=did:plc:abcdefghijklmnopqrstuvwx&skey=whole-space&action=read",
+            "space:not-an-nsid?authority=\(subject)&skey=whole-space&action=read",
+            "space:app.example.space?authority=\(subject)&skey=*&action=read",
+            "space:app.example.space?authority=\(subject)&skey=whole-space&action=anything",
+            "space:app.example.space?authority=\(subject)&skey=whole-space&action=read&unknown=value",
+            "space:app.example.space?authority=\(subject)&%61uthority=\(subject)&skey=whole-space&action=read",
+        ]
+        for scope in admittedByTheEnvelope {
+            XCTAssertNoThrow(
+                try OAuthClientMetadata.localhostRequestedScopes(scope),
+                """
+                §9-D21: the envelope is lexical + budget only. If this throws, a \
+                semantic gate has grown back at registration — the exact thing \
+                D21 deletes rather than relocates.
+                """
+            )
+        }
+
+        // ── Five are refused by the PARSER, each for its own stated reason ───
+        // Asserted with the reason, not merely "it throws": a vector that began
+        // failing for a different reason would otherwise look identical, and
+        // these five cover five different validator branches.
+        let refusedByTheParser: [(scope: String, because: String)] = [
+            ("space:app.example.space?authority=not-a-did&skey=whole-space&action=read",
+             "authority is not a DID"),
+            ("space:not-an-nsid?authority=\(subject)&skey=whole-space&action=read",
+             "the positional type is not an NSID"),
+            ("space:app.example.space?authority=\(subject)&skey=whole-space&action=anything",
+             "`anything` is not a SpaceAction"),
+            ("space:app.example.space?authority=\(subject)&skey=whole-space&action=read&unknown=value",
+             "`unknown` is not a declared parameter"),
+            // §7.3 D8 — a percent-decoded key collision. The two keys decode to
+            // the same name, so `single(\"authority\")` is `.repeated`. This is a
+            // real attack surface and the row §7.3 requires to STAY rejected.
+            ("space:app.example.space?authority=\(subject)&%61uthority=\(subject)&skey=whole-space&action=read",
+             "authority is single-valued and was supplied twice"),
+        ]
+        for vector in refusedByTheParser {
+            XCTAssertThrowsError(
+                try AtprotoScope.parse(vector.scope),
+                "must be refused at the parser — \(vector.because)"
+            )
+        }
+
+        // ── Three PARSE, and are held by the fences instead ──────────────────
+        // These are the shapes D21 deliberately admits. The property that
+        // replaced the gate is that they amplify into nothing: no delegation
+        // exchange, no aggregate listing, no write target.
+        for scope in [
+            "space:app.example.space",
+            "space:*?authority=*&skey=*&action=read",
+            "space:app.example.space?authority=\(subject)&skey=*&action=read",
         ] {
-            XCTAssertThrowsError(try OAuthClientMetadata.localhostRequestedScopes(invalid), invalid)
+            XCTAssertNoThrow(try AtprotoScope.parse(scope), "D21 admits this shape")
+            let permissions = SwanScopePermissions(rawScopes: ["atproto", scope], subject: subject)
+            XCTAssertTrue(permissions.rejected.isEmpty, scope)
+
+            // No write target, in any collection (M5): an empty `collection`
+            // list means NONE, not all.
+            for verb in [SpaceScopeTarget.Operation.RecordWrite.create, .update, .delete] {
+                XCTAssertFalse(
+                    permissions.allowsSpace(
+                        SpaceScopeTarget(
+                            type: "app.example.space",
+                            authority: subject,
+                            skey: "whole-space",
+                            operation: .write(verb, collection: "app.example.record")
+                        )
+                    ),
+                    "M5: \(scope) must have no write targets"
+                )
+            }
+            // No aggregate listing: the §6.1 fence needs literally-stated
+            // `skey=*` and a literal single `action=read`, carried as DURABLE
+            // provenance (§9-D23). A value reconstructed from the scope string —
+            // which is what this is — must never satisfy it.
+            XCTAssertFalse(
+                permissions.allowsSpaceListing(type: "app.example.space", authority: nil),
+                "§6.1: an aggregate listing needs stated provenance, not a re-parsed string"
+            )
+            // No delegation exchange, for the same reason (§5.6.3).
+            XCTAssertFalse(
+                permissions.allowsSpace(
+                    SpaceScopeTarget(
+                        type: "app.example.space",
+                        authority: subject,
+                        skey: "whole-space",
+                        operation: .delegationExchange
+                    )
+                ),
+                "§5.6.3: the delegation fence needs stated provenance"
+            )
         }
     }
 

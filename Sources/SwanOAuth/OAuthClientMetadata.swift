@@ -287,12 +287,15 @@ public struct OAuthClientMetadata: Codable, Sendable, Equatable {
                 return url
             }
         }
+        // Registration is LEXICAL ONLY and grants nothing (§9-D21). The
+        // `isIssuableQualified` allow-list that stood here was the registration
+        // half of a semantic gate that is retired, not relocated: upstream
+        // validates `OAuthClientMetadata.scope` with `oauthScopeSchema`
+        // (`oauth-types/src/oauth-client-metadata.ts:36` → `oauth-scope.ts:17-19`)
+        // = `OAUTH_SCOPE_REGEXP` and nothing else — no dictionary of permission
+        // families at all. An unknown or future scope name registers fine and is
+        // refused later, at PAR, if it is actually requested.
         let scope = try parseScopes(items.first(where: { $0.name == "scope" })?.value ?? "atproto")
-        guard scope.allSatisfy({
-            $0 == "atproto" || PermissionedSpaceScopeSyntax.isIssuableQualified($0)
-        }) else {
-            throw SwanError.malformed("invalid localhost development scope")
-        }
         return try Self(
             clientID: clientID,
             applicationType: .native,
@@ -332,7 +335,19 @@ public struct OAuthClientMetadata: Codable, Sendable, Equatable {
         try validateHTTPSClientID(url)
     }
 
-    private func validate() throws {
+    /// `internal`, not `private`, because §7.4 Stage 2 of the OAuth
+    /// permission-scopes spec asserts against this method **directly** — see
+    /// `Tests/SwanHTTPTests/RemoteClientPermissionedScopeE2ETests.swift`, which
+    /// reaches it through `@testable import`. Stage 2 is the stage that failed
+    /// hardest before §9-D21: `:343-344` gated the issuable-scope disjunct behind
+    /// `isLocalhostDevelopmentClient &&`, so a remote client could carry only a
+    /// bare `atproto`. Do not narrow this back on the reasonable-looking grounds
+    /// that nothing in `Sources/` calls it from outside the type.
+    ///
+    /// It stays non-`public`: the invariant is still that callers get a
+    /// validated value from the initializer, which is the only production caller
+    /// (`:151`).
+    func validate() throws {
         if isLocalhostDevelopmentClient {
             guard Self.isExactLocalhostDevelopmentClientID(clientID) else {
                 throw SwanError.malformed("invalid localhost development client_id")
@@ -340,12 +355,42 @@ public struct OAuthClientMetadata: Codable, Sendable, Equatable {
         } else {
             try Self.validateHTTPSClientID(clientID)
         }
-        let hasResourceScope = scopes.contains("atproto") ||
-            (isLocalhostDevelopmentClient && scopes.contains(where: PermissionedSpaceScopeSyntax.isIssuableQualified))
+        // Metadata validation keeps NO scope predicate at all — not the
+        // resource-scope disjunct, and not the `scopes.contains("atproto")` arm
+        // either (§9-D21). A base-scope requirement at registration is semantic
+        // registration policy, and the four-layer boundary puts every semantic
+        // question at PAR/admission, where the client is actually asking for
+        // something. The floor lives there and only there
+        // (`OAuthScopeAdmissionPolicy`, stage E) and reports `invalid_scope`.
+        // Layer 1's floor, and it must live HERE rather than only in
+        // `parseScopes`. `parseScopes` runs on the two paths that build scopes
+        // from a string — the Decodable init (`:186`) and the localhost
+        // query-string form (`:298`) — but the public memberwise initializer
+        // (`:76-113`) takes a `Set<String>` already split, so it reaches neither.
+        // `validate()` is the one funnel every construction path passes through,
+        // which makes it the only place the floor actually holds.
+        //
+        // This is not belt-and-braces: after §9-D21 the lexical floor is the
+        // ENTIRE defence at registration. A floor that admitted `"` (0x22) or
+        // `\` (0x5C) would be looser than upstream's `OAUTH_SCOPE_REGEXP`
+        // (`oauth-types/src/oauth-scope.ts:5-6`), which is the whole of
+        // upstream's client-metadata scope validation — so retiring the
+        // semantic gate would have widened the layer rather than relocating it.
+        //
+        // Routed through `ScopeToken.isScopeToken` and `OAuthScopeBudget.rawInput`
+        // so there is ONE charset and ONE budget shared with both wire
+        // tokenizers, rather than a second copy here that can drift.
+        let declaredWireForm = scopes.sorted().joined(separator: " ")
+        guard !scopes.isEmpty,
+              scopes.count <= OAuthScopeBudget.rawInput.scopeCount,
+              scopes.allSatisfy(ScopeToken.isScopeToken),
+              scopes.allSatisfy({ $0.utf8.count <= OAuthScopeBudget.rawInput.bytesPerScope }),
+              declaredWireForm.utf8.count <= OAuthScopeBudget.rawInput.bytesPerSet else {
+            throw SwanError.malformed("OAuth client metadata scope is not a valid scope-token list")
+        }
         guard !redirectURIs.isEmpty,
               grantTypes.contains("authorization_code"),
               responseTypes.contains("code"),
-              hasResourceScope,
               dpopBoundAccessTokens else {
             throw SwanError.malformed("OAuth client metadata misses a required AT Protocol field")
         }
@@ -435,33 +480,47 @@ public struct OAuthClientMetadata: Codable, Sendable, Equatable {
         }
     }
 
+    /// Client-metadata `scope` validation — stage D, and the whole of layer 1.
+    ///
+    /// Lexical and budgeted, nothing more (§9-D21). The old predicate
+    /// `$0 > 0x20 && $0 < 0x7F` admitted `"` (0x22) and `\` (0x5C), which RFC
+    /// 6749 §3.3 excludes and upstream's `OAUTH_SCOPE_REGEXP` excludes with it;
+    /// `ScopeToken.isScopeToken` is that charset exactly.
     private static func parseScopes(_ raw: String) throws -> Set<String> {
-        let values = raw.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-        guard !values.isEmpty, values.count == Set(values).count,
-              values.allSatisfy({ value in
-                  !value.isEmpty && value.utf8.allSatisfy { $0 > 0x20 && $0 < 0x7F }
-              }) else {
+        do {
+            return try OAuthScopeTokenizer.tokenize(raw)
+        } catch {
             throw SwanError.malformed("OAuth scope declaration is invalid")
         }
-        return Set(values)
     }
 
-    /// Parses a scope parameter from the localhost virtual-client flow. The
-    /// virtual metadata itself is the allow-list, and qualified grants use
-    /// the issuer-side grammar rather than the resource server's deliberately
-    /// more permissive wildcard matcher.
+    /// Stage A′ — the localhost bridge's wire tokenizer.
+    ///
+    /// It used to be a tokenizer **and** a second issuance gate,
+    /// `value == "atproto" || isIssuableQualified(value)`. That gate is DELETED,
+    /// not re-expressed over the new parser (§9-D21): A′ is now tokenizer plus
+    /// raw-input budget, matching stage A exactly, and every semantic question
+    /// moves to stage B/E.
+    ///
+    /// Deleting it is what makes the localhost flow usable at all:
+    /// `isIssuableQualified` admits ZERO of bulleted.app's five scopes, so
+    /// leaving A′ alone would have left this path rejecting four of five even
+    /// after the rest of the grammar shipped. The dangers the gate reached for —
+    /// a defaulted `self` authority, a `skey=*`, a defaulted action set — are
+    /// handled at the resource plane by the delegation and listing provenance
+    /// fences, which are the layer that can see what is being asked for.
+    ///
+    /// The own 4096-byte per-token cap goes with it: it was the fifth of five
+    /// disagreeing caps and the one that would have survived an incomplete
+    /// unification, leaving this path admitting 4096-byte tokens while every
+    /// other layer capped at 1024 (§6.4).
     public static func localhostRequestedScopes(_ raw: String?) throws -> Set<String>? {
         guard let raw else { return nil }
-        let values = raw.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-        guard !values.isEmpty, values.count <= 64, values.count == Set(values).count,
-              values.allSatisfy({ value in
-                  value.utf8.count <= 4_096 &&
-                      value.utf8.allSatisfy { $0 > 0x20 && $0 < 0x7F } &&
-                      (value == "atproto" || PermissionedSpaceScopeSyntax.isIssuableQualified(value))
-              }) else {
+        do {
+            return try OAuthScopeTokenizer.tokenize(raw)
+        } catch {
             throw SwanError.malformed("localhost OAuth scope is invalid")
         }
-        return Set(values)
     }
 
     private static func isVirtualLocalhostRedirect(_ url: URL) -> Bool {

@@ -313,6 +313,76 @@
       "roundTripStable": null
     },
     {
+      "input": "account:email?attr=repo",
+      "isAtprotoOauthScope": false,
+      "canonical": null,
+      "threw": null,
+      "roundTripStable": null
+    },
+    {
+      "input": "identity:handle?attr=*",
+      "isAtprotoOauthScope": false,
+      "canonical": null,
+      "threw": null,
+      "roundTripStable": null
+    },
+    {
+      "input": "space:com.example.type?type=com.other.type",
+      "isAtprotoOauthScope": false,
+      "canonical": null,
+      "threw": null,
+      "roundTripStable": null
+    },
+    {
+      "input": "rpc:com.example.method1?aud=did:web:example.com&lxm=com.example.method2",
+      "isAtprotoOauthScope": false,
+      "canonical": null,
+      "threw": null,
+      "roundTripStable": null
+    },
+    {
+      "input": "account?attr=email&attr=repo",
+      "isAtprotoOauthScope": false,
+      "canonical": null,
+      "threw": null,
+      "roundTripStable": null
+    },
+    {
+      "input": "include:com.example.foo?aud=did:web:example.com%23a&aud=did:web:example.com%23b",
+      "isAtprotoOauthScope": false,
+      "canonical": null,
+      "threw": null,
+      "roundTripStable": null
+    },
+    {
+      "input": "rpc:com.example.method?aud=did:web:example.com%23a&aud=did:web:example.com%23b",
+      "isAtprotoOauthScope": false,
+      "canonical": null,
+      "threw": null,
+      "roundTripStable": null
+    },
+    {
+      "input": "space:com.example.type?authority=did:plc:aaa&authority=did:plc:bbb",
+      "isAtprotoOauthScope": false,
+      "canonical": null,
+      "threw": null,
+      "roundTripStable": null
+    },
+    {
+      "input": "space:com.example.type?skey=abc&skey=def",
+      "isAtprotoOauthScope": false,
+      "canonical": null,
+      "threw": null,
+      "roundTripStable": null
+    },
+    {
+      "input": "repo:com%2Eexample%2Efoo",
+      "isAtprotoOauthScope": true,
+      "canonical": "repo:com.example.foo",
+      "threw": null,
+      "roundTripStable": true
+    },
+    {
       "input": "",
       "isAtprotoOauthScope": false,
       "canonical": null,
@@ -427,13 +497,13 @@
             "arg": {
               "mime": "image/png"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
               "mime": "image/svg+xml"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
@@ -760,7 +830,7 @@
               "skey": "default",
               "action": "read"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
@@ -801,7 +871,7 @@
               "action": "create",
               "collection": "app.bsky.feed.post"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
@@ -933,21 +1003,21 @@
               "action": "create",
               "collection": "app.bsky.feed.post"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
               "action": "delete",
               "collection": "app.bsky.feed.post"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
               "action": "create",
               "collection": "app.bsky.graph.follow"
             },
-            "allowed": false
+            "allowed": true
           }
         ],
         "blob": [
@@ -1087,13 +1157,13 @@
             "arg": {
               "mime": "image/png"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
               "mime": "image/svg+xml"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
@@ -1255,7 +1325,7 @@
             "arg": {
               "attr": "handle"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {

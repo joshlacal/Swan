@@ -269,9 +269,13 @@ public actor SQLitePreMigratedAccountDirectory:
         guard !isClosed else {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
-        guard case let .accountOAuth(subject, scopes) = authorization,
+        // `hasBaseATProtocolScope` is the SAME predicate this site spelled
+        // before — literal `atproto`, narrower than the resource floor, so a
+        // space-only grant is still refused here. §6.5.1: do NOT "fix" this to
+        // `hasResourceScope` while migrating.
+        guard case let .accountOAuth(subject, permissions) = authorization,
               subject == space.authority,
-              scopes.contains("atproto") else {
+              permissions.hasBaseATProtocolScope else {
             throw SwanError.unauthorized("authority account OAuth with atproto scope is required")
         }
 

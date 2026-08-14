@@ -130,14 +130,33 @@ public enum LocalSemanticInteropRunner {
             let firstValue = canonicalRecord(text: "first")
             let secondValue = canonicalRecord(text: "second")
             let updatedFirstValue = canonicalRecord(text: "updated")
+            // Provenance is supplied explicitly because this lab harness IS the
+            // issuer for its own grants: every key below is literally written
+            // in the string beside it. It must never be re-derived from the
+            // strings themselves (§9-D23) — that is the defect the durable
+            // record exists to prevent, and a harness that re-derived it would
+            // pass while production failed.
+            let readScope =
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=read"
+            let createScope =
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=create&collection=*"
+            let updateScope =
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=update&collection=*"
+            let deleteScope =
+                "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=delete&collection=*"
+            let writeKeys: Set<String> = ["authority", "skey", "action", "collection"]
             let authorized = AuthorizationContext.accountOAuth(
                 subject: author,
-                scopes: [
-                    "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=read",
-                    "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=create&collection=*",
-                    "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=update&collection=*",
-                    "space:app.bsky.bookmarks?authority=did:plc:alice&skey=self&action=delete&collection=*",
-                ]
+                permissions: SwanScopePermissions(
+                    rawScopes: [readScope, createScope, updateScope, deleteScope],
+                    subject: author,
+                    statedKeys: [
+                        readScope: ["authority", "skey", "action"],
+                        createScope: writeKeys,
+                        updateScope: writeKeys,
+                        deleteScope: writeKeys,
+                    ]
+                )
             )
 
             let sourceRoot = root.appending(path: "source", directoryHint: .isDirectory)

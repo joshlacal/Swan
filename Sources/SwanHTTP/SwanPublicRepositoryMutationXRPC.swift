@@ -446,8 +446,19 @@ private func authorizedPublicMutationSubject(
     } catch {
         throw PublicMutationFailure.unavailable
     }
-    guard case let .accountOAuth(subject, scopes) = authorization,
-          scopes.contains("atproto") else { throw PublicMutationFailure.unauthorized }
+    // NOT YET PORTED (§6.5.10), and this is the concrete route §6.1's
+    // `hasResourceScope` doc refers to: this single guard covers every repo
+    // write AND blob upload. Upstream asserts `assertRepo({action, collection})`
+    // on `repo/{createRecord.ts:64, putRecord.ts:82 AND :86, deleteRecord.ts:60,
+    // applyWrites.ts:118}` and `assertBlob({mime: encoding})` on
+    // `repo/uploadBlob.ts:16` — with `mime` read from the Content-Type HEADER,
+    // not the body, which is the porting detail most easily lost.
+    //
+    // Widening `hasResourceScope` to admit `repo:` or `blob:` BEFORE this row
+    // is ported hands such a token an unchecked write. The two are one change,
+    // not two.
+    guard case let .accountOAuth(subject, permissions) = authorization,
+          permissions.hasBaseATProtocolScope else { throw PublicMutationFailure.unauthorized }
     return subject
 }
 

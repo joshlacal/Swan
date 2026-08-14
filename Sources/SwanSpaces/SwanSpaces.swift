@@ -218,7 +218,15 @@ public struct SpaceGrant: Codable, Sendable, Equatable {
 /// unauditable `authenticated: Bool` escape hatch.
 public enum AuthorizationContext: Sendable, Equatable {
     case `public`
-    case accountOAuth(subject: String, scopes: Set<String>)
+    /// Carries a parsed, frozen permissions value rather than raw strings
+    /// (§6.5.1). This is the single highest-leverage change in the scope
+    /// rollout: it moves parsing from "every predicate, every call" to "once,
+    /// at the boundary that already validated the token"
+    /// (`SwanOAuthResourceAuthorization.swift:145-160`).
+    ///
+    /// `SwanScopePermissions` is `Sendable, Equatable, Hashable`, so this
+    /// enum's existing conformance is preserved with no `@unchecked` anywhere.
+    case accountOAuth(subject: String, permissions: SwanScopePermissions)
     /// A short-lived, signature-verified user-to-space-host delegation. This
     /// context exists only while the authority evaluates whether that user may
     /// exchange it for a read credential. It is deliberately not a repository
@@ -258,9 +266,20 @@ public enum SpaceAuthorizationPolicy {
             }
         case .spaceDelegation:
             throw SwanError.unauthorized("delegation tokens cannot access repositories")
-        case let .accountOAuth(subject, scopes):
+        case let .accountOAuth(subject, permissions):
+            // A `.manage` DOMAIN permission reaching the record path is a
+            // denial, preserving today's unsatisfiable-by-construction
+            // behaviour explicitly rather than by accident (§6.2). Likewise a
+            // write naming no collection: `SpaceScopeTarget.record` returns
+            // `nil` rather than widening it into a collection-free write.
             guard subject == author,
-                  scopeAllows(scopes, space: space, permission: permission, collection: uri?.collection)
+                  let action = SpaceRecordAction(permission),
+                  let target = SpaceScopeTarget.record(
+                      space,
+                      action: action,
+                      collection: uri?.collection
+                  ),
+                  permissions.allowsSpace(target)
             else {
                 throw SwanError.unauthorized("OAuth scope does not cover this space operation")
             }
@@ -283,137 +302,20 @@ public enum SpaceAuthorizationPolicy {
         authorization: AuthorizationContext,
         operation: SimpleSpaceManagementOperation
     ) throws {
-        guard case let .accountOAuth(subject, scopes) = authorization,
+        guard case let .accountOAuth(subject, permissions) = authorization,
               subject == space.authority else {
             throw SwanError.unauthorized("authority account OAuth is required")
         }
-        if scopes.contains("atproto") { return }
-        guard scopes.contains(where: {
-            managementScopeAllows($0, space: space, operation: operation)
-        }) else {
+        // The ambient `atproto` bypass is preserved verbatim and stays gated on
+        // `subject == space.authority` above (§6.5.6). Worth stating: this
+        // bypass is *stricter* than upstream's transition scopes, which never
+        // reach a space at all (`scope-permissions-transition.ts:55-61`) —
+        // Swan's applies only to an account acting on its own authority, so it
+        // is not the same hazard.
+        if permissions.hasBaseATProtocolScope { return }
+        guard permissions.allowsSpace(.manage(space, operation: operation)) else {
             throw SwanError.unauthorized("OAuth scope does not cover this space management operation")
         }
-    }
-
-    private static func scopeAllows(
-        _ scopes: Set<String>,
-        space: SpaceURI,
-        permission: SpacePermission,
-        collection: String?
-    ) -> Bool {
-        let action = permission.rawValue
-        // Shared OAuth boundaries reject unqualified grants. This domain
-        // matcher is also fail-closed: a qualified grant must explicitly
-        // cover this type/authority/skey/action/collection. The pinned
-        // matcher treats a literal `*` in each tuple dimension as overlap;
-        // it is not a prefix or substring match. A bare `space:<type>` grant
-        // has no trusted authority or action context, and is not normalized
-        // here.
-        return scopes.contains { scope in
-            guard let type = scopeType(scope),
-                  tupleElement(type, matches: space.spaceType),
-                  PermissionedSpaceScopeSyntax.isQualified(scope),
-              let parameters = strictQueryParameters(
-                    String(scope.dropFirst(scopeTypePrefixLength(scope)))
-                  ),
-                  parameters.keys.allSatisfy({
-                      ["authority", "skey", "action", "collection"].contains($0)
-                  }),
-                  parameters["manage"] == nil,
-                  tupleElement(parameters["authority"], matches: space.authority),
-                  tupleElement(parameters["skey"], matches: space.skey),
-                  parameters["action"] == action
-            else {
-                return false
-            }
-            if permission == .read {
-                // A collection-qualified grant may read only that collection's
-                // individual records. Aggregate surfaces must not silently
-                // censor their response; they require an unqualified or
-                // wildcard collection grant instead.
-                guard let collection else {
-                    return parameters["collection"] == nil || parameters["collection"] == "*"
-                }
-                return parameters["collection"] == nil
-                    || parameters["collection"] == "*"
-                    || parameters["collection"] == collection
-            }
-            // Space-management operations address the authority state rather
-            // than one repository record, so their scoped grant has no
-            // collection component.  Treating that as an implicit denial
-            // would make a syntactically valid `action=manage` scope useless.
-            guard collection == nil else {
-                return parameters["collection"] == collection
-                    || parameters["collection"] == "*"
-            }
-            return parameters["collection"] == nil || parameters["collection"] == "*"
-        }
-    }
-
-    private static func managementScopeAllows(
-        _ scope: String,
-        space: SpaceURI,
-        operation: SimpleSpaceManagementOperation
-    ) -> Bool {
-        guard let type = scopeType(scope),
-              tupleElement(type, matches: space.spaceType),
-              PermissionedSpaceScopeSyntax.isQualified(scope),
-              let parameters = strictQueryParameters(
-                String(scope.dropFirst(scopeTypePrefixLength(scope)))
-              ),
-              Set(parameters.keys) == ["authority", "skey", "manage"],
-              tupleElement(parameters["authority"], matches: space.authority),
-              tupleElement(parameters["skey"], matches: space.skey),
-              parameters["manage"] == operation.rawValue,
-              parameters["action"] == nil,
-              parameters["collection"] == nil else {
-            return false
-        }
-        return true
-    }
-
-    /// Parses only the compact query grammar used by scoped space grants.
-    /// Every key is single-valued and percent-decoded before comparison, so a
-    /// prefix (`action=creates`) or duplicate-key (`action=create&action=...`)
-    /// trick cannot broaden an authorization decision.
-    private static func strictQueryParameters(_ query: String) -> [String: String]? {
-        guard !query.isEmpty else { return nil }
-        var parameters: [String: String] = [:]
-        for segment in query.split(separator: "&", omittingEmptySubsequences: false) {
-            let pair = segment.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-            guard pair.count == 2,
-                  !pair[0].isEmpty,
-                  let key = String(pair[0]).removingPercentEncoding,
-                  let value = String(pair[1]).removingPercentEncoding,
-                  parameters[key] == nil
-            else {
-                return nil
-            }
-            parameters[key] = value
-        }
-        return parameters
-    }
-
-    private static func scopeType(_ scope: String) -> String? {
-        let prefix = "space:"
-        guard scope.hasPrefix(prefix),
-              let queryStart = scope.firstIndex(of: "?") else {
-            return nil
-        }
-        let typeStart = scope.index(scope.startIndex, offsetBy: prefix.count)
-        guard typeStart < queryStart else { return nil }
-        return String(scope[typeStart..<queryStart])
-    }
-
-    private static func scopeTypePrefixLength(_ scope: String) -> Int {
-        guard let queryStart = scope.firstIndex(of: "?") else {
-            return 0
-        }
-        return scope.distance(from: scope.startIndex, to: queryStart) + 1
-    }
-
-    private static func tupleElement(_ grant: String?, matches target: String) -> Bool {
-        grant == target || grant == "*"
     }
 }
 

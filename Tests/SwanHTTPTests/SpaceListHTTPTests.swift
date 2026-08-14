@@ -137,8 +137,8 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
             let ownerRepository = try DurableSpaceRepository(database: database, space: duplicate, author: Self.alice)
             let ownerRecord = try SpaceRecordURI(space: duplicate, author: Self.alice, collection: "app.example.records", rkey: "duplicate")
             _ = try await ownerRepository.apply(.put(uri: ownerRecord, value: Data([0xa0])), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: "3k2l5u2q6za2z"), authorization: createAuthorization(for: duplicate))
-            _ = try await database.createSimpleSpace(space: deleted, owner: Self.alice, configuration: .init(policy: .public, appAccess: .open), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
-            _ = try await database.deleteSimpleSpace(space: deleted, authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+            _ = try await database.createSimpleSpace(space: deleted, owner: Self.alice, configuration: .init(policy: .public, appAccess: .open), authorization: .accountOAuthForTesting(subject: Self.alice, scopes: ["atproto"]))
+            _ = try await database.deleteSimpleSpace(space: deleted, authorization: .accountOAuthForTesting(subject: Self.alice, scopes: ["atproto"]))
             try await database.receiveSpaceDeletionNotification(space: tombstoned, issuer: Self.bob, audience: Self.alice, eventID: "tombstone-list")
             let page = try await database.hostedSpaceURIs(spaceType: nil, authority: nil, cursor: nil, limit: 100)
             XCTAssertEqual(page, [duplicate])
@@ -186,7 +186,7 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
         do {
             _ = try await control.createAccount(try registration(did: Self.alice, handle: "alice.example.com"))
             let database = try await SQLiteAccountDatabase(dataDirectory: root, did: Self.alice)
-            _ = try await database.createSimpleSpace(space: owner, owner: Self.alice, configuration: .init(policy: .public, appAccess: .open), authorization: .accountOAuth(subject: Self.alice, scopes: ["atproto"]))
+            _ = try await database.createSimpleSpace(space: owner, owner: Self.alice, configuration: .init(policy: .public, appAccess: .open), authorization: .accountOAuthForTesting(subject: Self.alice, scopes: ["atproto"]))
             if includeRemoteRepository {
                 let repository = try DurableSpaceRepository(database: database, space: remote, author: Self.alice)
                 let uri = try SpaceRecordURI(space: remote, author: Self.alice, collection: "app.example.records", rkey: "one")
@@ -219,7 +219,7 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
     }
 
     private func createAuthorization(for space: SpaceURI) -> AuthorizationContext {
-        .accountOAuth(
+        .accountOAuthForTesting(
             subject: Self.alice,
             scopes: [
                 "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&action=create&collection=app.example.records",
@@ -228,7 +228,7 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
     }
 
     private func readAuthorization(for space: SpaceURI) -> AuthorizationContext {
-        .accountOAuth(
+        .accountOAuthForTesting(
             subject: Self.alice,
             scopes: [
                 "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&action=read",

@@ -142,7 +142,31 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         // collection decision for the selected operation. Do not let a
         // malformed or legacy stored binding reach that domain policy merely
         // because its DPoP proof and opaque token digest were otherwise valid.
-        guard Self.hasATProtocolResourceScope(grant.scopes) else {
+        //
+        // Parse ONCE, here, and hand a frozen value to the domain layer
+        // (§6.5.1, §6.5.2). `hasResourceScope` is `atproto`-or-`space:` only —
+        // deliberately NOT "any recognised family" (§6.1). Several routes
+        // perform no further scope check at all, so widening this floor would
+        // hand an `identity:`- or `blob:`-only token an unguarded route.
+        //
+        // `statedKeys` is DURABLE provenance (§9-D23), read from the token
+        // family's stored record via `AccessGrant.scopeProvenance`. It must
+        // NEVER be derived here: re-parsing `grant.scopes` would INVENT
+        // provenance for a mint-resolved `self` (flipping the delegation fence
+        // open) and DESTROY it for a canonical `skey=*` (silently disabling the
+        // listing fence). The two failures run in opposite directions, which is
+        // why no parser change can substitute for the stored bits.
+        //
+        // `statedScopeKeys` is non-optional and keyed by the effective scope
+        // string, i.e. the members of `grant.scopes`. A family with no
+        // persisted record yields `[:]`, which is the fail-closed case: absent
+        // bits deny, they never grant.
+        let permissions = SwanScopePermissions(
+            rawScopes: grant.scopes,
+            subject: grant.subject,
+            statedKeys: grant.statedScopeKeys
+        )
+        guard permissions.hasResourceScope else {
             throw SwanResourceAuthorizationFailure.denied
         }
 
@@ -157,7 +181,7 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
             throw Self.accountFailure(for: error)
         }
 
-        return .accountOAuth(subject: grant.subject, scopes: grant.scopes)
+        return .accountOAuth(subject: grant.subject, permissions: permissions)
     }
 
     private static func accessToken(from headers: HTTPFields) throws -> String {
@@ -201,12 +225,6 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
             }
         }
         return true
-    }
-
-    private static func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
-        scopes.contains("atproto") || scopes.contains { scope in
-            PermissionedSpaceScopeSyntax.isQualified(scope)
-        }
     }
 
     private static func dpopProof(from headers: HTTPFields) -> String? {
