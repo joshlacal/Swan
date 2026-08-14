@@ -400,9 +400,15 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
           XCTAssertFalse(Data(buffer: response.body).description.contains(self.password))
         }
         let originalRefresh = try XCTUnwrap(refreshToken)
+        // The rotation uses the shape the atproto-oauth Rust crate actually
+        // sends — `redirect_uri` included — which the parser accepts and
+        // ignores (RFC 6749 gives it no role in this grant). Refusing it
+        // failed every Bulleted session at its first refresh. The reuse
+        // attempt below keeps the bare RFC shape so both stay exercised.
         let refreshForm = self.form([
           ("grant_type", "refresh_token"), ("client_id", self.clientID.absoluteString),
           ("refresh_token", originalRefresh),
+          ("redirect_uri", self.redirectURI.absoluteString),
         ])
         let refreshProof = try self.dpop(
           dpopKey, dpopJWK, jti: "remote-public-refresh", nonce: try XCTUnwrap(tokenNonce),
@@ -419,9 +425,13 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
         let reuseProof = try self.dpop(
           dpopKey, dpopJWK, jti: "remote-public-reuse", nonce: try XCTUnwrap(tokenNonce),
           target: tokenTarget)
+        let bareRefreshForm = self.form([
+          ("grant_type", "refresh_token"), ("client_id", self.clientID.absoluteString),
+          ("refresh_token", originalRefresh),
+        ])
         try await client.execute(
           uri: "/oauth/token", method: .post, headers: formHeaders(dpop: reuseProof),
-          body: ByteBuffer(string: refreshForm)
+          body: ByteBuffer(string: bareRefreshForm)
         ) { response in
           XCTAssertEqual(response.status, .badRequest)
           XCTAssertEqual(try self.error(response.body), "invalid_grant")

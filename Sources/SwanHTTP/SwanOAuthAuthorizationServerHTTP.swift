@@ -1026,9 +1026,21 @@ private func parseOAuthServerTokenForm(
       refreshToken: nil, clientAssertionType: fields["client_assertion_type"],
       clientAssertion: fields["client_assertion"])
   case .refreshToken:
+    // The atproto-oauth Rust crate sends the registered redirect_uri with
+    // every refresh. RFC 6749 gives it no role in this grant — the family
+    // is already bound to its client — so it is bounds-checked and ignored
+    // rather than refused: refusing it broke every Bulleted session at its
+    // first refresh while the sign-in that minted the family succeeded.
+    var keys = Set(fields.keys)
+    if let redirectText = fields["redirect_uri"] {
+      guard redirectText.utf8.count <= 4_096, oauthServerExactURL(redirectText) != nil else {
+        throw OAuthServerRequestError.malformed
+      }
+      keys.remove("redirect_uri")
+    }
     let expected = common.union(["refresh_token"])
     let expectedWithAssertion = expected.union(["client_assertion_type", "client_assertion"])
-    guard Set(fields.keys) == expected || Set(fields.keys) == expectedWithAssertion,
+    guard keys == expected || keys == expectedWithAssertion,
       let refresh = fields["refresh_token"], oauthServerOpaqueToken(refresh)
     else {
       throw OAuthServerRequestError.malformed
