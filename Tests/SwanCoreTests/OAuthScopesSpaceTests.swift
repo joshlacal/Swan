@@ -326,6 +326,25 @@ struct OAuthScopesSpaceTests {
         #expect(wildcard.withResolvedAuthority("did:plc:abc123xyz").authority == .any) // unchanged
     }
 
+    @Test
+    func resolvingSelfFailsClosedOnNilSubjectAndDelegatesOtherwise() throws {
+        // §6.1: `nil` subject == fail closed — the grant comes back unresolved
+        // and therefore matches nothing (§5.6.3 step 2).
+        let selfGrant = try SpacePermission.parse("space:com.atmoboards.forum")
+        let unresolved = selfGrant.resolvingSelf(as: nil)
+        #expect(unresolved.authority == .unresolvedSelf)
+        #expect(!unresolved.matches(target(operation: Self.plainRead)))
+
+        // A concrete subject delegates to withResolvedAuthority.
+        let resolved = selfGrant.resolvingSelf(as: "did:plc:abc123xyz")
+        #expect(resolved.authority == .did("did:plc:abc123xyz"))
+
+        // Idempotent under repeated calls, including a mixed nil-then-concrete
+        // sequence a caller might run once at mint and again at match time.
+        #expect(resolved.resolvingSelf(as: "did:plc:different").authority == .did("did:plc:abc123xyz"))
+        #expect(resolved.resolvingSelf(as: nil).authority == .did("did:plc:abc123xyz"))
+    }
+
     // MARK: §9-D23 / delegation-fence relocation — the facade owns the fence now
 
     @Test

@@ -404,10 +404,11 @@ extension SpacePermission {
     /// **Provenance-preserving (§9-D23).** Resolving `self` changes `authority`'s
     /// VALUE only — never whether the client stated it. A naive rebuild through
     /// the public memberwise initializer would mark `authority` `.stated`
-    /// unconditionally, which flips `isExactReadOnlyDelegationGrant` from
-    /// correctly-refusing to incorrectly-granting for every `self`-defaulted
-    /// grant once resolved. See ScopeParameterValues's doc comment for the
-    /// worked example.
+    /// unconditionally, which would let a `self`-defaulted grant look literal
+    /// to any consumer reading `wasStated("authority")` post-resolution — the
+    /// exact amplification the facade's durable-provenance delegation fence
+    /// (§9-D23, §6.1) exists to refuse. See ScopeParameterValues's doc comment
+    /// for the worked example.
     public func withResolvedAuthority(_ userDID: String) -> SpacePermission {
         guard authority == .unresolvedSelf else { return self }
         var updatedParameters = parameters
@@ -418,6 +419,21 @@ extension SpacePermission {
             collection: collection, action: action, manage: manage,
             scopeParameters: updatedParameters
         )
+    }
+
+    /// `self`'s resolver at the type level (§6.1, spec line 3771). `nil`
+    /// subject == FAIL CLOSED: the grant is returned unchanged with its
+    /// authority still `.unresolvedSelf`, and `matches` returns `false` on
+    /// that (§5.6.3 step 2), per `space_permission.rs:1574-1584`. A concrete
+    /// subject delegates to `withResolvedAuthority`, which is idempotent and
+    /// a no-op on an already-concrete authority
+    /// (`space-permission.test.ts:424-430`), so calling this more than once
+    /// — e.g. once at mint and again at match time, belt-and-braces against a
+    /// row written by an older binary or a grant built directly from a raw
+    /// set — is free.
+    public func resolvingSelf(as subject: String?) -> SpacePermission {
+        guard let subject else { return self } // fail closed
+        return withResolvedAuthority(subject)
     }
 }
 
