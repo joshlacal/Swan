@@ -261,6 +261,39 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
         )
     }
 
+    // MARK: - Failure classification
+
+    /// Turns a caught error into a resolver-class failure — **unless the task
+    /// was cancelled**, in which case the cancellation is what actually
+    /// happened and it must propagate.
+    ///
+    /// `catch is CancellationError` alone is not sufficient anywhere on this
+    /// path, and the reason is not obvious. A cancellation raised inside the
+    /// fetcher is re-wrapped as `SwanError.unavailable("OAuth remote fetch
+    /// failed")` before the resolver sees it (`OAuthRemoteFetch.swift:674-677`),
+    /// and the same laundering is available to any injected DNS or DID-document
+    /// resolver. Whether the bare `CancellationError` reaches this file at all
+    /// then depends on which task in `SwanLexiconDeadline.run`'s group finishes
+    /// first — the sleeper (which throws `CancellationError`) or the operation
+    /// (which throws its laundered error). That race was measured at roughly
+    /// 50/50 for a cancelled fetch.
+    ///
+    /// Losing it is not cosmetic. `resolveAll` cancels every in-flight sibling
+    /// when the 10 s group deadline expires, so a laundered cancellation writes
+    /// a **negative cache row for an NSID that never failed**, and the next five
+    /// minutes of requests answer `.unresolvable` from that row without any I/O.
+    /// An authority that is merely slow would then decide which of a user's
+    /// other includes survive — the selective-corruption outcome §5.7.4's
+    /// "a proof failure never degrades to a drop" rule exists to prevent,
+    /// arriving through the cache instead of through the drop path.
+    private static func classify(
+        _ error: any Error, as failure: SwanLexiconResolverFailure
+    ) throws -> Never {
+        if error is CancellationError { throw CancellationError() }
+        try Task.checkCancellation()
+        throw failure
+    }
+
     // MARK: Step 1
 
     /// The reverse-DNS authority of an NSID: every segment but the last,
@@ -308,15 +341,15 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
             // than flattened into one failure.
             switch error {
             case .missingSigningKey, .unsupportedSigningKey, .missingPDSEndpoint:
-                throw SwanLexiconResolverFailure.authorityDocumentIncomplete
+                try Self.classify(error, as: .authorityDocumentIncomplete)
             case .invalidAuthorityDID, .didMethodNotAllowed,
                  .documentUnavailable, .documentSubjectMismatch:
-                throw SwanLexiconResolverFailure.authorityDocumentUnavailable
+                try Self.classify(error, as: .authorityDocumentUnavailable)
             }
         } catch let failure as SwanLexiconResolverFailure {
             throw failure
         } catch {
-            throw SwanLexiconResolverFailure.authorityDocumentUnavailable
+            try Self.classify(error, as: .authorityDocumentUnavailable)
         }
         await authorityCache.store(
             domain: domain, did: did, authority: authority, now: now()
@@ -349,7 +382,7 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
         } catch let failure as SwanLexiconResolverFailure {
             throw failure
         } catch {
-            throw SwanLexiconResolverFailure.dnsUnavailable
+            try Self.classify(error, as: .dnsUnavailable)
         }
         // The same answer-count bound `resolveTXT` applies to `_atproto`. An
         // unbounded answer set is work an attacker chooses the size of.
@@ -416,10 +449,8 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
             ) { [fetcher] in
                 try await fetcher.fetchBytes(from: url)
             }
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            throw SwanLexiconResolverFailure.recordFetchFailed
+            try Self.classify(error, as: .recordFetchFailed)
         }
         // The fetcher's policy cap already bounds this — the constructor refuses
         // a wider policy — but the CPU spent below is the thing being protected,
@@ -466,10 +497,8 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
             parsed = try await PublicRepositoryCAR.parseIncrementally(
                 from: ProofCARByteSource(bytes: car), to: sink, limits: limits
             )
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            throw SwanLexiconResolverFailure.carRootCountInvalid
+            try Self.classify(error, as: .carRootCountInvalid)
         }
         let blocks = try await sink.blocks
         guard let commitBytes = try await blocks.block(for: parsed.rootCID) else {
@@ -505,10 +534,8 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
                 expectedCommitCID: parsed.rootCID,
                 verifier: verifier
             )
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            throw SwanLexiconResolverFailure.commitSignatureInvalid
+            try Self.classify(error, as: .commitSignatureInvalid)
         }
 
         // Step 12 — MST membership from the SIGNATURE-VERIFIED `commit.data`.
@@ -529,10 +556,8 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
                 blocks: blocks,
                 limits: limits
             )
-        } catch is CancellationError {
-            throw CancellationError()
         } catch {
-            throw SwanLexiconResolverFailure.recordNotInProof
+            try Self.classify(error, as: .recordNotInProof)
         }
         guard let recordCID, let recordBytes = try await blocks.block(for: recordCID) else {
             throw SwanLexiconResolverFailure.recordNotInProof
