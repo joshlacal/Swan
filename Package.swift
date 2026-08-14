@@ -203,6 +203,17 @@ let package = Package(
                 .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
             ]
         ),
+        // Test support, deliberately not a package product: it builds proof
+        // CARs that production code must refuse, so it must never be linkable
+        // from `swan`.
+        .target(
+            name: "SwanPublicRepositoryTestSupport",
+            dependencies: [
+                "SwanCore", "SwanPublicRepository",
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "Petrel", package: "Petrel"),
+            ]
+        ),
         .testTarget(name: "SwanCoreTests", dependencies: ["SwanCore", "SwanSpacesWire"]),
         .testTarget(
             name: "SwanSpacesTests",
@@ -224,7 +235,8 @@ let package = Package(
         .testTarget(
             name: "SwanOAuthTests",
             dependencies: [
-                "SwanAccounts", "SwanOAuth", "SwanSQLite", "SwanStorage", "SwanSpaces",
+                "SwanAccounts", "SwanOAuth", "SwanPublicRepository",
+                "SwanPublicRepositoryTestSupport", "SwanSQLite", "SwanStorage", "SwanSpaces",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "NIOEmbedded", package: "swift-nio"),
@@ -316,7 +328,7 @@ let package = Package(
         .testTarget(
             name: "SwanPublicRepositoryTests",
             dependencies: [
-                "SwanPublicRepository",
+                "SwanPublicRepository", "SwanPublicRepositoryTestSupport",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "Petrel", package: "Petrel"),
                 .product(name: "secp256k1", package: "secp256k1.swift"),
