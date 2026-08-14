@@ -2459,19 +2459,12 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
             }
     }
 
-    /// Swan's resource-scope floor: `atproto` OR a `space:` grant — the same
-    /// accept set as before, expressed over the real grammar instead of
-    /// `PermissionedSpaceScopeSyntax.isQualified`, and deliberately NOT widened
-    /// to "any recognised family" (§6.1). Several routes treat this floor as
-    /// their only scope check, so admitting `identity:` or `blob:` here would
-    /// open blob upload and repository sync to a token that passes nothing else.
+    /// The third copy of the floor, routed through the same facade as the other
+    /// two (§6.1) so the accept set cannot drift between layers. `subject: nil`
+    /// and no provenance: this asks only `hasResourceScope` and never reaches a
+    /// fence, and a persistence check has no request subject to resolve against.
     private func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
-        scopes.contains { scope in
-            switch try? AtprotoScope.parse(scope) {
-            case .atproto, .space: true
-            default: false
-            }
-        }
+        SwanScopePermissions(rawScopes: scopes, subject: nil).hasResourceScope
     }
 
     /// Stage G, INSERT half (§6.3): a newly-minted grant must parse in full.

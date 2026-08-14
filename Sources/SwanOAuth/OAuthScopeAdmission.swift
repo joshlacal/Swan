@@ -255,7 +255,12 @@ public enum OAuthScopeAdmissionPolicy {
         // `atproto` (`request-manager.ts:241-243`). That divergence is
         // deliberate and recorded (§4.8): tightening it would break every
         // existing space-only session in production.
-        guard parsed.values.contains(where: isBaseOrResourceScope) else {
+        // Routed through the one facade rather than a fourth private copy of
+        // `atproto`-or-`space:` (§6.1). `subject: nil` is correct: `self` is not
+        // resolvable at PAR, and a `self` grant must not be COUNTED as
+        // satisfying the floor before it is resolvable. No provenance is passed
+        // because this reads `hasResourceScope` only and never reaches a fence.
+        guard SwanScopePermissions(rawScopes: requested, subject: nil).hasResourceScope else {
             throw .missingBaseScope
         }
 
@@ -408,17 +413,6 @@ public enum OAuthScopeAdmissionPolicy {
         return rejected
     }
 
-    /// Swan's resource-scope floor: `atproto`, or any `space:` grant. Kept
-    /// deliberately narrow — under §8 Stage C a remote client may register
-    /// `identity:handle` or `blob:image/*`, and such a token passing the floor
-    /// would reach blob upload and repository sync, which perform no further
-    /// scope check (§6.1).
-    private static func isBaseOrResourceScope(_ scope: AtprotoScope) -> Bool {
-        switch scope {
-        case .atproto, .space: true
-        default: false
-        }
-    }
 
     /// The one invariant re-homed from the retired `isIssuableQualified`
     /// (`SwanCore.swift:192-195`): only a read may be collection-free, because a

@@ -77,11 +77,26 @@ public actor DurableOAuthTokenService {
     /// binding before this value can be obtained.
     public struct AccessGrant: Sendable, Equatable {
         public let subject: String
+        /// The **effective** grant — post-`self`-resolution (§9-D8). This, and
+        /// never `scopesRequested`, is what the matcher enforces against.
         public let scopes: Set<String>
         public let issuer: String
         public let clientID: String
         public let redirectURI: String
         public let dpopJKT: String?
+        /// The durable §9-D23 provenance bits: for each effective scope string,
+        /// which parameter keys the client physically wrote.
+        ///
+        /// These ride on the grant because `SwanScopePermissions` cannot recover
+        /// them any other way. A persisted scope string is lossy in **both**
+        /// directions: mint writes a literal `authority=did:plc:…` where the
+        /// client wrote nothing, so a re-parse reports `authority` as *stated*
+        /// and the delegation fence flips open; and canonical serialisation
+        /// deletes a value equal to its default, so a literally-written
+        /// `skey=*` disappears and the listing fence can never fire again.
+        /// Provenance is therefore carried from the parse that produced it,
+        /// through mint and persistence, to here — never reconstructed.
+        public let scopeProvenance: OAuthScopeProvenance
 
         fileprivate init(family: OAuthTokenFamily) {
             subject = family.subject
@@ -90,6 +105,19 @@ public actor DurableOAuthTokenService {
             clientID = family.binding.clientID
             redirectURI = family.binding.redirectURI
             dpopJKT = family.binding.dpopJKT
+            // Absent bits mean "nothing was stated", which is the fail-closed
+            // direction for both fences: a missing record denies, never grants.
+            scopeProvenance = family.binding.scopeProvenance ?? OAuthScopeProvenance()
+        }
+
+        /// The durable stated-key bits in exactly the shape
+        /// `SwanScopePermissions.init(rawScopes:subject:statedKeys:)` takes.
+        ///
+        /// A plain dictionary rather than `OAuthScopeProvenance` because
+        /// `SwanScopePermissions` lives in SwanCore, which sits *beneath*
+        /// SwanStorage and so cannot name that type.
+        public var statedScopeKeys: [String: Set<String>] {
+            scopeProvenance.statedParameterKeys
         }
     }
 
@@ -1288,19 +1316,15 @@ public actor DurableOAuthTokenService {
         }
     }
 
-    /// The same `atproto`-or-`space:` floor as before, expressed over the real
-    /// grammar. Deliberately NOT widened to "any recognised family" (§6.1):
-    /// after §8 Stage C a remote client may register `identity:handle` or
-    /// `blob:image/*`, and several routes treat this floor as their only scope
-    /// check, so such a token would reach blob upload and repository sync
-    /// unenforced.
+    /// One of the three copies of this predicate that must not drift apart
+    /// again (§6.1); all three now route through the same facade.
+    ///
+    /// `subject: nil` is correct here (§6.5.2): this layer may run before `self`
+    /// is resolvable, and a `self` grant must not be counted as satisfying the
+    /// floor before it is. No provenance is passed because this site reads only
+    /// `hasResourceScope` and never reaches a fence.
     private static func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
-        scopes.contains { scope in
-            switch try? AtprotoScope.parse(scope) {
-            case .atproto, .space: true
-            default: false
-            }
-        }
+        SwanScopePermissions(rawScopes: scopes, subject: nil).hasResourceScope
     }
 
     private func constantTimeTextEqual(_ lhs: String, _ rhs: String) -> Bool {
