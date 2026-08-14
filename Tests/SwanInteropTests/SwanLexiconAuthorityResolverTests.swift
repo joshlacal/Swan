@@ -210,11 +210,119 @@ final class SwanLexiconAuthorityResolverTests: XCTestCase {
     /// legacy verification-method types, whose multibase carries raw key bytes
     /// under a second grammar. Swan rejects them rather than adding one. This
     /// test exists so the divergence is deliberate and visible, not discovered.
-    func testWebAuthorityWithLegacyVerificationMethodTypeIsRejected() async throws {
+    // MARK: - the two legacy W3C verification method types
+
+    /// Raw points with the multicodec prefix stripped — which is what a legacy
+    /// method's `publicKeyMultibase` carries. The secp256k1 pair is the same
+    /// key as `referenceSecp256k1Key` above, minus its `0xe701` prefix; the
+    /// P-256 one is `did:key:zDnaejgmAHMLkBPMBWnkBxyGxpXx8LgE4WJAYDhwZzyoRAddF`
+    /// minus `0x8024`. Deriving them from the Multikey fixtures is deliberate:
+    /// it makes the legacy and Multikey vectors provably the same keys, so a
+    /// difference in outcome is about the ENCODING and not about the key
+    /// (`getDidKeyFromMultibase`, `lex-resolver.ts:558-577`: legacy types go
+    /// through `multibaseToBytes`, taking their curve from `type`, while
+    /// `Multikey` goes through `parseMultikey`)
+    /// (`getDidKeyFromMultibase`, `lex-resolver.ts:558-577`: legacy types go
+    /// through `multibaseToBytes`, taking their curve from `type`, while
+    /// `Multikey` goes through `parseMultikey`).
+    private let legacySecp256k1Compressed = "z25z9DTpsiYYJKGsWmSPJK2NFN8PcJtZig12K59UgW7q5t"
+    private let legacyP256Compressed = "zviRreKX5SuoitdRY6TAbADXtHs6vjveQGre8SADVnra9"
+    private let legacySecp256k1Uncompressed =
+        "zQq4zWVMz5uyw6daveR17rgCG3h6dYcMWJ9Dwc5CkkWz7SJpnfUb4tWorFcoFQWPadUi3cieZUVv1Xbe1Zmej8Pux"
+
+    func testLegacySecp256k1VerificationMethodResolves() async throws {
+        let resolver = try makeResolver(document: webDocument(
+            id: webDID,
+            verificationMethodID: "#atproto",
+            multibase: legacySecp256k1Compressed,
+            verificationMethodType: "EcdsaSecp256k1VerificationKey2019",
+            serviceID: "#atproto_pds",
+            serviceEndpoint: "https://pds.example.net"
+        ))
+
+        let authority = try await resolver.resolveAuthority(did: webDID)
+        XCTAssertEqual(authority.commitVerifier.signingAlgorithm, .secp256k1)
+    }
+
+    func testLegacyP256VerificationMethodResolves() async throws {
+        let resolver = try makeResolver(document: webDocument(
+            id: webDID,
+            verificationMethodID: "#atproto",
+            multibase: legacyP256Compressed,
+            verificationMethodType: "EcdsaSecp256r1VerificationKey2019",
+            serviceID: "#atproto_pds",
+            serviceEndpoint: "https://pds.example.net"
+        ))
+
+        let authority = try await resolver.resolveAuthority(did: webDID)
+        XCTAssertEqual(authority.commitVerifier.signingAlgorithm, .p256)
+    }
+
+    /// Upstream normalises rather than requiring compressed input:
+    /// `formatMultikey` (`crypto/src/did.ts:26-41`) calls `compressPubkey`,
+    /// which is `ProjectivePoint.fromHex` (`crypto/src/p256/encoding.ts:3-6`)
+    /// and accepts 33- and 65-byte points alike. Refusing uncompressed here
+    /// would reject documents upstream resolves.
+    func testLegacyVerificationMethodAcceptsAnUncompressedPoint() async throws {
+        let resolver = try makeResolver(document: webDocument(
+            id: webDID,
+            verificationMethodID: "#atproto",
+            multibase: legacySecp256k1Uncompressed,
+            verificationMethodType: "EcdsaSecp256k1VerificationKey2019",
+            serviceID: "#atproto_pds",
+            serviceEndpoint: "https://pds.example.net"
+        ))
+
+        let authority = try await resolver.resolveAuthority(did: webDID)
+        XCTAssertEqual(authority.commitVerifier.signingAlgorithm, .secp256k1)
+    }
+
+    /// A legacy `type` whose bytes are actually MULTIKEY-prefixed is refused.
+    ///
+    /// This is the test the legacy support had to not break, and it is a real
+    /// property rather than a leftover: a legacy type declares "raw point", so
+    /// 35 bytes beginning `0xe701` is a document disagreeing with itself. The
+    /// earlier version of this test asserted that legacy types were rejected
+    /// *categorically*; it used `referenceSecp256k1Multibase`, which is a
+    /// Multikey, so it would have kept passing after legacy support landed
+    /// while claiming something no longer true.
+    func testLegacyTypeCarryingMultikeyPrefixedBytesIsRejected() async throws {
         let resolver = try makeResolver(document: webDocument(
             id: webDID,
             verificationMethodID: "#atproto",
             multibase: referenceSecp256k1Multibase,
+            verificationMethodType: "EcdsaSecp256k1VerificationKey2019",
+            serviceID: "#atproto_pds",
+            serviceEndpoint: "https://pds.example.net"
+        ))
+
+        await assertResolutionFails(resolver, webDID, .unsupportedSigningKey)
+    }
+
+    /// The converse: a `Multikey` carrying a bare raw point is refused too, so
+    /// the two encodings cannot be swapped in either direction.
+    func testMultikeyCarryingABareRawPointIsRejected() async throws {
+        let resolver = try makeResolver(document: webDocument(
+            id: webDID,
+            verificationMethodID: "#atproto",
+            multibase: legacySecp256k1Compressed,
+            verificationMethodType: "Multikey",
+            serviceID: "#atproto_pds",
+            serviceEndpoint: "https://pds.example.net"
+        ))
+
+        await assertResolutionFails(resolver, webDID, .unsupportedSigningKey)
+    }
+
+    /// The recorded residual divergence: upstream's `multibaseToBytes`
+    /// (`crypto/src/multibase.ts:4-20`) handles several multibase prefixes;
+    /// Swan accepts only `z` (base58btc). Pinned so the narrowing is visible
+    /// rather than discovered.
+    func testLegacyVerificationMethodRejectsANonBase58Multibase() async throws {
+        let resolver = try makeResolver(document: webDocument(
+            id: webDID,
+            verificationMethodID: "#atproto",
+            multibase: "f02a1b2c3d",
             verificationMethodType: "EcdsaSecp256k1VerificationKey2019",
             serviceID: "#atproto_pds",
             serviceEndpoint: "https://pds.example.net"

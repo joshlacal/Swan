@@ -650,25 +650,51 @@ struct OAuthScopesIncludeExpansionTests {
         #expect(set.permissions[0].fields.keys.sorted() == ["accept"])
     }
 
-    /// Swan accepts `include:<nsid>?aud=*` where upstream does not
-    /// (`include-scope.ts:183-187` validates `aud` with `isAtprotoDidRefAbsolute`
-    /// alone). Until §5.7.1 is reconciled, the splice must not carry that
-    /// wildcard into an `rpc:` grant: `this.aud === '*'` is unreachable upstream,
-    /// so there is no upstream behaviour to match, and `rpc:<lxm>?aud=*` is
-    /// strictly wider than anything the include could have expressed.
+    /// `include:<nsid>?aud=*` is REFUSED AT PARSE, matching upstream.
+    ///
+    /// This test previously documented the opposite — Swan accepted the
+    /// wildcard and the splice merely declined to carry it into an `rpc:`
+    /// grant, which made the divergence harmless rather than absent. §5.7.1's
+    /// validate has since been reconciled with its own citation: upstream
+    /// `include-scope.ts:183-187` is `validate: isAtprotoDidRefAbsolute` with
+    /// no wildcard, and the declared type at `:30` is
+    /// `undefined | AtprotoDidRefAbsolute`. Accepting it made Swan admit a
+    /// scope no conformant AS would issue.
     @Test
-    func aWildcardIncludeAudienceIsNotSplicedIntoAnRpcGrant() throws {
-        #expect(try compile("\(auth)?aud=*", """
-        {"type":"permission-set","permissions":[
-          {"type":"permission","resource":"rpc","inheritAud":true,
-           "lxm":["com.example.calendar.listEvents"]}]}
-        """) == [])
-        // An entry that names `aud: "*"` itself is unaffected — that is
-        // upstream's own `:220-234` vector and stays expandable.
-        #expect(try compile("\(auth)?aud=*", """
+    func aWildcardIncludeAudienceIsRefusedAtParse() throws {
+        #expect(throws: ScopeParseError.self) {
+            try IncludeScope.parse("\(auth)?aud=*")
+        }
+        // Positive control: a CONCRETE audience on the same include still
+        // parses, so the rejection above is about the wildcard and not about
+        // `aud=` having stopped working altogether.
+        let concrete = try IncludeScope.parse("\(auth)?aud=did:web:example.com%23svc")
+        #expect(concrete.aud == .service("did:web:example.com#svc"))
+    }
+
+    /// The entry-level `aud: "*"` is a DIFFERENT rule and stays expandable —
+    /// upstream's own `:220-234` vector. `rpc:`'s `aud` allows the wildcard
+    /// (`isAudParam`, `rpc-permission.ts:67-71`) even though `include:`'s does
+    /// not; the two families are not parallel, which is precisely why reading
+    /// them as parallel produced the divergence above.
+    @Test
+    func anEntryLevelWildcardAudienceStillExpands() throws {
+        #expect(try compile(auth, """
         {"type":"permission-set","permissions":[
           {"type":"permission","resource":"rpc","aud":"*",
            "lxm":["com.example.calendar.listEvents"]}]}
         """) == ["rpc:com.example.calendar.listEvents?aud=*"])
+    }
+
+    /// `inheritAud` with no include-level `aud` drops the entry — the splice
+    /// requires all three of `inheritAud == true`, entry `aud == nil`, and a
+    /// non-nil include `aud` (`include-scope.ts:98-105`).
+    @Test
+    func inheritAudWithoutAnIncludeAudienceDropsTheEntry() throws {
+        #expect(try compile(auth, """
+        {"type":"permission-set","permissions":[
+          {"type":"permission","resource":"rpc","inheritAud":true,
+           "lxm":["com.example.calendar.listEvents"]}]}
+        """) == [])
     }
 }

@@ -303,33 +303,41 @@ public struct SwanLexiconAuthorityResolver: SwanLexiconAuthorityResolving {
     /// which already proves curve, multicodec, canonical base58, and canonical
     /// point encoding.
     ///
-    /// **Known fail-closed divergence.** Upstream also accepts the two legacy
-    /// types `EcdsaSecp256r1VerificationKey2019` and
-    /// `EcdsaSecp256k1VerificationKey2019`, whose multibase carries *raw*
-    /// key bytes with no multicodec prefix and takes its curve from the `type`
-    /// field. Decoding those needs a bare base58 decoder plus a second
-    /// raw-point grammar — and `PLCDIDKeyCodec`'s own doc comment exists to
-    /// keep that rule in exactly one place "so state/audit verification cannot
-    /// accidentally accept a key-shaped string without proving its curve and
-    /// point encoding". Swan's `Base58BTC` is `private` to
-    /// `SwanAccounts/PLCOperation.swift`, so supporting them means either
-    /// widening that or writing a second decoder. Both are declined here.
-    /// Consequence: a `did:web` authority publishing a legacy-typed `#atproto`
-    /// method is **rejected**, where upstream would resolve it. Every atproto
-    /// producer in reach emits `Multikey` (PLC renders it; so does
-    /// `PLCOperation`'s own `P256DIDKey`), so this is an unexercised path —
-    /// but it is a divergence, it fails closed, and it is recorded rather than
-    /// hidden.
+    /// **The two legacy types are accepted too**, matching upstream's
+    /// `ATPROTO_VERIFICATION_METHOD_TYPES` (`packages/did/src/atproto.ts:189-192`).
+    /// Their multibase carries a *raw* point with no multicodec prefix and
+    /// takes its curve from the `type` field, so they cannot go through the
+    /// `did:key` grammar above; they route to
+    /// `PLCDIDKeyCodec.decodeLegacyMultibase(_:curve:)` instead, which owns the
+    /// base58 + canonical-form + point-validity proof in the same file as every
+    /// other key rule. This deliberately does **not** widen `Base58BTC` — see
+    /// that function's doc comment for why the proof lives there rather than
+    /// here.
+    ///
+    /// An earlier revision refused both legacy types. That was fail-closed but
+    /// wrong on cost: a `did:web` authority publishing the older W3C spelling
+    /// could never have its lexicons resolved by Swan, surfacing as an opaque
+    /// `invalid_scope` that the *operator* cannot fix because the document
+    /// belongs to the authority. Accepting them adds no attack surface — the
+    /// key must still verify a real commit signature, so a wrong curve or wrong
+    /// bytes either fail to construct here or fail to verify there.
     private static func verificationKey(
         type: String, publicKeyMultibase: String
     ) throws -> PLCDIDVerificationKey {
-        guard type == "Multikey" else {
+        do {
+            switch type {
+            case "Multikey":
+                return try PLCDIDKeyCodec.decode("did:key:" + publicKeyMultibase)
+            case "EcdsaSecp256r1VerificationKey2019":
+                return try PLCDIDKeyCodec.decodeLegacyMultibase(publicKeyMultibase, curve: .p256)
+            case "EcdsaSecp256k1VerificationKey2019":
+                return try PLCDIDKeyCodec.decodeLegacyMultibase(publicKeyMultibase, curve: .secp256k1)
+            default:
+                throw SwanLexiconAuthorityResolutionError.unsupportedSigningKey
+            }
+        } catch {
             throw SwanLexiconAuthorityResolutionError.unsupportedSigningKey
         }
-        guard let key = try? PLCDIDKeyCodec.decode("did:key:" + publicKeyMultibase) else {
-            throw SwanLexiconAuthorityResolutionError.unsupportedSigningKey
-        }
-        return key
     }
 
     private static func pdsEndpoint(in document: DIDDocument, did: String) throws -> URL {

@@ -43,7 +43,10 @@ public struct IncludeScope: Sendable, Hashable, ScopeFamily {
         }
         self.nsid = nsid
         if let audRaw = parameters.single("aud") {
-            self.aud = audRaw == "*" ? .any : .service(audRaw)
+            // Always `.service`: the schema's `validate` below rejects `*` for
+            // this family, so a wildcard never reaches here. `AudParam.any`
+            // remains reachable via `rpc:`, where upstream does allow it.
+            self.aud = .service(audRaw)
         } else {
             self.aud = nil
         }
@@ -58,13 +61,27 @@ public struct IncludeScope: Sendable, Hashable, ScopeFamily {
         parameters: [
             .init(key: "nsid", arity: .single, isRequired: true,
                   validate: AtprotoSyntax.isValidNSID),
-            // include-scope.ts:16, :184-188 — same `@atproto/did` predicate as
-            // `rpc:`'s `aud` (§5.5): `isAtprotoDidRefAbsolute`,
+            // include-scope.ts:16, :183-187 — `validate: isAtprotoDidRefAbsolute`,
             // `packages/did/src/atproto.ts:230-235`. Methods are restricted to
             // `plc` and `web` (`atproto.ts:19`); the fragment is mandatory and
             // non-empty (`did-ref.ts:14-15`).
+            //
+            // **NO `*` WILDCARD HERE — this is not the same rule as `rpc:`'s
+            // `aud`.** An earlier version read
+            // `{ $0 == "*" || isValidAtprotoDIDRefAbsolute($0) }` while this
+            // very comment cited `isAtprotoDidRefAbsolute`, which has no
+            // wildcard; the code and its own citation disagreed. Upstream's
+            // declared type is `undefined | AtprotoDidRefAbsolute`
+            // (`include-scope.ts:30`), so `include:<nsid>?aud=*` fails to parse
+            // upstream. Accepting it made Swan admit a scope no conformant AS
+            // would issue — a divergence in the ACCEPTING direction, which is
+            // the one that matters.
+            //
+            // `rpc:`'s `aud` genuinely does allow `*` (upstream `isAudParam`,
+            // `rpc-permission.ts:67-71`); the two families are not parallel and
+            // `AudParam.any` stays reachable through that one.
             .init(key: "aud", arity: .single, defaultValue: nil,
-                  validate: { $0 == "*" || AtprotoSyntax.isValidAtprotoDIDRefAbsolute($0) }),
+                  validate: AtprotoSyntax.isValidAtprotoDIDRefAbsolute),
         ]
     )
 }
