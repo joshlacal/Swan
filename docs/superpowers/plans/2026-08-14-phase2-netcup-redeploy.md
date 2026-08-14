@@ -1,6 +1,7 @@
 # Phase 2 → netcup redeploy readiness
 
-**Status: NOT READY.** Three gates are open — see "Blocking" below. Everything
+**Status: NOT READY.** Two gates remain open (merged-tree suite, Linux/image
+build) — see "Blocking" below. Gate 1 (P2-H) closed 2026-08-14. Everything
 else is prepared and verified.
 
 ## Live state — verified today, not remembered
@@ -59,16 +60,20 @@ rollback migration needed** — an older binary simply ignores the extra table.
 
 ## Blocking
 
-1. **P2-H is not landed.** Refresh does not re-derive the token scope, so
-   §5.7.4's 24 h hard expiry is inert (P2-F's F2, confirmed on both sides). This
-   only *matters* once `--enable-lexicon-resolution` is on — but shipping the
-   resolver without it means the narrowing safeguard never functions. Lane is
-   dispatched.
+1. ~~**P2-H is not landed.**~~ **CLOSED 2026-08-14.** P2-H sealed at
+   `5458a6a3`, integrated at `b2809f3d`. Refresh now re-derives the token scope
+   (7 new tests green, negative control measured: 4/7 fail with the fix
+   reverted). One expected behaviour post-deploy: **families minted before this
+   binary have no requested-side provenance and stay frozen at their mint-time
+   grant for the rest of their ≤14-day life** — a frozen legacy family during
+   that window is not the F2 defect recurring. New additive column
+   `scope_provenance_requested`; same automatic-migration story as below.
 2. **Full macOS suite not yet confirmed on the merged tree.** Lane figures are
-   1841 XCTest / 0 and 161 Swift Testing / 0 from P2-F's workspace; the
-   integration run must be measured here, **counting both frameworks** — a
-   `Test Case … passed` count alone already produced one false green in this
-   program.
+   1864 XCTest / 0 / 11 skipped and 163 Swift Testing / 0 from P2-H's workspace
+   (which contains all of Phase 2 except the `9c4a6926` docs commit); the
+   integration run must be measured on the merge itself, **counting both
+   frameworks** — a `Test Case … passed` count alone already produced one false
+   green in this program.
 3. **Linux build not yet run for Phase-2 code.** This is the real deployment
    gate and Phase 2 added substantial code across seven targets. Per
    `reference_swan_linux_docker_build_recipe`: `swift build --product swan` is

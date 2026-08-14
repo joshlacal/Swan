@@ -480,6 +480,17 @@ E2E assertion restated at unit level, so the two cannot drift).
 
 ### F2 — refresh does not re-derive the token scope (divergence, NOT closed by this lane)
 
+> **Status update (2026-08-14, P2-H): CLOSED.** Refresh now re-derives the
+> effective scope from `scopes_requested ?? scopes` before the rotation, writing
+> the rewritten grant inside the rotation transaction after the `used_at` CAS.
+> A re-derivation failure fails the refresh **without consuming the refresh
+> token** (`invalid_request`). One deliberate residual: **families minted before
+> P2-H have no requested-side provenance (`scope_provenance_requested` is NULL)
+> and stay frozen at their mint-time grant for the rest of their ≤14-day life.**
+> A frozen legacy family is expected behaviour during that window, not this
+> defect recurring. Everything below is the pre-P2-H analysis, kept for the
+> record.
+
 §5.7.5 names the second call site "**token mint / refresh**", and §5.7.4's
 24-hour hard-expiry rationale argues explicitly from *"the token scope is
 re-derived on every refresh (`token-manager.ts:260-263`)"*. **Swan's refresh does
