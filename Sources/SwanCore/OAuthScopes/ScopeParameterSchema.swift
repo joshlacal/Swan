@@ -130,7 +130,12 @@ public struct ScopeParameterSchema: Sendable {
 
     // MARK: parse — parser.ts:101-160, every `return null` becomes a typed throw
 
-    public func parse(_ syntax: ScopeStringSyntax) throws(ScopeParseError) -> ScopeParameterValues {
+    /// Generic over `ScopeSyntax` exactly as `Parser.parse` is
+    /// (`parser.ts:101-160`), so a scope string and a lexicon permission entry
+    /// (`LexPermissionSyntax`, §5.7.3) reach every rejection rule — unknown key,
+    /// repeated single, non-array multi, empty multi, `validate`, required —
+    /// through this one body rather than through two that can drift.
+    public func parse(_ syntax: some ScopeSyntax) throws(ScopeParseError) -> ScopeParameterValues {
         guard syntax.prefix == prefix else {
             throw .prefixMismatch(expected: prefix, actual: syntax.prefix)
         }
@@ -139,7 +144,7 @@ public struct ScopeParameterSchema: Sendable {
         // This is why `identity:*?action=manage` is rejected: `identity` has no
         // `action` key at all (identity-permission.test.ts:24-36).
         let declared = keys
-        for key in syntax.parameters.orderedKeys() where !declared.contains(key) {
+        for key in syntax.keys() where !declared.contains(key) {
             throw .unknownParameter(prefix: prefix, key: key)
         }
 
@@ -148,17 +153,33 @@ public struct ScopeParameterSchema: Sendable {
             let named: [String]?
             switch parameter.arity {
             case .single:
-                switch syntax.parameters.single(parameter.key) {
+                switch syntax.getSingle(parameter.key) {
                 case .absent:
                     named = nil
                 case let .present(value):
                     named = [value]
                 case .repeated:
-                    // parser.ts:121-122 via syntax-string.ts:21-22
+                    // parser.ts:121-122 via syntax-string.ts:21-22, and via
+                    // syntax-lexicon.ts:53-57 for an array where a single value
+                    // is required.
                     throw .repeatedSingleValuedParameter(prefix: prefix, key: parameter.key)
                 }
             case .multiple:
-                named = syntax.parameters.multiple(parameter.key)
+                switch syntax.getMulti(parameter.key) {
+                case .absent:
+                    named = nil
+                case let .values(values):
+                    named = values
+                case .rejected:
+                    // parser.ts:121-122 via syntax-lexicon.ts:59-64 — present,
+                    // but not an array. Unreachable from a scope string.
+                    // Rejecting rather than wrapping the scalar in a one-element
+                    // array is §5.7.3 gate 3: the wrap turns this rejection into
+                    // a live `repo:` create/update/delete grant.
+                    throw .invalidParameterValue(
+                        prefix: prefix, key: parameter.key, value: "<not an array>"
+                    )
+                }
             }
 
             if let named {
