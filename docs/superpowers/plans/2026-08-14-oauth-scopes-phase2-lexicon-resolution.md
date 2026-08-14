@@ -241,6 +241,56 @@ attempt within 5 minutes; and a `did:web` authority resolves.
 
 ---
 
+## Errata against the sealed spec
+
+Two contradictions found by implementation, each verified against upstream source
+rather than adjudicated from the spec's own prose. Recorded here; **no sealed
+spec text has been edited** — that is the spec owner's call.
+
+### E1 — §5.7.6's per-entry authority vector is wrong on both halves
+
+§5.7.6 describes `include-scope.test.ts:558-578` as *"a two-entry repo set"*
+yielding *"a **one**-element array holding only the in-namespace grant"*, and
+calls it *"the only vector proving the authority gate is per-entry, not
+per-set."* Read at
+`.interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354/…/include-scope.test.ts:557-574`,
+it is a **one-entry** set whose `collection` array holds
+`['com.example.calendar.event', 'app.bsky.feed.post']`, inside a
+`describe('rejects')` block, expecting **`[]`**. `isAllowedPermission` applies
+`.every` over the entry's own collections (`include-scope.ts:125`), so the entry
+drops whole.
+
+The consequence matters more than the miscitation: **the fixture cannot witness
+the property §5.7.6 assigns it.** P2-A proved this by mutation — replacing the
+per-entry gate with a per-set gate leaves the upstream-verbatim assertion
+*passing*; only Swan-authored vectors fail. A per-set implementation passes every
+upstream include vector.
+
+**Resolution taken:** implement upstream-verbatim (`[]`), and add Swan-authored
+vectors that genuinely witness per-entry behaviour — a two-entry set (one wholly
+in-namespace, one wholly foreign) → one surviving grant, plus a five-entry mixed
+set where a blob drop, a gate-2 parse failure and a wildcard-space drop coexist
+with two survivors. Those are what fail under a per-set gate.
+
+### E2 — §5.7.1's `include:` `aud` contradicts its own citation
+
+§5.7.1 validates `IncludeScope`'s `aud` as `{ $0 == "*" || isValidAtprotoDIDRefAbsolute($0) }`
+while its comment claims the *"same `@atproto/did` predicate as `rpc:`'s `aud`"*
+and cites `include-scope.ts:184-188`. Upstream at `:183-187` is
+`validate: isAtprotoDidRefAbsolute` — **no wildcard**; the declared type at `:30`
+is `undefined | AtprotoDidRefAbsolute`. Swan's `IncludeScope.swift:46`
+(`audRaw == "*" ? .any : .service(audRaw)`) accepts a scope upstream rejects at
+parse.
+
+This is a divergence in the **accepting** direction — Swan would admit and
+persist a grant no conformant AS would issue. Not pinned by the golden corpus
+(4 include entries, none with a wildcard `aud`).
+
+**Currently fail-closed, so not urgent:** P2-A's `inheritAud` splice requires a
+concrete service DID-ref, so `.any` does not splice and the entry drops —
+upstream's reachable behaviour. **Open decision:** whether §5.7.1 should lose the
+`"*"`. It is Phase-1 wire grammar.
+
 ## Accepted divergences from upstream
 
 Both are **fail-closed** — they refuse documents upstream would accept, never the
