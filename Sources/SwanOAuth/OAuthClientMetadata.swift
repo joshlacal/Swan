@@ -335,7 +335,19 @@ public struct OAuthClientMetadata: Codable, Sendable, Equatable {
         try validateHTTPSClientID(url)
     }
 
-    private func validate() throws {
+    /// `internal`, not `private`, because §7.4 Stage 2 of the OAuth
+    /// permission-scopes spec asserts against this method **directly** — see
+    /// `Tests/SwanHTTPTests/RemoteClientPermissionedScopeE2ETests.swift`, which
+    /// reaches it through `@testable import`. Stage 2 is the stage that failed
+    /// hardest before §9-D21: `:343-344` gated the issuable-scope disjunct behind
+    /// `isLocalhostDevelopmentClient &&`, so a remote client could carry only a
+    /// bare `atproto`. Do not narrow this back on the reasonable-looking grounds
+    /// that nothing in `Sources/` calls it from outside the type.
+    ///
+    /// It stays non-`public`: the invariant is still that callers get a
+    /// validated value from the initializer, which is the only production caller
+    /// (`:151`).
+    func validate() throws {
         if isLocalhostDevelopmentClient {
             guard Self.isExactLocalhostDevelopmentClientID(clientID) else {
                 throw SwanError.malformed("invalid localhost development client_id")
