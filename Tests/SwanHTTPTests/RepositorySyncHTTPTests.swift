@@ -512,6 +512,37 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     try self.assertCommit(commit, fixture: fixture, author: Self.bob)
                 }
 
+                // The pre-rename `getRepoState` alias answers identically to
+                // the canonical name: clients built on the atproto-crates
+                // lineage (bulleted.app) know only the alias.
+                try await client.execute(
+                    uri: self.latestURI(space: fixture.space, repo: Self.bob)
+                        .replacingOccurrences(
+                            of: "com.atproto.space.getLatestCommit",
+                            with: "com.atproto.space.getRepoState"
+                        ),
+                    method: .get,
+                    headers: self.bearerHeaders(credential, dpop: "not-a-dpop-proof")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let commit = try XCTUnwrap((try self.jsonObject(response.body))["commit"] as? [String: Any])
+                    try self.assertCommit(commit, fixture: fixture, author: Self.bob)
+                }
+
+                // And the service description lists the alias here, where its
+                // route is live.
+                try await client.execute(
+                    uri: "/xrpc/community.lexicon.service.describe", method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let object = try XCTUnwrap(
+                        try self.jsonObject(response.body) as? [String: Any])
+                    let values = try XCTUnwrap(object["methods"] as? [[String: Any]])
+                        .compactMap { $0["value"] as? String }
+                    XCTAssertTrue(values.contains("com.atproto.space.getRepoState"))
+                    XCTAssertTrue(values.contains("com.atproto.space.getLatestCommit"))
+                }
+
                 let pageHeaders = try self.dpopHeaders(
                     token: oauth.token, key: oauth.key, jwk: oauth.jwk,
                     nonce: fixture.runtime.dpopNonceService.issue(),

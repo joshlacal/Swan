@@ -200,6 +200,10 @@ final class SwanHTTPTests: XCTestCase {
                     // The spaces plane is the reason callers ask: bulleted.app
                     // gates its spaces support on this answer.
                     XCTAssertTrue(values.contains("com.atproto.space.getRecord"))
+                    // The `getRepoState` alias is listed only where its route
+                    // is live; this fixture wires no sync capability, so
+                    // listing it here would claim a method that 404s.
+                    XCTAssertFalse(values.contains("com.atproto.space.getRepoState"))
                     // A description that omitted this method itself would be
                     // the one claim disprovable from the response in hand.
                     XCTAssertTrue(values.contains("community.lexicon.service.describe"))

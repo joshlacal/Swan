@@ -890,7 +890,7 @@ public struct SwanHTTPServer: Sendable {
         // capability is absent still appear: they are routed (as
         // method-correct unavailability gates), and this deployment speaks
         // them.
-        let describedMethodNSIDs = Set(
+        var describedMethodSet = Set(
             PermissionedData0016.methods
                 .filter { profile.endpoints.contains($0.nsid) }
                 .map(\.nsid)
@@ -902,7 +902,16 @@ public struct SwanHTTPServer: Sendable {
             // one claim a caller could disprove from the response in hand.
             "community.lexicon.service.describe",
         ])
-        .sorted()
+        // The `getRepoState` alias is listed exactly when its route is live —
+        // the sync capability exists and the profile declares the canonical
+        // name (see `registerAuthenticatedGetLatestCommitEndpoint`). Listing
+        // one routed name but not the other would 404 the very probe this
+        // endpoint exists to answer.
+        if authenticatedSpaceRepositorySync != nil,
+           describedMethodSet.contains(ComAtprotoSpaceGetLatestCommit.typeIdentifier) {
+            describedMethodSet.insert(spaceGetRepoStateAliasNSID)
+        }
+        let describedMethodNSIDs = describedMethodSet.sorted()
         router.get("/xrpc/community.lexicon.service.describe") { _, _ -> Response in
             jsonResponse(CommunityServiceDescription(
                 roles: ["pds"],

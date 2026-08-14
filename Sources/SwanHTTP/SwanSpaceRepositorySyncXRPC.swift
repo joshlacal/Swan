@@ -457,29 +457,43 @@ private func syncWireOperation(
     )
 }
 
+/// The alias name for `com.atproto.space.getLatestCommit`.
+///
+/// `getLatestCommit` is the canonical proposal name; `getRepoState` is the
+/// name the atproto-crates reference PDS shipped before the draft settled,
+/// kept there (and in pds.js) as an alias to the same handler. Clients built
+/// on those crates — bulleted.app — probe for the alias and treat a 404 as
+/// "no spaces plane", so Swan serves both names for the one method.
+let spaceGetRepoStateAliasNSID = "com.atproto.space.getRepoState"
+
 func registerAuthenticatedGetLatestCommitEndpoint(
     on router: Router<BasicRequestContext>,
     capability: SwanAuthenticatedSpaceRepositorySyncCapability
 ) {
     let handler = AuthenticatedGetLatestCommitHandler(capability: capability)
-    let path: RouterPath = "/xrpc/com.atproto.space.getLatestCommit"
-    router.get(path) { request, _ async -> Response in
-        let parameters: ComAtprotoSpaceGetLatestCommit.Parameters
-        do {
-            parameters = try parseAuthenticatedGetLatestCommitParameters(request)
-        } catch {
-            return authenticatedRepositorySyncError(.badRequest, code: "InvalidRequest")
+    let paths: [RouterPath] = [
+        "/xrpc/com.atproto.space.getLatestCommit",
+        RouterPath("/xrpc/\(spaceGetRepoStateAliasNSID)"),
+    ]
+    for path in paths {
+        router.get(path) { request, _ async -> Response in
+            let parameters: ComAtprotoSpaceGetLatestCommit.Parameters
+            do {
+                parameters = try parseAuthenticatedGetLatestCommitParameters(request)
+            } catch {
+                return authenticatedRepositorySyncError(.badRequest, code: "InvalidRequest")
+            }
+            do {
+                let output = try await handler.handle(parameters: parameters, input: (), context: request)
+                return authenticatedGetLatestCommitJSON(.ok, output)
+            } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
+                return authenticatedRepositorySyncResponse(for: failure, capability: capability)
+            } catch {
+                return authenticatedRepositorySyncError(.serviceUnavailable, code: "temporarily_unavailable")
+            }
         }
-        do {
-            let output = try await handler.handle(parameters: parameters, input: (), context: request)
-            return authenticatedGetLatestCommitJSON(.ok, output)
-        } catch let failure as AuthenticatedSpaceRepositorySyncFailure {
-            return authenticatedRepositorySyncResponse(for: failure, capability: capability)
-        } catch {
-            return authenticatedRepositorySyncError(.serviceUnavailable, code: "temporarily_unavailable")
-        }
+        registerAuthenticatedRepositorySyncWrongMethods(on: router, path: path)
     }
-    registerAuthenticatedRepositorySyncWrongMethods(on: router, path: path)
 }
 
 func registerAuthenticatedListRepoOpsEndpoint(
