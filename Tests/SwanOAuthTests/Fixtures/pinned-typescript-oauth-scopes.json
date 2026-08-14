@@ -427,13 +427,13 @@
             "arg": {
               "mime": "image/png"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
               "mime": "image/svg+xml"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
@@ -760,7 +760,7 @@
               "skey": "default",
               "action": "read"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
@@ -801,7 +801,7 @@
               "action": "create",
               "collection": "app.bsky.feed.post"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
@@ -933,21 +933,21 @@
               "action": "create",
               "collection": "app.bsky.feed.post"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
               "action": "delete",
               "collection": "app.bsky.feed.post"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
               "action": "create",
               "collection": "app.bsky.graph.follow"
             },
-            "allowed": false
+            "allowed": true
           }
         ],
         "blob": [
@@ -1087,13 +1087,13 @@
             "arg": {
               "mime": "image/png"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
               "mime": "image/svg+xml"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
@@ -1255,7 +1255,7 @@
             "arg": {
               "attr": "handle"
             },
-            "allowed": false
+            "allowed": true
           },
           {
             "arg": {
