@@ -175,7 +175,7 @@ struct ScopeDescriptionTests {
         let data = try Data(contentsOf: fixtureURL)
         let root = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
         let values = try #require(root["values"] as? [[String: Any]])
-        #expect(values.count == 52, "corpus shape changed — re-check this test against it")
+        #expect(values.count == 62, "corpus shape changed — re-check this test against it")
 
         let knownPrefixes = ["account", "blob", "identity", "include", "repo", "rpc", "space"]
         var trueEntriesChecked = 0
@@ -225,8 +225,13 @@ struct ScopeDescriptionTests {
             }
             trueEntriesChecked += 1
         }
-        #expect(allEntriesChecked == 52)
-        #expect(trueEntriesChecked == 36, "expected 36 isAtprotoOauthScope:true entries in the pinned corpus")
+        #expect(allEntriesChecked == 62)
+        // 37, not 36: the corpus carries one valid entry — bare `atproto` —
+        // that matches none of `knownPrefixes`. It is still counted here,
+        // because the exact-match `switch` above covers it (and the three
+        // `transition:*` statics) before the prefix lookup is reached. An
+        // earlier 36 silently assumed every valid entry was prefix-matched.
+        #expect(trueEntriesChecked == 37, "expected 37 isAtprotoOauthScope:true entries in the pinned corpus")
     }
 
     private func htmlEscapeForTest(_ value: String) -> String {
