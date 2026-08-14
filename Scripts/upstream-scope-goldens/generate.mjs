@@ -71,6 +71,42 @@ const SCOPE_VALUES = [
   'space:com.example.group?skey=a@b',
   'space:com.example.group?skey=a%25b',
 
+  // Positional + named form of the SAME key. The schema forbids supplying a
+  // parameter both positionally and by name (parser.ts:124-127); the corpus
+  // previously contained no example, so no corpus-driven test could reach that
+  // branch at all.
+  //
+  // NOTE on the `rpc` row: it is NOT a duplicate of `rpc:app.bsky.feed.getFeed`
+  // above. That one rejects for a MISSING required `aud`; this one carries a
+  // valid `aud` and rejects because `lxm` is given positionally and by name.
+  // Same verdict, different branch — which is exactly why both belong here.
+  'account:email?attr=repo',
+  'identity:handle?attr=*',
+  'space:com.example.type?type=com.other.type',
+  'rpc:com.example.method1?aud=did:web:example.com&lxm=com.example.method2',
+
+  // Repeated SINGLE-valued parameter. `getSingle` returns null on more than one
+  // value (syntax-string.ts:18-23) and the schema rejects on null
+  // (parser.ts:121-122) — the tri-state that must not collapse into `String?`.
+  // Contrast with `account:email?action=manage` above: `action` is MULTIPLE
+  // arity, so repeating it is legal. The rejection is specific to single-valued
+  // keys, not to repetition.
+  //
+  // `repo:` cannot appear here: both its parameters are `.multiple` arity, so
+  // it has no single-valued key to repeat. Absence is correct, not a gap.
+  'account?attr=email&attr=repo',
+  'include:com.example.foo?aud=did:web:example.com%23a&aud=did:web:example.com%23b',
+  'rpc:com.example.method?aud=did:web:example.com%23a&aud=did:web:example.com%23b',
+  'space:com.example.type?authority=did:plc:aaa&authority=did:plc:bbb',
+  'space:com.example.type?skey=abc&skey=def',
+
+  // Percent-escaped POSITIONAL — a positive control, not a rejection. The
+  // positional is `decodeURIComponent`d (syntax-string.ts:62-64), so the escape
+  // decodes and the canonical form comes back in decoded shape. Every other row
+  // in the two classes above is rejection-shaped, and a corpus that only ever
+  // grows richer in rejections tests less than it appears to.
+  'repo:com%2Eexample%2Efoo',
+
   // malformed / rejected
   '',
   'space:',

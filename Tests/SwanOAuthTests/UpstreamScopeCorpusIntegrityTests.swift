@@ -42,7 +42,7 @@ final class UpstreamScopeCorpusIntegrityTests: XCTestCase, @unchecked Sendable {
     /// pass every driver vacuously.
     func testCorpusSectionsCarryTheirDeclaredRowCounts() throws {
         let corpus = try UpstreamScopeCorpus.load()
-        XCTAssertEqual(corpus.values.count, 52, "per-value parse + canonical rows")
+        XCTAssertEqual(corpus.values.count, 62, "per-value parse + canonical rows")
         XCTAssertEqual(corpus.strings.count, 6, "whole-scope-string normalisation rows")
         XCTAssertEqual(corpus.matches.count, 8, "representative grants")
         XCTAssertEqual(corpus.didRefs.count, 13, "isAtprotoDidRefAbsolute truth-table rows")
@@ -61,6 +61,96 @@ final class UpstreamScopeCorpusIntegrityTests: XCTestCase, @unchecked Sendable {
                 "bulleted.app scope not covered by the golden corpus: \(scope)"
             )
         }
+    }
+
+    /// The corpus must keep at least one example of each rejection class the
+    /// grammar can produce, plus a positive control for the decoding path.
+    ///
+    /// This exists because the corpus shipped for a while with **zero** examples
+    /// of two whole classes — positional+named conflict and repeated
+    /// single-valued parameter — so no corpus-driven test could reach either
+    /// branch, and the absence was invisible from a green run. A regeneration
+    /// that silently drops them would recreate exactly that hole.
+    ///
+    /// Asserted structurally (by shape of the input) rather than by literal
+    /// string, so adding more examples of a class strengthens the corpus without
+    /// touching this test.
+    func testCorpusCoversEachRejectionClassAndTheDecodingPositiveControl() throws {
+        let corpus = try UpstreamScopeCorpus.load()
+
+        /// A parameter supplied both positionally and by name — forbidden by the
+        /// schema (`parser.ts:124-127`).
+        let positionalKeys = [
+            "account": "attr", "identity": "attr", "repo": "collection",
+            "rpc": "lxm", "blob": "accept", "space": "type", "include": "nsid",
+        ]
+        let conflicts = corpus.values.filter { value in
+            let input = value.input
+            guard let questionMark = input.firstIndex(of: "?") else { return false }
+            let head = String(input[input.startIndex ..< questionMark])
+            guard let colon = head.firstIndex(of: ":"), head.index(after: colon) < head.endIndex,
+                  let key = positionalKeys[String(head[head.startIndex ..< colon])]
+            else { return false }
+            let query = input[input.index(after: questionMark)...]
+            return query.split(separator: "&").contains { $0.hasPrefix("\(key)=") }
+        }
+        XCTAssertFalse(
+            conflicts.isEmpty,
+            "no positional+named conflict vector — that rejection branch is unreachable from the corpus"
+        )
+        for value in conflicts {
+            XCTAssertFalse(value.parses, "a positional+named conflict must be rejected: \(value.input)")
+        }
+
+        /// A single-valued parameter given more than once — `getSingle` returns
+        /// null (`syntax-string.ts:18-23`) and the schema rejects on null
+        /// (`parser.ts:121-122`). This is the tri-state that must not collapse
+        /// into `String?`.
+        ///
+        /// `action` and `collection` are deliberately absent: they are `.multiple`
+        /// arity, so repeating them is legal and the corpus carries such a row
+        /// (`account:email?action=read&action=manage`) as the contrast.
+        let singleValued: Set<String> = ["authority", "skey", "type", "attr", "aud", "nsid"]
+        let repeats = corpus.values.filter { value in
+            guard let questionMark = value.input.firstIndex(of: "?") else { return false }
+            let keys = value.input[value.input.index(after: questionMark)...]
+                .split(separator: "&")
+                .compactMap { $0.split(separator: "=").first.map(String.init) }
+                .filter(singleValued.contains)
+            return Set(keys).count < keys.count
+        }
+        XCTAssertFalse(
+            repeats.isEmpty,
+            "no repeated single-valued parameter vector — that rejection branch is unreachable"
+        )
+        for value in repeats {
+            XCTAssertFalse(
+                value.parses,
+                "a repeated single-valued parameter must be rejected: \(value.input)"
+            )
+        }
+
+        /// Positive control. Every row above is rejection-shaped, and a corpus
+        /// that only ever grows richer in rejections tests less than it appears
+        /// to. The positional is `decodeURIComponent`d
+        /// (`syntax-string.ts:62-64`), so an escaped positional must DECODE and
+        /// round-trip, not merely fail to explode.
+        let escapedPositional = corpus.values.filter { value in
+            guard let head = value.input.split(separator: "?").first else { return false }
+            return head.contains("%")
+        }
+        XCTAssertFalse(
+            escapedPositional.isEmpty,
+            "no percent-escaped positional vector — the decode path has no positive control"
+        )
+        XCTAssertTrue(
+            escapedPositional.contains { $0.parses && $0.roundTripStable == true },
+            """
+            every percent-escaped positional in the corpus is a rejection. At \
+            least one must DECODE and round-trip stably, or this class only \
+            proves the parser can say no.
+            """
+        )
     }
 
     // MARK: - Internal consistency

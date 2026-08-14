@@ -16,7 +16,7 @@ import XCTest
 final class UpstreamScopeConformanceTests: XCTestCase, @unchecked Sendable {
     // MARK: - `values`: per-value parse + canonical form
 
-    /// 52 rows. For each: does Swan's parser agree with upstream about whether
+    /// 62 rows. For each: does Swan's parser agree with upstream about whether
     /// the string is a scope at all, and — when it is — does Swan produce the
     /// same canonical bytes?
     func testEveryCorpusValueParsesAndCanonicalisesAsUpstreamDoes() throws {
