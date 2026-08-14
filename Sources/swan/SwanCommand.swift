@@ -2811,7 +2811,25 @@ extension SwanCommand {
                             issuer: baseURL,
                             protectedResource: baseURL,
                             accounts: accounts,
-                            clientMetadataLoader: clientMetadataLoader
+                            clientMetadataLoader: clientMetadataLoader,
+                            // The transition entries are the upstream-standard hints
+                            // (build-metadata.ts calls them "not a specced behavior"), and
+                            // Swan's grammar already parses and admits all three at PAR
+                            // (`AtprotoScope.parse`; granted set pinned by
+                            // `SwanOAuthTests`). What was missing was the advertisement:
+                            // the atproto-oauth Rust crate (resources.rs,
+                            // ScopesSupportedMustIncludeTransitionGeneric) refuses to
+                            // begin sign-in against any server whose scopes_supported
+                            // omits transition:generic — observed as bulleted.app
+                            // declining swan.place — and Catbird's nest client requests
+                            // transition scopes at login. §6.6's rule that permission
+                            // families are not enumerated is unchanged.
+                            scopesSupported: [
+                                "atproto",
+                                "transition:generic",
+                                "transition:email",
+                                "transition:chat.bsky",
+                            ]
                         )
                     } catch let error as ValidationError {
                         throw error

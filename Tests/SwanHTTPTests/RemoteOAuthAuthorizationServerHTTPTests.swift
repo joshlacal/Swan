@@ -528,6 +528,32 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     ))
   }
 
+  /// The deployed composition root advertises the three transition scopes
+  /// beside `atproto` (`SwanCommand.swift`, `--enable-oauth-authorization-server`),
+  /// matching upstream's build-metadata.ts hints. Swan already parses and
+  /// admits all three at PAR (`AtprotoScope.parse`; `SwanOAuthTests` pins the
+  /// granted set) — the advertisement is what clients gate on: the
+  /// atproto-oauth Rust crate refuses to begin sign-in against a server whose
+  /// `scopes_supported` omits `transition:generic` (observed as bulleted.app
+  /// declining swan.place). This pins that the metadata type accepts and
+  /// renders the exact deployed advertisement, in the sorted order
+  /// `OAuthPublishedURL.validateScopes` imposes.
+  func testMetadataRendersTransitionScopeConformanceHints() throws {
+    let advertised = ["atproto", "transition:generic", "transition:email", "transition:chat.bsky"]
+    let metadata = try OAuthAuthorizationServerMetadata(issuer: issuer, scopesSupported: advertised)
+    XCTAssertEqual(
+      metadata.scopesSupported,
+      ["atproto", "transition:chat.bsky", "transition:email", "transition:generic"]
+    )
+    let rendered = try JSONSerialization.jsonObject(
+      with: OAuthMetadataRenderer.render(metadata)
+    ) as? [String: Any]
+    XCTAssertEqual(
+      try XCTUnwrap(rendered)["scopes_supported"] as? [String],
+      ["atproto", "transition:chat.bsky", "transition:email", "transition:generic"]
+    )
+  }
+
   func testCompleteOAuthConfigurationRejectsDefaultHTTPSIssuerPort() async throws {
     let fixture = try await makeFixture(metadata: try publicMetadata())
     defer { try? FileManager.default.removeItem(at: fixture.root) }
