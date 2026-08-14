@@ -765,9 +765,20 @@ public actor DurableOAuthTokenService {
             throw secureControlError(error)
         }
         do {
+            // The baseline is the REQUESTED set, never `binding.scopes` (§9-D20).
+            // `binding.scopes` holds the post-`self`-resolution grant (§9-D8),
+            // which the client has never seen; `authority=self` is the grammar's
+            // default, so comparing against it would fail refresh for
+            // essentially every grant Swan issues. The comparison itself stays
+            // raw-string equality — only the operand changes, and there is no
+            // canonical fallback in this rollout.
+            //
+            // `requestedScopes` on the binding is `scopesRequested ?? scopes`,
+            // total by §6.7's NULL rule: a pre-migration family compares against
+            // its own unchanged `scopes`, exactly as it does today.
             guard family.binding.clientID == metadata.clientID.absoluteString,
                   family.binding.confidentialClientKey == nil,
-                  requestedScopes.map({ $0 == family.binding.scopes }) ?? true else {
+                  requestedScopes.map({ $0 == family.binding.requestedScopes }) ?? true else {
                 throw OAuthControlStoreError.bindingMismatch
             }
             try requirePresentedBindings(

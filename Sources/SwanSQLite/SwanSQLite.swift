@@ -95,6 +95,14 @@ public enum SQLiteLayout {
             client_id TEXT NOT NULL,
             redirect_uri TEXT NOT NULL,
             scopes BLOB NOT NULL,
+            -- The as-requested set, present only when `self` resolution made it
+            -- differ from `scopes`. NULL means "requested == scopes" (spec
+            -- §6.7); it is the refresh baseline, not an audit column (§9-D20).
+            scopes_requested BLOB,
+            -- Which parameters the client physically stated, keyed by effective
+            -- scope string. Durable because a serialised scope is lossy in both
+            -- directions (§9-D23).
+            scope_provenance BLOB,
             dpop_jkt TEXT,
             client_assertion_key_id TEXT,
             client_assertion_algorithm TEXT,
@@ -111,6 +119,12 @@ public enum SQLiteLayout {
             client_id TEXT NOT NULL,
             redirect_uri TEXT NOT NULL,
             scopes BLOB NOT NULL,
+            -- A PAR row has no subject and so cannot hold a resolved value; its
+            -- `scopes` IS the as-requested set and it gains no
+            -- `scopes_requested` column. Provenance, however, is produced by the
+            -- parse at PAR and must be carried forward rather than re-derived
+            -- from these bytes at mint (§9-D23).
+            scope_provenance BLOB,
             dpop_jkt TEXT,
             client_assertion_key_id TEXT,
             client_assertion_algorithm TEXT,
