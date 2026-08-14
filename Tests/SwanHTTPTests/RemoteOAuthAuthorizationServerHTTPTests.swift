@@ -1179,13 +1179,185 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     }
   }
 
+  // MARK: - §5.7.5 call site 1 — PAR / authorize
+
+  /// The PAR leg of §5.7.5's failure matrix, at the real call site.
+  ///
+  /// `invalid_scope` here is half of the deliberate asymmetry — the token leg
+  /// answers `invalid_request` for the same root cause
+  /// (`request-manager.ts:293-312` vs `token-manager.ts:135-138`). The unit-level
+  /// twin is `OAuthLexiconScopeResolutionTests.testSameRootCauseReportsDifferentCodesOnTheTwoLegs`;
+  /// this one proves the code survives the HTTP layer's `catch` chain rather than
+  /// being flattened into `invalid_request` alongside the subset failure.
+  func testPARRejectsAnUnresolvableIncludeWithInvalidScope() async throws {
+    let include = "include:com.example.forum.auth"
+    let metadata = try publicMetadata(scopes: ["atproto", include])
+    let resolver = StubHTTPLexiconResolver([:])
+    let fixture = try await makeFixture(metadata: metadata, lexiconResolver: resolver)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.includeUnresolvable"))
+      try await app.test(.live) { client in
+        let (proof, parForm) = try await self.parHandshake(
+          client: client, scope: "atproto \(include)", jti: "include-unresolvable")
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(dpop: proof),
+          body: ByteBuffer(string: parForm)
+        ) { response in
+          XCTAssertEqual(response.status, .badRequest)
+          XCTAssertEqual(
+            try self.error(response.body), "invalid_scope",
+            """
+            §5.7.5: an `include:` that cannot be resolved is `invalid_scope` at \
+            PAR. `invalid_request` here would be the token-mint code, and \
+            unifying the two is the divergence this asymmetry exists to prevent.
+            """
+          )
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
+  /// §5.7.5 call site 1's second job, and the row that says an empty expansion is
+  /// **not** an error.
+  ///
+  /// One request carries two permission sets: one that expands to a real grant
+  /// and one whose every entry drops. The consent page must show the *expanded
+  /// capability* for the first — `include:` → concrete happens before the
+  /// renderer extracts anything for display (`lexicon-manager.ts:21-36`) — and
+  /// §5.7.2's canonical string, naming the NSID, for the second. A `.warn`
+  /// reaches an operator; the person authorizing never sees it.
+  func testConsentRendersTheExpansionAndNamesAnEmptyPermissionSet() async throws {
+    let productive = "include:com.example.forum.auth"
+    let barren = "include:com.example.empty.auth"
+    let metadata = try publicMetadata(scopes: ["atproto", productive, barren])
+    let resolver = StubHTTPLexiconResolver([
+      "com.example.forum.auth": .permissionSet(
+        LexiconPermissionSet(permissions: [
+          LexiconPermission(
+            resource: "repo",
+            fields: ["collection": .list([.string("com.example.forum.thread")])]
+          )
+        ])
+      ),
+      // Every entry drops: `blob` is not a family expansion admits (gate 1).
+      "com.example.empty.auth": .permissionSet(
+        LexiconPermissionSet(permissions: [
+          LexiconPermission(resource: "blob", fields: ["accept": .list([.string("image/*")])])
+        ])
+      ),
+    ])
+    let fixture = try await makeFixture(metadata: metadata, lexiconResolver: resolver)
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    do {
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.includeConsent"))
+      try await app.test(.live) { client in
+        let (proof, parForm) = try await self.parHandshake(
+          client: client, scope: "atproto \(productive) \(barren)", jti: "include-consent")
+        var requestURI: String?
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(dpop: proof),
+          body: ByteBuffer(string: parForm)
+        ) { response in
+          XCTAssertEqual(response.status, .created)
+          requestURI = try self.json(response.body)["request_uri"] as? String
+        }
+        let authorize =
+          "/oauth/authorize?client_id=\(encode(self.clientID.absoluteString))&request_uri=\(encode(try XCTUnwrap(requestURI)))"
+        var cookieValue: String?
+        var csrf: String?
+        try await client.execute(uri: authorize, method: .get) { response in
+          XCTAssertEqual(response.status, .ok)
+          cookieValue = self.cookie(response.headers[setCookieHeader])
+          csrf = try fixture.runtime.browserSessionService.verify(try XCTUnwrap(cookieValue))
+            .csrfToken
+        }
+        try await client.execute(
+          uri: "/oauth/authorize", method: .post,
+          headers: formHeaders(cookie: try XCTUnwrap(cookieValue)),
+          body: ByteBuffer(
+            string: self.form([
+              ("csrf", try XCTUnwrap(csrf)), ("handle", self.handle),
+              ("password", self.password),
+            ]))
+        ) { response in
+          XCTAssertEqual(response.status, .ok)
+          let html = String(decoding: Data(buffer: response.body), as: UTF8.self)
+          XCTAssertTrue(
+            html.contains("com.example.forum.thread"),
+            "the productive set must render as the capability it expands to, not as its NSID"
+          )
+          XCTAssertFalse(
+            html.contains("Requested permission set com.example.forum.auth"),
+            "an include that DID expand must not also render the 'grants nothing' wording"
+          )
+          // The card puts the NSID inside a `<b>`, so the canonical sentence is
+          // split by markup in the raw bytes; `ScopeDescriptionTests` pins it
+          // verbatim against stripped text.
+          XCTAssertTrue(
+            html.contains("Requested permission set com.example.empty.auth.")
+              && html.contains(
+                "Swan does not currently grant capabilities derived from this set."),
+            """
+            §5.7.5: an empty expansion is not an error, and it is not silent \
+            either. Without this line the permission set simply vanishes from \
+            the screen that authorises it.
+            """
+          )
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
+  /// Drives the nonce challenge and returns a usable proof plus the PAR form for
+  /// `scope`. The challenge round trip is not what these two tests are about.
+  private func parHandshake(
+    client: some TestClientProtocol,
+    scope: String,
+    jti: String
+  ) async throws -> (proof: String, form: String) {
+    let dpopKey = P256.Signing.PrivateKey()
+    let dpopJWK = try jwk(dpopKey)
+    let verifier = "remote-oauth-server-test-verifier-000000000000000000"
+    let challenge = Data(SHA256.hash(data: Data(verifier.utf8))).base64URLEncodedString()
+    let body = form([
+      ("client_id", clientID.absoluteString), ("redirect_uri", redirectURI.absoluteString),
+      ("response_type", "code"), ("scope", scope), ("state", "lexicon-state"),
+      ("code_challenge", challenge), ("code_challenge_method", "S256"),
+    ])
+    var nonce: String?
+    try await client.execute(
+      uri: "/oauth/par", method: .post, headers: formHeaders(),
+      body: ByteBuffer(string: body)
+    ) { response in
+      XCTAssertEqual(response.status, .badRequest)
+      nonce = response.headers[dpopNonceHeader]
+    }
+    let proof = try dpop(
+      dpopKey, dpopJWK, jti: jti, nonce: try XCTUnwrap(nonce),
+      target: try OAuthDPoPProofValidator.normalizedTarget(issuer.appending(path: "oauth/par"))
+    )
+    return (proof, body)
+  }
+
   private func makeFixture(
     metadata: OAuthClientMetadata,
     resolverAnswers: [[OAuthIPAddress]]? = nil,
     loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
     includeEmailRecovery: Bool = false,
     jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil,
-    maximumConnections: Int = 256
+    maximumConnections: Int = 256,
+    lexiconResolver: (any SwanLexiconResolving)? = nil
   ) async throws -> Fixture {
     let root = FileManager.default.temporaryDirectory.appending(
       path: "RemoteOAuthAuthorizationServerHTTPTests-\(UUID().uuidString)")
@@ -1220,7 +1392,8 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
         controlStore: control
       )
       let runtime = try SwanOAuthRuntime(
-        controlStore: control, serverKey: Data(repeating: 0xE2, count: 32))
+        controlStore: control, serverKey: Data(repeating: 0xE2, count: 32),
+        lexiconResolver: lexiconResolver)
       let complete = try SwanOAuthAuthorizationServerConfiguration(
         issuer: issuer, protectedResource: issuer, accounts: accounts, clientMetadataLoader: loader)
       let profile = try ProtocolProfile.load(
@@ -1306,11 +1479,13 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     }
   }
 
-  private func publicMetadata() throws -> OAuthClientMetadata {
+  private func publicMetadata(
+    scopes: Set<String> = ["atproto"]
+  ) throws -> OAuthClientMetadata {
     try OAuthClientMetadata(
       clientID: clientID, redirectURIs: [redirectURI],
       grantTypes: ["authorization_code", "refresh_token"], responseTypes: ["code"],
-      scopes: ["atproto"], dpopBoundAccessTokens: true)
+      scopes: scopes, dpopBoundAccessTokens: true)
   }
 
   private func parForm(challenge: String, assertion: String?) -> String {
@@ -1591,4 +1766,22 @@ private func encode(_ value: String) -> String {
     default: String(format: "%%%02X", byte)
     }
   }.joined()
+}
+
+/// A `SwanLexiconResolving` answering from a fixed table, for the two §5.7.5
+/// call-site-1 tests above. Deliberately not a proof-performing resolver: the
+/// proof chain is P2-G's subject, and re-asserting it here would test the stub.
+private struct StubHTTPLexiconResolver: SwanLexiconResolving {
+  private let documents: [String: SwanLexiconDocument]
+
+  init(_ documents: [String: SwanLexiconDocument]) { self.documents = documents }
+
+  func resolve(_ nsid: String) async throws -> SwanLexiconResolution {
+    guard let document = documents[nsid] else { return .unresolvable }
+    return .resolved(
+      document,
+      sourceURI: "at://did:plc:authorityauthorityauth/com.atproto.lexicon.schema/\(nsid)",
+      verifiedCID: "bafyreistubstubstubstubstubstubstubstubstubstubstubstubstub"
+    )
+  }
 }

@@ -1896,6 +1896,16 @@ extension SwanCommand {
         @Flag(name: .customLong("oauth-allow-localhost-development-client"), help: "Permit only AT Protocol's exact http://localhost development client metadata exception in the complete OAuth server")
         var oauthAllowLocalhostDevelopmentClient = false
 
+        /// §5.7.4 / §5.7.5. Off by default, and that default is a **recorded
+        /// divergence** rather than a preference: without a resolver an
+        /// `include:` grants nothing and a bare `space:<type>` materialises no
+        /// write targets, both of which a conformant AS does differently. It is
+        /// opt-in because turning it on adds DNS, a DID-document read and a CAR
+        /// fetch to the PAR path, and changes what an already-registered scope
+        /// string mints — neither is a change to make on an operator's behalf.
+        @Flag(name: .customLong("enable-lexicon-resolution"), help: "Resolve include:<nsid> permission sets and bare space:<type> collection declarations from their authority's cryptographically proved repo record (spec §5.7.4); requires the complete OAuth authorization server")
+        var enableLexiconResolution = false
+
         @Option(
             name: .customLong("oauth-server-key-file"),
             help: "Owner-only mounted file containing the URL-safe-base64 OAuth server key; SWAN_OAUTH_SERVER_KEY is the legacy alternative"
@@ -2619,9 +2629,65 @@ extension SwanCommand {
                 } else {
                     publicMutationRuntime = nil
                 }
+                // §5.7.5's composition root. The protocol lives in SwanCore so
+                // SwanOAuth and SwanHTTP can name it; the 15-step
+                // implementation lives in SwanInterop next to the CAR machinery
+                // it needs. `swan` is the only target that depends on both, so
+                // it is the only place the two can be joined — no source
+                // target's `Package.swift` dependencies change.
+                let lexiconResolver: (any SwanLexiconResolving)?
+                if enableLexiconResolution {
+                    guard enableOAuthAuthorizationServer else {
+                        throw ValidationError(
+                            "--enable-lexicon-resolution requires --enable-oauth-authorization-server"
+                        )
+                    }
+                    do {
+                        // The 256 KiB cap is an anti-DoS control on MST-walk and
+                        // signature CPU, not a document-size preference, and the
+                        // fetcher's body cap is the only thing that enforces it.
+                        // `SwanLexiconResolver.init` refuses a wider policy.
+                        let lexiconFetchPolicy = try OAuthRemoteFetchPolicy(
+                            maximumBodyBytes: SwanLexiconResolutionBudget.maximumCARBytes
+                        )
+                        let lexiconFetcher = OAuthRemoteDocumentFetcher(
+                            policy: lexiconFetchPolicy,
+                            transport: try NIOPeerPinnedOAuthDocumentTransport(
+                                maximumTransportTimeout: lexiconFetchPolicy.timeout
+                            )
+                        )
+                        lexiconResolver = try SwanLexiconResolver(
+                            // A new call site on the existing bounded DNS
+                            // resolver — `_lexicon.<authority>` over the same C
+                            // wire-parser that already reads `_atproto.<handle>`
+                            // — not new DNS plumbing.
+                            dns: SystemATHandleDNSResolver(),
+                            authorities: try SwanLexiconAuthorityResolver(
+                                plc: try PLCDirectoryClient(
+                                    configuration: managementDeletionPLCConfiguration
+                                        ?? .production()
+                                ),
+                                documents: try SwanPeerPinnedDIDDocumentFetcher(
+                                    documents: lexiconFetcher,
+                                    plcOrigin: managementDeletionPLCConfiguration?.origin
+                                        ?? PLCClientConfiguration.defaultProductionOrigin
+                                )
+                            ),
+                            fetcher: lexiconFetcher,
+                            store: controlDatabase
+                        )
+                    } catch let error as ValidationError {
+                        throw error
+                    } catch {
+                        throw ValidationError("lexicon resolution runtime is unavailable")
+                    }
+                } else {
+                    lexiconResolver = nil
+                }
                 let oauthRuntime = try SwanOAuthRuntime(
                     controlStore: controlDatabase,
-                    serverKey: serverKey
+                    serverKey: serverKey,
+                    lexiconResolver: lexiconResolver
                 )
                 // Make an unsafe public identity a startup error rather than
                 // silently leaving the authenticated endpoint closed. The

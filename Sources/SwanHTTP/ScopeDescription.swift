@@ -209,13 +209,28 @@ enum ConsentScope: Sendable, Hashable {
 /// the cards (S4.4). `atproto` alone never gets a card of its own (S4.1a);
 /// it still appears in the raw/advanced list, since that list is unconditional.
 enum ScopeDescription {
-    static func render(scopes: some Sequence<String>) -> String {
+    /// - Parameter emptyPermissionSets: NSIDs of `include:` scopes that Phase-2
+    ///   resolution proved and expanded to **zero** grants (§5.7.5). They render
+    ///   through the same `includeCard` as an unexpanded Phase-1 `include:`,
+    ///   because the wording §5.7.2 fixes — "Requested permission set `<nsid>`.
+    ///   Swan does not currently grant capabilities derived from this set." — is
+    ///   exactly true of both, and a second string saying the same thing is the
+    ///   defect §9-D19 exists to prevent.
+    ///
+    ///   They arrive as a separate parameter rather than inside `scopes` because
+    ///   by this point the `include:` string is gone: expansion replaced it, and
+    ///   an empty expansion replaced it with nothing. Only the caller that ran
+    ///   the resolver still knows the NSID was ever asked for.
+    static func render(
+        scopes: some Sequence<String>,
+        emptyPermissionSets: [String] = []
+    ) -> String {
         let sortedRaw = Array(Set(scopes)).sorted()
 
         var accountEntries: [(attr: String, actions: [String])] = []
         var blobAccepts: [[String]] = []
         var identityAttrs: [String] = []
-        var includeNsids: [String] = []
+        var includeNsids: [String] = emptyPermissionSets
         var repoEntries: [(collection: [String], actions: [String])] = []
         var rpcEntries: [(aud: String, lxm: [String])] = []
         var spaceGrants: [ConsentScope.SpaceGrant] = []
@@ -254,7 +269,11 @@ enum ScopeDescription {
         if !repoEntries.isEmpty { cards.append(repoCard(repoEntries)) }
         if !rpcEntries.isEmpty { cards.append(rpcCard(rpcEntries)) }
         if !spaceGrants.isEmpty { cards.append(spaceCard(spaceGrants)) }
-        if !includeNsids.isEmpty { cards.append(includeCard(includeNsids)) }
+        // Deduplicated and sorted: a Phase-1 `include:` still in `scopes` and a
+        // Phase-2 empty expansion naming the same NSID must not print twice.
+        if !includeNsids.isEmpty {
+            cards.append(includeCard(Array(Set(includeNsids)).sorted()))
+        }
         if !transitionRaws.isEmpty { cards.append(transitionCard(transitionRaws)) }
         if !unrecognizedRaws.isEmpty { cards.append(unrecognizedCard(unrecognizedRaws)) }
 

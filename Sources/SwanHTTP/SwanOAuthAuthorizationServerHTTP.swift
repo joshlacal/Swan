@@ -300,6 +300,27 @@ private func handleOAuthServerPAR(
       dpopProof: dpop,
       clientAssertion: assertion
     )
+    // §5.7.5 call site 1. Alongside `OAuthValidatedSession.init` — after stages
+    // B/C/E have run over the raw set, because stage C compares *raw requested*
+    // against *registered* and both sides must still be in `include:` form.
+    //
+    // Two jobs, and this is the first: every `include:` must resolve, or the
+    // request is refused with `invalid_scope`. It fails HERE rather than at mint
+    // so a client learns its permission set is unresolvable while it can still
+    // do something about it, instead of after a user has authorized.
+    //
+    // The second job — building the consent payload — is finished at the consent
+    // render below (`loginOAuthServerAuthorization`), which is a different HTTP
+    // request in Swan than it is upstream. The expansion is not persisted into
+    // the PAR row: the binding must keep the client's own `include:` bytes for
+    // §6.7 / §9-D20, and the resolver's document cache serves the render for
+    // free inside the 90-second PAR lifetime.
+    let expansion = try await OAuthLexiconScopeResolution.expandIncludes(
+      form.scopes,
+      resolver: runtime.lexiconResolver,
+      stage: .pushedAuthorizationRequest
+    )
+    oauthServerLogEmptyExpansions(expansion.emptyExpansions, context: context, stage: "par")
     let requestURI = try await runtime.tokenService.createPushedAuthorizationRequest(
       session: session,
       state: form.state,
@@ -316,6 +337,22 @@ private func handleOAuthServerPAR(
       "oauth par rejected",
       metadata: [
         "stage": .string("scope_admission"),
+        "client_id": .string(form.clientID.absoluteString),
+        "reason": .string(error.description),
+      ]
+    )
+    return oauthServerPARJSON(
+      .badRequest, OAuthServerPARError(error: error.oauthErrorCode))
+  } catch let error as OAuthScopeResolutionError {
+    // §5.7.5: `invalid_scope` here, `invalid_request` at token mint, for the
+    // SAME root cause. The asymmetry is upstream's
+    // (`request-manager.ts:293-312` vs `token-manager.ts:135-138`) and is kept
+    // for interop rather than silently unified; the code comes off the error's
+    // stage so the two legs cannot drift.
+    context.logger.info(
+      "oauth par rejected",
+      metadata: [
+        "stage": .string("lexicon_resolution"),
         "client_id": .string(form.clientID.absoluteString),
         "reason": .string(error.description),
       ]
@@ -430,13 +467,33 @@ private func loginOAuthServerAuthorization(
       subjectUpdatedAt: authenticated.account.updatedAt,
       lifetime: session.expiresAt.timeIntervalSinceNow
     )
+    // §5.7.5 call site 1's second job. `include:` → concrete grants happens
+    // BEFORE the renderer extracts space types for display
+    // (`lexicon-manager.ts:21-36`), so the person authorizing sees the actual
+    // capabilities rather than an opaque permission-set name.
+    //
+    // Re-resolving here rather than carrying the PAR-time expansion is
+    // deliberate: it costs one cache read (the row was proved seconds ago, well
+    // inside the 5-minute refresh threshold), and the alternative — persisting a
+    // rendered payload into the PAR row — would put a display artifact in the
+    // durable binding that §6.7 defines as the client's own requested bytes.
+    //
+    // A failure here is fatal to the flow rather than a degraded render: a
+    // consent page that cannot say what is being granted must not be shown.
+    let expansion = try await OAuthLexiconScopeResolution.expandIncludes(
+      pushed.binding.scopes,
+      resolver: runtime.lexiconResolver,
+      stage: .pushedAuthorizationRequest
+    )
+    oauthServerLogEmptyExpansions(expansion.emptyExpansions, context: context, stage: "consent")
     return oauthServerHTML(
       .ok,
       oauthServerConsentPage(
         csrf: issued.session.csrfToken,
         subject: authenticated.account.did,
         clientID: pushed.binding.clientID,
-        scopes: pushed.binding.scopes
+        scopes: expansion.scopes,
+        emptyPermissionSets: expansion.emptyExpansions
       ),
       setCookie: oauthServerCookie(issued.value),
       formActionSource: oauthServerFormActionSource(pushed.binding.redirectURI)
@@ -457,6 +514,17 @@ private func loginOAuthServerAuthorization(
     context.logger.info(
       "oauth authorize rejected", metadata: ["stage": .string("login_client_identity")])
     return oauthServerAuthorizationError(.serviceUnavailable)
+  } catch let error as OAuthScopeResolutionError {
+    // The browser gets the same opaque page every other authorize failure gets —
+    // this is not the leg that reports OAuth error codes to the client, which
+    // already had its `invalid_scope` answer at PAR. The operator gets the NSID.
+    context.logger.info(
+      "oauth authorize rejected",
+      metadata: [
+        "stage": .string("lexicon_resolution"),
+        "reason": .string(error.description),
+      ])
+    return oauthServerAuthorizationError(.badRequest)
   } catch let failure as SwanRequestBodyCollectionFailure {
     context.logger.info(
       "oauth authorize rejected",
@@ -1189,17 +1257,49 @@ private func oauthServerExpiredCookie() -> String {
   "\(SwanOAuthAuthorizationServerHTTP.cookieName)=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0"
 }
 
+/// §5.7.5's "every entry dropped → empty expansion" row: **not** an error, and
+/// **not** silent either.
+///
+/// A permission set that resolves and expands to zero grants is indistinguishable
+/// from success on the wire — the client asked for it, the request succeeded, and
+/// the token carries nothing derived from it. `.warn` is the level because an
+/// operator seeing this repeatedly is looking at either a permission set written
+/// against a different AS's families or an authority gate rejecting every entry,
+/// and both are worth acting on. The consent renderer carries the other half
+/// (`emptyPermissionSets`), because this log never reaches the person
+/// authorizing.
+private func oauthServerLogEmptyExpansions(
+  _ nsids: [String],
+  context: SwanHTTPRequestContext,
+  stage: String
+) {
+  guard !nsids.isEmpty else { return }
+  context.logger.warning(
+    "oauth permission set expanded to no capabilities",
+    metadata: [
+      "stage": .string(stage),
+      "nsids": .string(nsids.joined(separator: ",")),
+    ])
+}
+
 private func oauthServerLoginPage(csrf: String) -> String {
   "<!doctype html><html><head><meta charset=\"utf-8\"><title>Swan sign in</title></head><body><main><h1>Sign in to Swan</h1><form method=\"post\" action=\"/oauth/authorize\"><input type=\"hidden\" name=\"csrf\" value=\"\(csrf)\"><label>Handle <input name=\"handle\" autocomplete=\"username\" required></label><label>Password <input name=\"password\" type=\"password\" autocomplete=\"current-password\" required></label><button type=\"submit\">Continue</button></form></main></body></html>"
 }
 
+/// - Parameter emptyPermissionSets: NSIDs of `include:` scopes that resolved and
+///   expanded to nothing (§5.7.5). They MUST reach the page: the `.warn` this
+///   also emits reaches an operator, and the person authorizing never sees it,
+///   so an include that silently contributes zero capabilities would otherwise
+///   vanish from the consent screen entirely.
 private func oauthServerConsentPage(
   csrf: String,
   subject: String,
   clientID: String,
-  scopes: Set<String>
+  scopes: Set<String>,
+  emptyPermissionSets: [String] = []
 ) -> String {
-  let scopeSection = ScopeDescription.render(scopes: scopes)
+  let scopeSection = ScopeDescription.render(
+    scopes: scopes, emptyPermissionSets: emptyPermissionSets)
   return "<!doctype html><html><head><meta charset=\"utf-8\"><title>Authorize Swan client</title></head><body><main><h1>Authorize client</h1><p>Signed in as \(oauthServerEscape(subject)).</p><p>Client: <code>\(oauthServerEscape(clientID))</code></p>\(scopeSection)<form method=\"post\" action=\"/oauth/authorize/consent\"><input type=\"hidden\" name=\"csrf\" value=\"\(oauthServerEscape(csrf))\"><button name=\"decision\" value=\"approve\" type=\"submit\">Approve</button><button name=\"decision\" value=\"deny\" type=\"submit\">Deny</button></form></main></body></html>"
 }
 
