@@ -816,11 +816,9 @@ private func consentPage(
     clientID: String,
     scopes: Set<String>
 ) -> String {
-    let scopeItems = scopes.sorted().map {
-        "<li><code>\(htmlEscape($0))</code></li>"
-    }.joined()
+    let scopeSection = ScopeDescription.render(scopes: scopes)
     return """
-    <!doctype html><html><head><meta charset="utf-8"><title>Authorize Swan client</title></head><body><main><h1>Authorize local development client</h1><p>Signed in as \(htmlEscape(subject)).</p><p>Client: <code>\(htmlEscape(clientID))</code></p><p>Requested access:</p><ul>\(scopeItems)</ul><form method="post" action="/oauth/authorize/consent"><input type="hidden" name="csrf" value="\(htmlEscape(csrf))"><button name="decision" value="approve" type="submit">Approve</button><button name="decision" value="deny" type="submit">Deny</button></form></main></body></html>
+    <!doctype html><html><head><meta charset="utf-8"><title>Authorize Swan client</title></head><body><main><h1>Authorize local development client</h1><p>Signed in as \(htmlEscape(subject)).</p><p>Client: <code>\(htmlEscape(clientID))</code></p>\(scopeSection)<form method="post" action="/oauth/authorize/consent"><input type="hidden" name="csrf" value="\(htmlEscape(csrf))"><button name="decision" value="approve" type="submit">Approve</button><button name="decision" value="deny" type="submit">Deny</button></form></main></body></html>
     """
 }
 

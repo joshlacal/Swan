@@ -329,6 +329,78 @@ public struct OAuthConfidentialClientKeyBinding: Sendable, Equatable {
     }
 }
 
+/// Which scope parameters a client *physically wrote*, recorded per effective
+/// scope string.
+///
+/// This is durable state, not parser metadata (spec §9-D23). Two Swan fences —
+/// `isExactReadOnlyDelegationGrant` (§5.6.3) and `allowsSpaceListing` (§6.1) —
+/// require a parameter to have been literally stated by the client rather than
+/// defaulted into place by the grammar, and a serialised scope string cannot
+/// answer that question in either direction:
+///
+///   * resolving `authority=self` at mint writes a concrete DID where the
+///     client wrote nothing, so a re-parse reports `authority` as *stated* and
+///     the delegation fence flips open;
+///   * canonical serialisation deletes any value equal to its default, so a
+///     literally-written `skey=*` disappears and the listing fence can never
+///     fire again.
+///
+/// Both directions are demonstrated against upstream's own serialiser in
+/// `Tests/SwanOAuthTests/Fixtures/pinned-typescript-oauth-scopes.json`.
+/// Provenance is therefore carried forward from the parse that produced it and
+/// persisted beside the effective grant — never reconstructed.
+///
+/// Keys are the **effective** (post-resolution) scope strings, i.e. exactly the
+/// members of `OAuthClientBinding.scopes`, so a reader holding a scope set can
+/// look provenance up without re-deriving anything.
+public struct OAuthScopeProvenance: Sendable, Equatable, Hashable {
+    /// Effective scope string → the parameter keys the client wrote.
+    private var storage: [String: Set<String>]
+
+    public init(_ statedParameterKeys: [String: Set<String>] = [:]) {
+        storage = statedParameterKeys
+    }
+
+    public var isEmpty: Bool { storage.isEmpty }
+
+    /// Effective scope string → stated parameter keys, for persistence and for
+    /// readers that reconstruct a permissions value from durable state.
+    public var statedParameterKeys: [String: Set<String>] { storage }
+
+    /// The keys the client physically wrote in `scope`. An unrecorded scope
+    /// answers "nothing was stated", which is the fail-closed direction for
+    /// both fences.
+    public func statedKeys(for scope: String) -> Set<String> {
+        storage[scope] ?? []
+    }
+
+    public func wasStated(_ key: String, in scope: String) -> Bool {
+        storage[scope]?.contains(key) ?? false
+    }
+
+    public mutating func record(_ statedKeys: Set<String>, for scope: String) {
+        storage[scope] = statedKeys
+    }
+
+    /// Re-keys provenance onto a rewritten scope string. Mint resolves
+    /// `authority=self` into a concrete DID, which changes the *value* and must
+    /// never change the *statedness* (§9-D23).
+    public func rekeyed(from old: String, to new: String) -> OAuthScopeProvenance {
+        guard old != new, let slot = storage[old] else { return self }
+        var copy = storage
+        copy.removeValue(forKey: old)
+        copy[new] = slot
+        return OAuthScopeProvenance(copy)
+    }
+
+    /// Drops records for scopes that are not in `scopes`. Called before a write
+    /// so a rewritten grant cannot carry provenance for a scope it no longer
+    /// holds.
+    public func restricted(to scopes: Set<String>) -> OAuthScopeProvenance {
+        OAuthScopeProvenance(storage.filter { scopes.contains($0.key) })
+    }
+}
+
 /// Values which bind an OAuth request, authorization code, and token family.
 /// Keeping these values together makes it hard for a later HTTP adapter to
 /// accidentally turn a PAR or code for one client/redirect URI into a token
@@ -337,6 +409,9 @@ public struct OAuthClientBinding: Sendable, Equatable {
     public let issuer: String
     public let clientID: String
     public let redirectURI: String
+    /// The **effective** grant. For a token family this is post-`self`
+    /// resolution (§9-D8); for a PAR row it is necessarily the as-requested set,
+    /// because a PAR has no subject to resolve against.
     public let scopes: Set<String>
     /// RFC 7638 S256 JWK thumbprint binding. This is public key metadata, not
     /// a DPoP proof body.
@@ -349,6 +424,21 @@ public struct OAuthClientBinding: Sendable, Equatable {
     /// cannot turn a code originally authorized without refresh permission
     /// into a refresh-token grant.
     public let refreshTokenAllowed: Bool
+    /// The exact bytes the client requested, when they differ from `scopes`.
+    ///
+    /// `nil` means "requested == scopes" — **not** "unknown" (§6.7). Rows
+    /// written before `self` resolution existed genuinely stored what was
+    /// requested, which is what makes `requestedScopes` a total function and
+    /// keeps a pre-migration family refreshing exactly as it does today. Never
+    /// persist an empty set to mean "same": empty and absent would then be
+    /// indistinguishable from "requested nothing".
+    ///
+    /// This is **never** read by the matcher (§9-D8). It has exactly two
+    /// readers: consent/audit, and the refresh binding baseline (§9-D20).
+    public let scopesRequested: Set<String>?
+    /// Which parameters the client stated, keyed by effective scope string.
+    /// `nil` for rows written before the column existed.
+    public let scopeProvenance: OAuthScopeProvenance?
 
     public init(
         issuer: String,
@@ -357,7 +447,9 @@ public struct OAuthClientBinding: Sendable, Equatable {
         scopes: Set<String>,
         dpopJKT: String? = nil,
         confidentialClientKey: OAuthConfidentialClientKeyBinding? = nil,
-        refreshTokenAllowed: Bool = true
+        refreshTokenAllowed: Bool = true,
+        scopesRequested: Set<String>? = nil,
+        scopeProvenance: OAuthScopeProvenance? = nil
     ) {
         self.issuer = issuer
         self.clientID = clientID
@@ -366,6 +458,56 @@ public struct OAuthClientBinding: Sendable, Equatable {
         self.dpopJKT = dpopJKT
         self.confidentialClientKey = confidentialClientKey
         self.refreshTokenAllowed = refreshTokenAllowed
+        // Storing the requested set when it is identical to the effective one
+        // would make `scopes_requested` ambiguous on reload; collapse it here,
+        // once, so no caller has to remember the rule.
+        self.scopesRequested = scopesRequested == scopes ? nil : scopesRequested
+        self.scopeProvenance = scopeProvenance
+    }
+
+    /// The baseline a refreshing client is compared against (§9-D20). The `??`
+    /// is §6.7's NULL rule, which makes this total: it is the *correct* answer
+    /// for a pre-migration row, not a defensive shrug.
+    ///
+    /// Never compare a re-presented `scope` against `scopes`: under §9-D8 that
+    /// column holds the post-resolution grant the client has never seen, and
+    /// `authority=self` is the grammar's default, so the comparison would fail
+    /// for essentially every grant Swan issues.
+    public var requestedScopes: Set<String> { scopesRequested ?? scopes }
+
+    /// Everything a durable comparison treats as the binding's identity.
+    ///
+    /// `scopesRequested` and `scopeProvenance` are deliberately excluded: both
+    /// are *derived from* the scope set that is compared, so including them can
+    /// only manufacture a false mismatch — e.g. a PAR consumed with a binding
+    /// rebuilt from a fresh session rather than round-tripped through storage.
+    /// They carry no authority a matching `scopes` does not already carry.
+    public func matchesIdentity(of other: OAuthClientBinding) -> Bool {
+        issuer == other.issuer && clientID == other.clientID
+            && redirectURI == other.redirectURI && scopes == other.scopes
+            && dpopJKT == other.dpopJKT
+            && confidentialClientKey == other.confidentialClientKey
+            && refreshTokenAllowed == other.refreshTokenAllowed
+    }
+
+    /// Returns a copy whose effective grant is `scopes`, preserving the
+    /// requested bytes and re-keyed provenance. Used by the mint-time `self`
+    /// rewrite (§6.4), which changes values and must not change statedness.
+    public func withEffectiveScopes(
+        _ scopes: Set<String>,
+        provenance: OAuthScopeProvenance?
+    ) -> OAuthClientBinding {
+        OAuthClientBinding(
+            issuer: issuer,
+            clientID: clientID,
+            redirectURI: redirectURI,
+            scopes: scopes,
+            dpopJKT: dpopJKT,
+            confidentialClientKey: confidentialClientKey,
+            refreshTokenAllowed: refreshTokenAllowed,
+            scopesRequested: requestedScopes,
+            scopeProvenance: (provenance ?? scopeProvenance)?.restricted(to: scopes)
+        )
     }
 }
 

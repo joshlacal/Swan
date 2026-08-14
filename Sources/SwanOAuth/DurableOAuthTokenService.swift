@@ -77,11 +77,26 @@ public actor DurableOAuthTokenService {
     /// binding before this value can be obtained.
     public struct AccessGrant: Sendable, Equatable {
         public let subject: String
+        /// The **effective** grant — post-`self`-resolution (§9-D8). This, and
+        /// never `scopesRequested`, is what the matcher enforces against.
         public let scopes: Set<String>
         public let issuer: String
         public let clientID: String
         public let redirectURI: String
         public let dpopJKT: String?
+        /// The durable §9-D23 provenance bits: for each effective scope string,
+        /// which parameter keys the client physically wrote.
+        ///
+        /// These ride on the grant because `SwanScopePermissions` cannot recover
+        /// them any other way. A persisted scope string is lossy in **both**
+        /// directions: mint writes a literal `authority=did:plc:…` where the
+        /// client wrote nothing, so a re-parse reports `authority` as *stated*
+        /// and the delegation fence flips open; and canonical serialisation
+        /// deletes a value equal to its default, so a literally-written
+        /// `skey=*` disappears and the listing fence can never fire again.
+        /// Provenance is therefore carried from the parse that produced it,
+        /// through mint and persistence, to here — never reconstructed.
+        public let scopeProvenance: OAuthScopeProvenance
 
         fileprivate init(family: OAuthTokenFamily) {
             subject = family.subject
@@ -90,6 +105,19 @@ public actor DurableOAuthTokenService {
             clientID = family.binding.clientID
             redirectURI = family.binding.redirectURI
             dpopJKT = family.binding.dpopJKT
+            // Absent bits mean "nothing was stated", which is the fail-closed
+            // direction for both fences: a missing record denies, never grants.
+            scopeProvenance = family.binding.scopeProvenance ?? OAuthScopeProvenance()
+        }
+
+        /// The durable stated-key bits in exactly the shape
+        /// `SwanScopePermissions.init(rawScopes:subject:statedKeys:)` takes.
+        ///
+        /// A plain dictionary rather than `OAuthScopeProvenance` because
+        /// `SwanScopePermissions` lives in SwanCore, which sits *beneath*
+        /// SwanStorage and so cannot name that type.
+        public var statedScopeKeys: [String: Set<String>] {
+            scopeProvenance.statedParameterKeys
         }
     }
 
@@ -110,7 +138,12 @@ public actor DurableOAuthTokenService {
         familyID: UUID = UUID(),
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
-        let binding = session.durableBinding
+        // Stage F, as at `_issueAuthorizationCode`: this is a mint, so the
+        // family row must hold the RESOLVED grant or it would grant nothing.
+        let binding = try OAuthScopeAdmissionPolicy.resolvingSelfAuthority(
+            session.durableBinding,
+            subject: subject
+        )
         try requireOAuthDPoPBinding(binding)
         let pair = try makeTokenPair(
             familyID: familyID,
@@ -344,13 +377,27 @@ public actor DurableOAuthTokenService {
               codeLifetime.isFinite, refreshLifetime.isFinite else {
             throw SwanError.malformed("authorization code lifetimes must be positive")
         }
-        try requireOAuthDPoPBinding(binding)
+        // Stage F (§6.4). This is the first point at which the subject DID meets
+        // the client binding — `createPushedAuthorizationRequest` has no subject,
+        // so a PAR row genuinely cannot hold a resolved scope.
+        //
+        // Resolution is mandatory rather than cosmetic: an unresolved `self`
+        // matches NOTHING (`SpacePermission.matches` returns false on
+        // `.unresolvedSelf`), so a family storing `authority=self` would grant
+        // nothing at all on every request. The requested bytes are preserved
+        // separately on the binding, and provenance is carried rather than
+        // re-derived — resolving `self` changes the value, never the statedness.
+        let resolved = try OAuthScopeAdmissionPolicy.resolvingSelfAuthority(
+            binding,
+            subject: subject
+        )
+        try requireOAuthDPoPBinding(resolved)
         let code = Self.randomOpaqueValue()
         let record = OAuthAuthorizationCode(
             codeDigest: digest(code, purpose: .authorizationCode),
             familyID: familyID,
             subject: subject,
-            binding: binding,
+            binding: resolved,
             codeChallengeS256: codeChallengeS256,
             expiresAt: now.addingTimeInterval(codeLifetime),
             familyExpiresAt: now.addingTimeInterval(refreshLifetime)
@@ -765,9 +812,20 @@ public actor DurableOAuthTokenService {
             throw secureControlError(error)
         }
         do {
+            // The baseline is the REQUESTED set, never `binding.scopes` (§9-D20).
+            // `binding.scopes` holds the post-`self`-resolution grant (§9-D8),
+            // which the client has never seen; `authority=self` is the grammar's
+            // default, so comparing against it would fail refresh for
+            // essentially every grant Swan issues. The comparison itself stays
+            // raw-string equality — only the operand changes, and there is no
+            // canonical fallback in this rollout.
+            //
+            // `requestedScopes` on the binding is `scopesRequested ?? scopes`,
+            // total by §6.7's NULL rule: a pre-migration family compares against
+            // its own unchanged `scopes`, exactly as it does today.
             guard family.binding.clientID == metadata.clientID.absoluteString,
                   family.binding.confidentialClientKey == nil,
-                  requestedScopes.map({ $0 == family.binding.scopes }) ?? true else {
+                  requestedScopes.map({ $0 == family.binding.requestedScopes }) ?? true else {
                 throw OAuthControlStoreError.bindingMismatch
             }
             try requirePresentedBindings(
@@ -1110,7 +1168,22 @@ public actor DurableOAuthTokenService {
               redirectURI.absoluteString == binding.redirectURI,
               client.metadata.matchesRedirectURI(redirectURI),
               !binding.scopes.isEmpty,
-              binding.scopes.isSubset(of: client.metadata.scopes) else {
+              // Stage C compares REQUESTED against REGISTERED — both supplied by
+              // the client in the same generation (§9-D7). It must not compare
+              // `binding.scopes`, which under §9-D8 holds the post-`self`
+              // resolution grant: the resolved DID was never in the client's
+              // registered set, so this guard would reject every `self`-bearing
+              // family at the token endpoint. That is the same operand defect
+              // §9-D20 fixes at `:770`, at a second site the stage table lists
+              // under stage C.
+              //
+              // Both sides are canonicalised so a client that spells the same
+              // grant differently in its metadata and its request is not
+              // rejected by the canonical form itself.
+              OAuthScopeAdmissionPolicy.isCanonicalSubset(
+                  binding.requestedScopes,
+                  of: client.metadata.scopes
+              ) else {
             throw OAuthControlStoreError.bindingMismatch
         }
         switch client.metadata.tokenEndpointAuthMethod {
@@ -1243,10 +1316,15 @@ public actor DurableOAuthTokenService {
         }
     }
 
+    /// One of the three copies of this predicate that must not drift apart
+    /// again (§6.1); all three now route through the same facade.
+    ///
+    /// `subject: nil` is correct here (§6.5.2): this layer may run before `self`
+    /// is resolvable, and a `self` grant must not be counted as satisfying the
+    /// floor before it is. No provenance is passed because this site reads only
+    /// `hasResourceScope` and never reaches a fence.
     private static func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
-        scopes.contains("atproto") || scopes.contains { scope in
-            PermissionedSpaceScopeSyntax.isQualified(scope)
-        }
+        SwanScopePermissions(rawScopes: scopes, subject: nil).hasResourceScope
     }
 
     private func constantTimeTextEqual(_ lhs: String, _ rhs: String) -> Bool {

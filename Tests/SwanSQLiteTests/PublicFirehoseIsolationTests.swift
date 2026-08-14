@@ -35,12 +35,12 @@ final class PublicFirehoseIsolationTests: XCTestCase {
       space: space,
       owner: authority,
       configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
-      authorization: .accountOAuth(subject: authority, scopes: ["atproto"])
+      authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"])
     )
     _ = try await lifecycle.addMember(
       space: space,
       member: writer,
-      authorization: .accountOAuth(subject: authority, scopes: ["atproto"])
+      authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"])
     )
     let now = Date(timeIntervalSince1970: 1_785_844_800)
     let revision = try TID(tidString: "2222222222223")

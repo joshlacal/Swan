@@ -95,6 +95,14 @@ public enum SQLiteLayout {
             client_id TEXT NOT NULL,
             redirect_uri TEXT NOT NULL,
             scopes BLOB NOT NULL,
+            -- The as-requested set, present only when `self` resolution made it
+            -- differ from `scopes`. NULL means "requested == scopes" (spec
+            -- §6.7); it is the refresh baseline, not an audit column (§9-D20).
+            scopes_requested BLOB,
+            -- Which parameters the client physically stated, keyed by effective
+            -- scope string. Durable because a serialised scope is lossy in both
+            -- directions (§9-D23).
+            scope_provenance BLOB,
             dpop_jkt TEXT,
             client_assertion_key_id TEXT,
             client_assertion_algorithm TEXT,
@@ -111,6 +119,12 @@ public enum SQLiteLayout {
             client_id TEXT NOT NULL,
             redirect_uri TEXT NOT NULL,
             scopes BLOB NOT NULL,
+            -- A PAR row has no subject and so cannot hold a resolved value; its
+            -- `scopes` IS the as-requested set and it gains no
+            -- `scopes_requested` column. Provenance, however, is produced by the
+            -- parse at PAR and must be carried forward rather than re-derived
+            -- from these bytes at mint (§9-D23).
+            scope_provenance BLOB,
             dpop_jkt TEXT,
             client_assertion_key_id TEXT,
             client_assertion_algorithm TEXT,
@@ -11127,7 +11141,12 @@ public actor DurableSpaceRepository {
             let expectedRecord = expectedRecords[uri]
             switch write {
             case let .put(uri, value):
-                let permission: SpacePermission = expectedRecord == nil ? .create : .update
+                // Qualified: SwanCore's OAuth-grammar `SpacePermission` (§5.6.2)
+                // and SwanSpaces' domain `SpacePermission` (`SwanSpaces.swift:175-182`)
+                // share a name, and this module imports both (§9-D2 ruling:
+                // qualify at use, do not rename the domain type). This is the
+                // DOMAIN permission — a record verb, not an OAuth `action=` value.
+                let permission: SwanSpaces.SpacePermission = expectedRecord == nil ? .create : .update
                 try requireWrite(
                     uri: uri,
                     authorization: authorization,
@@ -11637,7 +11656,9 @@ public actor DurableSpaceRepository {
     private func requireWrite(
         uri: SpaceRecordURI,
         authorization: AuthorizationContext,
-        permission: SpacePermission
+        // Qualified for the same reason as the call site above (§9-D2): this is
+        // the SwanSpaces DOMAIN permission, not SwanCore's OAuth grammar type.
+        permission: SwanSpaces.SpacePermission
     ) throws {
         if case .service = authorization {
             throw SwanError.unauthorized(

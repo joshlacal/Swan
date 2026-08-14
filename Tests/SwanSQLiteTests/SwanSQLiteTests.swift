@@ -3782,7 +3782,7 @@ final class SwanSQLiteTests: XCTestCase {
             space: space,
             owner: did,
             configuration: try SimpleSpaceConfiguration(policy: .memberList),
-            authorization: .accountOAuth(subject: did, scopes: ["atproto"])
+            authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"])
         )
         try await database.close()
 
@@ -3802,7 +3802,7 @@ final class SwanSQLiteTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(
             try await reopened.simpleSpace(
                 space,
-                authorization: .accountOAuth(subject: did, scopes: ["atproto"])
+                authorization: .accountOAuthForTesting(subject: did, scopes: ["atproto"])
             )
         ) { error in
             guard case .corruptDatabase = error as? SQLiteRepositoryError else {
@@ -3818,7 +3818,7 @@ final class SwanSQLiteTests: XCTestCase {
                 space: space,
                 user: "did:plc:bob",
                 clientID: nil,
-                authorization: .accountOAuth(
+                authorization: .accountOAuthForTesting(
                     subject: "did:plc:bob",
                     scopes: ["atproto"]
                 )
@@ -3839,7 +3839,7 @@ final class SwanSQLiteTests: XCTestCase {
         )
         let database = try await SQLiteAccountDatabase(dataDirectory: root, did: owner)
         let authority = DurableSimpleSpaceAuthority(lifecycleDatabase: database)
-        let authorization: AuthorizationContext = .accountOAuth(
+        let authorization: AuthorizationContext = .accountOAuthForTesting(
             subject: owner,
             scopes: ["atproto"]
         )
@@ -3915,7 +3915,7 @@ final class SwanSQLiteTests: XCTestCase {
 
         let migrated = try await fixture.open()
         try await withClosedAccountDatabase(migrated) { database in
-            let authorization: AuthorizationContext = .accountOAuth(
+            let authorization: AuthorizationContext = .accountOAuthForTesting(
                 subject: fixture.author,
                 scopes: ["atproto"]
             )
@@ -3971,7 +3971,7 @@ final class SwanSQLiteTests: XCTestCase {
         async let secondOpen = SQLiteAccountDatabase(dataDirectory: root, did: did)
         let (first, second) = try await (firstOpen, secondOpen)
 
-        let authorization: AuthorizationContext = .accountOAuth(
+        let authorization: AuthorizationContext = .accountOAuthForTesting(
             subject: fixture.author,
             scopes: ["atproto"]
         )

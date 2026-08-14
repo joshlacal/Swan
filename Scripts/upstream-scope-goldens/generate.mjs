@@ -7,7 +7,6 @@
 //
 import {
   ScopePermissions,
-  ScopesSet,
   normalizeAtprotoOauthScope,
   normalizeAtprotoOauthScopeValue,
   isAtprotoOauthScope,
@@ -72,6 +71,42 @@ const SCOPE_VALUES = [
   'space:com.example.group?skey=a@b',
   'space:com.example.group?skey=a%25b',
 
+  // Positional + named form of the SAME key. The schema forbids supplying a
+  // parameter both positionally and by name (parser.ts:124-127); the corpus
+  // previously contained no example, so no corpus-driven test could reach that
+  // branch at all.
+  //
+  // NOTE on the `rpc` row: it is NOT a duplicate of `rpc:app.bsky.feed.getFeed`
+  // above. That one rejects for a MISSING required `aud`; this one carries a
+  // valid `aud` and rejects because `lxm` is given positionally and by name.
+  // Same verdict, different branch — which is exactly why both belong here.
+  'account:email?attr=repo',
+  'identity:handle?attr=*',
+  'space:com.example.type?type=com.other.type',
+  'rpc:com.example.method1?aud=did:web:example.com&lxm=com.example.method2',
+
+  // Repeated SINGLE-valued parameter. `getSingle` returns null on more than one
+  // value (syntax-string.ts:18-23) and the schema rejects on null
+  // (parser.ts:121-122) — the tri-state that must not collapse into `String?`.
+  // Contrast with `account:email?action=manage` above: `action` is MULTIPLE
+  // arity, so repeating it is legal. The rejection is specific to single-valued
+  // keys, not to repetition.
+  //
+  // `repo:` cannot appear here: both its parameters are `.multiple` arity, so
+  // it has no single-valued key to repeat. Absence is correct, not a gap.
+  'account?attr=email&attr=repo',
+  'include:com.example.foo?aud=did:web:example.com%23a&aud=did:web:example.com%23b',
+  'rpc:com.example.method?aud=did:web:example.com%23a&aud=did:web:example.com%23b',
+  'space:com.example.type?authority=did:plc:aaa&authority=did:plc:bbb',
+  'space:com.example.type?skey=abc&skey=def',
+
+  // Percent-escaped POSITIONAL — a positive control, not a rejection. The
+  // positional is `decodeURIComponent`d (syntax-string.ts:62-64), so the escape
+  // decodes and the canonical form comes back in decoded shape. Every other row
+  // in the two classes above is rejection-shaped, and a corpus that only ever
+  // grows richer in rejections tests less than it appears to.
+  'repo:com%2Eexample%2Efoo',
+
   // malformed / rejected
   '',
   'space:',
@@ -83,20 +118,40 @@ const SCOPE_VALUES = [
   'rpc:app.bsky.feed.getFeed',
 ]
 
-const values = SCOPE_VALUES.map((input) => {
-  let canonical = null
-  let threw = null
+// Every upstream call here is individually guarded, because upstream throws
+// rather than returning null on one whole class of input: a malformed percent
+// escape in a POSITIONAL is `decodeURIComponent`'s uncaught URIError
+// (syntax-string.ts:62-64). `isAtprotoOauthScope` and the round-trip check both
+// reach that code path, so a bare call to either aborts the entire run and the
+// generator emits NOTHING — not a corpus with one bad row, no corpus at all.
+//
+// Verified at bddc99fb: `space:%zz` throws `URI malformed` out of
+// `isAtprotoOauthScope`. No input in the current SCOPE_VALUES list throws, so
+// this guard is output-neutral for the corpus as it stands (proven by a zero
+// diff regeneration); it exists so that ADDING a percent-escape vector is a
+// one-line list edit rather than a debugging session.
+const call = (fn) => {
   try {
-    canonical = normalizeAtprotoOauthScopeValue(input) ?? null
+    return { value: fn(), threw: null }
   } catch (err) {
-    threw = String(err && err.message ? err.message : err)
+    return { value: null, threw: String(err && err.message ? err.message : err) }
   }
+}
+
+const values = SCOPE_VALUES.map((input) => {
+  const normalized = call(() => normalizeAtprotoOauthScopeValue(input) ?? null)
+  const canonical = normalized.value
+  const recognized = call(() => isAtprotoOauthScope(input))
+  const roundTrip =
+    canonical === null ? { value: null } : call(() => normalizeAtprotoOauthScopeValue(canonical) === canonical)
   return {
     input,
-    isAtprotoOauthScope: isAtprotoOauthScope(input),
+    // `null` means upstream threw instead of answering. Distinct from `false`,
+    // which is a considered rejection.
+    isAtprotoOauthScope: recognized.value,
     canonical,
-    threw,
-    roundTripStable: canonical === null ? null : normalizeAtprotoOauthScopeValue(canonical) === canonical,
+    threw: normalized.threw ?? recognized.threw,
+    roundTripStable: roundTrip.value,
   }
 })
 
@@ -153,7 +208,20 @@ const SPACE_CHECKS = [
 ]
 
 function outcomesFor(scopeString) {
-  const p = new ScopePermissions(new ScopesSet(scopeString))
+  // `ScopesSet extends Set<string>` (scopes-set.ts). Passing a whole
+  // space-delimited STRING to it iterates the string CHARACTER BY CHARACTER, so
+  // the set ends up holding single characters, none of which parse, and every
+  // `allows*` returns false. That is exactly what the first generated corpus
+  // recorded: 128 outcomes, all false, including
+  // `repo:app.bsky.feed.post?action=create` denying `{create,
+  // app.bsky.feed.post}` — which upstream's own repo-permission.test.ts asserts
+  // is allowed.
+  //
+  // `ScopePermissions`'s constructor is the one that splits on SPACE
+  // (scope-permissions.ts:32-39, `typeof scope === 'string' ? scope.split(' ')`),
+  // so the scope string goes there directly and `ScopesSet` is not constructed
+  // by hand at all. Do not "simplify" this back.
+  const p = new ScopePermissions(scopeString)
   const call = (fn, arg) => {
     try {
       return { arg, allowed: fn.call(p, arg) }

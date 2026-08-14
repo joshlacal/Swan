@@ -483,12 +483,12 @@ private struct NotificationRecoveryFixture {
             space: space,
             owner: authority,
             configuration: try SimpleSpaceConfiguration(policy: .memberList, appAccess: .open),
-            authorization: .accountOAuth(subject: authority, scopes: ["atproto"])
+            authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"])
         )
         _ = try await lifecycle.addMember(
             space: space,
             member: writer,
-            authorization: .accountOAuth(subject: authority, scopes: ["atproto"])
+            authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"])
         )
         let now = Date()
         try await database.registerSpaceNotification(
@@ -616,7 +616,7 @@ private struct PreopenedRecoveryFixture {
                 space: space,
                 owner: authority,
                 configuration: try .init(policy: .public, appAccess: .open),
-                authorization: .accountOAuth(subject: authority, scopes: ["atproto"])
+                authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"])
             )
             _ = try await database.appendOplogAndOutbox(
                 space: space,

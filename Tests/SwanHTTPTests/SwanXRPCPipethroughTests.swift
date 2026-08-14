@@ -1165,7 +1165,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         let sender = RecordingProxySender()
         let attempts = PipethroughCallRecorder()
         let authorizer = PipethroughAuthorizer(
-            result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"])),
+            result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"])),
             attempts: attempts
         )
         let steered: HTTPFields = {
@@ -1305,7 +1305,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
                 actorPreferencesXRPC: SwanActorPreferencesXRPCServer(
                     authorizer: PipethroughAuthorizer(
                         result: .success(
-                            .accountOAuth(subject: Self.did, scopes: ["atproto"])
+                            .accountOAuthForTesting(subject: Self.did, scopes: ["atproto"])
                         )
                     ),
                     store: control
@@ -1393,7 +1393,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
                 actorPreferencesXRPC: SwanActorPreferencesXRPCServer(
                     authorizer: PipethroughAuthorizer(
                         result: .success(
-                            .accountOAuth(subject: Self.did, scopes: ["atproto"])
+                            .accountOAuthForTesting(subject: Self.did, scopes: ["atproto"])
                         )
                     ),
                     store: control
@@ -1525,7 +1525,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         SwanXRPCPipethroughServer(
             authorizer: authorizer
                 ?? PipethroughAuthorizer(
-                    result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+                    result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
                 ),
             tokens: TestProxyServiceTokenIssuer(),
             sender: sender,

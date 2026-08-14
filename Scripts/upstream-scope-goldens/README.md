@@ -9,6 +9,30 @@ This exists because hand-transcribing a grammar from a reference implementation
 is where the errors come from. A golden corpus catches a whole class of them at
 once.
 
+## Use the right tree, and prove it before you trust the output
+
+The procedure below works **only** against a full checkout of `bddc99fb`. Against
+that tree it runs with no source patching at all. Against Swan's *other* pinned
+upstream commit — `3f6c96d5…`, the one in `.interop-cache/` that
+`interop/fetch-reference.sh` and `THIRD_PARTY_NOTICES.md` name — it needs 80
+type-only-import rewrites before Node will even load the package, and then it
+silently produces six **different** `values` rows (`skey=a+b`, `a%20b`, `a,b`,
+`a/b`, `a@b`, `a%25b` all parse there and none parse at `bddc99fb`). Two commits
+are in play in this repo and only one is the scope corpus's.
+
+Positive controls, both cheap:
+
+- `packages/oauth/oauth-scopes/src/scopes/space-permission.ts` must exist. A tree
+  without it predates the space plane entirely and every `space:` vector
+  generated from it would be wrong rather than absent.
+- The generator must run with **zero** source edits. If you find yourself
+  patching imports to make it load, you are on the wrong tree — stop.
+
+`referenceCommit` in the emitted JSON is a **string constant** in `generate.mjs`;
+the generator never checks it against the tree it imported. It records intent,
+not provenance. `verify-corpus-zero-diff.sh` is what actually establishes
+provenance, by regenerating and diffing.
+
 ## Regenerating
 
 ```bash

@@ -274,8 +274,11 @@ private func authorizedActorPreferencesSubject(
     } catch {
         throw ActorPreferencesXRPCFailure.unavailable
     }
-    guard case let .accountOAuth(subject, scopes) = authorization,
-          scopes.contains("atproto") else {
+    // NOT YET PORTED (§6.5.10): upstream asserts `assertRpc({aud, lxm})` on
+    // `api/app/bsky/actor/getPreferences.ts:22` and `putPreferences.ts:22`.
+    // Base scope only until the `rpc:` family is wired.
+    guard case let .accountOAuth(subject, permissions) = authorization,
+          permissions.hasBaseATProtocolScope else {
         throw ActorPreferencesXRPCFailure.unauthorized
     }
     return subject
