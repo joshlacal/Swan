@@ -174,6 +174,62 @@ final class OAuthPARHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testEnabledLocalhostPARAdmitsLoginHintAndInteractivePromptHints() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        // The atproto-oauth Rust crate sends the typed handle as `login_hint`
+        // on every sign-in; refusing the hint refuses the client. The server
+        // ignores both hints (it always presents the login form), so parsing
+        // must reach the nonce challenge and then persist the request.
+        let form = validForm(state: "hinted")
+            + "&login_hint=\(formEncode("someone.example.com"))&prompt=login"
+        let key = P256.Signing.PrivateKey()
+        let jwk = try makeJWK(key)
+        do {
+            let app = fixture.server.buildApplication(logger: Logger(label: "OAuthPARHTTPTests.hints"))
+            try await app.test(.router) { client in
+                var nonce: String?
+                try await client.execute(
+                    uri: "/oauth/par",
+                    method: .post,
+                    headers: formHeaders(),
+                    body: ByteBuffer(string: form)
+                ) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(
+                        try self.errorCode(from: response.body),
+                        "use_dpop_nonce",
+                        "a hinted form must parse and be met with the nonce challenge, not invalid_request"
+                    )
+                    nonce = response.headers[dpopNonceHeader]
+                }
+                let proof = try makeDPoPProof(
+                    key: key,
+                    jwk: jwk,
+                    jti: "dpop-hinted-success",
+                    nonce: try XCTUnwrap(nonce),
+                    target: try OAuthDPoPProofValidator.normalizedTarget(issuer.appending(path: "oauth/par"))
+                )
+                try await client.execute(
+                    uri: "/oauth/par",
+                    method: .post,
+                    headers: formHeaders(dpop: proof),
+                    body: ByteBuffer(string: form)
+                ) { response in
+                    XCTAssertEqual(response.status, .created)
+                    let object = try XCTUnwrap(
+                        JSONSerialization.jsonObject(with: Data(buffer: response.body)) as? [String: Any])
+                    let value = try XCTUnwrap(object["request_uri"] as? String)
+                    XCTAssertTrue(value.hasPrefix("urn:ietf:params:oauth:request_uri:"))
+                }
+            }
+            try await fixture.control.close()
+        } catch {
+            try? await fixture.control.close()
+            throw error
+        }
+    }
+
     func testLocalhostPARPreservesRegisteredQualifiedWholeSpaceScope() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -243,6 +299,12 @@ final class OAuthPARHTTPTests: XCTestCase, @unchecked Sendable {
                 let structurallyMalformed = [
                     validForm(state: "unknown") + "&unexpected=value",
                     validForm(state: "duplicate") + "&scope=atproto",
+                    // `prompt=none` demands a silent answer; this server always
+                    // presents the login form, so accepting it would leave the
+                    // client waiting on a redirect that needs a human.
+                    validForm(state: "prompt-none") + "&prompt=none",
+                    validForm(state: "prompt-unknown") + "&prompt=create",
+                    validForm(state: "hint-empty") + "&login_hint=",
                     validForm(state: "plain").replacingOccurrences(
                         of: "code_challenge_method=S256", with: "code_challenge_method=plain"
                     ),

@@ -554,6 +554,66 @@ final class RemoteOAuthAuthorizationServerHTTPTests: XCTestCase, @unchecked Send
     )
   }
 
+  func testRemotePARAdmitsLoginHintAndInteractivePromptHints() async throws {
+    let fixture = try await makeFixture(metadata: try publicMetadata())
+    defer { try? FileManager.default.removeItem(at: fixture.root) }
+    // The atproto-oauth Rust crate appends the typed handle as `login_hint`
+    // on every sign-in, so a parser that refuses the hint refuses the client
+    // before DPoP ever gets its nonce challenge — observed live as
+    // bulleted.app failing against swan.place with `invalid_request` at
+    // `stage=form_parse`. The server ignores both hints (it always presents
+    // the login form): the hinted form must draw the nonce challenge and
+    // then persist.
+    do {
+      let app = fixture.server.buildApplication(
+        logger: Logger(label: "RemoteOAuthAuthorizationServerHTTPTests.hints"))
+      try await app.test(.router) { client in
+        let dpopKey = P256.Signing.PrivateKey()
+        let dpopJWK = try jwk(dpopKey)
+        let verifier = "remote-oauth-server-test-verifier-000000000000000000"
+        let challenge = Data(SHA256.hash(data: Data(verifier.utf8))).base64URLEncodedString()
+        let body = form([
+          ("client_id", clientID.absoluteString), ("redirect_uri", redirectURI.absoluteString),
+          ("response_type", "code"), ("scope", "atproto"), ("state", "hinted-state"),
+          ("code_challenge", challenge), ("code_challenge_method", "S256"),
+          ("login_hint", "someone.example.com"), ("prompt", "login"),
+        ])
+        var nonce: String?
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(),
+          body: ByteBuffer(string: body)
+        ) { response in
+          XCTAssertEqual(response.status, .badRequest)
+          XCTAssertEqual(
+            try self.error(response.body),
+            "use_dpop_nonce",
+            "a hinted form must parse and draw the nonce challenge, not invalid_request"
+          )
+          nonce = response.headers[dpopNonceHeader]
+        }
+        let proof = try dpop(
+          dpopKey, dpopJWK, jti: "remote-par-hinted", nonce: try XCTUnwrap(nonce),
+          target: try OAuthDPoPProofValidator.normalizedTarget(issuer.appending(path: "oauth/par"))
+        )
+        try await client.execute(
+          uri: "/oauth/par", method: .post, headers: formHeaders(dpop: proof),
+          body: ByteBuffer(string: body)
+        ) { response in
+          XCTAssertEqual(response.status, .created)
+          let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(buffer: response.body)) as? [String: Any])
+          XCTAssertTrue(
+            try XCTUnwrap(object["request_uri"] as? String)
+              .hasPrefix("urn:ietf:params:oauth:request_uri:"))
+        }
+      }
+      try await fixture.control.close()
+    } catch {
+      try? await fixture.control.close()
+      throw error
+    }
+  }
+
   func testCompleteOAuthConfigurationRejectsDefaultHTTPSIssuerPort() async throws {
     let fixture = try await makeFixture(metadata: try publicMetadata())
     defer { try? FileManager.default.removeItem(at: fixture.root) }

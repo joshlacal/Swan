@@ -306,12 +306,20 @@ private func validateLocalhostPARFields(_ fields: [String: String]) throws -> Lo
         "client_id", "redirect_uri", "response_type", "scope", "state",
         "code_challenge", "code_challenge_method",
     ]
+    // `login_hint` and `prompt` are hints ATProto clients send with every
+    // sign-in (the atproto-oauth Rust crate includes the typed handle as
+    // `login_hint` unconditionally). This server always presents the
+    // interactive login form — a conforming answer to `login`, `consent`,
+    // and `select_account`, but not to `none`, which demands a silent
+    // answer it can never give, so `none` stays refused.
     let permitted: Set<String> = [
         "client_id", "redirect_uri", "response_type", "scope", "state",
-        "code_challenge", "code_challenge_method",
+        "code_challenge", "code_challenge_method", "login_hint", "prompt",
     ]
     guard fields.keys.allSatisfy({ permitted.contains($0) }),
           required.subtracting(["scope"]).isSubset(of: Set(fields.keys)),
+          fields["login_hint"].map({ !$0.isEmpty && $0.utf8.count <= 2_048 }) ?? true,
+          fields["prompt"].map({ ["login", "consent", "select_account"].contains($0) }) ?? true,
           fields["response_type"] == "code",
           fields["code_challenge_method"] == "S256",
           let clientIDText = fields["client_id"],

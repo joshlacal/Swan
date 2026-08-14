@@ -1,6 +1,19 @@
 # Phase 2 → netcup redeploy readiness
 
-**Status: DEPLOYED 2026-08-14 ~21:52 UTC, on Josh's go.** All three gates
+**Status: DEPLOYED 2026-08-14 ~21:52 UTC, on Josh's go.**
+**Hotfix 2026-08-14 ~22:33 UTC:** immediately post-deploy, bulleted.app
+sign-in failed against swan.place — Bulleted's client library (the
+`atproto-oauth` Rust crate, `resources.rs`,
+`ScopesSupportedMustIncludeTransitionGeneric`) refuses any authorization
+server whose `scopes_supported` omits `transition:generic`; Catbird's nest
+client requests transition scopes at login too. Swan already parsed and
+admitted all three transition scopes at PAR — only the advertisement was
+missing. Fix `e9f0a3cb` advertises
+`["atproto","transition:chat.bsky","transition:email","transition:generic"]`
+at the composition root (metadata type default and §6.6 fixtures
+untouched). Image `234a41d2` promoted to `swan:local`; prior Phase-2 image
+`6851d778` kept as `swan:rollback-20260815`. All four endpoints 200; public
+doc verified serving the four scopes through Cloudflare. All three gates
 closed the same day. `swan:next` (image `6851d778`, built from the merged tree
 at `b4e7118d`) promoted to `swan:local`; previous image preserved as
 `swan:rollback-20260814` (`0e77c5ad`). Service restarted, started clean

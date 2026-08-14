@@ -905,10 +905,21 @@ private func parseOAuthServerPARForm(
     "client_id", "redirect_uri", "response_type", "scope", "state", "code_challenge",
     "code_challenge_method",
   ]
-  let optional: Set<String> = ["client_assertion_type", "client_assertion"]
+  // `login_hint` and `prompt` are hints ATProto clients send with every
+  // sign-in (the atproto-oauth Rust crate includes the typed handle as
+  // `login_hint` unconditionally), so refusing them refuses those clients
+  // outright. Swan always presents the interactive login form, which is a
+  // conforming answer to `login`, `consent`, and `select_account` — but not
+  // to `none`, which demands a silent answer this server can never give, so
+  // `none` stays refused rather than dishonestly accepted.
+  let optional: Set<String> = [
+    "client_assertion_type", "client_assertion", "login_hint", "prompt",
+  ]
   guard fields.keys.allSatisfy({ required.contains($0) || optional.contains($0) }),
     required.isSubset(of: Set(fields.keys)),
     (fields["client_assertion_type"] == nil) == (fields["client_assertion"] == nil),
+    fields["login_hint"].map({ !$0.isEmpty && $0.utf8.count <= 2_048 }) ?? true,
+    fields["prompt"].map({ ["login", "consent", "select_account"].contains($0) }) ?? true,
     fields["response_type"] == "code", fields["code_challenge_method"] == "S256",
     let clientText = fields["client_id"], let redirectText = fields["redirect_uri"],
     let state = fields["state"], let challenge = fields["code_challenge"],
