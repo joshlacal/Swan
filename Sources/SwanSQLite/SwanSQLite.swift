@@ -139,6 +139,52 @@ public enum SQLiteLayout {
         )
         """,
         """
+        -- §5.7.4. The resolved-lexicon cache: upstream's `LexiconStore`
+        -- (`oauth-provider/src/lexicon/lexicon-store.ts`, findLexicon /
+        -- storeLexicon / deleteLexicon) over upstream's `LexiconData`
+        -- (`lexicon/lexicon-data.ts:5-11`), whose construction including the
+        -- negative branch is `lexicon-getter.ts:30-40`.
+        CREATE TABLE IF NOT EXISTS oauth_lexicon_documents (
+            nsid              TEXT    PRIMARY KEY NOT NULL CHECK(length(nsid) > 0),
+            -- NULLABLE, deliberately. `lexicon-getter.ts:19-40` writes a row
+            -- with `lexicon: null` on a LexResolverError, explicitly "to avoid
+            -- hammering the resolver with requests for the same lexicon that is
+            -- known to be unavailable" (:20-23). Declaring this NOT NULL makes
+            -- that row unrepresentable and turns serve-stale-on-failure into a
+            -- refetch on EVERY request for an unresolvable NSID — the exact
+            -- failure upstream's design exists to prevent.
+            --
+            -- SWAN DEVIATION FROM THE COLUMN'S SPEC COMMENT: these are the
+            -- canonical DAG-CBOR record bytes, not re-serialised JSON. The spec
+            -- says `verified_cid` is persisted "so a cached document can be
+            -- shown to be the same document that was proved" — which is only
+            -- achievable if the stored bytes still hash to that CID. JSON does
+            -- not. Storing the proved bytes makes the row self-verifying on
+            -- read; storing JSON would make `verified_cid` an unenforceable
+            -- annotation.
+            document          BLOB,
+            source_uri        TEXT,   -- at://<did>/com.atproto.lexicon.schema/<nsid>
+            -- The CID the MST walk terminated at (`lex-resolver.ts:545`,
+            -- returned `:555`). NULLABLE for the same reason `document` is: a
+            -- negative-cache row proved nothing. On a positive row it is NOT
+            -- optional — it is the only stored value tying `document` back to a
+            -- signed commit, and it is what lets an audit answer "which record
+            -- did this grant expand from" with a content address rather than a
+            -- URI whose TXT record may since have been repointed.
+            verified_cid      TEXT,
+            created_at        INTEGER NOT NULL CHECK(created_at >= 0),
+            updated_at        INTEGER NOT NULL CHECK(updated_at >= 0),
+            last_succeeded_at INTEGER CHECK(last_succeeded_at >= 0),
+            -- A positive row is all-or-nothing: bytes without the CID that
+            -- proved them, or a CID without the bytes, is not a state the
+            -- resolver can produce, and admitting it would let a partial write
+            -- read back as a document nothing vouches for.
+            CHECK((document IS NULL) = (verified_cid IS NULL)),
+            CHECK((document IS NULL) = (source_uri IS NULL)),
+            CHECK(document IS NULL OR last_succeeded_at IS NOT NULL)
+        ) STRICT
+        """,
+        """
         CREATE TABLE IF NOT EXISTS oauth_control_par_state_replays (
             state_digest BLOB PRIMARY KEY CHECK(length(state_digest) = 32),
             expires_at INTEGER NOT NULL CHECK(expires_at >= 0)
