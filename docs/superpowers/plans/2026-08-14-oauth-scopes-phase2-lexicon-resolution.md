@@ -317,6 +317,72 @@ Found by P2-E only *after* correcting a wrong-tree reading — see the tree tabl
 above; the same lane first concluded `LexiconSpace` had no upstream backing at
 all, from a checkout whose `lexicon.ts` is 21 lines against the pinned tree's 29.
 
+## P2-G findings — why the adversarial lane was kept separate
+
+P2-E reported every §5.7.6 vector covered by its own tests. That was true and
+still left two things only an independent attacker found.
+
+### G1 — cancellation laundered into `.unresolvable` (real, fixed)
+
+`.unresolvable` reachability was designed to be a **type fact**: internal steps
+throw a closed `SwanLexiconResolverFailure`, and only that is converted.
+Cancellation was supposed to propagate. It didn't, at a measured **5 of 10 runs**.
+
+The taxonomy was defeated from **underneath**: `OAuthRemoteDocumentFetcher`
+re-wraps every non-`SwanError` transport throw as
+`SwanError.unavailable("OAuth remote fetch failed")` (`OAuthRemoteFetch.swift:674-677`),
+so a `CancellationError` arrives indistinguishable from a genuine fetch failure.
+The only bare `CancellationError` came from the deadline's sleeper task, making
+visibility a race on `group.next()`.
+
+Impact, which is what makes it a soundness bug rather than hygiene: `resolveAll`
+calls `group.cancelAll()` on the 10 s group deadline, so **one slow authority
+negative-caches its innocent siblings for five minutes**, and the next request
+answers `.unresolvable` for them with no I/O. An attacker choosing which of a
+user's permissions survive — arriving through the *cache* rather than the drop
+path §5.7.4 guards.
+
+Fix: `classify(_:as:)` — reject `CancellationError`, then
+`try Task.checkCancellation()`, then classify — at all six resolution-path
+catch-alls. **The `checkCancellation()` line is the load-bearing one**: it
+re-detects cancellation even after the error was laundered into a `SwanError`.
+Vector loops 20× so a regression cannot hide in the coin flip.
+
+**Transferable rule:** an error-taxonomy guarantee at layer N is void if layer
+N−1 re-wraps errors. Catching a specific error type is not enough when something
+below you normalises throws — re-check the *state* (`Task.isCancelled`), not just
+the error identity.
+
+### G2 — a vacuous cache-integrity test (test-only)
+
+`testACachedRowWhoseBytesDoNotHashToItsVerifiedCIDIsNotServed` substituted
+`Data(repeating: 0xA1, count: 8)`, which fails **both** the CID re-hash and
+`decodeDocument` — so the re-hash was never what refused it. Deleting the CID
+comparison left it passing. Replaced with a second **valid** document for the
+same NSID declaring a broader `collection: ["*"]` grant, so only the CID
+comparison can tell it is not the proved bytes.
+
+Fifth test in this program that passed while proving less than it claimed. All
+five were found by someone reading code they did not write.
+
+### G3 — step-10 isolation (strengthened)
+
+P2-E's cross-repo vector wired the authority to the *document* key, so two checks
+rejected the CAR and it could not show `commit.did == did` was load-bearing
+alone. P2-G's wires the authority to the *substitute commit's own* key so the
+signature verifies; deleting step 10 then makes the resolver **resolve a document
+from the attacker's repo**.
+
+### Open, minor
+
+- `.carRootCountInvalid` is the catch-all name for every `parseIncrementally`
+  throw (≥6 framing faults), not just a bad root count. Sound today; a future
+  vector must not read more into the name.
+- The authority cache key is case-sensitive while DNS is not, so
+  `com.Example.foo.auth` takes a second slot for the same DNS name. Bounded by a
+  256-entry cache and the per-request caps; costs duplicated DNS work, never a
+  weakened trust decision.
+
 ## Known flake — not a regression
 
 `SwanOAuthTests.NIOPeerPinnedOAuthPostTransportTests.testPostTransportRejectsResponseBeyondConfiguredBound`
