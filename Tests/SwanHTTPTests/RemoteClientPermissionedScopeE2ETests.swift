@@ -386,7 +386,17 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
         // `var` is rejected. The closure runs to completion before `test` returns,
         // so a reference box is safe and needs no lock.
         let captured = ConsentHTMLBox()
-        try await app.test(.router) { http in
+        // `.live`, NOT `.router`. The consent page is only reached by POSTing
+        // credentials to `/oauth/authorize`, and that path runs
+        // `SwanLoginClientIdentityPolicy` over the connection's peer address.
+        // `.router` synthesises a request with no peer, so the policy throws
+        // `SwanLoginClientIdentityError` and the handler maps it to **503**
+        // (`SwanLocalhostOAuthHTTP.swift:243-244`) — before a single scope is
+        // rendered, which is why the downstream "no permission card" assertions
+        // all fire too. Every credential-posting test in
+        // `LocalhostOAuthBrowserHTTPTests` uses `.live` for exactly this reason;
+        // `.router` appears there only for GET-only assertions.
+        try await app.test(.live) { http in
             var cookie: String?
             var csrf: String?
             try await http.execute(uri: authorize, method: .get) { response in
@@ -491,8 +501,15 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
         // S4.4 — raw scope text survives as advanced detail, below the semantic
         // cards. It is not deleted; it is just not consent.
         for scope in BulletedApp.all where scope != BulletedApp.base {
+            // The advanced list escapes `&` to `&amp;`
+            // (`ScopeDescription.swift:262`), so compare against the escaped
+            // form. Matching the raw bytes can never succeed for any scope
+            // carrying a query string, which is most of them.
+            let escaped = scope.replacingOccurrences(of: "&", with: "&amp;")
+            let escapedCanonical = BulletedApp.canonicalSpace
+                .replacingOccurrences(of: "&", with: "&amp;")
             XCTAssertTrue(
-                html.contains(scope) || html.contains(BulletedApp.canonicalSpace),
+                html.contains(escaped) || html.contains(escapedCanonical),
                 "S4.4: raw scope text is demoted, not removed — missing \(scope)"
             )
         }
@@ -519,13 +536,20 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
             client: client,
             requestURI: requestURI
         )
+        // A card is `<article><h3>…` (`ScopeDescription.swift:415-417`). For an
+        // atproto-only grant there must be NONE — `atproto` is a session scope,
+        // not a permission, and rendering it as one trains users to approve
+        // lists they cannot read.
         XCTAssertFalse(
+            html.contains("<article><h3>"),
+            "S4.1a: bare `atproto` must produce no permission card at all"
+        )
+        // ... while still appearing in the advanced raw list, which is
+        // unconditional (S4.4). Asserting its total absence would forbid that,
+        // and the two obligations are different.
+        XCTAssertTrue(
             html.contains("<li><code>atproto</code>"),
-            """
-            S4.1a: `atproto` alone is a session scope, not a permission. \
-            Rendering it as a permission bullet trains users to approve lists \
-            they cannot read.
-            """
+            "S4.4: the raw scope list is unconditional — `atproto` still appears there"
         )
     }
 
@@ -560,8 +584,8 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
             "S4.1c: the warning must say the app is requesting access to EVERY space on the network"
         )
         XCTAssertTrue(
-            html.contains("trusted"),
-            "S4.1c: ... and that it should be granted only to deeply trusted applications"
+            html.contains("deeply trust"),
+            "S4.1c: ... and that it should be granted only to applications you deeply trust"
         )
     }
 
@@ -587,47 +611,21 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
             state: "stage4-as-consent",
             codeChallengeS256: String(repeating: "a", count: 43)
         )
-        let app = try await fixture
-            .buildRemoteAuthorizationServer(clientMetadata: try client.metadata())
-            .buildApplication(
-                logger: Logger(label: "RemoteClientPermissionedScopeE2ETests.as-consent")
-            )
-        let authorize =
-            "/oauth/authorize?client_id=\(scopeFormEncode(client.clientID.absoluteString))"
-            + "&request_uri=\(scopeFormEncode(requestURI))"
-
-        try await app.test(.router) { http in
-            // The AS page signs the user in first, then renders consent.
-            var cookie: String?
-            var csrf: String?
-            try await http.execute(uri: authorize, method: .get) { response in
-                XCTAssertEqual(response.status, .ok)
-                cookie = Self.cookieValue(
-                    try XCTUnwrap(response.headers[HTTPField.Name("Set-Cookie")!])
-                )
-                csrf = try fixture.runtime.browserSessionService
-                    .verify(try XCTUnwrap(cookie)).csrfToken
-            }
-            let form = [
-                ("csrf", try XCTUnwrap(csrf)),
-                ("handle", PermissionedScopeFixture.handle),
-                ("password", PermissionedScopeFixture.password),
-            ].map { "\(scopeFormEncode($0.0))=\(scopeFormEncode($0.1))" }
-                .joined(separator: "&")
-            var headers: HTTPFields = [.contentType: "application/x-www-form-urlencoded"]
-            headers[.cookie] = "__Host-swan-oauth=\(try XCTUnwrap(cookie))"
-
-            try await http.execute(
-                uri: "/oauth/authorize",
-                method: .post,
-                headers: headers,
-                body: ByteBuffer(string: form)
-            ) { response in
-                XCTAssertEqual(response.status, .ok)
-                let html = String(buffer: response.body)
-                Self.assertConsentPageIsSemantic(html, renderer: "authorization server")
-            }
-        }
+        // Routed through the SAME walk as the localhost twin. Two copies of the
+        // login sequence would be two places to get `.router` vs `.live` wrong,
+        // and the failure mode is a 503 that reads as "the renderer is missing
+        // its strings".
+        let html = try await consentHTML(
+            fixture: fixture,
+            app: try await fixture
+                .buildRemoteAuthorizationServer(clientMetadata: try client.metadata())
+                .buildApplication(
+                    logger: Logger(label: "RemoteClientPermissionedScopeE2ETests.as-consent")
+                ),
+            client: client,
+            requestURI: requestURI
+        )
+        Self.assertConsentPageIsSemantic(html, renderer: "authorization server")
     }
 
     /// The obligations S4.1-S4.4 place on **either** consent renderer. Shared so
@@ -674,12 +672,12 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
             """,
             file: file, line: line
         )
-        // S4.1a — bare `atproto` is not a permission card.
-        XCTAssertFalse(
-            html.contains("<li><code>atproto</code>"),
-            "S4.1a (\(renderer)): `atproto` alone renders no permission card",
-            file: file, line: line
-        )
+        // S4.1a is NOT asserted here. The advanced raw-scope list is
+        // unconditional by design (S4.4), so `<li><code>atproto</code></li>`
+        // legitimately appears on every page including this one. The real
+        // obligation — bare `atproto` produces no permission CARD — is only
+        // observable on an atproto-only set, and is asserted in
+        // `testStage4LocalhostConsentPageRendersNoCardForBareAtproto`.
     }
 
     private static func cookieValue(_ setCookie: String) -> String? {

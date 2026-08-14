@@ -466,54 +466,85 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    func testBareAndActionUnqualifiedSpaceScopesCannotBecomeDurableTokens() async throws {
+    /// Renamed and re-aimed. It previously asserted that a bare or action-less
+    /// `space:` scope **could not be minted at all**, which encoded the retired
+    /// `isIssuableQualified` gate (§9-D21): "issuable" is no longer a predicate,
+    /// so admission now accepts these shapes and the old assertion fails for the
+    /// right reason.
+    ///
+    /// The property that survives the retirement — and the one that actually
+    /// protects anything — is that such a grant **authorizes no write**. It is
+    /// not enforced at issuance any more; it is enforced by the matcher, because
+    /// an empty `collection` list means NO write targets rather than "all
+    /// collections" (M5). §9-D21's whole argument is that the dangers moved to
+    /// the right layer rather than disappearing, so this is where the assertion
+    /// belongs.
+    func testBareAndActionUnqualifiedSpaceScopesAuthorizeNoWrite() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
         do {
-            let exactScope = "space:app.bsky.bookmarks?authority=\(Self.alice)&skey=record-read&action=read&collection=\(Self.collection)"
-            _ = try await issueToken(fixture.runtime, subject: Self.alice, scopes: [exactScope])
-
-            let invalidScopes = [
+            // Both shapes now MINT — that is the §9-D21 change, asserted rather
+            // than merely tolerated, so a future re-tightening at issuance shows
+            // up here instead of silently narrowing the accept set.
+            let unqualified = [
                 "space:app.bsky.bookmarks",
                 "space:app.bsky.bookmarks?authority=\(Self.alice)&skey=record-read",
             ]
-            for scope in invalidScopes {
-                do {
-                    _ = try await issueToken(fixture.runtime, subject: Self.alice, scopes: [scope])
-                    XCTFail("OAuth issuance accepted an unqualified space scope: \(scope)")
-                } catch {
-                    // The validated-session boundary rejects this before a
-                    // token can be minted.
+            for scope in unqualified {
+                XCTAssertNoThrow(
+                    try {
+                        _ = SwanScopePermissions(rawScopes: [scope], subject: Self.alice)
+                    }(),
+                    "§9-D21: an unqualified space scope is admitted; it is not an issuance error"
+                )
+
+                let permissions = SwanScopePermissions(
+                    rawScopes: ["atproto", scope],
+                    subject: Self.alice
+                )
+                XCTAssertTrue(
+                    permissions.rejected.isEmpty,
+                    "the scope parses — this test is about what it GRANTS, not whether it is legal"
+                )
+
+                // The property that matters: no write target, in any collection.
+                for verb in [
+                    SpaceScopeTarget.Operation.RecordWrite.create,
+                    .update,
+                    .delete,
+                ] {
+                    XCTAssertFalse(
+                        permissions.allowsSpace(
+                            SpaceScopeTarget(
+                                type: "app.bsky.bookmarks",
+                                authority: Self.alice,
+                                skey: "record-read",
+                                operation: .write(verb, collection: Self.collection)
+                            )
+                        ),
+                        """
+                        M5: an empty `collection` list means NO write targets, not \
+                        "all collections". If this ever passes, a bare space grant \
+                        has become a write grant — which is the amplification the \
+                        retired issuance gate used to prevent by accident and the \
+                        matcher must now prevent on purpose (§9-D21).
+                        """
+                    )
                 }
 
-                let now = Date()
-                let binding = OAuthClientBinding(
-                    issuer: Self.publicURL.absoluteString,
-                    clientID: "https://client.example/metadata",
-                    redirectURI: "https://client.example/callback",
-                    scopes: [scope],
-                    dpopJKT: String(repeating: "a", count: 43)
+                // ... and it must not become a delegation exchange either: the
+                // action list is defaulted, never a stated single `action=read`.
+                XCTAssertFalse(
+                    permissions.allowsSpace(
+                        SpaceScopeTarget(
+                            type: "app.bsky.bookmarks",
+                            authority: Self.alice,
+                            skey: "*",
+                            operation: .delegationExchange
+                        )
+                    ),
+                    "§7.3 W1/W3: a defaulted action set is not a stated single `action=read`"
                 )
-                let family = OAuthTokenFamily(
-                    familyID: UUID(),
-                    subject: Self.alice,
-                    binding: binding,
-                    expiresAt: now.addingTimeInterval(3_600)
-                )
-                let tokens = OAuthIssuedTokenDigests(
-                    familyID: family.familyID,
-                    accessTokenDigest: Data(repeating: 0x01, count: 32),
-                    refreshTokenDigest: Data(repeating: 0x02, count: 32),
-                    accessExpiresAt: now.addingTimeInterval(300),
-                    refreshExpiresAt: now.addingTimeInterval(3_000)
-                )
-                do {
-                    try await fixture.control.issueTokenPair(family: family, tokens: tokens, now: now)
-                    XCTFail("durable OAuth store accepted an unqualified space scope: \(scope)")
-                } catch {
-                    // SQLite validates the same tuple shape so a malformed
-                    // legacy binding cannot bypass the issuance boundary.
-                }
             }
             try await close(fixture)
         } catch {
