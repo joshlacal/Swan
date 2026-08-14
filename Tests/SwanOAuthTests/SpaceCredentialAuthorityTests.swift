@@ -26,7 +26,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
             let token = try await issuer.issueSpaceCredential(
                 space: space,
                 user: member,
-                authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
+                authorization: .accountOAuthForTesting(subject: member, scopes: ["atproto"]),
                 now: now
             )
             let inspection = try PermissionedDataJWT.inspectSpaceCredential(token)
@@ -140,7 +140,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
             let token = try await fixture.authorityIssuer().issueSpaceCredential(
                 space: space,
                 user: member,
-                authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
+                authorization: .accountOAuthForTesting(subject: member, scopes: ["atproto"]),
                 now: now
             )
             let verifier = DurableSpaceCredentialVerifier(publicKeys: fixture.localPublicKeyResolver)
@@ -384,14 +384,14 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
             _ = try await issuer.issueSpaceCredential(
                 space: memberSpace,
                 user: member,
-                authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
+                authorization: .accountOAuthForTesting(subject: member, scopes: ["atproto"]),
                 now: now
             )
             await XCTAssertThrowsErrorAsync(
                 try await issuer.issueSpaceCredential(
                     space: memberSpace,
                     user: outsider,
-                    authorization: .accountOAuth(subject: outsider, scopes: ["atproto"]),
+                    authorization: .accountOAuthForTesting(subject: outsider, scopes: ["atproto"]),
                     now: now
                 )
             )
@@ -399,7 +399,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                 try await issuer.issueSpaceCredential(
                     space: memberSpace,
                     user: member,
-                    authorization: .accountOAuth(subject: authority, scopes: ["atproto"]),
+                    authorization: .accountOAuthForTesting(subject: authority, scopes: ["atproto"]),
                     now: now
                 )
             )
@@ -415,7 +415,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                 try await issuer.issueSpaceCredential(
                     space: allowListed,
                     user: member,
-                    authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
+                    authorization: .accountOAuthForTesting(subject: member, scopes: ["atproto"]),
                     now: now
                 )
             )
@@ -423,7 +423,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                 try await issuer.issueSpaceCredential(
                     space: allowListed,
                     user: member,
-                    authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
+                    authorization: .accountOAuthForTesting(subject: member, scopes: ["atproto"]),
                     clientAttestation: "unverified-attestation",
                     now: now
                 )
@@ -437,7 +437,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
             _ = try await verifiedAppIssuer.issueSpaceCredential(
                 space: allowListed,
                 user: member,
-                authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
+                authorization: .accountOAuthForTesting(subject: member, scopes: ["atproto"]),
                 clientAttestation: "test-signed-attestation",
                 now: now
             )
@@ -454,7 +454,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                 try await issuer.issueSpaceCredential(
                     space: managing,
                     user: member,
-                    authorization: .accountOAuth(subject: member, scopes: ["atproto"]),
+                    authorization: .accountOAuthForTesting(subject: member, scopes: ["atproto"]),
                     now: now
                 )
             )
@@ -483,7 +483,7 @@ final class SpaceCredentialAuthorityTests: XCTestCase, @unchecked Sendable {
                         try await issuer.issueSpaceCredential(
                             space: space,
                             user: self.member,
-                            authorization: .accountOAuth(subject: self.member, scopes: ["atproto"]),
+                            authorization: .accountOAuthForTesting(subject: self.member, scopes: ["atproto"]),
                             now: self.now
                         )
                     }
@@ -679,7 +679,7 @@ private struct Fixture: Sendable {
             spaceType: "app.bsky.bookmarks",
             skey: skey
         )
-        let authorization: AuthorizationContext = .accountOAuth(
+        let authorization: AuthorizationContext = .accountOAuthForTesting(
             subject: authority,
             scopes: ["atproto"]
         )

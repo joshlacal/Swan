@@ -446,7 +446,7 @@ final class GetSpaceHTTPTests: XCTestCase, @unchecked Sendable {
                 database: database,
                 credentialSecret: Data(repeating: 0xA9, count: 32)
             )
-            let authorization: AuthorizationContext = .accountOAuth(
+            let authorization: AuthorizationContext = .accountOAuthForTesting(
                 subject: Self.authority,
                 scopes: ["atproto"]
             )

@@ -430,7 +430,7 @@ final class ServePermissionedRuntimeCompositionTests: XCTestCase, @unchecked Sen
                 did: localDID
             )
             do {
-                let authorization = AuthorizationContext.accountOAuth(
+                let authorization = AuthorizationContext.accountOAuthForTesting(
                     subject: localDID,
                     scopes: fixture.semanticScopes
                 )
@@ -1511,7 +1511,7 @@ private struct Fixture {
                     "\(base)&action=update&collection=app.bsky.feed.post",
                     "\(base)&action=delete&collection=app.bsky.feed.post",
                 ]
-                let authorization = AuthorizationContext.accountOAuth(
+                let authorization = AuthorizationContext.accountOAuthForTesting(
                     subject: localDID,
                     scopes: scopes
                 )

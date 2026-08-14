@@ -218,7 +218,7 @@ final class AccountEmailXRPCTests: XCTestCase, @unchecked Sendable {
             )
             let email = makeServer(
                 authorizer: EmailAuthorizer(
-                    result: .success(.accountOAuth(
+                    result: .success(.accountOAuthForTesting(
                         subject: Self.did,
                         scopes: ["atproto"]
                     ))
@@ -263,7 +263,7 @@ final class AccountEmailXRPCTests: XCTestCase, @unchecked Sendable {
 
     func testAuthenticatedConfirmationUsesExactGeneratedPathsAndOAuthSubject() async throws {
         let authorizer = EmailAuthorizer(
-            result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+            result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
         )
         let recovery = EmailRecovery()
         let limiter = EmailRateLimiter()
@@ -316,7 +316,7 @@ final class AccountEmailXRPCTests: XCTestCase, @unchecked Sendable {
 
     func testAuthenticationRequiresLiteralATProtoScopeAndNeverMutatesOnFailure() async throws {
         let authorizer = EmailAuthorizer(
-            result: .success(.accountOAuth(
+            result: .success(.accountOAuthForTesting(
                 subject: Self.did,
                 scopes: ["transition:generic"]
             ))
@@ -370,7 +370,7 @@ final class AccountEmailXRPCTests: XCTestCase, @unchecked Sendable {
 
     func testUpdateEndpointsAreAuthenticatedFixedForbiddenAndNeverMutate() async throws {
         let authorizer = EmailAuthorizer(
-            result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+            result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
         )
         let recovery = EmailRecovery()
         let limiter = EmailRateLimiter()
@@ -411,7 +411,7 @@ final class AccountEmailXRPCTests: XCTestCase, @unchecked Sendable {
 
     func testStrictBodiesRejectDuplicatesUnknownFieldsAndOversizeBeforeMutation() async throws {
         let authorizer = EmailAuthorizer(
-            result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+            result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
         )
         let recovery = EmailRecovery()
         let limiter = EmailRateLimiter()
@@ -524,7 +524,7 @@ final class AccountEmailXRPCTests: XCTestCase, @unchecked Sendable {
 
     func testPasswordResetRequestIsOpaqueAndResetUsesOnlyDeclaredErrors() async throws {
         let authorizer = EmailAuthorizer(
-            result: .success(.accountOAuth(subject: Self.otherDID, scopes: ["atproto"]))
+            result: .success(.accountOAuthForTesting(subject: Self.otherDID, scopes: ["atproto"]))
         )
         let recovery = EmailRecovery(resetOutcomes: [.expiredToken, .invalidToken, .completed])
         let limiter = EmailRateLimiter()
@@ -587,7 +587,7 @@ final class AccountEmailXRPCTests: XCTestCase, @unchecked Sendable {
 
     func testRateLimitingUsesOnlyTheDirectSocketPeerAndFailsClosed() async throws {
         let authorizer = EmailAuthorizer(
-            result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+            result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
         )
         let recovery = EmailRecovery()
         let limiter = EmailRateLimiter(results: [true, false])
@@ -640,7 +640,7 @@ final class AccountEmailXRPCTests: XCTestCase, @unchecked Sendable {
 
     func testUntrustedProxyIgnoresForgedInternalClientIdentity() async throws {
         let authorizer = EmailAuthorizer(
-            result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+            result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
         )
         let recovery = EmailRecovery()
         let limiter = EmailRateLimiter()
@@ -680,7 +680,7 @@ final class AccountEmailXRPCTests: XCTestCase, @unchecked Sendable {
 
     func testTrustedProxyCanonicalClientIPsUseDistinctRateLimitBuckets() async throws {
         let authorizer = EmailAuthorizer(
-            result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+            result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
         )
         let recovery = EmailRecovery()
         let limiter = EmailRateLimiter()
@@ -723,7 +723,7 @@ final class AccountEmailXRPCTests: XCTestCase, @unchecked Sendable {
 
     func testTrustedProxyRejectsAmbiguousClientIdentityBeforeAdmissionOrRecovery() async throws {
         let authorizer = EmailAuthorizer(
-            result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+            result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
         )
         let recovery = EmailRecovery()
         let limiter = EmailRateLimiter()
@@ -797,7 +797,7 @@ final class AccountEmailXRPCTests: XCTestCase, @unchecked Sendable {
 
     func testRecoveryFailureIsFixedNoStoreAndDoesNotReflectRequestData() async throws {
         let authorizer = EmailAuthorizer(
-            result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+            result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
         )
         let recovery = EmailRecovery(
             requestPasswordFailure: .deliveryUnavailable
@@ -861,7 +861,7 @@ final class AccountEmailXRPCTests: XCTestCase, @unchecked Sendable {
         )
         return SwanAccountEmailXRPCServer(
             authorizer: EmailAuthorizer(
-                result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+                result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
             ),
             recovery: SwanAccountEmailRecoveryXRPCAdapter(
                 service: recovery,
