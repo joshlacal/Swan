@@ -1376,7 +1376,7 @@ private struct Fixture: Sendable {
             )
             let tids = try [0, 1, 2, 3, 4].map(tid)
             let scopeBase = "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)"
-            let authorization: AuthorizationContext = .accountOAuth(
+            let authorization: AuthorizationContext = .accountOAuthForTesting(
                 subject: RepositorySyncHTTPTests.alice,
                 scopes: [
                     "atproto",
@@ -1418,7 +1418,7 @@ private struct Fixture: Sendable {
             let bobDatabase = try await SQLiteAccountDatabase(dataDirectory: root, did: RepositorySyncHTTPTests.bob, oplogRetention: retention)
             let bobRepository = try DurableSpaceRepository(database: bobDatabase, space: space, author: RepositorySyncHTTPTests.bob)
             let bobRecord = try SpaceRecordURI(space: space, author: RepositorySyncHTTPTests.bob, collection: "app.bsky.feed.post", rkey: "bob")
-            _ = try await bobRepository.apply(.put(uri: bobRecord, value: recordCBOR("bob")), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: tids[0]), authorization: .accountOAuth(subject: RepositorySyncHTTPTests.bob, scopes: ["\(scopeBase)&action=create&collection=app.bsky.feed.post"]))
+            _ = try await bobRepository.apply(.put(uri: bobRecord, value: recordCBOR("bob")), expectedRevision: 0, requestID: UUID(), wireRevision: try TID(tidString: tids[0]), authorization: .accountOAuthForTesting(subject: RepositorySyncHTTPTests.bob, scopes: ["\(scopeBase)&action=create&collection=app.bsky.feed.post"]))
             try await bobDatabase.close()
 
             let hasher = try LibsodiumArgon2idHasher(policy: .interactive)

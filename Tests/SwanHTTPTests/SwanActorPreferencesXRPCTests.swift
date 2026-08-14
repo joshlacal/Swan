@@ -21,7 +21,7 @@ final class SwanActorPreferencesXRPCTests: XCTestCase, @unchecked Sendable {
         try await withPreferencesStore { store in
             let app = self.makeApp(
                 authorizer: PreferencesAuthorizer(
-                    result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+                    result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
                 ),
                 store: store
             )
@@ -52,7 +52,7 @@ final class SwanActorPreferencesXRPCTests: XCTestCase, @unchecked Sendable {
         try await withPreferencesStore { store in
             let app = self.makeApp(
                 authorizer: PreferencesAuthorizer(
-                    result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+                    result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
                 ),
                 store: store
             )
@@ -111,13 +111,13 @@ final class SwanActorPreferencesXRPCTests: XCTestCase, @unchecked Sendable {
         try await withPreferencesStore { store in
             let appA = self.makeApp(
                 authorizer: PreferencesAuthorizer(
-                    result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+                    result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
                 ),
                 store: store
             )
             let appB = self.makeApp(
                 authorizer: PreferencesAuthorizer(
-                    result: .success(.accountOAuth(subject: Self.otherDID, scopes: ["atproto"]))
+                    result: .success(.accountOAuthForTesting(subject: Self.otherDID, scopes: ["atproto"]))
                 ),
                 store: store
             )
@@ -185,7 +185,7 @@ final class SwanActorPreferencesXRPCTests: XCTestCase, @unchecked Sendable {
         try await withPreferencesStore { store in
             let app = self.makeApp(
                 authorizer: PreferencesAuthorizer(
-                    result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+                    result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
                 ),
                 store: store
             )
@@ -245,7 +245,7 @@ final class SwanActorPreferencesXRPCTests: XCTestCase, @unchecked Sendable {
             )
             let capability = SwanActorPreferencesXRPCServer(
                 authorizer: PreferencesAuthorizer(
-                    result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+                    result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
                 ),
                 store: control
             )
@@ -298,7 +298,7 @@ final class SwanActorPreferencesXRPCTests: XCTestCase, @unchecked Sendable {
         try await withPreferencesStore { store in
             let app = self.makeApp(
                 authorizer: PreferencesAuthorizer(
-                    result: .success(.accountOAuth(subject: Self.did, scopes: ["atproto"]))
+                    result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
                 ),
                 store: store
             )

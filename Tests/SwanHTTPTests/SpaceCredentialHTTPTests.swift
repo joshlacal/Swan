@@ -1631,7 +1631,7 @@ private struct Fixture: Sendable {
                 did: SpaceCredentialHTTPTests.authority
             )
             let authority = DurableSimpleSpaceAuthority(lifecycleDatabase: authorityDatabase)
-            let controlAuthorization: AuthorizationContext = .accountOAuth(
+            let controlAuthorization: AuthorizationContext = .accountOAuthForTesting(
                 subject: SpaceCredentialHTTPTests.authority,
                 scopes: ["atproto"]
             )
@@ -1689,7 +1689,7 @@ private struct Fixture: Sendable {
                 collection: "app.bsky.feed.post",
                 rkey: "member"
             )
-            let memberAuthorization: AuthorizationContext = .accountOAuth(
+            let memberAuthorization: AuthorizationContext = .accountOAuthForTesting(
                 subject: SpaceCredentialHTTPTests.member,
                 scopes: [
                     "space:\(publicSpace.spaceType)?authority=\(publicSpace.authority)&skey=\(publicSpace.skey)&action=create&collection=app.bsky.feed.post",

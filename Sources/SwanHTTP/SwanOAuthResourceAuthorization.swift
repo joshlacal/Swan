@@ -142,7 +142,25 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         // collection decision for the selected operation. Do not let a
         // malformed or legacy stored binding reach that domain policy merely
         // because its DPoP proof and opaque token digest were otherwise valid.
-        guard Self.hasATProtocolResourceScope(grant.scopes) else {
+        //
+        // Parse ONCE, here, and hand a frozen value to the domain layer
+        // (§6.5.1, §6.5.2). `hasResourceScope` is `atproto`-or-`space:` only —
+        // deliberately NOT "any recognised family" (§6.1). Several routes
+        // perform no further scope check at all, so widening this floor would
+        // hand an `identity:`- or `blob:`-only token an unguarded route.
+        //
+        // INTEGRATION SEAM (§9-D23): `statedKeys` is DURABLE provenance and
+        // must arrive on `AccessGrant` from the token family's stored record.
+        // It is NOT derivable here — re-parsing `grant.scopes` would invent
+        // provenance for a mint-resolved `self` and destroy it for a canonical
+        // `skey=*`. Until the durable field lands, this passes nothing, which
+        // is fail-closed: both provenance fences refuse, so `getDelegationToken`
+        // and `listSpaces` deny rather than widen.
+        let permissions = SwanScopePermissions(
+            rawScopes: grant.scopes,
+            subject: grant.subject
+        )
+        guard permissions.hasResourceScope else {
             throw SwanResourceAuthorizationFailure.denied
         }
 
@@ -157,7 +175,7 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
             throw Self.accountFailure(for: error)
         }
 
-        return .accountOAuth(subject: grant.subject, scopes: grant.scopes)
+        return .accountOAuth(subject: grant.subject, permissions: permissions)
     }
 
     private static func accessToken(from headers: HTTPFields) throws -> String {
@@ -201,12 +219,6 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
             }
         }
         return true
-    }
-
-    private static func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
-        scopes.contains("atproto") || scopes.contains { scope in
-            PermissionedSpaceScopeSyntax.isQualified(scope)
-        }
     }
 
     private static func dpopProof(from headers: HTTPFields) -> String? {

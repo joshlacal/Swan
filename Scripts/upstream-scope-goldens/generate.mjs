@@ -7,7 +7,6 @@
 //
 import {
   ScopePermissions,
-  ScopesSet,
   normalizeAtprotoOauthScope,
   normalizeAtprotoOauthScopeValue,
   isAtprotoOauthScope,
@@ -153,7 +152,20 @@ const SPACE_CHECKS = [
 ]
 
 function outcomesFor(scopeString) {
-  const p = new ScopePermissions(new ScopesSet(scopeString))
+  // `ScopesSet extends Set<string>` (scopes-set.ts). Passing a whole
+  // space-delimited STRING to it iterates the string CHARACTER BY CHARACTER, so
+  // the set ends up holding single characters, none of which parse, and every
+  // `allows*` returns false. That is exactly what the first generated corpus
+  // recorded: 128 outcomes, all false, including
+  // `repo:app.bsky.feed.post?action=create` denying `{create,
+  // app.bsky.feed.post}` — which upstream's own repo-permission.test.ts asserts
+  // is allowed.
+  //
+  // `ScopePermissions`'s constructor is the one that splits on SPACE
+  // (scope-permissions.ts:32-39, `typeof scope === 'string' ? scope.split(' ')`),
+  // so the scope string goes there directly and `ScopesSet` is not constructed
+  // by hand at all. Do not "simplify" this back.
+  const p = new ScopePermissions(scopeString)
   const call = (fn, arg) => {
     try {
       return { arg, allowed: fn.call(p, arg) }

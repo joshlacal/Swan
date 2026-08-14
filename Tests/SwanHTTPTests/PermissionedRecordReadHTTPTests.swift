@@ -1373,7 +1373,7 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                 try SpaceRecordURI(space: space, author: Self.alice, collection: Self.otherCollection, rkey: "third"),
             ]
             let values = ["first", "second", "third"]
-            let authorization = AuthorizationContext.accountOAuth(
+            let authorization = AuthorizationContext.accountOAuthForTesting(
                 subject: Self.alice,
                 scopes: repositoryScopes(for: space)
             )
@@ -1402,7 +1402,7 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                 expectedRevision: 0,
                 requestID: UUID(),
                 wireRevision: try tid(0),
-                authorization: .accountOAuth(
+                authorization: .accountOAuthForTesting(
                     subject: Self.alice,
                     scopes: repositoryScopes(for: foreignSpace)
                 )
