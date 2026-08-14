@@ -1,8 +1,11 @@
 # Phase 2 → netcup redeploy readiness
 
-**Status: NOT READY.** Two gates remain open (merged-tree suite, Linux/image
-build) — see "Blocking" below. Gate 1 (P2-H) closed 2026-08-14. Everything
-else is prepared and verified.
+**Status: READY — all three gates closed 2026-08-14.** `swan:next` (4.97 GB,
+digest `0502bcfc…`) is built on netcup from the merged tree (`b4e7118d` synced);
+`swan:local` and the running service are untouched. **The cutover (steps 3-4:
+tag rollback → retag → restart) awaits Josh's explicit go.** Note the host
+already carries `swan:new`/`swan:rollback`/`swan:rollback-prev` tags from
+earlier deploys — the dated rollback tag in step 3 avoids colliding with them.
 
 ## Live state — verified today, not remembered
 
@@ -68,18 +71,16 @@ rollback migration needed** — an older binary simply ignores the extra table.
    grant for the rest of their ≤14-day life** — a frozen legacy family during
    that window is not the F2 defect recurring. New additive column
    `scope_provenance_requested`; same automatic-migration story as below.
-2. **Full macOS suite not yet confirmed on the merged tree.** Lane figures are
-   1864 XCTest / 0 / 11 skipped and 163 Swift Testing / 0 from P2-H's workspace
-   (which contains all of Phase 2 except the `9c4a6926` docs commit); the
-   integration run must be measured on the merge itself, **counting both
-   frameworks** — a `Test Case … passed` count alone already produced one false
-   green in this program.
-3. **Linux build not yet run for Phase-2 code.** This is the real deployment
-   gate and Phase 2 added substantial code across seven targets. Per
-   `reference_swan_linux_docker_build_recipe`: `swift build --product swan` is
-   the gate, **not** `--build-tests` (which has never passed on the pinned Linux
-   toolchain, for an unrelated pre-existing reason). Since the image builds on
-   netcup natively, the honest gate is the image build itself.
+2. ~~**Full macOS suite not yet confirmed on the merged tree.**~~ **CLOSED
+   2026-08-14**, measured on the merge (`b2809f3d`), both frameworks counted:
+   **XCTest 1853 passed / 11 skipped / 0 failed (1864 executed); Swift Testing
+   163 / 0** (zero `✘` in the transcript), exit 0. The known
+   `NIOPeerPinnedOAuthPostTransportTests` load flake did not fire.
+3. ~~**Linux build not yet run for Phase-2 code.**~~ **CLOSED 2026-08-14.**
+   `sudo docker build -t swan:next` completed on netcup with exit 0 from the
+   merged tree — the image build *is* the Linux gate (release build of the
+   `swan` product inside the Dockerfile). Build log: `/tmp/swan-next-build.log`
+   on netcup.
 
 ## Procedure
 
