@@ -134,6 +134,29 @@ final class SwanServiceEndpointResolverTests: XCTestCase {
         }
     }
 
+    /// Host case is the other spelling that names the same subject and is not
+    /// the same string. DNS is case-insensitive, so the document fetch itself
+    /// would have succeeded; binding still refuses, because accepting it means
+    /// choosing a case-folding rule here that the fetcher's URL derivation
+    /// does not share. Declared as a behaviour change, not discovered as one:
+    /// a caller that spells the DID in a different case than the document does
+    /// gets `.unresolvableService` where it used to get the endpoint.
+    func testHostCaseDifferenceDoesNotMatchDocumentID() async {
+        let json = """
+        {"id":"did:web:x.example","service":[
+          {"id":"#bsky_appview","type":"BskyAppView",
+           "serviceEndpoint":"https://x.example"}]}
+        """
+        do {
+            _ = try await resolver(json).endpoint(
+                did: "did:web:X.Example", fragment: "bsky_appview"
+            )
+            XCTFail("expected failure")
+        } catch {
+            XCTAssertEqual(error as? SwanServiceResolutionFailure, .unresolvableService)
+        }
+    }
+
     /// A document with no `id` cannot be bound to the DID that was asked for.
     /// `id` is required by DID Core, so an absent one is a malformed document,
     /// not a permissive one — it is rejected rather than waved through.

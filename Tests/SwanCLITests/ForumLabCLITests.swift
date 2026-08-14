@@ -304,29 +304,7 @@ final class ForumLabCLITests: XCTestCase {
     }
 
     private func executableURL() throws -> URL {
-        if let override = ProcessInfo.processInfo.environment[
-            "SWAN_TEST_EXECUTABLE"
-        ], !override.isEmpty {
-            let executable = URL(fileURLWithPath: override)
-            guard FileManager.default.isExecutableFile(
-                atPath: executable.path
-            ) else {
-                throw XCTSkip("SWAN_TEST_EXECUTABLE is not executable")
-            }
-            return executable
-        }
-        let coBuiltExecutable = Bundle(for: ForumLabCLITests.self)
-            .bundleURL
-            .deletingLastPathComponent()
-            .appending(path: "swan")
-        if FileManager.default.isExecutableFile(
-            atPath: coBuiltExecutable.path
-        ) {
-            return coBuiltExecutable
-        }
-        throw XCTSkip(
-            "co-built swan executable is unavailable; set SWAN_TEST_EXECUTABLE explicitly"
-        )
+        try SwanCLITestExecutable.require()
     }
 }
 

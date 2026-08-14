@@ -193,17 +193,7 @@ final class PortableExportCLITests: XCTestCase {
     }
 
     private func executableURL() -> URL? {
-        let packageRoot = URL(filePath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        for candidate in [
-            packageRoot.appending(path: ".build/debug/swan"),
-            packageRoot.appending(path: ".build-task19/debug/swan"),
-        ] where FileManager.default.isExecutableFile(atPath: candidate.path) {
-            return candidate
-        }
-        return nil
+        SwanCLITestExecutable.resolved()
     }
 }
 

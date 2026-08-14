@@ -579,32 +579,7 @@ final class LabCLITests: XCTestCase {
     }
 
     private func executableURL() throws -> URL {
-        if let override = ProcessInfo.processInfo.environment[
-            "SWAN_TEST_EXECUTABLE"
-        ], !override.isEmpty {
-            let executable = URL(fileURLWithPath: override)
-            guard FileManager.default.isExecutableFile(
-                atPath: executable.path
-            ) else {
-                throw XCTSkip("SWAN_TEST_EXECUTABLE is not executable")
-            }
-            return executable
-        }
-        // Only the product built beside this exact test bundle is eligible.
-        // A package-root `.build/debug/swan` may belong to another scratch
-        // build or source revision and must never be used as fallback evidence.
-        let coBuiltExecutable = Bundle(for: LabCLITests.self)
-            .bundleURL
-            .deletingLastPathComponent()
-            .appending(path: "swan")
-        if FileManager.default.isExecutableFile(
-            atPath: coBuiltExecutable.path
-        ) {
-            return coBuiltExecutable
-        }
-        throw XCTSkip(
-            "co-built swan executable is unavailable; set SWAN_TEST_EXECUTABLE explicitly"
-        )
+        try SwanCLITestExecutable.require()
     }
 
     private func repoRoot() -> URL {

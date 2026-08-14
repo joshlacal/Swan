@@ -54,11 +54,26 @@ public struct SwanServiceEndpointResolver: Sendable {
         // shared host, a stale cache entry, or a path that is not the one the
         // method-specific id names — silently selects that subject's endpoint.
         //
-        // The comparison is byte-exact against the DID string as received.
-        // `did:web` ids legitimately differ in `%3A` port encoding and in host
-        // case, and any normalisation applied here would be a second, weaker
-        // grammar than the one `SwanPeerPinnedDIDDocumentFetcher` already used
-        // to derive the URL — which is exactly how a mismatch gets accepted.
+        // The comparison is byte-exact against the DID string as received,
+        // and no normalisation is applied: any normalisation here would be a
+        // second, weaker grammar than the one
+        // `SwanPeerPinnedDIDDocumentFetcher` already used to derive the fetch
+        // URL, which is exactly how a mismatch gets accepted.
+        //
+        // So this also refuses two spellings that name the same `did:web`
+        // subject but are not the same string: a differently percent-encoded
+        // port (`%3A` vs `:`) and a differently cased host. DNS is
+        // case-insensitive and the fetch would succeed either way, so a caller
+        // that spells the DID differently from the document it is asking about
+        // now gets `.unresolvableService` where it previously got the
+        // endpoint. That is deliberate — the caller controls the spelling
+        // (`SwanXRPCPipethrough` passes the `atproto-proxy` header through
+        // unfolded) and the remedy is to name the subject as its document
+        // does. `testDecodedPortSpellingDoesNotMatchEncodedDocumentID` and
+        // `testHostCaseDifferenceDoesNotMatchDocumentID` pin both, so a later
+        // "helpful" normalisation fails loudly instead of silently widening
+        // what may be bound.
+        //
         // A document with no `id` at all is rejected: `id` is required by DID
         // Core, and a document that will not name its own subject cannot be
         // bound to one.

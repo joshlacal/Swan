@@ -760,33 +760,7 @@ final class PLCAccountPreparationCLITests: XCTestCase {
     }
 
     private func executableURL() -> URL? {
-        let testBundleProduct = Bundle(for: PLCAccountPreparationCLITests.self)
-            .bundleURL
-            .deletingLastPathComponent()
-            .appending(path: "swan")
-        if FileManager.default.isExecutableFile(atPath: testBundleProduct.path) {
-            return testBundleProduct
-        }
-        let testExecutable = URL(fileURLWithPath: CommandLine.arguments[0])
-            .resolvingSymlinksInPath()
-        let adjacentProduct = testExecutable
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appending(path: "swan")
-        if FileManager.default.isExecutableFile(atPath: adjacentProduct.path) {
-            return adjacentProduct
-        }
-        let bundleProducts = Bundle.main.bundleURL.deletingLastPathComponent()
-        let bundled = bundleProducts.appending(path: "swan")
-        if FileManager.default.isExecutableFile(atPath: bundled.path) { return bundled }
-        let packageRoot = URL(filePath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let ordinary = packageRoot.appending(path: ".build/debug/swan")
-        return FileManager.default.isExecutableFile(atPath: ordinary.path) ? ordinary : nil
+        SwanCLITestExecutable.resolved()
     }
 
     private func decode(_ output: String) throws -> [String: Any] {

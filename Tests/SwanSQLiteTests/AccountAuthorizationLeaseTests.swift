@@ -268,6 +268,71 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
         XCTAssertFalse(entered, "stale signer rejection must not retry with nil firehose context")
     }
 
+    /// F18. The publication fence used to answer a non-authorizing account by
+    /// re-running the mutation with no firehose context: the write committed
+    /// and no event was published, leaving the repository permanently ahead of
+    /// every relay's view of it with nothing to reconcile from. The pinned
+    /// reference PDS has no such concept — its write routes refuse a
+    /// deactivated account outright — so the fence refuses too, and the
+    /// mutation must never run.
+    func testDeactivatedAccountIsRefusedRatherThanCommittedWithoutAnEvent() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "SwanAccountAuthorizationLease-\(UUID().uuidString)"
+            )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { Task { try? await control.close() } }
+        _ = try await control.createAccount(
+            AccountControlRegistration(
+                did: did,
+                canonicalHandle: "authorization-lease.example.com",
+                passwordVerifier:
+                    "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                signingKey: .init(purpose: .signing, generation: 1),
+                rotationKey: .init(purpose: .rotation, generation: 1),
+                createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+            )
+        )
+        _ = try await control.transitionStatus(
+            did: did,
+            to: .deactivated,
+            declaration: .init(),
+            now: Date(timeIntervalSince1970: 1_750_000_001)
+        )
+
+        let callback = RotationFenceProbe()
+        let fence = PublicFirehoseCommitFence(control: control)
+        do {
+            _ = try await fence.apply(did: did, signingGeneration: 1) { _ in
+                await callback.record(.enteredAuthorization)
+                throw TestPublicationError.unexpectedMutation
+            }
+            XCTFail("a deactivated account must not publish a public commit")
+        } catch let error as AccountControlStoreError {
+            XCTAssertEqual(
+                error,
+                .invalidTransition,
+                """
+                the refusal must stay the control store's own answer, which \
+                SwanPublicRepositoryMutationCoordinator maps to \
+                `.inactiveAccount` and the route answers 403 AccountInactive
+                """
+            )
+        }
+        let entered = await callback.hasEntered
+        XCTAssertFalse(
+            entered,
+            "a refused account must not reach the mutation at all"
+        )
+    }
+
     /// F46. `apply` used to commit the permissioned batch first and only then
     /// ask whether the account still authorized it, so a deactivation that
     /// landed in between produced a durable write *and* an `unauthorized`
@@ -411,6 +476,144 @@ final class AccountAuthorizationLeaseTests: XCTestCase {
                 """
             )
         }
+    }
+
+    /// F46's residual. Closing the write-then-check race put the whole batch
+    /// under the process-wide control-plane write gate, so the reads, the
+    /// authorization checks, and CID computation over as much as 1 MiB across
+    /// as many as 4,096 operations all head-of-line blocked OAuth and account
+    /// lifecycle traffic — at request rate, with no timeout. Only the durable
+    /// transaction needs the lease; staging is durably inert.
+    ///
+    /// The batch parks in staging, immediately after its first durable read.
+    /// The lease must not be held there, and an unrelated control-plane write
+    /// must be able to commit while it stays parked.
+    func testPermissionedWriteStagesWithoutHoldingTheControlLease() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "SwanAccountAuthorizationLease-\(UUID().uuidString)"
+            )
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let space = try SpaceURI(
+            authority: did,
+            spaceType: "app.bsky.bookmarks",
+            skey: "staging"
+        )
+        let record = try SpaceRecordURI(
+            space: space,
+            author: did,
+            collection: "app.bsky.bookmarks.bookmark",
+            rkey: "staged"
+        )
+        try await installSpaceAccountDatabase(root: root, did: did, space: space)
+
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        _ = try await control.createAccount(
+            AccountControlRegistration(
+                did: did,
+                canonicalHandle: "authorization-lease.example.com",
+                passwordVerifier:
+                    "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                signingKey: .init(purpose: .signing, generation: 1),
+                rotationKey: .init(purpose: .rotation, generation: 1),
+                createdAt: Date(timeIntervalSince1970: 1_750_000_000)
+            )
+        )
+        let directory = try await SQLitePreMigratedAccountDirectory.bootstrap(
+            dataDirectory: root,
+            controlStore: control,
+            publicIdentityVerifier: nil
+        )
+
+        let stagingBarrier = RotationCommitBarrier()
+        try await directory.installAccountTestingHooks(
+            SQLiteTestingHooks(
+                afterRepositoryStateRead: { await stagingBarrier.park() }
+            ),
+            did: did
+        )
+
+        let value = try DAGCBOR.encodeValue(OrderedCBORMap(entries: [
+            (key: "$type", value: "app.bsky.bookmarks.bookmark"),
+            (key: "subject", value: "staged permissioned write"),
+        ]))
+        let accountDID = did
+        let scope = "space:app.bsky.bookmarks?authority=\(did)"
+            + "&skey=staging&action=create"
+            + "&collection=app.bsky.bookmarks.bookmark"
+        let write = Task {
+            try await directory.apply(
+                space: space,
+                author: accountDID,
+                writes: [.create(uri: record, value: value)],
+                requestID: UUID(),
+                wireRevision: "3333333333333",
+                authorization: .accountOAuth(subject: accountDID, scopes: [scope])
+            )
+        }
+        await stagingBarrier.waitUntilParked()
+
+        let staging = await control.connectionGate.admissionSnapshotForTesting()
+        XCTAssertFalse(
+            staging.isHeld,
+            "staging a permissioned batch must not hold the control lease"
+        )
+
+        // The behavioural half: a control-plane write must commit while the
+        // batch is still parked. Raced against a deadline rather than simply
+        // awaited, so a regression that reinstates the coupling fails here
+        // instead of hanging the suite.
+        let unrelated = "did:plc:zyxwvutsrqponmlkjihgfedc"
+        let admitted = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                _ = try? await control.createAccount(
+                    AccountControlRegistration(
+                        did: unrelated,
+                        canonicalHandle: "unrelated.example.com",
+                        passwordVerifier:
+                            "$argon2id$v=19$m=65536,t=2,p=1$abcdefghijklmnopqrstuv$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+                        signingKey: .init(purpose: .signing, generation: 1),
+                        rotationKey: .init(purpose: .rotation, generation: 1),
+                        createdAt: Date(timeIntervalSince1970: 1_750_000_002)
+                    )
+                )
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        XCTAssertTrue(
+            admitted,
+            """
+            an unrelated control-plane write must not queue behind a \
+            permissioned batch that is only staging
+            """
+        )
+
+        await stagingBarrier.release()
+        _ = try await write.value
+
+        try await directory.close()
+        try await control.close()
+
+        let reopened = try await SQLiteAccountDatabase(dataDirectory: root, did: did)
+        let durable = try await reopened.spaceRecord(record)
+        try await reopened.close()
+        XCTAssertNotNil(
+            durable,
+            "the batch must still commit once it leaves staging"
+        )
     }
 }
 

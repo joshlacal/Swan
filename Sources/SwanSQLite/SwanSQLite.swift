@@ -1187,6 +1187,29 @@ public enum SQLiteSpaceWrite: Sendable, Equatable {
     }
 }
 
+/// A permissioned batch that has passed every preflight check and carries no
+/// durable effect yet.  It exists so a publication lease can be taken around
+/// the SQLite transaction alone rather than around the reads, the
+/// authorization checks, and the CID computation that precede it.
+public struct StagedAuthorizedWriteBatch: Sendable {
+    public let expectedRevision: UInt64
+    public let requestID: UUID
+    public let wireRevision: TID
+    public let writes: [SQLiteSpaceWrite]
+
+    public init(
+        expectedRevision: UInt64,
+        requestID: UUID,
+        wireRevision: TID,
+        writes: [SQLiteSpaceWrite]
+    ) {
+        self.expectedRevision = expectedRevision
+        self.requestID = requestID
+        self.wireRevision = wireRevision
+        self.writes = writes
+    }
+}
+
 public struct PersistedOplogCursor: Sendable, Hashable, Comparable {
     public let revision: UInt64
     public let index: UInt64
@@ -1611,6 +1634,11 @@ private let sqlitePermissionedCARSpoolAdmission =
 struct SQLiteTestingHooks: Sendable {
     var beforeApplyCommit: (@Sendable () async throws -> Void)?
     var afterSnapshotStateRead: (@Sendable () async -> Void)?
+    /// Fires after `repositoryState` releases the account connection, which is
+    /// the first durable read a permissioned batch performs. A test parks here
+    /// to observe what a *staging* batch holds — in particular that it does
+    /// not hold the control-plane publication lease.
+    var afterRepositoryStateRead: (@Sendable () async -> Void)?
     var beforeBlobReferenceCommit: (@Sendable () async throws -> Void)?
     var beforeLegacyBlobMigrationCommit: (@Sendable () async throws -> Void)?
     var afterBlobReclaimCommit: (@Sendable () async throws -> Void)?
@@ -1624,6 +1652,7 @@ struct SQLiteTestingHooks: Sendable {
     init(
         beforeApplyCommit: (@Sendable () async throws -> Void)? = nil,
         afterSnapshotStateRead: (@Sendable () async -> Void)? = nil,
+        afterRepositoryStateRead: (@Sendable () async -> Void)? = nil,
         beforeBlobReferenceCommit: (@Sendable () async throws -> Void)? = nil,
         beforeLegacyBlobMigrationCommit: (@Sendable () async throws -> Void)? = nil,
         afterBlobReclaimCommit: (@Sendable () async throws -> Void)? = nil,
@@ -1636,6 +1665,7 @@ struct SQLiteTestingHooks: Sendable {
     ) {
         self.beforeApplyCommit = beforeApplyCommit
         self.afterSnapshotStateRead = afterSnapshotStateRead
+        self.afterRepositoryStateRead = afterRepositoryStateRead
         self.beforeBlobReferenceCommit = beforeBlobReferenceCommit
         self.beforeLegacyBlobMigrationCommit = beforeLegacyBlobMigrationCommit
         self.afterBlobReclaimCommit = afterBlobReclaimCommit
@@ -5498,12 +5528,14 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         author: String
     ) async throws -> PersistedRepositoryState? {
         try requireAccount(author)
-        return try await withConnectionGate {
+        let state = try await withConnectionGate {
             try await readTransaction {
                 try await requireLocalRepositorySpaceOpen(space)
                 return try await loadState(space: space, author: author)
             }
         }
+        await testingHooks.afterRepositoryStateRead?()
+        return state
     }
 
     /// Enumerates the small, value-free local-PDS hosted-space projection for
@@ -11145,12 +11177,36 @@ public actor DurableSpaceRepository {
     /// write-side counterpart to the read projections: it reads only the
     /// local durable snapshot needed to choose the expected revision and to
     /// preflight an ordered batch, then performs one no-network transaction.
+    ///
+    /// Callers that publish under a control-plane lease must use
+    /// `stageAuthorizedWrites` and `commitStagedWrites` separately, so the
+    /// lease covers only the durable transaction.  This convenience form runs
+    /// both halves back to back and is what a caller with no fence wants.
     public func applyAuthorizedWrites(
         _ writes: [AuthorizedSpaceRepositoryWrite],
         requestID: UUID,
         wireRevision: TID,
         authorization: AuthorizationContext
     ) async throws -> [AuthorizedSpaceRepositoryWriteResult] {
+        let staged = try await stageAuthorizedWrites(
+            writes,
+            requestID: requestID,
+            wireRevision: wireRevision,
+            authorization: authorization
+        )
+        return try await commitStagedWrites(staged)
+    }
+
+    /// The preflight half of `applyAuthorizedWrites`: limit validation, the
+    /// durable reads that choose the expected revision, every authorization
+    /// check, and CID computation.  It makes nothing durable, so a caller can
+    /// run it *before* taking a publication lease instead of underneath one.
+    public func stageAuthorizedWrites(
+        _ writes: [AuthorizedSpaceRepositoryWrite],
+        requestID: UUID,
+        wireRevision: TID,
+        authorization: AuthorizationContext
+    ) async throws -> StagedAuthorizedWriteBatch {
         guard !writes.isEmpty else {
             throw SwanError.malformed("repository batch must contain a write")
         }
@@ -11216,13 +11272,29 @@ public actor DurableSpaceRepository {
             }
         }
 
-        let persisted = try await database.apply(
-            space: space,
-            author: author,
+        return StagedAuthorizedWriteBatch(
             expectedRevision: expectedRevision,
             requestID: requestID,
             wireRevision: wireRevision,
             writes: sqliteWrites
+        )
+    }
+
+    /// The durable half of `applyAuthorizedWrites`: one no-network SQLite
+    /// transaction over an already-staged batch.  Nothing here reads the
+    /// control store, so a caller may hold a control-plane write lease across
+    /// it.  The revision CAS inside `database.apply` — not the staging read —
+    /// is what rejects a batch staged against a superseded revision.
+    public func commitStagedWrites(
+        _ staged: StagedAuthorizedWriteBatch
+    ) async throws -> [AuthorizedSpaceRepositoryWriteResult] {
+        let persisted = try await database.apply(
+            space: space,
+            author: author,
+            expectedRevision: staged.expectedRevision,
+            requestID: staged.requestID,
+            wireRevision: staged.wireRevision,
+            writes: staged.writes
         )
         return try persisted.entries.map { entry in
             let action: AuthorizedSpaceRepositoryWriteResult.Action = switch entry.action {

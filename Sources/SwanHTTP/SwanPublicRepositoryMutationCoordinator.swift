@@ -280,6 +280,17 @@ public enum SwanPublicRepositoryMutationCoordinator {
                 return .unavailable
             }
         }
+        // A deactivation that lands between the route's `status == .active`
+        // check and the publication fence. The fence used to answer this by
+        // committing without emitting a firehose event, which left the
+        // repository ahead of every relay's view of it with nothing to
+        // reconcile from; it now refuses, and the client sees the same 403
+        // `AccountInactive` a write to an already-inactive account would
+        // deserve rather than a 200 for a write no relay will ever hear.
+        if let error = error as? AccountControlStoreError,
+           error == .invalidTransition {
+            return .inactiveAccount
+        }
         return .unavailable
     }
 

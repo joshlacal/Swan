@@ -99,128 +99,141 @@ final class OAuthRequestTargetTests: XCTestCase {
     // MARK: - OAuth document transport (GET)
 
     func testDocumentTransportEmitsPercentEncodedTargetOnTheWire() async throws {
-        let server = try await RequestTargetEchoPeer.start()
-        defer { Task { await server.close() } }
+        try await withEchoPeer { server in
+            let url = try XCTUnwrap(
+                URL(string: "http://localhost:\(server.port)\(Self.encodedPath)?\(Self.encodedQuery)")
+            )
+            let transport = try NIOPeerPinnedOAuthDocumentTransport(maximumTransportTimeout: 2)
+            let response = try await transport.get(
+                url: url,
+                approvedPeers: [server.oauthPeer],
+                timeout: 2,
+                maximumBodyBytes: 1_024
+            )
 
-        let url = try XCTUnwrap(
-            URL(string: "http://localhost:\(server.port)\(Self.encodedPath)?\(Self.encodedQuery)")
-        )
-        let transport = try NIOPeerPinnedOAuthDocumentTransport(maximumTransportTimeout: 2)
-        let response = try await transport.get(
-            url: url,
-            approvedPeers: [server.oauthPeer],
-            timeout: 2,
-            maximumBodyBytes: 1_024
-        )
-
-        XCTAssertEqual(response.status, 200)
-        XCTAssertEqual(server.observedURIs(), ["\(Self.encodedPath)?\(Self.encodedQuery)"])
-        XCTAssertEqual(response.responseURL.absoluteString, url.absoluteString)
+            XCTAssertEqual(response.status, 200)
+            XCTAssertEqual(server.observedURIs(), ["\(Self.encodedPath)?\(Self.encodedQuery)"])
+            XCTAssertEqual(response.responseURL.absoluteString, url.absoluteString)
+        }
     }
 
     func testDocumentTransportEmitsRootForAnEmptyPath() async throws {
-        let server = try await RequestTargetEchoPeer.start()
-        defer { Task { await server.close() } }
+        try await withEchoPeer { server in
+            let url = try XCTUnwrap(URL(string: "http://localhost:\(server.port)"))
+            let transport = try NIOPeerPinnedOAuthDocumentTransport(maximumTransportTimeout: 2)
+            let response = try await transport.get(
+                url: url,
+                approvedPeers: [server.oauthPeer],
+                timeout: 2,
+                maximumBodyBytes: 1_024
+            )
 
-        let url = try XCTUnwrap(URL(string: "http://localhost:\(server.port)"))
-        let transport = try NIOPeerPinnedOAuthDocumentTransport(maximumTransportTimeout: 2)
-        let response = try await transport.get(
-            url: url,
-            approvedPeers: [server.oauthPeer],
-            timeout: 2,
-            maximumBodyBytes: 1_024
-        )
-
-        XCTAssertEqual(server.observedURIs(), ["/"])
-        XCTAssertEqual(response.responseURL.absoluteString, url.absoluteString)
+            XCTAssertEqual(server.observedURIs(), ["/"])
+            XCTAssertEqual(response.responseURL.absoluteString, url.absoluteString)
+        }
     }
 
     // MARK: - OAuth notification transport (POST)
 
     func testPostTransportEmitsPercentEncodedTargetOnTheWire() async throws {
-        let server = try await RequestTargetEchoPeer.start()
-        defer { Task { await server.close() } }
+        try await withEchoPeer { server in
+            let url = try XCTUnwrap(
+                URL(string: "http://localhost:\(server.port)\(Self.encodedPath)?\(Self.encodedQuery)")
+            )
+            let transport = NIOPeerPinnedOAuthPostTransport(configuration: try .init(
+                endpointPeers: [url.absoluteString: server.oauthPeer]
+            ))
+            let response = try await transport.post(
+                url: url,
+                approvedPeers: [server.oauthPeer],
+                headers: ["content-type": "application/json"],
+                body: Data("{}".utf8),
+                timeout: 2,
+                maximumResponseBodyBytes: 1_024
+            )
 
-        let url = try XCTUnwrap(
-            URL(string: "http://localhost:\(server.port)\(Self.encodedPath)?\(Self.encodedQuery)")
-        )
-        let transport = NIOPeerPinnedOAuthPostTransport(configuration: try .init(
-            endpointPeers: [url.absoluteString: server.oauthPeer]
-        ))
-        let response = try await transport.post(
-            url: url,
-            approvedPeers: [server.oauthPeer],
-            headers: ["content-type": "application/json"],
-            body: Data("{}".utf8),
-            timeout: 2,
-            maximumResponseBodyBytes: 1_024
-        )
-
-        XCTAssertEqual(response.status, 200)
-        XCTAssertEqual(server.observedURIs(), ["\(Self.encodedPath)?\(Self.encodedQuery)"])
-        XCTAssertEqual(response.responseURL.absoluteString, url.absoluteString)
+            XCTAssertEqual(response.status, 200)
+            XCTAssertEqual(server.observedURIs(), ["\(Self.encodedPath)?\(Self.encodedQuery)"])
+            XCTAssertEqual(response.responseURL.absoluteString, url.absoluteString)
+        }
     }
 
     func testPostTransportEmitsRootForAnEmptyPath() async throws {
-        let server = try await RequestTargetEchoPeer.start()
-        defer { Task { await server.close() } }
+        try await withEchoPeer { server in
+            let url = try XCTUnwrap(URL(string: "http://localhost:\(server.port)"))
+            let transport = NIOPeerPinnedOAuthPostTransport(configuration: try .init(
+                endpointPeers: [url.absoluteString: server.oauthPeer]
+            ))
+            let response = try await transport.post(
+                url: url,
+                approvedPeers: [server.oauthPeer],
+                headers: [:],
+                body: Data("{}".utf8),
+                timeout: 2,
+                maximumResponseBodyBytes: 1_024
+            )
 
-        let url = try XCTUnwrap(URL(string: "http://localhost:\(server.port)"))
-        let transport = NIOPeerPinnedOAuthPostTransport(configuration: try .init(
-            endpointPeers: [url.absoluteString: server.oauthPeer]
-        ))
-        let response = try await transport.post(
-            url: url,
-            approvedPeers: [server.oauthPeer],
-            headers: [:],
-            body: Data("{}".utf8),
-            timeout: 2,
-            maximumResponseBodyBytes: 1_024
-        )
-
-        XCTAssertEqual(server.observedURIs(), ["/"])
-        XCTAssertEqual(response.responseURL.absoluteString, url.absoluteString)
+            XCTAssertEqual(server.observedURIs(), ["/"])
+            XCTAssertEqual(response.responseURL.absoluteString, url.absoluteString)
+        }
     }
 
     // MARK: - AT handle transport (GET)
 
     func testATHandleTransportEmitsPercentEncodedTargetOnTheWire() async throws {
-        let server = try await RequestTargetEchoPeer.start()
-        defer { Task { await server.close() } }
+        try await withEchoPeer { server in
+            let url = try XCTUnwrap(
+                URL(string: "http://127.0.0.1:\(server.port)\(Self.encodedPath)?\(Self.encodedQuery)")
+            )
+            let transport = try NIOPeerPinnedATHandleHTTPTransport(maximumTransportTimeout: 2)
+            let response = try await transport.get(
+                url: url,
+                approvedPeers: [server.handlePeer],
+                timeout: 2,
+                maximumBodyBytes: 1_024
+            )
 
-        let url = try XCTUnwrap(
-            URL(string: "http://127.0.0.1:\(server.port)\(Self.encodedPath)?\(Self.encodedQuery)")
-        )
-        let transport = try NIOPeerPinnedATHandleHTTPTransport(maximumTransportTimeout: 2)
-        let response = try await transport.get(
-            url: url,
-            approvedPeers: [server.handlePeer],
-            timeout: 2,
-            maximumBodyBytes: 1_024
-        )
-
-        XCTAssertEqual(response.status, 200)
-        XCTAssertEqual(server.observedURIs(), ["\(Self.encodedPath)?\(Self.encodedQuery)"])
-        XCTAssertEqual(response.responseURL.absoluteString, url.absoluteString)
+            XCTAssertEqual(response.status, 200)
+            XCTAssertEqual(server.observedURIs(), ["\(Self.encodedPath)?\(Self.encodedQuery)"])
+            XCTAssertEqual(response.responseURL.absoluteString, url.absoluteString)
+        }
     }
 
     func testATHandleTransportEmitsRootForAnEmptyPath() async throws {
+        try await withEchoPeer { server in
+            let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(server.port)"))
+            let transport = try NIOPeerPinnedATHandleHTTPTransport(maximumTransportTimeout: 2)
+            let response = try await transport.get(
+                url: url,
+                approvedPeers: [server.handlePeer],
+                timeout: 2,
+                maximumBodyBytes: 1_024
+            )
+
+            XCTAssertEqual(server.observedURIs(), ["/"])
+            XCTAssertEqual(response.responseURL.absoluteString, url.absoluteString)
+        }
+    }
+
+    /// Runs one wire test against a fresh echo peer and shuts that peer's
+    /// event-loop group down before the test returns, on both the success and
+    /// the failure path. A `defer { Task { await close() } }` would only
+    /// *schedule* the shutdown, so the group could outlive the test and
+    /// accumulate a thread per case across the suite.
+    private func withEchoPeer(
+        _ body: (RequestTargetEchoPeer) async throws -> Void
+    ) async throws {
         let server = try await RequestTargetEchoPeer.start()
-        defer { Task { await server.close() } }
-
-        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(server.port)"))
-        let transport = try NIOPeerPinnedATHandleHTTPTransport(maximumTransportTimeout: 2)
-        let response = try await transport.get(
-            url: url,
-            approvedPeers: [server.handlePeer],
-            timeout: 2,
-            maximumBodyBytes: 1_024
-        )
-
-        XCTAssertEqual(server.observedURIs(), ["/"])
-        XCTAssertEqual(response.responseURL.absoluteString, url.absoluteString)
+        do {
+            try await body(server)
+        } catch {
+            await server.close()
+            throw error
+        }
+        await server.close()
     }
 }
+
 
 /// A plaintext HTTP/1.1 peer on 127.0.0.1 that records the exact request-target
 /// bytes of every request line it decodes. Plaintext keeps the test free of

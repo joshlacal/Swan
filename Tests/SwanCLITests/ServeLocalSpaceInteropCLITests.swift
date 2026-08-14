@@ -636,18 +636,7 @@ final class ServeLocalSpaceInteropCLITests: XCTestCase {
     }
 
     private func executableURL() -> URL? {
-        if let override = ProcessInfo.processInfo.environment[
-            "SWAN_TEST_EXECUTABLE"
-        ], !override.isEmpty {
-            let url = URL(filePath: override)
-            if FileManager.default.isExecutableFile(atPath: url.path) {
-                return url
-            }
-        }
-        let packageRoot = URL(filePath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        let executable = packageRoot.appending(path: ".build/debug/swan")
-        return FileManager.default.isExecutableFile(atPath: executable.path) ? executable : nil
+        SwanCLITestExecutable.resolved()
     }
 
     private func temporaryDirectory() throws -> URL {

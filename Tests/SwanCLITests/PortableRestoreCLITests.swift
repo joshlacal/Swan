@@ -160,22 +160,7 @@ final class PortableRestoreCLITests: XCTestCase {
     }
 
     private func executableURL() -> URL? {
-        if let override = ProcessInfo.processInfo.environment["SWAN_TEST_EXECUTABLE"],
-           !override.isEmpty,
-           FileManager.default.isExecutableFile(atPath: override) {
-            return URL(filePath: override)
-        }
-        let packageRoot = URL(filePath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        for candidate in [
-            packageRoot.appending(path: ".build/debug/swan"),
-            packageRoot.appending(path: ".build-task20/debug/swan"),
-        ] where FileManager.default.isExecutableFile(atPath: candidate.path) {
-            return candidate
-        }
-        return nil
+        SwanCLITestExecutable.resolved()
     }
 }
 

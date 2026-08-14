@@ -17,6 +17,8 @@ three steps: `77bab90c` (L1-L5 + the two credential/blob lanes), `c1a71eb3`
 | `c1a71eb3` | 1571 passed / 0 failed | 1556 passed / 15 failed |
 | `e9db9b43` (merge) | 1608 passed / 0 failed | 1593 passed / 15 failed |
 | change `yzyzrzpl` (+F23, script fixes) | 1611 passed / 0 failed | 1596 passed / 15 failed |
+| change `ouystzzu` (+F46 uncoupling, L7/L8 residuals) | 1613 passed / 0 failed | 1598 passed / 15 failed |
+| change `ouystzzu` (+F18, `executableURL()`) | 1613 passed / 1 failed† | **1614 passed / 0 failed** (Swift 6.2.4) |
 
 The tip is named by its jj **change** id, not a commit id: it has been amended
 in place and every commit id quoted for it so far is already dead. Only sealed,
@@ -25,45 +27,112 @@ parented commits are quoted by commit id here. An intermediate state of
 measured 1609/0 on macOS and 1594/15 on x86_64; that tree no longer exists as
 a distinct commit.
 
-Every row reconciles exactly (1596 + 15 = 1611). All 15 Linux failures are the
+Every row reconciles exactly (1613 + 1 = 1614 on the tip). **The last row is
+the first fully green Linux run this program has produced**: consolidating
+`executableURL()` closed all 15 pre-existing harness failures, so Linux and
+macOS now agree test for test.
+
+† The one macOS failure is
+`SwanProxyHTTPTransportTests.testHostnameResolutionIsBoundedByThePolicyDeadline`,
+a deadline-bounded DNS test that caught its own `CancellationError` while an
+rsync and a Docker build were saturating the machine. It passes 3/3 in
+isolation on the same binary. Recorded as load-sensitive, not as a
+regression — and worth tightening, since a test that fails under load is a
+test that will fail in CI. All 15 Linux failures are the
 pre-existing `executableURL()` harness gap, and the failing test *names* are
 byte-identical to the pre-F23 run, so nothing regressed. `swift build --product
 swan` and `--build-tests` both exit 0 on x86_64. That run did not hang.
 
-**Open, unexplained: the full Linux suite intermittently hangs.** This was
-first recorded here as a non-reproducing flake. That was wrong — it recurred,
-and the correction matters more than the original note.
+**The intermittent suite hang is not Linux-only, and two earlier claims here
+were wrong.** It was recorded as a non-reproducing flake, then as "recurring,
+unexplained", then — after a symbolicated Linux dump — as a lost wakeup in the
+Linux executor. That third reading has now been falsified in part: **the same
+wedge happened on macOS**, under Xcode's XCTest and Darwin's runtime, on
+2026-08-14. Both corrections are recorded below rather than edited away,
+because each was stated confidently and each shaped what to do next.
 
-Tally across eight full x86_64 runs: **two hangs, six completions.** One hang
-was in a broken environment (wrong bind-mount path, stale PCH cache) and is
-weak evidence; the other was clean. Both stopped inside
-`PLCSpaceCredentialPublicKeyResolverTests`, but at *different* tests within
-it, and both required `timeout` to kill (`TEST_EXIT=124`, 50 min).
+Tally: **five wedges observed.** Four on x86_64 Linux across twelve full runs,
+one on macOS. Three were caught deliberately by a watchdog that dumps before
+killing (`x86-hang-hunt.sh` on netcup, dumps in
+`~/dev/swan-x86-gate/hang-logs/`); the macOS one was caught live with
+`sample`.
 
-What is established:
+What every wedge has in common:
 
-- **Not self-contained.** That suite passes 25/25 consecutive isolated runs,
-  14 tests each, ~0.5 s. The hang needs full-run context.
-- **Not network or DNS.** The tests use a fixture PLC client, and
-  `example.invalid` returns NXDOMAIN in well under a second in the container.
-- **No suspension primitive in the resolver** — no continuation, no semaphore
-  — so "a leaked admission permit blocks a later caller" is *not* supported.
-  That suite is more likely where the process happens to be parked when
-  something else wedges than the thing that wedges.
-- At the hang: main thread in `ppoll`, ~20 threads, SQLite pool threads idle.
-- **Never observed on macOS**, across many full runs.
-- **Not attributable to the remediation work.** Three consecutive full runs on
-  the final tree completed identically (1594 passed / 15 failed each).
+- **The main thread is inside XCTest's async bridge, waiting on an
+  expectation.** On Linux: `XCTWaiter.wait` under `XCTest.awaitUsingExpectation`
+  / `asyncTest`. On macOS: `-[XCTWaiter _performWait:manager:completionHandler:]`
+  → `+[XCTWaiter _synchronouslyWaitForTimeInterval:]` → `CFRunLoop` →
+  `mach_msg`. Both are the same mechanism: enqueue the `async` test body as a
+  Task, then block a thread until it signals.
+- **No Swift concurrency worker threads exist at all.** The macOS sample has
+  35 threads and *zero* frames in `com.apple.root`, `swift_task_*` or
+  `swift_job*`. The task the main thread is waiting for is not running
+  anywhere, and no worker was ever spun up to run it.
+- **No thread is in Swan code.**
 
-Whoever picks this up: it is a real availability question about
-`PLCSpaceCredentialPublicKeyResolver`, which sits on the credential
-verification path, and it should not be closed as flake a second time without
-a mechanism. A dump with Swift symbols (the frames were unsymbolicated) taken
-while wedged is the obvious next step.
+**Correction 1: the threads I called "cooperative-pool workers" are not.**
+`SGLTN-TP-#0…#N` is NIO's *singleton thread pool*
+(`NIOThreadPool._blockingWaitForWork` → `withLockWaitingForWork` →
+`pthread_cond_wait`), and `NIO-SGLTN-1-#N` are its event loops in
+`epoll_wait`/`kevent`. Both are idle by design and neither says anything about
+the Swift concurrency executor. The load-bearing observation is the one above:
+*no* cooperative threads exist.
 
-**Do not gate CI on a single Linux suite run until this is understood** — a
-timeout is mandatory, and a hang must be reported as a hang rather than as a
-run that never finished.
+**Correction 2: "never observed on macOS" is retired.** It was true across many
+runs and is no longer.
+
+The wedge concentrates in the PLC credential suites — four of five, at
+`PLCSpaceCredentialPublicKeyResolverTests` (×3) and
+`PLCSpaceCredentialSingleFlightTests` (×1) — so "it parks wherever the run
+happens to be" is too weak. Those suites are `async`-dense: many short tests,
+each spawning `Task.detached` refreshes, which is a high enqueue rate and more
+chances to lose a scheduling race.
+
+Two arguments rule out the Swan-side explanations that fit the shape:
+
+- The Linux wedge at
+  `PLCSpaceCredentialSingleFlightTests.testProcessWideConcurrencyNeverExceeds
+  HardCeilingAcrossResolvers` stopped as the test was *starting*, and that
+  test's first act (`waitForFetchCount`) throws after a **two-second**
+  `ContinuousClock` deadline (`PLCSpaceCredentialSingleFlightTests.swift:
+  497-509`). It sat wedged for over twenty minutes. A task being scheduled at
+  all would have failed in two seconds.
+- The macOS wedge was at
+  `PLCSpaceCredentialPublicKeyResolverTests.testUnknownIssuerAndKeyFailClosed
+  WithoutUnsafeFallback`, which has **no blocking primitive of any kind**: a
+  plain `ResolverPLCFixture` that answers from a dictionary, three `await`s, no
+  barrier, no controlled release, no parking. There is nothing in it to
+  deadlock on.
+
+A leaked `PLCProcessLookupGate` permit is also ruled out, twice over:
+`acquire()` returns `nil` at capacity (`PLCSpaceCredentialPublicKeyResolver
+.swift:67-73`) and the caller turns `nil` into an immediate `.failure`
+(`:413-418`) — no queue, no retry loop — so exhaustion produces a *failure*,
+never a wait.
+
+**Swift 6.2.4 on Linux: six runs, six completions, zero hangs** — same tree,
+same host, same 1598/15 result. Under 6.1 the rate was four in twelve, so a
+clean six has roughly a 9% chance if nothing changed. It also builds Swan with
+no source changes (`--product swan` and `--build-tests` both exit 0). That is
+encouraging but it is **not** a fix, and the macOS wedge is why: the same
+failure reproduces on an entirely different toolchain and a different XCTest
+implementation, so a 6.2 pin move is at best a reduction in frequency.
+
+Next steps, revised in light of the macOS instance:
+
+1. **Migrate the PLC credential suites to swift-testing.** This is now the
+   most promising fix rather than a workaround: swift-testing awaits test
+   bodies natively instead of enqueueing them and blocking a thread on an
+   expectation, which is the one mechanism common to all five wedges. Start
+   with the two PLC suites, keep the watchdog running, and see whether the
+   wedge moves elsewhere or stops.
+2. **Move the pin to 6.2.4** on its own merits — it is clean on the gate and
+   showed six consecutive completions — while treating the hang as open.
+3. Keep a `timeout` on every suite run, and report a hang as a hang. This is
+   the standing rule and it is what turned a "flake" into five data points.
+
+**Do not gate CI on a single suite run until this is understood.**
 
 **Three items whose status is not what the merge alone implies:**
 
@@ -97,15 +166,40 @@ run that never finished.
   is now pinned directly by
   `testSpoolLeaseDownsizeReturnsCapacityAndRefusesToGrow` rather than
   indirectly through an HTTP route.
-- **F46 — closed, but it bought an undeclared availability coupling.** Every
-  permissioned write now runs inside the process-wide control-database
-  connection gate and `BEGIN IMMEDIATE`, head-of-line blocking OAuth and
-  account-lifecycle traffic with no timeout. It is also client-visible:
-  concurrent same-account permissioned writes no longer return 409 within a
-  single process. The public mutation path already behaved this way
-  (`PublicFirehoseCommitFence`), so this is convergence rather than a new
-  class — but it is request-rate now, where every other caller of that fence
-  is operator-rate.
+- **F46 — closed, and its availability coupling is now closed too.** The fix
+  as first landed ran *every* permissioned write inside the process-wide
+  control-database connection gate and `BEGIN IMMEDIATE`, head-of-line
+  blocking OAuth and account-lifecycle traffic with no timeout, at request
+  rate.
+
+  The lease now covers only the durable transaction.
+  `DurableSpaceRepository.applyAuthorizedWrites` is split into
+  `stageAuthorizedWrites` — limit validation, the revision and
+  record-metadata reads, every authorization check, and CID computation over
+  as much as 1 MiB across as many as 4,096 operations — and
+  `commitStagedWrites`, the one no-network SQLite transaction. Staging is
+  durably inert, so running it under the control lease bought no
+  linearization: a deactivation landing during staging is still observed by
+  the fence, and one landing after the commit is still ordered after it.
+  `AccountAuthorizationLeaseTests.testPermissionedWriteStagesWithoutHolding
+  TheControlLease` parks a batch in staging and asserts both halves — the
+  lease is not held, and an unrelated control-plane write commits while the
+  batch stays parked. Against the previous arrangement both assertions fail,
+  the second only after the full 10 s deadline, which is the head-of-line
+  block itself.
+
+  The in-process ordering the control lease had been providing as a side
+  effect is now provided on purpose, by a per-`(account, space)`
+  `RepositoryWriteGate`. Concurrent batches for one repository still
+  serialize, each still stages against its predecessor's committed revision,
+  and `testConcurrentHTTPWritesAllCommitInATotalOrderUnderTheAuthorization
+  Fence` still sees 16 commits and no 409 — verified, not assumed: with the
+  ordering removed that test reports 1 commit and 15 conflicts. Lock order is
+  repository lease → control gate → account connection gate; nothing acquires
+  a repository lease while holding the control gate, so the new edge closes
+  no cycle. The gate map is reference-counted so an entry cannot be dropped
+  between a waiter's lookup and its acquisition, which would otherwise hand
+  two batches a lease on the same repository.
 - **L9's acceptance-script regressions are FIXED — there were two, not one.**
   `Scripts/run-reference-relay-acceptance.sh:369` read the operator secret
   from `/run/secrets/swan-runtime/`, which the split emptied; it now reads
@@ -144,6 +238,21 @@ run that never finished.
   space-credential flow. F23's evidence remains the seven route-level tests,
   three of which fail against a ceiling-reserving route.
 
+  **The F46 uncoupling was not driven live either, and the reason is worth
+  recording.** There *is* a scripted scenario that drives permissioned
+  `createRecord` writes end to end — `Scripts/run-forum-live-demo.sh`, which
+  provisions a forum space, posts from three writer identities across two
+  hosts, and syncs the merged thread. It was started against the merged tree
+  and got as far as building Swan's own image successfully, then failed
+  building the pinned reference-pds recovery overlay it requires:
+  `ResourceExhausted: failed to copy files: copy file range failed: no space
+  left on device`. The Colima VM's Docker disk is **98% full** — 118 GB, 3.3 GB
+  free, 105 images at 112 GB and 76 GB of build cache. `docker builder prune`
+  freed 5 GB and `docker image prune` freed nothing; the remaining 24 GB is
+  unused *tagged* images, which includes the checksum-pinned reference builds,
+  so reclaiming it is a deliberate operator decision and not a cleanup to make
+  in passing. Whoever wants the live forum run needs to free that space first.
+
   Two traps for whoever brings it up next:
 
   - `docker-compose.yml` uses `context: ..` with `dockerfile: Swan/Dockerfile`,
@@ -162,6 +271,46 @@ run that never finished.
     (`./interop/compose.sh --file docker-compose.yml --project-name <new> up
     -d`), which leaves the previous lab's volumes intact — preferable to
     `down -v`, which destroys them.
+
+**The verifier findings the lanes left open are now closed** — except the ones
+that turned out not to exist:
+
+- **L7's `did:web` host-case change was undeclared, and its comment
+  contradicted the code.** The comment said host case "legitimately differs"
+  while the code required a byte-exact match, so a caller spelling the DID in
+  a different case than the document does now gets `.unresolvableService`
+  where it previously got the endpoint. The comparison is right — any
+  normalisation here would be a second, weaker grammar than the one the
+  fetcher used to derive the URL — so the comment now states the consequence
+  instead of denying it, and `testHostCaseDifferenceDoesNotMatchDocumentID`
+  pins it beside the existing `%3A` port-spelling test. The caller controls
+  the spelling: `SwanXRPCPipethrough` passes the `atproto-proxy` header
+  through unfolded.
+- **L8's exact-URL guards were untested at two of their three sites.** The
+  document-fetch guard had a mismatch case (`SwanOAuthTests.swift:1260`); the
+  notification poster (`OAuthRemoteFetch.swift:820`) and the handle verifier
+  (`ATHandleVerification.swift:514`) had none, and the handle verifier's own
+  fake transport made one impossible by always echoing the requested URL back
+  as `responseURL`. Both now have one. Verified by deleting each guard: with
+  the guard gone both tests fail.
+- **L8's test peers leaked their event-loop groups.** Six wire tests closed
+  the peer with `defer { Task { await server.close() } }`, which only
+  *schedules* the shutdown — the group could outlive the test. They run
+  through a scoped `withEchoPeer` helper that closes on both the success and
+  the failure path before the test returns.
+- **L8's open question 2 is answerable: there is no unaudited fourth client
+  path.** `AsyncHTTPClientOAuthTransport` is a disabled stub whose
+  initialiser throws (`OAuthRemoteFetch.swift:439-458`), as is
+  `AsyncHTTPClientOAuthPostTransport.post`. Neither can be constructed, so
+  neither has `responseURL` behaviour to audit.
+- **L13 has nothing outstanding.** Its report checked every citation in its
+  brief and found all six correct; its three "disagreements" are a wording
+  note, a note that the `.equivocation` assertion already exists in the file
+  that owns the fixture, and a note that no citation drifted. The three
+  incorrect citations were **L8's**, in this document, and are now fixed in
+  §3: the charset guard is at `SwanProxyHTTPTransport.swift:234-236` not
+  `:227-229`, and the exact-URL comparison is at `OAuthRemoteFetch.swift:652`
+  not `:607` — with two more at `:820` and `ATHandleVerification.swift:514`.
 
 **Deferred by decision, not oversight:** F21, F24, F25, F29, F34, F42, and the
 F20/F31-step-2/F13-advertising halves — see §5. F21's block GC is the highest
@@ -352,7 +501,7 @@ F07: add `let id: String?` to `Document` (`SwanServiceEndpointResolver.swift:21-
 **Closes:** F22 (residual).
 **Files:** `Sources/SwanOAuth/NIOPeerPinnedOAuthDocumentTransport.swift`, `Sources/SwanOAuth/NIOPeerPinnedOAuthPostTransport.swift`, `Sources/SwanAccounts/NIOPeerPinnedATHandleHTTPTransport.swift`, `Tests/SwanOAuthTests/OAuthRequestTargetTests.swift` (new).
 
-Build the origin-form target from `components.percentEncodedPath` / `percentEncodedQuery` at `NIOPeerPinnedOAuthDocumentTransport.swift:128-132`, `NIOPeerPinnedOAuthPostTransport.swift:205-209`, `NIOPeerPinnedATHandleHTTPTransport.swift:159-163`. Keep the `0x21...0x7E` guard for symmetry with `SwanProxyHTTPTransport.swift:227-229`, but state in the comment that NIO's `NIOHTTPRequestHeadersValidator` is the actual CRLF control so nobody re-derives the refuted threat model. Also report the emitted target in `responseURL` (`NIOPeerPinnedOAuthDocumentTransport.swift:248-251`) so the exact-URL comparison at `OAuthRemoteFetch.swift:607` stops comparing a value against itself. Low priority; do it when L2 is idle.
+Build the origin-form target from `components.percentEncodedPath` / `percentEncodedQuery` at `NIOPeerPinnedOAuthDocumentTransport.swift:128-132`, `NIOPeerPinnedOAuthPostTransport.swift:205-209`, `NIOPeerPinnedATHandleHTTPTransport.swift:159-163`. Keep the `0x21...0x7E` guard for symmetry with `SwanProxyHTTPTransport.swift:234-236` (the lane found none of the three transports had one, so this **adds** a guard rather than keeping one), but state in the comment that NIO's `NIOHTTPRequestHeadersValidator` is the actual CRLF control so nobody re-derives the refuted threat model. Also report the emitted target in `responseURL` (`NIOPeerPinnedOAuthDocumentTransport.swift:248-251`) so the exact-URL comparison stops comparing a value against itself. That comparison is at `OAuthRemoteFetch.swift:652`, not `:607`, and there are **three** of them, all tautological: `OAuthRemoteFetch.swift:652` (document fetch), `OAuthRemoteFetch.swift:820` (notification poster), and `ATHandleVerification.swift:514` (handle verifier). Low priority; do it when L2 is idle.
 
 ### L9 — deployment-and-startup-config (not reachable, low)
 **Closes:** F12, F17, F36, F38; config halves of F05 (`--max-connections`) and F13 (startup refusal).
@@ -405,6 +554,71 @@ The only code defect in C2 is a comment: `StreamingSpaceCARRecovery.swift:305-30
 ---
 
 ## 4. Blocked on the maintainer
+
+**Decisions taken 2026-08-14 (Josh).** The items below stay as written for the
+record; these are the answers and what shipped for them.
+
+- **Item 4 — F41 `handleAttempts`: 100.** Already the deployed default
+  (`AccountLoginAdmission.swift:41`), pinned by
+  `testDefaultPolicyGivesTheHandleBucketHeadroomOverOnePeerPair`. L3 landed it
+  on the recommendation; this confirms it. No change.
+- **Item 8 — F03: the short lifetime, and *not* the watermark.** The 5-minute
+  mint lifetime is already shipped (`DurableSpaceCredentialAuthority
+  .Configuration.defaultLifetime`), far below the 2 h interop ceiling Swan
+  still *accepts*. With that in place the `iat > updated_at` watermark buys at
+  most five minutes of earlier revocation and costs a global invalidation of
+  every live credential for a space on *any* membership or policy edit, plus
+  four verifier seams that must stay in sync — the seams the program itself
+  warns are how one of five surfaces gets missed. Not worth it. One condition
+  reverses this: if prompt revocation becomes a requirement — removing an
+  abusive member must take effect immediately, not within five minutes — build
+  the watermark, and build it as one shared check.
+  Deliberately **not** adding a `swan serve` lifetime flag: the only thing an
+  operator could do with it is loosen the revocation window, and the secure
+  value is already the compiled-in default.
+- **Item 9 — F18: the non-emitting fallback is gone.** The question was what
+  the reference does. It refuses: every write route calls
+  `findAccount(repo, { checkDeactivated: true, checkTakedown: true })` and
+  answers `AuthRequiredError('Account is deactivated', 'AccountDeactivated')`
+  before touching the repository (`createRecord.ts:52-56`, and identically in
+  `putRecord`, `deleteRecord`, `applyWrites`). It has no non-emitting-commit
+  concept at all. `PublicFirehoseCommitFence` now propagates the refusal
+  instead of re-running the mutation without a firehose context, and
+  `SwanPublicRepositoryMutationCoordinator.map` turns it into the
+  already-wired-but-previously-unreachable `.inactiveAccount`, which the route
+  answers as 403 `AccountInactive`. Client-visible in exactly one case: a
+  write racing a deactivation now fails instead of committing an event no
+  relay will ever hear. Nothing pre-activation depended on the fallback — the
+  genesis commit is written by `PLCAccountPreparationService` against its own
+  store, and the fence exists only on the serve path.
+- **Item 10 — F31: step 1 is a bug fix, and it has already shipped.** The
+  reference's model leaves no room for a pre-emptive tombstone:
+  `notifySpaceDeleted` no-ops for an unrecognisable audience, no-ops for a
+  recipient it does not host, and inside the actor transaction does
+  `const existing = await actorTxn.space.getSpace(space); if (!existing)
+  return` — a projection cleanup for a space the recipient already knows.
+  Nothing in Swan ever documented a pre-emptive closure; its own comment calls
+  the tombstone "an isolated receipt used to reject later fanout state". The
+  one structure that might have depended on a tombstone predating repository
+  state does not: `permissioned_restored_repository_closures` is written *and*
+  read by the portable-restore path (`SwanSQLite.swift:4222, 4369, 4415,
+  4658`) and never consumes a notification tombstone. And without the
+  precondition, one valid token mints a permanent tombstone for every SpaceURI
+  under that authority, because the deletion JWT names no space — durable
+  write amplification driven by a remote peer, which is a defect and not a
+  feature. L10's participation precondition stands, with
+  `testDeletionNotificationForAnUnjoinedSpaceIsANoOp`. **Step 2 stays "no, not
+  unilaterally"** — take the space claim upstream.
+- **`executableURL()` consolidation — done.** Seven copies, three of which
+  ignored `SWAN_TEST_EXECUTABLE` and are the entire 15-test Linux failure set,
+  are now one `SwanCLITestExecutable` (`Tests/SwanCLITests/`). It takes the
+  strictest of the six policies — override, else the binary co-built beside
+  this test bundle, else skip — and drops the package-root `.build/debug/swan`
+  and per-lane `.build-taskNN` guesses, because a binary from another scratch
+  build produces evidence about the wrong binary and a skip is the better
+  answer. It checks both bundle layouts, since the bundle URL means different
+  things on Darwin and Linux, which is why the override had to exist at all.
+
 
 1. **F05 refusal signal.** Should a capacity-refused `subscribeRepos` upgrade close with WebSocket code 1013 ("try again later") and no frame, or should Swan add a new `#error` name to the subscribeRepos error set? The lexicon defines only `FutureCursor` and `ConsumerTooSlow`; a new name is lexicon-visible and relays may treat it as fatal rather than retryable. **Recommendation: 1013.** L1 will proceed on that default unless told otherwise — it is reversible.
 2. **F05 budget split.** What fraction of the 256-slot listener budget may anonymous firehose subscribers hold? **Recommendation: 25% (64 slots).** Also confirm `--max-connections` should be added at all (L9); today an operator under attack has no knob.

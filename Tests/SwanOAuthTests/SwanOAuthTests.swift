@@ -1559,6 +1559,30 @@ final class SwanOAuthTests: XCTestCase {
         let peerMismatchRequests = await peerMismatchTransport.requestCount()
         XCTAssertEqual(peerMismatchRequests, 1)
 
+        // The exact-URL guard on the response. It used to compare the request
+        // URL against itself and could not fail; the transports now report the
+        // URL their emitted request target denotes, so a transport that
+        // answers for a different resource is refused here.
+        let otherURLTransport = TestPostTransport(response: .init(
+            status: 204,
+            headers: [:],
+            body: Data(),
+            responseURL: URL(string: "https://notify.example/other")!,
+            connectedPeerAddress: publicAddress
+        ))
+        let otherURLPoster = OAuthBoundedJSONPoster(
+            policy: policy,
+            resolver: TestResolver(answers: [[publicAddress], [publicAddress]]),
+            transport: otherURLTransport
+        )
+        await XCTAssertThrowsErrorAsync(try await otherURLPoster.postJSON(
+            to: url,
+            headers: ["content-type": "application/json"],
+            body: body
+        ))
+        let otherURLRequests = await otherURLTransport.requestCount()
+        XCTAssertEqual(otherURLRequests, 1)
+
         let nilPeerTransport = TestPostTransport(response: .init(
             status: 204, headers: [:], body: Data(), responseURL: url
         ))

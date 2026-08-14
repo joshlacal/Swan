@@ -56,6 +56,24 @@ public actor SQLitePreMigratedAccountDirectory:
     /// so it is bounded by hosted accounts rather than by anonymous input —
     /// the same bound ``publicReadReadmissionFailures`` argues for itself.
     private var publicReadGenerationPublishSequence: [String: UInt64] = [:]
+    /// One single-holder gate per `(account, space)` repository, live only
+    /// while a batch holds or waits for it. Concurrent permissioned batches
+    /// for one repository serialize here, so each stages against the revision
+    /// its predecessor committed and the revision CAS has nothing to reject —
+    /// the ordering `testConcurrentHTTPWritesAllCommitInATotalOrderUnderThe
+    /// AuthorizationFence` pins, and the ordering the pinned reference PDS
+    /// gets from its per-actor write lock.
+    ///
+    /// This used to fall out of holding the process-wide control-plane write
+    /// transaction across the whole batch, which bought the ordering at the
+    /// price of blocking OAuth and account-lifecycle traffic behind every
+    /// repository write. The ordering is an account-local property and now
+    /// costs the control plane nothing.
+    ///
+    /// Lock order is repository lease → control gate → account connection
+    /// gate. Nothing acquires a repository lease while holding the control
+    /// gate, so the added edge closes no cycle; keep it that way.
+    private var repositoryWriteGates: [String: RepositoryWriteGateEntry] = [:]
     private var permanentlyRevokedDIDs: Set<String> = []
     private var drainingDatabases: [String: SQLiteAccountDatabase] = [:]
     /// At most one in-flight public-read re-admission per DID. A foreign
@@ -1122,30 +1140,47 @@ public actor SQLitePreMigratedAccountDirectory:
             // produced a permanent permissioned record *and* an `unauthorized`
             // response, with nothing able to roll the write back.
             //
-            // `applyAuthorizedWrites` is a staged, network-free mutation,
-            // which is exactly what `withActiveAccountAuthorization`
-            // documents itself for, so holding the control write transaction
-            // across it makes a lifecycle transition linearize either before
-            // this fence — observed as non-active, nothing written — or after
-            // the batch commits.
+            // The lease covers the durable transaction and nothing else.
+            // Staging — the revision and record-metadata reads, every
+            // authorization check, and CID computation over as much as 1 MiB
+            // across as many as 4,096 operations — makes nothing durable, so
+            // running it under the control-plane write gate would head-of-line
+            // block OAuth and account-lifecycle traffic for the whole
+            // preflight at request rate, buying no linearization: a
+            // deactivation that lands during staging is still observed by the
+            // fence, and one that lands after the commit is still ordered
+            // after it.
             //
-            // Nothing reachable from the closure re-enters the control store:
-            // `DurableSpaceRepository` holds only the account database,
-            // `SQLiteAccountDatabase` holds only its own connection and
-            // performs no network I/O, and the authorization preflight is the
-            // pure `SpaceAuthorizationPolicy`. The lock order this takes —
-            // control gate, then account-database gate — is the one
-            // `PublicFirehoseCommitFence` already takes on the public
-            // mutation path, so it introduces no new inversion.
-            let result = try await requireAuthorizationFence()
-                .withActiveAccountAuthorization(did: author) {
-                    try await repository.applyAuthorizedWrites(
-                        writes,
-                        requestID: requestID,
-                        wireRevision: revision,
-                        authorization: authorization
-                    )
-                }
+            // The in-process ordering that the control lease used to provide
+            // as a side effect is provided directly, by the repository's own
+            // write lease: concurrent batches for one repository still
+            // serialize, each still stages against its predecessor's
+            // committed revision, and the revision CAS still has nothing to
+            // reject — without the control plane paying for it.
+            let result = try await withRepositoryWriteLease(
+                space: space,
+                author: author
+            ) {
+                let staged = try await repository.stageAuthorizedWrites(
+                    writes,
+                    requestID: requestID,
+                    wireRevision: revision,
+                    authorization: authorization
+                )
+                // Nothing reachable from the closure re-enters the control
+                // store: `DurableSpaceRepository` holds only the account
+                // database, `SQLiteAccountDatabase` holds only its own
+                // connection and performs no network I/O, and
+                // `commitStagedWrites` reads nothing beyond the staged batch.
+                // The lock order this takes — control gate, then
+                // account-database gate — is the one
+                // `PublicFirehoseCommitFence` already takes on the public
+                // mutation path, so it introduces no new inversion.
+                return try await requireAuthorizationFence()
+                    .withActiveAccountAuthorization(did: author) {
+                        try await repository.commitStagedWrites(staged)
+                    }
+            }
             guard !isClosed else {
                 throw SwanError.unavailable("authenticated space directory is unavailable")
             }
@@ -1164,6 +1199,54 @@ public actor SQLitePreMigratedAccountDirectory:
             }
         } catch {
             throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
+    /// Runs one permissioned batch as the sole writer of its repository.
+    ///
+    /// The gate is checked out and back in around the whole body, so an entry
+    /// cannot be dropped between a waiter's lookup and its acquisition — that
+    /// race would hand two batches a lease on the same repository and lose
+    /// exactly the ordering this exists to provide.
+    private func withRepositoryWriteLease<T: Sendable>(
+        space: SpaceURI,
+        author: String,
+        _ body: () async throws -> T
+    ) async throws -> T {
+        let key = "\(author)\u{1F}\(space.rawValue)"
+        let gate = checkOutRepositoryWriteGate(key)
+        defer { checkInRepositoryWriteGate(key) }
+        try await gate.acquire()
+        do {
+            let result = try await body()
+            await gate.release()
+            return result
+        } catch {
+            await gate.release()
+            throw error
+        }
+    }
+
+    private func checkOutRepositoryWriteGate(
+        _ key: String
+    ) -> RepositoryWriteGate {
+        if var entry = repositoryWriteGates[key] {
+            entry.users += 1
+            repositoryWriteGates[key] = entry
+            return entry.gate
+        }
+        let gate = RepositoryWriteGate()
+        repositoryWriteGates[key] = RepositoryWriteGateEntry(gate: gate, users: 1)
+        return gate
+    }
+
+    private func checkInRepositoryWriteGate(_ key: String) {
+        guard var entry = repositoryWriteGates[key] else { return }
+        entry.users -= 1
+        if entry.users <= 0 {
+            repositoryWriteGates.removeValue(forKey: key)
+        } else {
+            repositoryWriteGates[key] = entry
         }
     }
 
@@ -2738,9 +2821,27 @@ public actor SQLitePreMigratedAccountDirectory:
 
 /// Applies a public repository mutation while holding the control-plane
 /// authorization transaction so no lifecycle transition can interleave with
-/// the generation snapshot. An account that no longer authorizes falls back
-/// to a non-emitting mutation: pre-activation and post-deactivation commits
-/// produce no firehose event.
+/// the generation snapshot. An account that no longer authorizes is refused.
+///
+/// This used to fall back to a *non-emitting* mutation instead: the write
+/// committed durably and no firehose event was published, which forks Swan's
+/// repository from every relay's view of it silently and permanently. The
+/// pinned reference PDS has no such concept — every write route calls
+/// `findAccount(repo, { checkDeactivated: true, checkTakedown: true })` and
+/// answers `AuthRequiredError('Account is deactivated', 'AccountDeactivated')`
+/// before touching the repository
+/// (`.interop-cache/atproto-3f6c96d5…/packages/pds/src/api/com/atproto/repo/`
+/// `createRecord.ts:52-56`, and the same in `putRecord`, `deleteRecord` and
+/// `applyWrites`).
+///
+/// Nothing pre-activation depends on the fallback: the genesis commit is
+/// written by `PLCAccountPreparationService` against its own store, and this
+/// fence is constructed only on the serve path
+/// (`SwanCommand.swift:627`), whose route already requires `status == .active`
+/// before it reaches here (`SwanPublicRepositoryMutationXRPC.swift:373`). What
+/// the fallback actually covered was the race — a deactivation landing between
+/// that check and this fence — and for that case a refusal is the honest
+/// answer.
 public struct PublicFirehoseCommitFence: Sendable {
     private let control: SQLiteControlDatabase
 
@@ -2754,17 +2855,12 @@ public struct PublicFirehoseCommitFence: Sendable {
         mutate: @escaping @Sendable (PublicFirehoseCommitContext?) async throws
             -> CommittedPublicRepositoryMutation
     ) async throws -> CommittedPublicRepositoryMutation {
-        do {
-            return try await control.withActiveAccountFirehoseAuthorization(
-                did: did,
-                signingGeneration: signingGeneration
-            ) {
-                generation in
-                try await mutate(.init(lifecycleGeneration: generation))
-            }
-        } catch let error as AccountControlStoreError {
-            guard case .invalidTransition = error else { throw error }
-            return try await mutate(nil)
+        try await control.withActiveAccountFirehoseAuthorization(
+            did: did,
+            signingGeneration: signingGeneration
+        ) {
+            generation in
+            try await mutate(.init(lifecycleGeneration: generation))
         }
     }
 }
@@ -2915,5 +3011,93 @@ private actor SQLiteGenerationRefreshingPublicMutationStore:
 
     func uploadedBlobMetadata(cid: String) async throws -> PublicBlobMetadata? {
         try await database.uploadedBlobMetadata(cid: cid)
+    }
+}
+
+/// A live repository write gate plus the number of batches that hold or are
+/// waiting on it. The count is what makes the map self-pruning without a race:
+/// an entry survives exactly as long as some batch is using it.
+struct RepositoryWriteGateEntry {
+    let gate: RepositoryWriteGate
+    var users: Int
+}
+
+/// Single-holder FIFO admission for one repository's permissioned writes.
+///
+/// Deliberately separate from `ControlSQLiteConnectionGate` rather than a
+/// reuse of it: that gate guards one process-wide connection and refuses with
+/// the control plane's own exhaustion message, while this one is per
+/// repository and refuses with the repository's.
+actor RepositoryWriteGate {
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private let maximumQueuedWaiters: Int
+    private var isHeld = false
+    private var waiters: [Waiter] = []
+
+    init(maximumQueuedWaiters: Int = 128) {
+        precondition(maximumQueuedWaiters > 0)
+        self.maximumQueuedWaiters = maximumQueuedWaiters
+    }
+
+    func acquire() async throws {
+        try Task.checkCancellation()
+        if !isHeld {
+            isHeld = true
+            return
+        }
+        guard waiters.count < maximumQueuedWaiters else {
+            throw SwanError.unavailable(
+                "permissioned repository write capacity is exhausted"
+            )
+        }
+        let id = UUID()
+        try await withTaskCancellationHandler(
+            operation: { try await self.enqueueWaiter(id: id) },
+            onCancel: { Task { await self.cancelWaiter(id: id) } }
+        )
+        // A cancellation that lands after the hand-off would otherwise leak
+        // the lease and wedge this repository for the process's lifetime.
+        do {
+            try Task.checkCancellation()
+        } catch {
+            release()
+            throw error
+        }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            isHeld = false
+        } else {
+            waiters.removeFirst().continuation.resume()
+        }
+    }
+
+    private func cancelWaiter(id: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        waiters.remove(at: index).continuation.resume(
+            throwing: CancellationError()
+        )
+    }
+
+    private func enqueueWaiter(id: UUID) async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            if Task.isCancelled {
+                continuation.resume(throwing: CancellationError())
+                return
+            }
+            waiters.append(Waiter(id: id, continuation: continuation))
+        }
+    }
+
+    func admissionSnapshotForTesting() -> (isHeld: Bool, queuedWaiters: Int) {
+        (isHeld, waiters.count)
     }
 }

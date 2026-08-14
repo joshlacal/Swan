@@ -303,6 +303,22 @@ final class ATHandleVerificationTests: XCTestCase {
                     .init(status: 200, body: Data(did.utf8), peer: nil),
                 ])
             ),
+            // A transport that answers for a URL other than the one it was
+            // asked for. The guard that catches this used to compare the
+            // request URL against itself, so it could not fail; now that the
+            // transports report the URL their emitted target denotes, it can,
+            // and this is the case that proves the caller still checks.
+            (
+                publicDNS(txt: []),
+                FakeHandleHTTP([
+                    .init(
+                        status: 200,
+                        body: Data(did.utf8),
+                        peer: publicPeer,
+                        responseURL: URL(string: "https://alice.example.org/other")!
+                    ),
+                ])
+            ),
         ]
         for (dns, http) in cases {
             await assertVerificationFailure(
@@ -563,6 +579,11 @@ private actor FakeHandleHTTP: ATHandleHTTPFetching {
         var headers: [String: [String]] = [:]
         let body: Data
         let peer: ATHandleIPAddress?
+        /// Overrides the URL this fake reports back. Nil echoes the requested
+        /// URL, which is what a well-behaved transport does; a value is how a
+        /// test drives the verifier's exact-URL guard, which nothing could
+        /// reach while the fake always echoed.
+        var responseURL: URL?
     }
 
     private var results: [Result]
@@ -587,7 +608,7 @@ private actor FakeHandleHTTP: ATHandleHTTPFetching {
             status: result.status,
             headers: result.headers,
             body: result.body,
-            responseURL: url,
+            responseURL: result.responseURL ?? url,
             connectedPeer: result.peer
         )
     }
