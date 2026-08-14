@@ -145,18 +145,27 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
         try assertStage2Registration(client)
     }
 
+    /// `OAuthClientMetadata`'s throwing initializer IS the registration gate —
+    /// `validate()` is private and runs inside it (`OAuthClientMetadata.swift:76-100`,
+    /// `:338`). So "registers" is spelled `XCTAssertNoThrow(try OAuthClientMetadata(...))`
+    /// and "is refused at registration" is `XCTAssertThrowsError` on the same
+    /// initializer. Constructing the value and then separately validating it
+    /// would assert the gate twice and the layer boundary not at all.
     private func assertStage2Registration(_ client: PermissionedScopeClient) throws {
+        func metadata(scopes: Set<String>) throws -> OAuthClientMetadata {
+            try OAuthClientMetadata(
+                clientID: PermissionedScopeClient.remoteClientID,
+                redirectURIs: [PermissionedScopeClient.remoteRedirectURI],
+                grantTypes: ["authorization_code", "refresh_token"],
+                responseTypes: ["code"],
+                scopes: scopes,
+                dpopBoundAccessTokens: true
+            )
+        }
+
         // A2a — the five-scope remote HTTPS client registers.
-        let remote = try OAuthClientMetadata(
-            clientID: URL(string: "https://bulleted.app/client-metadata.json")!,
-            redirectURIs: [URL(string: "https://bulleted.app/callback")!],
-            grantTypes: ["authorization_code", "refresh_token"],
-            responseTypes: ["code"],
-            scopes: Set(BulletedApp.all),
-            dpopBoundAccessTokens: true
-        )
         XCTAssertNoThrow(
-            try remote.validate(),
+            try metadata(scopes: Set(BulletedApp.all)),
             """
             A2a: this is the stage that fails hardest today — \
             `OAuthClientMetadata.swift:343-344` gates the issuable disjunct behind \
@@ -164,41 +173,45 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
             bare `atproto`. §9-D21 retires that gate rather than re-expressing it.
             """
         )
+        // ... and it really is the remote path: a localhost virtual client would
+        // take the other branch of that same gate and prove nothing.
+        XCTAssertFalse(
+            try metadata(scopes: Set(BulletedApp.all)).isLocalhostDevelopmentClient,
+            "A2a must exercise the REMOTE branch — a localhost fixture sails past the gate under test"
+        )
 
         // A2b — lexically valid scope-token bytes, semantically malformed.
         // Registration grants nothing, so it registers fine.
         let malformed = "space:not-an-nsid?authority=notadid&skey=k&action=read"
-        let semanticallyBad = try OAuthClientMetadata(
-            clientID: URL(string: "https://bulleted.app/client-metadata.json")!,
-            redirectURIs: [URL(string: "https://bulleted.app/callback")!],
-            grantTypes: ["authorization_code"],
-            responseTypes: ["code"],
-            scopes: [malformed],
-            dpopBoundAccessTokens: true
-        )
         XCTAssertNoThrow(
-            try semanticallyBad.validate(),
+            try metadata(scopes: [malformed]),
             "A2b: registration validates RFC scope-token syntax and Swan's budgets, nothing semantic"
         )
 
         // A2b′ (parser half) — the scope does not parse. This is a PRECONDITION
-        // for the HTTP assertion below, not a substitute for it: it proves the
-        // parser's answer, not that PAR consults the parser. The layer assertion
-        // lives in `testStage2MalformedScopeIsRejectedAtPARNotAtRegistration`.
+        // for the HTTP assertion, not a substitute for it: it proves the parser's
+        // answer, not that PAR consults the parser. The layer assertion lives in
+        // `testStage2MalformedScopeIsRejectedAtPARNotAtRegistration`.
         XCTAssertThrowsError(
             try AtprotoScope.parse(malformed),
             "A2b′ precondition: the scope must be unparseable for the PAR test to mean anything"
         )
 
-        // A2c — the lexical/budget floor is the only registration gate, so it has
+        // A2c — the lexical/budget floor is the ONLY registration gate, so it has
         // to actually hold. `"` (0x22) and `\` (0x5C) are excluded by
         // OAUTH_SCOPE_REGEXP and admitted by today's `0x21...0x7E` check.
-        for illegal in ["atproto", "space:x.y.z?skey=a\"b", "space:x.y.z?skey=a\\b"].dropFirst() {
+        for illegal in ["space:x.y.z?skey=a\"b", "space:x.y.z?skey=a\\b"] {
             XCTAssertFalse(
                 ScopeToken.isScopeToken(illegal),
                 "A2c: `\(illegal)` carries a byte RFC 6749 §3.3 excludes"
             )
+            XCTAssertThrowsError(
+                try metadata(scopes: [illegal]),
+                "A2c: the lexical floor must REJECT at registration — it is the only gate left there"
+            )
         }
+        // The floor admits what it should: every bulleted.app scope is a valid
+        // RFC 6749 §3.3 scope-token.
         XCTAssertTrue(ScopeToken.isScopeToken(BulletedApp.space))
         XCTAssertTrue(client.scopes.allSatisfy(ScopeToken.isScopeToken))
     }
@@ -237,19 +250,15 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
                 logger: Logger(label: "RemoteClientPermissionedScopeE2ETests.par-invalid-scope")
             )
 
-        func form(scope: String) -> String {
-            [
-                ("client_id", client.clientID.absoluteString),
-                ("redirect_uri", client.redirectURI.absoluteString),
-                ("response_type", "code"),
-                ("scope", scope),
-                ("state", "a2b-prime"),
-                ("code_challenge", String(repeating: "a", count: 43)),
-                ("code_challenge_method", "S256"),
-            ].map { "\(scopeFormEncode($0.0))=\(scopeFormEncode($0.1))" }
-                .joined(separator: "&")
-        }
-        var headers: HTTPFields = [
+        // Built up front, immutably. Swift 6 strict concurrency: `app.test`'s
+        // closure is `@Sendable`, so a captured `var` or a local function is a
+        // data race the compiler rejects — and rightly, since the closure may run
+        // off-thread. Everything it needs is a `let`.
+        let malformedForm = Self.parForm(
+            client: client, scope: "\(BulletedApp.base) \(malformed)"
+        )
+        let wellFormedForm = Self.parForm(client: client, scope: BulletedApp.base)
+        let baseHeaders: HTTPFields = [
             .contentType: "application/x-www-form-urlencoded; charset=utf-8",
         ]
 
@@ -259,8 +268,8 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
             try await http.execute(
                 uri: "/oauth/par",
                 method: .post,
-                headers: headers,
-                body: ByteBuffer(string: form(scope: "\(BulletedApp.base) \(malformed)"))
+                headers: baseHeaders,
+                body: ByteBuffer(string: malformedForm)
             ) { response in
                 XCTAssertEqual(response.status, .badRequest)
                 XCTAssertEqual(
@@ -274,7 +283,8 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
             // 2. Retry with the nonce. THIS is the request that reaches scope
             //    admission, and it must be refused with `invalid_scope`.
             let challenge = try XCTUnwrap(nonce)
-            headers[HTTPField.Name("DPoP")!] = try makeScopeDPoPProof(
+            var malformedHeaders = baseHeaders
+            malformedHeaders[HTTPField.Name("DPoP")!] = try makeScopeDPoPProof(
                 key: client.signingKey,
                 jwk: client.jwk,
                 jti: "a2b-prime-malformed",
@@ -284,11 +294,12 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
                     PermissionedScopeFixture.issuer.appending(path: "oauth/par")
                 )
             )
+            let sealedMalformedHeaders = malformedHeaders
             try await http.execute(
                 uri: "/oauth/par",
                 method: .post,
-                headers: headers,
-                body: ByteBuffer(string: form(scope: "\(BulletedApp.base) \(malformed)"))
+                headers: sealedMalformedHeaders,
+                body: ByteBuffer(string: malformedForm)
             ) { response in
                 XCTAssertEqual(
                     try Self.errorCode(from: response.body),
@@ -310,7 +321,8 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
             // 3. Control: the SAME client, same endpoint, same nonce path, with
             //    only well-formed scopes — must be admitted. Without this, a PAR
             //    that rejected everything would pass the assertion above.
-            headers[HTTPField.Name("DPoP")!] = try makeScopeDPoPProof(
+            var controlHeaders = baseHeaders
+            controlHeaders[HTTPField.Name("DPoP")!] = try makeScopeDPoPProof(
                 key: client.signingKey,
                 jwk: client.jwk,
                 jti: "a2b-prime-control",
@@ -320,11 +332,12 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
                     PermissionedScopeFixture.issuer.appending(path: "oauth/par")
                 )
             )
+            let sealedControlHeaders = controlHeaders
             try await http.execute(
                 uri: "/oauth/par",
                 method: .post,
-                headers: headers,
-                body: ByteBuffer(string: form(scope: BulletedApp.base))
+                headers: sealedControlHeaders,
+                body: ByteBuffer(string: wellFormedForm)
             ) { response in
                 XCTAssertEqual(
                     response.status,
@@ -333,6 +346,77 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
                 )
             }
         }
+    }
+
+    /// PAR form body. `static` and pure so it can be evaluated before the
+    /// `@Sendable` test closure and captured as a plain `let`.
+    private static func parForm(client: PermissionedScopeClient, scope: String) -> String {
+        [
+            ("client_id", client.clientID.absoluteString),
+            ("redirect_uri", client.redirectURI.absoluteString),
+            ("response_type", "code"),
+            ("scope", scope),
+            ("state", "a2b-prime"),
+            ("code_challenge", String(repeating: "a", count: 43)),
+            ("code_challenge_method", "S256"),
+        ].map { "\(scopeFormEncode($0.0))=\(scopeFormEncode($0.1))" }
+            .joined(separator: "&")
+    }
+
+
+    /// Walks a browser consent flow to the **consent** page and returns its HTML.
+    ///
+    /// `GET /oauth/authorize` renders the SIGN-IN page, not consent — on both
+    /// renderers. Asserting on that response tests the login form and reports
+    /// every semantic-consent obligation as missing, which is a convincing
+    /// false negative. Consent is only reached after `POST /oauth/authorize`
+    /// with valid credentials.
+    private func consentHTML(
+        fixture: PermissionedScopeFixture,
+        app: some ApplicationProtocol,
+        client: PermissionedScopeClient,
+        requestURI: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws -> String {
+        let authorize =
+            "/oauth/authorize?client_id=\(scopeFormEncode(client.clientID.absoluteString))"
+            + "&request_uri=\(scopeFormEncode(requestURI))"
+        // A `Mutex`-free box: `app.test`'s closure is `@Sendable`, so a captured
+        // `var` is rejected. The closure runs to completion before `test` returns,
+        // so a reference box is safe and needs no lock.
+        let captured = ConsentHTMLBox()
+        try await app.test(.router) { http in
+            var cookie: String?
+            var csrf: String?
+            try await http.execute(uri: authorize, method: .get) { response in
+                XCTAssertEqual(response.status, .ok, "sign-in page", file: file, line: line)
+                cookie = Self.cookieValue(
+                    try XCTUnwrap(response.headers[HTTPField.Name("Set-Cookie")!])
+                )
+                csrf = try fixture.runtime.browserSessionService
+                    .verify(try XCTUnwrap(cookie)).csrfToken
+            }
+            let form = [
+                ("csrf", try XCTUnwrap(csrf)),
+                ("handle", PermissionedScopeFixture.handle),
+                ("password", PermissionedScopeFixture.password),
+            ].map { "\(scopeFormEncode($0.0))=\(scopeFormEncode($0.1))" }
+                .joined(separator: "&")
+            var headers: HTTPFields = [.contentType: "application/x-www-form-urlencoded"]
+            headers[.cookie] = "__Host-swan-oauth=\(try XCTUnwrap(cookie))"
+            let sealed = headers
+            try await http.execute(
+                uri: "/oauth/authorize",
+                method: .post,
+                headers: sealed,
+                body: ByteBuffer(string: form)
+            ) { response in
+                XCTAssertEqual(response.status, .ok, "consent page", file: file, line: line)
+                captured.value = String(buffer: response.body)
+            }
+        }
+        return captured.value
     }
 
     private static func errorCode(from body: ByteBuffer) throws -> String {
@@ -395,30 +479,22 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
             state: "stage4-consent",
             codeChallengeS256: String(repeating: "a", count: 43)
         )
-        let app = try fixture.buildServer().buildApplication(
-            logger: Logger(label: "RemoteClientPermissionedScopeE2ETests.consent")
+        let html = try await consentHTML(
+            fixture: fixture,
+            app: try fixture.buildServer().buildApplication(
+                logger: Logger(label: "RemoteClientPermissionedScopeE2ETests.consent")
+            ),
+            client: client,
+            requestURI: requestURI
         )
-        let authorize =
-            "/oauth/authorize?client_id=\(scopeFormEncode(client.clientID.absoluteString))"
-            + "&request_uri=\(scopeFormEncode(requestURI))"
-        try await app.test(.router) { http in
-            try await http.execute(uri: authorize, method: .get) { response in
-                XCTAssertEqual(response.status, .ok)
-                let html = String(buffer: response.body)
-
-                // S4.1-S4.2, shared with the authorization-server renderer so the
-                // two cannot drift into two different sets of assertions.
-                Self.assertConsentPageIsSemantic(html, renderer: "localhost bridge")
-
-                // S4.4 — raw scope text survives as advanced detail, below the
-                // semantic cards. It is not deleted; it is just not consent.
-                for scope in BulletedApp.all where scope != BulletedApp.base {
-                    XCTAssertTrue(
-                        html.contains(scope) || html.contains(BulletedApp.canonicalSpace),
-                        "S4.4: raw scope text is demoted, not removed — missing \(scope)"
-                    )
-                }
-            }
+        Self.assertConsentPageIsSemantic(html, renderer: "localhost bridge")
+        // S4.4 — raw scope text survives as advanced detail, below the semantic
+        // cards. It is not deleted; it is just not consent.
+        for scope in BulletedApp.all where scope != BulletedApp.base {
+            XCTAssertTrue(
+                html.contains(scope) || html.contains(BulletedApp.canonicalSpace),
+                "S4.4: raw scope text is demoted, not removed — missing \(scope)"
+            )
         }
     }
 
@@ -435,26 +511,22 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
             state: "stage4-atproto-only",
             codeChallengeS256: String(repeating: "a", count: 43)
         )
-        let app = try fixture.buildServer().buildApplication(
-            logger: Logger(label: "RemoteClientPermissionedScopeE2ETests.atproto-only")
+        let html = try await consentHTML(
+            fixture: fixture,
+            app: try fixture.buildServer().buildApplication(
+                logger: Logger(label: "RemoteClientPermissionedScopeE2ETests.atproto-only")
+            ),
+            client: client,
+            requestURI: requestURI
         )
-        let authorize =
-            "/oauth/authorize?client_id=\(scopeFormEncode(client.clientID.absoluteString))"
-            + "&request_uri=\(scopeFormEncode(requestURI))"
-        try await app.test(.router) { http in
-            try await http.execute(uri: authorize, method: .get) { response in
-                XCTAssertEqual(response.status, .ok)
-                let html = String(buffer: response.body)
-                XCTAssertFalse(
-                    html.contains("<li><code>atproto</code>"),
-                    """
-                    S4.1a: `atproto` alone is a session scope, not a permission. \
-                    Rendering it as a permission bullet trains users to approve \
-                    lists they cannot read.
-                    """
-                )
-            }
-        }
+        XCTAssertFalse(
+            html.contains("<li><code>atproto</code>"),
+            """
+            S4.1a: `atproto` alone is a session scope, not a permission. \
+            Rendering it as a permission bullet trains users to approve lists \
+            they cannot read.
+            """
+        )
     }
 
     /// S4.1c — a `type == "*" && authority == "*"` grant must carry the
@@ -475,26 +547,22 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
             state: "stage4-universal",
             codeChallengeS256: String(repeating: "a", count: 43)
         )
-        let app = try fixture.buildServer().buildApplication(
-            logger: Logger(label: "RemoteClientPermissionedScopeE2ETests.universal")
+        let html = try await consentHTML(
+            fixture: fixture,
+            app: try fixture.buildServer().buildApplication(
+                logger: Logger(label: "RemoteClientPermissionedScopeE2ETests.universal")
+            ),
+            client: client,
+            requestURI: requestURI
+        ).lowercased()
+        XCTAssertTrue(
+            html.contains("every space"),
+            "S4.1c: the warning must say the app is requesting access to EVERY space on the network"
         )
-        let authorize =
-            "/oauth/authorize?client_id=\(scopeFormEncode(client.clientID.absoluteString))"
-            + "&request_uri=\(scopeFormEncode(requestURI))"
-        try await app.test(.router) { http in
-            try await http.execute(uri: authorize, method: .get) { response in
-                XCTAssertEqual(response.status, .ok)
-                let html = String(buffer: response.body).lowercased()
-                XCTAssertTrue(
-                    html.contains("every space"),
-                    "S4.1c: the warning must say the app is requesting access to EVERY space on the network"
-                )
-                XCTAssertTrue(
-                    html.contains("trusted"),
-                    "S4.1c: ... and that it should be granted only to deeply trusted applications"
-                )
-            }
-        }
+        XCTAssertTrue(
+            html.contains("trusted"),
+            "S4.1c: ... and that it should be granted only to deeply trusted applications"
+        )
     }
 
     /// **S4.5 — the SECOND renderer.** `SwanOAuthAuthorizationServerHTTP.swift:1170-1172`
@@ -723,14 +791,14 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
 
         // 1. `read_self` on the account's own repo inside the space → ALLOWED.
         XCTAssertTrue(
-            permissions.allowsSpace(target(.readSelf)),
+            permissions.allowsSpace(target(.readSelf(aggregate: false, collection: nil))),
             "Stage 6.1: the grant's action is exactly `read_self` on its own repo"
         )
 
         // 2. `read` across the whole space → DENIED. M14: `read_self` does not
         //    imply `read`; the implication runs the other way only.
         XCTAssertFalse(
-            permissions.allowsSpace(target(.read)),
+            permissions.allowsSpace(target(.read(aggregate: false, collection: nil))),
             "Stage 6.2 (M14): read_self must never widen into a whole-space read"
         )
 
@@ -769,7 +837,7 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
                     type: "app.bulleted.otherSpace",
                     authority: subject,
                     skey: "own",
-                    operation: .readSelf
+                    operation: .readSelf(aggregate: false, collection: nil)
                 )
             ),
             "Stage 6.5: include:app.bulleted.spaceAccess must not widen the space grant"
@@ -889,7 +957,7 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
                     type: BulletedApp.spaceType,
                     authority: PermissionedScopeFixture.subject,
                     skey: "own",
-                    operation: .readSelf
+                    operation: .readSelf(aggregate: false, collection: nil)
                 )
             ),
             "an include: naming a space permission set must not grant the space itself in Phase 1"
@@ -902,4 +970,12 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
             ).hasResourceScope
         )
     }
+}
+
+/// Carries the consent HTML out of the `@Sendable` test closure. `final class`
+/// rather than a captured `var` because Swift 6 rejects mutating a captured
+/// local from concurrently-executing code; the closure completes before
+/// `app.test` returns, so no synchronisation is required.
+private final class ConsentHTMLBox: @unchecked Sendable {
+    var value = ""
 }

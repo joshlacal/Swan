@@ -80,7 +80,14 @@ final class UpstreamScopeConformanceTests: XCTestCase, @unchecked Sendable {
         do {
             _ = try AtprotoScope.parse(row.input)
             XCTFail("expected a validator rejection")
-        } catch let error as ScopeParseError {
+        // `catch` WITHOUT an `as` cast, deliberately. `AtprotoScope.parse` is
+        // `throws(ScopeParseError)` — typed throws — so `error` is already
+        // concretely typed here and the cast is redundant. It is also not merely
+        // redundant: `catch let error as ScopeParseError` over a typed-throws
+        // call CRASHES this toolchain in SILGenCleanup ("fatal error
+        // encountered during compilation"), which reads as an unrelated build
+        // failure. Do not reintroduce the cast.
+        } catch {
             XCTAssertNotEqual(
                 error,
                 .malformedPercentEncoding(row.input),
@@ -145,7 +152,7 @@ final class UpstreamScopeConformanceTests: XCTestCase, @unchecked Sendable {
         do {
             _ = try AtprotoScope.parse("notafamily:whatever")
             XCTFail("`notafamily:whatever` must not parse")
-        } catch let error as ScopeParseError {
+        } catch {  // typed throws — see the note above; an `as` cast crashes SILGen
             XCTAssertEqual(error, .unknownPrefix("notafamily:whatever"))
         }
 
@@ -162,7 +169,20 @@ final class UpstreamScopeConformanceTests: XCTestCase, @unchecked Sendable {
             "the raw strings must survive verbatim — persistence and audit never see a re-serialised value"
         )
         XCTAssertTrue(permissions.hasBaseATProtocolScope)
-        XCTAssertFalse(permissions.hasResourceScope, "atproto alone is the floor, not a resource grant")
+        // The floor is atproto OR a qualified `space:` grant (§6.1), so `atproto`
+        // alone satisfies it — that is the ruled predicate, not an accident.
+        XCTAssertTrue(
+            permissions.hasResourceScope,
+            "§6.1: the resource floor is atproto-or-space, and `atproto` is present"
+        )
+        // The property that actually matters here: the junk companion contributed
+        // NOTHING to that answer. Drop the base scope and the same set fails the
+        // floor, which is what proves the unparseable string is inert rather than
+        // quietly counting toward admission.
+        XCTAssertFalse(
+            SwanScopePermissions(rawScopes: ["notafamily:whatever"], subject: nil).hasResourceScope,
+            "an unparseable held scope must grant nothing — including not satisfying the floor"
+        )
     }
 
     /// **DIVERGENCE, structural.** Upstream's normaliser does not deduplicate:
@@ -301,12 +321,28 @@ final class UpstreamScopeConformanceTests: XCTestCase, @unchecked Sendable {
         )
     }
 
+    /// `aggregate: false, collection: nil` for both read arms, deliberately.
+    ///
+    /// The corpus's space checks are concrete `{type, authority, skey, action}`
+    /// tuples — upstream's own `SPACE_CHECKS`, which probe one named space, not a
+    /// listing surface. `aggregate: true` would make every corpus space-read
+    /// assertion an aggregate read, which requires an unqualified or wildcard
+    /// collection GRANT (§6.5.5), and would quietly change what this suite
+    /// tests: rows that upstream says are allowed would start failing against a
+    /// hardening upstream has no equivalent of, and the conformance suite would
+    /// be asserting a Swan divergence while claiming to assert conformance.
+    ///
+    /// `collection: nil` matches the corpus too — its rows carry no collection
+    /// filter, and a read stays collection-independent by default.
+    ///
+    /// Swan's aggregate surface is exercised where it actually lives, through
+    /// `allowsSpaceListing(type:authority:)`, in the §9-D23 listing-fence tests.
     private static func spaceOperation(
         forCorpusAction action: String
     ) -> SpaceScopeTarget.Operation? {
         switch action {
-        case "read": .read
-        case "read_self": .readSelf
+        case "read": .read(aggregate: false, collection: nil)
+        case "read_self": .readSelf(aggregate: false, collection: nil)
         default: nil  // write actions need a collection the corpus does not carry
         }
     }

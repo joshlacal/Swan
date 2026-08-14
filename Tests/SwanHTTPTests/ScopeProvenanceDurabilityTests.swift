@@ -34,6 +34,73 @@ import SwanSQLite
 final class ScopeProvenanceDurabilityTests: XCTestCase, @unchecked Sendable {
     private static let spaceType = "app.example.forum"
 
+    // MARK: - Isolating the layer: facade vs. seam
+
+    /// **Control for the two failing end-to-end tests below.** It answers the
+    /// only question that matters when they go red: is the *facade* wrong, or is
+    /// provenance simply not reaching it?
+    ///
+    /// Pure unit, no HTTP, no storage — the same permissions value constructed
+    /// twice, once with the durable `statedKeys` and once without. If the
+    /// with-provenance case passes and the without case fails, the matcher is
+    /// correct and the defect is at the plumbing seam. That is a different bug,
+    /// with a different owner, than "the fence logic is wrong".
+    func testFacadeHonoursDurableProvenanceWhenItIsSupplied() throws {
+        let stated = "space:\(Self.spaceType)?authority=\(PermissionedScopeFixture.subject)&skey=*&action=read"
+
+        // WITHOUT provenance: both fences must refuse. This is the fail-closed
+        // posture, and it is what the resource plane currently produces.
+        let blind = SwanScopePermissions(
+            rawScopes: [stated],
+            subject: PermissionedScopeFixture.subject
+        )
+        XCTAssertFalse(
+            blind.allowsSpace(
+                SpaceScopeTarget(
+                    type: Self.spaceType,
+                    authority: PermissionedScopeFixture.subject,
+                    skey: "*",
+                    operation: .delegationExchange
+                )
+            ),
+            "with no provenance the delegation fence must refuse — fail closed, not open"
+        )
+
+        // WITH provenance: the same grant, plus the bits saying the client
+        // literally wrote all three keys. Both fences must now allow.
+        let witnessed = SwanScopePermissions(
+            rawScopes: [stated],
+            subject: PermissionedScopeFixture.subject,
+            statedKeys: [stated: ["authority", "skey", "action"]]
+        )
+        XCTAssertTrue(
+            witnessed.allowsSpace(
+                SpaceScopeTarget(
+                    type: Self.spaceType,
+                    authority: PermissionedScopeFixture.subject,
+                    skey: "*",
+                    operation: .delegationExchange
+                )
+            ),
+            """
+            The FACADE is the wrong suspect if this fails: given durable \
+            provenance, `isExactReadOnlyDelegationGrant` must accept a grant whose \
+            `authority`, `skey` and single `action=read` were all literally \
+            written. If this passes while the end-to-end tests fail, the matcher \
+            is fine and provenance is not reaching it.
+            """
+        )
+        let wildcard = "space:\(Self.spaceType)?authority=*&skey=*&action=read"
+        XCTAssertTrue(
+            SwanScopePermissions(
+                rawScopes: [wildcard],
+                subject: PermissionedScopeFixture.subject,
+                statedKeys: [wildcard: ["authority", "skey", "action"]]
+            ).allowsSpaceListing(type: Self.spaceType, authority: nil),
+            "same for the listing fence (§7.3 W8)"
+        )
+    }
+
     // MARK: - Direction 1: minting must not INVENT provenance
 
     /// The exact example §9-D23 names. `authority` is never written by the
@@ -103,7 +170,12 @@ final class ScopeProvenanceDurabilityTests: XCTestCase, @unchecked Sendable {
                     type: Self.spaceType,
                     authority: PermissionedScopeFixture.subject,
                     skey: "anything",
-                    operation: .read
+                    // NOT aggregate: this probes an ordinary read of one named
+                    // space, which is what must survive `self` resolution. An
+                    // aggregate read carries the §6.5.5 hardening and would fail
+                    // here for a reason unrelated to provenance, turning a
+                    // positive control into a false alarm.
+                    operation: .read(aggregate: false, collection: nil)
                 )
             ),
             "resolution must still make the grant match ordinary reads (§6.4)"

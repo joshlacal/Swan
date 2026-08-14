@@ -272,7 +272,17 @@ struct PermissionedScopeClient: Sendable {
             let scopeParameter = scopes.joined(separator: " ")
             clientID = try XCTUnwrap(
                 URL(
-                    string: "http://localhost?scope=\(scopeFormEncode(scopeParameter))"
+                    // `%20`, NOT `+`, for the separator between scopes.
+                    // `localhostDevelopmentMetadata` reads the scope through
+                    // `URLComponents.queryItems` (`OAuthClientMetadata.swift:265`,
+                    // `:298`), and Foundation does **not** fold `+` to SPACE
+                    // there. A `+`-joined multi-scope client id therefore
+                    // registers as ONE mangled token and every request against it
+                    // fails "requested scope is not registered" — a harness
+                    // artefact that looks exactly like a real subset-check bug.
+                    // Single-scope clients never hit it, which is why it stayed
+                    // hidden until a two-scope fixture.
+                    string: "http://localhost?scope=\(scopeQueryEncode(scopeParameter))"
                         + "&redirect_uri=\(scopeFormEncode(PermissionedScopeFixture.redirectURI.absoluteString))"
                 )
             )
@@ -422,6 +432,21 @@ extension PermissionedScopeFixture {
 }
 
 // MARK: - Shared helpers
+
+/// Percent-encodes for a URL **query component** read back by
+/// `URLComponents.queryItems`: SPACE becomes `%20`, never `+`. Distinct from
+/// `scopeFormEncode`, which is `application/x-www-form-urlencoded` for request
+/// BODIES. The two differ on exactly one byte and confusing them is silent.
+func scopeQueryEncode(_ value: String) -> String {
+    value.utf8.map { byte in
+        switch byte {
+        case 65 ... 90, 97 ... 122, 48 ... 57, 45, 46, 95, 126:
+            String(UnicodeScalar(byte))
+        default:
+            String(format: "%%%02X", byte)
+        }
+    }.joined()
+}
 
 func scopeFormEncode(_ value: String) -> String {
     value.utf8.map { byte in

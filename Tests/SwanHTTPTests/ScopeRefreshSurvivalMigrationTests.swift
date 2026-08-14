@@ -27,6 +27,13 @@ import SwanSQLite
 final class ScopeRefreshSurvivalMigrationTests: XCTestCase, @unchecked Sendable {
     private static let spaceType = "app.example.forum"
 
+    /// Every client here is `.localhostBridge`, and it is not a shortcut.
+    /// §9-D20's binding comparison lives on `redeemLocalhostPublicRefresh`
+    /// (`DurableOAuthTokenService.swift:770`), which validates its `clientID` as
+    /// a localhost development client and refuses anything else. A remote client
+    /// fails with `invalid localhost development client_id` — a harness error
+    /// that would masquerade as the refresh failure this suite exists to detect.
+
     // MARK: - §9-D20: refresh survives `self` resolution
 
     /// Shape A: `authority` **omitted**, so it defaults to `self`
@@ -57,7 +64,7 @@ final class ScopeRefreshSurvivalMigrationTests: XCTestCase, @unchecked Sendable 
         file: StaticString = #filePath,
         line: UInt = #line
     ) async throws {
-        let client = try PermissionedScopeClient(scopes: [requested])
+        let client = try PermissionedScopeClient(scopes: [requested], kind: .localhostBridge)
         let fixture = try await PermissionedScopeFixture.make()
         defer { Task { await fixture.tearDown() } }
 
@@ -141,7 +148,7 @@ final class ScopeRefreshSurvivalMigrationTests: XCTestCase, @unchecked Sendable 
         // `authority` first. The client re-presents its own ordering.
         let requested =
             "space:\(Self.spaceType)?skey=default&authority=\(PermissionedScopeFixture.subject)&action=read"
-        let client = try PermissionedScopeClient(scopes: [requested])
+        let client = try PermissionedScopeClient(scopes: [requested], kind: .localhostBridge)
         let fixture = try await PermissionedScopeFixture.make()
         defer { Task { await fixture.tearDown() } }
 
@@ -161,7 +168,7 @@ final class ScopeRefreshSurvivalMigrationTests: XCTestCase, @unchecked Sendable 
     /// regresses, §9-D20 was implemented as "stop checking".
     func testRefreshStillRefusesAWidenedScopeSet() async throws {
         let requested = "space:\(Self.spaceType)?action=read_self"
-        let client = try PermissionedScopeClient(scopes: [requested])
+        let client = try PermissionedScopeClient(scopes: [requested], kind: .localhostBridge)
         let fixture = try await PermissionedScopeFixture.make()
         defer { Task { await fixture.tearDown() } }
 
@@ -194,41 +201,40 @@ final class ScopeRefreshSurvivalMigrationTests: XCTestCase, @unchecked Sendable 
     /// Rotating such a family must **succeed**. Under a full re-parse on
     /// rotation it would fail, and the session would be locked out permanently —
     /// a live-session outage caused by a scope the client is not even using.
-    func testRotationSucceedsForAFamilyHoldingAnUnparseableCompanionScope() async throws {
+    func testRotationSucceedsForAFamilyHoldingAnUnparseableCompanionScope() throws {
         // Lexically legal for `validScope` (no whitespace, no controls, short),
         // semantically unparseable under the new grammar: the type is not an NSID
-        // and the authority is not a DID. §7.5 item 3 names this exact shape as
-        // one that could have been persisted and that the new schema rejects.
+        // and the authority is not a DID. §7.5 item 3 names this exact shape.
         let junk = "space:notannsid?authority=notadid&skey=k&action=read"
-        let good = "space:\(Self.spaceType)?authority=\(PermissionedScopeFixture.subject)&skey=*&action=read"
-        let client = try PermissionedScopeClient(scopes: [good, junk])
-        let fixture = try await PermissionedScopeFixture.make()
-        defer { Task { await fixture.tearDown() } }
 
-        let issued = try await fixture.mint(client: client, proofID: "junk-companion-mint")
-        let refreshToken = try XCTUnwrap(issued.refreshToken)
-        let session = try client.session(proofID: "junk-companion-refresh")
-
-        let rotated = try await fixture.runtime.tokenService.redeemLocalhostPublicRefresh(
-            refreshToken,
-            clientID: client.clientID,
-            dpopProof: session.dpopProof,
-            requestedScopes: client.scopeSet
-        )
-
-        // Retained, not silently dropped: a rotation that quietly narrows the
-        // stored set is indistinguishable from the widening check firing.
-        let grant = try await fixture.runtime.tokenService.validateAccess(
-            rotated.accessToken,
-            proof: session.dpopProof
-        )
-        XCTAssertTrue(
-            grant.scopes.contains(junk),
+        // FINDING, and the reason this test cannot run today: a family holding an
+        // unparseable companion can no longer be CREATED through the request
+        // path at all. §9-D5 rejects an unparseable *requested* scope at PAR, so
+        // mint refuses the whole request rather than persisting the junk beside
+        // the good scope. That is correct behaviour, and it narrows §7.5's
+        // concern usefully: such a row can now only exist as a LEGACY row
+        // written by an older binary. Which is exactly the row this test needs
+        // and cannot construct.
+        //
+        // Seeding one directly is not reachable from a test either:
+        // `DurableOAuthTokenService.tokenDigests(for:)` and `digest(_:purpose:)`
+        // are `private` (`:1059`, `:1069`, `:1121`), so a test cannot compute the
+        // digests for a token it could then present. `OAuthClientBinding` itself
+        // is fully public and carries `scopesRequested` and `scopeProvenance`, so
+        // the only missing piece is a seam.
+        //
+        // REQUESTED OF L2: an internal test seam mirroring L3's
+        // `accountOAuthForTesting` — something like
+        // `seedTokenFamilyForTesting(subject:binding:now:) -> OAuthTokenPair`,
+        // which writes the family and returns the raw tokens. With it, this test
+        // becomes: seed {atproto, junk} with `scopeProvenance: nil` (a
+        // pre-migration row), rotate, assert the rotation SUCCEEDS and the junk
+        // is retained. Under a stage-G full re-parse it would fail and lock the
+        // session out permanently — a live-session outage caused by a scope the
+        // client is not even using.
+        throw XCTSkip(
             """
-            Stage G's re-parse must be ADDITIVE ONLY. The junk companion was \
-            dropped from the rotated family; a client that re-presents its own \
-            original set on the next refresh will then fail the binding \
-            comparison and be locked out (§6.3, §7.5 item 4).
+            Needs a durable-row seeding seam. A family holding \(junk) cannot be             minted (§9-D5 rejects it at PAR — correct) and cannot be seeded             (token digest helpers are private). Requested of L2:             `seedTokenFamilyForTesting(subject:binding:now:)`. Until then the             additive-only stage-G property is UNVERIFIED, not passing.
             """
         )
     }
@@ -237,49 +243,61 @@ final class ScopeRefreshSurvivalMigrationTests: XCTestCase, @unchecked Sendable 
     /// binary cannot parse must be able to fail a request neither OPEN nor with a
     /// crash. It grants nothing, silently, and the good scope beside it still
     /// works.
-    func testAnUnparseableHeldScopeGrantsNothingAndBreaksNothing() async throws {
+    func testAnUnparseableHeldScopeGrantsNothingAndBreaksNothing() throws {
+        // Asserted on a directly-constructed permissions value rather than on a
+        // minted token, and that is now the ONLY faithful shape. §9-D5 splits
+        // this across two layers: the REQUEST layer rejects an unparseable scope
+        // at PAR, so such a set can no longer be minted at all; the MATCH layer
+        // — this one — must hold for a set that is ALREADY persisted, i.e. a row
+        // an older binary wrote. Routing it through mint would exercise the
+        // request layer's rejection and label it the match layer's tolerance.
         let junk = "space:notannsid?authority=notadid&skey=k&action=read"
         let good = "space:\(Self.spaceType)?authority=\(PermissionedScopeFixture.subject)&skey=*&action=read"
-        let client = try PermissionedScopeClient(scopes: [good, junk])
-        let minting = try await PermissionedScopeFixture.make()
-        let issued: OAuthTokenGrantResult
-        do {
-            issued = try await minting.mint(client: client, proofID: "junk-match-mint")
-        } catch {
-            await minting.tearDown()
-            throw error
-        }
-        let reloaded = try await minting.reopeningStorage()
-        defer { Task { await reloaded.tearDown() } }
-
-        let permissions = try await reloaded.permissions(
-            accessToken: issued.accessToken,
-            client: client,
-            jti: "junk-match-authorize"
+        let permissions = SwanScopePermissions(
+            rawScopes: ["atproto", good, junk],
+            subject: PermissionedScopeFixture.subject
         )
-        // Recorded for logging, greppable, and granting nothing.
+
+        // Neither fails open nor crashes: recorded for logging, greppable, and
+        // granting nothing.
         XCTAssertEqual(Set(permissions.rejected.keys), [junk])
+        XCTAssertTrue(
+            permissions.rawScopes.contains(junk),
+            "the raw string survives verbatim — persistence and audit never see a re-serialised value"
+        )
         XCTAssertFalse(
             permissions.allowsSpace(
                 SpaceScopeTarget(
                     type: "notannsid",
                     authority: "notadid",
                     skey: "k",
-                    operation: .read
+                    operation: .read(aggregate: false, collection: nil)
                 )
-            )
+            ),
+            "an unparseable held scope must grant exactly nothing"
         )
         // The good scope beside it is unaffected — a rejected element must not
-        // poison the set.
+        // poison the set. Ordinary single-space read, not an aggregate surface:
+        // an aggregate read would fail on the §6.5.5 hardening rather than on
+        // anything to do with the junk companion.
         XCTAssertTrue(
             permissions.allowsSpace(
                 SpaceScopeTarget(
                     type: Self.spaceType,
                     authority: PermissionedScopeFixture.subject,
                     skey: "anything",
-                    operation: .read
+                    operation: .read(aggregate: false, collection: nil)
                 )
-            )
+            ),
+            "a rejected element must not poison the rest of the set"
+        )
+
+        // The other half of §9-D5, asserted in the same file so the pair is
+        // visible: the same string is REFUSED at the request layer rather than
+        // silently dropped.
+        XCTAssertThrowsError(
+            try AtprotoScope.parse(junk),
+            "§9-D5 request layer: an unparseable requested scope is rejected, never narrowed away"
         )
     }
 
@@ -339,7 +357,7 @@ final class ScopeRefreshSurvivalMigrationTests: XCTestCase, @unchecked Sendable 
     func testPreMigrationShapedGrantRefreshesThroughTheNullFallback() async throws {
         let requested =
             "space:\(Self.spaceType)?authority=\(PermissionedScopeFixture.subject)&skey=*&action=read"
-        let client = try PermissionedScopeClient(scopes: ["atproto", requested])
+        let client = try PermissionedScopeClient(scopes: ["atproto", requested], kind: .localhostBridge)
         let fixture = try await PermissionedScopeFixture.make()
         defer { Task { await fixture.tearDown() } }
 
