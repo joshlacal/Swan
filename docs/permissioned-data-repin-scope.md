@@ -164,7 +164,7 @@ let space = try SpaceURI(parameters.space.uriString())
 the workaround for a wire type that cannot hold the value. Give the generator
 the right type and every one of those lines becomes unnecessary.
 
-### 3a-ii. The two types to add
+### 3a-ii. The two types to add — **done**, Petrel `710ecb0a`
 
 Swan already has both shapes modelled correctly, in `SwanSpaces/SwanSpaces.swift`:
 `SpaceURI` (`:37-104`, the three-part form, DID + NSID + record-key validated)
@@ -195,6 +195,26 @@ strings are already in upstream's format — `SpaceURI.description`
 (`SwanSpaces.swift:63`) emits `at://\(authority)/space/\(spaceType)/\(skey)`,
 byte-identical to `SpaceRef.toString()` (`aturi.ts:250-252`). **No wire values
 change and no stored data migrates.**
+
+Both landed in Petrel `710ecb0a`, ahead of the re-pin, because the `ATProtocolURI`
+half fixes a mis-parse that exists in the code today:
+
+- `Sources/Petrel/Core/Utils/ATProtoTypes.swift` — `ATProtocolURI` gains
+  `isSpace`, `spaceDID`, `spaceType`, `skey`, `authorDID`, and a `spaceRef`
+  accessor; `parseSegments` follows upstream's `parsePath`, gating
+  `spaceDID`/`authorDID` on well-formed DIDs and `spaceType` on being an NSID.
+  Public at-uris parse exactly as before. New `SpaceRef` type for `space-ref`.
+- `generator/type_converter.py`, `generator/kotlin_type_converter.py` —
+  `space-ref` mapped to `SpaceRef`, with a thin Kotlin `SpaceRef` added to the
+  runtime for parity.
+- `Tests/PetrelTests/SpaceRefTests.swift` — 19 vectors ported from
+  `packages/syntax/tests/aturi-string.test.ts`, including the one that pins the
+  regression: a space URI must not report `space` as its collection.
+
+Verified: Petrel suite green (276 + 29 swift-testing, 106 XCTest, 0 failures);
+the codegen round-trip still produces an empty diff, so the converter change is
+inert for the core corpus; and `swift build --product swan` — Swan's real
+gate — is green against the updated Petrel.
 
 ### 3b. Regeneration is checksum-gated
 
@@ -265,10 +285,10 @@ Local read-only clone for this investigation:
 
 1. **Ask the Bulleted author** which precondition failed and which revision
    they target. One message, and it may collapse a lot of guesswork.
-2. **Types first** — add `SpaceRef` to Petrel Core, teach `ATProtocolURI` the
-   space grammar, then map `space-ref` in both converters (see 3a-ii). Small,
-   independently testable, and it fixes a mis-parse that exists *today* as well
-   as stopping the silent `String` degradation at regeneration.
+2. ~~**Types first**~~ — **done** in Petrel `710ecb0a` (see 3a-ii). `SpaceRef`
+   added, `ATProtocolURI` made space-aware, `space-ref` mapped in both
+   converters. Follow-up once Swan re-pins: the 20+ `try SpaceURI(x.uriString())`
+   laundering lines become unnecessary and should be removed with the handlers.
 3. **Re-pin and regenerate** — new profile document, new digests, generator
    commit bumped. Diff the generated tree and expect it to be readable: same
    values, better names.
