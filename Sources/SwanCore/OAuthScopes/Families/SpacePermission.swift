@@ -432,13 +432,44 @@ extension SpacePermission {
     /// persisted grant). This is a read, not a re-derivation: it does not
     /// re-parse any serialised string, which is the distinction §9-D23 exists
     /// to enforce.
+    ///
+    /// **The RETURN must not re-invent provenance either.** An earlier
+    /// version of this function built its result through the public
+    /// memberwise initializer, which marks every field `.stated`
+    /// unconditionally (`buildParameters`) — so `authority` (and every other
+    /// untouched field) would come out of expansion looking client-stated
+    /// even when it never was. That is the exact §9-D23 "provenance invented"
+    /// failure re-entering through a rebuild instead of a re-parse. This
+    /// version threads the existing `parameters` through the private,
+    /// explicit-`scopeParameters` initializer instead (the same pattern
+    /// `withResolvedAuthority` uses just below), updating only the two keys
+    /// that actually change:
+    ///   - `collection`'s new value is necessarily `.defaulted` — an empty
+    ///     multi-valued list (the precondition for even reaching this
+    ///     function, via `!hasCollections`) can only arise from an absent
+    ///     key, never a stated-but-empty one (a stated multi-value key that
+    ///     resolves to zero entries is `.emptyMultiValuedParameter` at parse
+    ///     time), so there is no other provenance it could have carried;
+    ///   - `action`'s VALUE may narrow (write verbs dropped when unstated,
+    ///     above), but its PROVENANCE is carried forward unchanged — same
+    ///     rule as `withResolvedAuthority`.
+    /// Every other key (`type`, `authority`, `skey`, `manage`) is untouched
+    /// in both value and provenance.
     public func withDefaultCollections(_ collections: [SpaceCollectionParam]) -> SpacePermission {
         guard !hasCollections, !collections.isEmpty else { return self }
         let effectiveAction = scopeParameters.wasStated("action")
             ? action
             : action.filter { $0 == .read || $0 == .readSelf }
-        return SpacePermission(type: type, authority: authority, skey: skey,
-                                collection: collections, action: effectiveAction, manage: manage)
+        var updatedParameters = parameters
+        let collectionProvenance = parameters.provenance(for: "collection") ?? .defaulted
+        updatedParameters.set("collection", collections.map(\.stringValue), collectionProvenance)
+        let actionProvenance = parameters.provenance(for: "action") ?? .defaulted
+        updatedParameters.set("action", effectiveAction.map(\.rawValue), actionProvenance)
+        return SpacePermission(
+            type: type, authority: authority, skey: skey,
+            collection: collections, action: effectiveAction, manage: manage,
+            scopeParameters: updatedParameters
+        )
     }
 
     /// space-permission.ts:156-166. The matcher is context-free and cannot do

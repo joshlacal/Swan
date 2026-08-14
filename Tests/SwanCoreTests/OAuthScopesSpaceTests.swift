@@ -351,6 +351,43 @@ struct OAuthScopesSpaceTests {
     }
 
     @Test
+    func withDefaultCollectionsDoesNotInventProvenanceOnUntouchedFields() throws {
+        // The second §9-D23 regression this function had to avoid: an
+        // earlier version rebuilt its result through the public memberwise
+        // initializer, which marks every field `.stated` unconditionally —
+        // so `authority` would come out of expansion looking client-stated
+        // even though it was never written. Assert the durable bit directly
+        // rather than reasoning about it.
+        let neverStatedAuthority = try SpacePermission.parse("space:com.atmoboards.forum?skey=*&action=read")
+        #expect(!neverStatedAuthority.scopeParameters.wasStated("authority"))
+        #expect(!neverStatedAuthority.scopeParameters.wasStated("manage"))
+        #expect(neverStatedAuthority.scopeParameters.wasStated("skey"))
+        #expect(neverStatedAuthority.scopeParameters.wasStated("action"))
+
+        let expanded = neverStatedAuthority.withDefaultCollections([.nsid("com.atmoboards.thread")])
+        // Untouched fields keep BOTH their value and their original
+        // provenance — this is the assertion the earlier, buggy version
+        // would have failed.
+        #expect(!expanded.scopeParameters.wasStated("authority"))
+        #expect(!expanded.scopeParameters.wasStated("manage"))
+        #expect(expanded.scopeParameters.wasStated("skey"))
+        #expect(expanded.scopeParameters.wasStated("action")) // value narrowed elsewhere; provenance carried forward
+        #expect(expanded.authority == .unresolvedSelf) // value also unchanged
+        // The materialised `collection` itself is `.defaulted`, never
+        // `.stated` — the client didn't write it, Phase 2 did.
+        #expect(!expanded.scopeParameters.wasStated("collection"))
+
+        // Confirm, rather than reason about, the structural fact any
+        // delegation-fence implementation depends on: an expanded grant's
+        // `collection` is non-empty regardless of provenance, so clause 2 of
+        // such a fence (which this file no longer implements itself — it
+        // lives at the resource-plane facade, §9-D23) fails on VALUE alone.
+        // Preserving provenance correctly cannot be what flips that clause;
+        // the value itself already blocks it.
+        #expect(!expanded.collection.isEmpty)
+    }
+
+    @Test
     func spaceWithResolvedAuthorityIsIdempotentAndPreservesConcreteAuthority() throws {
         let selfGrant = try SpacePermission.parse("space:com.atmoboards.forum")
         let resolved = selfGrant.withResolvedAuthority("did:plc:abc123xyz")
