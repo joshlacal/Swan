@@ -564,6 +564,10 @@ struct OAuthAdmittedRemoteDocumentFetcher: Sendable {
     func fetchJSON(from url: URL) async throws -> Data {
         try await fetcher.fetchJSONWithoutAdmission(from: url)
     }
+
+    func fetchBytes(from url: URL) async throws -> Data {
+        try await fetcher.fetchBytesWithoutAdmission(from: url)
+    }
 }
 
 /// Applies the complete local policy around a single GET. It intentionally has
@@ -588,6 +592,29 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         _ = try policy.validateURL(url)
         return try await withAdmission { admittedFetcher in
             try await admittedFetcher.fetchJSON(from: url)
+        }
+    }
+
+    /// Bytes-returning sibling of `fetchJSON(from:)` for binary payloads —
+    /// e.g. the CAR bytes `com.atproto.sync.getRecord` returns — that cannot
+    /// be interpreted as a JSON document. It goes through the identical
+    /// `OAuthRemoteFetchPolicy` machinery as `fetchJSON`: URL policy, DNS
+    /// resolution raced against the same deadline, the public-address-only
+    /// peer check, redirect policy, admission control, and the body cap, all
+    /// via the shared `fetchValidatedResponse` core the two methods call.
+    /// Adding a second fetch path that bypasses any of those controls is
+    /// exactly what this sibling must not do.
+    ///
+    /// The body cap is not a document-size preference here: it is an
+    /// anti-DoS control on downstream MST-walk and commit-signature
+    /// verification work. A proof CAR (one commit block plus an MST path) is
+    /// a few KiB by construction, so the cap — 256 KiB by policy default —
+    /// bounds the CPU a hostile response can force the caller to spend, not
+    /// the size of a legitimate document.
+    public func fetchBytes(from url: URL) async throws -> Data {
+        _ = try policy.validateURL(url)
+        return try await withAdmission { admittedFetcher in
+            try await admittedFetcher.fetchBytes(from: url)
         }
     }
 
@@ -620,8 +647,16 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         )
     }
 
-    fileprivate func fetchJSONWithoutAdmission(from url: URL) async throws
-        -> Data
+    /// The complete network-and-policy core shared by `fetchJSON` and
+    /// `fetchBytes`: URL policy was already checked by the caller before
+    /// admission; this performs DNS preflight, the transport GET, DNS
+    /// postflight, the exact-URL/no-redirect/200 check, the dual-answer-set
+    /// peer proof, header canonicalization, the content-length cross-check,
+    /// and the body-size cap. It deliberately does not interpret the body —
+    /// content-type and payload-syntax checks are the caller's job, because
+    /// they differ between a JSON document and a binary payload like a CAR.
+    fileprivate func fetchValidatedResponse(from url: URL) async throws
+        -> (body: Data, headers: [String: [String]])
     {
         let host = try policy.validateURL(url)
         let preflightPeers = Set(try await resolveOAuthHostname(
@@ -662,10 +697,6 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         let headers = response.headers.reduce(into: [String: [String]]()) { output, item in
             output[item.key.lowercased(), default: []].append(contentsOf: item.value)
         }
-        guard let contentType = headers["content-type"], contentType.count == 1,
-              isJSONContentType(contentType[0]) else {
-            throw SwanError.unauthorized("OAuth remote document has non-JSON content type")
-        }
         if let lengths = headers["content-length"] {
             guard lengths.count == 1, let declared = strictDecimal(lengths[0]),
                   declared <= policy.maximumBodyBytes, declared == response.body.count else {
@@ -675,11 +706,32 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         guard !response.body.isEmpty, response.body.count <= policy.maximumBodyBytes else {
             throw SwanError.unauthorized("OAuth remote document body is out of bounds")
         }
+        return (response.body, headers)
+    }
+
+    fileprivate func fetchJSONWithoutAdmission(from url: URL) async throws
+        -> Data
+    {
+        let (body, headers) = try await fetchValidatedResponse(from: url)
+        guard let contentType = headers["content-type"], contentType.count == 1,
+              isJSONContentType(contentType[0]) else {
+            throw SwanError.unauthorized("OAuth remote document has non-JSON content type")
+        }
         // The duplicate-member scanner also verifies complete JSON syntax. Keep
         // the bytes unmodified so metadata/JWKS decoders see exactly what was
         // validated and any caller can bind an audit hash if needed.
-        try StrictJSON.validate(response.body)
-        return response.body
+        try StrictJSON.validate(body)
+        return body
+    }
+
+    /// Bytes path for binary payloads (e.g. a CAR file). Shares every network
+    /// control with `fetchJSONWithoutAdmission` through `fetchValidatedResponse`
+    /// and intentionally skips the JSON-only checks — content-type-is-JSON and
+    /// `StrictJSON.validate` — which do not apply to a non-JSON body.
+    fileprivate func fetchBytesWithoutAdmission(from url: URL) async throws
+        -> Data
+    {
+        try await fetchValidatedResponse(from: url).body
     }
 
     private func isJSONContentType(_ value: String) -> Bool {

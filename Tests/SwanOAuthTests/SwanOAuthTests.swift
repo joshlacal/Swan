@@ -1381,6 +1381,140 @@ final class SwanOAuthTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(try await nilPeerFetcher.fetchJSON(from: url))
     }
 
+    /// `fetchBytes` must inherit every control `fetchJSON` has except the
+    /// JSON-specific ones (content-type-is-JSON, `StrictJSON.validate`),
+    /// which do not apply to a binary payload like a CAR. A test that only
+    /// asserted "bytes come back" would pass even if `fetchBytes` bypassed
+    /// URL policy, the peer proof, redirect policy, or the body cap — so
+    /// each control gets its own assertion, mirroring
+    /// `testHardenedRemoteFetcherRejectsUnsafeDNSAndBadResponses` above but
+    /// through the bytes path.
+    func testHardenedRemoteFetcherFetchBytesInheritsControls() async throws {
+        let url = URL(string: "https://metadata.example/proof.car")!
+        let publicAddress = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+        let privateAddress = try XCTUnwrap(OAuthIPAddress(literal: "10.0.0.7"))
+        let privateV6 = try XCTUnwrap(OAuthIPAddress(literal: "fc00::7"))
+        let body = Data([0x01, 0x71, 0xA0, 0xE4, 0x02, 0x20])
+        let policy = try OAuthRemoteFetchPolicy(maximumBodyBytes: 1_024, timeout: 2)
+
+        // Happy path: non-JSON content type succeeds for fetchBytes even
+        // though it would fail fetchJSON, proving fetchBytes genuinely skips
+        // only the JSON-specific checks rather than accidentally becoming
+        // permissive elsewhere.
+        let safeResolver = TestResolver(answers: [[publicAddress], [publicAddress]])
+        let safeTransport = TestTransport(responses: [url.absoluteString: .init(
+            status: 200,
+            headers: ["Content-Type": ["application/vnd.ipld.car"]],
+            body: body,
+            responseURL: url,
+            connectedPeerAddress: publicAddress
+        )])
+        let fetcher = OAuthRemoteDocumentFetcher(policy: policy, resolver: safeResolver, transport: safeTransport)
+        let fetched = try await fetcher.fetchBytes(from: url)
+        XCTAssertEqual(fetched, body)
+
+        // Private-address peer is refused, same as fetchJSON.
+        for unsafe in [privateAddress, privateV6] {
+            let resolver = TestResolver(answers: [[unsafe]])
+            let transport = TestTransport(responses: [:])
+            let unsafeFetcher = OAuthRemoteDocumentFetcher(policy: policy, resolver: resolver, transport: transport)
+            await XCTAssertThrowsErrorAsync(try await unsafeFetcher.fetchBytes(from: url))
+        }
+
+        // DNS-rebinding peer mismatch between preflight and postflight answer
+        // sets is refused, same as fetchJSON.
+        let rebindingResolver = TestResolver(answers: [[publicAddress], [privateAddress]])
+        let rebindingTransport = TestTransport(responses: [url.absoluteString: .init(
+            status: 200,
+            headers: ["content-type": ["application/vnd.ipld.car"]],
+            body: body,
+            responseURL: url,
+            connectedPeerAddress: publicAddress
+        )])
+        let rebindingFetcher = OAuthRemoteDocumentFetcher(
+            policy: policy, resolver: rebindingResolver, transport: rebindingTransport
+        )
+        await XCTAssertThrowsErrorAsync(try await rebindingFetcher.fetchBytes(from: url))
+
+        // Over-cap body, redirect, wrong response URL, and a nil connected
+        // peer are all refused, same as fetchJSON. Content type is
+        // deliberately NOT included here since it is JSON-only.
+        let badResponses: [OAuthRemoteHTTPResponse] = [
+            .init(status: 302, headers: ["content-type": ["application/vnd.ipld.car"]], body: body, responseURL: url),
+            .init(status: 200, headers: ["content-type": ["application/vnd.ipld.car"]], body: Data(repeating: 0x20, count: 1_025), responseURL: url),
+            .init(status: 200, headers: ["content-type": ["application/vnd.ipld.car"]], body: body, responseURL: URL(string: "https://other.example/")!),
+            .init(status: 200, headers: ["content-type": ["application/vnd.ipld.car"]], body: body, responseURL: url, redirectCount: 1),
+            .init(status: 200, headers: ["content-type": ["application/vnd.ipld.car"]], body: body, responseURL: url, connectedPeerAddress: privateAddress),
+        ]
+        for response in badResponses {
+            let resolver = TestResolver(answers: [[publicAddress], [publicAddress]])
+            let transport = TestTransport(responses: [url.absoluteString: response])
+            let badFetcher = OAuthRemoteDocumentFetcher(policy: policy, resolver: resolver, transport: transport)
+            await XCTAssertThrowsErrorAsync(try await badFetcher.fetchBytes(from: url))
+        }
+        let nilPeerFetcher = OAuthRemoteDocumentFetcher(
+            policy: policy,
+            resolver: TestResolver(answers: [[publicAddress], [publicAddress]]),
+            transport: TestTransport(
+                responses: [url.absoluteString: .init(
+                    status: 200, headers: ["content-type": ["application/vnd.ipld.car"]],
+                    body: body, responseURL: url
+                )],
+                reportsConnectedPeer: false
+            )
+        )
+        await XCTAssertThrowsErrorAsync(try await nilPeerFetcher.fetchBytes(from: url))
+
+        // Malformed/non-HTTPS URLs are refused before any network work,
+        // same as fetchJSON's policy.validateURL gate.
+        let insecureURL = URL(string: "http://metadata.example/proof.car")!
+        await XCTAssertThrowsErrorAsync(try await fetcher.fetchBytes(from: insecureURL))
+    }
+
+    /// Confirms the DNS-preflight/postflight deadline race — the mechanism
+    /// most likely to be silently dropped by a naive refactor — applies to
+    /// `fetchBytes` exactly as it does to `fetchJSON` in
+    /// `testHardenedRemoteFetcherBoundsPreAndPostDNSResolution` below.
+    func testHardenedRemoteFetcherFetchBytesBoundsPreAndPostDNSResolution() async throws {
+        let url = URL(string: "https://metadata.example/proof.car")!
+        let publicAddress = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+        let body = Data([0x01, 0x71, 0xA0, 0xE4])
+        let policy = try OAuthRemoteFetchPolicy(maximumBodyBytes: 1_024, timeout: 0.05)
+        let response = OAuthRemoteHTTPResponse(
+            status: 200,
+            headers: ["content-type": ["application/vnd.ipld.car"]],
+            body: body,
+            responseURL: url,
+            connectedPeerAddress: publicAddress
+        )
+
+        let slowPreflightTransport = TestTransport(responses: [url.absoluteString: response])
+        let slowPreflight = OAuthRemoteDocumentFetcher(
+            policy: policy,
+            resolver: DelayedTestResolver(
+                address: publicAddress, delay: 0.75, delayFirstResolution: true),
+            transport: slowPreflightTransport
+        )
+        let preflightStart = Date()
+        await XCTAssertThrowsErrorAsync(try await slowPreflight.fetchBytes(from: url))
+        XCTAssertLessThan(Date().timeIntervalSince(preflightStart), 0.4)
+        let preflightRequests = await slowPreflightTransport.requestCount()
+        XCTAssertEqual(preflightRequests, 0)
+
+        let slowPostflightTransport = TestTransport(responses: [url.absoluteString: response])
+        let slowPostflight = OAuthRemoteDocumentFetcher(
+            policy: policy,
+            resolver: DelayedTestResolver(
+                address: publicAddress, delay: 0.75, delayFirstResolution: false),
+            transport: slowPostflightTransport
+        )
+        let postflightStart = Date()
+        await XCTAssertThrowsErrorAsync(try await slowPostflight.fetchBytes(from: url))
+        XCTAssertLessThan(Date().timeIntervalSince(postflightStart), 0.4)
+        let postflightRequests = await slowPostflightTransport.requestCount()
+        XCTAssertEqual(postflightRequests, 1)
+    }
+
     func testHardenedRemoteFetcherBoundsPreAndPostDNSResolution() async throws {
         let url = URL(string: "https://metadata.example/client.json")!
         let publicAddress = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
