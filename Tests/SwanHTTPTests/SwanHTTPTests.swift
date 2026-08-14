@@ -172,6 +172,51 @@ final class SwanHTTPTests: XCTestCase {
         }
     }
 
+    func testCommunityServiceDescribeListsRoutedMethods() async throws {
+        let profile = try loadPinnedProfile()
+        let (server, controlDatabase, root) = try await makeServer(profile: profile)
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let app = server.buildApplication(logger: Logger(label: "SwanHTTPTests"))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/xrpc/community.lexicon.service.describe", method: .get
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(response.headers[.cacheControl], "no-store")
+                    let object = try XCTUnwrap(
+                        JSONSerialization.jsonObject(with: Data(buffer: response.body))
+                            as? [String: Any])
+                    XCTAssertEqual(object["roles"] as? [String], ["pds"])
+                    let methods = try XCTUnwrap(object["methods"] as? [[String: Any]])
+                    let values = methods.compactMap { $0["value"] as? String }
+                    XCTAssertEqual(values, values.sorted(), "deterministic order")
+                    XCTAssertTrue(
+                        methods.allSatisfy {
+                            $0["$type"] as? String == "community.lexicon.service.describe#nsid"
+                        },
+                        "every entry discriminates its union member"
+                    )
+                    // The spaces plane is the reason callers ask: bulleted.app
+                    // gates its spaces support on this answer.
+                    XCTAssertTrue(values.contains("com.atproto.space.getRecord"))
+                    // A description that omitted this method itself would be
+                    // the one claim disprovable from the response in hand.
+                    XCTAssertTrue(values.contains("community.lexicon.service.describe"))
+                    XCTAssertTrue(values.contains("com.atproto.server.describeServer"))
+                    XCTAssertFalse(
+                        values.contains { $0.hasPrefix("app.bsky.") || $0.hasPrefix("chat.bsky.") },
+                        "proxied namespaces are forwarded, not implemented here"
+                    )
+                }
+            }
+            try await controlDatabase.close()
+        } catch {
+            try? await controlDatabase.close()
+            throw error
+        }
+    }
+
     func testOAuthMetadataIsReviewableButUnavailableByDefault() async throws {
         let resource = try XCTUnwrap(URL(string: "https://pds.swan.example"))
         let issuer = try XCTUnwrap(URL(string: "https://auth.swan.example"))

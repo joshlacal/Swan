@@ -878,6 +878,38 @@ public struct SwanHTTPServer: Sendable {
             ))
         }
 
+        // `community.lexicon.service.describe` — the community proposal that
+        // lets a caller ask which XRPC methods a service serves instead of
+        // trying each one and reading the failures. Clients gate on it:
+        // bulleted.app refuses to enable its spaces support when this answer
+        // is missing, because a 404 here is indistinguishable from a server
+        // with no spaces plane. The answer is derived from the same two
+        // inputs that install routes below — the selected permissioned
+        // profile and the public route surface — so it cannot drift from the
+        // router the way a hand-kept list would. Profile methods whose
+        // capability is absent still appear: they are routed (as
+        // method-correct unavailability gates), and this deployment speaks
+        // them.
+        let describedMethodNSIDs = Set(
+            PermissionedData0016.methods
+                .filter { profile.endpoints.contains($0.nsid) }
+                .map(\.nsid)
+        )
+        .union(configuration.publicRouteSurface.servedMethodNSIDs)
+        .union([
+            "com.atproto.server.describeServer",
+            // This method itself: a description that omitted it would be the
+            // one claim a caller could disprove from the response in hand.
+            "community.lexicon.service.describe",
+        ])
+        .sorted()
+        router.get("/xrpc/community.lexicon.service.describe") { _, _ -> Response in
+            jsonResponse(CommunityServiceDescription(
+                roles: ["pds"],
+                methods: describedMethodNSIDs.map(CommunityServiceMethodReference.init(value:))
+            ))
+        }
+
         // Do not route permissioned traffic to the in-memory repository store
         // while durable OAuth and account control have no HTTP entry points.
         // The checked-in wire registry is the sole source for this coverage:
@@ -1222,6 +1254,32 @@ private struct ServerDescription: Encodable {
         case availableUserDomains
         case inviteCodeRequired
         case swanProfile
+    }
+}
+
+/// Output of `community.lexicon.service.describe`.
+private struct CommunityServiceDescription: Encodable {
+    let roles: [String]
+    let methods: [CommunityServiceMethodReference]
+}
+
+/// One entry in `methods`. The proposal allows an NSID, an AT-URI, or a
+/// strongRef; every method Swan serves is standardised and resolvable by
+/// NSID, so that is the only form emitted — an AT-URI or strongRef would pin
+/// a schema record this server does not publish. The `$type` discriminator is
+/// required or a client cannot tell which of the three forms it received.
+private struct CommunityServiceMethodReference: Encodable {
+    let value: String
+
+    enum CodingKeys: String, CodingKey {
+        case type = "$type"
+        case value
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode("community.lexicon.service.describe#nsid", forKey: .type)
+        try container.encode(value, forKey: .value)
     }
 }
 
