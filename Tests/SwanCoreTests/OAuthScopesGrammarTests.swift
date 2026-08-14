@@ -191,4 +191,82 @@ struct OAuthScopesGrammarTests {
     func atprotoDidPlcIsFixedLengthBase32() {
         #expect(!AtprotoSyntax.isValidAtprotoDIDRefAbsolute("did:plc:111#service_id")) // wrong length + charset
     }
+
+    // MARK: §4.6 schema-level rejections, exact case pinned (not just "throws")
+
+    /// Previously only exercised indirectly (an rpc positional+named vector
+    /// asserted generic `throws: ScopeParseError.self`, never the specific
+    /// case) and never exercised at all for the repeated-single-valued class.
+    /// Both classes are also absent from the pinned golden corpus's 16
+    /// invalid entries, so a consent-renderer audit of a hand-rolled bridge
+    /// parser (`Sources/SwanHTTP/ScopeDescription.swift` in L4's lane) could
+    /// not have been caught by a corpus-driven test either — pin the exact
+    /// case here so the class itself has a positive control independent of
+    /// the corpus.
+    @Test
+    func positionalAndNamedConflictIsPinnedAcrossFamilies() {
+        // parser.ts:124-127 — positional and named form of the SAME key
+        // present together is a hard reject, regardless of family or of
+        // whether the two values agree.
+        #expect(throws: ScopeParseError.positionalAndNamedConflict(prefix: "account", key: "attr")) {
+            try AccountPermission.parse("account:email?attr=repo")
+        }
+        #expect(throws: ScopeParseError.positionalAndNamedConflict(prefix: "identity", key: "attr")) {
+            try IdentityPermission.parse("identity:handle?attr=*")
+        }
+        #expect(throws: ScopeParseError.positionalAndNamedConflict(prefix: "space", key: "type")) {
+            try SpacePermission.parse("space:com.example.type?type=com.other.type")
+        }
+        #expect(throws: ScopeParseError.positionalAndNamedConflict(prefix: "rpc", key: "lxm")) {
+            // rpc-permission.test.ts:65-71 — upstream's own vector.
+            try RpcPermission.parse("rpc:com.example.method1?aud=did:web:example.com&lxm=com.example.method2")
+        }
+    }
+
+    @Test
+    func repeatedSingleValuedParameterIsPinnedAcrossFamilies() {
+        // syntax-string.ts:18-23 -> parser.ts:121-122 — a single-valued
+        // parameter named more than once is `null`, not "use the last (or
+        // first) value silently". `repo` has no non-positional single-valued
+        // parameter (`collection` and `action` are both `.multiple`), so it
+        // cannot produce this case at all — every other family can.
+        #expect(throws: ScopeParseError.repeatedSingleValuedParameter(prefix: "account", key: "attr")) {
+            try AccountPermission.parse("account?attr=email&attr=repo")
+        }
+        #expect(throws: ScopeParseError.repeatedSingleValuedParameter(prefix: "identity", key: "attr")) {
+            try IdentityPermission.parse("identity?attr=handle&attr=*")
+        }
+        #expect(throws: ScopeParseError.repeatedSingleValuedParameter(prefix: "include", key: "nsid")) {
+            try IncludeScope.parse("include?nsid=com.example.foo&nsid=com.example.bar")
+        }
+        #expect(throws: ScopeParseError.repeatedSingleValuedParameter(prefix: "include", key: "aud")) {
+            try IncludeScope.parse(
+                "include:com.example.foo?aud=did:web:example.com%23a&aud=did:web:example.com%23b"
+            )
+        }
+        #expect(throws: ScopeParseError.repeatedSingleValuedParameter(prefix: "rpc", key: "aud")) {
+            try RpcPermission.parse(
+                "rpc:com.example.method?aud=did:web:example.com%23a&aud=did:web:example.com%23b"
+            )
+        }
+        #expect(throws: ScopeParseError.repeatedSingleValuedParameter(prefix: "space", key: "authority")) {
+            try SpacePermission.parse("space:com.example.type?authority=did:plc:aaa&authority=did:plc:bbb")
+        }
+        #expect(throws: ScopeParseError.repeatedSingleValuedParameter(prefix: "space", key: "skey")) {
+            try SpacePermission.parse("space:com.example.type?skey=abc&skey=def")
+        }
+    }
+
+    /// The mirror finding from the same audit: `ConsentScope`'s bridge parser
+    /// never percent-decodes a POSITIONAL segment at all (only query values),
+    /// so a percent-escaped positional would render its raw undecoded bytes.
+    /// The real grammar decodes it via `decodeURIComponent` (§4.4) before
+    /// validation. No corpus entry exercises this (checked with a script), so
+    /// pin it here as a positive control on the correct behaviour.
+    @Test
+    func percentEscapedPositionalDecodesBeforeValidation() throws {
+        let decoded = try RepoPermission.parse("repo:com%2Eexample%2Efoo")
+        #expect(decoded.collection == [.nsid("com.example.foo")])
+        #expect(try decoded.canonicalScopeString() == "repo:com.example.foo")
+    }
 }
