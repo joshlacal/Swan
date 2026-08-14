@@ -325,7 +325,13 @@ public extension SwanScopePermissions {
                     type: target.type,
                     authority: target.authority,
                     skey: target.skey,
-                    operation: .read
+                    // `aggregate: false`, `collection: nil` — a delegation
+                    // exchange is a whole-space read: not an aggregate surface,
+                    // and not collection-filtered. The fence above has already
+                    // established the stricter `action == [.read]` and that no
+                    // collection is named, so this call contributes only
+                    // §5.6.3 steps 1-3 (type, authority, skey).
+                    operation: .read(aggregate: false, collection: nil)
                 )
             )
         }

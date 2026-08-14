@@ -27,6 +27,15 @@ final class ScopePermissionsFenceTests: XCTestCase {
         )
     }
 
+    private func read(aggregate: Bool, collection: String?) -> SpaceScopeTarget {
+        SpaceScopeTarget(
+            type: "x.y.z",
+            authority: user,
+            skey: "self",
+            operation: .read(aggregate: aggregate, collection: collection)
+        )
+    }
+
     private func delegation(_ type: String = "x.y.z", skey: String = "self") -> SpaceScopeTarget {
         SpaceScopeTarget(
             type: type,
@@ -182,7 +191,7 @@ final class ScopePermissionsFenceTests: XCTestCase {
     func testDelegationFenceStillRequiresTheTupleToMatch() {
         let scope = "space:x.y.z?authority=\(user)&skey=self&action=read"
         let permissions = permissions(scope, stated: ["authority", "skey", "action"])
-        XCTAssertFalse(permissions.allowsSpace(delegation(type: "other.type.here")))
+        XCTAssertFalse(permissions.allowsSpace(delegation("other.type.here")))
         XCTAssertFalse(permissions.allowsSpace(delegation(skey: "different")))
     }
 
@@ -193,6 +202,64 @@ final class ScopePermissionsFenceTests: XCTestCase {
         XCTAssertFalse(
             permissions(scope, stated: ["authority", "skey", "action"])
                 .allowsSpace(delegation())
+        )
+    }
+
+    // MARK: - The aggregate-read hardening (§6.5.5)
+
+    /// **This test fails under the literal §5.6.2 port, which is the point.**
+    ///
+    /// §5.6.2 originally declared `case read` with no payload and §5.6.3's arm
+    /// was `return action.contains(.read)` — upstream's collection-INDEPENDENT
+    /// rule (`space-permission.ts:104-110`, which takes the read arms *before*
+    /// `collectionAllows` at `:112-115`). Ported literally, the second
+    /// assertion below returns TRUE: a grant naming exactly one collection
+    /// would satisfy a read that spans every collection, and the response would
+    /// silently omit the rows the grant does not cover.
+    ///
+    /// That is the widening §6.5.5 exists to prevent
+    /// (`SwanSpaces.swift:329-341`, "aggregate surfaces must not silently
+    /// censor their response"). Nothing else in the suite catches it, because a
+    /// collection-qualified read of *that same collection* — the first
+    /// assertion — is legitimate and passes either way.
+    func testAggregateReadRefusesACollectionQualifiedGrant() {
+        let scope = "space:x.y.z?authority=\(user)&skey=self&action=read&collection=app.example.records"
+        let permissions = permissions(
+            scope,
+            stated: ["authority", "skey", "action", "collection"]
+        )
+
+        // Reading that one collection is exactly what the grant names.
+        XCTAssertTrue(
+            permissions.allowsSpace(read(aggregate: false, collection: "app.example.records"))
+        )
+        // Reading ACROSS collections is not.
+        XCTAssertFalse(
+            permissions.allowsSpace(read(aggregate: true, collection: nil)),
+            "a collection-qualified grant must not satisfy an aggregate read"
+        )
+        // Nor is a non-aggregate read of a DIFFERENT collection.
+        XCTAssertFalse(
+            permissions.allowsSpace(read(aggregate: false, collection: "app.other.records"))
+        )
+    }
+
+    /// The positive controls, so the clause above cannot be satisfied by a
+    /// matcher that simply refuses every aggregate read.
+    func testAggregateReadAcceptsUnqualifiedAndWildcardCollectionGrants() {
+        let stated: Set<String> = ["authority", "skey", "action"]
+        // An empty collection list names no WRITE targets but constrains no
+        // read (`space-permission.ts:193-198`), so it covers an aggregate read.
+        let unqualified = "space:x.y.z?authority=\(user)&skey=self&action=read"
+        XCTAssertTrue(
+            permissions(unqualified, stated: stated)
+                .allowsSpace(read(aggregate: true, collection: nil))
+        )
+        // `collection=*` covers every collection explicitly.
+        let wildcard = "space:x.y.z?authority=\(user)&skey=self&action=read&collection=*"
+        XCTAssertTrue(
+            permissions(wildcard, stated: stated.union(["collection"]))
+                .allowsSpace(read(aggregate: true, collection: nil))
         )
     }
 

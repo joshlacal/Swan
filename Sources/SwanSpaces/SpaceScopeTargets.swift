@@ -53,6 +53,28 @@ public extension SpaceScopeTarget {
     /// (`space-permission.ts:70-74` makes `collection` non-optional in the
     /// write arm) and is a denial here: `nil` is returned so the caller throws
     /// rather than silently widening.
+    ///
+    /// **Why `aggregate` is DERIVED from `collection == nil` rather than taken
+    /// as a parameter, and why that is faithful to the rule being ported.**
+    /// §6.5.5 calls the flag "explicit", which invites a later reader to add an
+    /// `aggregate:` argument and let callers pass it. Do not — the derivation
+    /// *is* the ported rule. Today's behaviour lives in one branch,
+    /// `SwanSpaces.swift:329-341`, and that branch is selected by exactly this
+    /// condition: `guard let collection else { …aggregate rule… }`. The caller
+    /// never had a separate say. `collection` reaches here as `uri?.collection`
+    /// (`SwanSpaces.swift:261-266`), so "no record URI in hand" and "this
+    /// surface spans collections" are the same fact, and a `nil` collection is
+    /// the only way an aggregate surface can present itself.
+    ///
+    /// Taking the flag as a parameter would let a caller pass
+    /// `aggregate: false` beside a `nil` collection and silently opt out of the
+    /// hardening — a widening reachable from one mistaken argument, at a call
+    /// site that would still compile and still look correct. Deriving it makes
+    /// that state unrepresentable, the same principle `SpaceRecordAction`
+    /// applies to `.manage` above.
+    ///
+    /// Pinned by `testAggregateReadRefusesACollectionQualifiedGrant`, which
+    /// fails under the literal §5.6.2 port.
     static func record(
         _ space: SpaceURI,
         action: SpaceRecordAction,
