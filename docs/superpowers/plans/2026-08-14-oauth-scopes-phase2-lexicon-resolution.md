@@ -291,6 +291,47 @@ concrete service DID-ref, so `.any` does not splice and the entry drops —
 upstream's reachable behaviour. **Open decision:** whether §5.7.1 should lose the
 `"*"`. It is Phase-1 wire grammar.
 
+### E3 — §5.7.4's `LexiconSpace` transcription drops a field
+
+The citation is exact but the Swift block beneath it is lossy. Upstream
+`lib/lexicon.ts:23-29`:
+
+```ts
+export type LexiconSpace = {
+  readonly type: 'space'
+  readonly name: string
+  readonly 'name:lang'?: LangMap      // <- omitted by §5.7.4
+  readonly collections: readonly string[]
+  readonly description?: string
+}
+```
+
+Harmless as implemented — a synthesized `Decodable` keyed container ignores keys
+it has no case for, so a localised space document still decodes — but that is a
+property of the mechanism, not of anyone's intent, and a later "add strict
+unknown-key rejection" change would silently start refusing legitimate localised
+authorities. Now pinned by `testSpaceDocumentCarryingNameLangStillDecodes` and
+its sibling `testPermissionSetCarryingTitleLangStillDecodes`.
+
+Found by P2-E only *after* correcting a wrong-tree reading — see the tree table
+above; the same lane first concluded `LexiconSpace` had no upstream backing at
+all, from a checkout whose `lexicon.ts` is 21 lines against the pinned tree's 29.
+
+## Known flake — not a regression
+
+`SwanOAuthTests.NIOPeerPinnedOAuthPostTransportTests.testPostTransportRejectsResponseBeyondConfiguredBound`
+fails intermittently **only under full-suite load**, with `"I/O on closed channel"`
+at `NIOPeerPinnedOAuthPostTransport.swift:228`.
+
+Evidence it is a flake rather than a Phase-2 regression:
+- the file is untouched by **all six** Phase-2 commits (checked per-commit by name);
+- it passes 3/3 in isolation in **6 ms**, against **2.677 s** in the failing
+  full-suite run — the duration gap shows it took a timeout path under contention;
+- a second unfiltered full-suite run is 1810/0, exit 0.
+
+Do not "fix" it by loosening the bound assertion; the bound is the thing under
+test. If it becomes frequent, the fix is in the test's channel lifecycle.
+
 ## Accepted divergences from upstream
 
 Both are **fail-closed** — they refuse documents upstream would accept, never the
