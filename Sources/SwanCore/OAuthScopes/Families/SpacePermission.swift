@@ -391,6 +391,45 @@ extension SpacePermission {
 extension SpacePermission {
     /// space-permission.ts:134-146. No-op when the grant already names
     /// collections (including `collection=*`) or the declaration list is empty.
+    ///
+    /// **PRECONDITION FOR THE PHASE-2 CALLER (`expandSpaceCollections`,
+    /// §5.6.4/§5.7.4-§5.7.5) — READ THIS BEFORE WIRING IT.** As of this
+    /// writing the function is unwired (a repo-wide grep for
+    /// `withDefaultCollections|expandSpaceCollections` across every lane's
+    /// workspace returns exactly one non-comment hit: this declaration), so
+    /// there is no live caller and no behaviour change here — this is a
+    /// documented invariant, not a fix.
+    ///
+    /// A bare grant that never states `action` gets `SPACE_DEFAULT_ACTIONS`
+    /// (`read, create, update, delete`) from the schema default (§5.6.2), but
+    /// today that is harmless: the write arm in `matches(_:)` requires BOTH
+    /// `action.contains(verb.asAction)` AND `collectionAllows(collection)`,
+    /// and `collectionAllows` on an EMPTY `self.collection` list is `false`
+    /// unconditionally ("An EMPTY collection list allows nothing" — this
+    /// file's own comment on `collectionAllows`). So an unstated-`action`
+    /// grant is read-only IN EFFECT, purely because `collection` stays empty.
+    ///
+    /// **The moment a caller materialises collections through THIS function,
+    /// that protection disappears — not through admission, through
+    /// expansion.** The defaulted write verbs the client never typed go live
+    /// against every collection the space type declares, with no
+    /// `action=create` ever having been requested. No admission-layer rule
+    /// can catch this, because admission never sees the expanded grant —
+    /// `buildTokenScope`'s expansion happens at mint, after the admission
+    /// checks §6.3 describes have already passed.
+    ///
+    /// Two acceptable discharges for whoever wires this, not both required:
+    ///   1. Only call this when `wasStated("action")` — leave a
+    ///      defaulted-action grant's collections empty, preserving today's
+    ///      de facto read-only behaviour explicitly instead of accidentally.
+    ///   2. When `action` was NOT stated, drop the write verbs
+    ///      (`create`/`update`/`delete`) before or as part of materialising
+    ///      collections, keeping only `read`/`read_self`.
+    /// Either is sufficient; picking neither is the regression. The
+    /// provenance bit this decision needs is already durable —
+    /// `scopeParameters.wasStated("action")` survives mint → persist →
+    /// reload (§9-D23) — so the caller does not need to re-derive statedness
+    /// from a serialised string, only read it.
     public func withDefaultCollections(_ collections: [SpaceCollectionParam]) -> SpacePermission {
         guard !hasCollections, !collections.isEmpty else { return self }
         return SpacePermission(type: type, authority: authority, skey: skey,
