@@ -295,6 +295,76 @@ final class SwanLexiconResolverTests: XCTestCase {
         XCTAssertEqual(space.collections, ["com.example.foo.item", "com.example.foo.list"])
     }
 
+    func testSpaceDocumentCarryingNameLangStillDecodes() async throws {
+        // `name:lang` (`lib/lexicon.ts:26` at the pinned corpus commit
+        // `bddc99fb`) is a display-localisation map that contributes no
+        // capability. Upstream declares it, so a real space from a localised
+        // lexicon carries it, and refusing the document over it would reject a
+        // legitimate authority. Same treatment `LexiconPermissionSet` already
+        // gives `title:lang` / `detail:lang`.
+        let harness = try await Harness(
+            .valid,
+            record: PublicRecord([
+                "$type": .string("com.atproto.lexicon.schema"),
+                "lexicon": .integer(1),
+                "id": .string(PublicRepositoryProofFixtureBuilder.defaultNSID),
+                "defs": .object(["main": .object([
+                    "type": .string("space"),
+                    "name": .string("Bulleted"),
+                    "name:lang": .object([
+                        "fr": .string("Puces"),
+                        "ja": .string("ブレット"),
+                    ]),
+                    "collections": .array([.string("com.example.foo.item")]),
+                    "description": .string("A bulleted space"),
+                ])]),
+            ])
+        )
+        let resolution = try await harness.resolver.resolve(harness.fixture.nsid)
+        guard case let .resolved(.space(space), _, _) = resolution else {
+            return XCTFail("expected a space, got \(resolution)")
+        }
+        XCTAssertEqual(space.type, "space")
+        XCTAssertEqual(space.name, "Bulleted")
+        XCTAssertEqual(space.collections, ["com.example.foo.item"])
+        XCTAssertEqual(space.description, "A bulleted space")
+    }
+
+    func testPermissionSetCarryingTitleLangStillDecodes() async throws {
+        // The sibling control: the localisation maps upstream declares on a
+        // permission set (`lexicon.ts:18`, `:20`) reach the resolver on the same
+        // path and must not fail the document either.
+        let harness = try await Harness(
+            .valid,
+            record: PublicRecord([
+                "$type": .string("com.atproto.lexicon.schema"),
+                "lexicon": .integer(1),
+                "id": .string(PublicRepositoryProofFixtureBuilder.defaultNSID),
+                "defs": .object(["main": .object([
+                    "type": .string("permission-set"),
+                    "title": .string("Bulleted"),
+                    "title:lang": .object(["fr": .string("Puces")]),
+                    "detail": .string("Read and write bulleted items"),
+                    "detail:lang": .object(["fr": .string("Lire et écrire")]),
+                    "permissions": .array([
+                        .object([
+                            "type": .string("permission"),
+                            "resource": .string("repo"),
+                            "collection": .array([.string("com.example.foo.item")]),
+                        ]),
+                    ]),
+                ])]),
+            ])
+        )
+        let resolution = try await harness.resolver.resolve(harness.fixture.nsid)
+        guard case let .resolved(.permissionSet(set), _, _) = resolution else {
+            return XCTFail("expected a permission set, got \(resolution)")
+        }
+        XCTAssertEqual(set.title, "Bulleted")
+        XCTAssertEqual(set.detail, "Read and write bulleted items")
+        XCTAssertEqual(set.permissions.count, 1)
+    }
+
     func testEmptySpaceCollectionListDecodesAsEmptyAndNotAsAbsent() async throws {
         // §5.7.5: an empty declared collection list is NOT an error; the bare
         // grant passes through. Materialisation treats `[]` and "unresolvable"

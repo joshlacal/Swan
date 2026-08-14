@@ -26,28 +26,42 @@ import Foundation
 
 // MARK: - LexiconSpace
 
-/// A space declaration as it appears in lexicon JSON.
+/// A space declaration as it appears in lexicon JSON. Ported from
+/// `oauth-scopes/src/lib/lexicon.ts:23-29`, exactly as §5.7.4 cites it.
 ///
-/// **Citation note, reported rather than absorbed.** §5.7.4 cites this type as
-/// `lib/lexicon.ts:23-29`, described as "referenced once by the first draft and
-/// never defined". In the reference checkout at
-/// `atproto/packages/oauth/oauth-scopes/src/lib/lexicon.ts` that file is **21
-/// lines long**, so `:23-29` is past its end, and `LexiconSpace` appears
-/// nowhere in `packages/` at all. Positive control for that absence: the same
-/// `grep -rn` over the same tree finds `space` inside
-/// `oauth-scopes/src/scopes/include-scope.ts`, so the query works and the
-/// tree is the one being searched — `LexiconSpace` is genuinely not there.
+/// **Which tree this was read against, because reading the wrong one is how
+/// this type nearly got mis-recorded.** The corpus is pinned at
+/// `bddc99fb24c34b4078b9bf65837283f37b49ab66`
+/// (`Swan/.interop-cache/atproto-bddc99fb…`), where `lib/lexicon.ts` is 29
+/// lines and `:23-29` is this declaration. A pre-space-plane checkout of the
+/// same repo has that file at 21 lines with no `LexiconSpace` in it at all, so
+/// the citation reads as dangling and the type reads as invented. The control
+/// that tells the two trees apart is
+/// `oauth-scopes/src/scopes/space-permission.ts`: it exists only in the pinned
+/// tree. Grepping for the word `space` does **not** discriminate — it hits
+/// `include-scope.ts` in both.
 ///
-/// The shape below is therefore **spec-authored, not ported**: it is exactly the
-/// Swift §5.7.4 writes out, and it carries no upstream vector behind it. The
-/// `space:` scope family is Swan/proposal-0016 work that the checked-out
-/// upstream does not implement, which is consistent with the absence.
+/// The `space:` scope family therefore has upstream backing, and so does its
+/// consumer: `expandSpaceCollections` is a real implementation at
+/// `oauth-provider/src/lexicon/lexicon-manager.ts:74-95`, which materialises
+/// `space.collections` into any bare `space:<type>` grant.
 public struct LexiconSpace: Sendable, Equatable, Decodable {
     /// Must decode to exactly `"space"`. Retained rather than asserted here for
     /// the same reason `LexiconPermissionSet.type` is: the resolver classifies
-    /// a document by this discriminator, so the value has to survive decoding
-    /// in order to be classified.
+    /// a document by this discriminator (`lexicon-manager.ts:153`,
+    /// `lexicon.defs.main?.type !== 'space'`), so the value has to survive
+    /// decoding in order to be classified.
     public let type: String
+    /// `name:lang` (`lexicon.ts:26`) is **accepted and ignored**, matching the
+    /// treatment `LexiconPermissionSet` already gives its siblings `title:lang`
+    /// and `detail:lang`: a display-localisation map contributes no capability.
+    ///
+    /// It is ignored by mechanism rather than by intention-in-a-comment — a
+    /// synthesized `Decodable` keyed container simply does not look at keys it
+    /// has no case for. That is load-bearing rather than incidental: a real
+    /// space from a localised lexicon carries `name:lang`, and rejecting the
+    /// document over it would refuse a legitimate authority. Pinned by
+    /// `testSpaceDocumentCarryingNameLangStillDecodes`.
     public let name: String
     /// May legitimately be empty. §5.7.5: "A space declaring an empty
     /// collection list is not an error; the bare grant passes through."
