@@ -11127,7 +11127,12 @@ public actor DurableSpaceRepository {
             let expectedRecord = expectedRecords[uri]
             switch write {
             case let .put(uri, value):
-                let permission: SpacePermission = expectedRecord == nil ? .create : .update
+                // Qualified: SwanCore's OAuth-grammar `SpacePermission` (§5.6.2)
+                // and SwanSpaces' domain `SpacePermission` (`SwanSpaces.swift:175-182`)
+                // share a name, and this module imports both (§9-D2 ruling:
+                // qualify at use, do not rename the domain type). This is the
+                // DOMAIN permission — a record verb, not an OAuth `action=` value.
+                let permission: SwanSpaces.SpacePermission = expectedRecord == nil ? .create : .update
                 try requireWrite(
                     uri: uri,
                     authorization: authorization,
@@ -11637,7 +11642,9 @@ public actor DurableSpaceRepository {
     private func requireWrite(
         uri: SpaceRecordURI,
         authorization: AuthorizationContext,
-        permission: SpacePermission
+        // Qualified for the same reason as the call site above (§9-D2): this is
+        // the SwanSpaces DOMAIN permission, not SwanCore's OAuth grammar type.
+        permission: SwanSpaces.SpacePermission
     ) throws {
         if case .service = authorization {
             throw SwanError.unauthorized(
