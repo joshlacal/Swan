@@ -667,8 +667,29 @@ final class SwanSpacesTests: XCTestCase {
             )
         )
 
+        // A spoofed scope must not authorize a write. The VECTOR changed with
+        // the grammar port; the assertion did not.
+        //
+        // This used to duplicate `action=create&action=create`. The retired
+        // grammar rejected duplicate keys wholesale (`SwanCore.swift:224`), so
+        // that string was unparseable and the write was denied. Under the new
+        // grammar `action` has arity `.multiple` — repeats are its wire
+        // encoding for a list — so `["create","create"]` normalizes to
+        // `["create"]` and the grant becomes identical in effect to the
+        // `scopedCreate` scope below, which this same test expects to SUCCEED.
+        // It stopped being a rejection, and a test that can only fail because
+        // of a retired parser artifact is not testing anything real (§5.6.3's
+        // comment block names this exact string; §7.3 row W4 replaces the
+        // grammar-artifact denial with a semantic one).
+        //
+        // Duplicating a SINGLE-arity key is still a hard rejection, and it is
+        // the one that matters: `authority` selects WHICH space's records the
+        // grant reaches, so a parser that accepted two of them — or picked
+        // either — would be a real privilege confusion.
+        // `ScopeParameterSchema.swift:155-157` throws
+        // `.repeatedSingleValuedParameter` here, citing `parser.ts:121-122`.
         let spoofedScope = """
-        space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=create&action=create&collection=\(fixture.first.collection)
+        space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&authority=did:plc:other&skey=\(fixture.space.skey)&action=create&collection=\(fixture.first.collection)
         """
         await XCTAssertThrowsErrorAsync(
             try await durable.apply(

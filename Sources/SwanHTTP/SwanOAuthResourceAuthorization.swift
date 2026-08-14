@@ -149,16 +149,22 @@ public struct SwanOAuthResourceAuthorizer: Sendable {
         // perform no further scope check at all, so widening this floor would
         // hand an `identity:`- or `blob:`-only token an unguarded route.
         //
-        // INTEGRATION SEAM (§9-D23): `statedKeys` is DURABLE provenance and
-        // must arrive on `AccessGrant` from the token family's stored record.
-        // It is NOT derivable here — re-parsing `grant.scopes` would invent
-        // provenance for a mint-resolved `self` and destroy it for a canonical
-        // `skey=*`. Until the durable field lands, this passes nothing, which
-        // is fail-closed: both provenance fences refuse, so `getDelegationToken`
-        // and `listSpaces` deny rather than widen.
+        // `statedKeys` is DURABLE provenance (§9-D23), read from the token
+        // family's stored record via `AccessGrant.scopeProvenance`. It must
+        // NEVER be derived here: re-parsing `grant.scopes` would INVENT
+        // provenance for a mint-resolved `self` (flipping the delegation fence
+        // open) and DESTROY it for a canonical `skey=*` (silently disabling the
+        // listing fence). The two failures run in opposite directions, which is
+        // why no parser change can substitute for the stored bits.
+        //
+        // `statedScopeKeys` is non-optional and keyed by the effective scope
+        // string, i.e. the members of `grant.scopes`. A family with no
+        // persisted record yields `[:]`, which is the fail-closed case: absent
+        // bits deny, they never grant.
         let permissions = SwanScopePermissions(
             rawScopes: grant.scopes,
-            subject: grant.subject
+            subject: grant.subject,
+            statedKeys: grant.statedScopeKeys
         )
         guard permissions.hasResourceScope else {
             throw SwanResourceAuthorizationFailure.denied
