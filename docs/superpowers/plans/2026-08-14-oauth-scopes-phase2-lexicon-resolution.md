@@ -171,7 +171,19 @@ A bytes-returning sibling to `fetchJSON` through the same policy object, with an
 explicit 256 KiB cap at this call site treated as an **anti-DoS control on
 MST-walk and signature work**, not as a document-size preference.
 
-### P2-E — resolver orchestrator + cache · SwanOAuth + SwanSQLite
+### P2-E — resolver orchestrator + cache · **SwanInterop** (corrected)
+
+> **Module correction.** This lane originally said "SwanOAuth + SwanSQLite".
+> That was impossible: `Package.swift` has **SwanInterop → SwanOAuth**, not the
+> reverse, and `PermissionedDataPublicRepositoryCommitVerifier` — named by the
+> fixed `SwanLexiconAuthority` interface — is defined in
+> `SwanInterop/PublicRepositoryCARReplication.swift:282`. P2-E in SwanOAuth
+> could never have consumed P2-C. SwanInterop already depends on SwanOAuth,
+> SwanSQLite, SwanPublicRepository and SwanCore, so P2-E moves there with **zero
+> `Package.swift` change**. Found by P2-C, not by me — and it is the second time
+> this plan-level mistake has been made (Phase 1 put `SwanScopePermissions` in
+> SwanOAuth and hit the same cycle). Check `Package.swift` before assigning a
+> module, not the module's apparent subject matter.
 
 All 15 steps including all 6 proofs. DNS TXT `_lexicon.<authority>` reusing
 `ATHandleDNSResolving.txtRecords(name:)` (new call site, **not** new DNS
@@ -228,6 +240,22 @@ Plus: negative caching performs **no** network I/O and no MST walk on the second
 attempt within 5 minutes; and a `did:web` authority resolves.
 
 ---
+
+## Accepted divergences from upstream
+
+Both are **fail-closed** — they refuse documents upstream would accept, never the
+reverse — and both are documented in-code with a pinning test. Recorded here so
+they are visible rather than buried in a lane report.
+
+| divergence | upstream | Swan | why accepted |
+|---|---|---|---|
+| **Multikey-only verification methods** | also accepts `EcdsaSecp256r1VerificationKey2019` / `EcdsaSecp256k1VerificationKey2019`, whose `publicKeyMultibase` carries *raw* key bytes with no multicodec prefix and takes its curve from `type` | Multikey only | supporting the legacy forms needs a bare base58 decoder plus a second raw-point grammar, and `Base58BTC` is deliberately `private` to `SwanAccounts/PLCOperation.swift` so curve/point-encoding proof stays in one place. Every atproto producer in reach emits Multikey. Pinned by `testWebAuthorityWithLegacyVerificationMethodTypeIsRejected` |
+| **Exactly-one `#atproto` / `#atproto_pds`** | `Array.find` (first match wins) | refuses a document declaring either twice; also requires https, non-empty host, no embedded credentials on the PDS endpoint, where upstream requires only `URL.canParse` | matches `SwanServiceEndpointResolver`'s existing rule for services |
+
+**Open, not blocking:** full legacy-verification-method parity is available by
+making `Base58BTC` public. It is an interop-availability question (a legitimate
+authority publishing a legacy key type would fail to resolve → `invalid_scope`),
+not a security one. Decide before Phase 2 closes.
 
 ## Completion gate
 
