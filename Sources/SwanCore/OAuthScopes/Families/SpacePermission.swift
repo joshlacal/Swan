@@ -392,46 +392,41 @@ extension SpacePermission {
     /// space-permission.ts:134-146. No-op when the grant already names
     /// collections (including `collection=*`) or the declaration list is empty.
     ///
-    /// **THE PHASE-2 EXPANSION HAZARD (`expandSpaceCollections`,
-    /// §5.6.4/§5.7.4-§5.7.5) IS CLOSED BY CONSTRUCTION HERE — do not also
-    /// apply the OTHER discharge on top of this one; see below.** As of this
-    /// writing the function has exactly one live caller in the whole repo
-    /// grep-wise (its own declaration is the only non-comment hit, so nothing
-    /// currently exercises this path in production), but the guard is
-    /// unconditional rather than gated on that, because the hazard is real
-    /// the moment Phase 2 wires it and this is the cheap place to close it.
+    /// **`action` is passed through UNCHANGED, matching upstream — and a
+    /// write-verb guard here was tried and deliberately REVERTED.** Read this
+    /// before adding one back, because the reasoning that motivates it is
+    /// correct right up to the point where it isn't.
     ///
-    /// A bare grant that never states `action` gets `SPACE_DEFAULT_ACTIONS`
-    /// (`read, create, update, delete`) from the schema default (§5.6.2), but
-    /// today that is harmless: the write arm in `matches(_:)` requires BOTH
-    /// `action.contains(verb.asAction)` AND `collectionAllows(collection)`,
-    /// and `collectionAllows` on an EMPTY `self.collection` list is `false`
-    /// unconditionally ("An EMPTY collection list allows nothing" — this
-    /// file's own comment on `collectionAllows`). So an unstated-`action`
-    /// grant is read-only IN EFFECT, purely because `collection` stays empty.
-    /// Materialising `collections` here — the one place that changes that —
-    /// would otherwise arm the client-never-typed write verbs against every
-    /// collection the space type declares, and no admission-layer rule could
-    /// catch it, because admission never sees the expanded grant
-    /// (`buildTokenScope`'s expansion happens at mint, after §6.3's admission
-    /// checks have already passed).
+    /// The tempting guard: a bare grant that never states `action` gets
+    /// `SPACE_DEFAULT_ACTIONS` (`read, create, update, delete`) from the schema
+    /// default (§5.6.2). Today that is inert, because the write arm of
+    /// `matches(_:)` requires BOTH `action.contains(verb.asAction)` AND
+    /// `collectionAllows(collection)`, and an empty `collection` list allows
+    /// nothing. This function is the one place that changes that — so
+    /// materialising collections is exactly what arms write verbs the client
+    /// never typed. That reads like a privilege escalation, and a guard
+    /// dropping the write verbs when `action` was unstated was written on that
+    /// basis.
     ///
-    /// **Discharge taken: (2), not (1).** When `action` was NOT stated, the
-    /// write verbs (`create`/`update`/`delete`) are dropped from the
-    /// materialised permission, keeping only the read verbs — rather than
-    /// discharge (1) (refusing to materialise collections at all on a
-    /// defaulted-action grant). Do not layer (1) on top: a caller that also
-    /// short-circuits on `!wasStated("action")` before calling this would
-    /// silently stop expanding collections for those grants at all, which is
-    /// a bigger behaviour change than this function is meant to make on its
-    /// own and is not what was asked for here.
+    /// **Why it was wrong.** A schema default applies precisely when the client
+    /// did not state the parameter. Such a guard strips write verbs precisely
+    /// when the client did not state the parameter. Those are the same
+    /// condition, so the `create`/`update`/`delete` half of
+    /// `SPACE_DEFAULT_ACTIONS` becomes unreachable for every grant that ever
+    /// existed — not narrowed in an edge case, but dead. Upstream's own
+    /// `withDefaultCollections` (`space-permission.ts:134-146`) passes
+    /// `this.action` through as the 5th constructor argument, and `:211` wires
+    /// `SPACE_DEFAULT_ACTIONS` as the schema default for `action`, so a bare
+    /// `space:<type>` grant IS writable after expansion upstream. That is the
+    /// meaning of the scope, not an oversight in it.
     ///
-    /// The statedness check reads `self.scopeParameters.wasStated("action")`
-    /// — `self`'s OWN durable provenance, carried on the value from whichever
-    /// process constructed it (the original parse, or a reload of a
-    /// persisted grant). This is a read, not a re-derivation: it does not
-    /// re-parse any serialised string, which is the distinction §9-D23 exists
-    /// to enforce.
+    /// Swan applying the guard unilaterally would issue a token strictly weaker
+    /// than the identical scope string yields on any conformant AS, silently —
+    /// and §5.7.5(b) names *minting a grant narrower than the user consented
+    /// to* as the outcome to avoid, which is the very thing the guard produced.
+    /// The legitimate answer to "the user may not realise this grants writes"
+    /// is the consent renderer (§9-D19) saying so, not a token that quietly
+    /// disagrees with the screen that authorised it.
     ///
     /// **The RETURN must not re-invent provenance either.** An earlier
     /// version of this function built its result through the public
@@ -442,32 +437,23 @@ extension SpacePermission {
     /// failure re-entering through a rebuild instead of a re-parse. This
     /// version threads the existing `parameters` through the private,
     /// explicit-`scopeParameters` initializer instead (the same pattern
-    /// `withResolvedAuthority` uses just below), updating only the two keys
-    /// that actually change:
-    ///   - `collection`'s new value is necessarily `.defaulted` — an empty
-    ///     multi-valued list (the precondition for even reaching this
-    ///     function, via `!hasCollections`) can only arise from an absent
-    ///     key, never a stated-but-empty one (a stated multi-value key that
-    ///     resolves to zero entries is `.emptyMultiValuedParameter` at parse
-    ///     time), so there is no other provenance it could have carried;
-    ///   - `action`'s VALUE may narrow (write verbs dropped when unstated,
-    ///     above), but its PROVENANCE is carried forward unchanged — same
-    ///     rule as `withResolvedAuthority`.
-    /// Every other key (`type`, `authority`, `skey`, `manage`) is untouched
-    /// in both value and provenance.
+    /// `withResolvedAuthority` uses just below), updating only the one key
+    /// that actually changes: `collection`'s new value is necessarily
+    /// `.defaulted` — an empty multi-valued list (the precondition for even
+    /// reaching this function, via `!hasCollections`) can only arise from an
+    /// absent key, never a stated-but-empty one (a stated multi-value key that
+    /// resolves to zero entries is `.emptyMultiValuedParameter` at parse
+    /// time), so there is no other provenance it could have carried.
+    /// Every other key (`type`, `authority`, `skey`, `action`, `manage`) is
+    /// untouched in both value and provenance.
     public func withDefaultCollections(_ collections: [SpaceCollectionParam]) -> SpacePermission {
         guard !hasCollections, !collections.isEmpty else { return self }
-        let effectiveAction = scopeParameters.wasStated("action")
-            ? action
-            : action.filter { $0 == .read || $0 == .readSelf }
         var updatedParameters = parameters
         let collectionProvenance = parameters.provenance(for: "collection") ?? .defaulted
         updatedParameters.set("collection", collections.map(\.stringValue), collectionProvenance)
-        let actionProvenance = parameters.provenance(for: "action") ?? .defaulted
-        updatedParameters.set("action", effectiveAction.map(\.rawValue), actionProvenance)
         return SpacePermission(
             type: type, authority: authority, skey: skey,
-            collection: collections, action: effectiveAction, manage: manage,
+            collection: collections, action: action, manage: manage,
             scopeParameters: updatedParameters
         )
     }

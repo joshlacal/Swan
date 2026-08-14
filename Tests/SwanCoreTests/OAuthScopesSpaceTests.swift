@@ -313,38 +313,51 @@ struct OAuthScopesSpaceTests {
     }
 
     @Test
-    func withDefaultCollectionsDropsDefaultedWriteVerbsButKeepsThemWhenStated() throws {
-        // The Phase-2 expansion hazard, closed by construction: an
-        // unstated-`action` grant defaults to the full read/create/update/
-        // delete list purely from the schema default (§5.6.2), never because
-        // the client typed a write verb. Materialising collections onto that
-        // grant must not arm those defaulted write verbs against every
-        // collection the space type declares.
+    func withDefaultCollectionsPassesActionThroughUnchanged() throws {
+        // Upstream parity, and the pin against re-adding a write-verb guard
+        // here. `space-permission.ts:134-146` passes `this.action` through as
+        // the 5th constructor argument; `:211` wires SPACE_DEFAULT_ACTIONS as
+        // the schema default for `action`. So a bare `space:<type>` grant is
+        // WRITABLE after expansion — that is what the scope means, not an
+        // oversight in it.
+        //
+        // A guard dropping the write verbs when `action` was unstated was
+        // written here and reverted: a schema default applies exactly when the
+        // client did not state the parameter, so such a guard makes the
+        // create/update/delete half of SPACE_DEFAULT_ACTIONS unreachable for
+        // every grant that could ever exist. See `withDefaultCollections`'s
+        // doc comment.
         let unstatedAction = try SpacePermission.parse("space:com.atmoboards.forum?authority=*")
         #expect(!unstatedAction.scopeParameters.wasStated("action"))
         #expect(unstatedAction.action == [.read, .create, .update, .delete]) // the default, pre-expansion
 
         let expanded = unstatedAction.withDefaultCollections([.nsid("com.atmoboards.thread")])
         #expect(expanded.collection == [.nsid("com.atmoboards.thread")])
-        #expect(expanded.action == [.read]) // write verbs dropped; read verbs kept
-        #expect(!expanded.matches(target(operation: .write(.create, collection: "com.atmoboards.thread"))))
-        #expect(!expanded.matches(target(operation: .write(.update, collection: "com.atmoboards.thread"))))
-        #expect(!expanded.matches(target(operation: .write(.delete, collection: "com.atmoboards.thread"))))
-        // Reads still work — the point is narrowing the write surface, not
-        // silently revoking the grant altogether.
+        #expect(expanded.action == [.read, .create, .update, .delete]) // untouched
+        // Expansion is what arms the write verbs, by supplying the targets the
+        // empty `collection` list previously denied them. Asserted through
+        // `.matches` rather than the action array, because the array alone
+        // would also pass if `collectionAllows` were broken.
+        #expect(expanded.matches(target(operation: .write(.create, collection: "com.atmoboards.thread"))))
+        #expect(expanded.matches(target(operation: .write(.update, collection: "com.atmoboards.thread"))))
+        #expect(expanded.matches(target(operation: .write(.delete, collection: "com.atmoboards.thread"))))
         #expect(expanded.matches(target(authority: "did:plc:anyone", operation: Self.plainRead)))
 
-        // Positive control: a STATED write action must survive expansion
-        // unchanged — this guard narrows only what the client never asked
-        // for, not an ordinary, explicitly-requested write grant.
+        // Negative control: expansion widens only to the collections it was
+        // given. A collection the space never declared stays refused, so the
+        // assertions above are about THESE targets, not about `matches`
+        // having become permissive.
+        #expect(!expanded.matches(target(operation: .write(.create, collection: "com.atmoboards.undeclared"))))
+
+        // A STATED action is likewise passed through verbatim — expansion
+        // never widens the verb set beyond what the grant already carried.
         let statedAction = try SpacePermission.parse("space:com.atmoboards.forum?authority=*&action=create")
         #expect(statedAction.scopeParameters.wasStated("action"))
         let statedExpanded = statedAction.withDefaultCollections([.nsid("com.atmoboards.thread")])
         #expect(statedExpanded.action == [.create])
         #expect(statedExpanded.matches(target(operation: .write(.create, collection: "com.atmoboards.thread"))))
+        #expect(!statedExpanded.matches(target(operation: .write(.delete, collection: "com.atmoboards.thread"))))
 
-        // A stated `read_self` (also not a write verb) survives untouched
-        // too, since the filter only ever removes create/update/delete.
         let statedReadSelf = try SpacePermission.parse("space:com.atmoboards.forum?authority=*&action=read_self")
         let readSelfExpanded = statedReadSelf.withDefaultCollections([.nsid("com.atmoboards.thread")])
         #expect(readSelfExpanded.action == [.readSelf])

@@ -119,41 +119,55 @@ final class SpaceWriteTargetInvariantTests: XCTestCase {
         XCTAssertTrue(grant.matches(target(.write(.create, collection: "anything.at.all"))))
     }
 
-    // MARK: the guard — expansion cannot activate writes the client never stated
+    // MARK: expansion supplies the TARGETS the empty collection list denied
 
-    func testExpandingCollectionsDoesNotActivateDefaultedWrites() throws {
-        // The guard for the hazard this file was originally written to name.
-        // `withDefaultCollections` is §5.6.4's `expandSpaceCollections`. Before
-        // the guard, materialising collections on a grant whose write verbs came
-        // only from the schema default produced a permission authorizing writes
-        // nobody asked for — and admission cannot catch it, because expansion
-        // happens at mint, after admission has already passed.
+    func testExpandingCollectionsActivatesTheDefaultedWrites() throws {
+        // The resolution of the hazard this file was originally written to
+        // name — and it is the opposite of what this file first asserted.
+        //
+        // `withDefaultCollections` is §5.6.4's `expandSpaceCollections`. The
+        // rest of this file establishes that a bare grant authorizes no write
+        // TARGET, because `collection` defaults to `[]`. That is a statement
+        // about targets, not about verbs: the defaulted write verbs were
+        // always present and always inert. Expansion supplies the targets, and
+        // the verbs become live — which is the entire point of the step.
+        //
+        // A guard dropping those verbs when `action` was unstated was written
+        // here and reverted. A schema default applies exactly when the client
+        // did not state the parameter, so the guard made the
+        // create/update/delete half of SPACE_DEFAULT_ACTIONS unreachable for
+        // every grant that could exist. Upstream
+        // (`space-permission.ts:134-146`) passes `action` through unchanged.
         //
         // Asserted through `.matches`, not by reading `expanded.action`: the
-        // action array is an implementation detail of how the guard is
-        // discharged, and the property that matters is what the grant
-        // AUTHORIZES. A test against the array would also pass if the verbs were
-        // dropped but the collection gate stopped working.
+        // property that matters is what the grant AUTHORIZES.
         let grant = try SpacePermission.parse("space:\(spaceType)?authority=\(authority)&skey=k")
         XCTAssertFalse(grant.scopeParameters.wasStated("action"))
+        // The premise: inert BEFORE expansion, purely for want of a target.
+        for verb in [SpaceScopeTarget.Operation.RecordWrite.create, .update, .delete] {
+            XCTAssertFalse(grant.matches(target(.write(verb, collection: collection))))
+        }
 
         let expanded = grant.withDefaultCollections([.nsid(collection)])
         for verb in [SpaceScopeTarget.Operation.RecordWrite.create, .update, .delete] {
-            XCTAssertFalse(
+            XCTAssertTrue(
                 expanded.matches(target(.write(verb, collection: collection))),
                 """
-                Expansion must not turn a read-shaped grant into a write-capable \
-                one from schema defaults alone. The client never wrote `action=`, \
-                so the defaulted write verbs are not a grant.
+                Expansion must materialise the space's declared collections as \
+                write targets for the defaulted verbs. A token that cannot write \
+                after expansion is narrower than the user consented to — §5.7.5(b).
                 """
             )
         }
+        // Bounded: only the declared collection, not everything.
+        XCTAssertFalse(expanded.matches(target(.write(.create, collection: "com.other.undeclared"))))
     }
 
     func testExpansionStillProducesAUsableReadGrant() throws {
-        // Discharge (2) is "drop the write verbs", not "refuse to expand". If
-        // this fails, expansion has been neutered rather than guarded, and every
-        // assertion in the test above would pass vacuously.
+        // Expansion must materialise, not neuter. If this fails, expansion has
+        // stopped producing a usable grant at all, and the write assertions in
+        // the test above would be failing for that reason rather than for the
+        // reason they name.
         let grant = try SpacePermission.parse("space:\(spaceType)?authority=\(authority)&skey=k")
         let expanded = grant.withDefaultCollections([.nsid(collection)])
         XCTAssertTrue(expanded.matches(target(.read(aggregate: false, collection: collection))))
@@ -161,9 +175,10 @@ final class SpaceWriteTargetInvariantTests: XCTestCase {
     }
 
     func testExpansionPreservesAStatedWriteAction() throws {
-        // The positive control the guard needs: a write the client DID state
-        // survives expansion untouched. Without this, the guard could be
-        // "drop every write verb always" and the test above would not notice.
+        // A write the client DID state survives expansion untouched — the
+        // narrowing counterpart to the test above, which covers the defaulted
+        // case. Together they pin that `action` is passed through verbatim
+        // regardless of provenance.
         //
         // Note this shape cannot reach expansion through Swan's own admission —
         // a stated write action with no collection is refused at PAR
@@ -178,7 +193,7 @@ final class SpaceWriteTargetInvariantTests: XCTestCase {
         let expanded = grant.withDefaultCollections([.nsid(collection)])
         XCTAssertTrue(
             expanded.matches(target(.write(.create, collection: collection))),
-            "a STATED write action must survive expansion — the guard keys on statedness, not on the verb"
+            "a stated write action must survive expansion — `action` is passed through unchanged"
         )
     }
 
