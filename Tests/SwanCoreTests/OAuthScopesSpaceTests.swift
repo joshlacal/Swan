@@ -313,6 +313,81 @@ struct OAuthScopesSpaceTests {
     }
 
     @Test
+    func withDefaultCollectionsDropsDefaultedWriteVerbsButKeepsThemWhenStated() throws {
+        // The Phase-2 expansion hazard, closed by construction: an
+        // unstated-`action` grant defaults to the full read/create/update/
+        // delete list purely from the schema default (§5.6.2), never because
+        // the client typed a write verb. Materialising collections onto that
+        // grant must not arm those defaulted write verbs against every
+        // collection the space type declares.
+        let unstatedAction = try SpacePermission.parse("space:com.atmoboards.forum?authority=*")
+        #expect(!unstatedAction.scopeParameters.wasStated("action"))
+        #expect(unstatedAction.action == [.read, .create, .update, .delete]) // the default, pre-expansion
+
+        let expanded = unstatedAction.withDefaultCollections([.nsid("com.atmoboards.thread")])
+        #expect(expanded.collection == [.nsid("com.atmoboards.thread")])
+        #expect(expanded.action == [.read]) // write verbs dropped; read verbs kept
+        #expect(!expanded.matches(target(operation: .write(.create, collection: "com.atmoboards.thread"))))
+        #expect(!expanded.matches(target(operation: .write(.update, collection: "com.atmoboards.thread"))))
+        #expect(!expanded.matches(target(operation: .write(.delete, collection: "com.atmoboards.thread"))))
+        // Reads still work — the point is narrowing the write surface, not
+        // silently revoking the grant altogether.
+        #expect(expanded.matches(target(authority: "did:plc:anyone", operation: Self.plainRead)))
+
+        // Positive control: a STATED write action must survive expansion
+        // unchanged — this guard narrows only what the client never asked
+        // for, not an ordinary, explicitly-requested write grant.
+        let statedAction = try SpacePermission.parse("space:com.atmoboards.forum?authority=*&action=create")
+        #expect(statedAction.scopeParameters.wasStated("action"))
+        let statedExpanded = statedAction.withDefaultCollections([.nsid("com.atmoboards.thread")])
+        #expect(statedExpanded.action == [.create])
+        #expect(statedExpanded.matches(target(operation: .write(.create, collection: "com.atmoboards.thread"))))
+
+        // A stated `read_self` (also not a write verb) survives untouched
+        // too, since the filter only ever removes create/update/delete.
+        let statedReadSelf = try SpacePermission.parse("space:com.atmoboards.forum?authority=*&action=read_self")
+        let readSelfExpanded = statedReadSelf.withDefaultCollections([.nsid("com.atmoboards.thread")])
+        #expect(readSelfExpanded.action == [.readSelf])
+    }
+
+    @Test
+    func withDefaultCollectionsDoesNotInventProvenanceOnUntouchedFields() throws {
+        // The second §9-D23 regression this function had to avoid: an
+        // earlier version rebuilt its result through the public memberwise
+        // initializer, which marks every field `.stated` unconditionally —
+        // so `authority` would come out of expansion looking client-stated
+        // even though it was never written. Assert the durable bit directly
+        // rather than reasoning about it.
+        let neverStatedAuthority = try SpacePermission.parse("space:com.atmoboards.forum?skey=*&action=read")
+        #expect(!neverStatedAuthority.scopeParameters.wasStated("authority"))
+        #expect(!neverStatedAuthority.scopeParameters.wasStated("manage"))
+        #expect(neverStatedAuthority.scopeParameters.wasStated("skey"))
+        #expect(neverStatedAuthority.scopeParameters.wasStated("action"))
+
+        let expanded = neverStatedAuthority.withDefaultCollections([.nsid("com.atmoboards.thread")])
+        // Untouched fields keep BOTH their value and their original
+        // provenance — this is the assertion the earlier, buggy version
+        // would have failed.
+        #expect(!expanded.scopeParameters.wasStated("authority"))
+        #expect(!expanded.scopeParameters.wasStated("manage"))
+        #expect(expanded.scopeParameters.wasStated("skey"))
+        #expect(expanded.scopeParameters.wasStated("action")) // value narrowed elsewhere; provenance carried forward
+        #expect(expanded.authority == .unresolvedSelf) // value also unchanged
+        // The materialised `collection` itself is `.defaulted`, never
+        // `.stated` — the client didn't write it, Phase 2 did.
+        #expect(!expanded.scopeParameters.wasStated("collection"))
+
+        // Confirm, rather than reason about, the structural fact any
+        // delegation-fence implementation depends on: an expanded grant's
+        // `collection` is non-empty regardless of provenance, so clause 2 of
+        // such a fence (which this file no longer implements itself — it
+        // lives at the resource-plane facade, §9-D23) fails on VALUE alone.
+        // Preserving provenance correctly cannot be what flips that clause;
+        // the value itself already blocks it.
+        #expect(!expanded.collection.isEmpty)
+    }
+
+    @Test
     func spaceWithResolvedAuthorityIsIdempotentAndPreservesConcreteAuthority() throws {
         let selfGrant = try SpacePermission.parse("space:com.atmoboards.forum")
         let resolved = selfGrant.withResolvedAuthority("did:plc:abc123xyz")

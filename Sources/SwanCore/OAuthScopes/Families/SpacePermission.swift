@@ -392,13 +392,14 @@ extension SpacePermission {
     /// space-permission.ts:134-146. No-op when the grant already names
     /// collections (including `collection=*`) or the declaration list is empty.
     ///
-    /// **PRECONDITION FOR THE PHASE-2 CALLER (`expandSpaceCollections`,
-    /// §5.6.4/§5.7.4-§5.7.5) — READ THIS BEFORE WIRING IT.** As of this
-    /// writing the function is unwired (a repo-wide grep for
-    /// `withDefaultCollections|expandSpaceCollections` across every lane's
-    /// workspace returns exactly one non-comment hit: this declaration), so
-    /// there is no live caller and no behaviour change here — this is a
-    /// documented invariant, not a fix.
+    /// **THE PHASE-2 EXPANSION HAZARD (`expandSpaceCollections`,
+    /// §5.6.4/§5.7.4-§5.7.5) IS CLOSED BY CONSTRUCTION HERE — do not also
+    /// apply the OTHER discharge on top of this one; see below.** As of this
+    /// writing the function has exactly one live caller in the whole repo
+    /// grep-wise (its own declaration is the only non-comment hit, so nothing
+    /// currently exercises this path in production), but the guard is
+    /// unconditional rather than gated on that, because the hazard is real
+    /// the moment Phase 2 wires it and this is the cheap place to close it.
     ///
     /// A bare grant that never states `action` gets `SPACE_DEFAULT_ACTIONS`
     /// (`read, create, update, delete`) from the schema default (§5.6.2), but
@@ -408,32 +409,67 @@ extension SpacePermission {
     /// unconditionally ("An EMPTY collection list allows nothing" — this
     /// file's own comment on `collectionAllows`). So an unstated-`action`
     /// grant is read-only IN EFFECT, purely because `collection` stays empty.
+    /// Materialising `collections` here — the one place that changes that —
+    /// would otherwise arm the client-never-typed write verbs against every
+    /// collection the space type declares, and no admission-layer rule could
+    /// catch it, because admission never sees the expanded grant
+    /// (`buildTokenScope`'s expansion happens at mint, after §6.3's admission
+    /// checks have already passed).
     ///
-    /// **The moment a caller materialises collections through THIS function,
-    /// that protection disappears — not through admission, through
-    /// expansion.** The defaulted write verbs the client never typed go live
-    /// against every collection the space type declares, with no
-    /// `action=create` ever having been requested. No admission-layer rule
-    /// can catch this, because admission never sees the expanded grant —
-    /// `buildTokenScope`'s expansion happens at mint, after the admission
-    /// checks §6.3 describes have already passed.
+    /// **Discharge taken: (2), not (1).** When `action` was NOT stated, the
+    /// write verbs (`create`/`update`/`delete`) are dropped from the
+    /// materialised permission, keeping only the read verbs — rather than
+    /// discharge (1) (refusing to materialise collections at all on a
+    /// defaulted-action grant). Do not layer (1) on top: a caller that also
+    /// short-circuits on `!wasStated("action")` before calling this would
+    /// silently stop expanding collections for those grants at all, which is
+    /// a bigger behaviour change than this function is meant to make on its
+    /// own and is not what was asked for here.
     ///
-    /// Two acceptable discharges for whoever wires this, not both required:
-    ///   1. Only call this when `wasStated("action")` — leave a
-    ///      defaulted-action grant's collections empty, preserving today's
-    ///      de facto read-only behaviour explicitly instead of accidentally.
-    ///   2. When `action` was NOT stated, drop the write verbs
-    ///      (`create`/`update`/`delete`) before or as part of materialising
-    ///      collections, keeping only `read`/`read_self`.
-    /// Either is sufficient; picking neither is the regression. The
-    /// provenance bit this decision needs is already durable —
-    /// `scopeParameters.wasStated("action")` survives mint → persist →
-    /// reload (§9-D23) — so the caller does not need to re-derive statedness
-    /// from a serialised string, only read it.
+    /// The statedness check reads `self.scopeParameters.wasStated("action")`
+    /// — `self`'s OWN durable provenance, carried on the value from whichever
+    /// process constructed it (the original parse, or a reload of a
+    /// persisted grant). This is a read, not a re-derivation: it does not
+    /// re-parse any serialised string, which is the distinction §9-D23 exists
+    /// to enforce.
+    ///
+    /// **The RETURN must not re-invent provenance either.** An earlier
+    /// version of this function built its result through the public
+    /// memberwise initializer, which marks every field `.stated`
+    /// unconditionally (`buildParameters`) — so `authority` (and every other
+    /// untouched field) would come out of expansion looking client-stated
+    /// even when it never was. That is the exact §9-D23 "provenance invented"
+    /// failure re-entering through a rebuild instead of a re-parse. This
+    /// version threads the existing `parameters` through the private,
+    /// explicit-`scopeParameters` initializer instead (the same pattern
+    /// `withResolvedAuthority` uses just below), updating only the two keys
+    /// that actually change:
+    ///   - `collection`'s new value is necessarily `.defaulted` — an empty
+    ///     multi-valued list (the precondition for even reaching this
+    ///     function, via `!hasCollections`) can only arise from an absent
+    ///     key, never a stated-but-empty one (a stated multi-value key that
+    ///     resolves to zero entries is `.emptyMultiValuedParameter` at parse
+    ///     time), so there is no other provenance it could have carried;
+    ///   - `action`'s VALUE may narrow (write verbs dropped when unstated,
+    ///     above), but its PROVENANCE is carried forward unchanged — same
+    ///     rule as `withResolvedAuthority`.
+    /// Every other key (`type`, `authority`, `skey`, `manage`) is untouched
+    /// in both value and provenance.
     public func withDefaultCollections(_ collections: [SpaceCollectionParam]) -> SpacePermission {
         guard !hasCollections, !collections.isEmpty else { return self }
-        return SpacePermission(type: type, authority: authority, skey: skey,
-                                collection: collections, action: action, manage: manage)
+        let effectiveAction = scopeParameters.wasStated("action")
+            ? action
+            : action.filter { $0 == .read || $0 == .readSelf }
+        var updatedParameters = parameters
+        let collectionProvenance = parameters.provenance(for: "collection") ?? .defaulted
+        updatedParameters.set("collection", collections.map(\.stringValue), collectionProvenance)
+        let actionProvenance = parameters.provenance(for: "action") ?? .defaulted
+        updatedParameters.set("action", effectiveAction.map(\.rawValue), actionProvenance)
+        return SpacePermission(
+            type: type, authority: authority, skey: skey,
+            collection: collections, action: effectiveAction, manage: manage,
+            scopeParameters: updatedParameters
+        )
     }
 
     /// space-permission.ts:156-166. The matcher is context-free and cannot do
