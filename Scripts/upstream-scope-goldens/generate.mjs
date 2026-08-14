@@ -82,20 +82,40 @@ const SCOPE_VALUES = [
   'rpc:app.bsky.feed.getFeed',
 ]
 
-const values = SCOPE_VALUES.map((input) => {
-  let canonical = null
-  let threw = null
+// Every upstream call here is individually guarded, because upstream throws
+// rather than returning null on one whole class of input: a malformed percent
+// escape in a POSITIONAL is `decodeURIComponent`'s uncaught URIError
+// (syntax-string.ts:62-64). `isAtprotoOauthScope` and the round-trip check both
+// reach that code path, so a bare call to either aborts the entire run and the
+// generator emits NOTHING — not a corpus with one bad row, no corpus at all.
+//
+// Verified at bddc99fb: `space:%zz` throws `URI malformed` out of
+// `isAtprotoOauthScope`. No input in the current SCOPE_VALUES list throws, so
+// this guard is output-neutral for the corpus as it stands (proven by a zero
+// diff regeneration); it exists so that ADDING a percent-escape vector is a
+// one-line list edit rather than a debugging session.
+const call = (fn) => {
   try {
-    canonical = normalizeAtprotoOauthScopeValue(input) ?? null
+    return { value: fn(), threw: null }
   } catch (err) {
-    threw = String(err && err.message ? err.message : err)
+    return { value: null, threw: String(err && err.message ? err.message : err) }
   }
+}
+
+const values = SCOPE_VALUES.map((input) => {
+  const normalized = call(() => normalizeAtprotoOauthScopeValue(input) ?? null)
+  const canonical = normalized.value
+  const recognized = call(() => isAtprotoOauthScope(input))
+  const roundTrip =
+    canonical === null ? { value: null } : call(() => normalizeAtprotoOauthScopeValue(canonical) === canonical)
   return {
     input,
-    isAtprotoOauthScope: isAtprotoOauthScope(input),
+    // `null` means upstream threw instead of answering. Distinct from `false`,
+    // which is a considered rejection.
+    isAtprotoOauthScope: recognized.value,
     canonical,
-    threw,
-    roundTripStable: canonical === null ? null : normalizeAtprotoOauthScopeValue(canonical) === canonical,
+    threw: normalized.threw ?? recognized.threw,
+    roundTripStable: roundTrip.value,
   }
 })
 
