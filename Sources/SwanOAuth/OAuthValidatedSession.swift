@@ -88,9 +88,15 @@ public struct OAuthValidatedSession: Sendable, Equatable {
     /// its exact authority/skey/action/collection later; this layer admits
     /// only a qualified tuple, rather than accepting a bare type grant with
     /// no trusted authority or action binding.
+    ///
+    /// One of the three copies of this predicate that must not drift apart
+    /// again (§6.1); all three now route through the same facade.
+    ///
+    /// `subject: nil` is correct here (§6.5.2): this layer has not resolved
+    /// `self` yet, and a `self` grant must not be *counted* as satisfying the
+    /// floor before it is resolvable. No provenance is passed because this
+    /// site reads only `hasResourceScope` and never reaches a fence.
     private static func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
-        scopes.contains("atproto") || scopes.contains { scope in
-            PermissionedSpaceScopeSyntax.isQualified(scope)
-        }
+        SwanScopePermissions(rawScopes: scopes, subject: nil).hasResourceScope
     }
 }

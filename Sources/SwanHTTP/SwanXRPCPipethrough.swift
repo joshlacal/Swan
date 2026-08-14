@@ -521,8 +521,17 @@ private func authorizedPipethroughSubject(
     } catch {
         throw SwanXRPCPipethroughFailure.unavailable
     }
-    guard case let .accountOAuth(subject, scopes) = authorization,
-          scopes.contains("atproto") else {
+    // NOT YET PORTED (§6.5.10, §9-D12): upstream guards the proxy plane with
+    // `assertRpc({lxm, aud})` — the generic catch-all at `pipethrough.ts:66-68`
+    // plus 14 per-route sites. Porting it requires the `scopeAud`/`tokenAud`
+    // split at `pipethrough.ts:101-106`, which is what lets an `rpc:?aud=did#service`
+    // grant match a proxied call while the outbound service-auth JWT keeps a
+    // bare-DID `aud`. Porting `assertRpc` without that split either breaks
+    // outbound auth or leaves every `rpc:` scope unmatched. Until it lands,
+    // this route stays on the base scope alone — and `hasResourceScope` must
+    // NOT be widened to admit `rpc:` before it does (§6.1).
+    guard case let .accountOAuth(subject, permissions) = authorization,
+          permissions.hasBaseATProtocolScope else {
         throw SwanXRPCPipethroughFailure.unauthorized
     }
     return subject
