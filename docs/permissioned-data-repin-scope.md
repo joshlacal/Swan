@@ -80,9 +80,10 @@ blocks sign-in is the furthest outside it.
 
 `format: "at-uri"` became `format: "space-ref"` — **28 occurrences** across the
 space surface. `space-ref` is a new lexicon string format
-(`packages/lexicon/src/validators/formats.ts:40-43`, backed by
-`isSpaceRefString` in `@atproto/syntax`). The surface also picked up
-`format: "tid"` (6 uses), which the pinned lexicons did not use here.
+(`packages/lexicon/src/types.ts:48`, validated at
+`packages/lexicon/src/validators/formats.ts:40-43` by `isSpaceRefString` in
+`@atproto/syntax`). The surface also picked up `format: "tid"` (6 uses), which
+the pinned lexicons did not use here.
 
 Petrel's `generator/type_converter.py:55-77` is an explicit format table ending
 in:
@@ -98,14 +99,102 @@ just a weaker type than the code has today. `tid` is already mapped
 (`:71-72`); `space-ref` is not. The Kotlin converter has the same table
 (`generator/kotlin_type_converter.py:122`) and needs the same entry for parity.
 
-**The cheap correct fix is one line per converter.** Upstream's `SpaceRef`
-serialises as `at://{spaceDid}/space/{spaceType}/{skey}`
-(`packages/syntax/src/aturi.ts:235-254`) and Swan's `SpaceURI` already produces
-exactly that string (`SwanSpaces.swift:38-61`), as does its record form
-(`:106`). So `space-ref` can map to `ATProtocolURI` and preserve today's typing
-precisely. **No wire values change and no stored data migrates** — this is a
-naming and typing change, not a format change. A dedicated `SpaceRef` type is
-optional polish, not a prerequisite.
+> **Correction, 2026-08-14.** An earlier revision of this section said
+> `space-ref` could map to `ATProtocolURI`, and called a dedicated type
+> "optional polish". That was wrong on the evidence below. `ATProtocolURI`
+> **mis-parses** a space ref. The dedicated type is required.
+
+### 3a-i. Why `ATProtocolURI` is the wrong target
+
+A space ref is not a narrower at-uri. It is a **different path grammar** that
+the public at-uri grammar rejects. Upstream says so in its own comment at
+`packages/syntax/src/aturi_validation.ts:238-239`:
+
+> Space URIs carry extra path segments the public grammar disallows, so they
+> get their own validation.
+
+The two shapes, from `aturi.ts:57-61`:
+
+```
+at://{authorDid}/{collection}/{rkey}                                        public
+at://{spaceDid}/space/{spaceType}/{skey}[/{authorDid}/{collection}/{rkey}]  space
+```
+
+The public regexp (`aturi_validation.ts:208-209`) admits at most two path
+segments. A space ref has three; a space record URI has six. Upstream routes
+them to a separate regexp (`:212-213`) and a separate parser, and a space URI's
+authority and author **must be DIDs** — handles are not allowed, an invariant
+the public grammar does not have (`:355-357`).
+
+Petrel's `ATProtocolURI` (`Sources/Petrel/Core/Utils/ATProtoTypes.swift:34-92`)
+does none of this. It splits on `/` and assigns positionally:
+
+```swift
+authority = String(parts[0])
+collection = parts.count > 1 ? ... String(parts[1]) : nil
+recordKey  = parts.count > 2 ? ... String(parts[2]) : nil
+```
+
+Fed `at://did:plc:x/space/app.bsky.group/default` it yields
+`collection == "space"`, `recordKey == "app.bsky.group"`, and **silently drops
+`default`** — the skey, the one segment that names which space. It throws
+nothing; `originalString` is retained, so the value still round-trips onto the
+wire byte-identically. The corruption is confined to the structured view, which
+is exactly the kind of defect that survives a test suite.
+
+Upstream hit the same ambiguity and resolved it by deprecating the accessor
+rather than leaving it wrong (`aturi.ts:100-105`):
+
+> `did` — *deprecated: ambiguous on space URIs, where the authority owns the
+> space but the record belongs to one of its members.*
+
+**Swan already pays for this, 20+ times.** Every space handler takes the
+generated `ATProtocolURI`, discards its parse, and re-parses the raw string
+with the correct type:
+
+```swift
+let space = try SpaceURI(parameters.space.uriString())
+```
+
+`SwanSpaceXRPC.swift:55,385,470,826`, `SwanSpaceBlobXRPC.swift:262`,
+`SwanSpaceDelegationXRPC.swift:56`, `SwanSpaceCredentialXRPC.swift:69,262`,
+`SwanSimpleSpaceXRPC.swift:63,436`, `SwanSpaceRepositorySyncXRPC.swift:267`,
+`SwanSpaceNotificationXRPC.swift:378,517`,
+`SwanSimpleSpaceCheckUserAccessXRPC.swift:46`, and more. That laundering line is
+the workaround for a wire type that cannot hold the value. Give the generator
+the right type and every one of those lines becomes unnecessary.
+
+### 3a-ii. The two types to add
+
+Swan already has both shapes modelled correctly, in `SwanSpaces/SwanSpaces.swift`:
+`SpaceURI` (`:37-104`, the three-part form, DID + NSID + record-key validated)
+and `SpaceRecordURI` (`:106+`, the seven-part form). They are the domain types.
+What is missing is the same distinction at the **generated wire boundary**,
+where the code only imports `Foundation` and `Petrel` — so the types have to
+live in Petrel Core beside `ATProtocolURI`, `DID`, `NSID`, and `RecordKey`.
+
+**1. A new `SpaceRef` in Petrel Core**, mapped from `format: "space-ref"`.
+Three-part form only, DID authority, NSID space type, validated skey. Upstream's
+`SpaceRef.parse` (`aturi.ts:242-249`) additionally requires
+`parsed.toString() === input`, which is what makes it reject a record URI that
+merely starts with a valid space ref — worth porting exactly.
+
+**2. Space-awareness in `ATProtocolURI` itself.** This is *not* optional extra
+scope: five fields in the new space lexicons still carry `format: "at-uri"`, and
+every one of them is a **space record** URI — `createRecord.json:54`,
+`getRecord.json:42`, `putRecord.json:54`, and `applyWrites.json:127,145`, all of
+them the `uri` of a record written inside a space. Those are the six-segment
+form, and today `ATProtocolURI` reports `collection == "space"` for every one of
+them. Port upstream's single-class approach (`aturi.ts:34-230`): detect the
+`space` marker, parse both grammars, and expose `spaceDid` / `spaceType` /
+`skey` / `authorDid` alongside `collection` / `rkey` — where `collection` and
+`rkey` mean the *record's*, in both shapes, exactly as upstream does.
+
+Neither change touches the wire. Both are strictly parse-side, and Swan's stored
+strings are already in upstream's format — `SpaceURI.description`
+(`SwanSpaces.swift:63`) emits `at://\(authority)/space/\(spaceType)/\(skey)`,
+byte-identical to `SpaceRef.toString()` (`aturi.ts:250-252`). **No wire values
+change and no stored data migrates.**
 
 ### 3b. Regeneration is checksum-gated
 
@@ -144,13 +233,42 @@ pinned generator commit moves too.
    **and a DPoP proof signed by the key to bind the credential to**"). That is
    a behaviour change in the credential authority, not a type change.
 
+## 3e. There is a second implementation, and it is complete
+
+`https://tangled.org/ngerakines.me/atproto-crates` is a Rust workspace of 18
+crates, MIT-licensed, extracted from smokesignal.events. Three of them make it
+the most useful reference available for this work, because it is an independent
+implementation of the same proposal by someone who is not Bluesky:
+
+| Crate | Size | What it gives us |
+|---|---|---|
+| `atproto-oauth/src/scopes.rs` + `scopes/space_permission.rs` | 4,959 lines | The scope grammar in a **strongly-typed compiled language** — the closest analogue to what Swift needs |
+| `atproto-space/` | 4,398 lines | Space repo, `credential.rs` (919 lines), member sets, commit, recon |
+| `atproto-pds/` | 79,222 lines | A working PDS implementing **the entire space surface** |
+
+Their PDS implements all 32 space methods, including the two Swan is missing
+(`listBlobs`, `unregisterNotify`) and `getSpaceCredential` with the new key
+binding — their commit *"Bind a space credential to a key its holder proves, not
+one it names"* is precisely the change flagged in 3d(2). Their integration tests
+(`portal_spaces`, `space_membership`, `portal_delegation`, `dpop_enforcement`)
+encode semantics the lexicons alone do not state.
+
+Not a perfect oracle: they still reference `com.atproto.space.getSpace`, which
+the current branch removed, and they implement `getRepoState` and
+`uploadBlob`, which are not in the branch's lexicon set. Treat it as a strong
+second opinion, not as the spec.
+
+Local read-only clone for this investigation:
+`$CLAUDE_JOB_DIR/tmp/atproto-crates`.
+
 ## 4. Suggested sequencing
 
 1. **Ask the Bulleted author** which precondition failed and which revision
    they target. One message, and it may collapse a lot of guesswork.
-2. **Generator first** — add `space-ref` to both converters, mapped to
-   `ATProtocolURI`. Small, independently testable, and it stops the silent
-   `String` degradation before anything regenerates.
+2. **Types first** — add `SpaceRef` to Petrel Core, teach `ATProtocolURI` the
+   space grammar, then map `space-ref` in both converters (see 3a-ii). Small,
+   independently testable, and it fixes a mis-parse that exists *today* as well
+   as stopping the silent `String` degradation at regeneration.
 3. **Re-pin and regenerate** — new profile document, new digests, generator
    commit bumped. Diff the generated tree and expect it to be readable: same
    values, better names.
