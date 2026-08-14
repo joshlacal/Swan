@@ -187,7 +187,16 @@ public struct SwanScopePermissions: Sendable, Equatable, Hashable {
     ) {
         self.rawScopes = rawScopes
         self.subject = subject
-        self.statedKeys = statedKeys
+        // NORMALIZE: a scope mapped to an EMPTY stated-key set and a scope with
+        // no entry at all are the same fact — "this grant stated nothing" — and
+        // both fail every provenance clause identically. Keeping both spellings
+        // would make `==` disagree with behaviour: a value built from a durable
+        // record (which lists every scope, `atproto` included, with an empty set
+        // for the parameterless ones) would compare unequal to a semantically
+        // identical value built with `[:]`. That is not hypothetical — it is
+        // what `OAuthResourceAuthorizationTests` compares. Dropping empty sets
+        // makes equality a function of what the value actually decides.
+        self.statedKeys = statedKeys.filter { !$0.value.isEmpty }
         // Sort so `grants` is a deterministic function of the inputs and
         // equality is stable across Set iteration order.
         var grants: [Grant] = []
