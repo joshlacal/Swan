@@ -84,6 +84,10 @@ public actor DurableOAuthTokenService {
         public let clientID: String
         public let redirectURI: String
         public let dpopJKT: String?
+        /// The pre-resolution set — the bytes the client asked for (§6.7). Equal
+        /// to `scopes` for a grant Swan did not rewrite; never `nil`, because
+        /// the durable NULL means "requested == stored", not "unknown".
+        public let scopesRequested: Set<String>
         /// The durable §9-D23 provenance bits: for each effective scope string,
         /// which parameter keys the client physically wrote.
         ///
@@ -105,6 +109,7 @@ public actor DurableOAuthTokenService {
             clientID = family.binding.clientID
             redirectURI = family.binding.redirectURI
             dpopJKT = family.binding.dpopJKT
+            scopesRequested = family.binding.requestedScopes
             // Absent bits mean "nothing was stated", which is the fail-closed
             // direction for both fences: a missing record denies, never grants.
             scopeProvenance = family.binding.scopeProvenance ?? OAuthScopeProvenance()
@@ -576,7 +581,10 @@ public actor DurableOAuthTokenService {
             accessExpiresAt: grant.accessExpiresAt,
             scopes: record.binding.scopes,
             subject: record.subject,
-            refreshToken: grant.refreshToken
+            refreshToken: grant.refreshToken,
+            // The pre-resolution bytes, so a caller can tell preservation from
+            // mutation (§6.7). Stage F rewrote `binding.scopes` in place.
+            scopesRequested: record.binding.requestedScopes
         )
     }
 
@@ -761,7 +769,8 @@ public actor DurableOAuthTokenService {
             accessExpiresAt: pair.accessExpiresAt,
             scopes: family.binding.scopes,
             subject: family.subject,
-            refreshToken: pair.refreshToken
+            refreshToken: pair.refreshToken,
+            scopesRequested: family.binding.requestedScopes
         )
     }
 

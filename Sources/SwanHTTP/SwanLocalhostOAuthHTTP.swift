@@ -399,7 +399,8 @@ private func exchangeLocalhostToken(
                 accessExpiresAt: pair.accessExpiresAt,
                 scopes: grant.scopes,
                 subject: grant.subject,
-                refreshToken: pair.refreshToken
+                refreshToken: pair.refreshToken,
+                scopesRequested: grant.scopesRequested
             )
         }
         let expiresIn = max(0, Int(issued.accessExpiresAt.timeIntervalSinceNow.rounded(.down)))
