@@ -45,6 +45,21 @@ import Foundation
 /// consumer: `expandSpaceCollections` is a real implementation at
 /// `oauth-provider/src/lexicon/lexicon-manager.ts:74-95`, which materialises
 /// `space.collections` into any bare `space:<type>` grant.
+///
+/// **What that materialisation does to the grant's VERBS is an open ruling, and
+/// this type deliberately does not answer it.** The sentence above is scoped to
+/// `collections` on purpose; do not read it as settling actions. The two
+/// positions on the table, recorded as facts rather than as a conclusion:
+/// upstream's `withDefaultCollections` (`space-permission.ts:134-146`) passes
+/// `this.action` through **unchanged**, and `action`'s schema default is
+/// `SPACE_DEFAULT_ACTIONS = [read, create, update, delete]` (`:25-30`), so
+/// upstream a bare space grant is writable after expansion; Swan currently
+/// carries a guard that drops those verbs when `action` was never stated, which
+/// would leave it read-only. That is being decided elsewhere.
+///
+/// `LexiconSpace` is structurally the wrong place to settle it in any case — the
+/// declaration carries collections and no action information at all, so nothing
+/// here could express either answer even if it wanted to.
 public struct LexiconSpace: Sendable, Equatable, Decodable {
     /// Must decode to exactly `"space"`. Retained rather than asserted here for
     /// the same reason `LexiconPermissionSet.type` is: the resolver classifies
