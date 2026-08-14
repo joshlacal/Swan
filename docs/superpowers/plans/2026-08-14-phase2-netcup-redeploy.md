@@ -13,7 +13,18 @@ missing. Fix `e9f0a3cb` advertises
 at the composition root (metadata type default and §6.6 fixtures
 untouched). Image `234a41d2` promoted to `swan:local`; prior Phase-2 image
 `6851d778` kept as `swan:rollback-20260815`. All four endpoints 200; public
-doc verified serving the four scopes through Cloudflare. All three gates
+doc verified serving the four scopes through Cloudflare.
+**Hotfix 2, ~22:55 UTC:** Bulleted then failed at PAR itself
+(`stage=form_parse reason=malformed`) — the same crate appends the typed
+handle as `login_hint` to every PAR, and both of Swan's PAR parsers
+rejected any field outside their exact allowlists, so the form died before
+the DPoP nonce challenge and the client surfaced it as a DPoP error. Fix
+`e6e4aa96`: both parsers admit optional `login_hint` (bounded, ignored)
+and `prompt` limited to `login`/`consent`/`select_account`
+(`prompt=none` stays refused — this server can never answer silently),
+mirroring the reference PDS. Redeployed; prior image kept as
+`swan:rollback-20260815-b`; live probe of a hinted PAR returns
+`use_dpop_nonce` as expected. All three gates
 closed the same day. `swan:next` (image `6851d778`, built from the merged tree
 at `b4e7118d`) promoted to `swan:local`; previous image preserved as
 `swan:rollback-20260814` (`0e77c5ad`). Service restarted, started clean
