@@ -169,16 +169,17 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
 
     // MARK: - Cache integrity
 
-    /// The non-vacuous replacement for
-    /// `testACachedRowWhoseBytesDoNotHashToItsVerifiedCIDIsNotServed`.
+    /// The sole pin on cached-row integrity. It replaced a vacuous test in
+    /// `SwanLexiconResolverTests`, now deleted, which substituted
+    /// `Data(repeating: 0xA1, count: 8)` — filler failing **both** the CID
+    /// re-hash and `decodeDocument`, so it passed unchanged with the re-hash
+    /// check deleted (mutation recorded in the lane report).
     ///
-    /// That test substitutes `Data(repeating: 0xA1, count: 8)`, which fails
-    /// **both** the CID re-hash and `decodeDocument`, so it passes unchanged
-    /// with the re-hash check deleted (mutation recorded in the lane report).
     /// This substitutes a *different, perfectly valid* lexicon document for the
     /// same NSID: it decodes, it satisfies `lexicon == 1` and `id == rkey`, and
     /// only the CID comparison can tell that these are not the bytes the proof
-    /// chain terminated at.
+    /// chain terminated at. That is what makes storing canonical DAG-CBOR rather
+    /// than re-serialised JSON an enforceable decision instead of an annotation.
     func testACachedRowHoldingAValidButDIFFERENTDocumentIsNotServed() async throws {
         let harness = try await AdversarialHarness(.valid)
         _ = try await harness.resolver.resolve(harness.fixture.nsid)
@@ -311,9 +312,19 @@ final class SwanLexiconResolverAdversarialTests: XCTestCase {
     ///
     /// That is defensible — the resolver's own task is healthy and the fetch
     /// genuinely failed — and it is NOT the `resolveAll` hazard, which the
-    /// vector above shows is closed. It is reported as an observation because
-    /// the two cases are indistinguishable in `fetchProofCAR`'s source and only
-    /// the deadline racer separates them.
+    /// vector above shows is closed. The two cases are separated in source by
+    /// `classify`'s `Task.checkCancellation()`, which asks whether **this task**
+    /// is cancelled rather than what type the error happens to be; before that
+    /// existed they were told apart only by which task won the deadline race.
+    ///
+    /// **This expectation is coupled to the fetcher and moves with it.** The
+    /// case lands on `.recordFetchFailed` precisely *because* the transport's
+    /// `CancellationError` is re-wrapped — the same laundering that caused the
+    /// bug the vector above pins is what makes this case come out right. If
+    /// `OAuthRemoteFetch` ever stops re-wrapping, a bare `CancellationError`
+    /// reaches `classify` first, this resolution starts propagating instead of
+    /// caching, and **this test is supposed to fail**. It is the tripwire for
+    /// that change, not a victim of it.
     func testATransportRaisedCancellationWithoutTaskCancellationIsAFetchFailure() async throws {
         let harness = try await AdversarialHarness(.valid, transportError: CancellationError())
         let resolution = try await harness.resolver.resolve(harness.fixture.nsid)

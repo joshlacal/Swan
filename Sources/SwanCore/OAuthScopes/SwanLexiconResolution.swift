@@ -165,6 +165,33 @@ public enum SwanLexiconResolution: Sendable, Equatable {
 /// to drop entries from. If one of these ever reached a drop path, an
 /// attacker-controlled PDS would get to choose which of a user's requested
 /// permissions survive by selectively corrupting proofs.
+///
+/// ## Never add a `.cancelled` case
+///
+/// **Every member of this enum is, by construction, cacheable as a negative
+/// result — that is what this type IS.** A value here means "the authority's
+/// document could not be established, and the next request may answer from a
+/// `document IS NULL` row for five minutes without touching the network."
+/// Cancellation means nothing of the kind: the work simply stopped, and the
+/// authority may be perfectly healthy.
+///
+/// This is not hypothetical. Cancellation *was* being converted into one of
+/// these — `OAuthRemoteDocumentFetcher` re-wraps a `CancellationError` as
+/// `SwanError.unavailable` (`OAuthRemoteFetch.swift:674-677`), so an
+/// error-identity check could not see it, and a resolver catch-all classified
+/// it as `.recordFetchFailed`. Because `resolveAll` cancels every in-flight
+/// sibling when the 10 s group deadline expires, **one slow authority
+/// negative-cached its innocent siblings**: an attacker choosing which of a
+/// user's permissions survive, arriving through the cache rather than through
+/// the drop path §5.7.5 forbids. It is fixed by keying on task state
+/// (`Task.checkCancellation()`) rather than on error type — see
+/// `SwanLexiconResolver.classify`.
+///
+/// Adding `.cancelled` here would reinstate that bug through the front door,
+/// with a comment explaining why it was intentional. A reader who notices
+/// cancellation is unrepresentable in this enum has found the design, not an
+/// omission. If cancellation ever needs to be observed, it belongs on a
+/// separate channel that no cache write is derived from.
 public enum SwanLexiconResolverFailure: Error, Sendable, Equatable {
     // Steps 1-4 — authority selection.
 

@@ -68,6 +68,15 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
     ///     `.standard`, which is deliberately the **same** limits object the
     ///     full validators use: two MST budgets that can drift apart is a worse
     ///     outcome than either number.
+    ///   - diagnostics: observes which check refused a resolution. A **cancelled**
+    ///     resolution deliberately reports NOTHING here: cancellation is not a
+    ///     resolver-class failure, so it leaves through `classify` before the
+    ///     reporting site is reached. Read that silence as correctness, not as a
+    ///     gap — this hook previously reported a cancelled fetch as
+    ///     `.recordFetchFailed`, which was a confident false answer about an
+    ///     NSID that never failed. If cancellation ever needs observing, it needs
+    ///     its own channel; see `SwanLexiconResolverFailure` for why it must not
+    ///     be added there.
     public init(
         dns: any ATHandleDNSResolving,
         authorities: any SwanLexiconAuthorityResolving,
@@ -128,7 +137,7 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
         let cached = try await store.findLexicon(nsid: nsid)
 
         if let cached, !cached.isStale(now: instant) {
-            if let served = Self.serve(cached, now: instant) { return served }
+            if let served = try Self.serve(cached, now: instant) { return served }
             // A fresh row that cannot be served is either a negative-cache row
             // or a positive one past the 24 h hard expiry. Both answer without a
             // network round trip, which is the point of writing the row at all.
@@ -170,7 +179,7 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
                     lastSucceededAt: cached?.lastSucceededAt
                 )
             )
-            if let cached, let served = Self.serve(cached, now: instant) {
+            if let cached, let served = try Self.serve(cached, now: instant) {
                 return served
             }
             return .unresolvable
@@ -187,16 +196,32 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
     /// an enforced property instead of an annotation. A row that fails it is
     /// treated as unservable rather than trusted — nothing vouches for those
     /// bytes any more.
+    ///
+    /// **Why this throws rather than folding every failure into `nil`.**
+    /// `decodeDocument` routes its catch-all through `classify`, so it can raise
+    /// `CancellationError`. Under the `try?` this function used to use, that
+    /// cancellation would have been swallowed into `nil` and answered as
+    /// `.unresolvable` — reintroducing the exact laundering `classify` exists to
+    /// remove, on the one path that reaches it without any network I/O. `nil`
+    /// still means "this row cannot be served"; cancellation now leaves by a
+    /// different door.
     private static func serve(
         _ row: OAuthLexiconDocumentRow, now: Date
-    ) -> SwanLexiconResolution? {
+    ) throws -> SwanLexiconResolution? {
         guard let bytes = row.document,
               let sourceURI = row.sourceURI,
               let verifiedCID = row.verifiedCID,
               !row.isHardExpired(now: now) else { return nil }
+        // `CID.parse` and `fromDAGCBOR` are pure and cannot be cancelled, so a
+        // failure here is genuinely an unservable row.
         guard let cid = try? CID.parse(verifiedCID),
-              CID.fromDAGCBOR(bytes) == cid,
-              let document = try? decodeDocument(bytes, expectedNSID: row.nsid) else {
+              CID.fromDAGCBOR(bytes) == cid else { return nil }
+        let document: SwanLexiconDocument
+        do {
+            document = try decodeDocument(bytes, expectedNSID: row.nsid)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
             return nil
         }
         return .resolved(document, sourceURI: sourceURI, verifiedCID: verifiedCID)
@@ -231,7 +256,7 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
                 collection: Self.lexiconCollection, recordKey: nsid
             )
         } catch {
-            throw SwanLexiconResolverFailure.invalidNSID
+            try Self.classify(error, as: .invalidNSID)
         }
         let sourceURI = "at://\(did)/\(Self.lexiconCollection)/\(nsid)"
 
@@ -266,6 +291,14 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
     /// Turns a caught error into a resolver-class failure — **unless the task
     /// was cancelled**, in which case the cancellation is what actually
     /// happened and it must propagate.
+    ///
+    /// **Every catch-all on the resolution path routes through here — including
+    /// the synchronous ones that cannot currently raise a cancellation at all.**
+    /// That uniformity is the point: "the async catch-alls are covered" is an
+    /// invariant a reader has to re-derive by checking which callee is async,
+    /// and it silently stops holding the day someone makes one of the decoders
+    /// streaming. "Every catch-all routes through `classify`" is checkable with
+    /// a grep.
     ///
     /// `catch is CancellationError` alone is not sufficient anywhere on this
     /// path, and the reason is not obvious. A cancellation raised inside the
@@ -515,7 +548,7 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
                 signedCommitBytes: commitBytes, expectedCommitCID: parsed.rootCID
             )
         } catch {
-            throw SwanLexiconResolverFailure.commitDecodeFailed
+            try Self.classify(error, as: .commitDecodeFailed)
         }
 
         // Step 10 — `commit.did` is the RESOLVED did, not one the response
@@ -570,7 +603,7 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
         do {
             probe = try DAGCBOR.decode(recordBytes)
         } catch {
-            throw SwanLexiconResolverFailure.recordTypeMismatch
+            try Self.classify(error, as: .recordTypeMismatch)
         }
         guard probe.type == Self.lexiconCollection else {
             throw SwanLexiconResolverFailure.recordTypeMismatch
@@ -594,7 +627,7 @@ public struct SwanLexiconResolver: SwanLexiconResolving {
         do {
             record = try DAGCBOR.decode(recordBytes)
         } catch {
-            throw SwanLexiconResolverFailure.documentSchemaInvalid
+            try Self.classify(error, as: .documentSchemaInvalid)
         }
         // `lexiconDocumentSchema` (`lex-document/src/lexicon-document.ts:730`):
         // `lexicon` is the literal 1 and `id` is an NSID.

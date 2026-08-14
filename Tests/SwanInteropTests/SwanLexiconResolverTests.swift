@@ -491,28 +491,17 @@ final class SwanLexiconResolverTests: XCTestCase {
         XCTAssertEqual(expired, .unresolvable)
     }
 
-    func testACachedRowWhoseBytesDoNotHashToItsVerifiedCIDIsNotServed() async throws {
-        let harness = try await Harness(.valid)
-        _ = try await harness.resolver.resolve(harness.fixture.nsid)
-        let storedRow = try await harness.store.findLexicon(nsid: harness.fixture.nsid)
-        let row = try XCTUnwrap(storedRow)
-        // A row whose document no longer hashes to the CID that was proved has
-        // nothing vouching for it, so it is unservable rather than trusted.
-        try await harness.store.storeLexicon(
-            OAuthLexiconDocumentRow(
-                nsid: row.nsid,
-                document: Data(repeating: 0xA1, count: 8),
-                sourceURI: row.sourceURI,
-                verifiedCID: row.verifiedCID,
-                createdAt: row.createdAt,
-                updatedAt: row.updatedAt,
-                lastSucceededAt: row.lastSucceededAt
-            )
-        )
-        await harness.advance(by: 60)
-        let unservable = try await harness.resolver.resolve(harness.fixture.nsid)
-        XCTAssertEqual(unservable, .unresolvable)
-    }
+    // The cached-row-integrity property is pinned by
+    // `SwanLexiconResolverAdversarialTests`
+    // `testACachedRowHoldingAValidButDIFFERENTDocumentIsNotServed`.
+    //
+    // A test named `…WhoseBytesDoNotHashToItsVerifiedCIDIsNotServed` used to sit
+    // here and was DELETED rather than renamed. It substituted eight bytes of
+    // filler, which fails the CID re-hash AND `decodeDocument`, so it passed
+    // unchanged with the re-hash deleted — it never pinned the property its name
+    // claimed. The name is what let it survive review, mine included, so keeping
+    // it under an honest name would still have left a reader believing the
+    // property was covered twice when it was covered once.
 
     func testStepsOneToSixAreCachedByDomainAcrossDistinctNSIDs() async throws {
         // Four includes under one authority share ONE DNS + DID resolution.
