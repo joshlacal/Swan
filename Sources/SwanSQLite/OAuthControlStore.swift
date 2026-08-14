@@ -1941,6 +1941,10 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
     }
 
     private func insertFamily(_ family: OAuthTokenFamily) async throws {
+        // Every caller of this is a MINT — `storeAuthorizationCode` and
+        // `issueTokenPair`. Rotation never rewrites a family row, so stage G's
+        // strict half belongs here and nowhere else.
+        try validateNewlyMintedScopes(family.binding.scopes)
         try await requireInsertionCapacity(
             table: "oauth_control_token_families",
             keyColumn: "family_id",
@@ -2442,16 +2446,49 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         !value.isEmpty && value.utf8.count <= 4_096 && !value.utf8.contains(0)
     }
 
+    /// Per-element persistence gate. The byte cap is 1024, not 256 (§9-D9): one
+    /// cap at every surviving layer, because a `space:` grant with a
+    /// multi-valued `collection` list blows past 256 bytes with three or four
+    /// NSIDs and upstream imposes no length limit at all. Raising it is
+    /// read-compatible — every existing row is ≤ 256 bytes and re-validates
+    /// under the larger bound, so there is no data rewrite.
     private func validScope(_ value: String) -> Bool {
-        validText(value) && value.utf8.count <= 256 &&
+        validText(value) && value.utf8.count <= 1_024 &&
             value.unicodeScalars.allSatisfy {
                 !$0.properties.isWhitespace && !CharacterSet.controlCharacters.contains($0)
             }
     }
 
+    /// Swan's resource-scope floor: `atproto` OR a `space:` grant — the same
+    /// accept set as before, expressed over the real grammar instead of
+    /// `PermissionedSpaceScopeSyntax.isQualified`, and deliberately NOT widened
+    /// to "any recognised family" (§6.1). Several routes treat this floor as
+    /// their only scope check, so admitting `identity:` or `blob:` here would
+    /// open blob upload and repository sync to a token that passes nothing else.
     private func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
-        scopes.contains("atproto") || scopes.contains { scope in
-            PermissionedSpaceScopeSyntax.isQualified(scope)
+        scopes.contains { scope in
+            switch try? AtprotoScope.parse(scope) {
+            case .atproto, .space: true
+            default: false
+            }
+        }
+    }
+
+    /// Stage G, INSERT half (§6.3): a newly-minted grant must parse in full.
+    ///
+    /// This is deliberately not in `validate(binding:)`, which also runs on
+    /// DECODE. The only per-element gate Swan ever had was `validScope`, and the
+    /// resource-scope check beside it is an OR over the set, so a live family
+    /// may legitimately hold an unparseable companion scope. Gating the read
+    /// path on a full re-parse would fail `decodeFamily` and permanently lock
+    /// that session out — the opposite of §9-D5, which rules that a *held*
+    /// unparseable scope silently grants nothing.
+    ///
+    /// New tokens are entirely under the new grammar's control, so the tightening
+    /// here has no back-compat surface.
+    private func validateNewlyMintedScopes(_ scopes: Set<String>) throws {
+        guard scopes.allSatisfy({ (try? AtprotoScope.parse($0)) != nil }) else {
+            throw OAuthControlStoreError.invalidInput
         }
     }
 

@@ -201,6 +201,19 @@ private func handleOAuthServerPAR(
         "failure": .string(String(describing: failure)),
       ])
     return oauthServerBodyFailurePAR(failure)
+  } catch let error as OAuthScopeAdmissionError {
+    // `invalid_scope` is new to Swan and describes the request's own text, so
+    // it discloses nothing server-side (§4.8). The subset failure keeps
+    // `invalid_request` — that one WOULD leak the client's registration — and
+    // the mapping lives on the error, not here, so the two cannot drift.
+    context.logger.info(
+      "oauth par rejected",
+      metadata: [
+        "stage": .string("scope_admission"),
+        "reason": .string(error.description),
+      ])
+    return oauthServerPARJSON(
+      .badRequest, OAuthServerPARError(error: error.oauthErrorCode))
   } catch let error as OAuthServerRequestError {
     context.logger.info(
       "oauth par rejected",
@@ -251,9 +264,14 @@ private func handleOAuthServerPAR(
   }
   do {
     let client = try await configuration.clientMetadataLoader.load(clientID: form.clientID)
-    guard client.metadata.matchesRedirectURI(form.redirectURI),
-      form.scopes.isSubset(of: client.metadata.scopes)
-    else {
+    // The raw `form.scopes.isSubset(of: client.metadata.scopes)` that stood here
+    // is now stage C inside `OAuthScopeAdmissionPolicy`, reached through
+    // `OAuthValidatedSession` below, because the subset check must canonicalise
+    // both sides (§9-D7). Leaving the raw comparison in front of it would reject
+    // a client that spelled the same grant differently in its metadata and its
+    // request before the canonical form ever ran — the exact false negative the
+    // canonicalisation exists to remove.
+    guard client.metadata.matchesRedirectURI(form.redirectURI) else {
       // `invalid_request` is deliberately opaque on the wire; record the
       // distinguishing detail server-side so an operator can tell a redirect
       // mismatch from a scope mismatch without instrumenting the client.
@@ -262,10 +280,7 @@ private func handleOAuthServerPAR(
         metadata: [
           "stage": .string("client_binding"),
           "client_id": .string(form.clientID.absoluteString),
-          "redirect_matches": .string(
-            client.metadata.matchesRedirectURI(form.redirectURI) ? "true" : "false"),
-          "scopes_subset": .string(
-            form.scopes.isSubset(of: client.metadata.scopes) ? "true" : "false"),
+          "redirect_matches": .string("false"),
         ]
       )
       return oauthServerPARJSON(.badRequest, OAuthServerPARError(error: "invalid_request"))
@@ -293,6 +308,20 @@ private func handleOAuthServerPAR(
     )
     return oauthServerPARJSON(
       .created, OAuthServerPARSuccess(requestURI: requestURI, expiresIn: 90))
+  } catch let error as OAuthScopeAdmissionError {
+    // Stages B, C and E reach the wire here. `invalid_scope` names a fault in
+    // the request's own text; `invalid_request` is retained for the subset
+    // failure so the client's registration stays undisclosed (§4.8).
+    context.logger.info(
+      "oauth par rejected",
+      metadata: [
+        "stage": .string("scope_admission"),
+        "client_id": .string(form.clientID.absoluteString),
+        "reason": .string(error.description),
+      ]
+    )
+    return oauthServerPARJSON(
+      .badRequest, OAuthServerPARError(error: error.oauthErrorCode))
   } catch let error as SwanError {
     if case .unavailable = error {
       context.logger.info(
@@ -1056,16 +1085,19 @@ private func oauthServerExactURL(_ raw: String) -> URL? {
   return url
 }
 
+/// Stage A — the remote authorization server's wire tokenizer.
+///
+/// Delegates to the one tokenizer shared with the localhost bridge (§6.3 stages
+/// A / A′) so the two cannot drift apart again: the same RFC 6749 §3.3 charset
+/// (`$0 > 0x20 && $0 < 0x7F` admitted `"` and `\`), the same 1024-byte per-token
+/// and 8192-byte whole-request RAW-INPUT budget in place of this path's 256, and
+/// the literal `openid` rejection.
+///
+/// The thrown error is deliberately NOT collapsed into
+/// `OAuthServerRequestError.malformed`: `openid` must surface as
+/// `invalid_scope`, not `invalid_request` (§4.8).
 private func oauthServerScopes(_ raw: String) throws -> Set<String> {
-  let values = raw.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-  guard !values.isEmpty, values.count <= 64, values.count == Set(values).count,
-    values.allSatisfy({
-      !$0.isEmpty && $0.utf8.count <= 256 && $0.utf8.allSatisfy { $0 > 0x20 && $0 < 0x7F }
-    })
-  else {
-    throw OAuthServerRequestError.malformed
-  }
-  return Set(values)
+  try OAuthScopeTokenizer.tokenize(raw)
 }
 
 private func oauthServerS256Challenge(_ value: String) -> Bool {

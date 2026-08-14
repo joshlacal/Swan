@@ -110,7 +110,12 @@ public actor DurableOAuthTokenService {
         familyID: UUID = UUID(),
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
-        let binding = session.durableBinding
+        // Stage F, as at `_issueAuthorizationCode`: this is a mint, so the
+        // family row must hold the RESOLVED grant or it would grant nothing.
+        let binding = try OAuthScopeAdmissionPolicy.resolvingSelfAuthority(
+            session.durableBinding,
+            subject: subject
+        )
         try requireOAuthDPoPBinding(binding)
         let pair = try makeTokenPair(
             familyID: familyID,
@@ -344,13 +349,27 @@ public actor DurableOAuthTokenService {
               codeLifetime.isFinite, refreshLifetime.isFinite else {
             throw SwanError.malformed("authorization code lifetimes must be positive")
         }
-        try requireOAuthDPoPBinding(binding)
+        // Stage F (§6.4). This is the first point at which the subject DID meets
+        // the client binding — `createPushedAuthorizationRequest` has no subject,
+        // so a PAR row genuinely cannot hold a resolved scope.
+        //
+        // Resolution is mandatory rather than cosmetic: an unresolved `self`
+        // matches NOTHING (`SpacePermission.matches` returns false on
+        // `.unresolvedSelf`), so a family storing `authority=self` would grant
+        // nothing at all on every request. The requested bytes are preserved
+        // separately on the binding, and provenance is carried rather than
+        // re-derived — resolving `self` changes the value, never the statedness.
+        let resolved = try OAuthScopeAdmissionPolicy.resolvingSelfAuthority(
+            binding,
+            subject: subject
+        )
+        try requireOAuthDPoPBinding(resolved)
         let code = Self.randomOpaqueValue()
         let record = OAuthAuthorizationCode(
             codeDigest: digest(code, purpose: .authorizationCode),
             familyID: familyID,
             subject: subject,
-            binding: binding,
+            binding: resolved,
             codeChallengeS256: codeChallengeS256,
             expiresAt: now.addingTimeInterval(codeLifetime),
             familyExpiresAt: now.addingTimeInterval(refreshLifetime)
@@ -1121,7 +1140,22 @@ public actor DurableOAuthTokenService {
               redirectURI.absoluteString == binding.redirectURI,
               client.metadata.matchesRedirectURI(redirectURI),
               !binding.scopes.isEmpty,
-              binding.scopes.isSubset(of: client.metadata.scopes) else {
+              // Stage C compares REQUESTED against REGISTERED — both supplied by
+              // the client in the same generation (§9-D7). It must not compare
+              // `binding.scopes`, which under §9-D8 holds the post-`self`
+              // resolution grant: the resolved DID was never in the client's
+              // registered set, so this guard would reject every `self`-bearing
+              // family at the token endpoint. That is the same operand defect
+              // §9-D20 fixes at `:770`, at a second site the stage table lists
+              // under stage C.
+              //
+              // Both sides are canonicalised so a client that spells the same
+              // grant differently in its metadata and its request is not
+              // rejected by the canonical form itself.
+              OAuthScopeAdmissionPolicy.isCanonicalSubset(
+                  binding.requestedScopes,
+                  of: client.metadata.scopes
+              ) else {
             throw OAuthControlStoreError.bindingMismatch
         }
         switch client.metadata.tokenEndpointAuthMethod {
@@ -1254,9 +1288,18 @@ public actor DurableOAuthTokenService {
         }
     }
 
+    /// The same `atproto`-or-`space:` floor as before, expressed over the real
+    /// grammar. Deliberately NOT widened to "any recognised family" (§6.1):
+    /// after §8 Stage C a remote client may register `identity:handle` or
+    /// `blob:image/*`, and several routes treat this floor as their only scope
+    /// check, so such a token would reach blob upload and repository sync
+    /// unenforced.
     private static func hasATProtocolResourceScope(_ scopes: Set<String>) -> Bool {
-        scopes.contains("atproto") || scopes.contains { scope in
-            PermissionedSpaceScopeSyntax.isQualified(scope)
+        scopes.contains { scope in
+            switch try? AtprotoScope.parse(scope) {
+            case .atproto, .space: true
+            default: false
+            }
         }
     }
 
