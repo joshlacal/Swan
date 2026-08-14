@@ -310,9 +310,20 @@ not a security one. Decide before Phase 2 closes.
 ## Running the golden-corpus gate — and a durability warning
 
 ```bash
-SWAN_UPSTREAM_ATPROTO=<full checkout of bddc99fb> \
+SWAN_UPSTREAM_ATPROTO=/Users/joshlacalamito/Developer/Catbird+Petrel/Swan/.interop-cache/atproto-bddc99fb24c34b4078b9bf65837283f37b49ab66 \
   Scripts/upstream-scope-goldens/verify-corpus-zero-diff.sh
 ```
+
+**Resolved:** the `bddc99fb` tree now lives at that path — in the **main Swan
+checkout's** `.interop-cache/`, not a workspace's, following the existing
+`atproto-<commit>` convention beside `atproto-3f6c96d5…`. `.interop-cache/` is
+gitignored (`.gitignore:6`), so this adds 37 MB of untracked cache and touches no
+VCS state. Verified from that path: zero diff. It previously existed only in an
+ephemeral job scratch directory.
+
+Note `interop/fetch-reference.sh` pins `3f6c96d5…`, a *different* commit for a
+different purpose. Do not repoint it at `bddc99fb`; the two trees serve different
+gates and both are needed.
 
 Without `SWAN_UPSTREAM_ATPROTO` the corpus-integrity test **silently skips** —
 it does not fail — so a green suite says nothing about corpus/upstream agreement.
