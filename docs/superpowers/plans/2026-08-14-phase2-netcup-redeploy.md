@@ -1,0 +1,144 @@
+# Phase 2 → netcup redeploy readiness
+
+**Status: NOT READY.** Three gates are open — see "Blocking" below. Everything
+else is prepared and verified.
+
+## Live state — verified today, not remembered
+
+Checked read-only over `ssh netcup` on 2026-08-14. **Two of these contradict
+what memory said**, which is why they were checked:
+
+| fact | value |
+|---|---|
+| host arch | `x86_64` (image builds natively — no aarch64 cross-compile problem) |
+| `swan.service` | **active** |
+| public URL | **`https://swan.place`** — the domain migration has landed; memory still said `swan.catbird.blue` |
+| health | `/health` 200, `describeServer` 200, `/.well-known/oauth-authorization-server` 200, public `swan.place/xrpc/…describeServer` 200 |
+| image | `swan:local`, 4.96 GB, built **13 h ago** |
+| disk | 346 G free of 503 G (29 % used) — ample for a rebuild |
+| source | `~/dev/swan-src/{Swan,Petrel}` — **not a git checkout**; an rsync'd tree carrying `.build-*` dirs and `artifacts/` |
+
+**Live flags (`systemctl cat swan.service`) — memory recorded three of these as
+disabled; they are ON:**
+
+```
+--enable-oauth-authorization-server
+--enable-local-space-interop
+--enable-public-repository-mutations
+--enable-public-firehose
+--login-trusted-proxy-peer 172.17.0.1
+--profile .../permissioned-data-0016-2026-07-30.json
+```
+
+Container shape: `--user 994:984 --workdir /data --read-only`, tmpfs `/tmp`,
+`--memory=2g --pids-limit=512`, `-p 127.0.0.1:3020:3000`, data at
+`/srv/swan/data:/data`, secrets at `/srv/swan/secrets:/run/secrets/swan-runtime:ro`.
+
+## What Phase 2 ships, and why this deploy is low-risk
+
+**Phase 2 is inert unless explicitly enabled.**
+
+- New flag `--enable-lexicon-resolution`, **default `false`**
+  (`SwanCommand.swift:1907`), and it *requires* `--enable-oauth-authorization-server`
+  (`:2639-2642`), which prod already has. So the precondition is satisfied but
+  the flag is not passed — the resolver does not run.
+- With the flag off, both Phase-2 transformations are documented pass-throughs
+  (P2-F's F3). Behaviour is unchanged from today's build.
+- **No new outbound I/O unless the flag is on.** When on, the resolver performs
+  DNS TXT + DID document + `sync.getRecord` per authority, all through the
+  existing `OAuthRemoteFetchPolicy` (public-address-only peer check, redirect
+  policy, admission control, 256 KiB cap, 5 s timeout, 10 s group deadline).
+
+**The schema change is automatic and idempotent.** `oauth_lexicon_documents` is
+a `CREATE TABLE IF NOT EXISTS` appended to `SQLiteLayout.controlMigrations`
+(`SwanSQLite.swift:147`), applied at startup inside a transaction
+(`OAuthControlStore.swift:1470-1474`). The pragma-skip is **computed**
+(`dropFirst(SQLiteLayout.controlConnectionPragmas.count)`), not a hardcoded
+index, so appending to the list is safe. **No manual migration step, and no
+rollback migration needed** — an older binary simply ignores the extra table.
+
+## Blocking
+
+1. **P2-H is not landed.** Refresh does not re-derive the token scope, so
+   §5.7.4's 24 h hard expiry is inert (P2-F's F2, confirmed on both sides). This
+   only *matters* once `--enable-lexicon-resolution` is on — but shipping the
+   resolver without it means the narrowing safeguard never functions. Lane is
+   dispatched.
+2. **Full macOS suite not yet confirmed on the merged tree.** Lane figures are
+   1841 XCTest / 0 and 161 Swift Testing / 0 from P2-F's workspace; the
+   integration run must be measured here, **counting both frameworks** — a
+   `Test Case … passed` count alone already produced one false green in this
+   program.
+3. **Linux build not yet run for Phase-2 code.** This is the real deployment
+   gate and Phase 2 added substantial code across seven targets. Per
+   `reference_swan_linux_docker_build_recipe`: `swift build --product swan` is
+   the gate, **not** `--build-tests` (which has never passed on the pinned Linux
+   toolchain, for an unrelated pre-existing reason). Since the image builds on
+   netcup natively, the honest gate is the image build itself.
+
+## Procedure
+
+```bash
+# 1. sync source (rsync target, NOT a git checkout — exclude build dirs)
+rsync -az --delete \
+  --exclude '.build*' --exclude '.jj' --exclude '.git' --exclude 'artifacts' \
+  ~/Developer/Catbird+Petrel/Swan-merge3/  netcup:~/dev/swan-src/Swan/
+rsync -az --delete --exclude '.build*' --exclude '.jj' --exclude '.git' \
+  ~/Developer/Catbird+Petrel/Petrel/       netcup:~/dev/swan-src/Petrel/
+
+# 2. build on netcup (x86_64 native). `josh` is NOT in the docker group.
+ssh netcup 'cd ~/dev/swan-src && sudo docker build -t swan:next -f Swan/Dockerfile .'
+
+# 3. keep the current image as a rollback point BEFORE retagging
+ssh netcup 'sudo docker tag swan:local swan:rollback-$(date +%Y%m%d) && sudo docker tag swan:next swan:local'
+
+# 4. restart and verify
+ssh netcup 'sudo systemctl restart swan.service && sleep 5 && \
+  curl -s -o /dev/null -w "health %{http_code}\n" http://127.0.0.1:3020/health'
+```
+
+**Verify after restart** — all four were 200 before the deploy, so any non-200
+is a regression:
+`/health`, `/xrpc/com.atproto.server.describeServer`,
+`/.well-known/oauth-authorization-server`, and public
+`https://swan.place/xrpc/com.atproto.server.describeServer`.
+
+**Rollback:** `sudo docker tag swan:rollback-<date> swan:local && sudo systemctl restart swan.service`.
+The new table is additive, so the old binary runs against the migrated DB
+unchanged.
+
+## Gotchas that have bitten this deployment before
+
+Carried from `project_swan_netcup_deployment`; **the flag list in that memory is
+now stale** (see above), so treat its other claims as needing the same check.
+
+- `josh` is deliberately **not** in the docker group → always `sudo docker`.
+- **`systemctl reload caddy` is a NO-OP** on this host (unit stuck "reloading"
+  since Apr 2026 while serving fine). Use
+  `sudo caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile`.
+- Running `caddy validate/reload` as **root** creates per-site logs owned
+  `root:root 0600` which the `caddy` user then cannot open → chown back to
+  `caddy:caddy`.
+- **`DOCKER-USER` needs the conntrack RETURN rule FIRST**, then the DROP. A bare
+  `-i eth0 -j DROP` kills all container egress by dropping return packets —
+  which would break the lexicon resolver's outbound fetches specifically, if the
+  flag is ever enabled.
+- **`journalctl` on netcup uses LOCAL time (UTC+2).** `--since "<UTC wall time>"`
+  silently reads a window 2 h off. Use `--since @<epoch> --until @<epoch>`.
+- Image user is uid 999; the service runs `--user 994:984` and therefore cannot
+  traverse the image's `/var/lib/swan` — hence `--workdir /data`.
+
+## Open decision — enabling the resolver
+
+Deploying the build and *enabling* `--enable-lexicon-resolution` are separate
+choices, and they should be separate deploys. Recommended order:
+
+1. Ship the build with the flag **off**. Behaviour is unchanged; this only
+   proves Phase 2 compiles, migrates and runs in production.
+2. Land P2-H.
+3. Enable the flag as its own change, so any resolver-related symptom has an
+   unambiguous cause.
+
+Enabling it turns on outbound DNS and HTTPS from the container to arbitrary
+lexicon authorities. The transport hardening is already in place, but the
+`DOCKER-USER` conntrack rule above is what makes container egress work at all.
