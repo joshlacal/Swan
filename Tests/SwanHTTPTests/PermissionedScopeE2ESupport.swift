@@ -41,10 +41,19 @@ struct PermissionedScopeFixture: Sendable {
     static let password = "correct horse battery staple"
     static let serverKey = Data(repeating: 0xD5, count: 32)
 
-    static func make() async throws -> PermissionedScopeFixture {
+    /// The resolver this fixture's runtime was built with, so a test can change
+    /// the documents it serves between mint and refresh — which is the only way
+    /// to witness a permission set being *narrowed* by its authority.
+    let lexiconResolver: (any SwanLexiconResolving)?
+
+    static func make(
+        lexiconResolver: (any SwanLexiconResolving)? = nil
+    ) async throws -> PermissionedScopeFixture {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "PermissionedScope-\(UUID().uuidString)")
-        return try await open(root: root, provisionAccount: true)
+        return try await open(
+            root: root, provisionAccount: true, lexiconResolver: lexiconResolver
+        )
     }
 
     /// Closes this fixture's handle and returns a fresh one over the same
@@ -52,7 +61,9 @@ struct PermissionedScopeFixture: Sendable {
     /// out of SQLite rather than out of the process that wrote it.
     func reopeningStorage() async throws -> PermissionedScopeFixture {
         try await control.close()
-        return try await Self.open(root: root, provisionAccount: false)
+        return try await Self.open(
+            root: root, provisionAccount: false, lexiconResolver: lexiconResolver
+        )
     }
 
     func tearDown() async {
@@ -62,7 +73,8 @@ struct PermissionedScopeFixture: Sendable {
 
     private static func open(
         root: URL,
-        provisionAccount: Bool
+        provisionAccount: Bool,
+        lexiconResolver: (any SwanLexiconResolving)?
     ) async throws -> PermissionedScopeFixture {
         let control = try await SQLiteControlDatabase(dataDirectory: root)
         do {
@@ -89,7 +101,11 @@ struct PermissionedScopeFixture: Sendable {
                     )
                 )
             }
-            let runtime = try SwanOAuthRuntime(controlStore: control, serverKey: serverKey)
+            let runtime = try SwanOAuthRuntime(
+                controlStore: control,
+                serverKey: serverKey,
+                lexiconResolver: lexiconResolver
+            )
             let authorizer = try SwanOAuthResourceAuthorizer(
                 publicURL: issuer,
                 runtime: runtime,
@@ -100,7 +116,8 @@ struct PermissionedScopeFixture: Sendable {
                 control: control,
                 runtime: runtime,
                 authorizer: authorizer,
-                accounts: directory
+                accounts: directory,
+                lexiconResolver: lexiconResolver
             )
         } catch {
             try? await control.close()

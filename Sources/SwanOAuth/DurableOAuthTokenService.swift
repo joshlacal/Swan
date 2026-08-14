@@ -706,6 +706,7 @@ public actor DurableOAuthTokenService {
         )
     }
 
+    @discardableResult
     func redeemRefresh(
         _ refreshToken: String,
         dpopProof: OAuthValidatedDPoPProof,
@@ -715,6 +716,26 @@ public actor DurableOAuthTokenService {
         requireActiveSubject: Bool,
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
+        try await rotateRefresh(
+            refreshToken,
+            dpopProof: dpopProof,
+            clientAssertion: clientAssertion,
+            metadataLoader: metadataLoader,
+            accessLifetime: accessLifetime,
+            requireActiveSubject: requireActiveSubject,
+            now: now
+        ).pair
+    }
+
+    private func rotateRefresh(
+        _ refreshToken: String,
+        dpopProof: OAuthValidatedDPoPProof,
+        clientAssertion: OAuthValidatedClientAssertion?,
+        metadataLoader: OAuthClientMetadataLoader,
+        accessLifetime: TimeInterval,
+        requireActiveSubject: Bool,
+        now: Date
+    ) async throws -> (pair: OAuthTokenPair, scopes: Set<String>) {
         let refreshDigest = digest(refreshToken, purpose: .refreshToken)
         let family: OAuthTokenFamily
         do {
@@ -741,6 +762,10 @@ public actor DurableOAuthTokenService {
         } catch {
             throw secureControlError(error)
         }
+        // BEFORE the rotation, deliberately: re-derivation performs network I/O
+        // and can fail, and a failure must leave the presented refresh token
+        // still usable rather than burning it on a rotation that then refuses.
+        let rederived = try await rederivedGrant(for: family)
         let remainingLifetime = family.expiresAt.timeIntervalSince(now)
         let pair = try makeTokenPair(
             familyID: family.familyID,
@@ -752,13 +777,70 @@ public actor DurableOAuthTokenService {
             try await controlStore.redeemRefreshToken(
                 refreshTokenDigest: refreshDigest,
                 replacement: tokenDigests(for: pair),
+                rewrittenGrant: rederived,
                 requireActiveSubject: requireActiveSubject,
                 now: now
             )
         } catch {
             throw secureControlError(error)
         }
-        return pair
+        return (pair, rederived?.scopes ?? family.binding.scopes)
+    }
+
+    /// §5.7.5's second call site, the half F2 found missing: **refresh
+    /// re-derives the token scope**, exactly as `rotateToken` does upstream
+    /// (`token-manager.ts:260-263` → `buildTokenScope(parameters.scope!, did)`).
+    ///
+    /// The input is the **requested** baseline (`scopes_requested ?? scopes`,
+    /// §9-D20), never `binding.scopes`: the latter holds the post-`self`
+    /// resolution grant (§9-D8), so re-deriving from it would re-resolve an
+    /// already-resolved value and drift a little further on every rotation.
+    /// Upstream's operand is the same one — `parameters.scope` is the
+    /// authorization request's own bytes.
+    ///
+    /// **Why this matters more than "we hadn't wired refresh yet."** §5.7.4
+    /// introduced Swan's 24-hour hard cache expiry with a rationale that argues
+    /// *from* re-derivation: without it, a permission set that was **narrowed**
+    /// upstream would keep minting the wider grant. With the scope frozen at
+    /// mint, that safeguard was inert — a 14-day refresh family kept its
+    /// mint-time grant for its whole life whether or not the resolver was
+    /// reachable, and whatever the authority now declares.
+    ///
+    /// **Failure policy: a re-derivation failure fails the refresh.** It is not
+    /// a fall-back-to-stored, and the two are genuinely different layers:
+    /// serving a stale document on a fetch failure is the *cache's* job
+    /// (§5.7.5's matrix, first row), so by the time a failure reaches here the
+    /// cache has already declined to answer — either it has nothing or its 24 h
+    /// hard expiry has passed. Continuing at that point would mint the wider
+    /// grant precisely when Swan can no longer show it is still granted, which
+    /// is the outcome the hard expiry exists to prevent. Upstream makes the same
+    /// call in the same place and says so (`token-manager.ts:257-259`: "it's
+    /// fine to propagate a 500 here"). Swan's code is `invalid_request` rather
+    /// than `server_error`, carried by the stage on
+    /// ``OAuthScopeResolutionError`` (§5.7.5's asymmetry).
+    ///
+    /// Returns `nil` — leave the stored grant exactly as it is — in two cases:
+    /// the re-derivation reproduced what is already stored, which is the common
+    /// case and must not churn the row; or the family predates
+    /// `scope_provenance_requested` and has no baseline to derive from, which is
+    /// bounded by the 14-day family lifetime and preserves today's behaviour for
+    /// those rows rather than narrowing a live grant on a guess.
+    /// `internal` rather than `private` so the two decisions that produce `nil` —
+    /// no change, and no baseline — can be asserted directly. Neither is
+    /// observable from the rotation's outputs: both look exactly like a refresh
+    /// that re-derived and happened to agree.
+    func rederivedGrant(for family: OAuthTokenFamily) async throws -> OAuthRefreshedGrant? {
+        guard let baseline = family.binding.requestedBaseline() else { return nil }
+        let resolved = try await OAuthLexiconScopeResolution.resolvingLexiconGrants(
+            baseline,
+            subject: family.subject,
+            resolver: lexiconResolver
+        )
+        let provenance = resolved.scopeProvenance ?? OAuthScopeProvenance()
+        guard resolved.scopes != family.binding.scopes
+            || provenance != (family.binding.scopeProvenance ?? OAuthScopeProvenance())
+        else { return nil }
+        return OAuthRefreshedGrant(scopes: resolved.scopes, scopeProvenance: provenance)
     }
 
     /// Authorization-server refresh adapter. It reuses the existing durable
@@ -795,7 +877,7 @@ public actor DurableOAuthTokenService {
         } catch {
             throw secureControlError(error)
         }
-        let pair = try await redeemRefresh(
+        let rotated = try await rotateRefresh(
             refreshToken,
             dpopProof: dpopProof,
             clientAssertion: clientAssertion,
@@ -805,11 +887,18 @@ public actor DurableOAuthTokenService {
             now: now
         )
         return OAuthTokenGrantResult(
-            accessToken: pair.accessToken,
-            accessExpiresAt: pair.accessExpiresAt,
-            scopes: family.binding.scopes,
+            accessToken: rotated.pair.accessToken,
+            accessExpiresAt: rotated.pair.accessExpiresAt,
+            // The RE-DERIVED grant, not the one the family held on the way in:
+            // a rotation that narrowed the stored scope and then reported the
+            // old one would tell the client it still holds capabilities the
+            // access token no longer carries. Upstream reports the same value it
+            // just persisted (`token-manager.ts:266-295`).
+            scopes: rotated.scopes,
             subject: family.subject,
-            refreshToken: pair.refreshToken,
+            // Unchanged by rotation, and that is the point: it is the baseline
+            // the NEXT refresh re-derives from (§9-D20).
+            refreshToken: rotated.pair.refreshToken,
             scopesRequested: family.binding.requestedScopes
         )
     }
@@ -886,6 +975,11 @@ public actor DurableOAuthTokenService {
         } catch {
             throw secureControlError(error)
         }
+        // The localhost bridge rotates through the same durable transaction and
+        // therefore re-derives on the same terms. Exempting it would leave one
+        // refresh path minting a frozen grant, which is the defect, not a
+        // simplification.
+        let rederived = try await rederivedGrant(for: family)
         let remainingLifetime = family.expiresAt.timeIntervalSince(now)
         let pair = try makeTokenPair(
             familyID: family.familyID,
@@ -897,6 +991,7 @@ public actor DurableOAuthTokenService {
             try await controlStore.redeemRefreshToken(
                 refreshTokenDigest: refreshDigest,
                 replacement: tokenDigests(for: pair),
+                rewrittenGrant: rederived,
                 requireActiveSubject: requireActiveSubject,
                 now: now
             )

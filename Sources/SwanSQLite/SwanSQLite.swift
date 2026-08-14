@@ -103,6 +103,12 @@ public enum SQLiteLayout {
             -- scope string. Durable because a serialised scope is lossy in both
             -- directions (§9-D23).
             scope_provenance BLOB,
+            -- The same bits keyed by the REQUESTED strings, stored under the
+            -- same NULL rule as `scopes_requested`. It is the provenance half of
+            -- the baseline a refresh re-derives the grant from (§5.7.5), and it
+            -- is persisted rather than re-parsed out of `scopes_requested`
+            -- because §9-D23's rule has no exceptions.
+            scope_provenance_requested BLOB,
             dpop_jkt TEXT,
             client_assertion_key_id TEXT,
             client_assertion_algorithm TEXT,

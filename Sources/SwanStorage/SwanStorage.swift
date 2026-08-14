@@ -439,6 +439,28 @@ public struct OAuthClientBinding: Sendable, Equatable {
     /// Which parameters the client stated, keyed by effective scope string.
     /// `nil` for rows written before the column existed.
     public let scopeProvenance: OAuthScopeProvenance?
+    /// The same bits keyed by the **requested** scope strings — the exact
+    /// counterpart of `scopesRequested`, and stored under exactly the same rule:
+    /// present iff the requested set is.
+    ///
+    /// It exists because re-deriving the grant on refresh (§5.7.5's second call
+    /// site) has to start from the requested bytes, and the transformations
+    /// carry provenance forward by re-keying it. `scopeProvenance` is keyed by
+    /// the *effective* strings, so it cannot serve as that input: the entry for
+    /// a rewritten scope sits under a key the requested set does not contain.
+    ///
+    /// Persisted rather than recovered by re-parsing `scopesRequested`, because
+    /// §9-D23's rule is mechanical: provenance is durable state, carried forward
+    /// from the parse that produced it, and never reconstructed from a
+    /// serialised scope string. A reader cannot tell locally whether a given
+    /// string is the client's or Swan's, which is the whole reason the rule has
+    /// no exceptions.
+    ///
+    /// `nil` alongside a non-`nil` `scopesRequested` therefore means one thing
+    /// only: a row written before this column existed. Refresh treats that as
+    /// "cannot re-derive" and leaves the grant frozen — see
+    /// ``requestedBaseline()``.
+    public let scopeProvenanceRequested: OAuthScopeProvenance?
 
     public init(
         issuer: String,
@@ -449,7 +471,8 @@ public struct OAuthClientBinding: Sendable, Equatable {
         confidentialClientKey: OAuthConfidentialClientKeyBinding? = nil,
         refreshTokenAllowed: Bool = true,
         scopesRequested: Set<String>? = nil,
-        scopeProvenance: OAuthScopeProvenance? = nil
+        scopeProvenance: OAuthScopeProvenance? = nil,
+        scopeProvenanceRequested: OAuthScopeProvenance? = nil
     ) {
         self.issuer = issuer
         self.clientID = clientID
@@ -463,6 +486,12 @@ public struct OAuthClientBinding: Sendable, Equatable {
         // once, so no caller has to remember the rule.
         self.scopesRequested = scopesRequested == scopes ? nil : scopesRequested
         self.scopeProvenance = scopeProvenance
+        // Collapsed by the same rule and in the same place: when the requested
+        // set is not stored, its provenance has nothing to be keyed by, and
+        // `scopeProvenance` is already keyed by those very strings.
+        self.scopeProvenanceRequested = self.scopesRequested == nil
+            ? nil
+            : scopeProvenanceRequested
     }
 
     /// The baseline a refreshing client is compared against (§9-D20). The `??`
@@ -474,6 +503,47 @@ public struct OAuthClientBinding: Sendable, Equatable {
     /// `authority=self` is the grammar's default, so the comparison would fail
     /// for essentially every grant Swan issues.
     public var requestedScopes: Set<String> { scopesRequested ?? scopes }
+
+    /// This binding as it stood **before** any mint-time transformation: the
+    /// requested scopes with the provenance that parse produced, and nothing
+    /// derived from either.
+    ///
+    /// It is the input a refresh re-derives from (§5.7.5's "token mint /
+    /// refresh"), which upstream spells `buildTokenScope(parameters.scope!, …)`
+    /// on every rotation (`token-manager.ts:260`). The operand is the same one
+    /// §9-D20 fixed for the refresh binding comparison, and for the same reason:
+    /// `scopes` holds the post-`self`-resolution grant (§9-D8), so re-deriving
+    /// from it would re-resolve an already-resolved value and drift.
+    ///
+    /// `nil` means the requested-side provenance is unavailable — a row written
+    /// before `scope_provenance_requested` existed. It is deliberately not
+    /// substituted with an empty map: an empty map is a *claim* that the client
+    /// stated nothing, which would silently close both §9-D23 fences on a live
+    /// grant that legitimately stated something. A caller that cannot get a
+    /// baseline must leave the grant alone rather than narrow it.
+    public func requestedBaseline() -> OAuthClientBinding? {
+        let provenance: OAuthScopeProvenance?
+        if let scopeProvenanceRequested {
+            provenance = scopeProvenanceRequested
+        } else if scopesRequested == nil {
+            // Requested == effective, so `scopeProvenance` is already keyed by
+            // the requested strings. Total for every pre-migration row, by the
+            // same NULL rule as `requestedScopes` (§6.7).
+            provenance = scopeProvenance ?? OAuthScopeProvenance()
+        } else {
+            return nil
+        }
+        return OAuthClientBinding(
+            issuer: issuer,
+            clientID: clientID,
+            redirectURI: redirectURI,
+            scopes: requestedScopes,
+            dpopJKT: dpopJKT,
+            confidentialClientKey: confidentialClientKey,
+            refreshTokenAllowed: refreshTokenAllowed,
+            scopeProvenance: provenance
+        )
+    }
 
     /// Everything a durable comparison treats as the binding's identity.
     ///
@@ -493,6 +563,11 @@ public struct OAuthClientBinding: Sendable, Equatable {
     /// Returns a copy whose effective grant is `scopes`, preserving the
     /// requested bytes and re-keyed provenance. Used by the mint-time `self`
     /// rewrite (§6.4), which changes values and must not change statedness.
+    ///
+    /// The requested-side provenance is frozen here, at the one point where the
+    /// two sides part company: whatever this binding held before the rewrite is
+    /// what the requested strings were parsed with, so it is preserved verbatim
+    /// rather than re-derived later from either serialised set (§9-D23).
     public func withEffectiveScopes(
         _ scopes: Set<String>,
         provenance: OAuthScopeProvenance?
@@ -506,7 +581,10 @@ public struct OAuthClientBinding: Sendable, Equatable {
             confidentialClientKey: confidentialClientKey,
             refreshTokenAllowed: refreshTokenAllowed,
             scopesRequested: requestedScopes,
-            scopeProvenance: (provenance ?? scopeProvenance)?.restricted(to: scopes)
+            scopeProvenance: (provenance ?? scopeProvenance)?.restricted(to: scopes),
+            scopeProvenanceRequested: scopeProvenanceRequested
+                ?? scopeProvenance
+                ?? OAuthScopeProvenance()
         )
     }
 }
@@ -671,6 +749,32 @@ public struct OAuthIssuedTokenDigests: Sendable, Equatable {
     }
 }
 
+/// A grant re-derived at refresh, written into its family row by the same
+/// durable transaction that rotates the token digests (§5.7.5's second call
+/// site; upstream passes `scope` into `store.rotateToken`, `token-manager.ts:266-274`).
+///
+/// It carries the effective side only. The requested side — `scopes_requested`
+/// and `scope_provenance_requested` — is the client's own frozen input and the
+/// baseline every later refresh re-derives from (§9-D20); a rotation that
+/// rewrote it would move the baseline under itself, and the second refresh
+/// would compare against bytes the client never sent.
+///
+/// Rotation and scope rewrite are one transaction rather than two on purpose: a
+/// write that rotated the digests without the scopes would mint a token whose
+/// stored grant is the one the re-derivation just rejected, and the reverse
+/// would narrow a live family without issuing the token that narrowing was for.
+public struct OAuthRefreshedGrant: Sendable, Equatable {
+    /// The effective, post-transformation grant.
+    public let scopes: Set<String>
+    /// Provenance keyed by those effective strings (§9-D23).
+    public let scopeProvenance: OAuthScopeProvenance
+
+    public init(scopes: Set<String>, scopeProvenance: OAuthScopeProvenance) {
+        self.scopes = scopes
+        self.scopeProvenance = scopeProvenance
+    }
+}
+
 /// The two opaque token tables which may identify a durable OAuth family for
 /// RFC 7009 revocation. Keeping this typed prevents an adapter from probing
 /// arbitrary control-plane tables using a client-presented string.
@@ -776,9 +880,15 @@ public protocol OAuthControlStore: Sendable {
         kind: OAuthOpaqueTokenKind,
         now: Date
     ) async throws -> OAuthTokenFamily?
+    /// Rotates a refresh token and, when `rewrittenGrant` is present, writes the
+    /// re-derived grant into the same family row **inside the same
+    /// transaction**. `nil` leaves the stored grant untouched, which is both the
+    /// no-change case and the "cannot re-derive" case (see
+    /// ``OAuthClientBinding/requestedBaseline()``).
     func redeemRefreshToken(
         refreshTokenDigest: Data,
         replacement: OAuthIssuedTokenDigests,
+        rewrittenGrant: OAuthRefreshedGrant?,
         requireActiveSubject: Bool,
         now: Date
     ) async throws

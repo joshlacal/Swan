@@ -982,7 +982,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                     """
                     SELECT f.family_id, f.subject, f.issuer, f.client_id,
                            f.redirect_uri, f.scopes, f.scopes_requested,
-                           f.scope_provenance, f.dpop_jkt,
+                           f.scope_provenance, f.scope_provenance_requested, f.dpop_jkt,
                            f.client_assertion_key_id, f.client_assertion_algorithm,
                            f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at, f.revoked_at,
                            a.expires_at AS token_expires_at
@@ -1053,7 +1053,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                     """
                     SELECT f.family_id, f.subject, f.issuer, f.client_id,
                            f.redirect_uri, f.scopes, f.scopes_requested,
-                           f.scope_provenance, f.dpop_jkt,
+                           f.scope_provenance, f.scope_provenance_requested, f.dpop_jkt,
                            f.client_assertion_key_id, f.client_assertion_algorithm,
                            f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at, f.revoked_at,
                            t.expires_at AS token_expires_at
@@ -1077,6 +1077,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
     public func redeemRefreshToken(
         refreshTokenDigest: Data,
         replacement: OAuthIssuedTokenDigests,
+        rewrittenGrant: OAuthRefreshedGrant? = nil,
         requireActiveSubject: Bool,
         now: Date = Date()
     ) async throws {
@@ -1111,6 +1112,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                     [.integer(try timestamp(now)), blob(refreshTokenDigest)]
                 )
                 try await insertTokenPair(replacement)
+                try await rewriteGrant(rewrittenGrant, of: family)
                 return false
             }
         }
@@ -1532,6 +1534,19 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 column: "scope_provenance",
                 definition: "BLOB"
             )
+            // Additive, and on the same authorization path as `scopes_requested`
+            // rather than beside it: refresh re-derives the grant from the
+            // requested set, and this is the provenance that derivation carries
+            // forward (§5.7.5). NULL beside a NON-NULL `scopes_requested` is the
+            // one shape that means "written before this column existed", and
+            // refresh reads it as "leave this family's grant frozen" — not as
+            // "the client stated nothing", which would close both §9-D23 fences
+            // on a live grant.
+            try await addColumnIfMissing(
+                table: "oauth_control_token_families",
+                column: "scope_provenance_requested",
+                definition: "BLOB"
+            )
             try await addColumnIfMissing(
                 table: "oauth_control_client_metadata_freshness",
                 column: "published_generation",
@@ -1942,8 +1957,10 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
 
     private func insertFamily(_ family: OAuthTokenFamily) async throws {
         // Every caller of this is a MINT — `storeAuthorizationCode` and
-        // `issueTokenPair`. Rotation never rewrites a family row, so stage G's
-        // strict half belongs here and nowhere else.
+        // `issueTokenPair` — so stage G's strict half belongs here. Rotation
+        // now DOES rewrite a family row (`rewriteGrant`), and deliberately does
+        // not repeat this gate: see that method for why re-parsing on a rewrite
+        // would lock a live session out.
         try validateNewlyMintedScopes(family.binding.scopes)
         try await requireInsertionCapacity(
             table: "oauth_control_token_families",
@@ -1955,10 +1972,10 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
             """
             INSERT INTO oauth_control_token_families(
                 family_id, subject, issuer, client_id, redirect_uri, scopes,
-                scopes_requested, scope_provenance,
+                scopes_requested, scope_provenance, scope_provenance_requested,
                 dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
                 client_assertion_jkt, refresh_token_allowed, expires_at, revoked_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 .text(family.familyID.uuidString), .text(family.subject),
@@ -1966,6 +1983,12 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 .text(family.binding.redirectURI), blob(try encodeScopes(family.binding.scopes)),
                 try encodeOptionalScopes(family.binding.scopesRequested),
                 try encodeProvenance(family.binding.scopeProvenance),
+                // `encodePresentProvenance`, not `encodeProvenance`: an EMPTY
+                // requested-side map is a real answer ("the client stated
+                // nothing anywhere") and must not collapse to NULL, which on
+                // this column means "written by an older binary" and freezes the
+                // grant on every future refresh.
+                try encodePresentProvenance(family.binding.scopeProvenanceRequested),
                 optionalText(family.binding.dpopJKT),
                 optionalText(family.binding.confidentialClientKey?.keyID),
                 optionalText(family.binding.confidentialClientKey?.algorithm),
@@ -1973,6 +1996,52 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
                 .integer(family.binding.refreshTokenAllowed ? 1 : 0),
                 .integer(try timestamp(family.expiresAt)),
                 family.revokedAt.map { try? timestamp($0) }.flatMap { $0 }.map(SQLiteData.integer) ?? .null,
+            ]
+        )
+    }
+
+    /// Writes a refresh-time re-derived grant into its family row.
+    ///
+    /// **Called only from inside the rotation transaction**, after the `used_at`
+    /// CAS has been won. That placement is the whole atomicity argument: a
+    /// concurrent redemption of the same token either loses the CAS — in which
+    /// case it revokes the family and never reaches here — or has not started,
+    /// because `BEGIN IMMEDIATE` serialises the two. There is no interleaving in
+    /// which one refresh's digests pair with another's scopes.
+    ///
+    /// `nil`, or a grant equal to the stored one, writes nothing at all. A
+    /// resolver that keeps answering the same document is the common case, and
+    /// re-writing an identical row on every rotation is pure churn.
+    ///
+    /// The scopes are validated as `validScope` (via `encodeScopes`) and for the
+    /// base-scope floor, but **deliberately not re-parsed**. Stage G's strict
+    /// half belongs to mint: a live family may legitimately hold a scope a newer
+    /// grammar cannot parse, and rejecting one here would lock that session out
+    /// permanently over a scope the client is not using (§9-D5, §7.5 item 4).
+    /// The floor check is not optional in the same way — a set that fails it
+    /// would decode as `malformedRecord` on the very next read, so refusing the
+    /// rotation is strictly better than writing a row nothing can load.
+    private func rewriteGrant(
+        _ grant: OAuthRefreshedGrant?,
+        of family: OAuthTokenFamily
+    ) async throws {
+        guard let grant,
+              grant.scopes != family.binding.scopes
+                  || grant.scopeProvenance != (family.binding.scopeProvenance ?? OAuthScopeProvenance())
+        else { return }
+        guard hasATProtocolResourceScope(grant.scopes) else {
+            throw OAuthControlStoreError.invalidInput
+        }
+        _ = try await connection.query(
+            """
+            UPDATE oauth_control_token_families
+            SET scopes = ?, scope_provenance = ?
+            WHERE family_id = ?
+            """,
+            [
+                blob(try encodeScopes(grant.scopes)),
+                try encodeProvenance(grant.scopeProvenance.restricted(to: grant.scopes)),
+                .text(family.familyID.uuidString),
             ]
         )
     }
@@ -2041,7 +2110,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         let rows = try await connection.query(
             """
             SELECT family_id, subject, issuer, client_id, redirect_uri, scopes,
-                   scopes_requested, scope_provenance,
+                   scopes_requested, scope_provenance, scope_provenance_requested,
                    dpop_jkt, client_assertion_key_id, client_assertion_algorithm,
                    client_assertion_jkt, refresh_token_allowed, expires_at, revoked_at
             FROM oauth_control_token_families
@@ -2058,7 +2127,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         SELECT c.family_id, c.code_challenge_method, c.code_challenge_s256, c.expires_at,
                c.reuse_expires_at, c.consumed_at,
                f.subject, f.issuer, f.client_id, f.redirect_uri, f.scopes,
-               f.scopes_requested, f.scope_provenance,
+               f.scopes_requested, f.scope_provenance, f.scope_provenance_requested,
                f.dpop_jkt, f.client_assertion_key_id, f.client_assertion_algorithm,
                f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at AS family_expires_at,
                f.revoked_at
@@ -2072,6 +2141,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         """
         SELECT f.family_id, f.subject, f.issuer, f.client_id, f.redirect_uri,
                f.scopes, f.scopes_requested, f.scope_provenance,
+               f.scope_provenance_requested,
                f.dpop_jkt, f.client_assertion_key_id,
                f.client_assertion_algorithm, f.client_assertion_jkt, f.refresh_token_allowed, f.expires_at,
                f.revoked_at, r.expires_at AS token_expires_at, r.used_at
@@ -2181,7 +2251,12 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
             // migration. Absent is the correct answer in both cases, not an
             // error: NULL means "requested == scopes" (§6.7).
             scopesRequested: try decodeOptionalScopes(row, "scopes_requested"),
-            scopeProvenance: try decodeProvenance(row, "scope_provenance")
+            scopeProvenance: try decodeProvenance(row, "scope_provenance"),
+            // NULL here is load-bearing rather than tolerated: beside a non-NULL
+            // `scopes_requested` it is the only signal that this row predates
+            // refresh-time re-derivation, and `requestedBaseline()` refuses to
+            // re-derive without it.
+            scopeProvenanceRequested: try decodeProvenance(row, "scope_provenance_requested")
         )
         do {
             try validate(binding: binding)
@@ -2325,6 +2400,22 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
         } catch {
             throw OAuthControlStoreError.invalidInput
         }
+    }
+
+    /// `encodeProvenance` for a column where **absent and empty differ**.
+    ///
+    /// `scope_provenance` may collapse an empty map to NULL because both answer
+    /// the same question there — nothing was stated, and the fences deny either
+    /// way. `scope_provenance_requested` cannot: NULL is how a pre-migration row
+    /// is recognised, so an empty map written as NULL would make every grant
+    /// whose client stated no parameters at all look pre-migration and never
+    /// re-derive on refresh. That is the common shape, not a corner case.
+    private func encodePresentProvenance(
+        _ provenance: OAuthScopeProvenance?
+    ) throws -> SQLiteData {
+        guard let provenance else { return .null }
+        guard !provenance.isEmpty else { return blob(Data("{}".utf8)) }
+        return try encodeProvenance(provenance)
     }
 
     private func decodeProvenance(
