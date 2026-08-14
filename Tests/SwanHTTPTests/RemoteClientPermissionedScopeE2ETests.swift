@@ -181,12 +181,13 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
             "A2b: registration validates RFC scope-token syntax and Swan's budgets, nothing semantic"
         )
 
-        // A2b′ — the same scope requested at PAR is rejected. A2b + A2b′ together
-        // are the pair that proves the layer boundary MOVED rather than the check
-        // disappearing; asserting only one of them pins the retired behaviour.
+        // A2b′ (parser half) — the scope does not parse. This is a PRECONDITION
+        // for the HTTP assertion below, not a substitute for it: it proves the
+        // parser's answer, not that PAR consults the parser. The layer assertion
+        // lives in `testStage2MalformedScopeIsRejectedAtPARNotAtRegistration`.
         XCTAssertThrowsError(
             try AtprotoScope.parse(malformed),
-            "A2b′: §9-D5 rejects an unparseable REQUESTED scope with invalid_scope"
+            "A2b′ precondition: the scope must be unparseable for the PAR test to mean anything"
         )
 
         // A2c — the lexical/budget floor is the only registration gate, so it has
@@ -200,6 +201,145 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
         }
         XCTAssertTrue(ScopeToken.isScopeToken(BulletedApp.space))
         XCTAssertTrue(client.scopes.allSatisfy(ScopeToken.isScopeToken))
+    }
+
+    /// **A2b′ at the layer the spec actually names.** The pair A2b + A2b′ only
+    /// proves the boundary *moved* if the second half is asserted where the
+    /// rejection is supposed to happen — the PAR/authorize layer — not at the
+    /// parser.
+    ///
+    /// The distinction is load-bearing under §9-D21: registration is lexical and
+    /// budget-only, and PAR is the layer that rejects semantically. A wiring bug
+    /// in which PAR never calls the parse gate at all would leave a
+    /// parser-level `XCTAssertThrowsError` perfectly green while the security
+    /// property is gone. So this drives the real endpoint over HTTP: same remote
+    /// client, same malformed scope, through `/oauth/par`, expecting
+    /// `invalid_scope`.
+    ///
+    /// The DPoP-nonce challenge is part of the path (`OAuthPARHTTPTests.swift:15-51`
+    /// establishes the shape): the first POST is answered with
+    /// `use_dpop_nonce`, and only the retry carrying the nonce reaches scope
+    /// admission. Asserting on the first response would prove nothing about
+    /// scopes at all.
+    func testStage2MalformedScopeIsRejectedAtPARNotAtRegistration() async throws {
+        let fixture = try await PermissionedScopeFixture.make()
+        defer { Task { await fixture.tearDown() } }
+
+        let malformed = "space:not-an-nsid?authority=notadid&skey=k&action=read"
+        // The client REGISTERS this scope — A2b — so PAR's subset check passes and
+        // the request reaches scope admission rather than being turned away for
+        // requesting something it never declared. Without this the test would go
+        // green on the wrong rejection.
+        let client = try PermissionedScopeClient(scopes: [BulletedApp.base, malformed])
+        let app = try await fixture
+            .buildRemoteAuthorizationServer(clientMetadata: try client.metadata())
+            .buildApplication(
+                logger: Logger(label: "RemoteClientPermissionedScopeE2ETests.par-invalid-scope")
+            )
+
+        func form(scope: String) -> String {
+            [
+                ("client_id", client.clientID.absoluteString),
+                ("redirect_uri", client.redirectURI.absoluteString),
+                ("response_type", "code"),
+                ("scope", scope),
+                ("state", "a2b-prime"),
+                ("code_challenge", String(repeating: "a", count: 43)),
+                ("code_challenge_method", "S256"),
+            ].map { "\(scopeFormEncode($0.0))=\(scopeFormEncode($0.1))" }
+                .joined(separator: "&")
+        }
+        var headers: HTTPFields = [
+            .contentType: "application/x-www-form-urlencoded; charset=utf-8",
+        ]
+
+        try await app.test(.router) { http in
+            // 1. Unproofed POST earns the nonce challenge.
+            var nonce: String?
+            try await http.execute(
+                uri: "/oauth/par",
+                method: .post,
+                headers: headers,
+                body: ByteBuffer(string: form(scope: "\(BulletedApp.base) \(malformed)"))
+            ) { response in
+                XCTAssertEqual(response.status, .badRequest)
+                XCTAssertEqual(
+                    try Self.errorCode(from: response.body),
+                    "use_dpop_nonce",
+                    "expected the DPoP nonce challenge before scope admission is reached"
+                )
+                nonce = response.headers[HTTPField.Name("DPoP-Nonce")!]
+            }
+
+            // 2. Retry with the nonce. THIS is the request that reaches scope
+            //    admission, and it must be refused with `invalid_scope`.
+            let challenge = try XCTUnwrap(nonce)
+            headers[HTTPField.Name("DPoP")!] = try makeScopeDPoPProof(
+                key: client.signingKey,
+                jwk: client.jwk,
+                jti: "a2b-prime-malformed",
+                nonce: challenge,
+                method: "POST",
+                target: try OAuthDPoPProofValidator.normalizedTarget(
+                    PermissionedScopeFixture.issuer.appending(path: "oauth/par")
+                )
+            )
+            try await http.execute(
+                uri: "/oauth/par",
+                method: .post,
+                headers: headers,
+                body: ByteBuffer(string: form(scope: "\(BulletedApp.base) \(malformed)"))
+            ) { response in
+                XCTAssertEqual(
+                    try Self.errorCode(from: response.body),
+                    "invalid_scope",
+                    """
+                    A2b′: §9-D5 rejects an unparseable REQUESTED scope at PAR with \
+                    `invalid_scope`. Swan deliberately diverges from upstream's \
+                    silent drop (`request-manager.ts:179-185`): a silently narrowed \
+                    grant hands the client an `atproto`-only token and then an \
+                    opaque 401 at the resource plane with nothing in the OAuth \
+                    response pointing at the cause. If this returns `created`, PAR \
+                    is not consulting the parse gate at all and the semantic check \
+                    that §9-D21 moved here does not exist.
+                    """
+                )
+                XCTAssertEqual(response.status, .badRequest)
+            }
+
+            // 3. Control: the SAME client, same endpoint, same nonce path, with
+            //    only well-formed scopes — must be admitted. Without this, a PAR
+            //    that rejected everything would pass the assertion above.
+            headers[HTTPField.Name("DPoP")!] = try makeScopeDPoPProof(
+                key: client.signingKey,
+                jwk: client.jwk,
+                jti: "a2b-prime-control",
+                nonce: challenge,
+                method: "POST",
+                target: try OAuthDPoPProofValidator.normalizedTarget(
+                    PermissionedScopeFixture.issuer.appending(path: "oauth/par")
+                )
+            )
+            try await http.execute(
+                uri: "/oauth/par",
+                method: .post,
+                headers: headers,
+                body: ByteBuffer(string: form(scope: BulletedApp.base))
+            ) { response in
+                XCTAssertEqual(
+                    response.status,
+                    .created,
+                    "positive control: a well-formed scope from the same client must still be admitted"
+                )
+            }
+        }
+    }
+
+    private static func errorCode(from body: ByteBuffer) throws -> String {
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(buffer: body)) as? [String: Any]
+        )
+        return try XCTUnwrap(object["error"] as? String)
     }
 
     // MARK: - Stage 3: PAR
@@ -513,12 +653,35 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
             every call is denied, and it looks like a client bug.
             """
         )
-        // ... and the requested bytes are preserved separately (§6.7). The
-        // observable form of that: the granted set is NOT the requested set.
+        // PARTIAL — and the gap is deliberate rather than overlooked.
+        //
+        // §7.4 Stage 5 also requires asserting that `scopes_requested` holds the
+        // PRE-resolution set while `scopes` holds the resolved one (§6.7). This
+        // assertion does NOT prove that. `OAuthTokenGrantResult`
+        // (`SwanOAuth.swift:162-171`) exposes only `scopes: Set<String>`; there is
+        // no requested-set field on the type, so the strongest thing reachable
+        // from here is that the granted set DIFFERS from what the client asked
+        // for — i.e. that *something* was rewritten, not that the original bytes
+        // were preserved anywhere.
+        //
+        // That distinction is exactly what §9-D20 turns on: a mint that resolved
+        // `self` and then DISCARDED the requested bytes would satisfy the
+        // assertion below and still break refresh for every `self`-bearing grant.
+        // The property is covered end-to-end by
+        // `ScopeRefreshSurvivalMigrationTests` (refresh with the original bytes
+        // must succeed), which is behavioural and needs no new field.
+        //
+        // TODO(L2, §6.7): once `OAuthTokenGrantResult` exposes the requested set,
+        // replace this with the literal assertion — compare against
+        // `scopes_requested ?? scopes`, NEVER `binding.scopes`.
         XCTAssertNotEqual(
             issued.scopes,
             client.scopeSet,
-            "`scopes_requested` holds the pre-resolution set and `scopes` the resolved one (§6.7)"
+            """
+            Proxy assertion: the granted set was rewritten relative to the \
+            request, which is a necessary but NOT sufficient condition for §6.7's \
+            dual-field guarantee. See the comment above before strengthening this.
+            """
         )
     }
 
