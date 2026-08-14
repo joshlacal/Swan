@@ -456,6 +456,88 @@ Note the two predicate spellings are not a contradiction: `isAtprotoAudience` is
 `` `${AtprotoDid}#${string}` `` — DID plus exactly one fragment. **Neither
 predicate accepts `*`**, so E2 holds across every tree checked.
 
+## P2-F findings — wiring
+
+### F1 — §7.4 Stage 6 check 3 was already labelled a divergence; nothing to re-label
+
+P2-F was briefed to re-label §7.4 Stage 6 check 3, which "currently pins [a bare
+`space:` grant having no write targets] as upstream conformance". Read at
+`docs/superpowers/specs/2026-08-14-oauth-permission-scopes-design.md:5661-5670`,
+it already says, in bold, *"Assert this as a Phase-1 DIVERGENCE, not as
+conformance"*, names `expandSpaceCollections` and `lexicon-manager.ts:74-95` as
+what a conformant AS runs, and even prescribes the test name. The test
+(`RemoteClientPermissionedScopeE2ETests.testBareSpaceGrantHasNoWriteTargetsUntilPhase2`)
+carries the same framing in its own doc comment and assertion message.
+
+The instruction was written against an earlier state of the spec and the fix had
+already landed with §5.7.5 itself. **No spec text was edited.** What P2-F added
+instead is the *closing* half: that test's doc comment now names what closes the
+divergence (a configured resolver), and points at the two unit vectors that pin
+both sides — `testABareGrantIsWritableAfterMaterialisation` (with a resolver: the
+same grant comes out writable) and
+`testWithoutAResolverBothTransformationsArePhase1PassThroughs` (without one: the
+E2E assertion restated at unit level, so the two cannot drift).
+
+### F2 — refresh does not re-derive the token scope (divergence, NOT closed by this lane)
+
+§5.7.5 names the second call site "**token mint / refresh**", and §5.7.4's
+24-hour hard-expiry rationale argues explicitly from *"the token scope is
+re-derived on every refresh (`token-manager.ts:260-263`)"*. **Swan's refresh does
+not re-derive anything.** `DurableOAuthTokenService.redeemRefreshForClient`
+returns `family.binding.scopes` — the set frozen at mint — and
+`redeemRefresh`/`controlStore.redeemRefreshToken` rotate token digests without
+touching the binding. Verified by reading both, not inferred.
+
+Two consequences worth stating separately:
+
+1. The hard expiry does not do the job §5.7.4 assigns it. Its stated purpose is
+   that a permission set **narrowed** upstream stops minting the wider grant;
+   with no re-derivation, a 14-day refresh family keeps the mint-time grant for
+   its whole life regardless of what the authority now declares. The expiry still
+   bounds *serving a stale cached document at the next mint*, which is a
+   different and smaller property.
+2. It is not a small addition. Re-deriving at refresh means writing a new scope
+   set into an existing family row, and `redeemRefreshToken` is a fixed durable
+   rotation transaction that takes token digests and nothing else. That is a
+   control-store change, not a call-site change, so P2-F did not absorb it —
+   scope for this lane is the two call sites §5.7.5 enumerates.
+
+### F3 — resolution is opt-in, and a `nil` resolver is a documented pass-through
+
+`--enable-lexicon-resolution` (off by default) is what constructs a
+`SwanLexiconResolver` in the composition root. With no resolver, **both**
+transformations pass through: `include:` persists and grants nothing (§9-D4's
+stated cost, still pinned by
+`testIncludeScopesAuthorizeSuccessfullyThenGrantNothing`) and a bare
+`space:<type>` materialises no write targets (F1).
+
+The alternative — refusing an `include:` outright when no resolver is configured
+— was considered and rejected: it converts an operator's *absence* of
+configuration into a hard rejection of clients that authorize successfully today,
+which is an outage rather than a correctness fix. The divergence is recorded in
+three places (the flag's help text, `OAuthLexiconScopeResolution`'s doc comment,
+and the two tests above) rather than traded for one.
+
+Opt-in rather than default-on for two reasons that are not preference: turning it
+on adds DNS + a DID-document read + a CAR fetch to the PAR path, and it changes
+what an *already-registered* scope string mints. Neither is a change to make on
+an operator's behalf.
+
+### F4 — the consent payload is re-derived, not carried
+
+§5.7.5 describes PAR/authorize as one call site doing both jobs, which is true
+upstream because `oauth-provider.ts:744-762` builds the consent payload in the
+same request. In Swan the consent page renders in a **different HTTP request**
+(`POST /oauth/authorize`, after login) than PAR. P2-F therefore runs the gate at
+PAR and re-derives the expansion at consent render, which costs one document-cache
+read — the row was proved seconds earlier, well inside the 5-minute refresh
+threshold, and the PAR lifetime is 90 s.
+
+The alternative was persisting a rendered payload into the PAR row. That was
+rejected because §6.7 defines the binding's scope columns as the client's own
+requested bytes; a display artifact in the durable binding would be exactly the
+kind of derived-value-in-storage §9-D23 spends its length arguing against.
+
 ## Completion gate
 
 Phase 2 is not done until all of these are green **and** independently measured

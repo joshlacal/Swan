@@ -32,15 +32,36 @@ public struct SwanOAuthRuntime: Sendable {
     /// never crosses into `OAuthControlStore`; validators receive this service
     /// from the runtime rather than accepting arbitrary caller text as a nonce.
     public let dpopNonceService: DPoPNonceService
+    /// §5.7.4's resolver, or `nil` when this deployment has no lexicon authority
+    /// configured.
+    ///
+    /// It is carried on the runtime rather than reached for at a call site
+    /// because BOTH §5.7.5 call sites need the same instance: PAR/consent lives
+    /// in SwanHTTP and token mint lives in ``DurableOAuthTokenService``, and two
+    /// resolvers would mean two caches — so a document proved at PAR would be
+    /// re-proved, over the network, at mint.
+    ///
+    /// The concrete `SwanLexiconResolver` is in **SwanInterop**, which depends on
+    /// SwanOAuth and not the reverse; only the protocol (SwanCore) is nameable
+    /// here. The composition root (`swan`) depends on both and injects one into
+    /// the other. No source target's `Package.swift` dependencies change.
+    ///
+    /// `nil` is Phase-1 behaviour, deliberately and with a recorded cost: an
+    /// `include:` grants nothing and a bare `space:<type>` materialises no write
+    /// targets. See ``OAuthLexiconScopeResolution``.
+    public let lexiconResolver: (any SwanLexiconResolving)?
 
     public init(
         controlStore: any OAuthControlStore & SpaceDelegationReplayStore,
-        serverKey: Data
+        serverKey: Data,
+        lexiconResolver: (any SwanLexiconResolving)? = nil
     ) throws {
         tokenService = try DurableOAuthTokenService(
             controlStore: controlStore,
-            serverKey: serverKey
+            serverKey: serverKey,
+            lexiconResolver: lexiconResolver
         )
+        self.lexiconResolver = lexiconResolver
         dpopReplayStore = try DurableDPoPReplayStore(
             controlStore: controlStore,
             serverKey: serverKey
@@ -70,6 +91,9 @@ public actor DurableOAuthTokenService {
 
     private let controlStore: any OAuthControlStore
     private let macKey: SymmetricKey
+    /// §5.7.5 call site 2. `nil` leaves this service in Phase-1 behaviour — see
+    /// ``SwanOAuthRuntime/lexiconResolver``.
+    private let lexiconResolver: (any SwanLexiconResolving)?
 
     /// A resource-facing grant deliberately includes the DPoP binding instead
     /// of looking like a plain bearer-token result. Resource middleware must
@@ -126,11 +150,16 @@ public actor DurableOAuthTokenService {
         }
     }
 
-    public init(controlStore: any OAuthControlStore, serverKey: Data) throws {
+    public init(
+        controlStore: any OAuthControlStore,
+        serverKey: Data,
+        lexiconResolver: (any SwanLexiconResolving)? = nil
+    ) throws {
         guard serverKey.count == 32 else {
             throw SwanError.malformed("OAuth server key must be exactly 32 bytes")
         }
         self.controlStore = controlStore
+        self.lexiconResolver = lexiconResolver
         macKey = SymmetricKey(data: serverKey)
     }
 
@@ -143,11 +172,14 @@ public actor DurableOAuthTokenService {
         familyID: UUID = UUID(),
         now: Date = Date()
     ) async throws -> OAuthTokenPair {
-        // Stage F, as at `_issueAuthorizationCode`: this is a mint, so the
-        // family row must hold the RESOLVED grant or it would grant nothing.
-        let binding = try OAuthScopeAdmissionPolicy.resolvingSelfAuthority(
+        // §5.7.5 call site 2, as at `_issueAuthorizationCode`: this is a mint, so
+        // the family row must hold the RESOLVED grant or it would grant nothing.
+        // (a) `include:` → concrete, (b) `expandSpaceCollections`, (c) stage F's
+        // `self` → subject, in that order.
+        let binding = try await OAuthLexiconScopeResolution.resolvingLexiconGrants(
             session.durableBinding,
-            subject: subject
+            subject: subject,
+            resolver: lexiconResolver
         )
         try requireOAuthDPoPBinding(binding)
         let pair = try makeTokenPair(
@@ -392,9 +424,17 @@ public actor DurableOAuthTokenService {
         // nothing at all on every request. The requested bytes are preserved
         // separately on the binding, and provenance is carried rather than
         // re-derived — resolving `self` changes the value, never the statedness.
-        let resolved = try OAuthScopeAdmissionPolicy.resolvingSelfAuthority(
+        //
+        // Stage F is (c) of §5.7.5's three transformations, and it does not run
+        // alone: (a) `include:` → concrete and (b) `expandSpaceCollections` run
+        // first, in that order, inside `resolvingLexiconGrants`. All three land
+        // here rather than earlier because §6.3 stage C compares *raw requested*
+        // against *registered* and both sides must still be in `include:` form
+        // for that comparison to mean anything.
+        let resolved = try await OAuthLexiconScopeResolution.resolvingLexiconGrants(
             binding,
-            subject: subject
+            subject: subject,
+            resolver: lexiconResolver
         )
         try requireOAuthDPoPBinding(resolved)
         let code = Self.randomOpaqueValue()

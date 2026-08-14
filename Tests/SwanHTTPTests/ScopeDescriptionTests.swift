@@ -299,6 +299,45 @@ struct ScopeDescriptionTests {
         #expect(text.contains(expected))
     }
 
+    /// §5.7.5's last row: an `include:` that Phase-2 resolution proved and
+    /// expanded to **zero** grants is not an error, and must still be rendered.
+    ///
+    /// By that point the `include:` string is gone — expansion replaced it, and
+    /// an empty expansion replaced it with nothing — so the NSID arrives on its
+    /// own channel. If it did not reach the page, the only trace would be a
+    /// `.warn` in the operator's log, which the person authorizing never sees;
+    /// the permission set would simply have vanished from the consent screen.
+    @Test("an empty Phase-2 expansion renders the same canonical string, naming the NSID")
+    func emptyExpansionRendersCanonicalWording() {
+        let html = ScopeDescription.render(
+            scopes: ["atproto"], emptyPermissionSets: ["com.example.bar"]
+        )
+        let text = stripTags(html)
+        #expect(
+            text.contains(
+                "Requested permission set com.example.bar. Swan does not currently grant capabilities derived from this set."
+            )
+        )
+    }
+
+    /// One NSID, two routes to the same card — a Phase-1 `include:` still in the
+    /// scope set and a Phase-2 empty expansion naming it — must print once.
+    @Test("an NSID reaching the include card both ways is not printed twice")
+    func includeNSIDIsNotDuplicatedAcrossBothChannels() {
+        let html = ScopeDescription.render(
+            scopes: ["include:com.example.bar"], emptyPermissionSets: ["com.example.bar"]
+        )
+        let text = stripTags(html)
+        let needle = "Requested permission set com.example.bar."
+        var count = 0
+        var cursor = text.startIndex
+        while let found = text.range(of: needle, range: cursor ..< text.endIndex) {
+            count += 1
+            cursor = found.upperBound
+        }
+        #expect(count == 1)
+    }
+
     // MARK: - D11 / §9-D19 — transition:* recognised, grants nothing, never raw-only
 
     @Test("transition: scopes render a semantic card, not bare bytes")

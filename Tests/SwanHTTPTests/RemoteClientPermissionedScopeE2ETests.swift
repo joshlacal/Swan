@@ -885,6 +885,18 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
     /// be able to create records against a reference PDS. Phase 1 ships without
     /// that step, so the name says so — without this framing the test reads as
     /// "upstream behaviour verified" and the real gap goes unrecorded.
+    ///
+    /// **Phase 2 (P2-F) closes this, and the condition is a configured lexicon
+    /// resolver — which this fixture deliberately does not have.**
+    /// `OAuthLexiconScopeResolution.expandSpaceCollections` now runs at mint and
+    /// materialises the declaration; with `lexiconResolver == nil` it is a
+    /// documented pass-through, so what this test pins is unchanged and remains
+    /// a divergence *for a deployment that has not enabled resolution*. The
+    /// closed half is asserted in `OAuthLexiconScopeResolutionTests`:
+    /// `testABareGrantIsWritableAfterMaterialisation` is the same grant, through
+    /// a resolver, coming out writable — and
+    /// `testWithoutAResolverBothTransformationsArePhase1PassThroughs` is this
+    /// test's assertion restated at the unit level, so the two cannot drift.
     func testBareSpaceGrantHasNoWriteTargetsUntilPhase2() async throws {
         let fixture = try await PermissionedScopeFixture.make()
         defer { Task { await fixture.tearDown() } }
