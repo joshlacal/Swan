@@ -160,7 +160,22 @@ now stale** (see above), so treat its other claims as needing the same check.
 - Image user is uid 999; the service runs `--user 994:984` and therefore cannot
   traverse the image's `/var/lib/swan` — hence `--workdir /data`.
 
-## Open decision — enabling the resolver
+## Resolved — resolver ENABLED 2026-08-14 ~23:10 UTC
+
+The sequencing below was honored: the build shipped dark, P2-H landed, two
+client-interop hotfixes (transition-scopes advertisement, PAR
+`login_hint`/`prompt`) and a refresh-grant fix (`redirect_uri` accepted and
+ignored, `0e18b2cd`) deployed and verified — and then
+`--enable-lexicon-resolution` was added to the unit as its own restart
+(backup at `/etc/systemd/system/swan.service.bak-20260815`). Trigger:
+Bulleted's spaces flow requests `include:app.bulleted.authFull`, which
+renders as "Swan does not currently grant capabilities derived from this
+set" while the resolver is off. The set's chain was verified resolvable
+first: `_lexicon.bulleted.app` TXT → `did:plc:geqwme5xqva5iasvlrwi4izj` →
+vesuvius.pyroclastic.cloud → `com.atproto.lexicon.schema/app.bulleted.authFull`.
+Flag confirmed in the running container; all four endpoints 200.
+
+## Open decision — enabling the resolver (RESOLVED above; kept for context)
 
 Deploying the build and *enabling* `--enable-lexicon-resolution` are separate
 choices, and they should be separate deploys. Recommended order:
