@@ -362,8 +362,32 @@ public struct OAuthClientMetadata: Codable, Sendable, Equatable {
         // question at PAR/admission, where the client is actually asking for
         // something. The floor lives there and only there
         // (`OAuthScopeAdmissionPolicy`, stage E) and reports `invalid_scope`.
-        // `parseScopes` above is the whole of layer 1: a well-formed RFC 6749
-        // §3.3 scope-token list inside Swan's documented raw-input budget.
+        // Layer 1's floor, and it must live HERE rather than only in
+        // `parseScopes`. `parseScopes` runs on the two paths that build scopes
+        // from a string — the Decodable init (`:186`) and the localhost
+        // query-string form (`:298`) — but the public memberwise initializer
+        // (`:76-113`) takes a `Set<String>` already split, so it reaches neither.
+        // `validate()` is the one funnel every construction path passes through,
+        // which makes it the only place the floor actually holds.
+        //
+        // This is not belt-and-braces: after §9-D21 the lexical floor is the
+        // ENTIRE defence at registration. A floor that admitted `"` (0x22) or
+        // `\` (0x5C) would be looser than upstream's `OAUTH_SCOPE_REGEXP`
+        // (`oauth-types/src/oauth-scope.ts:5-6`), which is the whole of
+        // upstream's client-metadata scope validation — so retiring the
+        // semantic gate would have widened the layer rather than relocating it.
+        //
+        // Routed through `ScopeToken.isScopeToken` and `OAuthScopeBudget.rawInput`
+        // so there is ONE charset and ONE budget shared with both wire
+        // tokenizers, rather than a second copy here that can drift.
+        let declaredWireForm = scopes.sorted().joined(separator: " ")
+        guard !scopes.isEmpty,
+              scopes.count <= OAuthScopeBudget.rawInput.scopeCount,
+              scopes.allSatisfy(ScopeToken.isScopeToken),
+              scopes.allSatisfy({ $0.utf8.count <= OAuthScopeBudget.rawInput.bytesPerScope }),
+              declaredWireForm.utf8.count <= OAuthScopeBudget.rawInput.bytesPerSet else {
+            throw SwanError.malformed("OAuth client metadata scope is not a valid scope-token list")
+        }
         guard !redirectURIs.isEmpty,
               grantTypes.contains("authorization_code"),
               responseTypes.contains("code"),
