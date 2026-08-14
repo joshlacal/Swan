@@ -304,9 +304,12 @@ let package = Package(
         .testTarget(
             name: "SwanInteropTests",
             dependencies: [
-                "SwanAccounts", "SwanInterop", "SwanOAuth", "SwanSpaces",
+                "SwanAccounts", "SwanCore", "SwanInterop", "SwanOAuth",
+                "SwanPublicRepository", "SwanPublicRepositoryTestSupport",
+                "SwanSpaces", "SwanSQLite",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "Petrel", package: "Petrel"),
             ]
         ),
         .testTarget(

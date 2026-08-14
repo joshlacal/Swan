@@ -1299,7 +1299,7 @@ public actor SQLiteControlDatabase: OAuthControlStore, AccountControlStore,
 
     // MARK: Transactional helpers
 
-    private func requireInsertionCapacity(
+    func requireInsertionCapacity(
         table: String,
         keyColumn: String,
         key: SQLiteData,
