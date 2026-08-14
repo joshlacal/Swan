@@ -307,6 +307,37 @@ making `Base58BTC` public. It is an interop-availability question (a legitimate
 authority publishing a legacy key type would fail to resolve → `invalid_scope`),
 not a security one. Decide before Phase 2 closes.
 
+## Running the golden-corpus gate — and a durability warning
+
+```bash
+SWAN_UPSTREAM_ATPROTO=<full checkout of bddc99fb> \
+  Scripts/upstream-scope-goldens/verify-corpus-zero-diff.sh
+```
+
+Without `SWAN_UPSTREAM_ATPROTO` the corpus-integrity test **silently skips** —
+it does not fail — so a green suite says nothing about corpus/upstream agreement.
+
+**Only one tree on this machine is `bddc99fb`**, and it currently sits in an
+ephemeral job scratch directory that is deleted with the job. Of the four other
+`atproto` checkouts present:
+
+| tree | verdict |
+|---|---|
+| `.interop-cache/atproto-3f6c96d5…` | has `space-permission.ts`, but is the **wrong commit** — needs 80 type-only-import rewrites and produces six different `values` rows |
+| `Catbird+Petrel/atproto` | no `space-permission.ts` — predates the space plane |
+| `Catbird+Petrel/Petrel/atproto` | no `space-permission.ts`; also spells the `include:` `aud` rule as `isAtprotoAudience` rather than `isAtprotoDidRefAbsolute` |
+| `Developer/atproto-oauth-debug` | unverified |
+
+**Action needed:** move a `bddc99fb` checkout somewhere durable, or the gate
+becomes unrunnable and the corpus drifts undetected. The `space-permission.ts`
+presence check is the cheap positive control — a tree without it is not
+`bddc99fb`, and every `space:` vector generated from it would be *wrong rather
+than absent*.
+
+Note the two predicate spellings are not a contradiction: `isAtprotoAudience` is
+`` `${AtprotoDid}#${string}` `` — DID plus exactly one fragment. **Neither
+predicate accepts `*`**, so E2 holds across every tree checked.
+
 ## Completion gate
 
 Phase 2 is not done until all of these are green **and** independently measured
