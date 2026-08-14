@@ -119,14 +119,29 @@ public struct OAuthPeerAdmissionPolicy: Sendable, Equatable {
 /// Process-local fixed-window admission keyed on the request's client
 /// address.
 ///
-/// Deliberately not durable, unlike ``AccountLoginAdmissionService``. The
-/// window is seconds rather than minutes, so a restart resetting it is not an
-/// evasion worth a schema change; and the durable login table is globally
-/// capacity-bounded and fails *closed* into
-/// ``AccountLoginAdmissionError/unavailable``, so routing unauthenticated
-/// OAuth peers into it would give anonymous traffic a path to deny password
-/// login. Nothing here crosses a storage boundary, so the addresses are held
-/// as the already-validated literals rather than as HMAC digests.
+/// **This is deliberately process-local, and making it durable would be a
+/// regression, not an upgrade.** It sits next to ``AccountLoginAdmissionService``,
+/// which is durable, so the obvious reading is that this one is the lazy
+/// version. It is not. Two reasons, in order of weight:
+///
+/// 1. The durable login table is globally capacity-bounded
+///    (`maximumDurableEntries`, 100,000) and exhausting it fails *closed*
+///    into ``AccountLoginAdmissionError/unavailable``. Putting unauthenticated
+///    OAuth peers in that table would let anonymous traffic fill it and
+///    thereby deny password **login** — one principal denying another through
+///    a shared bucket, which is precisely the defect the handle-bucket sizing
+///    above exists to fix. The fix for one finding would have recreated the
+///    other.
+/// 2. A restart resetting the window is not an evasion worth a schema change
+///    on a live PDS. What this bounds is a *concurrent burst* from one peer
+///    over a ten-second window, and restarting the server is not a primitive
+///    an attacker can invoke — if they could, they would already have the
+///    denial they were working toward.
+///
+/// Also note the storage boundary: nothing here crosses one, so addresses are
+/// held as the already-validated literals rather than as HMAC digests. The
+/// digesting in ``AccountLoginAdmissionService`` exists because handles and
+/// addresses reach SQLite there, not as a general policy.
 public actor OAuthPeerAdmissionService {
     private struct Bucket {
         var startedAt: Date

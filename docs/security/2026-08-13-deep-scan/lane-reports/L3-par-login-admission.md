@@ -78,11 +78,27 @@ One consequence worth naming: the new type lives in `SwanAccounts` next to the l
 
 Reasoning, since both alternatives are defensible and both are worse here:
 
-- **Admitting** removes the control precisely in the state an attacker would aim for. A client that can provoke the policy into throwing — for instance by getting a second `X-Swan-Client-IP` value onto the request — would opt itself out of the budget entirely. Not acceptable.
-- **Rejecting** turns one proxy misconfiguration into total OAuth unavailability. This deployment has already had exactly that failure: every sign-in returned 503 because Caddy was not sending `X-Swan-Client-IP` while Swan ran with `--login-trusted-proxy-peer`. Reproducing that failure mode on PAR, token, and revocation would take the whole OAuth surface down rather than just interactive login.
+- **Admitting** removes the control precisely in the state an attacker would aim for: whoever can make identity unresolvable would opt themselves out of the budget entirely. Not acceptable.
+- **Rejecting** turns one proxy misconfiguration into total OAuth unavailability. This deployment has already had exactly that failure: every sign-in returned 503 because Caddy was not sending `X-Swan-Client-IP` while Swan ran with `--login-trusted-proxy-peer` (recorded as ADV-62, `docs/superpowers/plans/swan-adversarial-review-2026-07-30.md:130`). Reproducing that on PAR, token, and revocation would take the whole OAuth surface down rather than just interactive login.
 - **A shared bounded bucket** keeps the ceiling unconditional — unidentified traffic in aggregate is capped at the same 600 per 10 s — while degrading to a single global budget instead of an outage. It is the same choice already made and documented for invalid handles at `Sources/SwanAccounts/AccountLoginAdmission.swift:232-235`, where attacker-varied invalid spellings collapse to one sentinel so they cannot inflate bucket cardinality.
 
-Note that direct-origin traffic is not affected either way: when no trusted proxy peer is configured, the policy returns the socket peer's own address and never consults the header (`SwanLoginClientIdentityPolicy.swift:52-54`).
+### The deployed configuration was checked, not assumed
+
+The lead asked whether the deployed policy is really the trusted-proxy variant rather than `.direct`, since the control is worthless if it is not. It is:
+
+- `docker-compose.yml:100-101` passes `--login-trusted-proxy-peer` / `172.30.0.2`, and `Sources/swan/SwanCommand.swift:2133-2137` turns that list into the policy. With an empty list the policy is `.direct`; with a peer it is the trusted-proxy variant.
+- `Scripts/verify-interop-lab.sh:550` and `:1308` **assert** the compose block declares exactly one `--login-trusted-proxy-peer`, so this is machine-checked rather than conventional.
+
+Better than that, the header is not client-forgeable and the unresolvable path is not client-reachable:
+
+- `interop/Caddyfile:10` is `header_up X-Swan-Client-IP {http.request.remote.host}` — **overwrite**, not the `+` append form. A client sending its own `X-Swan-Client-IP` has it replaced, so it cannot produce the duplicate-value case that makes `clientIPAddress` throw.
+- `Scripts/verify-interop-lab.sh:669` and `:676` assert both halves of that: no `header_up -X-Swan-Client-IP` delete-after-set, and the set line in exactly the overwrite form. The delete-after-set spelling is what caused ADV-62, and it is now pinned against.
+
+So on the deployed configuration the sentinel bucket catches **operator misconfiguration only** — which is exactly the case where failing closed would be an outage and failing open would cost nothing, because no attacker can steer traffic into it. That makes the shared-bucket choice cheap rather than merely defensible.
+
+Direct-origin traffic is unaffected either way: when the socket peer is not a trusted proxy, the policy returns that peer's own address and never consults the header (`SwanLoginClientIdentityPolicy.swift:52-54`), so per-peer accounting holds for anything bypassing Caddy.
+
+**Test coverage and its limit.** `testUnresolvedClientAddressesShareOneBoundedBucket` covers the admission half: `nil` and non-literal values collapse to one bucket, that bucket is capped, and an identifiable peer is unaffected by its exhaustion. It does not drive `SwanLoginClientIdentityPolicy` itself, because `SwanLoginClientIdentityPolicy` lives in `SwanHTTP` and `Tests/SwanAccountsTests` does not depend on `SwanHTTP` — adding that dependency means editing `Package.swift`, which is outside this lane. The composition of the two is verified by reading `oauthServerPeerAdmission`, which is three lines.
 
 ## 4. Rate
 

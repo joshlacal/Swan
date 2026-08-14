@@ -158,16 +158,16 @@ func registerOAuthAuthorizationServerEndpoints(
 }
 
 /// - Parameter loginClientIdentityPolicy: How PAR resolves the requesting
-///   client's address for its admission budget. `nil` means the caller has not
-///   supplied one, and every PAR request then shares the single unidentified
-///   bucket — the budget still holds, but it is global rather than per peer.
-///   This is the degraded mode, not the intended one; pass the server's policy
-///   to get per-peer accounting.
+///   client's address for its admission budget. Deliberately required and
+///   deliberately not defaulted to `.direct`: behind a trusted proxy, `.direct`
+///   returns the proxy's own socket address for every request, so the budget
+///   would silently collapse from per-peer to one global bucket while still
+///   compiling and still passing its tests.
 func registerOAuthAuthorizationServerPAREndpoint(
   on router: Router<BasicRequestContext>,
   configuration: SwanOAuthAuthorizationServerConfiguration,
   runtime: SwanOAuthRuntime,
-  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy? = nil,
+  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy,
   requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) {
   router.post("/oauth/par") { request, context async -> Response in
@@ -186,7 +186,7 @@ private func handleOAuthServerPAR(
   context: SwanHTTPRequestContext,
   configuration: SwanOAuthAuthorizationServerConfiguration,
   runtime: SwanOAuthRuntime,
-  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy?,
+  loginClientIdentityPolicy: SwanLoginClientIdentityPolicy,
   requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
 ) async -> Response {
   let form: OAuthServerPARForm
@@ -220,11 +220,7 @@ private func handleOAuthServerPAR(
     request: request, context: context, policy: loginClientIdentityPolicy) == .rateLimited
   {
     context.logger.info(
-      "oauth par rejected",
-      metadata: [
-        "stage": .string("peer_admission"),
-        "identity": .string(loginClientIdentityPolicy == nil ? "unwired" : "policy"),
-      ])
+      "oauth par rejected", metadata: ["stage": .string("peer_admission")])
     return oauthServerJSON(
       .tooManyRequests, OAuthServerPARError(error: "temporarily_unavailable"),
       headers: oauthServerRetryAfterHeaders())
@@ -739,16 +735,24 @@ private func revokeOAuthServerToken(
 /// fetch first. Refusing the request instead leaves the replay namespace
 /// global over the `jti`, which is what RFC 9449 requires.
 ///
-/// A peer whose address cannot be resolved — because the policy rejected the
-/// forwarded header, or because no policy was supplied — is charged to one
-/// shared bucket rather than admitted or rejected; see
-/// `OAuthPeerAdmissionService`.
+/// A peer whose address cannot be resolved is charged to one shared bucket
+/// rather than admitted or rejected; see `OAuthPeerAdmissionService`.
+///
+/// Placement matters and is not arbitrary. This runs *after* the form has been
+/// fully collected, so a refusal leaves no half-read body holding a listener
+/// connection slot, and needs no drain. Moving it ahead of body collection
+/// would require `drainRejectedRequestBody`, which reserves from the very JSON
+/// write pool an earlier check would be protecting — an admission control that
+/// drains through the resource it guards is not a control. The body's own
+/// lease is already released by then: `collectAdmittedRequestBody` hands back a
+/// `SwanAdmittedRequestBody` whose `deinit` releases it, and that happens when
+/// `oauthServerForm` returns.
 private func oauthServerPeerAdmission(
   request: Request,
   context: SwanHTTPRequestContext,
-  policy: SwanLoginClientIdentityPolicy?
+  policy: SwanLoginClientIdentityPolicy
 ) async -> OAuthPeerAdmissionDecision {
-  let peer = try? policy?.clientIPAddress(
+  let peer = try? policy.clientIPAddress(
     directPeer: context.remoteAddress?.ipAddress,
     headers: request.headers
   )

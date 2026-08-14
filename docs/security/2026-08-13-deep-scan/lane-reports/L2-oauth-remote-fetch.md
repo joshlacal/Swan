@@ -115,7 +115,7 @@ population the finding is about — token refresh and revocation are what
 `revalidate` serves. The check fails closed to the general tier if the control
 database is unavailable (`OAuthClientMetadataLoader.swift:280-292`), and it is
 consulted **only after the general tier is already full** and only while a
-reserved slot is still winnable (`OAuthRemoteFetch.swift:605-618`,
+reserved slot is still winnable (`OAuthRemoteFetch.swift:598-621`,
 `OAuthClientMetadataLoader.swift:156-168`), so a rejected anonymous caller
 never costs a control-database round trip.
 
@@ -265,19 +265,26 @@ claimed as regressions.
 
 ## 3a. Suite and Linux results
 
+**Every number in an earlier draft of this report was withdrawn and re-measured.**
+The scratchpad path those runs logged to is shared by all eight lanes, and
+generic filenames (`baseline.log`, `linux-build.log`) collide silently; a
+clobbered log is self-consistent and undetectable by inspection. Everything
+below comes from `/private/tmp/swan-lane-L2-oauth-remote-fetch/`, which only
+this lane writes to.
+
 Baseline at `75e7b509`: exit 0, 1,489 passed, 0 failed, 9 skipped, 11 targets.
 
-Final tree: **exit 0, 1,500 passed, 0 failed, 9 skipped, 11 targets**, and zero
-`Some test targets reported failures` lines. 1,489 + the 11 tests this lane adds
-= 1,500; nothing was removed or disabled.
+Final tree: **exit 0, 1,501 passed, 0 failed, 9 skipped, 11 targets**, and zero
+`Some test targets reported failures` lines. 1,489 + the 12 tests this lane adds
+= 1,501; nothing was removed or disabled.
 
 Two notes on how that number was obtained, because both cost time:
 
 - The pass-counting pattern in the lane brief, `Test Case '-\[.*\] passed`,
   matches nothing — XCTest prints `Test Case '-[Suite testName]' passed`, with a
-  closing quote before ` passed`. The pattern that works is
-  `Test Case '-\[.*\]' passed`. A run counted with the brief's pattern reports
-  0 passes and looks like a crashed target.
+  closing quote before ` passed`, so `\] passed` cannot match. Counts here use
+  `^Test Case .* passed` / `^Test Case .* failed`. A run counted with the
+  brief's pattern reports 0 passes and looks like a crashed target.
 - Two full-suite runs hung — not failed, hung — in
   `PLCSpaceCredentialPublicKeyResolverTests`, a suite this lane does not touch.
   Cause: my two concurrency tests originally released their barrier transport
@@ -287,6 +294,34 @@ Two notes on how that number was obtained, because both cost time:
   them. Both tests now release the transport and `await` every load before
   returning. The suite has run clean end-to-end since. Pre-existing tests in the
   same file share the older `defer`-release shape and were left alone.
+
+### The `NIOPeerPinnedOAuthPostTransportTests` timeout flake
+
+Asked to characterise
+`testDocumentTransportTimeoutCompletesAndClosesUnresponsivePeer` failing with
+`"I/O on closed channel"`.
+
+**My one prior observation of it is discarded** — it came from a shared-path log
+during the window that also contained a stray `docker kill` across lanes and a
+full Docker disk, so it is not sound evidence either way.
+
+Clean data, all from the private directory, on the final tree: **0 reproductions
+in 11 runs** — one full-suite run (0 failed of 1,501) plus 10 targeted runs of
+`SwanOAuthTests.NIOPeerPinnedOAuthPostTransportTests`, each of which matched and
+ran 10 test cases (100 cases, 0 failures). So I have no reproduction, not a
+refutation.
+
+One cheap code-level observation, offered as a hypothesis and deliberately not
+fixed — the file belongs to L8, not this lane.
+`OAuthPeerPinnedNIOClientResources`
+(`Sources/SwanOAuth/NIOPeerPinnedOAuthDocumentTransport.swift:150-167`) owns a
+`MultiThreadedEventLoopGroup` and shuts it down from `deinit` with an unawaited
+`shutdownGracefully { _ in }`. Nothing keeps the group alive for work already in
+flight on it, and `"I/O on closed channel"` raised from `bootstrap.connect`
+(`:114-118`) is precisely what a raced group teardown produces. That is a
+lifecycle shape worth a follow-up lane, and it is consistent with an
+intermittent failure in a test whose whole subject is what happens when a
+transport is torn down on a deadline. I did not prove it.
 
 **Linux (`swift:6.1-jammy`, Docker): every library target and the `swan`
 product build clean — `[3844/3855] Linking swan`, no error from any file this
@@ -340,6 +375,54 @@ architecture-dependent — no SIMD, no pointer-width assumptions, no new
 `#if arch` — but x86_64 was not compiled and is not claimed.
 
 ---
+
+## 3b. Does any control refuse or clean up *through* the resource it protects?
+
+Checked deliberately after L4 found its own fix draining rejections through the
+pool it was protecting. Both answers here are clean, and both are load-bearing
+rather than incidental.
+
+**F19 — can `abandonClientMetadataFetch` run when the freshness table is full?
+Yes, and there is now a test for it.** The resource F19 exhausts is *rows in
+`oauth_control_client_metadata_freshness`*, and the release path is a `DELETE`.
+It does not call `requireInsertionCapacity`
+(`Sources/SwanSQLite/OAuthControlStore.swift:1291`, the gate that raises
+"OAuth control state capacity is exhausted"), and it does not call
+`purgeExpiredLocked` either, so it neither needs a free row nor depends on
+cleanup that itself needs one. `testAbandonSucceedsWithTheFreshnessTableAtCapacity`
+pins this: with the cap at 2 and two tickets outstanding, a third
+`beginClientMetadataFetch` is refused, the second ticket is abandoned, and the
+third then succeeds. Without that property the fix would be circular — the
+abandon that recovers a full table would need the table not to be full.
+
+It does need the control-database connection gate, which is a *different*
+resource with its own independent bound
+(`ControlSQLiteConnectionGate`, 128 queued waiters,
+`OAuthControlStore.swift:17-37`), and one that a full freshness table does not
+consume.
+
+**F09 — does a refused caller consume either pool, or anything the exhaustion
+has already consumed? No.** Three refusal sites, all of which fail before
+acquiring anything:
+
+- `OAuthRemoteFetchAdmission.acquire(reserved:)`
+  (`Sources/SwanOAuth/OAuthRemoteFetch.swift:492-506`) throws *before*
+  incrementing either counter, so a refusal costs no permit in either tier.
+- The escalation in `withAdmission` (`:598-621`) checks
+  `mayHaveReservedCapacity` — a plain lock read, no lease — **before** running
+  `reservedCapacityCheck()`. That ordering is the point: when the pool is
+  entirely full, a refused anonymous caller performs zero control-database work,
+  so refusals cannot amplify into load on the store that the admitted flights
+  are already contending for.
+- The loader's flight gates (`OAuthClientMetadataLoader.swift:149-155`,
+  `:156-168`) are in-memory dictionary reads on the actor, and the reserved
+  branch likewise refuses on `inFlight.count >= maximumConcurrentFlights`
+  before the durable read rather than after it.
+
+The one place this lane deliberately does spend a protected resource on a
+non-success path is the F19 abandon, which is awaited while the fetch permit is
+still held — one bounded write, on a path that already performed one. It is
+recorded under Residual rather than left implicit.
 
 ## 4. Not done, and why
 

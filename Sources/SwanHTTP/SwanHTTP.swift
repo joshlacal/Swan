@@ -831,6 +831,7 @@ public struct SwanHTTPServer: Sendable {
                 on: router,
                 configuration: authorizationServerConfiguration,
                 runtime: oauthRuntime,
+                loginClientIdentityPolicy: loginClientIdentityPolicy,
                 requestBodyAdmission: requestBodyAdmission
             )
         } else if let localhostOAuthConfiguration {
