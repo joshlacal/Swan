@@ -39,4 +39,27 @@ public extension AuthorizationContext {
             )
         )
     }
+
+    /// The legacy (app-password) equivalent, for TESTS AND LABORATORY HARNESSES
+    /// ONLY, under the same rule as above.
+    ///
+    /// It exists mainly so a test can prove a surface REFUSES this context.
+    /// Every predicate written as `case let .accountOAuth(...)` already fails
+    /// closed against it by construction; the value of pinning that in a test is
+    /// that the refusal survives someone later "simplifying" the two cases
+    /// together.
+    static func accountLegacySessionForTesting(
+        subject: String,
+        scopes: Set<String>,
+        statedKeys: [String: Set<String>] = [:]
+    ) -> AuthorizationContext {
+        .accountLegacySession(
+            subject: subject,
+            permissions: SwanScopePermissions(
+                rawScopes: scopes,
+                subject: subject,
+                statedKeys: statedKeys
+            )
+        )
+    }
 }

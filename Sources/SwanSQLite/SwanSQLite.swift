@@ -9808,6 +9808,15 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     "credential requester does not match the requested user"
                 )
             }
+        case .accountLegacySession:
+            // Minting a space credential is the permissioned-data surface, which
+            // app-password sessions do not reach — the same position
+            // `SpaceAuthorizationPolicy.require` states. Matching the subject
+            // would not make it safe: the objection is the credential type, not
+            // who is holding it.
+            throw SwanError.unauthorized(
+                "app-password sessions cannot request space credentials"
+            )
         case let .spaceDelegation(subject, delegatedSpace):
             guard subject == user, delegatedSpace == space else {
                 throw SwanError.unauthorized(

@@ -1589,3 +1589,95 @@ private struct DurableRepositoryFixture {
 private extension Array {
     var only: Element? { count == 1 ? first : nil }
 }
+
+/// The position `AuthorizationContext.accountLegacySession` was added to force.
+///
+/// App-password sessions carry the same payload as OAuth ones and are evaluated
+/// by the same matcher, so nothing but a separate case stops them inheriting
+/// every grant the OAuth case has. These pin the refusal so it survives someone
+/// later "simplifying" the two cases together.
+final class LegacySessionSpaceDenialTests: XCTestCase {
+    private let author = "did:plc:alice"
+
+    private func space() throws -> SpaceURI {
+        try SpaceURI(authority: author, spaceType: "app.bsky.bookmarks", skey: "key")
+    }
+
+    /// The widest scope set a legacy session could possibly present — every
+    /// transition scope, plus a wildcard space grant — still cannot reach a
+    /// space. The grant is deliberately generous so the test is measuring the
+    /// CASE, not a narrow scope set.
+    func testTheMostPermissiveLegacySessionStillCannotReachASpace() throws {
+        let space = try space()
+        let record = try SpaceRecordURI(
+            space: space,
+            author: author,
+            collection: "app.bsky.feed.post",
+            rkey: "key"
+        )
+        let legacy = AuthorizationContext.accountLegacySessionForTesting(
+            subject: author,
+            scopes: [
+                "atproto",
+                "transition:generic",
+                "transition:chat.bsky",
+                "transition:email",
+                "space:*?authority=*&skey=*&action=create&action=read",
+                "space:*?authority=*&skey=*&manage=create",
+            ],
+            statedKeys: [
+                "space:*?authority=*&skey=*&action=create&action=read":
+                    ["authority", "skey", "action"],
+            ]
+        )
+        for permission in [SpacePermission.read, .create, .update, .delete] {
+            XCTAssertThrowsError(
+                try SpaceAuthorizationPolicy.require(
+                    space: space,
+                    author: author,
+                    uri: record,
+                    authorization: legacy,
+                    permission: permission
+                ),
+                "legacy sessions must not reach a space for \(permission)"
+            )
+        }
+    }
+
+    /// The identical grant as `.accountOAuth` DOES pass, which is what proves
+    /// the refusal above comes from the credential type and not from the scopes.
+    func testTheSameGrantAsOAuthIsAdmitted() throws {
+        let space = try space()
+        let record = try SpaceRecordURI(
+            space: space,
+            author: author,
+            collection: "app.bsky.feed.post",
+            rkey: "key"
+        )
+        XCTAssertNoThrow(
+            try SpaceAuthorizationPolicy.require(
+                space: space,
+                author: author,
+                uri: record,
+                authorization: .accountOAuthForTesting(
+                    subject: author,
+                    scopes: ["space:*?authority=*&skey=*&action=create&collection=app.bsky.feed.post"]
+                ),
+                permission: .create
+            )
+        )
+    }
+
+    func testLegacySessionsAreRefusedManagement() throws {
+        XCTAssertThrowsError(
+            try SpaceAuthorizationPolicy.requireManagement(
+                space: try space(),
+                authorization: .accountLegacySessionForTesting(
+                    subject: author,
+                    scopes: ["space:*?authority=*&skey=*&manage=create"]
+                ),
+                operation: .create
+            )
+        )
+    }
+}

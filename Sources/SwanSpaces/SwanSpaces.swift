@@ -227,6 +227,25 @@ public enum AuthorizationContext: Sendable, Equatable {
     /// `SwanScopePermissions` is `Sendable, Equatable, Hashable`, so this
     /// enum's existing conformance is preserved with no `@unchecked` anywhere.
     case accountOAuth(subject: String, permissions: SwanScopePermissions)
+    /// An app-password (legacy) session.
+    ///
+    /// **Deliberately NOT `.accountOAuth`.** The two carry the same payload and
+    /// are evaluated by the same matcher, so collapsing them would compile and
+    /// look tidy. It would also be the whole security failure of this feature:
+    /// every existing `guard case let .accountOAuth(...)` site would silently
+    /// begin admitting a bearer credential, including the ~20 that check only
+    /// the subject and discard the permissions entirely.
+    ///
+    /// As a separate case, every one of those sites FAILS CLOSED until someone
+    /// opts it in on purpose, and `SpaceAuthorizationPolicy.require` — which
+    /// switches all cases with no `default:` — turns the omission into a
+    /// compile error rather than a silent grant.
+    ///
+    /// The distinction is credential TYPE, not authority: an app password is a
+    /// long-lived bearer secret, so a captured request is replayable in a way no
+    /// DPoP-bound OAuth token is. Scope narrows what it reaches; it does not
+    /// change that.
+    case accountLegacySession(subject: String, permissions: SwanScopePermissions)
     /// A short-lived, signature-verified user-to-space-host delegation. This
     /// context exists only while the authority evaluates whether that user may
     /// exchange it for a read credential. It is deliberately not a repository
@@ -283,6 +302,21 @@ public enum SpaceAuthorizationPolicy {
             else {
                 throw SwanError.unauthorized("OAuth scope does not cover this space operation")
             }
+        case .accountLegacySession:
+            // The position this case exists to force a decision on, and the
+            // answer is no.
+            //
+            // `transition:generic` — what an app password defaults to when it
+            // names no scopes — predates permissioned data entirely, which is
+            // why `allowsSpace` grows no transition arm. Admitting a legacy
+            // session here would hand a long-lived bearer secret the
+            // permissioned-data surface, where a captured request is replayable
+            // in a way no DPoP-bound OAuth token is.
+            //
+            // If a permissioned client ever needs legacy login, that is a
+            // deliberate design change starting at this line, not a widening of
+            // some other predicate.
+            throw SwanError.unauthorized("app-password sessions cannot access spaces")
         case let .service(_, audience):
             guard permission == .read, audience == space.authority else {
                 throw SwanError.unauthorized("service authentication is read-only")
