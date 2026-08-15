@@ -243,6 +243,32 @@ public struct SwanScopePermissions: Sendable, Equatable, Hashable {
     /// apart again.
     public var hasBaseATProtocolScope: Bool { rawScopes.contains("atproto") }
 
+    // MARK: - Transition scopes
+    //
+    // Ported from `oauth-scopes/src/scope-permissions-transition.ts`, whose
+    // overrides let the three `transition:` scopes stand in for the modern
+    // families. Upstream models this as a SUBCLASS, but the PDS constructs it
+    // UNCONDITIONALLY for every OAuth credential — `auth-verifier.ts:658`,
+    // `new ScopePermissionsTransition(scope?.split(' '))`, with no alternative
+    // branch. There is therefore no "transition mode" to select between: the
+    // overrides ARE the behaviour of every OAuth credential upstream, so Swan
+    // folds them into the base matcher rather than reproducing an inheritance
+    // hierarchy that only ever has one instantiated shape.
+    //
+    // These read `rawScopes` rather than `grants`, matching upstream's
+    // `this.scopes.has(...)` and the `hasBaseATProtocolScope` idiom directly
+    // above. All three are parameterless exact strings, so there is no
+    // provenance question and nothing for a parse to lose.
+
+    /// `transition:generic` — the pre-permissioned-data catch-all.
+    public var hasTransitionGeneric: Bool { rawScopes.contains("transition:generic") }
+
+    /// `transition:email` — grants exactly `account:email?action=read`.
+    public var hasTransitionEmail: Bool { rawScopes.contains("transition:email") }
+
+    /// `transition:chat.bsky` — grants exactly the `chat.bsky.*` RPC arm.
+    public var hasTransitionChatBsky: Bool { rawScopes.contains("transition:chat.bsky") }
+
     /// True when this grant carries something the AT Protocol resource plane
     /// **enforces**. Replaces the three copies of `hasATProtocolResourceScope`
     /// — and must replace them with *the same accept set*, not a wider one.
@@ -315,6 +341,20 @@ public extension SwanScopePermissions {
     /// `.read` reproduces §5.6.3 steps 1-3 exactly (type, authority, skey) plus
     /// `action.contains(.read)`, which the fence has already established more
     /// strictly as `action == [.read]`.
+    ///
+    /// ## No transition arm, deliberately
+    ///
+    /// Every sibling matcher in this file grew a `transition:` arm ported from
+    /// `scope-permissions-transition.ts`. This one does NOT, and that is the
+    /// same decision upstream made — it overrides `allowsSpace` to call `super`
+    /// and nothing else, purely so the omission reads as a decision rather than
+    /// an oversight (`:55-62`): *"`transition:generic` predates permissioned
+    /// data, so a legacy token must never reach a space."*
+    ///
+    /// Swan has a second reason to hold this line: an app password defaults to
+    /// `transition:generic` when it names no scopes, so a transition arm here
+    /// would silently hand every legacy bearer credential the permissioned-data
+    /// surface. Do not add one.
     func allowsSpace(_ target: SpaceScopeTarget) -> Bool {
         grants.contains { grant in
             guard case let .space(permission) = grant.scope else { return false }
@@ -503,8 +543,11 @@ public extension SwanScopePermissions {
 // `hasResourceScope` must NOT be widened to admit their families.
 
 public extension SwanScopePermissions {
+    /// `scope-permissions-transition.ts:47-53`: `transition:generic` allows any
+    /// repo write, on any collection, with any action.
     func allowsRepo(_ target: RepoPermission.Target) -> Bool {
-        grants.contains { grant in
+        if hasTransitionGeneric { return true }
+        return grants.contains { grant in
             guard case let .repo(permission) = grant.scope else { return false }
             return permission.matches(target)
         }
@@ -518,8 +561,21 @@ public extension SwanScopePermissions {
         }
     }
 
+    /// `scope-permissions-transition.ts:64-80`. Three arms, in upstream's order:
+    /// `transition:generic` with the `*` wildcard `lxm`; `transition:generic`
+    /// for any `lxm` OUTSIDE `chat.bsky.`; and `transition:chat.bsky` for any
+    /// `lxm` INSIDE it. The split is the whole reason DMs are the one thing a
+    /// non-privileged legacy credential cannot reach.
+    ///
+    /// Neither arm consults `aud` — upstream's overrides ignore it, so a
+    /// transition credential is audience-unrestricted. That is the pre-existing
+    /// legacy contract, not a widening introduced here; `getServiceAuth` is
+    /// where it is fenced.
     func allowsRPC(_ target: RpcPermission.Target) -> Bool {
-        grants.contains { grant in
+        if hasTransitionGeneric, target.lxm == "*" { return true }
+        if hasTransitionGeneric, !target.lxm.hasPrefix("chat.bsky.") { return true }
+        if hasTransitionChatBsky, target.lxm.hasPrefix("chat.bsky.") { return true }
+        return grants.contains { grant in
             guard case let .rpc(permission) = grant.scope else { return false }
             return permission.matches(target)
         }
@@ -533,8 +589,13 @@ public extension SwanScopePermissions {
         }
     }
 
+    /// `scope-permissions-transition.ts:39-45`: `transition:generic` allows any
+    /// blob mime. Note this bypasses `BlobPermission.matches`'s concrete-mime
+    /// gate, so a transition credential may upload a blob whose declared mime a
+    /// modern `blob:` grant would refuse outright. That is upstream's behaviour.
     func allowsBlob(_ target: BlobPermission.Target) -> Bool {
-        grants.contains { grant in
+        if hasTransitionGeneric { return true }
+        return grants.contains { grant in
             guard case let .blob(permission) = grant.scope else { return false }
             return permission.matches(target)
         }
@@ -548,8 +609,12 @@ public extension SwanScopePermissions {
         }
     }
 
+    /// `scope-permissions-transition.ts:27-37`: `transition:email` grants
+    /// EXACTLY `email` + `read`. It does not imply `manage`, and it says nothing
+    /// about `repo` or `status`.
     func allowsAccount(_ target: AccountPermission.Target) -> Bool {
-        grants.contains { grant in
+        if target.attr == .email, target.action == .read, hasTransitionEmail { return true }
+        return grants.contains { grant in
             guard case let .account(permission) = grant.scope else { return false }
             return permission.matches(target)
         }

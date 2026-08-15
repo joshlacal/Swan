@@ -1531,13 +1531,133 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    // MARK: - Scope enforcement (§6.5.10 port of assertRepo / assertBlob)
+
+    /// The identity scope grants nothing. Before the port this token could write
+    /// any collection; upstream has always refused it
+    /// (`ScopePermissions.allowsRepo` finds no `repo:` grant), and now so does
+    /// Swan.
+    func testRepoWriteDeniedWithoutRepoOrTransitionScope() async throws {
+        let fixture = try await makeFixture(scopes: ["atproto"])
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.scope-denied")
+        ).test(.live) { client in
+            let response = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "scope-denied-create",
+                    method: "POST",
+                    path: Self.mutationPath
+                ),
+                body: ByteBuffer(string: self.putBody(rkey: "denied", text: "nope"))
+            )
+            XCTAssertEqual(response.status, .unauthorized)
+            // §9-D6: the body stays the route's own opaque code. The needed
+            // scope goes to the server log and NEVER to the caller.
+            let body = String(decoding: response.body.readableBytesView, as: UTF8.self)
+            XCTAssertEqual(body, "{\"error\":\"Unauthorized\"}")
+            XCTAssertFalse(body.contains("repo:"), "must not echo the needed scope")
+            XCTAssertFalse(body.contains(Self.collection), "must not echo the collection")
+        }
+    }
+
+    /// A narrow modern grant admits its own collection and refuses its
+    /// neighbour — the property the whole port exists to give app passwords.
+    func testRepoWriteHonoursNarrowCollectionGrant() async throws {
+        let fixture = try await makeFixture(
+            scopes: ["atproto", "repo:\(Self.collection)?action=create"]
+        )
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.scope-narrow")
+        ).test(.live) { client in
+            let granted = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "scope-narrow-granted",
+                    method: "POST",
+                    path: Self.mutationPath
+                ),
+                body: ByteBuffer(string: self.putBody(rkey: "granted", text: "ok"))
+            )
+            XCTAssertEqual(
+                granted.status,
+                .ok,
+                String(decoding: granted.body.readableBytesView, as: UTF8.self)
+            )
+
+            // Same token, a collection it was never granted.
+            let otherCollection = "app.bsky.feed.like"
+            let refused = try await client.execute(
+                uri: Self.mutationPath,
+                method: .post,
+                headers: try fixture.headers(
+                    jti: "scope-narrow-refused",
+                    method: "POST",
+                    path: Self.mutationPath
+                ),
+                body: ByteBuffer(string:
+                    "{\"repo\":\"" + Self.did + "\",\"collection\":\"" + otherCollection
+                        + "\",\"rkey\":\"refused\",\"record\":{\"text\":\"nope\"}}"
+                )
+            )
+            XCTAssertEqual(refused.status, .unauthorized)
+        }
+    }
+
+    /// `uploadBlob` asserts from the Content-Type HEADER. `transition:generic`
+    /// covers any mime; the identity scope alone covers none.
+    func testBlobUploadDeniedWithoutBlobOrTransitionScope() async throws {
+        let fixture = try await makeFixture(scopes: ["atproto"])
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? await fixture.control.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        try await fixture.server.buildApplication(
+            logger: Logger(label: "PublicRepositoryMutationHTTPTests.blob-scope-denied")
+        ).test(.live) { client in
+            var headers = try fixture.headers(
+                jti: "blob-scope-denied",
+                method: "POST",
+                path: Self.uploadPath
+            )
+            headers[.contentType] = "image/png"
+            let response = try await client.execute(
+                uri: Self.uploadPath,
+                method: .post,
+                headers: headers,
+                body: ByteBuffer(bytes: [0x89, 0x50, 0x4E, 0x47])
+            )
+            XCTAssertEqual(response.status, .unauthorized)
+        }
+    }
+
     private func makeFixture(
         includePublicBlobSpoolAdmission: Bool = true,
         jsonWriteAdmission: PublicRepositoryJSONWriteAdmission? = nil,
         jsonWriteBodyPolicy: SwanJSONWriteBodyPolicy? = nil,
         mutationBarrier: MutationTargetBarrier? = nil,
         mutationStatusSequence: [AccountControlStatus] = [],
-        blobQuota: AccountBlobQuota = .conservative
+        blobQuota: AccountBlobQuota = .conservative,
+        scopes: Set<String> = PublicRepositoryMutationHTTPTests.realisticClientScopes
     ) async throws -> Fixture {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "SwanPublicRepositoryMutationHTTPTests-" + UUID().uuidString)
@@ -1570,7 +1690,7 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
                 controlStore: control,
                 serverKey: Data(repeating: 0x41, count: 32)
             )
-            let token = try await issueToken(runtime: runtime)
+            let token = try await issueToken(runtime: runtime, scopes: scopes)
             let directory = TestMutationDirectory(
                 did: Self.did,
                 database: database,
@@ -1647,7 +1767,26 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
         )
     }
 
-    private func issueToken(runtime: SwanOAuthRuntime) async throws -> TokenMaterial {
+    /// The scope set every real Swan client actually holds.
+    ///
+    /// `atproto` ALONE grants nothing on the repo surface — it is the identity
+    /// scope, and since the `assertRepo`/`assertBlob` port it no longer admits a
+    /// write. That is upstream's rule, not a Swan tightening: upstream's
+    /// `ScopePermissions.allowsRepo` finds no `repo:` grant on such a token
+    /// either. Real credentials carry a transition scope beside it — the live
+    /// server advertises all three in `scopes_supported`, Catbird's
+    /// `AuthManager` requests `"atproto transition:generic transition:chat.bsky"`,
+    /// and nest's `default.toml` the same — so this default is what production
+    /// looks like, not a convenience.
+    ///
+    /// Tests that need to prove the narrow case pass their own set; see
+    /// `testRepoWriteDeniedWithoutRepoOrTransitionScope`.
+    static let realisticClientScopes: Set<String> = ["atproto", "transition:generic"]
+
+    private func issueToken(
+        runtime: SwanOAuthRuntime,
+        scopes: Set<String> = PublicRepositoryMutationHTTPTests.realisticClientScopes
+    ) async throws -> TokenMaterial {
         let key = P256.Signing.PrivateKey()
         let jwk = try makeJWK(key)
         let now = Date()
@@ -1659,13 +1798,13 @@ final class PublicRepositoryMutationHTTPTests: XCTestCase, @unchecked Sendable {
                     redirectURIs: [URL(string: "https://client.example/callback")!],
                     grantTypes: ["authorization_code", "refresh_token"],
                     responseTypes: ["code"],
-                    scopes: ["atproto"],
+                    scopes: scopes,
                     dpopBoundAccessTokens: true
                 ),
                 keySet: nil
             ),
             redirectURI: URL(string: "https://client.example/callback")!,
-            scopes: ["atproto"],
+            scopes: scopes,
             dpopProof: OAuthValidatedDPoPProof(
                 keyThumbprint: jwk.thumbprint(),
                 jwtID: "issue-" + UUID().uuidString,

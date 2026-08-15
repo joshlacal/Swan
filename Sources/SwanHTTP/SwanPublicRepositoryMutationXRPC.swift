@@ -74,11 +74,12 @@ private struct PublicMutationHandlers {
             admission: publicMutationRejectedDrainAdmission,
             policy: capability.jsonWriteBodyPolicy
         ) {
-            let subject = try await authorizedPublicMutationSubject(
+            let principal = try await authorizedPublicMutationPrincipal(
                 request: request,
                 path: "/xrpc/" + SwanPublicWire.ComAtprotoRepoUploadBlob.typeIdentifier,
                 capability: capability
             )
+            let subject = principal.subject
             guard let target = try await capability.directory.publicRepositoryMutationTarget(selector: subject),
                   target.did == subject,
                   target.status == .active,
@@ -92,6 +93,27 @@ private struct PublicMutationHandlers {
             let requestedMIMEType = contentTypes.first?.split(separator: ";", maxSplits: 1).first.map(String.init)
                 ?? "application/octet-stream"
             let mimeType = safePublicBlobMIMEType(requestedMIMEType)
+            // `assertBlob({mime: encoding})` — `repo/uploadBlob.ts:16`. Upstream
+            // reads the mime from the Content-Type HEADER, never the body, and
+            // so does this.
+            //
+            // The SANITIZED value is what is checked, not the raw header. That
+            // is deliberate and it is the fail-closed direction: a malformed
+            // header collapses to `application/octet-stream`, which is also what
+            // gets recorded on the blob, so the grant is evaluated against the
+            // mime the account will actually be storing. Checking the raw header
+            // instead would let a client name `image/png`, be admitted by a
+            // `blob:image/*` grant, and still store an octet-stream. It also
+            // guarantees a concrete `type/subtype`, which `BlobPermission.matches`
+            // requires before anything — not even `*/*` matches a non-concrete
+            // request mime (`mime.test.ts:73-74`).
+            try enforcingScope(
+                route: "/xrpc/" + SwanPublicWire.ComAtprotoRepoUploadBlob.typeIdentifier,
+                logger: context.logger,
+                denial: PublicMutationFailure.unauthorized
+            ) {
+                try principal.permissions.requireBlob(.init(mime: mimeType))
+            }
             guard let admission = capability.publicBlobSpoolAdmission,
                   let lease = admission.reserve(
                       accountDID: target.did,
@@ -429,11 +451,11 @@ private struct PublicMutationHandlers {
 /// proof's `jti` (`Sources/SwanOAuth/OAuthProofValidation.swift:117-119`), so
 /// a second call for the same request is indistinguishable from a replay and
 /// would deny every legitimate command.
-private func authorizedPublicMutationSubject(
+private func authorizedPublicMutationPrincipal(
     request: Request,
     path: String,
     capability: SwanPublicRepositoryMutationCapability
-) async throws -> String {
+) async throws -> PublicMutationPrincipal {
     let authorization: AuthorizationContext
     do {
         // Every route on this surface is registered with `post`; the fixed
@@ -446,20 +468,22 @@ private func authorizedPublicMutationSubject(
     } catch {
         throw PublicMutationFailure.unavailable
     }
-    // NOT YET PORTED (§6.5.10), and this is the concrete route §6.1's
-    // `hasResourceScope` doc refers to: this single guard covers every repo
-    // write AND blob upload. Upstream asserts `assertRepo({action, collection})`
-    // on `repo/{createRecord.ts:64, putRecord.ts:82 AND :86, deleteRecord.ts:60,
+    // PORTED (§6.5.10). This is the authorization FLOOR only — it establishes
+    // that the caller holds an AT Protocol session at all. The per-method
+    // predicates upstream spells `assertRepo({action, collection})` on
+    // `repo/{createRecord.ts:64, putRecord.ts:82 AND :86, deleteRecord.ts:60,
     // applyWrites.ts:118}` and `assertBlob({mime: encoding})` on
-    // `repo/uploadBlob.ts:16` — with `mime` read from the Content-Type HEADER,
-    // not the body, which is the porting detail most easily lost.
+    // `repo/uploadBlob.ts:16` CANNOT run here: `collection` lives in the
+    // request body, and this function deliberately runs on headers alone so no
+    // JSON write lease is reserved for an unauthenticated caller.
     //
-    // Widening `hasResourceScope` to admit `repo:` or `blob:` BEFORE this row
-    // is ported hands such a token an unchecked write. The two are one change,
-    // not two.
+    // So the permissions travel out with the subject and each route asserts
+    // once it has decoded its own input. `uploadBlob` is the exception and
+    // asserts from the Content-Type HEADER, which is the porting detail most
+    // easily lost — never from the body.
     guard case let .accountOAuth(subject, permissions) = authorization,
           permissions.hasBaseATProtocolScope else { throw PublicMutationFailure.unauthorized }
-    return subject
+    return PublicMutationPrincipal(subject: subject, permissions: permissions)
 }
 
 private func withPublicBlobUploadPreflightDrain<Value>(
@@ -530,10 +554,23 @@ func registerPublicRepositoryMutationEndpoints(
             as: SwanPublicWire.ComAtprotoRepoPutRecord.Input.self,
             path: "/xrpc/\(putNSID)",
             capability: capability
-        ) { input, digest, subject in
-            publicMutationJSON(
+        ) { input, digest, principal in
+            try enforcingScope(
+                route: "/xrpc/\(putNSID)",
+                logger: context.logger,
+                denial: PublicMutationFailure.unauthorized
+            ) {
+                // `putRecord.ts:82 AND :86` — BOTH actions, deliberately.
+                // The route may create or update, and upstream demands both up
+                // front rather than deciding after the swap check, so a grant
+                // holding only one of them cannot reach it.
+                let collection = input.collection.nsidString()
+                try principal.permissions.requireRepo(.init(collection: collection, action: .create))
+                try principal.permissions.requireRepo(.init(collection: collection, action: .update))
+            }
+            return publicMutationJSON(
                 .ok,
-                try await handlers.put(input, bodyDigest: digest, subject: subject)
+                try await handlers.put(input, bodyDigest: digest, subject: principal.subject)
             )
         }
     }
@@ -544,10 +581,20 @@ func registerPublicRepositoryMutationEndpoints(
             as: SwanPublicWire.ComAtprotoRepoCreateRecord.Input.self,
             path: "/xrpc/\(createNSID)",
             capability: capability
-        ) { input, digest, subject in
-            publicMutationJSON(
+        ) { input, digest, principal in
+            try enforcingScope(
+                route: "/xrpc/\(createNSID)",
+                logger: context.logger,
+                denial: PublicMutationFailure.unauthorized
+            ) {
+                // `createRecord.ts:64`.
+                try principal.permissions.requireRepo(
+                    .init(collection: input.collection.nsidString(), action: .create)
+                )
+            }
+            return publicMutationJSON(
                 .ok,
-                try await handlers.create(input, bodyDigest: digest, subject: subject)
+                try await handlers.create(input, bodyDigest: digest, subject: principal.subject)
             )
         }
     }
@@ -558,10 +605,41 @@ func registerPublicRepositoryMutationEndpoints(
             as: SwanPublicWire.ComAtprotoRepoApplyWrites.Input.self,
             path: "/xrpc/\(applyNSID)",
             capability: capability
-        ) { input, digest, subject in
-            publicMutationJSON(
+        ) { input, digest, principal in
+            try enforcingScope(
+                route: "/xrpc/\(applyNSID)",
+                logger: context.logger,
+                denial: PublicMutationFailure.unauthorized
+            ) {
+                // `applyWrites.ts:104-120` — PER WRITE, not per request.
+                // Upstream groups the writes into one collection set per action
+                // and asserts each (action, collection) pair, so a batch is
+                // admitted only if EVERY write in it is individually granted.
+                // An `.unexpected` member is not classifiable into an action and
+                // so cannot be granted; it is left to the handler, which already
+                // refuses it.
+                for write in input.writes {
+                    switch write {
+                    case let .comAtprotoRepoApplyWritesCreate(value):
+                        try principal.permissions.requireRepo(
+                            .init(collection: value.collection.nsidString(), action: .create)
+                        )
+                    case let .comAtprotoRepoApplyWritesUpdate(value):
+                        try principal.permissions.requireRepo(
+                            .init(collection: value.collection.nsidString(), action: .update)
+                        )
+                    case let .comAtprotoRepoApplyWritesDelete(value):
+                        try principal.permissions.requireRepo(
+                            .init(collection: value.collection.nsidString(), action: .delete)
+                        )
+                    case .unexpected:
+                        continue
+                    }
+                }
+            }
+            return publicMutationJSON(
                 .ok,
-                try await handlers.applyWrites(input, bodyDigest: digest, subject: subject)
+                try await handlers.applyWrites(input, bodyDigest: digest, subject: principal.subject)
             )
         }
     }
@@ -593,10 +671,20 @@ func registerPublicRepositoryMutationEndpoints(
             as: SwanPublicWire.ComAtprotoRepoDeleteRecord.Input.self,
             path: "/xrpc/\(deleteNSID)",
             capability: capability
-        ) { input, digest, subject in
-            publicMutationJSON(
+        ) { input, digest, principal in
+            try enforcingScope(
+                route: "/xrpc/\(deleteNSID)",
+                logger: context.logger,
+                denial: PublicMutationFailure.unauthorized
+            ) {
+                // `deleteRecord.ts:60`.
+                try principal.permissions.requireRepo(
+                    .init(collection: input.collection.nsidString(), action: .delete)
+                )
+            }
+            return publicMutationJSON(
                 .ok,
-                try await handlers.delete(input, bodyDigest: digest, subject: subject)
+                try await handlers.delete(input, bodyDigest: digest, subject: principal.subject)
             )
         }
     }
@@ -629,7 +717,7 @@ private func withPublicMutationInput<Value: Decodable>(
     as type: Value.Type,
     path: String,
     capability: SwanPublicRepositoryMutationCapability,
-    operation: (Value, Data, String) async throws -> Response
+    operation: (Value, Data, PublicMutationPrincipal) async throws -> Response
 ) async -> Response {
     let contentTypes = request.headers[values: .contentType]
     guard contentTypes.count == 1,
@@ -652,9 +740,9 @@ private func withPublicMutationInput<Value: Decodable>(
     // let an anonymous caller own one of eight shared JSON write leases for
     // the whole 30-second body deadline. `uploadBlob` above has always done
     // it this way.
-    let subject: String
+    let principal: PublicMutationPrincipal
     do {
-        subject = try await authorizedPublicMutationSubject(
+        principal = try await authorizedPublicMutationPrincipal(
             request: request,
             path: path,
             capability: capability
@@ -692,7 +780,7 @@ private func withPublicMutationInput<Value: Decodable>(
             Data(SHA256.hash(data: data))
         )
     } operation: { admitted in
-        try await operation(admitted.0, admitted.1, subject)
+        try await operation(admitted.0, admitted.1, principal)
     } errorResponse: { error in
         publicMutationResponse(error, capability: capability)
     }

@@ -49,6 +49,31 @@ The legacy case must match: `case accountLegacySession(subject: String, permissi
 
 > ⚠️ **Maintainer decision required before Task 6.** If you want the needed-scope echoed to app-password callers, that is a deliberate, narrow exception to §9-D6 and must be ruled on explicitly — do not let an implementer infer it. Default if unruled: follow §9-D6 (opaque denial).
 
+**Δ5 — enforcement required a `transition:` port first (found while executing Task 1).**
+Transition scopes are flat cases in `AtprotoScope`, so they produce no `.repo` /
+`.rpc` / `.blob` grant. Wiring `requireRepo` without a port would have denied
+**every credential in the wild**: Catbird's `AuthManager`, nest's `default.toml`
+and Petrel all request `atproto transition:generic [transition:chat.bsky]`, and
+the live server advertises exactly those in `scopes_supported`.
+
+Upstream solves this with `ScopePermissionsTransition`, a subclass whose
+`allows*` overrides let transition scopes stand in for the modern families. The
+PDS constructs it **unconditionally** for every OAuth credential
+(`auth-verifier.ts:658`) — there is no "transition mode" to select — so Swan
+folds the arms into the base matcher rather than mirroring a hierarchy with one
+inhabitant. Ported in Task 1: `allowsRepo`/`allowsBlob` (any, on
+`transition:generic`), `allowsRPC` (the three-arm `chat.bsky.` split),
+`allowsAccount` (`transition:email` → exactly `email`+`read`). **`allowsSpace`
+gets NO arm** — upstream overrides it to `super` purely to make the omission a
+decision, and Swan has a second reason: an app password with no declared scopes
+defaults to `transition:generic`, so an arm there would hand every legacy bearer
+credential the permissioned-data surface.
+
+Consequence for Task 8: the `privileged: false` default (`transition:generic`)
+already grants the whole repo/blob/non-chat-RPC surface, so the "Bluesky app"
+preset's risk is narrower than feared — but `atproto` ALONE now denies writes,
+which is upstream's rule and is a live behaviour change.
+
 **Δ4 — "four call sites" is now ~20.** The spec's D3 argues from four `.accountOAuth` guard sites. There are approximately twenty across `SwanSpaces`, `SwanHTTP`, `SwanSQLite`, and `SwanOAuth`. This *strengthens* D3 — the compile-error forcing function is worth more, not less — but it makes Task 5 substantially larger than the spec implies. Budget for it.
 
 ---

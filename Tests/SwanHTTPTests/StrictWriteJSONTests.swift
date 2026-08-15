@@ -378,13 +378,17 @@ final class StrictWriteJSONTests: XCTestCase, @unchecked Sendable {
                     redirectURIs: [URL(string: "https://client.example/callback")!],
                     grantTypes: ["authorization_code", "refresh_token"],
                     responseTypes: ["code"],
-                    scopes: ["atproto"],
+                    // `atproto` alone grants nothing on the repo surface since
+                    // the `assertRepo` port (§6.5.10). This suite is about JSON
+                    // body strictness, not scopes, so it holds what every real
+                    // client holds and lets the body policy be the only variable.
+                    scopes: ["atproto", "transition:generic"],
                     dpopBoundAccessTokens: true
                 ),
                 keySet: nil
             ),
             redirectURI: URL(string: "https://client.example/callback")!,
-            scopes: ["atproto"],
+            scopes: ["atproto", "transition:generic"],
             dpopProof: OAuthValidatedDPoPProof(
                 keyThumbprint: jwk.thumbprint(),
                 jwtID: "issue-" + UUID().uuidString,
