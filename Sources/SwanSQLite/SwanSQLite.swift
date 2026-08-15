@@ -62,6 +62,29 @@ public enum SQLiteLayout {
         "CREATE TABLE IF NOT EXISTS oauth_tokens (digest BLOB PRIMARY KEY, family_id TEXT NOT NULL, subject TEXT NOT NULL, expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS oauth_client_metadata (client_id TEXT PRIMARY KEY, document BLOB NOT NULL, expires_at INTEGER NOT NULL)",
         """
+        CREATE TABLE IF NOT EXISTS account_app_passwords (
+            id TEXT PRIMARY KEY,
+            did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            -- Deterministic Argon2id over (DID-derived salt, secret). Stored as
+            -- raw bytes and looked up by equality, so a login is one KDF
+            -- evaluation and one indexed probe rather than a verify-loop over
+            -- every row the account owns.
+            digest BLOB NOT NULL,
+            -- Verbatim canonical scope string. Refresh re-derives from HERE,
+            -- never from the session row, so editing narrows live sessions and
+            -- revoking ends them.
+            scopes TEXT NOT NULL,
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            -- A user must be able to tell two credentials apart to revoke one.
+            UNIQUE(did, name)
+        )
+        """,
+        // The login probe. `digest` leads because it is the selective column;
+        // `did` follows so the pair is covered without touching the table.
+        "CREATE INDEX IF NOT EXISTS account_app_passwords_lookup ON account_app_passwords(digest, did)",
+        "CREATE INDEX IF NOT EXISTS account_app_passwords_by_account ON account_app_passwords(did)",
+        """
         CREATE TABLE IF NOT EXISTS oauth_control_client_metadata (
             client_id TEXT PRIMARY KEY,
             document BLOB NOT NULL,
