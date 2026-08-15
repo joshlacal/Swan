@@ -419,6 +419,7 @@ public struct SwanHTTPServer: Sendable {
     /// capability is nil unless the caller has assembled the proof codec,
     /// control-store adapter, rate limiter, and SMTP worker at startup.
     public let accountEmailXRPC: SwanAccountEmailXRPCServer?
+    public let legacySessionXRPC: SwanLegacySessionXRPCServer?
     /// Local `app.bsky.actor.getPreferences` / `app.bsky.actor.putPreferences`
     /// routes. These can never be proxied to an AppView — the AppView does
     /// not store preferences, the PDS does — so this capability is nil unless
@@ -485,6 +486,7 @@ public struct SwanHTTPServer: Sendable {
         publicBlobSpoolAdmission: PublicRepositorySpoolAdmission? = nil,
         blobStreamAdmission: PublicRepositorySpoolAdmission? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
+        legacySessionXRPC: SwanLegacySessionXRPCServer? = nil,
         actorPreferencesXRPC: SwanActorPreferencesXRPCServer? = nil,
         xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
@@ -505,6 +507,7 @@ public struct SwanHTTPServer: Sendable {
             SwanPublicHandleResolutionCapability(controlStore: $0)
         }
         self.accountEmailXRPC = accountEmailXRPC
+        self.legacySessionXRPC = legacySessionXRPC
         self.actorPreferencesXRPC = actorPreferencesXRPC
         self.xrpcPipethrough = xrpcPipethrough
         self.publicFirehoseStreaming = publicFirehoseStreaming
@@ -1158,6 +1161,15 @@ public struct SwanHTTPServer: Sendable {
             requestBodyAdmission: requestBodyAdmission,
             servedMethods: servedPublicMethods
         )
+        // Registered BEFORE `registerUnknownPublicEndpointGuards` for
+        // readability only — exact paths outrank a `<prefix>.*` guard in
+        // Hummingbird's trie regardless of order, which is what lets these seven
+        // methods coexist with the flat 404 over `com.atproto.server.*` without
+        // weakening it.
+        legacySessionXRPC?.register(
+            on: router,
+            requestBodyAdmission: requestBodyAdmission
+        )
         actorPreferencesXRPC?.register(
             on: router,
             requestBodyAdmission: requestBodyAdmission
@@ -1325,18 +1337,18 @@ private struct CommunityServiceMethodReference: Encodable {
 /// `/.well-known/did.json` and `com.atproto.server.describeServer` read this
 /// value so that a resolver following the DID from one to the other cannot
 /// observe two identities for a single deployment.
-struct SwanServiceIdentity: Sendable, Equatable {
+public struct SwanServiceIdentity: Sendable, Equatable {
     /// `did:web:<host>` — with `%3A<port>` appended when the public URL names
     /// a port other than its scheme's default. Dropping a non-default port
     /// would publish an identity that resolves to a *different* origin than
     /// the one actually serving, which is a silent misdirection rather than a
     /// visible failure.
-    let did: String
+    public let did: String
     /// The scheme/host/port origin, with no path, query, or trailing slash.
     /// This is what the `AtprotoPersonalDataServer` service entry advertises.
-    let serviceEndpoint: String
+    public let serviceEndpoint: String
 
-    init(publicURL: URL) {
+    public init(publicURL: URL) {
         let scheme = publicURL.scheme?.lowercased() ?? "https"
         let host = (publicURL.host ?? "localhost").lowercased()
         let defaultPort = scheme == "http" ? 80 : 443

@@ -971,6 +971,7 @@ struct ServePermissionedRuntime {
         localhostOAuthConfiguration: SwanLocalhostOAuthConfiguration? = nil,
         authorizationServerConfiguration: SwanOAuthAuthorizationServerConfiguration? = nil,
         accountEmailXRPC: SwanAccountEmailXRPCServer? = nil,
+        legacySessionXRPC: SwanLegacySessionXRPCServer? = nil,
         actorPreferencesXRPC: SwanActorPreferencesXRPCServer? = nil,
         xrpcPipethrough: SwanXRPCPipethroughServer? = nil,
         loginClientIdentityPolicy: SwanLoginClientIdentityPolicy = .direct,
@@ -1002,6 +1003,7 @@ struct ServePermissionedRuntime {
             },
             blobStreamAdmission: directory.publicRepositorySpoolAdmission,
             accountEmailXRPC: accountEmailXRPC,
+            legacySessionXRPC: legacySessionXRPC,
             actorPreferencesXRPC: actorPreferencesXRPC,
             xrpcPipethrough: xrpcPipethrough,
             loginClientIdentityPolicy: loginClientIdentityPolicy,
@@ -3112,6 +3114,54 @@ extension SwanCommand {
                     accountEmailXRPC = nil
                     emailRecoveryService = nil
                 }
+
+                // Legacy (app-password) sessions. Off unless the operator both
+                // set the flag and mounted a key — the interlock above already
+                // refused to boot on any other combination, so reaching here
+                // with the flag set means the key file is named.
+                let legacySessionXRPC: SwanLegacySessionXRPCServer?
+                if enableLegacySessions {
+                    do {
+                        let signingKey = try AccountProvisioningSecrets
+                            .requiredMounted32ByteSecret(
+                                secretFile: URL(fileURLWithPath: legacySessionSigningKeyFile!)
+                            )
+                        let passwordHasher = try LibsodiumArgon2idHasher()
+                        let credentials = try AppPasswordCredentials()
+                        legacySessionXRPC = SwanLegacySessionXRPCServer(
+                            sessions: try DurableLegacySessionService(
+                                store: controlDatabase,
+                                appPasswords: controlDatabase,
+                                credentials: credentials,
+                                // The same identity `/.well-known/did.json` and
+                                // `describeServer` publish, so a token's `aud`
+                                // names the host that minted it.
+                                serviceDID: SwanServiceIdentity(publicURL: baseURL).did,
+                                serverKey: signingKey
+                            ),
+                            credentials: credentials,
+                            appPasswords: controlDatabase,
+                            accounts: DurableAccountDirectory(
+                                store: controlDatabase,
+                                passwordHasher: passwordHasher,
+                                verificationExecutor: try Argon2idVerificationExecutor(
+                                    hasher: passwordHasher
+                                )
+                            ),
+                            directory: SwanDurableLegacySessionDirectory(store: controlDatabase),
+                            rateLimiter: SwanInProcessLegacySessionRateLimiter()
+                        )
+                    } catch let error as ValidationError {
+                        throw error
+                    } catch {
+                        throw ValidationError(
+                            "--enable-legacy-sessions requires a readable owner-only "
+                                + "--legacy-session-signing-key-file"
+                        )
+                    }
+                } else {
+                    legacySessionXRPC = nil
+                }
                 // Composed unconditionally, and deliberately not behind a
                 // flag. Preferences are PDS-owned state that the AppView does
                 // not store, so a nil capability here would leave the routes
@@ -3462,6 +3512,7 @@ extension SwanCommand {
                     localhostOAuthConfiguration: localhostOAuthConfiguration,
                     authorizationServerConfiguration: authorizationServerConfiguration,
                     accountEmailXRPC: accountEmailXRPC,
+                    legacySessionXRPC: legacySessionXRPC,
                     actorPreferencesXRPC: actorPreferencesXRPC,
                     xrpcPipethrough: xrpcPipethrough,
                     loginClientIdentityPolicy: loginClientIdentityPolicy,

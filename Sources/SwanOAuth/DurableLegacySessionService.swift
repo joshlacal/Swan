@@ -145,6 +145,38 @@ public actor DurableLegacySessionService {
         return .accountLegacySession(subject: family.did, permissions: permissions)
     }
 
+    /// Resolves a presented access token that must be FULL ACCESS, and returns
+    /// its subject.
+    ///
+    /// Upstream gates the app-password management endpoints on `ACCESS_FULL`
+    /// (`createAppPassword.ts:11`), i.e. a session opened with the account
+    /// password. The rule that matters is the anti-escalation one: an app
+    /// password must not be able to mint further app passwords, or revoke the
+    /// credential that would have contained it.
+    ///
+    /// Upstream ALSO refuses OAuth on those endpoints. Swan matches that rather
+    /// than inventing an admission path: gating them on an `account:` scope
+    /// instead would mean enforcing a family the route map still lists as NOT
+    /// PORTED, and a half-ported check on a privilege-granting endpoint is
+    /// worse than no path at all. Admitting OAuth here is a deliberate later
+    /// change that starts with porting `assertAccount`.
+    public func authorizeFullAccess(
+        accessJWT: String,
+        now: Date = Date()
+    ) async throws -> String {
+        _ = try LegacySessionJWT.verify(accessJWT, kind: .access, key: signingKey, now: now)
+        guard let family = try await store.legacyAccessSession(
+            digest: digest(accessJWT, purpose: .accessToken),
+            now: now
+        ) else {
+            throw SwanError.unauthorized("legacy session is not active")
+        }
+        guard family.appPasswordID == nil else {
+            throw SwanError.unauthorized("app-password sessions cannot manage app passwords")
+        }
+        return family.did
+    }
+
     /// Rotates a session.
     ///
     /// Reuse of an already-consumed refresh token revokes the whole family. The

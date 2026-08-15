@@ -79,14 +79,16 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             accounts: accounts,
             directory: SwanDurableLegacySessionDirectory(store: database),
             rateLimiter: rateLimiter,
-            requestBodyAdmission: .init(
-                admission: .processShared,
-                policy: .productionDefault
-            ),
             // These tests assert behaviour, not timing. The production floor is
             // 350ms and would add seconds across the suite.
             minimumFailedLoginDuration: .milliseconds(1)
-        ).register(on: router)
+        ).register(
+            on: router,
+            requestBodyAdmission: .init(
+                admission: .processShared,
+                policy: .productionDefault
+            )
+        )
         // The fence these routes must coexist with, registered exactly as the
         // production assembly does.
         registerUnknownPublicEndpointGuards(on: router)
@@ -402,6 +404,148 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    // MARK: - App-password management
+
+    private func fullAccessToken(
+        _ client: some TestClientProtocol,
+        fixture: Fixture
+    ) async throws -> String {
+        var token = ""
+        try await client.execute(
+            uri: "/xrpc/com.atproto.server.createSession",
+            method: .post,
+            headers: [.contentType: "application/json"],
+            body: ByteBuffer(string:
+                "{\"identifier\":\"\(self.handle)\",\"password\":\"\(Self.accountPassword)\"}"
+            )
+        ) { response in
+            token = try XCTUnwrap(try self.json(response)["accessJwt"] as? String)
+        }
+        return token
+    }
+
+    func testCreateListAndRevokeAnAppPassword() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        try await app(fixture).test(.router) { client in
+            let token = try await self.fullAccessToken(client, fixture: fixture)
+
+            var issued = ""
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.createAppPassword",
+                method: .post,
+                headers: [.contentType: "application/json", .authorization: "Bearer \(token)"],
+                body: ByteBuffer(string: "{\"name\":\"phone\"}")
+            ) { response in
+                XCTAssertEqual(response.status, .ok, self.body(response))
+                let payload = try self.json(response)
+                XCTAssertEqual(payload["name"] as? String, "phone")
+                issued = try XCTUnwrap(payload["password"] as? String)
+            }
+
+            // Listing shows it and never carries the secret.
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.listAppPasswords",
+                method: .get,
+                headers: [.authorization: "Bearer \(token)"]
+            ) { response in
+                XCTAssertEqual(response.status, .ok, self.body(response))
+                XCTAssertFalse(self.body(response).contains(issued))
+                let passwords = try XCTUnwrap(
+                    try self.json(response)["passwords"] as? [[String: Any]]
+                )
+                XCTAssertEqual(passwords.count, 1)
+                XCTAssertEqual(passwords[0]["name"] as? String, "phone")
+            }
+
+            // The issued secret signs in.
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.createSession",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(string:
+                    "{\"identifier\":\"\(self.handle)\",\"password\":\"\(issued)\"}"
+                )
+            ) { response in
+                XCTAssertEqual(response.status, .ok, self.body(response))
+            }
+
+            // Revoking it stops that.
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.revokeAppPassword",
+                method: .post,
+                headers: [.contentType: "application/json", .authorization: "Bearer \(token)"],
+                body: ByteBuffer(string: "{\"name\":\"phone\"}")
+            ) { response in
+                XCTAssertEqual(response.status, .ok, self.body(response))
+            }
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.createSession",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(string:
+                    "{\"identifier\":\"\(self.handle)\",\"password\":\"\(issued)\"}"
+                )
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+    }
+
+    /// The anti-escalation rule, and the reason these endpoints require
+    /// `ACCESS_FULL`: an app password must not mint further app passwords, nor
+    /// revoke the credential that would have contained it.
+    func testAnAppPasswordSessionCannotManageAppPasswords() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let scoped = try await issuePassword(fixture, name: "scoped")
+        try await app(fixture).test(.router) { client in
+            var token = ""
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.createSession",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(string:
+                    "{\"identifier\":\"\(self.handle)\",\"password\":\"\(scoped)\"}"
+                )
+            ) { response in
+                XCTAssertEqual(response.status, .ok, self.body(response))
+                token = try XCTUnwrap(try self.json(response)["accessJwt"] as? String)
+            }
+
+            for (uri, method, payload) in [
+                ("/xrpc/com.atproto.server.createAppPassword", HTTPRequest.Method.post, "{\"name\":\"escalated\"}"),
+                ("/xrpc/com.atproto.server.revokeAppPassword", .post, "{\"name\":\"scoped\"}"),
+            ] {
+                try await client.execute(
+                    uri: uri,
+                    method: method,
+                    headers: [.contentType: "application/json", .authorization: "Bearer \(token)"],
+                    body: ByteBuffer(string: payload)
+                ) { response in
+                    XCTAssertNotEqual(response.status, .ok, "for \(uri)")
+                }
+            }
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.listAppPasswords",
+                method: .get,
+                headers: [.authorization: "Bearer \(token)"]
+            ) { response in
+                XCTAssertNotEqual(response.status, .ok)
+            }
+        }
+    }
+
     // MARK: - The fence still holds
 
     /// The four exact routes must coexist with the `com.atproto.server.*` guard
@@ -420,7 +564,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
                 "com.atproto.server.createAccount",
                 "com.atproto.server.resetPassword",
                 "com.atproto.server.getServiceAuth",
-                "com.atproto.server.createAppPassword",
+                "com.atproto.server.requestPasswordReset",
             ] {
                 try await client.execute(
                     uri: "/xrpc/\(nsid)",

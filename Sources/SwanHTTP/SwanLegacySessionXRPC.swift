@@ -67,15 +67,18 @@ public protocol SwanLegacySessionRateLimiting: Sendable {
     func admitSessionCreation(identifier: String, now: Date) async -> Bool
 }
 
-struct SwanLegacySessionXRPCServer: Sendable {
+public struct SwanLegacySessionXRPCServer: Sendable {
     static let maximumJSONBytes = 8 * 1024
 
-    /// The four methods this service owns.
-    static let methodNSIDs: Set<String> = [
+    /// The seven methods this service owns.
+    public static let methodNSIDs: Set<String> = [
         ComAtprotoServerCreateSession.typeIdentifier,
         ComAtprotoServerRefreshSession.typeIdentifier,
         ComAtprotoServerGetSession.typeIdentifier,
         ComAtprotoServerDeleteSession.typeIdentifier,
+        ComAtprotoServerCreateAppPassword.typeIdentifier,
+        ComAtprotoServerListAppPasswords.typeIdentifier,
+        ComAtprotoServerRevokeAppPassword.typeIdentifier,
     ]
 
     private let sessions: DurableLegacySessionService
@@ -84,7 +87,6 @@ struct SwanLegacySessionXRPCServer: Sendable {
     private let accounts: DurableAccountDirectory
     private let directory: any SwanLegacySessionDirectory
     private let rateLimiter: any SwanLegacySessionRateLimiting
-    private let requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
     /// A floor on how long a failed `createSession` takes.
     ///
     /// Upstream pads every login to 350ms (`account-manager.ts:640`) for exactly
@@ -93,14 +95,13 @@ struct SwanLegacySessionXRPCServer: Sendable {
     /// measurable. Swan already uses this technique for password recovery.
     private let minimumFailedLoginDuration: Duration
 
-    init(
+    public init(
         sessions: DurableLegacySessionService,
         credentials: AppPasswordCredentials,
         appPasswords: any AppPasswordStore,
         accounts: DurableAccountDirectory,
         directory: any SwanLegacySessionDirectory,
         rateLimiter: any SwanLegacySessionRateLimiting,
-        requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
         minimumFailedLoginDuration: Duration = .milliseconds(350)
     ) {
         self.sessions = sessions
@@ -109,7 +110,6 @@ struct SwanLegacySessionXRPCServer: Sendable {
         self.accounts = accounts
         self.directory = directory
         self.rateLimiter = rateLimiter
-        self.requestBodyAdmission = requestBodyAdmission
         self.minimumFailedLoginDuration = minimumFailedLoginDuration
     }
 
@@ -120,7 +120,10 @@ struct SwanLegacySessionXRPCServer: Sendable {
     /// `<prefix>.*` guard in Hummingbird's trie regardless of registration
     /// order, which is how `describeServer` already survives it. The guard is
     /// NOT weakened — every other `com.atproto.server.*` method still 404s.
-    func register(on router: Router<SwanHTTPRequestContext>) {
+    func register(
+        on router: Router<SwanHTTPRequestContext>,
+        requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+    ) {
         let handlers = Handlers(
             sessions: sessions,
             credentials: credentials,
@@ -146,6 +149,18 @@ struct SwanLegacySessionXRPCServer: Sendable {
         router.post("/xrpc/\(ComAtprotoServerDeleteSession.typeIdentifier)") {
             request, context async -> Response in
             await handlers.deleteSession(request, context: context)
+        }
+        router.post("/xrpc/\(ComAtprotoServerCreateAppPassword.typeIdentifier)") {
+            request, context async -> Response in
+            await handlers.createAppPassword(request, context: context)
+        }
+        router.get("/xrpc/\(ComAtprotoServerListAppPasswords.typeIdentifier)") {
+            request, context async -> Response in
+            await handlers.listAppPasswords(request, context: context)
+        }
+        router.post("/xrpc/\(ComAtprotoServerRevokeAppPassword.typeIdentifier)") {
+            request, context async -> Response in
+            await handlers.revokeAppPassword(request, context: context)
         }
     }
 }
@@ -373,6 +388,117 @@ private struct Handlers: Sendable {
         }
     }
 
+    // MARK: - App-password management
+
+    /// Every one of these requires a FULL-ACCESS session — upstream's
+    /// `ACCESS_FULL` (`createAppPassword.ts:11`). The rule that matters is
+    /// anti-escalation: an app password must not mint further app passwords, nor
+    /// revoke the credential that would have contained it.
+    private func fullAccessSubject(_ request: Request) async throws -> String {
+        let presented = try bearerToken(request)
+        do {
+            return try await sessions.authorizeFullAccess(accessJWT: presented)
+        } catch {
+            throw SwanLegacySessionXRPCFailure.expiredToken
+        }
+    }
+
+    func createAppPassword(_ request: Request, context: SwanHTTPRequestContext) async -> Response {
+        do {
+            try await requireNoQuery(request, context: context)
+            let input: ComAtprotoServerCreateAppPassword.Input = try await decodeExactJSON(
+                request, context: context, required: ["name"], optional: ["privileged"]
+            )
+            let subject = try await fullAccessSubject(request)
+            guard !input.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  input.name.utf8.count <= 256 else {
+                throw SwanLegacySessionXRPCFailure.invalidRequest
+            }
+            // Petrel's generated Input carries `name` and `privileged` — the
+            // standard lexicon has no `scopes` field, so the design's proposed
+            // extension is not expressible without a lexicon change. The
+            // backward-compatible default IS the mapping the design specifies:
+            // `privileged` decides only whether DMs are reachable.
+            let scopes = AppPasswordScopes.defaultScopes(privileged: input.privileged ?? false)
+            let issued: AppPasswordIssuance
+            do {
+                issued = try await credentials.issue(
+                    did: subject, name: input.name, scopes: scopes, into: appPasswords
+                )
+            } catch let failure as AppPasswordStoreError {
+                switch failure {
+                case .duplicateName, .limitReached: throw SwanLegacySessionXRPCFailure.invalidRequest
+                case .unknownAccount: throw SwanLegacySessionXRPCFailure.expiredToken
+                }
+            } catch {
+                throw SwanLegacySessionXRPCFailure.unavailable
+            }
+            // The one and only time the secret is returned.
+            return try json(
+                .ok,
+                ComAtprotoServerCreateAppPassword.AppPassword(
+                    name: issued.record.name,
+                    password: issued.password,
+                    createdAt: ATProtocolDate(date: issued.record.createdAt),
+                    privileged: input.privileged ?? false
+                )
+            )
+        } catch {
+            return response(for: error)
+        }
+    }
+
+    func listAppPasswords(_ request: Request, context: SwanHTTPRequestContext) async -> Response {
+        do {
+            let subject = try await fullAccessSubject(request)
+            let rows: [AppPasswordRecord]
+            do {
+                rows = try await appPasswords.listAppPasswords(did: subject)
+            } catch {
+                throw SwanLegacySessionXRPCFailure.unavailable
+            }
+            return try json(
+                .ok,
+                ComAtprotoServerListAppPasswords.Output(
+                    passwords: rows.map { record in
+                        ComAtprotoServerListAppPasswords.AppPassword(
+                            name: record.name,
+                            createdAt: ATProtocolDate(date: record.createdAt),
+                            // Derived from the stored scopes rather than a
+                            // separate column, so the two can never disagree.
+                            privileged: record.scopes
+                                .split(separator: " ")
+                                .contains("transition:chat.bsky")
+                        )
+                    }
+                )
+            )
+        } catch {
+            return response(for: error)
+        }
+    }
+
+    func revokeAppPassword(_ request: Request, context: SwanHTTPRequestContext) async -> Response {
+        do {
+            try await requireNoQuery(request, context: context)
+            let input: ComAtprotoServerRevokeAppPassword.Input = try await decodeExactJSON(
+                request, context: context, required: ["name"], optional: []
+            )
+            let subject = try await fullAccessSubject(request)
+            do {
+                // Deleting the row cascades to its session families and their
+                // tokens, so revocation ends the credential's live sessions in
+                // the same statement.
+                try await appPasswords.revokeAppPassword(did: subject, name: input.name)
+            } catch {
+                throw SwanLegacySessionXRPCFailure.unavailable
+            }
+            return Response(status: .ok, headers: [:], body: .init())
+        } catch {
+            return response(for: error)
+        }
+    }
+
     // MARK: shared
 
     private func bearerToken(_ request: Request) throws -> String {
@@ -526,5 +652,48 @@ public struct SwanDurableLegacySessionDirectory: SwanLegacySessionDirectory {
 
     public func canonicalHandle(did: String) async throws -> String? {
         try await store.account(did: did)?.canonicalHandle
+    }
+}
+
+/// A per-identifier sliding-window limit on `createSession`.
+///
+/// An app password is a machine-generated 100-bit secret and the account
+/// password is Argon2id-verified, so this is not the thing standing between an
+/// attacker and a guess. It bounds COST: every attempt spends two Argon2id
+/// evaluations at 64 MiB each, so an unthrottled login endpoint is a memory and
+/// CPU amplifier pointed at the host by anyone who can name a handle.
+///
+/// Keyed by the presented identifier rather than by account, deliberately: an
+/// unknown identifier must be throttled the same as a known one, or the limiter
+/// itself becomes the existence oracle the login path is careful not to be.
+public actor SwanInProcessLegacySessionRateLimiter: SwanLegacySessionRateLimiting {
+    private let limit: Int
+    private let window: TimeInterval
+    private var attempts: [String: [Date]] = [:]
+
+    public init(limit: Int = 30, window: TimeInterval = 300) {
+        self.limit = limit
+        self.window = window
+    }
+
+    public func admitSessionCreation(identifier: String, now: Date) async -> Bool {
+        let key = identifier.lowercased()
+        let cutoff = now.addingTimeInterval(-window)
+        var recent = (attempts[key] ?? []).filter { $0 > cutoff }
+        guard recent.count < limit else {
+            attempts[key] = recent
+            return false
+        }
+        recent.append(now)
+        attempts[key] = recent
+        // Opportunistic sweep so a long-lived process does not accumulate one
+        // entry per identifier ever presented.
+        if attempts.count > 4096 {
+            attempts = attempts.compactMapValues { stamps in
+                let live = stamps.filter { $0 > cutoff }
+                return live.isEmpty ? nil : live
+            }
+        }
+        return true
     }
 }
