@@ -773,6 +773,26 @@ final class PermissionedRecordReadHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(results.map { $0["$type"] as? String }, ["com.atproto.space.applyWrites#createResult", "com.atproto.space.applyWrites#updateResult"])
                 }
 
+                // COMPAT SHIM (anchor policy): the reference crate spells each
+                // write as `{"action":"create",...}` with an empty `rkey`
+                // meaning auto-TID — bulleted.app's exact emission, captured
+                // off the wire. The dialect maps onto the lexicon's `$type`
+                // union at decode; a bogus action never maps and refuses.
+                let actionDialect = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","writes":[{"action":"create","collection":"\#(Self.collection)","rkey":"","value":{"$type":"app.bsky.feed.post","text":"crate dialect"}}]}"#
+                try await client.execute(uri: Self.applyPath, method: .post, headers: try self.writeHeaders(fixture, path: Self.applyPath, jti: "apply-action-dialect"), body: ByteBuffer(string: actionDialect)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let results = try XCTUnwrap((try self.jsonObject(response.body))["results"] as? [[String: Any]])
+                    XCTAssertEqual(results.count, 1)
+                    XCTAssertEqual(results.first?["$type"] as? String, "com.atproto.space.applyWrites#createResult")
+                    let uri = try XCTUnwrap(results.first?["uri"] as? String)
+                    XCTAssertFalse(uri.hasSuffix("/"), "an empty crate-dialect rkey must auto-generate a TID")
+                }
+                let bogusAction = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","writes":[{"action":"upsert","collection":"\#(Self.collection)","value":{"$type":"app.bsky.feed.post","text":"no"}}]}"#
+                try await client.execute(uri: Self.applyPath, method: .post, headers: try self.writeHeaders(fixture, path: Self.applyPath, jti: "apply-bogus-action"), body: ByteBuffer(string: bogusAction)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                }
+
                 let atomicFailure = #"{"space":"\#(fixture.space.rawValue)","repo":"\#(Self.alice)","writes":[{"$type":"com.atproto.space.applyWrites#create","collection":"\#(Self.collection)","rkey":"must-not-appear","value":{"$type":"app.bsky.feed.post","text":"no"}},{"$type":"com.atproto.space.applyWrites#update","collection":"\#(Self.collection)","rkey":"missing","value":{"$type":"app.bsky.feed.post","text":"no"}}]}"#
                 try await client.execute(uri: Self.applyPath, method: .post, headers: try self.writeHeaders(fixture, path: Self.applyPath, jti: "apply-atomic"), body: ByteBuffer(string: atomicFailure)) { response in
                     XCTAssertEqual(response.status, .badRequest)

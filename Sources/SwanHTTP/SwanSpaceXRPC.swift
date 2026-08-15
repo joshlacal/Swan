@@ -1036,7 +1036,8 @@ func registerAuthenticatedApplyWritesEndpoint(
             request,
             context: context,
             as: ComAtprotoSpaceApplyWrites.Input.self,
-            capability: capability
+            capability: capability,
+            transform: applyWritesActionDialect
         ) { input in
             authenticatedSpaceWriteJSON(
                 .ok,
@@ -1052,6 +1053,7 @@ private func withAuthenticatedSpaceWriteInput<Value: Decodable>(
     context: SwanHTTPRequestContext,
     as type: Value.Type,
     capability: SwanAuthenticatedSpaceRecordsCapability,
+    transform: (@Sendable (Data) -> Data)? = nil,
     operation: (Value) async throws -> Response
 ) async -> Response {
     let contentTypes = request.headers[values: .contentType]
@@ -1081,7 +1083,8 @@ private func withAuthenticatedSpaceWriteInput<Value: Decodable>(
     ) { data in
         do {
             try StrictPermissionedWriteJSON.validate(data)
-            return try JSONDecoder().decode(type, from: data)
+            let admitted = transform?(data) ?? data
+            return try JSONDecoder().decode(type, from: admitted)
         } catch {
             throw AuthenticatedSpaceWriteFailure.invalidRequest
         }
@@ -1158,6 +1161,39 @@ private func authenticatedSpaceWriteError(_ status: HTTPResponse.Status, code: S
 
 private func authenticatedSpaceWriteJSON(_ status: HTTPResponse.Status, _ output: some Encodable) -> Response {
     authenticatedGetSpaceJSON(status, output)
+}
+
+/// COMPAT SHIM (anchor policy, 2026-08-15): the reference crate's
+/// `applyWrites` spells each write as `{"action":"create",...}` with an
+/// empty-string `rkey` meaning auto-TID (`space_handlers.rs::ApplyWritesOp`),
+/// while the official lexicon — pinned AND current HEAD — declares a closed
+/// `$type` union (`applyWrites.json`). bulleted.app emits the crate spelling,
+/// so entries carrying `action` and no `$type` are rewritten to the union
+/// form before the generated decoder runs; entries already carrying `$type`
+/// pass through untouched, and the rewrite runs strictly AFTER
+/// `StrictPermissionedWriteJSON` has validated the raw bytes. Anything
+/// unexpected returns the input unchanged and the generated decoder issues
+/// the refusal.
+@Sendable
+func applyWritesActionDialect(_ data: Data) -> Data {
+    guard var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let writes = root["writes"] as? [[String: Any]],
+          writes.contains(where: { $0["$type"] == nil && $0["action"] is String })
+    else { return data }
+    let rewritten: [[String: Any]] = writes.map { entry in
+        guard entry["$type"] == nil, let action = entry["action"] as? String,
+              ["create", "update", "delete"].contains(action) else { return entry }
+        var write = entry
+        write.removeValue(forKey: "action")
+        write["$type"] = "com.atproto.space.applyWrites#\(action)"
+        if action == "create", let rkey = write["rkey"] as? String, rkey.isEmpty {
+            write.removeValue(forKey: "rkey")
+        }
+        return write
+    }
+    root["writes"] = rewritten
+    guard let encoded = try? JSONSerialization.data(withJSONObject: root) else { return data }
+    return encoded
 }
 
 /// `JSONDecoder` intentionally follows Foundation's permissive duplicate-key
