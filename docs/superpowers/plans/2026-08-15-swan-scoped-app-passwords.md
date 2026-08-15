@@ -256,6 +256,45 @@ Access JWT: `typ: at+jwt`, `sub` = DID, `aud` = service DID, plus a `scope` clai
 
 ---
 
+## ⛔ BLOCKER on Task 7 — the four lexicons are not in the generated wire
+
+Discovered while executing. `SwanPublicWire` has no `ComAtprotoServerCreateSession`
+and no session types at all: the generated set is `confirmEmail`,
+`requestEmailConfirmation`, `requestEmailUpdate`, `requestPasswordReset`,
+`resetPassword`, `updateEmail`. The four lexicons DO exist in the pinned
+reference tree (`.interop-cache/atproto-bddc99fb…/lexicons/com/atproto/server/`).
+
+Generation is guarded on purpose. `Scripts/public-wire-generation-common.sh`
+enforces an **exact 21-file lexicon inventory** (`public_wire_write_expected_lexicon_paths`),
+a checked-in SHA manifest tied to a PROFILE
+(`Profiles/public-data-testing-2026-08-06.lexicons.sha256`), and a pinned Petrel
+generator commit that must be a clean, empty jj child of
+`c2a1cdbee8c621c7682416114700f032cc7e2b37`. That commit **does exist** in
+`../Petrel`, so regeneration is mechanically possible.
+
+Three routes forward. **This is a maintainer decision — do not pick one silently.**
+
+1. **Extend the pinned wire set.** Add the four paths to the inventory and the
+   profile's SHA manifest, then regenerate. Most consistent with "codegen is
+   source of truth", but it mutates a SHA-pinned protocol manifest whose whole
+   purpose is to keep the permissioned-data surface byte-identical to the
+   reference implementation, and it may require minting a NEW profile version
+   rather than editing the current one — which then requires the systemd unit's
+   `--profile` to follow, or endpoints 404.
+2. **Hand-write the four request/response types in `SwanHTTP`.** Touches no
+   pinned surface and is fully reversible. There is precedent — the OAuth
+   authorization-server endpoints are hand-written, not generated — and the
+   session lexicons are ordinary `com.atproto.server.*`, not part of the
+   permissioned-data proposal the pinning exists to protect. Register them as
+   exact routes, which outrank the `com.atproto.server.*` prefix guard in
+   Hummingbird's trie regardless of order (that is how `describeServer`
+   survives), so the fence stays intact.
+3. **Defer** legacy login entirely.
+
+Recommendation: **(2)**. The pinned inventory guards the proposal-0016 wire; the
+session family is not part of it, and (2) is the only route that cannot corrupt
+a surface that took real work to establish.
+
 ## Task 7: The session endpoints
 
 **Files:** Create `Sources/SwanHTTP/SwanLegacySessionXRPC.swift`. Modify `Sources/SwanHTTP/SwanHTTP.swift:1098`. Tests alongside.
