@@ -324,6 +324,12 @@ func registerAuthenticatedRegisterSpaceNotifyEndpoint(
             let output = try await handler.handle(parameters: (), input: input, context: request)
             return authenticatedGetSpaceJSON(.ok, output)
         } catch let failure as AuthenticatedSpaceNotificationFailure {
+            // Rejection KIND only — never body content. Tonight's debugging
+            // repeatedly stalled on silent 400s from this route.
+            context.logger.info(
+                "registerNotify rejected",
+                metadata: ["failure": .string(String(describing: failure))]
+            )
             return authenticatedSpaceNotificationResponse(for: failure)
         } catch let failure as SwanRequestBodyCollectionFailure {
             return authenticatedSpaceNotificationResponse(

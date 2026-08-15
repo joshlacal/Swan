@@ -734,9 +734,28 @@ public struct OAuthRemoteDocumentFetcher: Sendable {
         try await fetchValidatedResponse(from: url).body
     }
 
+    /// `application/json` or any RFC 6839 `+json` structured-syntax suffix.
+    ///
+    /// DID documents are served as `application/did+ld+json` — the
+    /// W3C-registered type; bulleted.app and plc.directory both use it — and
+    /// the exact-match here made every DID-document resolution answer
+    /// `ServiceNotResolvable` (Erratum 03 addendum, defect class instance
+    /// #9). The suffix declares the payload IS JSON, and the protection was
+    /// never the media-type string: `StrictJSON.validate` runs on the bytes
+    /// either way, and the domain decoder still decides what those bytes may
+    /// mean.
     private func isJSONContentType(_ value: String) -> Bool {
         let mediaType = value.split(separator: ";", maxSplits: 1)[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return mediaType == "application/json"
+        if mediaType == "application/json" { return true }
+        guard mediaType.hasSuffix("+json"), mediaType.utf8.count <= 127,
+              let slash = mediaType.firstIndex(of: "/"),
+              slash != mediaType.startIndex else {
+            return false
+        }
+        let subtype = mediaType[mediaType.index(after: slash)...]
+        return subtype.count > "+json".count
+            && !subtype.contains("/")
+            && mediaType.utf8.allSatisfy({ $0 > 0x20 && $0 < 0x7F })
     }
 
     private func strictDecimal(_ value: String) -> Int? {

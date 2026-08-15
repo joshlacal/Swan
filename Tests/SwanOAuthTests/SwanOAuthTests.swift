@@ -1355,7 +1355,12 @@ final class SwanOAuthTests: XCTestCase {
         let badResponses: [OAuthRemoteHTTPResponse] = [
             .init(status: 302, headers: ["content-type": ["application/json"]], body: body, responseURL: url),
             .init(status: 200, headers: ["content-type": ["text/html"]], body: body, responseURL: url),
-            .init(status: 200, headers: ["content-type": ["application/problem+json"]], body: body, responseURL: url),
+            // Erratum 03 addendum: `+json` suffix types are JSON and now pass
+            // the content-type gate (pinned in
+            // testHardenedRemoteFetcherAcceptsStructuredJSONSuffixTypes), so
+            // this rejection vector uses a genuinely non-JSON type instead of
+            // the former `application/problem+json`.
+            .init(status: 200, headers: ["content-type": ["application/xml"]], body: body, responseURL: url),
             .init(status: 200, headers: ["content-type": ["application/json"]], body: Data(repeating: 0x20, count: 1_025), responseURL: url),
             .init(status: 200, headers: ["content-type": ["application/json"]], body: body, responseURL: URL(string: "https://other.example/")!),
             .init(status: 200, headers: ["content-type": ["application/json"]], body: body, responseURL: url, redirectCount: 1),
@@ -1379,6 +1384,57 @@ final class SwanOAuthTests: XCTestCase {
             )
         )
         await XCTAssertThrowsErrorAsync(try await nilPeerFetcher.fetchJSON(from: url))
+    }
+
+    /// Erratum 03 addendum (defect class instance #9): `fetchJSON` accepts
+    /// `application/json` and any RFC 6839 `+json` structured-syntax suffix —
+    /// DID documents arrive as `application/did+ld+json` from bulleted.app
+    /// and plc.directory alike, and the exact match made every DID-document
+    /// resolution unresolvable. Non-JSON types still refuse, as does a bare
+    /// suffix with no subtype name.
+    func testHardenedRemoteFetcherAcceptsStructuredJSONSuffixTypes() async throws {
+        let url = URL(string: "https://metadata.example/.well-known/did.json")!
+        let publicAddress = try XCTUnwrap(OAuthIPAddress(literal: "93.184.216.34"))
+        let body = Data(#"{"id":"did:web:metadata.example"}"#.utf8)
+        let policy = try OAuthRemoteFetchPolicy(maximumBodyBytes: 1_024, timeout: 2)
+
+        for accepted in [
+            "application/did+ld+json; charset=utf-8",
+            "application/did+json",
+            "application/json",
+        ] {
+            let fetcher = OAuthRemoteDocumentFetcher(
+                policy: policy,
+                resolver: TestResolver(answers: [[publicAddress], [publicAddress]]),
+                transport: TestTransport(responses: [url.absoluteString: .init(
+                    status: 200,
+                    headers: ["Content-Type": [accepted]],
+                    body: body,
+                    responseURL: url,
+                    connectedPeerAddress: publicAddress
+                )])
+            )
+            let fetched = try await fetcher.fetchJSON(from: url)
+            XCTAssertEqual(fetched, body, "content-type \(accepted) must be accepted")
+        }
+
+        for refused in ["text/html", "application/+json", "text/json", "application/jsonx"] {
+            let fetcher = OAuthRemoteDocumentFetcher(
+                policy: policy,
+                resolver: TestResolver(answers: [[publicAddress], [publicAddress]]),
+                transport: TestTransport(responses: [url.absoluteString: .init(
+                    status: 200,
+                    headers: ["Content-Type": [refused]],
+                    body: body,
+                    responseURL: url,
+                    connectedPeerAddress: publicAddress
+                )])
+            )
+            do {
+                _ = try await fetcher.fetchJSON(from: url)
+                XCTFail("content-type \(refused) must be refused")
+            } catch {}
+        }
     }
 
     /// `fetchBytes` must inherit every control `fetchJSON` has except the
