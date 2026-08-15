@@ -88,15 +88,24 @@ public enum SQLiteLayout {
         CREATE TABLE IF NOT EXISTS legacy_session_families (
             family_id TEXT PRIMARY KEY,
             did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
-            -- The credential this session was born from.
+            -- The credential this session was born from, or NULL when it was
+            -- the ACCOUNT password.
             --
-            -- ON DELETE CASCADE is the whole revocation mechanism: deleting an
-            -- app password deletes its session families, and the token rows
-            -- cascade from those. Upstream achieves the same by remembering to
-            -- call `revokeAppPasswordRefreshToken` beside `deleteAppPassword`
-            -- in one transaction (`account-manager.ts:674-681`). Expressing it
-            -- as a foreign key means a future revocation path cannot forget.
-            app_password_id TEXT NOT NULL
+            -- Upstream's createSession accepts either (`account-manager.ts:587-641`),
+            -- and Swan matches it: an account-password session is full-authority
+            -- and has no app-password row to point at. NULL is therefore a real
+            -- state, not a missing value.
+            --
+            -- ON DELETE CASCADE is the whole revocation mechanism for the
+            -- app-password case: deleting a credential deletes its session
+            -- families, and the token rows cascade from those. Upstream achieves
+            -- the same by remembering to call `revokeAppPasswordRefreshToken`
+            -- beside `deleteAppPassword` in one transaction (`:674-681`).
+            -- Expressing it as a foreign key means a future revocation path
+            -- cannot forget. A NULL row is unaffected by any credential
+            -- deletion, which is correct — the account password is not one of
+            -- them.
+            app_password_id TEXT
                 REFERENCES account_app_passwords(id) ON DELETE CASCADE,
             created_at INTEGER NOT NULL CHECK(created_at >= 0),
             -- Set when reuse of a rotated refresh token is detected. The family

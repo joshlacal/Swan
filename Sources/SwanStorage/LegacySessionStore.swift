@@ -10,14 +10,16 @@ import SwanCore
 public struct LegacySessionFamily: Sendable, Equatable {
     public let familyID: String
     public let did: String
-    public let appPasswordID: String
+    /// `nil` when the session was opened with the ACCOUNT password, which
+    /// carries full authority and has no credential row to re-read.
+    public let appPasswordID: String?
     public let createdAt: Date
     public let revokedAt: Date?
 
     public init(
         familyID: String,
         did: String,
-        appPasswordID: String,
+        appPasswordID: String?,
         createdAt: Date,
         revokedAt: Date?
     ) {
@@ -51,7 +53,7 @@ public protocol LegacySessionStore: Sendable {
     func createLegacySessionFamily(
         familyID: String,
         did: String,
-        appPasswordID: String,
+        appPasswordID: String?,
         accessDigest: Data,
         accessExpiresAt: Date,
         refreshDigest: Data,

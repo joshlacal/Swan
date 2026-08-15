@@ -20,8 +20,10 @@ import XCTest
 final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
     private let did = "did:plc:abcdefghijklmnopqrstuvwx"
     private let handle = "legacy.example.com"
-    private let verifier =
-        "$argon2id$v=19$m=65536,t=2,p=1$initialsalt$initial-precomputed-verifier"
+    /// The real account password, hashed with the same policy the directory
+    /// verifies against — these tests exercise the account-password login path,
+    /// so a placeholder verifier would not do.
+    private static let accountPassword = "correct-horse-battery-staple"
 
     private struct AlwaysAdmits: SwanLegacySessionRateLimiting {
         func admitSessionCreation(identifier: String, now: Date) async -> Bool { true }
@@ -46,11 +48,17 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "LegacySessionHTTPTests-" + UUID().uuidString)
         let database = try await SQLiteControlDatabase(dataDirectory: root)
+        let hasher = try LibsodiumArgon2idHasher()
+        let accounts = DurableAccountDirectory(
+            store: database,
+            passwordHasher: hasher,
+            verificationExecutor: try Argon2idVerificationExecutor(hasher: hasher)
+        )
         _ = try await database.createAccount(
             try AccountControlRegistration(
                 did: did,
                 canonicalHandle: handle,
-                passwordVerifier: verifier,
+                passwordVerifier: try hasher.hash(Self.accountPassword),
                 signingKey: try .init(purpose: .signing, generation: 1),
                 rotationKey: try .init(purpose: .rotation, generation: 1),
                 createdAt: Date(timeIntervalSince1970: 1_750_000_000)
@@ -68,6 +76,7 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
             ),
             credentials: credentials,
             appPasswords: database,
+            accounts: accounts,
             directory: SwanDurableLegacySessionDirectory(store: database),
             rateLimiter: rateLimiter,
             requestBodyAdmission: .init(
@@ -138,6 +147,79 @@ final class LegacySessionHTTPTests: XCTestCase, @unchecked Sendable {
                 XCTAssertEqual(payload["handle"] as? String, self.handle)
                 XCTAssertNotNil(payload["accessJwt"] as? String)
                 XCTAssertNotNil(payload["refreshJwt"] as? String)
+            }
+        }
+    }
+
+    /// The reason this path exists: there is no app-password UI, so the
+    /// account password must work or nobody can sign in at all. Upstream
+    /// accepts either (`account-manager.ts:620-633`).
+    func testTheAccountPasswordSignsIn() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        try await app(fixture).test(.router) { client in
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.createSession",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(string:
+                    "{\"identifier\":\"\(self.handle)\",\"password\":\"\(Self.accountPassword)\"}"
+                )
+            ) { response in
+                XCTAssertEqual(response.status, .ok, self.body(response))
+                let payload = try self.json(response)
+                XCTAssertEqual(payload["did"] as? String, self.did)
+                // The `scope` claim is upstream's credential-TYPE discriminator:
+                // an account-password session is `com.atproto.access`, not
+                // `com.atproto.appPass`.
+                let access = try XCTUnwrap(payload["accessJwt"] as? String)
+                let claims = try XCTUnwrap(
+                    JSONSerialization.jsonObject(
+                        with: try XCTUnwrap(
+                            Data(base64URLEncoded: String(access.split(separator: ".")[1]))
+                        )
+                    ) as? [String: Any]
+                )
+                XCTAssertEqual(claims["scope"] as? String, "com.atproto.access")
+            }
+        }
+    }
+
+    /// Signing in with an app password produces a session of the SAME shape but
+    /// a different credential type — which is where the narrowing lives.
+    func testAnAppPasswordSignsInWithItsOwnDiscriminator() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let password = try await issuePassword(fixture)
+        try await app(fixture).test(.router) { client in
+            try await client.execute(
+                uri: "/xrpc/com.atproto.server.createSession",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(string:
+                    "{\"identifier\":\"\(self.handle)\",\"password\":\"\(password)\"}"
+                )
+            ) { response in
+                XCTAssertEqual(response.status, .ok, self.body(response))
+                let access = try XCTUnwrap(try self.json(response)["accessJwt"] as? String)
+                let claims = try XCTUnwrap(
+                    JSONSerialization.jsonObject(
+                        with: try XCTUnwrap(
+                            Data(base64URLEncoded: String(access.split(separator: ".")[1]))
+                        )
+                    ) as? [String: Any]
+                )
+                XCTAssertEqual(claims["scope"] as? String, "com.atproto.appPass")
             }
         }
     }

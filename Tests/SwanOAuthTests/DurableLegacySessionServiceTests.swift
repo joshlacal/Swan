@@ -192,6 +192,55 @@ final class DurableLegacySessionServiceTests: XCTestCase {
         )
     }
 
+    /// An account-password session has no credential row to read from, so its
+    /// authority is the widest the legacy surface reaches — upstream's
+    /// `AuthScope.Access`. It still must not reach a space.
+    func testAnAccountPasswordSessionCarriesFullLegacyAuthority() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let tokens = try await fixture.service.issue(did: did, appPassword: nil)
+        let context = try await fixture.service.authorize(accessJWT: tokens.accessJWT)
+        guard case let .accountLegacySession(subject, permissions) = context else {
+            return XCTFail("must still be a legacy session, never .accountOAuth")
+        }
+        XCTAssertEqual(subject, did)
+        XCTAssertTrue(permissions.allowsRepo(.init(collection: "app.bsky.feed.post", action: .create)))
+        XCTAssertTrue(permissions.allowsBlob(.init(mime: "image/png")))
+        XCTAssertTrue(permissions.allowsRPC(.init(lxm: "chat.bsky.convo.listConvos", aud: "did:web:x")))
+        // Full LEGACY authority is not full authority: the permissioned-data
+        // surface refuses `.accountLegacySession` whatever it carries.
+        XCTAssertFalse(permissions.allowsSpace(
+            SpaceScopeTarget(
+                type: "com.example.space",
+                authority: did,
+                skey: "key",
+                operation: .read(aggregate: false, collection: nil)
+            )
+        ))
+    }
+
+    /// Revoking an app password must not touch account-password sessions —
+    /// their family has a NULL credential reference, so no cascade reaches it.
+    func testRevokingAnAppPasswordLeavesAccountPasswordSessionsAlone() async throws {
+        let fixture = try await makeFixture()
+        defer {
+            Task {
+                try? await fixture.database.close()
+                try? FileManager.default.removeItem(at: fixture.root)
+            }
+        }
+        let account = try await fixture.service.issue(did: did, appPassword: nil)
+        let (scoped, _) = try await issue(fixture, name: "phone")
+
+        try await fixture.database.revokeAppPassword(did: did, name: scoped.record.name)
+        _ = try await fixture.service.authorize(accessJWT: account.accessJWT)
+    }
+
     // MARK: - Rotation and reuse
 
     func testRefreshRotatesAndTheOldAccessTokenKeepsWorkingUntilItExpires() async throws {

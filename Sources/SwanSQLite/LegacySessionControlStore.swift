@@ -15,7 +15,7 @@ extension SQLiteControlDatabase: LegacySessionStore {
     public func createLegacySessionFamily(
         familyID: String,
         did: String,
-        appPasswordID: String,
+        appPasswordID: String?,
         accessDigest: Data,
         accessExpiresAt: Date,
         refreshDigest: Data,
@@ -34,7 +34,7 @@ extension SQLiteControlDatabase: LegacySessionStore {
                     [
                         .text(familyID),
                         .text(did),
-                        .text(appPasswordID),
+                        appPasswordID.map(SQLiteData.text) ?? .null,
                         .integer(createdAt),
                     ]
                 )
@@ -209,9 +209,16 @@ extension SQLiteControlDatabase: LegacySessionStore {
     private func legacySessionFamily(_ row: SQLiteRow) throws -> LegacySessionFamily {
         guard case let .text(familyID) = row.column("family_id"),
               case let .text(did) = row.column("did"),
-              case let .text(appPasswordID) = row.column("app_password_id"),
               case let .integer(createdAt) = row.column("created_at") else {
             throw AccountControlStoreError.malformedRecord
+        }
+        // NULL is the account-password case, not a malformed row.
+        var appPasswordID: String?
+        if let value = row.column("app_password_id"), !value.isNull {
+            guard case let .text(identifier) = value else {
+                throw AccountControlStoreError.malformedRecord
+            }
+            appPasswordID = identifier
         }
         var revokedAt: Date?
         if let value = row.column("revoked_at"), !value.isNull {

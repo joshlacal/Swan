@@ -70,13 +70,15 @@ public actor DurableLegacySessionService {
         )
     }
 
-    /// Opens a session for an already-authenticated app password.
+    /// Opens a session for an already-authenticated credential.
     ///
-    /// The caller is responsible for having verified the account password path
-    /// first; this mints against a resolved app-password row.
+    /// - Parameter appPassword: the credential the session was opened with, or
+    ///   `nil` for the ACCOUNT password. Upstream's `createSession` accepts
+    ///   either (`account-manager.ts:587-641`) and Swan matches it. The two
+    ///   differ in authority and in the token's `scope` claim, not in mechanism.
     public func issue(
         did: String,
-        appPassword: AppPasswordRecord,
+        appPassword: AppPasswordRecord?,
         now: Date = Date()
     ) async throws -> LegacySessionTokens {
         let familyID = UUID().uuidString.lowercased()
@@ -85,13 +87,23 @@ public actor DurableLegacySessionService {
         let accessExpiry = now.addingTimeInterval(LegacySessionJWT.accessLifetime)
         let refreshExpiry = now.addingTimeInterval(LegacySessionJWT.refreshLifetime)
 
-        let access = try mint(.access, subject: did, tokenID: accessID, scope: .appPassword, now: now)
+        // Upstream's `scope` claim is a credential-TYPE discriminator
+        // (`auth-scope.ts:2-9`): `com.atproto.access` for the account password,
+        // `com.atproto.appPass` for an app password. Swan carries the same
+        // values so the claim keeps its established meaning.
+        let access = try mint(
+            .access,
+            subject: did,
+            tokenID: accessID,
+            scope: appPassword == nil ? .access : .appPassword,
+            now: now
+        )
         let refresh = try mint(.refresh, subject: did, tokenID: refreshID, scope: .refresh, now: now)
 
         try await store.createLegacySessionFamily(
             familyID: familyID,
             did: did,
-            appPasswordID: appPassword.id,
+            appPasswordID: appPassword?.id,
             accessDigest: digest(access, purpose: .accessToken),
             accessExpiresAt: accessExpiry,
             refreshDigest: digest(refresh, purpose: .refreshToken),
@@ -168,7 +180,14 @@ public actor DurableLegacySessionService {
             let accessExpiry = now.addingTimeInterval(LegacySessionJWT.accessLifetime)
             let refreshExpiry = now.addingTimeInterval(LegacySessionJWT.refreshLifetime)
             let access = try mint(
-                .access, subject: family.did, tokenID: accessID, scope: .appPassword, now: now
+                .access,
+                subject: family.did,
+                tokenID: accessID,
+                // Same discriminator the family was opened with — a rotation
+                // must not silently promote an app-password session to a
+                // full-access one.
+                scope: family.appPasswordID == nil ? .access : .appPassword,
+                now: now
             )
             let replacement = try mint(
                 .refresh, subject: family.did, tokenID: refreshID, scope: .refresh, now: now
@@ -214,10 +233,26 @@ public actor DurableLegacySessionService {
         }
     }
 
-    /// The current authority of a session, from its app-password row.
+    /// The current authority of a session.
+    ///
+    /// An app-password session re-reads its credential row on EVERY call, so
+    /// narrowing takes effect at once and revoking ends the session (§D5).
+    /// An account-password session has no row to read: it is full authority,
+    /// which upstream spells `AuthScope.Access` and which here is the widest
+    /// scope set the legacy surface can reach.
     private func permissions(for family: LegacySessionFamily) async throws -> SwanScopePermissions {
+        guard let appPasswordID = family.appPasswordID else {
+            // Full authority — every transition scope. Still NOT the
+            // permissioned-data surface: `allowsSpace` has no transition arm,
+            // and `.accountLegacySession` is refused at every space predicate
+            // regardless of what it carries.
+            return SwanScopePermissions(
+                rawScopes: Set(AppPasswordPreset.full.scopes(appViewAudience: "")),
+                subject: family.did
+            )
+        }
         let rows = try await appPasswords.listAppPasswords(did: family.did)
-        guard let record = rows.first(where: { $0.id == family.appPasswordID }) else {
+        guard let record = rows.first(where: { $0.id == appPasswordID }) else {
             // The credential was revoked. The family rows cascade on delete, so
             // reaching here means a token survived its credential — fail closed
             // rather than assuming the cascade ran.

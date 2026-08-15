@@ -12,17 +12,23 @@ import SwanStorage
 /// `com.atproto.server.{createSession,refreshSession,getSession,deleteSession}`
 /// — the legacy session family the official Bluesky client uses.
 ///
-/// ## App passwords only, deliberately
+/// ## Account password OR app password, matching upstream
 ///
-/// Upstream's `createSession` accepts EITHER the account password or an app
-/// password (`account-manager.ts:587-641`). Swan accepts only an app password.
+/// `account-manager.ts:587-641`: try the account password; if it does not match,
+/// try the account's app passwords; reject if neither. Swan does the same.
 ///
-/// The goal this feature exists for is that the credential a legacy client holds
-/// is **narrower than the account**. Accepting the account password over a
-/// bearer channel would make the account password itself a long-lived bearer
-/// secret — strictly worse than the thing app passwords were introduced to
-/// bound, and a direct contradiction of the design's own framing. A user signs
-/// in to the Bluesky app by creating an app password and typing that.
+/// An earlier revision here accepted only app passwords, on the argument that
+/// the credential a legacy client holds should be narrower than the account.
+/// That argument loses to two facts. There is no app-password UI, so
+/// app-password-only means nobody can sign in at all — a login path that cannot
+/// be used is not a safer login path. And divergence from the reference costs
+/// interop for no gain: the official client offers one password field, and a
+/// user who types their account password into it expects it to work.
+///
+/// The two differ in AUTHORITY, which is where the narrowing actually lives: an
+/// app-password session carries exactly its row's scopes, an account-password
+/// session carries full legacy authority. Neither reaches the permissioned-data
+/// surface.
 ///
 /// ## The types are Petrel's
 ///
@@ -75,6 +81,7 @@ struct SwanLegacySessionXRPCServer: Sendable {
     private let sessions: DurableLegacySessionService
     private let credentials: AppPasswordCredentials
     private let appPasswords: any AppPasswordStore
+    private let accounts: DurableAccountDirectory
     private let directory: any SwanLegacySessionDirectory
     private let rateLimiter: any SwanLegacySessionRateLimiting
     private let requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
@@ -90,6 +97,7 @@ struct SwanLegacySessionXRPCServer: Sendable {
         sessions: DurableLegacySessionService,
         credentials: AppPasswordCredentials,
         appPasswords: any AppPasswordStore,
+        accounts: DurableAccountDirectory,
         directory: any SwanLegacySessionDirectory,
         rateLimiter: any SwanLegacySessionRateLimiting,
         requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
@@ -98,6 +106,7 @@ struct SwanLegacySessionXRPCServer: Sendable {
         self.sessions = sessions
         self.credentials = credentials
         self.appPasswords = appPasswords
+        self.accounts = accounts
         self.directory = directory
         self.rateLimiter = rateLimiter
         self.requestBodyAdmission = requestBodyAdmission
@@ -116,6 +125,7 @@ struct SwanLegacySessionXRPCServer: Sendable {
             sessions: sessions,
             credentials: credentials,
             appPasswords: appPasswords,
+            accounts: accounts,
             directory: directory,
             rateLimiter: rateLimiter,
             requestBodyAdmission: requestBodyAdmission,
@@ -144,6 +154,7 @@ private struct Handlers: Sendable {
     let sessions: DurableLegacySessionService
     let credentials: AppPasswordCredentials
     let appPasswords: any AppPasswordStore
+    let accounts: DurableAccountDirectory
     let directory: any SwanLegacySessionDirectory
     let rateLimiter: any SwanLegacySessionRateLimiting
     let requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
@@ -199,23 +210,50 @@ private struct Handlers: Sendable {
         }
     }
 
-    /// App-password authentication, written to cost the same whether or not the
-    /// account exists.
+    /// Account password first, then app passwords — upstream's order
+    /// (`account-manager.ts:620-633`).
+    ///
+    /// Written so the work does not depend on whether the account exists. Both
+    /// verifications run on every path: `authenticateForLogin` performs exactly
+    /// one Argon2id on every route including the unknown-account one, using its
+    /// boot-generated dummy verifier, and the app-password digest is a second
+    /// fixed-cost Argon2id salted by the DID (or, for an unknown account, by the
+    /// identifier presented). Neither "the expensive step happened" nor "it
+    /// happened twice" separates a missing account from a wrong password.
     private func authenticate(
         identifier: String,
         password: String
     ) async throws -> LegacySessionTokens {
         let resolved: String?
+        let handle: String?
         do {
             resolved = try await directory.resolveLoginIdentifier(identifier)
+            if let resolved {
+                handle = try await directory.canonicalHandle(did: resolved)
+            } else {
+                handle = nil
+            }
         } catch {
             throw SwanLegacySessionXRPCFailure.unavailable
         }
-        // The Argon2id digest runs on EVERY path, including the unknown-account
-        // one, so an attacker cannot tell a missing account from a wrong
-        // password by whether the expensive step happened. The DID is the salt,
-        // so an unknown account is salted with the identifier it presented —
-        // real work over real bytes, not a sleep.
+
+        // 1. The account password. `authenticateForLogin` is already
+        //    enumeration-resistant, so it is handed the presented identifier
+        //    when nothing resolved rather than being skipped.
+        let outcome: AccountLoginAuthenticationOutcome
+        do {
+            outcome = try await accounts.authenticateForLogin(
+                handle: handle ?? identifier,
+                password: password
+            )
+        } catch {
+            // `AccountLoginAuthenticationError.unavailable` is infrastructure,
+            // never a credential verdict.
+            throw SwanLegacySessionXRPCFailure.unavailable
+        }
+
+        // 2. The app-password digest, computed unconditionally so step 1's
+        //    outcome is not observable in the cost of step 2.
         let did = resolved ?? identifier
         let digest: Data
         do {
@@ -223,20 +261,32 @@ private struct Handlers: Sendable {
         } catch {
             throw SwanLegacySessionXRPCFailure.unavailable
         }
-        guard resolved != nil else {
+
+        if case .authenticated = outcome, let resolved {
+            // Full legacy authority, upstream's `AuthScope.Access`.
+            return try await open(did: resolved, appPassword: nil)
+        }
+        guard let resolved else {
             throw SwanLegacySessionXRPCFailure.authenticationRequired
         }
         let record: AppPasswordRecord?
         do {
-            record = try await appPasswords.appPassword(did: did, digest: digest)
+            record = try await appPasswords.appPassword(did: resolved, digest: digest)
         } catch {
             throw SwanLegacySessionXRPCFailure.unavailable
         }
         guard let record else {
             throw SwanLegacySessionXRPCFailure.authenticationRequired
         }
+        return try await open(did: resolved, appPassword: record)
+    }
+
+    private func open(
+        did: String,
+        appPassword: AppPasswordRecord?
+    ) async throws -> LegacySessionTokens {
         do {
-            return try await sessions.issue(did: did, appPassword: record)
+            return try await sessions.issue(did: did, appPassword: appPassword)
         } catch {
             throw SwanLegacySessionXRPCFailure.unavailable
         }
