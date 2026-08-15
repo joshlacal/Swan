@@ -103,6 +103,34 @@ public extension SpaceScopeTarget {
         )
     }
 
+    /// A single-blob read target — **Erratum 03's one deliberate exception**
+    /// to the rule above that `aggregate` is derived from `collection == nil`.
+    ///
+    /// A blob fetch arrives with no record URI, so `record(_:action:collection:)`
+    /// classified it as an aggregate read and §6.5.5 refused every
+    /// collection-qualified grant. But "no record URI in hand" and "this
+    /// surface spans collections" are NOT the same fact here: a blob is one
+    /// content-addressed object whose row is already namespace-scoped to the
+    /// space — nothing about fetching it enumerates or censors a
+    /// cross-collection response, which is the hazard §6.5.5 exists for.
+    /// And post-Erratum-02 the same grant can exchange for a whole-space
+    /// credential and read the identical bytes through the credential arm, so
+    /// the aggregate classification refused conformant clients (bulleted.app's
+    /// six-collection grant, `getBlob` 401) while protecting nothing.
+    ///
+    /// This constructor is for SINGLE-blob retrieval only. Any surface that
+    /// answers with a set spanning collections keeps `record` and its derived
+    /// aggregate flag — do not reach for this to quiet a §6.5.5 refusal on a
+    /// listing.
+    static func blobRead(_ space: SpaceURI) -> SpaceScopeTarget {
+        SpaceScopeTarget(
+            type: space.spaceType,
+            authority: space.authority,
+            skey: space.skey,
+            operation: .read(aggregate: false, collection: nil)
+        )
+    }
+
     /// A space-lifecycle target. `manage=` is a DISJOINT vocabulary from
     /// `action=` (`space-permission.ts:32-36`); the mapping must keep `.manage`
     /// routing to the `manage=` parameter and never to `action=`.

@@ -76,8 +76,9 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
         )
         try await database.receiveSpaceWriteNotification(first, now: now)
         // Duplicate service JTI is a successful no-op, not another state
-        // change. The pinned TypeScript receiver requires `iss == repo`, so
-        // an authority cannot lawfully fan this write out to another host.
+        // change. The registration above is LEGACY (endpoint-only, no service
+        // identity), so Erratum 03's write fanout does not fire either: with
+        // no service identity there is no audience a receiver could verify.
         try await database.receiveSpaceWriteNotification(first, now: now.addingTimeInterval(1))
         // A reordered older TID cannot regress the authority hint or produce
         // another recipient delivery. It also must not become permanent replay
@@ -133,6 +134,135 @@ final class SpaceNotificationSQLiteTests: XCTestCase {
             authorization: credential
         )
         XCTAssertEqual(afterConflict.first?.commitment, Data(repeating: 1, count: 32))
+    }
+
+    /// Erratum 03: write fanout fires for SERVICE-NAMED registrations only,
+    /// from both write paths — a member's announced write and a local apply —
+    /// carrying the writer/revision/commitment the `notifyWrite` body needs.
+    /// Legacy endpoint-only rows enqueue nothing, an expired service row stops
+    /// matching, and the service-identity accessor answers per registration.
+    func testWriteFanoutEnqueuesOnlyForServiceNamedRegistrations() async throws {
+        let fixture = try NotificationFixture()
+        let database = try await fixture.open()
+        defer { Task { try? await database.close() } }
+        try await fixture.createAuthorityState(on: database)
+
+        let credential = fixture.readCredential()
+        // Wall-clock, deliberately: the LOCAL apply path stamps its fanout
+        // rows with real time, so a fixed past epoch would silently expire
+        // every registration for that path.
+        let now = Date()
+        let legacyEndpoint = "https://legacy.example/xrpc/com.atproto.space.notifyWrite"
+        let serviceEndpoint = "https://events.bulleted.example"
+        let serviceIdentity = "did:web:events.bulleted.example#bulleted_events"
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: legacyEndpoint,
+                repository: nil,
+                expiresAt: now.addingTimeInterval(3_600)
+            ),
+            authorization: credential,
+            now: now
+        )
+        try await database.registerSpaceNotification(
+            .init(
+                space: fixture.space,
+                endpoint: serviceEndpoint,
+                repository: nil,
+                expiresAt: now.addingTimeInterval(3_600),
+                service: serviceIdentity
+            ),
+            authorization: credential,
+            now: now
+        )
+
+        // Path 1: a LOCAL apply by the authority's own account enqueues
+        // in-transaction (the authority is its own hosted writer here).
+        let localURI = try SpaceRecordURI(
+            space: fixture.space,
+            author: fixture.authority,
+            collection: "app.bsky.feed.post",
+            rkey: "erratum03-local"
+        )
+        let localValue = Data([0xA1, 0x61, 0x61, 0x01])
+        _ = try await database.apply(
+            space: fixture.space,
+            author: fixture.authority,
+            expectedRevision: 0,
+            requestID: UUID(),
+            wireRevision: try fixture.tid(1),
+            writes: [
+                .put(
+                    uri: localURI,
+                    value: localValue,
+                    cid: CID.fromDAGCBOR(localValue).string
+                ),
+            ]
+        )
+        let afterLocal = try await database.pendingNotificationFanout()
+        XCTAssertEqual(afterLocal.count, 1, "only the service registration enqueues")
+        let localRow = try XCTUnwrap(afterLocal.first)
+        XCTAssertEqual(localRow.kind, .write)
+        XCTAssertEqual(localRow.endpoint, serviceEndpoint)
+        XCTAssertEqual(localRow.repository, fixture.authority)
+        XCTAssertEqual(localRow.wireRevision, try fixture.tid(1).toString())
+        XCTAssertNotNil(localRow.commitment)
+        XCTAssertEqual(localRow.sourceIssuer, fixture.authority)
+
+        // Path 2: a member's announced write fans out the same way.
+        try await database.receiveSpaceWriteNotification(
+            fixture.writeNotification(
+                eventID: "erratum03-announced",
+                revision: try fixture.tid(2),
+                commitmentByte: 7
+            ),
+            now: now
+        )
+        let afterAnnounce = try await database.pendingNotificationFanout()
+        XCTAssertEqual(afterAnnounce.count, 2)
+        let announced = try XCTUnwrap(
+            afterAnnounce.first { $0.wireRevision == (try? fixture.tid(2).toString()) }
+        )
+        XCTAssertEqual(announced.kind, .write)
+        XCTAssertEqual(announced.endpoint, serviceEndpoint)
+        XCTAssertEqual(announced.commitment, Data(repeating: 7, count: 32))
+
+        // The identity accessor: the delivery worker's source of the JWT
+        // audience. Legacy rows answer nil; an inactive row answers nil.
+        let identity = try await database.spaceNotificationRegistrationService(
+            space: fixture.space,
+            endpoint: serviceEndpoint,
+            repository: fixture.writer,
+            now: now
+        )
+        XCTAssertEqual(identity, serviceIdentity)
+        let legacyIdentity = try await database.spaceNotificationRegistrationService(
+            space: fixture.space,
+            endpoint: legacyEndpoint,
+            repository: fixture.writer,
+            now: now
+        )
+        XCTAssertNil(legacyIdentity)
+        let expiredIdentity = try await database.spaceNotificationRegistrationService(
+            space: fixture.space,
+            endpoint: serviceEndpoint,
+            repository: fixture.writer,
+            now: now.addingTimeInterval(4_000)
+        )
+        XCTAssertNil(expiredIdentity)
+
+        // An expired service registration stops enqueueing.
+        try await database.receiveSpaceWriteNotification(
+            fixture.writeNotification(
+                eventID: "erratum03-after-expiry",
+                revision: try fixture.tid(3),
+                commitmentByte: 8
+            ),
+            now: now.addingTimeInterval(4_000)
+        )
+        let afterExpiry = try await database.pendingNotificationFanout()
+        XCTAssertEqual(afterExpiry.count, 2, "an expired service registration enqueues nothing")
     }
 
     func testNotificationReceiptsCompactToCurrentStateAndTombstonesStopGrowth() async throws {

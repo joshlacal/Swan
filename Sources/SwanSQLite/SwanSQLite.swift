@@ -400,6 +400,7 @@ public enum SQLiteLayout {
             repo_did TEXT,
             expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
             updated_at INTEGER NOT NULL CHECK(updated_at >= 0),
+            service_did TEXT,
             PRIMARY KEY(space_uri, endpoint),
             CHECK(length(endpoint) > 0)
         )
@@ -2174,6 +2175,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migratePublicFirehoseOutboxIfNeeded()
             try await migratePublicFirehoseCompletionAnchorsIfNeeded()
             try await migratePermissionedRequestReceiptRetentionIfNeeded()
+            try await migrateSpaceNotificationServiceIdentityIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -2351,6 +2353,27 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             )
         }
         _ = try await connection.query("DROP TABLE public_repository_mutation_requests_pre_integrity")
+    }
+
+    /// Erratum 03's `registerNotify` service adoption: a registration may name
+    /// the subscriber's service identifier, which delivery uses as the JWT
+    /// audience. Pre-existing rows have no identifier — they stay legacy
+    /// endpoint-only registrations (never dynamic delivery destinations), so
+    /// the column is nullable and no row rewrite is needed.
+    private func migrateSpaceNotificationServiceIdentityIfNeeded() async throws {
+        // An empty PRAGMA result means the table itself is absent — this
+        // database never carries space registrations (or creates the table
+        // with the column already in place later in setup); there is nothing
+        // to migrate.
+        let columns = try await connection.query(
+            "PRAGMA table_info(permissioned_space_notification_registrations)"
+        )
+        guard !columns.isEmpty else { return }
+        let existing = Set(columns.compactMap { $0.column("name")?.string })
+        guard !existing.contains("service_did") else { return }
+        _ = try await connection.query(
+            "ALTER TABLE permissioned_space_notification_registrations ADD COLUMN service_did TEXT"
+        )
     }
 
     /// Task 42 originally shipped staging tables before the exact projection
@@ -3959,6 +3982,55 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     .integer(createdAt),
                 ]
             )
+
+            // Erratum 03: when this account IS the space authority, a local
+            // write fans out to the space's service-named subscribers in the
+            // same transaction — the reference's HOP-2 enqueue
+            // (`notify.rs::enqueue_writes`), whose deliveries are
+            // authority-signed (`iss = space authority`, `aud = subscriber
+            // service`). Legacy endpoint-only rows (service_did IS NULL) are
+            // never enqueued: without a service identity the delivery JWT has
+            // no audience its receiver could verify, which is the original
+            // reason cross-host write fanout was withheld. Per-repo rows
+            // filter by this writer, matching `list_recipients`.
+            if space.authority == accountDID {
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_space_notification_fanout(
+                        id, source_issuer, source_event_id, kind, space_uri,
+                        repo_did, wire_revision, commitment, endpoint,
+                        attempts, created_at, available_at,
+                        lease_token, lease_expires_at
+                    )
+                    SELECT
+                        substr(h,1,8)||'-'||substr(h,9,4)||'-'||substr(h,13,4)
+                            ||'-'||substr(h,17,4)||'-'||substr(h,21,12),
+                        ?, ?, 'write', ?,
+                        ?, ?, ?, endpoint,
+                        0, ?, ?, NULL, NULL
+                    FROM (
+                        SELECT hex(randomblob(16)) AS h, endpoint
+                        FROM permissioned_space_notification_registrations
+                        WHERE space_uri = ?
+                          AND service_did IS NOT NULL
+                          AND expires_at > ?
+                          AND (repo_did IS NULL OR repo_did = ?)
+                    )
+                    WHERE true
+                    ON CONFLICT(source_issuer, source_event_id, kind, endpoint) DO NOTHING
+                    """,
+                    [
+                        .text(space.authority), .text(eventID.uuidString.lowercased()),
+                        .text(space.rawValue),
+                        .text(author), .text(wireRevision.toString()),
+                        blob(ltHash.commitment),
+                        .integer(createdAt), .integer(createdAt),
+                        .text(space.rawValue),
+                        .integer(createdAt),
+                        .text(author),
+                    ]
+                )
+            }
 
             try await testingHooks.beforeApplyCommit?()
 
@@ -7047,6 +7119,11 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 throw SwanError.invalidIdentifier("notification repository")
             }
         }
+        if let service = registration.service {
+            guard Self.isValidNotificationServiceIdentity(service) else {
+                throw SwanError.invalidIdentifier("notification service identity")
+            }
+        }
         let timestamp = try simpleSpaceTimestamp(now)
         let expiry = try simpleSpaceTimestamp(registration.expiresAt)
         guard expiry > timestamp,
@@ -7102,19 +7179,86 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                 _ = try await connection.query(
                     """
                     INSERT INTO permissioned_space_notification_registrations(
-                        space_uri, endpoint, repo_did, expires_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?)
+                        space_uri, endpoint, repo_did, expires_at, updated_at, service_did
+                    ) VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT(space_uri, endpoint) DO UPDATE SET
                         repo_did = excluded.repo_did,
                         expires_at = excluded.expires_at,
-                        updated_at = excluded.updated_at
+                        updated_at = excluded.updated_at,
+                        service_did = excluded.service_did
                     """,
                     [
                         .text(registration.space.rawValue), .text(endpoint),
                         registration.repository.map(SQLiteData.text) ?? .null,
                         .integer(expiry), .integer(timestamp),
+                        registration.service.map(SQLiteData.text) ?? .null,
                     ]
                 )
+            }
+        }
+    }
+
+    /// A subscriber service identifier: a DID with an optional single
+    /// `#fragment`. Charset-bounded here so a stored identity can always be a
+    /// service-JWT audience; the HTTP layer has already resolved it to an
+    /// endpoint through the DID document.
+    static func isValidNotificationServiceIdentity(_ value: String) -> Bool {
+        guard !value.isEmpty, value.utf8.count <= 640,
+              value.utf8.allSatisfy({ $0 > 0x20 && $0 < 0x7F }) else {
+            return false
+        }
+        let parts = value.split(separator: "#", omittingEmptySubsequences: false)
+        guard (1 ... 2).contains(parts.count),
+              parts.allSatisfy({ !$0.isEmpty }),
+              parts[0].hasPrefix("did:") else {
+            return false
+        }
+        return true
+    }
+
+    /// The active registration's service identity for one `(space, endpoint)`
+    /// row, or `nil` when the row is absent, expired, filtered out by its
+    /// per-repo binding, or a legacy endpoint-only registration. Delivery
+    /// treats `nil` as "not a dynamic destination" — a replaced or withdrawn
+    /// service registration turns a leased fanout row into a safe no-op.
+    public func spaceNotificationRegistrationService(
+        space: SpaceURI,
+        endpoint: String,
+        repository: String?,
+        now: Date = Date()
+    ) async throws -> String? {
+        let endpoint = try validNotificationEndpoint(endpoint)
+        if let repository {
+            guard isValidSimpleSpaceDID(repository) else {
+                throw SwanError.invalidIdentifier("notification repository")
+            }
+        }
+        let timestamp = try simpleSpaceTimestamp(now)
+        try requireAuthorityAccount(space: space)
+        return try await withConnectionGate {
+            try await readTransaction {
+                let rows = try await connection.query(
+                    """
+                    SELECT repo_did, expires_at, service_did
+                    FROM permissioned_space_notification_registrations
+                    WHERE space_uri = ? AND endpoint = ?
+                    """,
+                    [.text(space.rawValue), .text(endpoint)]
+                )
+                guard let row = rows.first,
+                      try requiredNonnegativeInteger(row, "expires_at") > timestamp else {
+                    return nil
+                }
+                let selectedRepository = row.column("repo_did")?.string
+                guard repository == nil || selectedRepository == nil
+                    || selectedRepository == repository else {
+                    return nil
+                }
+                guard let service = row.column("service_did")?.string,
+                      Self.isValidNotificationServiceIdentity(service) else {
+                    return nil
+                }
+                return service
             }
         }
     }
@@ -7270,13 +7414,53 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     ]
                 )
 
-                // Do not enqueue an authority-signed `notifyWrite` fanout.
-                // The pinned TypeScript receiver requires `iss == repo`, but
-                // this authority has only its own key and cannot truthfully
-                // sign for another member writer. Registrations remain local
-                // discovery/authority state; cross-host write fanout awaits a
-                // compatible upstream receiver contract. Deletion fanout is
-                // separate and remains authority-signed by definition.
+                // Erratum 03: fan the accepted member write out to the
+                // space's SERVICE-NAMED subscribers, authority-signed —
+                // the reference contract (`notify.rs::enqueue_writes`,
+                // `iss = space authority`, `aud = subscriber service`). The
+                // old refusal reasoned from the pinned TypeScript PDS
+                // receiver (`iss == repo`), but a registered subscriber is a
+                // service that named itself in a DID document, not a PDS;
+                // its verifier checks the audience it registered. Legacy
+                // endpoint-only rows still get nothing: with no service
+                // identity there is no audience a receiver could verify.
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_space_notification_fanout(
+                        id, source_issuer, source_event_id, kind, space_uri,
+                        repo_did, wire_revision, commitment, endpoint,
+                        attempts, created_at, available_at,
+                        lease_token, lease_expires_at
+                    )
+                    SELECT
+                        substr(h,1,8)||'-'||substr(h,9,4)||'-'||substr(h,13,4)
+                            ||'-'||substr(h,17,4)||'-'||substr(h,21,12),
+                        ?, ?, 'write', ?,
+                        ?, ?, ?, endpoint,
+                        0, ?, ?, NULL, NULL
+                    FROM (
+                        SELECT hex(randomblob(16)) AS h, endpoint
+                        FROM permissioned_space_notification_registrations
+                        WHERE space_uri = ?
+                          AND service_did IS NOT NULL
+                          AND expires_at > ?
+                          AND (repo_did IS NULL OR repo_did = ?)
+                    )
+                    WHERE true
+                    ON CONFLICT(source_issuer, source_event_id, kind, endpoint) DO NOTHING
+                    """,
+                    [
+                        .text(notification.space.authority), .text(eventID),
+                        .text(notification.space.rawValue),
+                        .text(notification.repository),
+                        .text(notification.wireRevision),
+                        blob(notification.commitment),
+                        .integer(timestamp), .integer(timestamp),
+                        .text(notification.space.rawValue),
+                        .integer(timestamp),
+                        .text(notification.repository),
+                    ]
+                )
             }
         }
     }
@@ -11507,14 +11691,13 @@ public actor DurableSpaceRepository {
         )
     }
 
-    /// The declared length of that same blob, under the identical aggregate
-    /// repository-read check.  A collection-qualified OAuth grant cannot use
-    /// this to learn whether a blob exists any more than it can open one.
+    /// The declared length of that same blob, under the identical single-blob
+    /// read check (Erratum 03) — the two calls cannot answer differently.
     public func permissionedBlobMetadata(
         cid: String,
         authorization: AuthorizationContext
     ) async throws -> AuthorizedSpaceBlobMetadata? {
-        try requireRead(uri: nil, authorization: authorization)
+        try requireBlobRead(authorization: authorization)
         return try await database.permissionedBlobMetadata(
             space: space,
             author: author,
@@ -11523,14 +11706,18 @@ public actor DurableSpaceRepository {
     }
 
     /// Opens one already-authorized, file-backed blob body.  Blob retrieval is
-    /// an aggregate repository read: a collection-qualified OAuth grant may
-    /// read its individual records but cannot be repurposed into an arbitrary
-    /// blob oracle.
+    /// a SINGLE-blob read (Erratum 03), not an aggregate repository read: a
+    /// collection-qualified OAuth grant that can read its records can fetch
+    /// the blobs they reference — post-Erratum-02 the same grant reaches these
+    /// bytes through a whole-space credential anyway, so the old aggregate
+    /// classification refused conformant clients while protecting nothing.
+    /// The CAR snapshot above keeps the aggregate rule: it really does export
+    /// every collection.
     public func permissionedBlob(
         cid: String,
         authorization: AuthorizationContext
     ) async throws -> AuthorizedSpaceBlob? {
-        try requireRead(uri: nil, authorization: authorization)
+        try requireBlobRead(authorization: authorization)
         return try await database.permissionedBlob(
             space: space,
             author: author,
@@ -11702,6 +11889,14 @@ public actor DurableSpaceRepository {
             uri: uri,
             authorization: authorization,
             permission: .read
+        )
+    }
+
+    private func requireBlobRead(authorization: AuthorizationContext) throws {
+        try SpaceAuthorizationPolicy.requireBlobRead(
+            space: space,
+            author: author,
+            authorization: authorization
         )
     }
 

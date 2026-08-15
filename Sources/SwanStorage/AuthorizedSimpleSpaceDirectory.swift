@@ -339,17 +339,25 @@ public struct AuthorizedSpaceNotificationRegistration: Sendable, Equatable {
     public let endpoint: String
     public let repository: String?
     public let expiresAt: Date
+    /// The subscriber's service identifier (`did` or `did#fragment`) when the
+    /// registration named one — the audience `notifyWrite` deliveries are
+    /// addressed to, and the marker that the endpoint has DID-document
+    /// provenance. `nil` for a legacy endpoint-only registration, which stays
+    /// local discovery state and is never a dynamic delivery destination.
+    public let service: String?
 
     public init(
         space: SpaceURI,
         endpoint: String,
         repository: String?,
-        expiresAt: Date
+        expiresAt: Date,
+        service: String? = nil
     ) {
         self.space = space
         self.endpoint = endpoint
         self.repository = repository
         self.expiresAt = expiresAt
+        self.service = service
     }
 }
 

@@ -103,4 +103,109 @@ final class SpaceScopeTargetTests: XCTestCase {
             return XCTFail("expected a .delegationExchange operation")
         }
     }
+
+    // MARK: - Erratum 03: the single-blob read target and its policy arm
+
+    private static let author = "did:plc:user"
+
+    private func collectionQualifiedReadPermissions() -> SwanScopePermissions {
+        let scope = "space:x.y.z?authority=\(Self.author)&skey=self&action=read&collection=app.example.records"
+        return SwanScopePermissions(
+            rawScopes: [scope],
+            subject: Self.author,
+            statedKeys: [scope: ["authority", "skey", "action", "collection"]]
+        )
+    }
+
+    /// The one deliberate `aggregate: false` + `collection: nil` combination.
+    /// It exists ONLY on this constructor — `record` still derives aggregate
+    /// from the absent collection, pinned above.
+    func testBlobReadTargetIsNonAggregateAndCollectionFree() {
+        let target = SpaceScopeTarget.blobRead(Self.space)
+        XCTAssertEqual(target.type, Self.space.spaceType)
+        XCTAssertEqual(target.authority, Self.space.authority)
+        XCTAssertEqual(target.skey, Self.space.skey)
+        guard case let .read(aggregate, collection) = target.operation else {
+            return XCTFail("expected a .read operation")
+        }
+        XCTAssertFalse(aggregate, "one content-addressed blob is not an aggregate surface")
+        XCTAssertNil(collection)
+    }
+
+    /// The Bulleted regression: a collection-qualified read grant fetches a
+    /// blob (was 401 under the aggregate classification).
+    func testRequireBlobReadAcceptsACollectionQualifiedOAuthGrant() throws {
+        try SpaceAuthorizationPolicy.requireBlobRead(
+            space: Self.space,
+            author: Self.author,
+            authorization: .accountOAuth(
+                subject: Self.author,
+                permissions: collectionQualifiedReadPermissions()
+            )
+        )
+    }
+
+    /// The reclassification widens nothing across accounts: a foreign token
+    /// subject still never reaches another author's blobs.
+    func testRequireBlobReadRefusesAForeignSubject() {
+        XCTAssertThrowsError(
+            try SpaceAuthorizationPolicy.requireBlobRead(
+                space: Self.space,
+                author: Self.author,
+                authorization: .accountOAuth(
+                    subject: "did:plc:other",
+                    permissions: collectionQualifiedReadPermissions()
+                )
+            )
+        )
+    }
+
+    /// Nor does it widen across verbs: a write-only grant has no `read` and
+    /// opens nothing.
+    func testRequireBlobReadRefusesAWriteOnlyGrant() {
+        let scope = "space:x.y.z?authority=\(Self.author)&skey=self&action=create&collection=app.example.records"
+        let permissions = SwanScopePermissions(
+            rawScopes: [scope],
+            subject: Self.author,
+            statedKeys: [scope: ["authority", "skey", "action", "collection"]]
+        )
+        XCTAssertThrowsError(
+            try SpaceAuthorizationPolicy.requireBlobRead(
+                space: Self.space,
+                author: Self.author,
+                authorization: .accountOAuth(subject: Self.author, permissions: permissions)
+            )
+        )
+    }
+
+    /// Every non-OAuth arm delegates to the ordinary `.read` policy: a space
+    /// credential still opens blobs, a delegation token and the public
+    /// context still never do.
+    func testRequireBlobReadDelegatesNonOAuthArmsUnchanged() throws {
+        let grant = SpaceGrant(
+            subject: "did:plc:member",
+            space: Self.space,
+            permissions: [.read],
+            expiresAt: Date().addingTimeInterval(60)
+        )
+        try SpaceAuthorizationPolicy.requireBlobRead(
+            space: Self.space,
+            author: Self.author,
+            authorization: .spaceCredential(grant)
+        )
+        XCTAssertThrowsError(
+            try SpaceAuthorizationPolicy.requireBlobRead(
+                space: Self.space,
+                author: Self.author,
+                authorization: .spaceDelegation(subject: Self.author, space: Self.space)
+            )
+        )
+        XCTAssertThrowsError(
+            try SpaceAuthorizationPolicy.requireBlobRead(
+                space: Self.space,
+                author: Self.author,
+                authorization: .public
+            )
+        )
+    }
 }

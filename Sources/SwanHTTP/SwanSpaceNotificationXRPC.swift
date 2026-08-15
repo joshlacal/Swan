@@ -18,19 +18,27 @@ public struct SwanAuthenticatedSpaceNotificationsCapability: Sendable {
     let serviceAuthentication: any SpaceServiceAuthenticationVerifier
     let recipientBindings: SwanSpaceNotificationRecipientBindings
     let notificationJSONDecodeObserver: (@Sendable () async -> Void)?
+    /// Resolves a `registerNotify` subscriber's `service` identifier to its
+    /// DID-document endpoint (Erratum 03). `nil` when the server runs without
+    /// outbound DID resolution — `service` registrations then answer the same
+    /// `ServiceNotResolvable` as an identifier that does not resolve, because
+    /// from the caller's seat that is exactly what it is.
+    let serviceEndpointResolver: SwanServiceEndpointResolver?
 
     init(
         directory: any AuthorizedSpaceNotificationDirectory,
         credentialAuthorizer: any SpaceCredentialAuthorizationVerifier,
         serviceAuthentication: any SpaceServiceAuthenticationVerifier,
         recipientBindings: SwanSpaceNotificationRecipientBindings,
-        notificationJSONDecodeObserver: (@Sendable () async -> Void)? = nil
+        notificationJSONDecodeObserver: (@Sendable () async -> Void)? = nil,
+        serviceEndpointResolver: SwanServiceEndpointResolver? = nil
     ) {
         self.directory = directory
         self.credentialAuthorizer = credentialAuthorizer
         self.serviceAuthentication = serviceAuthentication
         self.recipientBindings = recipientBindings
         self.notificationJSONDecodeObserver = notificationJSONDecodeObserver
+        self.serviceEndpointResolver = serviceEndpointResolver
     }
 }
 
@@ -39,6 +47,11 @@ private enum AuthenticatedSpaceNotificationFailure: Error {
     case spaceNotFound
     case denied
     case unavailable
+    /// The `service` identifier could not be resolved to a DID document with
+    /// a usable service endpoint (Erratum 03). The lexicon's one named error
+    /// for it; the underlying cause is logged, never returned — a 500 would
+    /// implicate the server in what is usually a typo'd DID.
+    case serviceNotResolvable
 }
 
 private enum SwanSpaceNotificationHTTP {
@@ -100,16 +113,24 @@ private struct AuthenticatedListSpaceReposHandler:
     }
 }
 
-private struct AuthenticatedRegisterSpaceNotifyHandler:
-    ComAtprotoSpaceRegisterNotify.ServerHandler
-{
-    typealias Context = Request
+/// The `registerNotify` wire input. `service` names the subscriber (a DID
+/// with an optional `#fragment`, resolved through its DID document — the
+/// current lexicon shape); `endpoint` is the pre-lexicon legacy. At least one
+/// is required, and when both are sent `service` decides, mirroring the
+/// reference handler.
+private struct RegisterSpaceNotifyWireInput: Decodable {
+    let space: ATProtocolURI
+    let repo: DID?
+    let endpoint: String?
+    let service: String?
+}
 
+private struct AuthenticatedRegisterSpaceNotifyHandler {
     let capability: SwanAuthenticatedSpaceNotificationsCapability
 
     func handle(
-        parameters: Void,
-        input: ComAtprotoSpaceRegisterNotify.Input,
+        parameters _: Void,
+        input: RegisterSpaceNotifyWireInput,
         context request: Request
     ) async throws -> ComAtprotoSpaceRegisterNotify.Output {
         let space = try notificationSpace(input.space)
@@ -118,15 +139,52 @@ private struct AuthenticatedRegisterSpaceNotifyHandler:
             request: request,
             space: space
         )
+        let endpoint: String
+        let service: String?
+        if let identifier = input.service {
+            // The whole reason the lexicon names a service rather than a URL:
+            // the identifier is the audience `notifyWrite` will be addressed
+            // to, and its DID document's service entry is the endpoint. An
+            // unreachable document, an absent entry, and a server with no
+            // resolver are one answer — this identifier cannot be delivered
+            // to.
+            guard let resolver = capability.serviceEndpointResolver else {
+                throw AuthenticatedSpaceNotificationFailure.serviceNotResolvable
+            }
+            let resolved: URL
+            do {
+                resolved = try await resolver.endpoint(serviceIdentifier: identifier)
+            } catch {
+                // Unreachable, absent, and entry-less documents are one
+                // answer to the caller; the distinction never leaves the
+                // resolver.
+                throw AuthenticatedSpaceNotificationFailure.serviceNotResolvable
+            }
+            // A resolved endpoint gets the same admission check as a supplied
+            // one — a DID document is not this server's to trust either.
+            endpoint = resolved.absoluteString
+            service = identifier
+        } else if let supplied = input.endpoint {
+            // Legacy: the endpoint comes from the request and no verifiable
+            // audience exists, so the registration stays local discovery
+            // state (`service` is nil) and is never a dynamic delivery
+            // destination. Supplying `service` is how a subscriber fixes
+            // that.
+            endpoint = supplied
+            service = nil
+        } else {
+            throw AuthenticatedSpaceNotificationFailure.invalidRequest
+        }
         let now = Date()
         let expiry = now.addingTimeInterval(SwanSpaceNotificationHTTP.registrationLifetime)
         do {
             try await capability.directory.registerSpaceNotification(
                 .init(
                     space: space,
-                    endpoint: input.endpoint.uriString(),
+                    endpoint: endpoint,
                     repository: input.repo?.didString(),
-                    expiresAt: expiry
+                    expiresAt: expiry,
+                    service: service
                 ),
                 authorization: authorization
             )
@@ -387,7 +445,7 @@ private func decodeRegisterSpaceNotifyInput(
     context: SwanHTTPRequestContext,
     requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
     decodeObserver: (@Sendable () async -> Void)?
-) async throws -> ComAtprotoSpaceRegisterNotify.Input {
+) async throws -> RegisterSpaceNotifyWireInput {
     let admitted = try await notificationJSONBody(
         request, context: context, requestBodyAdmission: requestBodyAdmission)
     defer { withExtendedLifetime(admitted.body) {} }
@@ -395,17 +453,29 @@ private func decodeRegisterSpaceNotifyInput(
     await decodeObserver?()
     try notificationJSONObject(
         data,
-        allowedKeys: ["space", "repo", "endpoint"],
-        requiredKeys: ["space", "endpoint"]
+        allowedKeys: ["space", "repo", "endpoint", "service"],
+        requiredKeys: ["space"]
     )
     do {
-        let input = try JSONDecoder().decode(ComAtprotoSpaceRegisterNotify.Input.self, from: data)
+        let input = try JSONDecoder().decode(RegisterSpaceNotifyWireInput.self, from: data)
         _ = try notificationSpace(input.space)
         if let repository = input.repo {
             _ = try DID(didString: repository.didString())
         }
-        guard validRegisteredNotificationEndpoint(input.endpoint.uriString()) else {
+        // At least one subscriber locator; `service` decides when both are
+        // sent (the handler ignores `endpoint` in that case).
+        guard input.service != nil || input.endpoint != nil else {
             throw AuthenticatedSpaceNotificationFailure.invalidRequest
+        }
+        if let service = input.service {
+            guard validNotificationServiceIdentifier(service) else {
+                throw AuthenticatedSpaceNotificationFailure.invalidRequest
+            }
+        }
+        if input.service == nil, let endpoint = input.endpoint {
+            guard validRegisteredNotificationEndpoint(endpoint) else {
+                throw AuthenticatedSpaceNotificationFailure.invalidRequest
+            }
         }
         return input
     } catch let failure as AuthenticatedSpaceNotificationFailure {
@@ -413,6 +483,24 @@ private func decodeRegisterSpaceNotifyInput(
     } catch {
         throw AuthenticatedSpaceNotificationFailure.invalidRequest
     }
+}
+
+/// A subscriber service identifier: `did:<method>:…` with at most one
+/// non-empty `#fragment`, printable ASCII, bounded. Resolution decides
+/// everything further — this only refuses shapes that could never name a
+/// verifiable audience.
+private func validNotificationServiceIdentifier(_ value: String) -> Bool {
+    guard !value.isEmpty, value.utf8.count <= 640,
+          value.utf8.allSatisfy({ $0 > 0x20 && $0 < 0x7F }) else {
+        return false
+    }
+    let parts = value.split(separator: "#", omittingEmptySubsequences: false)
+    guard (1 ... 2).contains(parts.count),
+          parts.allSatisfy({ !$0.isEmpty }),
+          parts[0].hasPrefix("did:") else {
+        return false
+    }
+    return true
 }
 
 private func decodeNotifySpaceWriteInput(
@@ -651,6 +739,8 @@ private func authenticatedSpaceNotificationResponse(
         authenticatedSpaceNotificationError(.unauthorized, code: "Unauthorized")
     case .unavailable:
         authenticatedSpaceNotificationError(.serviceUnavailable, code: "temporarily_unavailable")
+    case .serviceNotResolvable:
+        authenticatedSpaceNotificationError(.badRequest, code: "ServiceNotResolvable")
     }
 }
 

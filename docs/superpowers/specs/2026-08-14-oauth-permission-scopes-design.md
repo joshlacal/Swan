@@ -7047,3 +7047,76 @@ stated-authority/skey. Flipped tests are annotated in place
 (`ScopePermissionsFenceTests`, `ScopeProvenanceDurabilityTests`,
 `RefreshScopeRederivationTests`, `SpaceDelegationMintingHTTPTests`,
 `RemoteClientPermissionedScopeE2ETests` stage 6.6 kept as a refusal).
+
+## Erratum 03 (2026-08-15) — single-blob reads and the notify service contract
+
+Ruled by Josh ("fix both, implement full robust tests and new machinery
+for 2"). Two seams, one release.
+
+### 1. §6.5.5's aggregate classification no longer covers single-blob reads
+
+`getBlob` reached the repository facade with no record URI, so
+`SpaceScopeTarget.record` derived `aggregate: true` and the §6.5.5 gate
+refused every collection-qualified grant — bulleted.app's six-collection
+grant 401'd on every blob it had itself just uploaded. Post-Erratum-02 the
+same grant exchanges for a whole-space credential that reads the identical
+bytes through the credential arm, so the refusal protected nothing while
+breaking upstream's collection-independent read path.
+
+`SpaceScopeTarget.blobRead` is the ONE deliberate `aggregate: false` +
+`collection: nil` construction (its doc comment carries the boundary), and
+`SpaceAuthorizationPolicy.requireBlobRead` applies it only on the
+`accountOAuth` arm — credentials, self-reads, delegation/public refusals,
+and cross-account/cross-verb refusals are unchanged and pinned
+(`SpaceScopeTargetTests`). The CAR snapshot and every set-answering
+surface KEEP the aggregate rule: they really do span collections.
+
+### 2. `registerNotify` adopts the `service` subscriber contract
+
+The reference evolved the lexicon: the subscriber names a `service`
+identifier (`did[#fragment]`, resolved through its DID document to both the
+delivery endpoint and the verifiable JWT audience); `endpoint` is the
+pre-lexicon legacy, and `service` decides when both are sent. Swan's
+exact-key parser refused any body carrying `service` (defect class
+instance #7), which starved bulleted.app's events pipeline and made saved
+records look unsaved.
+
+Adopted, with new machinery end to end:
+
+- **Resolution**: `SwanServiceEndpointResolver.endpoint(serviceIdentifier:)`
+  — fragment form unchanged; a fragment-less identifier resolves only a
+  single-service document (refuse-ambiguity kept over the reference's
+  first-entry rule). Failures collapse to the lexicon's one error,
+  `ServiceNotResolvable` (400), including a server with no resolver.
+- **Storage**: `service_did` on the registrations table (nullable ALTER
+  migration; legacy rows stay endpoint-only local discovery state and are
+  NEVER dynamic destinations).
+- **Fanout**: write intents enqueue for service-named registrations from
+  both write paths — a member's announced write and a local authority
+  apply — in the same transaction as the write. The old refusal reasoned
+  from the pinned TypeScript PDS receiver (`iss == repo`); a registered
+  subscriber is a service that named itself in a DID document, and the
+  reference contract for it is authority-signed (`iss = space authority`,
+  `aud = subscriber service`), which Swan's own `notifyWrite` receiver
+  posture is unchanged by.
+- **Delivery**: a service-named registration is its own destination —
+  audience from the stored identity, endpoint from registration-time
+  resolution — re-checked active at send. Egress: the peer-pinned
+  transport gains `allowsDynamicPeerSelection`, connecting an UNPINNED
+  endpoint to a member of the poster's policy-approved DNS answers
+  (literal IP chosen before the socket opens, no second lookup, TLS still
+  verifies the hostname; configured pins keep priority and a failed pin
+  never falls back). Operator pins are therefore no longer required to
+  enable delivery.
+
+Pinned by `SwanServiceEndpointResolverTests`,
+`SpaceNotificationHTTPTests` (decode shapes, resolution, refusals,
+no-resolver, legacy regression, dynamic delivery seam),
+`SpaceNotificationSQLiteTests` (fanout enqueue/expiry/accessor), and
+`NIOPeerPinnedOAuthPostTransportTests` (dynamic selection end-to-end over
+local TLS, pin priority, no-fallback).
+
+Not adopted (recorded, not forgotten): `unregisterNotify` — Swan still
+does not serve it; withdrawal is expiry or replacement. Same-host
+different-account member writes still do not fan out (pre-existing
+account-isolation gap, unreachable for single-user spaces).

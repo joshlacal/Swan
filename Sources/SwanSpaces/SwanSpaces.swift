@@ -292,6 +292,37 @@ public enum SpaceAuthorizationPolicy {
         }
     }
 
+    /// A single-blob read (Erratum 03). Every arm except `accountOAuth`
+    /// delegates to ``require(space:author:uri:authorization:permission:)``
+    /// with `.read` — credentials, self-reads, service auth, and the refusals
+    /// are unchanged. The OAuth arm alone differs: it matches against
+    /// ``SpaceScopeTarget/blobRead(_:)`` (non-aggregate, collection-free)
+    /// instead of the derived aggregate target, so a collection-qualified
+    /// grant that reads its records can also fetch the blobs those records
+    /// reference. See the constructor's doc for why this is not a §6.5.5
+    /// bypass.
+    public static func requireBlobRead(
+        space: SpaceURI,
+        author: String,
+        authorization: AuthorizationContext
+    ) throws {
+        if case let .accountOAuth(subject, permissions) = authorization {
+            guard subject == author,
+                  permissions.allowsSpace(SpaceScopeTarget.blobRead(space))
+            else {
+                throw SwanError.unauthorized("OAuth scope does not cover this space operation")
+            }
+            return
+        }
+        try require(
+            space: space,
+            author: author,
+            uri: nil,
+            authorization: authorization,
+            permission: .read
+        )
+    }
+
     /// Requires the exact pinned `manage` verb for a simple-space authority
     /// operation.  The broad `atproto` grant is deliberately retained for an
     /// account's own PDS, while a scoped grant must bind the type, authority,

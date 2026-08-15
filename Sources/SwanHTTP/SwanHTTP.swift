@@ -277,30 +277,38 @@ public struct SwanSpaceRepositorySyncHTTPConfiguration: Sendable {
 }
 
 /// Explicitly enables only the local/pinned service-JWT verification needed
-/// by the writer notification endpoints. It contains no remote DID resolver;
-/// service claims can never turn an XRPC request into a network lookup.
+/// by the writer notification endpoints. Incoming service CLAIMS still never
+/// turn an XRPC request into a network lookup; the one resolver here is used
+/// solely by `registerNotify` (Erratum 03) to resolve the credentialed
+/// caller's OWN `service` identifier through its DID document — a lookup the
+/// caller explicitly requested by naming it.
 public struct SwanSpaceNotificationHTTPConfiguration: Sendable {
     public let serviceAuthentication: any SpaceServiceAuthenticationVerifier
     let recipientBindings: SwanSpaceNotificationRecipientBindings
     let notificationJSONDecodeObserver: (@Sendable () async -> Void)?
+    let serviceEndpointResolver: SwanServiceEndpointResolver?
 
     public init(
         serviceAuthentication: any SpaceServiceAuthenticationVerifier,
-        recipientBindings: SwanSpaceNotificationRecipientBindings = .empty
+        recipientBindings: SwanSpaceNotificationRecipientBindings = .empty,
+        serviceEndpointResolver: SwanServiceEndpointResolver? = nil
     ) {
         self.serviceAuthentication = serviceAuthentication
         self.recipientBindings = recipientBindings
         notificationJSONDecodeObserver = nil
+        self.serviceEndpointResolver = serviceEndpointResolver
     }
 
     init(
         serviceAuthentication: any SpaceServiceAuthenticationVerifier,
         recipientBindings: SwanSpaceNotificationRecipientBindings = .empty,
+        serviceEndpointResolver: SwanServiceEndpointResolver? = nil,
         notificationJSONDecodeObserver: @escaping @Sendable () async -> Void
     ) {
         self.serviceAuthentication = serviceAuthentication
         self.recipientBindings = recipientBindings
         self.notificationJSONDecodeObserver = notificationJSONDecodeObserver
+        self.serviceEndpointResolver = serviceEndpointResolver
     }
 }
 
@@ -725,7 +733,9 @@ public struct SwanHTTPServer: Sendable {
                     serviceAuthentication: spaceNotificationConfiguration.serviceAuthentication,
                     recipientBindings: spaceNotificationConfiguration.recipientBindings,
                     notificationJSONDecodeObserver:
-                        spaceNotificationConfiguration.notificationJSONDecodeObserver
+                        spaceNotificationConfiguration.notificationJSONDecodeObserver,
+                    serviceEndpointResolver:
+                        spaceNotificationConfiguration.serviceEndpointResolver
                 )
             } else {
                 authenticatedSpaceNotifications = nil

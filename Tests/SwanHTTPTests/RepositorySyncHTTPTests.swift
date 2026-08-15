@@ -314,6 +314,11 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertFalse(String(decoding: response.body.readableBytesView, as: UTF8.self).contains(fixture.blobCID))
                 }
 
+                // Erratum 03: a collection-qualified read grant FETCHES a
+                // single blob — the aggregate classification that refused it
+                // protected nothing once the same grant could exchange for a
+                // whole-space credential reading the identical bytes. The
+                // foreign-subject refusal above is the boundary that remains.
                 let narrowHeaders = try self.dpopHeaders(
                     token: narrow.token, key: narrow.key, jwk: narrow.jwk,
                     nonce: fixture.runtime.dpopNonceService.issue(),
@@ -323,8 +328,8 @@ final class RepositorySyncHTTPTests: XCTestCase, @unchecked Sendable {
                     uri: self.blobURI(space: fixture.space, repo: Self.alice, cid: fixture.blobCID),
                     method: .get, headers: narrowHeaders
                 ) { response in
-                    XCTAssertEqual(response.status, .unauthorized)
-                    self.assertNoStore(response)
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(response.headers[.contentType], "application/octet-stream")
                 }
 
                 let replayHeaders = try self.dpopHeaders(

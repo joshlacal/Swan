@@ -841,7 +841,8 @@ struct ServePermissionedRuntime {
         notification: ServeNotificationRuntime?,
         managingServiceAudience: String? = nil,
         clientAttestationPolicy: any SpaceCredentialClientAttestationPolicy =
-            UnavailableSpaceCredentialClientAttestationPolicy()
+            UnavailableSpaceCredentialClientAttestationPolicy(),
+        serviceEndpointResolver: SwanServiceEndpointResolver? = nil
     ) async throws -> ServePermissionedRuntime {
         let credentialPublicKeys: (any SpaceCredentialPublicKeyResolver)?
         let delegationPublicKeys: (any SpaceDelegationPublicKeyResolver)?
@@ -906,7 +907,8 @@ struct ServePermissionedRuntime {
             serviceAuthentication = verifier
             notificationConfiguration = .init(
                 serviceAuthentication: verifier,
-                recipientBindings: notification?.recipientBindings ?? .empty
+                recipientBindings: notification?.recipientBindings ?? .empty,
+                serviceEndpointResolver: serviceEndpointResolver
             )
         } else {
             serviceAuthentication = nil
@@ -2875,20 +2877,45 @@ extension SwanCommand {
                 }
                 let permissionedRuntime: ServePermissionedRuntime
                 do {
+                    // Erratum 03: `registerNotify` resolves a subscriber's
+                    // `service` identifier through its DID document. Built
+                    // unconditionally for serve — the fetch path is the same
+                    // peer-policied one OAuth metadata uses, and it only
+                    // fires when a credentialed caller names a service.
+                    let notifyServiceResolver: SwanServiceEndpointResolver?
+                    do {
+                        let policy = try OAuthRemoteFetchPolicy()
+                        notifyServiceResolver = SwanServiceEndpointResolver(
+                            documents: try SwanPeerPinnedDIDDocumentFetcher(
+                                documents: OAuthRemoteDocumentFetcher(
+                                    policy: policy,
+                                    transport: try NIOPeerPinnedOAuthDocumentTransport(
+                                        maximumTransportTimeout: policy.timeout
+                                    )
+                                ),
+                                plcOrigin: managementDeletionPLCConfiguration?.origin
+                                    ?? PLCClientConfiguration.defaultProductionOrigin
+                            )
+                        )
+                    } catch {
+                        notifyServiceResolver = nil
+                    }
                     permissionedRuntime = try await .compose(
                         local: localSpaceRuntime,
                         notification: notificationRuntime,
                         managingServiceAudience: managingServiceAudience,
-                        clientAttestationPolicy: clientAttestationPolicy
+                        clientAttestationPolicy: clientAttestationPolicy,
+                        serviceEndpointResolver: notifyServiceResolver
                     )
                 } catch {
                     throw ValidationError("permissioned runtime key composition is invalid")
                 }
                 let notificationRecoveryService: SwanNotificationRecoveryService?
                 if enableNotificationDelivery, let notificationRuntime {
-                    guard !notificationRuntime.peerPinnedTransportConfiguration.endpointPeers.isEmpty else {
-                        throw ValidationError("--enable-notification-delivery requires at least one peer-pinned destination")
-                    }
+                    // Erratum 03: operator pins are no longer the only
+                    // destinations — service-named registrations deliver to
+                    // DID-document-resolved endpoints under dynamic peer
+                    // selection, so an empty pin set is a valid runtime.
                     let serviceIssuer: any SpaceServiceAuthenticationIssuer
                     if let localSpaceRuntime,
                        notificationAccountKEKFile == nil,
@@ -2931,10 +2958,17 @@ extension SwanCommand {
                     }
                     let poster: OAuthBoundedJSONPoster
                     do {
+                        let pinned = notificationRuntime.peerPinnedTransportConfiguration
                         poster = .init(
                             policy: try OAuthRemoteFetchPolicy(allowLocalhostDevelopment: true),
                             transport: NIOPeerPinnedOAuthPostTransport(
-                                configuration: notificationRuntime.peerPinnedTransportConfiguration
+                                configuration: try .init(
+                                    endpointPeers: pinned.endpointPeers,
+                                    // Service-named subscriber endpoints have
+                                    // no operator pin by construction.
+                                    allowsDynamicPeerSelection: true,
+                                    additionalTrustRootsPEM: pinned.additionalTrustRootsPEM
+                                )
                             )
                         )
                     } catch {

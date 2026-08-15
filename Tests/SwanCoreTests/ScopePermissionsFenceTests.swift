@@ -263,6 +263,14 @@ final class ScopePermissionsFenceTests: XCTestCase {
         XCTAssertTrue(
             permissions.allowsSpace(read(aggregate: false, collection: "app.example.records"))
         )
+        // A SINGLE-blob read (Erratum 03: non-aggregate, collection-free —
+        // `SpaceScopeTarget.blobRead`'s shape) is satisfied by the same
+        // collection-qualified grant: one content-addressed object is not a
+        // cross-collection enumeration.
+        XCTAssertTrue(
+            permissions.allowsSpace(read(aggregate: false, collection: nil)),
+            "a collection-qualified grant must satisfy a single-blob read (Erratum 03)"
+        )
         // Reading ACROSS collections is not.
         XCTAssertFalse(
             permissions.allowsSpace(read(aggregate: true, collection: nil)),

@@ -22,6 +22,18 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
     /// lookup between the poster's validation and the TCP connect.
     public struct Configuration: Sendable {
         public let endpointPeers: [String: OAuthIPAddress]
+        /// Erratum 03: permits an endpoint with NO configured pin to connect
+        /// to a member of the poster's policy-approved DNS answer set instead.
+        /// This is not the AsyncHTTPClient escape hatch the adapter below
+        /// warns about: the connect target is still a literal IP chosen
+        /// BEFORE the socket opens, it must appear in both of the poster's
+        /// approved answer sets, no second lookup ever happens, and TLS still
+        /// verifies the URL hostname. What it gives up relative to an
+        /// operator pin is only the operator's foreknowledge of the peer —
+        /// which cannot exist for a subscriber endpoint learned at
+        /// registration time from a DID document. Configured pins keep
+        /// priority for their endpoints.
+        public let allowsDynamicPeerSelection: Bool
         /// Optional PEM trust roots are only for a local interop lab. Normal
         /// construction leaves NIOSSL's platform/default trust policy intact.
         public let additionalTrustRootsPEM: Data?
@@ -29,6 +41,7 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
 
         public init(
             endpointPeers: [String: OAuthIPAddress],
+            allowsDynamicPeerSelection: Bool = false,
             additionalTrustRootsPEM: Data? = nil
         ) throws {
             guard endpointPeers.count <= 4_096,
@@ -48,6 +61,7 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
                 throw SwanError.malformed("peer-pinned notification transport configuration is invalid")
             }
             self.endpointPeers = endpointPeers
+            self.allowsDynamicPeerSelection = allowsDynamicPeerSelection
             self.additionalTrustRootsPEM = additionalTrustRootsPEM
             resources = try OAuthPeerPinnedNIOClientResources(
                 additionalTrustRootsPEM: additionalTrustRootsPEM
@@ -82,8 +96,7 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
               components.fragment == nil,
               !approvedPeers.isEmpty,
               approvedPeers.count <= 32,
-              let peer = configuredPeer(for: url),
-              approvedPeers.contains(peer) else {
+              let peer = connectPeer(for: url, approvedPeers: approvedPeers) else {
             throw SwanError.unauthorized("notification endpoint is not peer-pinned")
         }
         guard scheme == "https" || (scheme == "http" && hostname == "localhost") else {
@@ -114,6 +127,21 @@ public struct NIOPeerPinnedOAuthPostTransport: OAuthRemotePostTransport {
             timeout: timeout,
             maximumResponseBodyBytes: maximumResponseBodyBytes
         )
+    }
+
+    /// A configured pin wins and must be a member of the approved answers.
+    /// With dynamic selection enabled, an unpinned endpoint connects to the
+    /// canonically-smallest approved answer — a deterministic choice so a
+    /// retry cannot be steered to a different member by response timing.
+    private func connectPeer(
+        for url: URL,
+        approvedPeers: Set<OAuthIPAddress>
+    ) -> OAuthIPAddress? {
+        if let configured = configuredPeer(for: url) {
+            return approvedPeers.contains(configured) ? configured : nil
+        }
+        guard configuration.allowsDynamicPeerSelection else { return nil }
+        return approvedPeers.min { "\($0)" < "\($1)" }
     }
 
     private func configuredPeer(for url: URL) -> OAuthIPAddress? {
