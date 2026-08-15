@@ -615,7 +615,7 @@ private func credentialAuthorization(
 ) async throws -> AuthorizationContext {
     let token: String
     do {
-        guard let bearer = try exactBearerToken(from: request.headers) else {
+        guard let bearer = try spaceCredentialSchemeToken(from: request.headers) else {
             throw AuthenticatedSpaceNotificationFailure.denied
         }
         token = bearer

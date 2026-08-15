@@ -653,7 +653,7 @@ private func authorizeRecordRead(
 ) async throws -> AuthorizationContext {
     let bearerToken: String?
     do {
-        bearerToken = try exactBearerToken(from: request.headers)
+        bearerToken = try spaceCredentialSchemeToken(from: request.headers)
     } catch {
         throw AuthenticatedSpaceRecordFailure.denied
     }

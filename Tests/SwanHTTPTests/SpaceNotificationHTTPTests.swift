@@ -313,6 +313,63 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// Erratum 03 addendum (defect class instance #8): the reference presents
+    /// a space credential under the `DPoP` scheme, and Swan's Bearer-only
+    /// reader answered a conformant presentation with 401 — the reference's
+    /// own recorded lesson about its `bearer_token`. The DPoP-scheme
+    /// presentation registers; a DPoP-scheme OAUTH-shaped token still routes
+    /// to OAuth policy and is refused here.
+    func testRegisterNotifyAcceptsTheDPoPSchemeCredentialPresentation() async throws {
+        let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
+        defer { fixture.cleanup() }
+        do {
+            let subscriber = "did:web:events.dpop.example"
+            let document = """
+            {"id":"\(subscriber)","service":[
+                {"id":"#events","serviceEndpoint":"https://events.dpop.example"}
+            ]}
+            """
+            let resolver = SwanServiceEndpointResolver(
+                documents: StubNotificationDIDDocumentFetcher(
+                    documents: [subscriber: Data(document.utf8)]
+                )
+            )
+            let app = try fixture.server(serviceEndpointResolver: resolver)
+                .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.dpopScheme"))
+            try await app.test(.router) { client in
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: try fixture.dpopSchemeCredentialHeaders(),
+                    body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"service\":\"\(subscriber)#events\"}")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                // A non-credential token under DPoP is NOT routed to the
+                // credential verifier: it stays with OAuth policy, which this
+                // fixture leaves unconfigured for the route → denied.
+                var oauthShaped: HTTPFields = [.contentType: "application/json"]
+                oauthShaped[.authorization] = "DPoP not-a-credential-jwt"
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.registerNotify",
+                    method: .post,
+                    headers: oauthShaped,
+                    body: ByteBuffer(string: "{\"space\":\"\(fixture.space.rawValue)\",\"service\":\"\(subscriber)#events\"}")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+            }
+            let registered = await fixture.directory.registrations()
+            XCTAssertEqual(registered.count, 1)
+            XCTAssertEqual(registered[0].service, "\(subscriber)#events")
+            XCTAssertEqual(registered[0].endpoint, "https://events.dpop.example")
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     /// A server with NO resolver answers a service registration exactly like
     /// an unresolvable identifier — from the caller's seat that is what it is
     /// — while legacy endpoint registrations keep working untouched.
@@ -745,6 +802,16 @@ private struct NotificationHTTPFixture {
         let credential = try PermissionedDataJWT.createSpaceCredential(issuer: authority, space: space, key: key)
         var headers: HTTPFields = [.contentType: "application/json"]
         headers[.authorization] = "Bearer \(credential)"
+        return headers
+    }
+
+    /// The reference presentation: the credential under the `DPoP` scheme
+    /// ("a space credential is bound to a key"), proof header included.
+    func dpopSchemeCredentialHeaders() throws -> HTTPFields {
+        let credential = try PermissionedDataJWT.createSpaceCredential(issuer: authority, space: space, key: key)
+        var headers: HTTPFields = [.contentType: "application/json"]
+        headers[.authorization] = "DPoP \(credential)"
+        headers[.init("DPoP")!] = "surplus-proof-swan-credentials-are-unbound"
         return headers
     }
 

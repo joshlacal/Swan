@@ -292,7 +292,7 @@ private func authorizeBlobRead(
 ) async throws -> AuthorizationContext {
     let bearer: String?
     do {
-        bearer = try exactBearerToken(from: request.headers)
+        bearer = try spaceCredentialSchemeToken(from: request.headers)
     } catch {
         throw AuthenticatedSpaceBlobFailure.denied
     }
