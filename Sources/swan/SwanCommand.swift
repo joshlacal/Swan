@@ -2022,6 +2022,25 @@ extension SwanCommand {
         @Option(name: .customLong("email-proof-key-file"), help: "Owner-only mounted base64url 32-byte HMAC key required by --enable-email-recovery")
         var emailProofKeyFile: String?
 
+        /// Legacy (app-password) sessions.
+        ///
+        /// Off by default and gated behind an owner-only mounted key, because
+        /// enabling it introduces the deployment's FIRST long-lived bearer
+        /// credential. Every OAuth credential is sender-constrained — an access
+        /// token is useless without proof of possession of the DPoP key — so a
+        /// captured request cannot be replayed from another machine. An app
+        /// password can. Scoping bounds what a stolen one reaches; it does not
+        /// make a captured request unreplayable.
+        ///
+        /// Swan takes no secret from a process environment or a secret manager:
+        /// the whole surface is owner-only mounted files, so this follows
+        /// `--email-proof-key-file` exactly.
+        @Flag(name: .customLong("enable-legacy-sessions"), help: "Enable com.atproto.server.createSession and the app-password family (introduces a bearer credential)")
+        var enableLegacySessions = false
+
+        @Option(name: .customLong("legacy-session-signing-key-file"), help: "Owner-only mounted base64url 32-byte HMAC key required by --enable-legacy-sessions")
+        var legacySessionSigningKeyFile: String?
+
         @Option(name: .customLong("email-sender"), help: "Canonical sender mailbox for the Mailpit account-email worker")
         var emailSender: String?
 
@@ -2344,6 +2363,37 @@ extension SwanCommand {
             )
         }
 
+        /// Legacy sessions and their signing key move together, in BOTH
+        /// directions.
+        ///
+        /// A flag with no key is the obvious half. The other half matters as
+        /// much: a key file mounted with the flag off means an operator staged
+        /// a bearer-token signing secret believing the feature was live when it
+        /// was not — the kind of silent gap that is discovered by someone
+        /// noticing `createSession` still 404s, long after the secret was
+        /// placed on disk. Refusing to boot says so immediately.
+        ///
+        /// Extracted from `run()` deliberately: a refusal that can only be
+        /// observed by spawning the executable is a refusal nobody re-checks.
+        static func requireLegacySessionKeyMatchesFlag(
+            enableLegacySessions: Bool,
+            legacySessionSigningKeyFile: String?
+        ) throws {
+            let named = legacySessionSigningKeyFile
+                .map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                ?? false
+            if enableLegacySessions, !named {
+                throw ValidationError(
+                    "--enable-legacy-sessions requires an owner-only --legacy-session-signing-key-file"
+                )
+            }
+            if !enableLegacySessions, legacySessionSigningKeyFile != nil {
+                throw ValidationError(
+                    "legacy session options require --enable-legacy-sessions"
+                )
+            }
+        }
+
         func run() async throws {
             guard (1 ... 1_000_000).contains(spaceOplogRetention) else {
                 throw ValidationError(
@@ -2433,6 +2483,10 @@ extension SwanCommand {
                     throw ValidationError("notification account key-store options are invalid")
                 }
             }
+            try Self.requireLegacySessionKeyMatchesFlag(
+                enableLegacySessions: enableLegacySessions,
+                legacySessionSigningKeyFile: legacySessionSigningKeyFile
+            )
             if !enableEmailRecovery {
                 guard emailProofKeyFile == nil,
                       emailSender == nil,

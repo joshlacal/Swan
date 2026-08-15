@@ -331,4 +331,53 @@ final class DeploymentStartupInterlockTests: XCTestCase {
             1
         )
     }
+
+    // MARK: - Legacy sessions and their signing key
+
+    private func requireLegacySessionKey(
+        enabled: Bool,
+        keyFile: String?
+    ) throws {
+        try SwanCommand.Serve.requireLegacySessionKeyMatchesFlag(
+            enableLegacySessions: enabled,
+            legacySessionSigningKeyFile: keyFile
+        )
+    }
+
+    /// Enabling the deployment's first bearer credential without a signing key
+    /// must not boot.
+    func testLegacySessionsWithoutAKeyRefusesToStart() {
+        XCTAssertThrowsError(try requireLegacySessionKey(enabled: true, keyFile: nil))
+    }
+
+    /// A present-but-blank path is the same misconfiguration wearing a value —
+    /// an unset environment variable interpolated into a compose file lands
+    /// here, not in the `nil` case.
+    func testLegacySessionsWithABlankKeyPathRefusesToStart() {
+        for blank in ["", " ", "\t", "\n", "   \n "] {
+            XCTAssertThrowsError(
+                try requireLegacySessionKey(enabled: true, keyFile: blank),
+                "blank path \(blank.debugDescription) must be refused"
+            )
+        }
+    }
+
+    /// The other direction, and the one a naive interlock misses: a signing
+    /// secret staged on disk with the feature off means someone believes
+    /// legacy login is live when `createSession` still 404s.
+    func testAKeyWithoutTheFlagRefusesToStart() {
+        XCTAssertThrowsError(
+            try requireLegacySessionKey(enabled: false, keyFile: "/run/secrets/swan-runtime/legacy-key")
+        )
+    }
+
+    /// Both coherent configurations boot. The default — feature off, no key —
+    /// is what every existing deployment passes, so this pins that adding the
+    /// option changed nothing for them.
+    func testCoherentLegacySessionConfigurationsStart() {
+        XCTAssertNoThrow(try requireLegacySessionKey(enabled: false, keyFile: nil))
+        XCTAssertNoThrow(
+            try requireLegacySessionKey(enabled: true, keyFile: "/run/secrets/swan-runtime/legacy-key")
+        )
+    }
 }
