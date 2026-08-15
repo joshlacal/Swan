@@ -833,6 +833,19 @@ public final class AsyncHTTPClientOAuthPostTransport: OAuthRemotePostTransport {
     }
 }
 
+/// A verified-peer HTTP 4xx on an outbound notification POST. The receiver
+/// answered and refused: retrying cannot succeed, and a queue that retries it
+/// anyway grinds forever on a permanent failure (the nest push-stall lesson;
+/// bulleted.app's absent deletion receiver produced exactly that here).
+/// Callers acknowledge these rather than retrying.
+public struct OAuthOutboundPostPermanentlyRejected: Error, Sendable, Equatable {
+    public let status: Int
+
+    public init(status: Int) {
+        self.status = status
+    }
+}
+
 /// Applies the same URL, DNS re-resolution, peer-address, redirect, timeout,
 /// and response-size policy as OAuth metadata discovery to a small JSON POST.
 /// It intentionally does not inspect a success body: service notifications
@@ -889,7 +902,6 @@ public struct OAuthBoundedJSONPoster: Sendable {
         try policy.validateResolved(Array(finalAddresses), host: host)
         guard response.redirectCount == 0,
               response.responseURL.absoluteString == url.absoluteString,
-              (200 ... 299).contains(response.status),
               response.body.count <= policy.maximumBodyBytes else {
             throw SwanError.unauthorized("outbound notification response is invalid")
         }
@@ -898,6 +910,14 @@ public struct OAuthBoundedJSONPoster: Sendable {
               finalAddresses.contains(peer),
               policy.permits(peer, forHost: host) else {
             throw SwanError.unauthorized("outbound notification peer is forbidden")
+        }
+        // Status is classified only AFTER the peer proof above: a forged
+        // response must never be able to acknowledge (4xx) a delivery.
+        if (400 ... 499).contains(response.status) {
+            throw OAuthOutboundPostPermanentlyRejected(status: response.status)
+        }
+        guard (200 ... 299).contains(response.status) else {
+            throw SwanError.unavailable("outbound notification response status is retryable")
         }
         let normalized = response.headers.reduce(into: [String: [String]]()) { output, item in
             output[item.key.lowercased(), default: []].append(contentsOf: item.value)

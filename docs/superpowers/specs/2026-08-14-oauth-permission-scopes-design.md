@@ -7120,3 +7120,59 @@ Not adopted (recorded, not forgotten): `unregisterNotify` — Swan still
 does not serve it; withdrawal is expiry or replacement. Same-host
 different-account member writes still do not fan out (pre-existing
 account-isolation gap, unreachable for single-user spaces).
+
+## Anchor policy (2026-08-15, ruled by Josh)
+
+**Upstream is the pinned official TypeScript PDS** (`.interop-cache`
+spaces-draft checkout, `packages/pds`) — not the third-party Rust
+`atproto-crates` reference that powers bulleted.app. Conformance arguments
+cite the TS tree; crate behaviors adopted for bulleted.app interop are
+COMPAT SHIMS, individually marked, to be revisited when the spaces draft
+ratifies. Do not adopt further crate dialect without checking the TS
+handler first and marking the divergence.
+
+Classification of the 2026-08-14/15 interop campaign:
+
+TS-upstream parity (conformance fixes, keep):
+- transition scope advertisement; PAR `login_hint`/`prompt`; refresh
+  `redirect_uri` tolerance (RFC 6749)
+- Erratum 01 (§6.1 listing fence — TS `assertSpaceRead`/`listSpaces.ts`)
+- Erratum 02 (§5.6.3 read arm — TS `space-permission.ts:104-107`; the
+  concrete-type clause remains a Swan hardening)
+- Erratum 03 blob reads (TS read arm is collection-independent)
+- RFC 6839 `+json` media types (W3C DID documents)
+- 4xx permanent-failure acknowledgement on outbound notify (operational)
+
+**PIN STALENESS (found 2026-08-15, Josh):** the `.interop-cache` pin
+(`3f6c96d5`) trails the live `permissioned-data` branch HEAD (`bddc99fb`,
+2026-08-13 "fixes from review"). Several behaviors first classed as crate
+dialect are CURRENT-HEAD official; the rows below are corrected against
+HEAD (clone at `$CLAUDE_JOB_DIR/tmp/atproto-permissioned-data`). A re-pin
+of `.interop-cache` to `bddc99fb` is the queued follow-up.
+
+Current-HEAD parity (upstream at bddc99fb, not shims):
+- `registerNotify` `service` identifier + DID-document resolution — HEAD
+  requires `[space, service]` and has REMOVED `endpoint`; Swan's legacy
+  `endpoint` acceptance is now the compat shim, not the service form
+- `createSpace` without `did` — HEAD's lexicon deleted the field (the
+  authority is the caller); HEAD also REQUIRES top-level
+  `policy`/`appAccess`, which Swan does not yet admit (queued)
+- `createSpace` delete→recreate as a FRESH create — HEAD's deleteSpace
+  removes the config row its conflict check reads, so recreate succeeds
+  with the newly supplied config; a LIVE duplicate still throws
+  SpaceAlreadyExists (both matched exactly by Swan's revive-on-tombstone)
+
+Crate-compat shims (still absent at HEAD, marked in place):
+- `community.lexicon.service.describe` (unratified; served under protest)
+- `com.atproto.space.getRepoState` alias of `getLatestCommit`
+- legacy `endpoint`-only registerNotify acceptance (see above)
+- DPoP-scheme space-credential presentation routing (HEAD auth shape
+  unverified either way; accepting both schemes grants nothing new)
+- authority-signed write-push fanout to registered subscribers (HEAD
+  notifies deletion-only through `resolveNotifyTarget`)
+
+Queued to reach HEAD surface (now official, not yet served):
+`com.atproto.space.unregisterNotify`, `com.atproto.space.listBlobs`,
+`com.atproto.simplespace.getSpace`, top-level `policy`/`appAccess` on
+`createSpace`; and `com.atproto.space.getSpace` (which Swan serves) was
+REMOVED at HEAD.

@@ -313,6 +313,61 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// Erratum 03 addendum (instance #10), CURRENT official HEAD semantics
+    /// (`bddc99fb`): re-creating a LIVE space still throws
+    /// SpaceAlreadyExists, but a delete→recreate cycle (bulleted.app's own
+    /// recovery path) is a FRESH create — upstream's deleteSpace removes the
+    /// config row its conflict check reads, so the recreate succeeds with
+    /// the NEWLY SUPPLIED configuration, not the pre-deletion one.
+    func testLifecycleCreateIsIdempotentAndResurrectsADeletedSpace() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let app = try makeServer(fixture).buildApplication(logger: Logger(label: "SimpleSpaceLifecycleHTTPTests.phoenix"))
+            try await app.test(.router) { client in
+                let create = #"{"type":"\#(Self.type)","skey":"phoenix"}"#
+                var uri = ""
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "phoenix-create"), body: ByteBuffer(string: create)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    uri = try XCTUnwrap((try self.jsonObject(response.body))["uri"] as? String)
+                }
+                // Re-creating the LIVE space: SpaceAlreadyExists, per the
+                // current official HEAD.
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "phoenix-recreate"), body: ByteBuffer(string: create)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "SpaceAlreadyExists")
+                }
+                // Distinguish the stored configuration from create defaults so
+                // the recreate below can prove it applies the SUPPLIED config.
+                let publicise = #"{"space":"\#(uri)","policy":"public"}"#
+                try await client.execute(uri: Self.updatePath, method: .post, headers: try self.postHeaders(fixture, path: Self.updatePath, jti: "phoenix-publicise"), body: ByteBuffer(string: publicise)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                // Delete, then recreate: a FRESH create — same URI, but the
+                // pre-deletion "public" policy is gone; the create's default
+                // configuration (member-list) applies.
+                let delete = #"{"space":"\#(uri)"}"#
+                try await client.execute(uri: Self.deletePath, method: .post, headers: try self.postHeaders(fixture, path: Self.deletePath, jti: "phoenix-delete"), body: ByteBuffer(string: delete)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "phoenix-rise"), body: ByteBuffer(string: create)) { response in
+                    XCTAssertEqual(response.status, .ok, "a delete→recreate cycle must be a fresh create, not SpaceAlreadyExists")
+                    XCTAssertEqual((try self.jsonObject(response.body))["uri"] as? String, uri)
+                }
+                let getPath = "/xrpc/com.atproto.space.getSpace?space=\(self.percentEncode(uri))"
+                try await client.execute(uri: getPath, method: .get, headers: try self.getHeaders(fixture, path: "/xrpc/com.atproto.space.getSpace", jti: "phoenix-get-2")) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let config = try XCTUnwrap((try self.jsonObject(response.body))["config"] as? [String: Any])
+                    XCTAssertEqual(config["policy"] as? String, "member-list", "a recreate applies the supplied configuration, not the pre-deletion one")
+                }
+            }
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
     func testLifecycleScopesAuthorityPrivacyAndRequestValidation() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }
@@ -372,11 +427,17 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
                 try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "duplicate-body"), body: ByteBuffer(string: duplicate)) { response in
                     XCTAssertEqual(response.status, .badRequest)
                 }
-                var oversized = try self.postHeaders(fixture, path: Self.createPath, jti: "oversized")
-                oversized[.contentLength] = "1048577"
-                try await client.execute(uri: Self.createPath, method: .post, headers: oversized, body: ByteBuffer(string: create)) { response in
-                    XCTAssertEqual(response.status, .badRequest)
-                }
+                // The forged-Content-Length vector that used to sit here was
+                // DEAD: HummingbirdTesting replaces the header with the real
+                // body length, so the request always passed the declaration
+                // guard and the 400 it asserted was actually
+                // SpaceAlreadyExists from the deleted space above — exposed
+                // the moment Erratum 03's resurrection made that a 200. The
+                // declaration guard is asserted directly instead; the
+                // chunked vector below still exercises the streaming limit
+                // with a genuinely oversized body.
+                XCTAssertFalse(acceptsSimpleSpaceWriteContentLength(["1048577"]))
+                XCTAssertTrue(acceptsSimpleSpaceWriteContentLength(["1048576"]))
                 // Hummingbird's router test client fragments large bodies in
                 // 32 KiB chunks. This exercises the streaming body limit with
                 // a real oversized payload, rather than only trusting a

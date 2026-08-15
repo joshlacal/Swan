@@ -6393,12 +6393,65 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                     authorization: authorization,
                     operation: .create
                 )
+                // Erratum 03 addendum (instance #10), anchored to the CURRENT
+                // official permissioned-data HEAD (`bddc99fb`): deleteSpace
+                // there removes the simplespace config row while the space row
+                // survives only as a credential tombstone, and createSpace's
+                // conflict check reads that config — so a delete→recreate
+                // cycle is a FRESH create (bulleted.app's recovery path),
+                // while re-creating a LIVE space still throws
+                // SpaceAlreadyExists (`simplespace/manager.ts:27-46`,
+                // `actor-store/space/transactor.ts:67-79`). Swan keeps its
+                // single-row tombstone, so the fresh create is expressed as a
+                // revive: un-tombstone, apply the SUPPLIED configuration, and
+                // reseed the membership to just the owner.
                 let existing = try await connection.query(
-                    "SELECT 1 FROM permissioned_simple_space_authorities WHERE space_uri = ?",
+                    "SELECT owner_did, is_deleted, revision FROM permissioned_simple_space_authorities WHERE space_uri = ?",
                     [.text(space.rawValue)]
                 )
-                guard existing.isEmpty else {
-                    throw SwanError.conflict(expected: 0, actual: 1)
+                if let row = existing.first {
+                    // A foreign owner can never reach here
+                    // (requireAuthorityAccount above); the stored owner is
+                    // still checked so a corrupt row fails closed.
+                    guard row.column("owner_did")?.string == owner,
+                          (row.column("is_deleted")?.integer ?? 0) != 0 else {
+                        throw SwanError.conflict(expected: 0, actual: 1)
+                    }
+                    let storedRevision = try requiredRevision(row, "revision")
+                    let nextRevision = try nextSimpleSpaceRevision(storedRevision)
+                    _ = try await connection.query(
+                        """
+                        UPDATE permissioned_simple_space_authorities
+                        SET is_deleted = 0, revision = ?,
+                            policy = ?, app_access = ?, managing_app = ?,
+                            updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END
+                        WHERE space_uri = ?
+                        """,
+                        [
+                            .integer(try sqliteRevision(nextRevision)),
+                            .text(configuration.policy.rawValue),
+                            .text(simpleSpaceAppAccessName(configuration.appAccess)),
+                            configuration.managingApp.map(SQLiteData.text) ?? .null,
+                            .integer(timestamp), .integer(timestamp),
+                            .text(space.rawValue),
+                        ]
+                    )
+                    _ = try await connection.query(
+                        "DELETE FROM permissioned_simple_space_members WHERE space_uri = ?",
+                        [.text(space.rawValue)]
+                    )
+                    _ = try await connection.query(
+                        """
+                        INSERT INTO permissioned_simple_space_members(space_uri, member_did)
+                        VALUES (?, ?)
+                        """,
+                        [.text(space.rawValue), .text(owner)]
+                    )
+                    try await replaceSimpleSpaceClients(
+                        space: space,
+                        appAccess: configuration.appAccess
+                    )
+                    return try await requiredSimpleSpace(space).state
                 }
                 _ = try await connection.query(
                     """

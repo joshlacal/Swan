@@ -165,11 +165,18 @@ public struct HTTPPermissionedSpaceOutboxTransport: PermissionedSpaceOutboxTrans
             eventID: notification.id.uuidString,
             now: Date()
         )
-        try await poster.postJSON(
-            to: endpoint,
-            headers: notificationHeaders(token),
-            body: body
-        )
+        do {
+            try await poster.postJSON(
+                to: endpoint,
+                headers: notificationHeaders(token),
+                body: body
+            )
+        } catch is OAuthOutboundPostPermanentlyRejected {
+            // A verified peer answered 4xx: the receiver refused this
+            // delivery and a retry cannot change its mind. Acknowledge
+            // rather than grinding the queue on a permanent failure.
+            return
+        }
     }
 }
 
@@ -277,11 +284,17 @@ public struct HTTPPermissionedSpaceNotificationFanoutTransport:
             eventID: notification.id.uuidString,
             now: Date()
         )
-        try await poster.postJSON(
-            to: endpoint,
-            headers: notificationHeaders(token),
-            body: body
-        )
+        do {
+            try await poster.postJSON(
+                to: endpoint,
+                headers: notificationHeaders(token),
+                body: body
+            )
+        } catch is OAuthOutboundPostPermanentlyRejected {
+            // A verified peer answered 4xx (bulleted.app has no deletion
+            // receiver at all, for instance): permanent, acknowledge.
+            return
+        }
     }
 }
 
