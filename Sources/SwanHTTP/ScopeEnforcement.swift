@@ -3,7 +3,7 @@ import Logging
 import SwanCore
 import SwanSpaces
 
-/// The authenticated principal behind one public repository mutation.
+/// The authenticated principal behind one scope-enforced request.
 ///
 /// Carries the parsed permissions beside the subject because the two are
 /// produced by the same single `authorize` call and must not be re-derived.
@@ -11,7 +11,7 @@ import SwanSpaces
 /// (`SwanOAuth/OAuthProofValidation.swift:117-119`), so authorizing a second
 /// time to recover the permissions would be indistinguishable from a replay and
 /// would deny every legitimate command.
-struct PublicMutationPrincipal: Sendable {
+struct AuthorizedPrincipal: Sendable {
     let subject: String
     let permissions: SwanScopePermissions
 }

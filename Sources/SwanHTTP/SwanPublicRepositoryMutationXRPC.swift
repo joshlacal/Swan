@@ -455,7 +455,7 @@ private func authorizedPublicMutationPrincipal(
     request: Request,
     path: String,
     capability: SwanPublicRepositoryMutationCapability
-) async throws -> PublicMutationPrincipal {
+) async throws -> AuthorizedPrincipal {
     let authorization: AuthorizationContext
     do {
         // Every route on this surface is registered with `post`; the fixed
@@ -483,7 +483,7 @@ private func authorizedPublicMutationPrincipal(
     // easily lost — never from the body.
     guard case let .accountOAuth(subject, permissions) = authorization,
           permissions.hasBaseATProtocolScope else { throw PublicMutationFailure.unauthorized }
-    return PublicMutationPrincipal(subject: subject, permissions: permissions)
+    return AuthorizedPrincipal(subject: subject, permissions: permissions)
 }
 
 private func withPublicBlobUploadPreflightDrain<Value>(
@@ -717,7 +717,7 @@ private func withPublicMutationInput<Value: Decodable>(
     as type: Value.Type,
     path: String,
     capability: SwanPublicRepositoryMutationCapability,
-    operation: (Value, Data, PublicMutationPrincipal) async throws -> Response
+    operation: (Value, Data, AuthorizedPrincipal) async throws -> Response
 ) async -> Response {
     let contentTypes = request.headers[values: .contentType]
     guard contentTypes.count == 1,
@@ -740,7 +740,7 @@ private func withPublicMutationInput<Value: Decodable>(
     // let an anonymous caller own one of eight shared JSON write leases for
     // the whole 30-second body deadline. `uploadBlob` above has always done
     // it this way.
-    let principal: PublicMutationPrincipal
+    let principal: AuthorizedPrincipal
     do {
         principal = try await authorizedPublicMutationPrincipal(
             request: request,

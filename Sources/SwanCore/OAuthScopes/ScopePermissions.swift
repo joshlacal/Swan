@@ -47,21 +47,35 @@ import Foundation
 //   * getDelegationToken -> `isExchangeableDelegationGrant` (§5.6.3)
 //   * listSpaces         -> `allowsSpaceListing` (§6.1)
 //
-// NOT YET PORTED — the four non-space families below have named upstream port
-// targets, and `hasResourceScope` must not be widened to admit any of them
-// until the corresponding Swan route actually calls the matching `allowsX`
-// (§6.1, §9-D12):
+// ALSO PORTED — repo, blob and rpc landed with the app-password enforcement
+// work. Each route calls the matching `requireX` and maps `ScopeDenied` to its
+// own opaque code via `SwanHTTP/ScopeEnforcement.swift`:
 //
 //   assertRepo     -> repo/{createRecord.ts:64, putRecord.ts:82 AND :86,
 //                     deleteRecord.ts:60, applyWrites.ts:118}
-//                     Swan: SwanPublicRepositoryMutationXRPC.swift:449-450,
-//                     which today guards every repo write with
-//                     `scopes.contains("atproto")` and nothing else.
+//                     Swan: each route in SwanPublicRepositoryMutationXRPC
+//                     asserts AFTER decoding its input, because `collection`
+//                     lives in the body and the authorizer runs on headers
+//                     alone. putRecord asserts BOTH create and update;
+//                     applyWrites asserts per write, not per request.
 //   assertBlob     -> repo/uploadBlob.ts:16, `mime` from the Content-Type
-//                     HEADER, never the body. Swan: same single guard.
-//   assertRpc      -> pipethrough.ts:66-68 plus 14 per-route sites. Porting
-//                     requires the `scopeAud`/`tokenAud` split at
-//                     pipethrough.ts:101-106. Swan: SwanXRPCPipethrough.swift:524.
+//                     HEADER, never the body. Swan: same file, on the
+//                     SANITIZED mime, which is the value actually stored.
+//   assertRpc      -> pipethrough.ts:66-68 plus 14 per-route sites, with the
+//                     `scopeAud`/`tokenAud` split at pipethrough.ts:101-106.
+//                     Swan: SwanXRPCPipethrough step 3b, after authentication
+//                     and before the body is buffered, so an out-of-scope
+//                     method never reaches the mint at step 6.
+//
+// The transition arms these depend on are ported into the matchers themselves —
+// see `hasTransitionGeneric` and the `allows*` docs below. Without them every
+// credential in the wild would be denied, since transition scopes yield no
+// `.repo`/`.rpc`/`.blob` grant.
+//
+// STILL NOT PORTED — `hasResourceScope` must not be widened to admit these
+// until the corresponding Swan route actually calls the matching `allowsX`
+// (§6.1, §9-D12):
+//
 //   assertIdentity -> identity/{updateHandle.ts:13, signPlcOperation.ts:16,
 //                     submitPlcOperation.ts:12,
 //                     requestPlcOperationSignature.ts:14}. Swan serves none of
@@ -536,11 +550,11 @@ public extension SwanScopePermissions {
 
 // MARK: - repo, rpc, blob, account, identity
 //
-// §9-D12: the six families ship now even though Swan enforces only `space:`.
-// They are NOT YET PORTED rather than dead — upstream wires every one of them
-// (see the route map at the top of this file). Until the corresponding Swan
-// route calls the matching `allowsX`, these are reached only by tests, and
-// `hasResourceScope` must NOT be widened to admit their families.
+// §9-D12: all six families ship. `space:`, `repo:`, `blob:` and `rpc:` are now
+// enforced by real routes (see the route map at the top of this file);
+// `identity:` and `account:` remain reached only by tests, and
+// `hasResourceScope` must NOT be widened to admit those two until their routes
+// call the matching `allowsX`.
 
 public extension SwanScopePermissions {
     /// `scope-permissions-transition.ts:47-53`: `transition:generic` allows any

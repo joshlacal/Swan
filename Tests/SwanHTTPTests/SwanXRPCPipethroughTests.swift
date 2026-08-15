@@ -74,6 +74,17 @@ final class SwanXRPCRouterPrecedenceTests: XCTestCase, @unchecked Sendable {
 
 final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
     private static let did = "did:plc:abcdefghijklmnopqrstuvwx"
+
+    /// What a real Swan client holds. Since the `assertRpc` port
+    /// (`pipethrough.ts:66-68`) `atproto` alone proxies nothing — it is the
+    /// identity scope. Catbird's `AuthManager` requests exactly these three and
+    /// the live server advertises them in `scopes_supported`, so this is the
+    /// production credential, not a test convenience. `transition:chat.bsky` is
+    /// present because several cases here proxy `chat.bsky.*`, which
+    /// `transition:generic` deliberately does NOT cover.
+    private static let realisticClientScopes: Set<String> = [
+        "atproto", "transition:generic", "transition:chat.bsky",
+    ]
     private static let appViewDID = "did:web:api.bsky.app"
 
     // MARK: Step 1
@@ -127,6 +138,139 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(components.percentEncodedPath, "/xrpc/app.bsky.feed.getAuthorFeed")
         XCTAssertEqual(components.percentEncodedQuery, "actor=alice.test&limit=2")
         XCTAssertNil(outbound.body)
+    }
+
+    // MARK: - assertRpc (§6.5.10 port of pipethrough.ts:66-68)
+
+    /// The DM fence. `transition:generic` covers every proxied method EXCEPT
+    /// `chat.bsky.*` (`scope-permissions-transition.ts:71-73`), which is the one
+    /// thing a non-privileged legacy credential must not reach.
+    ///
+    /// Asserted on the SENDER, not only the status: the minted service token is
+    /// observable solely as the outbound `Authorization`, so zero recorded sends
+    /// is what proves no credential was minted for an out-of-scope method. The
+    /// check sits at step 3b, before the body is buffered and before a
+    /// concurrency slot is taken, so the denial also costs nothing.
+    func testTransitionGenericCannotProxyChatWithoutTheChatScope() async throws {
+        let sender = RecordingProxySender()
+        let authorizer = PipethroughAuthorizer(
+            result: .success(.accountOAuthForTesting(
+                subject: Self.did,
+                scopes: ["atproto", "transition:generic"]
+            ))
+        )
+        try await withPipethrough(
+            sender: sender,
+            authorizer: authorizer,
+            documents: Self.chatServiceDocuments
+        ) { client in
+            try await client.execute(
+                uri: "/xrpc/chat.bsky.convo.listConvos",
+                method: .get,
+                headers: Self.chatProxyHeaders
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+                // §9-D6: the needed scope never reaches the caller.
+                XCTAssertFalse(self.body(response).contains("rpc:"))
+                XCTAssertFalse(self.body(response).contains("chat.bsky"))
+            }
+        }
+        XCTAssertEqual(
+            sender.recorded().count,
+            0,
+            "an out-of-scope method must never have a service token minted for it"
+        )
+    }
+
+    /// The same request succeeds once the credential carries the chat arm.
+    func testTransitionChatBskyProxiesChat() async throws {
+        let sender = RecordingProxySender()
+        let authorizer = PipethroughAuthorizer(
+            result: .success(.accountOAuthForTesting(
+                subject: Self.did,
+                scopes: ["atproto", "transition:generic", "transition:chat.bsky"]
+            ))
+        )
+        try await withPipethrough(
+            sender: sender,
+            authorizer: authorizer,
+            documents: Self.chatServiceDocuments
+        ) { client in
+            try await client.execute(
+                uri: "/xrpc/chat.bsky.convo.listConvos",
+                method: .get,
+                headers: Self.chatProxyHeaders
+            ) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+        XCTAssertEqual(sender.recorded().count, 1)
+    }
+
+    /// `chat.bsky.` lives at another service, so the router refuses it without
+    /// an explicit destination — the scope check is only reached when the
+    /// client names one.
+    private static let chatProxyHeaders: HTTPFields = {
+        var headers = HTTPFields()
+        headers[HTTPField.Name("atproto-proxy")!] = "did:web:api.bsky.chat#bsky_chat"
+        return headers
+    }()
+
+    private static let chatServiceDocuments = StubDIDDocuments(
+        documents: [
+            "did:web:api.bsky.chat": Data(
+                """
+                {"id":"did:web:api.bsky.chat","service":[
+                  {"id":"#bsky_chat","type":"BskyChatService",
+                   "serviceEndpoint":"https://api.bsky.chat"}]}
+                """.utf8
+            )
+        ]
+    )
+
+    /// The identity scope proxies nothing.
+    func testAtprotoAloneProxiesNothing() async throws {
+        let sender = RecordingProxySender()
+        let authorizer = PipethroughAuthorizer(
+            result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
+        )
+        try await withPipethrough(sender: sender, authorizer: authorizer) { client in
+            try await client.execute(uri: "/xrpc/app.bsky.feed.getTimeline", method: .get) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+        XCTAssertEqual(sender.recorded().count, 0)
+    }
+
+    /// The `scopeAud`/`tokenAud` split (`pipethrough.ts:101-106`). A modern
+    /// `rpc:` grant names the FRAGMENT-QUALIFIED audience, because
+    /// `RpcPermission.matches` compares `aud` as an exact string with no
+    /// fragment stripping — while the minted token's `aud` stays a bare DID.
+    /// Collapsing the two would leave every such grant unmatched.
+    func testModernRpcGrantMatchesFragmentQualifiedAudienceAndMintsBareDID() async throws {
+        let sender = RecordingProxySender()
+        let authorizer = PipethroughAuthorizer(
+            result: .success(.accountOAuthForTesting(
+                subject: Self.did,
+                scopes: [
+                    "atproto",
+                    "rpc:app.bsky.feed.getTimeline?aud=\(Self.appViewDID)%23bsky_appview",
+                ]
+            ))
+        )
+        try await withPipethrough(sender: sender, authorizer: authorizer) { client in
+            try await client.execute(uri: "/xrpc/app.bsky.feed.getTimeline", method: .get) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+        let outbound = try XCTUnwrap(sender.recorded().first)
+        let authorization = try XCTUnwrap(
+            outbound.headers.first { $0.name.lowercased() == "authorization" }?.value
+        )
+        let claims = try Self.claims(ofJWT: String(authorization.dropFirst("Bearer ".count)))
+        // tokenAud stays the BARE did even though the scope matched on did#fragment.
+        XCTAssertEqual(claims["aud"] as? String, Self.appViewDID)
+        XCTAssertEqual(claims["lxm"] as? String, "app.bsky.feed.getTimeline")
     }
 
     func testStripsInboundCredentialHeaders() async throws {
@@ -1165,7 +1309,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         let sender = RecordingProxySender()
         let attempts = PipethroughCallRecorder()
         let authorizer = PipethroughAuthorizer(
-            result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"])),
+            result: .success(.accountOAuthForTesting(subject: Self.did, scopes: Self.realisticClientScopes)),
             attempts: attempts
         )
         let steered: HTTPFields = {
@@ -1305,7 +1449,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
                 actorPreferencesXRPC: SwanActorPreferencesXRPCServer(
                     authorizer: PipethroughAuthorizer(
                         result: .success(
-                            .accountOAuthForTesting(subject: Self.did, scopes: ["atproto"])
+                            .accountOAuthForTesting(subject: Self.did, scopes: Self.realisticClientScopes)
                         )
                     ),
                     store: control
@@ -1393,7 +1537,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
                 actorPreferencesXRPC: SwanActorPreferencesXRPCServer(
                     authorizer: PipethroughAuthorizer(
                         result: .success(
-                            .accountOAuthForTesting(subject: Self.did, scopes: ["atproto"])
+                            .accountOAuthForTesting(subject: Self.did, scopes: Self.realisticClientScopes)
                         )
                     ),
                     store: control
@@ -1525,7 +1669,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         SwanXRPCPipethroughServer(
             authorizer: authorizer
                 ?? PipethroughAuthorizer(
-                    result: .success(.accountOAuthForTesting(subject: Self.did, scopes: ["atproto"]))
+                    result: .success(.accountOAuthForTesting(subject: Self.did, scopes: Self.realisticClientScopes))
                 ),
             tokens: TestProxyServiceTokenIssuer(),
             sender: sender,

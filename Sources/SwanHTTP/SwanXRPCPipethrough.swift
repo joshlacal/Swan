@@ -355,13 +355,42 @@ private func handleSwanXRPCPipethrough(
         // 3. Authentication, before the body is buffered, before a concurrency
         //    slot is taken, and before any outbound work, so an anonymous
         //    caller can never make Swan open a socket.
-        let subject = try await authorizedPipethroughSubject(
+        let principal = try await authorizedPipethroughSubject(
             request,
             method: method,
             path: "/xrpc/\(nsid)",
             authorizer: capability.authorizer,
             now: now
         )
+        let subject = principal.subject
+
+        // 3b. `assertRpc({lxm, aud})` — `pipethrough.ts:66-68`. This is the
+        //     caller-DEPENDENT question, and it is deliberately NOT folded into
+        //     `SwanXRPCProxyRouter.route` at step 2: that router is pure and
+        //     caller-independent, and a scope check there would be worthless
+        //     because it does not know who is calling — any scoped credential
+        //     could then mint a service token for every proxyable NSID.
+        //
+        //     Placed here it is both sufficient and complete: `lxm` binds the
+        //     minted token to one exact NSID, so an out-of-scope method never
+        //     reaches step 6 to have a credential minted for it. It also runs
+        //     before the body is buffered and before a concurrency slot is
+        //     taken, so a denied caller costs the host nothing.
+        try enforcingScope(
+            route: "/xrpc/\(nsid)",
+            logger: context.logger,
+            denial: SwanXRPCPipethroughFailure.unauthorized
+        ) {
+            try principal.permissions.requireRPC(
+                .init(
+                    lxm: nsid,
+                    aud: pipethroughScopeAudience(
+                        route: route,
+                        appViewServiceFragment: capability.appView.serviceFragment
+                    )
+                )
+            )
+        }
 
         // 4. The query string is validated here, before the resolver, the
         //    token issuer, or the sender can be reached, so an unforwardable
@@ -500,7 +529,7 @@ private func authorizedPipethroughSubject(
     path: String,
     authorizer: any SwanXRPCPipethroughResourceAuthorizing,
     now: Date
-) async throws -> String {
+) async throws -> AuthorizedPrincipal {
     let authorization: AuthorizationContext
     do {
         authorization = try await authorizer.authorizePipethrough(
@@ -521,20 +550,39 @@ private func authorizedPipethroughSubject(
     } catch {
         throw SwanXRPCPipethroughFailure.unavailable
     }
-    // NOT YET PORTED (§6.5.10, §9-D12): upstream guards the proxy plane with
-    // `assertRpc({lxm, aud})` — the generic catch-all at `pipethrough.ts:66-68`
-    // plus 14 per-route sites. Porting it requires the `scopeAud`/`tokenAud`
-    // split at `pipethrough.ts:101-106`, which is what lets an `rpc:?aud=did#service`
-    // grant match a proxied call while the outbound service-auth JWT keeps a
-    // bare-DID `aud`. Porting `assertRpc` without that split either breaks
-    // outbound auth or leaves every `rpc:` scope unmatched. Until it lands,
-    // this route stays on the base scope alone — and `hasResourceScope` must
-    // NOT be widened to admit `rpc:` before it does (§6.1).
+    // The authorization FLOOR only. `assertRpc({lxm, aud})` needs the routing
+    // decision's `did#serviceId`, which this function does not have and must
+    // not compute — see the caller, which asserts immediately after this
+    // returns and strictly before any outbound work.
     guard case let .accountOAuth(subject, permissions) = authorization,
           permissions.hasBaseATProtocolScope else {
         throw SwanXRPCPipethroughFailure.unauthorized
     }
-    return subject
+    return AuthorizedPrincipal(subject: subject, permissions: permissions)
+}
+
+/// The `aud` an `rpc:` grant is matched against, per the `scopeAud`/`tokenAud`
+/// split at `pipethrough.ts:101-106`.
+///
+/// The SCOPE check sees the combined `did#serviceId` form, so a caller's
+/// `rpc:...?aud=did#service` grant matches. The outbound service-auth JWT keeps
+/// a bare-DID `aud` regardless — that is `tokenAud`, computed separately at
+/// step 5. Collapsing the two either breaks outbound auth or leaves every
+/// fragment-qualified `rpc:` scope unmatched.
+///
+/// `RpcPermission.matches` compares `aud` as an exact string with no fragment
+/// stripping (`rpc-permission.ts:43-49`), which is why the fragment must be
+/// appended here rather than relied upon to be ignored.
+private func pipethroughScopeAudience(
+    route: SwanXRPCProxyRoute,
+    appViewServiceFragment: String
+) -> String {
+    switch route {
+    case let .configuredAppView(did):
+        "\(did)#\(appViewServiceFragment)"
+    case let .resolvedService(did, fragment):
+        "\(did)#\(fragment)"
+    }
 }
 
 private func pipethroughRequestBody(
