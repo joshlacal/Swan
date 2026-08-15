@@ -585,9 +585,21 @@ public struct SwanHTTPServer: Sendable {
                runtime: oauthRuntime,
                accountControlStore: accountControlStore
            ) {
+            // Formed once, ahead of every capability that verifies compact
+            // space credentials — including the description endpoint, whose
+            // live contract admits a member hosted elsewhere by credential.
+            let getSpaceCredentialVerifier: (any SpaceCredentialAuthorizationVerifier)?
+            if let spaceCredentialConfiguration {
+                getSpaceCredentialVerifier = DurableSpaceCredentialVerifier(
+                    publicKeys: spaceCredentialConfiguration.credentialPublicKeys
+                )
+            } else {
+                getSpaceCredentialVerifier = nil
+            }
             authenticatedGetSpace = SwanAuthenticatedGetSpaceCapability(
                 authorizer: authorizer,
-                directory: authenticatedGetSpaceDirectory
+                directory: authenticatedGetSpaceDirectory,
+                credentialAuthorizer: getSpaceCredentialVerifier
             )
             if let mutationDirectory = publicRepositoryMutationDirectory,
                let signerProvider = publicRepositoryMutationSignerProvider {
@@ -604,14 +616,7 @@ public struct SwanHTTPServer: Sendable {
             }
             if let repositoryDirectory = authenticatedGetSpaceDirectory
                 as? any AuthorizedSpaceRepositoryDirectory {
-                let credentialVerifier: (any SpaceCredentialAuthorizationVerifier)?
-                if let spaceCredentialConfiguration {
-                    credentialVerifier = DurableSpaceCredentialVerifier(
-                        publicKeys: spaceCredentialConfiguration.credentialPublicKeys
-                    )
-                } else {
-                    credentialVerifier = nil
-                }
+                let credentialVerifier = getSpaceCredentialVerifier
                 authenticatedSpaceRecords = SwanAuthenticatedSpaceRecordsCapability(
                     authorizer: authorizer,
                     directory: repositoryDirectory,
@@ -945,7 +950,7 @@ public struct SwanHTTPServer: Sendable {
         // answer 404 rather than 503 when one is written.
         for descriptor in PermissionedData0016.methods
             .filter({ profile.endpoints.contains($0.nsid) }) {
-            if descriptor.nsid == ComAtprotoSpaceGetSpace.typeIdentifier,
+            if descriptor.nsid == ComAtprotoSimplespaceGetSpace.typeIdentifier,
                let authenticatedGetSpace {
                 registerAuthenticatedGetSpaceEndpoint(on: router, capability: authenticatedGetSpace)
             } else if descriptor.nsid == ComAtprotoSpaceGetDelegationToken.typeIdentifier,
@@ -967,6 +972,9 @@ public struct SwanHTTPServer: Sendable {
             } else if descriptor.nsid == ComAtprotoSpaceListRecords.typeIdentifier,
                       let authenticatedSpaceRecords {
                 registerAuthenticatedListRecordsEndpoint(on: router, capability: authenticatedSpaceRecords)
+            } else if descriptor.nsid == ComAtprotoSpaceListBlobs.typeIdentifier,
+                      let authenticatedSpaceRecords {
+                registerAuthenticatedListBlobsEndpoint(on: router, capability: authenticatedSpaceRecords)
             } else if descriptor.nsid == ComAtprotoSpaceListSpaces.typeIdentifier,
                       let authenticatedSpaceList {
                 registerAuthenticatedListSpacesEndpoint(on: router, capability: authenticatedSpaceList)
@@ -1015,6 +1023,13 @@ public struct SwanHTTPServer: Sendable {
             } else if descriptor.nsid == ComAtprotoSpaceRegisterNotify.typeIdentifier,
                       let authenticatedSpaceNotifications {
                 registerAuthenticatedRegisterSpaceNotifyEndpoint(
+                    on: router,
+                    capability: authenticatedSpaceNotifications,
+                    requestBodyAdmission: requestBodyAdmission
+                )
+            } else if descriptor.nsid == ComAtprotoSpaceUnregisterNotify.typeIdentifier,
+                      let authenticatedSpaceNotifications {
+                registerAuthenticatedUnregisterSpaceNotifyEndpoint(
                     on: router,
                     capability: authenticatedSpaceNotifications,
                     requestBodyAdmission: requestBodyAdmission

@@ -33,8 +33,9 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
                     XCTAssertEqual(Set(body.keys), ["cursor", "spaces"])
                     let spaces = try XCTUnwrap(body["spaces"] as? [[String: Any]])
                     XCTAssertEqual(spaces.map { $0["uri"] as? String }, [fixture.owner.rawValue])
-                    XCTAssertEqual(spaces.map { $0["isOwner"] as? Bool }, [true])
-                    XCTAssertTrue(spaces.allSatisfy { Set($0.keys) == ["uri", "isOwner"] })
+                    // The live lexicon's SpaceView carries only the URI;
+                    // isOwner was removed at bddc99fb.
+                    XCTAssertTrue(spaces.allSatisfy { Set($0.keys) == ["uri"] })
                     let rendered = String(decoding: response.body.readableBytesView, as: UTF8.self)
                     for forbidden in ["cid", "blob", "policy", "member", "value", "record"] {
                         XCTAssertFalse(rendered.localizedCaseInsensitiveContains(forbidden), forbidden)
@@ -79,7 +80,7 @@ final class SpaceListHTTPTests: XCTestCase, @unchecked Sendable {
                     let spaces = try XCTUnwrap(self.json(response.body)["spaces"] as? [[String: Any]])
                     XCTAssertEqual(spaces.count, 1)
                     XCTAssertEqual(spaces[0]["uri"] as? String, fixture.remote.rawValue)
-                    XCTAssertEqual(spaces[0]["isOwner"] as? Bool, false)
+                    XCTAssertTrue(spaces.allSatisfy { Set($0.keys) == ["uri"] })
                 }
                 let filtered = try signedHeaders(fixture.token, path: Self.path, runtime: fixture.runtime, jti: "filter")
                 try await client.execute(uri: "\(Self.path)?type=app.example.space&did=\(Self.bob)", method: .get, headers: filtered) { response in

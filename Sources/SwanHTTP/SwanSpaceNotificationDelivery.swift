@@ -338,13 +338,13 @@ private func notificationJSON(
     commitment: Data
 ) throws -> Data {
     guard commitment.count == 32,
-          (try? TID(tidString: wireRevision)) != nil else {
+          let revision = try? TID(tidString: wireRevision) else {
         throw SwanError.malformed("writer notification is invalid")
     }
     let input = try ComAtprotoSpaceNotifyWrite.Input(
-        space: ATProtocolURI(uriString: space.rawValue),
+        space: SpaceRef(uriString: space.rawValue),
         repo: DID(didString: repository),
-        rev: wireRevision,
+        rev: revision,
         hash: Bytes(data: commitment)
     )
     let encoder = JSONEncoder()
@@ -354,7 +354,7 @@ private func notificationJSON(
 
 private func deletionJSON(space: SpaceURI) throws -> Data {
     let input = try ComAtprotoSpaceNotifySpaceDeleted.Input(
-        space: ATProtocolURI(uriString: space.rawValue)
+        space: SpaceRef(uriString: space.rawValue)
     )
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]

@@ -123,7 +123,7 @@ public struct Record: ATProtocolCodable, ATProtocolValue {
         }
     }    
 public struct Parameters: Parametrizable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let repo: DID
         public let collection: NSID?
         public let limit: Int?
@@ -132,7 +132,7 @@ public struct Parameters: Parametrizable {
         public let excludeValues: Bool?
         
         public init(
-            space: ATProtocolURI, 
+            space: SpaceRef, 
             repo: DID, 
             collection: NSID? = nil, 
             limit: Int? = nil, 
@@ -247,6 +247,7 @@ public struct Output: ATProtocolCodable {
         
 public enum Error: String, Swift.Error, ATProtoErrorType, CustomStringConvertible {
                 case spaceNotFound = "SpaceNotFound"
+                case repoNotFound = "RepoNotFound"
                 case repoTakendown = "RepoTakendown"
                 case repoSuspended = "RepoSuspended"
                 case repoDeactivated = "RepoDeactivated"
@@ -270,7 +271,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
     public static let endpointDescriptor = XRPCMethodDescriptor(
         nsid: "com.atproto.space.listRecords", kind: "query",
         inputEncoding: nil, outputEncoding: "application/json",
-        declaredErrors: ["SpaceNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]
+        declaredErrors: ["SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]
     )
 
     public protocol ServerHandler: Sendable {
@@ -290,7 +291,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
 extension ATProtoClient.Com.Atproto.Space {
     // MARK: - listRecords
 
-    /// List the records in an account's repo within a permissioned space, optionally filtered by collection. By default each record's value is inlined; set excludeValues for a metadata-only listing (collection, rkey, cid). Used for full-state recovery. Callable with either OAuth (for the authenticated user's own data) or a space credential (for syncing services).
+    /// List the records in an account's repo within a permissioned space, optionally filtered by collection. By default each record's value is inlined; set excludeValues for a metadata-only listing (collection, rkey, cid). Used for full-state recovery. Callable with either OAuth (for the authenticated user's own data) or a space credential (for syncing services). Throws RepoNotFound when the account holds no repo in the space; this does not distinguish a member that has never written from a non-member.
     /// 
     /// - Parameter input: The input parameters for the request
     /// 

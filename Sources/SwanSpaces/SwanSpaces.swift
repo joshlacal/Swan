@@ -323,6 +323,38 @@ public enum SpaceAuthorizationPolicy {
         )
     }
 
+    /// The `simplespace.getSpace` description read, ported from the live
+    /// reference handler: a space credential bound to this space reads the
+    /// configuration it was minted against, while the OAuth arm requires the
+    /// authority account itself (`assertSpaceOwner`) holding `read_self` for
+    /// the space (`assertSpaceScope`), with the same ambient `atproto` bypass
+    /// as the management verbs — gated on the owner check exactly like
+    /// ``requireManagement(space:authorization:operation:)``.
+    public static func requireSpaceDescriptionRead(
+        space: SpaceURI,
+        authorization: AuthorizationContext
+    ) throws {
+        switch authorization {
+        case let .spaceCredential(grant):
+            guard grant.space == space else {
+                throw SwanError.unauthorized("credential is for another space")
+            }
+            try grant.allows(.read)
+        case let .accountOAuth(subject, permissions):
+            guard subject == space.authority else {
+                throw SwanError.unauthorized("authority account OAuth is required")
+            }
+            if permissions.hasBaseATProtocolScope { return }
+            guard permissions.allowsSpace(.spaceDescriptionRead(space)) else {
+                throw SwanError.unauthorized(
+                    "OAuth scope does not cover this space description read"
+                )
+            }
+        default:
+            throw SwanError.unauthorized("space credential or authority OAuth is required")
+        }
+    }
+
     /// Requires the exact pinned `manage` verb for a simple-space authority
     /// operation.  The broad `atproto` grant is deliberately retained for an
     /// account's own PDS, while a scoped grant must bind the type, authority,

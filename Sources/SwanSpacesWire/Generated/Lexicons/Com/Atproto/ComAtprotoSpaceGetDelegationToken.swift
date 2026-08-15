@@ -11,10 +11,10 @@ public struct ComAtprotoSpaceGetDelegationToken {
 
     public static let typeIdentifier = "com.atproto.space.getDelegationToken"    
 public struct Parameters: Parametrizable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         
         public init(
-            space: ATProtocolURI
+            space: SpaceRef
             ) {
             self.space = space
             

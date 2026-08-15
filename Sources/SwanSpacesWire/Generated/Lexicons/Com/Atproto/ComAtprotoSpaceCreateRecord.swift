@@ -11,7 +11,7 @@ public struct ComAtprotoSpaceCreateRecord {
 
     public static let typeIdentifier = "com.atproto.space.createRecord"
 public struct Input: ATProtocolCodable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let repo: DID
         public let collection: NSID
         public let rkey: RecordKey?
@@ -19,7 +19,7 @@ public struct Input: ATProtocolCodable {
         public let record: ATProtocolValueContainer
 
         /// Standard public initializer
-        public init(space: ATProtocolURI, repo: DID, collection: NSID, rkey: RecordKey? = nil, validate: Bool? = nil, record: ATProtocolValueContainer) {
+        public init(space: SpaceRef, repo: DID, collection: NSID, rkey: RecordKey? = nil, validate: Bool? = nil, record: ATProtocolValueContainer) {
             self.space = space
             self.repo = repo
             self.collection = collection
@@ -31,7 +31,7 @@ public struct Input: ATProtocolCodable {
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.space = try container.decode(ATProtocolURI.self, forKey: .space)
+            self.space = try container.decode(SpaceRef.self, forKey: .space)
             self.repo = try container.decode(DID.self, forKey: .repo)
             self.collection = try container.decode(NSID.self, forKey: .collection)
             if container.contains(.rkey) {
@@ -222,6 +222,8 @@ public struct Output: ATProtocolCodable {
         
 public enum Error: String, Swift.Error, ATProtoErrorType, CustomStringConvertible {
                 case spaceNotFound = "SpaceNotFound"
+                /// A record already exists at this collection and rkey. Retry with a different rkey, or use putRecord.
+                case recordAlreadyExists = "RecordAlreadyExists"
             public var description: String {
                 return self.rawValue
             }
@@ -242,7 +244,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
     public static let endpointDescriptor = XRPCMethodDescriptor(
         nsid: "com.atproto.space.createRecord", kind: "procedure",
         inputEncoding: "application/json", outputEncoding: "application/json",
-        declaredErrors: ["SpaceNotFound"]
+        declaredErrors: ["SpaceNotFound", "RecordAlreadyExists"]
     )
 
     public protocol ServerHandler: Sendable {

@@ -13,7 +13,7 @@ public struct ComAtprotoSpaceListRepoOps {
         
 public struct OpEntry: ATProtocolCodable, ATProtocolValue {
             public static let typeIdentifier = "com.atproto.space.listRepoOps#opEntry"
-            public let rev: String
+            public let rev: TID
             public let collection: NSID
             public let rkey: RecordKey
             public let cid: CID?
@@ -21,7 +21,7 @@ public struct OpEntry: ATProtocolCodable, ATProtocolValue {
             public let value: ATProtocolValueContainer?
 
         public init(
-            rev: String, collection: NSID, rkey: RecordKey, cid: CID?, prev: CID?, value: ATProtocolValueContainer?
+            rev: TID, collection: NSID, rkey: RecordKey, cid: CID?, prev: CID?, value: ATProtocolValueContainer?
         ) {
             self.rev = rev
             self.collection = collection
@@ -34,7 +34,7 @@ public struct OpEntry: ATProtocolCodable, ATProtocolValue {
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             do {
-                self.rev = try container.decode(String.self, forKey: .rev)
+                self.rev = try container.decode(TID.self, forKey: .rev)
             } catch {
                 LogManager.logError("Decoding error for required property 'rev': \(error)")
                 throw error
@@ -189,23 +189,26 @@ public struct OpEntry: ATProtocolCodable, ATProtocolValue {
         }
     }    
 public struct Parameters: Parametrizable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let repo: DID
-        public let since: String?
+        public let since: TID?
         public let limit: Int?
+        public let cursor: String?
         public let excludeValues: Bool?
         
         public init(
-            space: ATProtocolURI, 
+            space: SpaceRef, 
             repo: DID, 
-            since: String? = nil, 
+            since: TID? = nil, 
             limit: Int? = nil, 
+            cursor: String? = nil, 
             excludeValues: Bool? = nil
             ) {
             self.space = space
             self.repo = repo
             self.since = since
             self.limit = limit
+            self.cursor = cursor
             self.excludeValues = excludeValues
             
         }
@@ -337,6 +340,7 @@ public struct Output: ATProtocolCodable {
         
 public enum Error: String, Swift.Error, ATProtoErrorType, CustomStringConvertible {
                 case spaceNotFound = "SpaceNotFound"
+                case repoNotFound = "RepoNotFound"
                 case repoTakendown = "RepoTakendown"
                 case repoSuspended = "RepoSuspended"
                 case repoDeactivated = "RepoDeactivated"
@@ -360,7 +364,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
     public static let endpointDescriptor = XRPCMethodDescriptor(
         nsid: "com.atproto.space.listRepoOps", kind: "query",
         inputEncoding: nil, outputEncoding: "application/json",
-        declaredErrors: ["SpaceNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]
+        declaredErrors: ["SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]
     )
 
     public protocol ServerHandler: Sendable {
@@ -380,7 +384,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
 extension ATProtoClient.Com.Atproto.Space {
     // MARK: - listRepoOps
 
-    /// List the operation log for an account's permissioned repo within a space, returning operations after a given revision. Primary incremental sync mechanism. By default each created or updated operation inlines the record's current value; set excludeValues for metadata-only entries. Callable with either OAuth (for the authenticated user's own data) or a space credential (for syncing services).
+    /// List the operation log for an account's permissioned repo within a space, returning operations after a given revision. Primary incremental sync mechanism. By default each created or updated operation inlines the record's current value; set excludeValues for metadata-only entries. Note the oplog is a transport optimization with no history guarantee: a host may compact it or drop it, and it does not survive account migration, so omitting `since` returns the retained window rather than the repo's full history. Use getRepo for an initial sync or when a `since` revision is no longer available. Callable with either OAuth (for the authenticated user's own data) or a space credential (for syncing services).
     /// 
     /// - Parameter input: The input parameters for the request
     /// 

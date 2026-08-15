@@ -1545,6 +1545,8 @@ private actor CorruptSyncDirectory: AuthorizedSimpleSpaceDirectory, AuthorizedSp
     func close() async throws {}
     func record(_ uri: SpaceRecordURI, authorization _: AuthorizationContext) async throws -> SpaceRecord? { nil }
     func records(space _: SpaceURI, author _: String, collection _: String?, limit _: Int, cursor _: String?, reverse _: Bool, authorization _: AuthorizationContext) async throws -> [SpaceRecord] { [] }
+
+    func repositoryBlobCIDs(space _: SpaceURI, author _: String, since _: String?, limit _: Int, cursor _: String?, authorization _: AuthorizationContext) async throws -> [String] { [] }
     func repositoryCommitState(space: SpaceURI, author: String, authorization _: AuthorizationContext) async throws -> AuthorizedSpaceRepositoryCommitState {
         .init(space: space, author: author, wireRevision: "2222222222222", commitment: Data(repeating: 0x01, count: 32))
     }

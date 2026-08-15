@@ -91,7 +91,7 @@ final class SwanInteropTests: XCTestCase {
         defer { fixture.remove() }
 
         try fixture.replaceInProfile(
-            "3f6c96d5d2d25438bd40fa89d6ecc37865f8e354",
+            "bddc99fb24c34b4078b9bf65837283f37b49ab66",
             with: String(repeating: "a", count: 40)
         )
 
@@ -1550,11 +1550,11 @@ private final class ProfileFixture {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let profileName = "permissioned-data-0016-2026-07-30.json"
-        let lexiconName = "permissioned-data-0016-2026-07-30.lexicons.sha256"
+        let profileName = "permissioned-data-0016-2026-08-15.json"
+        let lexiconName = "permissioned-data-0016-2026-08-15.lexicons.sha256"
         profileURL = profiles.appending(path: profileName)
         lexiconManifestURL = profiles.appending(path: lexiconName)
-        generatedWireManifestURL = profiles.appending(path: "permissioned-data-0016-2026-07-30.generated-wire.sha256")
+        generatedWireManifestURL = profiles.appending(path: "permissioned-data-0016-2026-08-15.generated-wire.sha256")
         generatedWireSourceURL = sources.appending(path: "SwanSpacesWire/SwanSpacesWire.swift")
 
         try FileManager.default.copyItem(
@@ -1566,7 +1566,7 @@ private final class ProfileFixture {
             to: lexiconManifestURL
         )
         try FileManager.default.copyItem(
-            at: packageRoot.appending(path: "Profiles/permissioned-data-0016-2026-07-30.generated-wire.sha256"),
+            at: packageRoot.appending(path: "Profiles/permissioned-data-0016-2026-08-15.generated-wire.sha256"),
             to: generatedWireManifestURL
         )
         try FileManager.default.copyItem(
@@ -1596,7 +1596,7 @@ private final class ProfileFixture {
         try data.write(to: generatedWireManifestURL)
         let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         try replaceInProfile(
-            "80f9f7b93127826d95d516a4a9d18b7ca245d82fc74f8fa484bbf3423d1f51db",
+            "a5428bd2edd32d2d2a605e41fb46816a14e3a9985ede60b56f3e50f6ca180387",
             with: digest
         )
     }

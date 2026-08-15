@@ -1030,6 +1030,24 @@ public enum SQLiteLayout {
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS permissioned_space_record_blobs (
+            space_uri TEXT NOT NULL,
+            author_did TEXT NOT NULL,
+            collection TEXT NOT NULL,
+            rkey TEXT NOT NULL,
+            blob_cid TEXT NOT NULL,
+            -- The wire TID of the record's last write. listBlobs' `since`
+            -- compares against this lexically, exactly as the reference
+            -- compares space_record.repoRev.
+            wire_revision TEXT NOT NULL CHECK(length(wire_revision) = 13),
+            PRIMARY KEY(space_uri, author_did, collection, rkey, blob_cid)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS permissioned_space_record_blobs_page
+        ON permissioned_space_record_blobs(space_uri, author_did, blob_cid)
+        """,
+        """
         CREATE TABLE IF NOT EXISTS permissioned_space_oplog (
             space_uri TEXT NOT NULL,
             author_did TEXT NOT NULL,
@@ -1784,6 +1802,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     private static let publicFirehoseCompletionAnchorMigrationVersion = 14
     private static let stagedBlobNamespaceMigrationVersion = 15
     private static let permissionedRequestReceiptRetentionMigrationVersion = 16
+    private static let permissionedSpaceRecordBlobIndexMigrationVersion = 17
 
     /// How long an uploaded blob no commit has claimed stays staged.
     ///
@@ -2176,6 +2195,7 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             try await migratePublicFirehoseCompletionAnchorsIfNeeded()
             try await migratePermissionedRequestReceiptRetentionIfNeeded()
             try await migrateSpaceNotificationServiceIdentityIfNeeded()
+            try await backfillPermissionedSpaceRecordBlobIndexIfNeeded()
         }
         // SQLite cannot replace a CHECK constraint in place. This migration
         // rebuilds the simple-space parent and its FK children after the base
@@ -2703,6 +2723,81 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
             column: "created_at",
             definition: "INTEGER NOT NULL DEFAULT 0 CHECK(created_at >= 0)"
         )
+        _ = try await connection.query(
+            """
+            INSERT INTO permissioned_repository_migrations(version, applied_at)
+            VALUES (?, ?)
+            """,
+            [
+                .integer(version),
+                .integer(Int(Date().timeIntervalSince1970 * 1_000_000)),
+            ]
+        )
+    }
+
+    /// Builds the record→blob edge index for databases whose permissioned
+    /// records predate `permissioned_space_record_blobs`. New writes maintain
+    /// the edges transactionally; this backfill parses each stored record's
+    /// canonical DAG-CBOR for raw blob links, exactly as the write path does.
+    ///
+    /// Backfilled edges are stamped with the repository's CURRENT wire
+    /// revision rather than each record's actual last-write revision (the
+    /// oplog's retention makes the latter unrecoverable in general). That is
+    /// deliberately over-inclusive for `since` filtering — a syncer may be
+    /// offered a blob it already holds — and never under-inclusive, which
+    /// would silently lose blobs during migration.
+    private func backfillPermissionedSpaceRecordBlobIndexIfNeeded() async throws {
+        // Runs inside migrateWithoutGate's single schema/upgrade transaction;
+        // starting another here would nest.
+        let version = Self.permissionedSpaceRecordBlobIndexMigrationVersion
+        let applied = try await connection.query(
+            "SELECT 1 FROM permissioned_repository_migrations WHERE version = ?",
+            [.integer(version)]
+        )
+        guard applied.isEmpty else { return }
+
+        var stateRevisions: [String: String] = [:]
+        let stateRows = try await connection.query(
+            "SELECT space_uri, author_did, wire_revision FROM permissioned_repository_state"
+        )
+        for row in stateRows {
+            let space = try requiredText(row, "space_uri")
+            let author = try requiredText(row, "author_did")
+            stateRevisions["\(space)\u{0}\(author)"] =
+                try requiredText(row, "wire_revision")
+        }
+        let recordRows = try await connection.query(
+            """
+            SELECT space_uri, author_did, collection, rkey, value
+            FROM permissioned_space_records
+            """
+        )
+        for row in recordRows {
+            let space = try requiredText(row, "space_uri")
+            let author = try requiredText(row, "author_did")
+            guard let wireRevision = stateRevisions["\(space)\u{0}\(author)"] else {
+                continue
+            }
+            let value = try requiredBlob(row, "value")
+            for cid in try rawBlobCIDs(in: value) {
+                _ = try await connection.query(
+                    """
+                    INSERT INTO permissioned_space_record_blobs(
+                        space_uri, author_did, collection, rkey,
+                        blob_cid, wire_revision
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(space_uri, author_did, collection, rkey, blob_cid)
+                    DO NOTHING
+                    """,
+                    [
+                        .text(space), .text(author),
+                        .text(try requiredText(row, "collection")),
+                        .text(try requiredText(row, "rkey")),
+                        .text(cid), .text(wireRevision),
+                    ]
+                )
+            }
+        }
         _ = try await connection.query(
             """
             INSERT INTO permissioned_repository_migrations(version, applied_at)
@@ -3846,6 +3941,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                             blob(value), .text(cid), .integer(storedRevision),
                         ]
                     )
+                    try await replacePermissionedRecordBlobEdges(
+                        space: space, author: author,
+                        collection: uri.collection, rkey: uri.rkey,
+                        blobCIDs: try rawBlobCIDs(in: value),
+                        wireRevision: wireRevision
+                    )
                 case let .put(_, value, cid), let .update(_, value, cid):
                     if case .update = write, old == nil {
                         throw SwanError.malformed("cannot update a missing record")
@@ -3875,6 +3976,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                             blob(value), .text(cid), .integer(storedRevision),
                         ]
                     )
+                    try await replacePermissionedRecordBlobEdges(
+                        space: space, author: author,
+                        collection: uri.collection, rkey: uri.rkey,
+                        blobCIDs: try rawBlobCIDs(in: value),
+                        wireRevision: wireRevision
+                    )
                 case .delete:
                     action = .delete
                     guard let old else {
@@ -3891,6 +3998,12 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
                             .text(space.rawValue), .text(author),
                             .text(uri.collection), .text(uri.rkey),
                         ]
+                    )
+                    try await replacePermissionedRecordBlobEdges(
+                        space: space, author: author,
+                        collection: uri.collection, rkey: uri.rkey,
+                        blobCIDs: [],
+                        wireRevision: wireRevision
                     )
                 }
 
@@ -5866,6 +5979,46 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// body; only the accepted keys are then decoded from the same read
     /// transaction. A page may be shorter than `limit` at the byte boundary,
     /// and the caller continues with the last returned key.
+    /// The distinct blob CIDs referenced by this repository's records within
+    /// one space, ordered ascending by CID — the exact projection
+    /// `com.atproto.space.listBlobs` serves. `since` keeps only blobs whose
+    /// referencing record was last written after that wire TID; `cursor` is
+    /// the last CID of the previous page.
+    public func spaceRecordBlobCIDPage(
+        space: SpaceURI,
+        author: String,
+        since: String?,
+        cursor: String?,
+        limit: Int
+    ) async throws -> [String] {
+        try requireAccount(author)
+        guard (1 ... 1_000).contains(limit) else {
+            throw SwanError.malformed("permissioned blob page is invalid")
+        }
+        var sql = """
+            SELECT DISTINCT blob_cid
+            FROM permissioned_space_record_blobs
+            WHERE space_uri = ? AND author_did = ?
+            """
+        var bindings: [SQLiteData] = [.text(space.rawValue), .text(author)]
+        if let since {
+            sql += " AND wire_revision > ?"
+            bindings.append(.text(since))
+        }
+        if let cursor {
+            sql += " AND blob_cid > ?"
+            bindings.append(.text(cursor))
+        }
+        sql += " ORDER BY blob_cid ASC LIMIT ?"
+        bindings.append(.integer(limit))
+        return try await withConnectionGate {
+            try await readTransaction {
+                let rows = try await connection.query(sql, bindings)
+                return try rows.map { try requiredText($0, "blob_cid") }
+            }
+        }
+    }
+
     public func repositoryRecordPage(
         space: SpaceURI,
         author: String,
@@ -6495,10 +6648,13 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
         try requireAuthorityAccount(space: space)
         return try await withConnectionGate {
             try await readTransaction {
-                try requireAuthorityManagement(
+                // The live `simplespace.getSpace` read contract: authority
+                // OAuth with read_self (ambient `atproto` bypass included) or
+                // a space credential bound to this exact space — not the
+                // management verbs, which stay on the mutation paths.
+                try SpaceAuthorizationPolicy.requireSpaceDescriptionRead(
                     space: space,
-                    authorization: authorization,
-                    operation: .update
+                    authorization: authorization
                 )
                 return try await loadSimpleSpace(space)?.state
             }
@@ -7161,6 +7317,39 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// keyed by the delivery endpoint, matching the pinned PDS. Re-registering
     /// with a different optional repo replaces it; expiry cleanup below acts
     /// as removal without accepting a broad administration endpoint.
+    /// Withdraws a subscriber's registrations by service identity, the live
+    /// `unregisterNotify` contract: idempotent (succeeds whether or not a
+    /// matching registration existed), gated on a space credential for this
+    /// exact space and on the space still being active.
+    public func unregisterSpaceNotification(
+        space: SpaceURI,
+        service: String,
+        authorization: AuthorizationContext
+    ) async throws {
+        guard Self.isValidNotificationServiceIdentity(service) else {
+            throw SwanError.invalidIdentifier("notification service identity")
+        }
+        try requireAuthorityAccount(space: space)
+        guard case let .spaceCredential(grant) = authorization,
+              grant.space == space else {
+            throw SwanError.unauthorized("space credential is required")
+        }
+        try grant.allows(.read)
+        try await withConnectionGate {
+            try await transaction {
+                let state = try await requiredSimpleSpace(space)
+                try requireActiveSimpleSpace(state.state)
+                _ = try await connection.query(
+                    """
+                    DELETE FROM permissioned_space_notification_registrations
+                    WHERE space_uri = ? AND service_did = ?
+                    """,
+                    [.text(space.rawValue), .text(service)]
+                )
+            }
+        }
+    }
+
     public func registerSpaceNotification(
         _ registration: AuthorizedSpaceNotificationRegistration,
         authorization: AuthorizationContext,
@@ -10704,6 +10893,46 @@ public actor SQLiteAccountDatabase: StreamingBlobStore, PublicRepositoryGenesisS
     /// The staged upload edge is consumed unconditionally: a permissioned
     /// record has claimed those bytes, and a later same-CID re-upload creates
     /// a fresh staged edge that is likewise never anonymously reachable. A
+    /// Replaces the record→blob edges for one permissioned record inside the
+    /// caller's write transaction. The edge set mirrors the record's current
+    /// raw blob links exactly; `wire_revision` is the committing batch's TID,
+    /// which is what `listBlobs`' `since` filter compares against.
+    private func replacePermissionedRecordBlobEdges(
+        space: SpaceURI,
+        author: String,
+        collection: String,
+        rkey: String,
+        blobCIDs: [String],
+        wireRevision: TID
+    ) async throws {
+        _ = try await connection.query(
+            """
+            DELETE FROM permissioned_space_record_blobs
+            WHERE space_uri = ? AND author_did = ?
+              AND collection = ? AND rkey = ?
+            """,
+            [
+                .text(space.rawValue), .text(author),
+                .text(collection), .text(rkey),
+            ]
+        )
+        for cid in blobCIDs {
+            _ = try await connection.query(
+                """
+                INSERT INTO permissioned_space_record_blobs(
+                    space_uri, author_did, collection, rkey,
+                    blob_cid, wire_revision
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    .text(space.rawValue), .text(author),
+                    .text(collection), .text(rkey),
+                    .text(cid), .text(wireRevision.toString()),
+                ]
+            )
+        }
+    }
+
     /// CID a validated public record also references keeps (or has restored)
     /// its public reference — that blob is genuinely published and
     /// `com.atproto.sync.getBlob` must keep serving it. Existing private
@@ -11855,6 +12084,29 @@ public actor DurableSpaceRepository {
     /// is checked against a synthetic, valid record URI before the durable
     /// snapshot is queried. An omitted collection therefore cannot silently
     /// downgrade an aggregate response to a censored list.
+    /// The distinct blob CIDs referenced by this repository's records within
+    /// the space. Authorization mirrors an aggregate record read: the blobs a
+    /// caller can enumerate here are exactly the ones whose records a
+    /// cross-collection `listRecords` would show it.
+    public func listBlobCIDs(
+        since: String?,
+        cursor: String?,
+        limit: Int,
+        authorization: AuthorizationContext
+    ) async throws -> [String] {
+        guard (1 ... 1_000).contains(limit) else {
+            throw SwanError.malformed("permissioned blob page limit is invalid")
+        }
+        try requireRead(uri: nil, authorization: authorization)
+        return try await database.spaceRecordBlobCIDPage(
+            space: space,
+            author: author,
+            since: since,
+            cursor: cursor,
+            limit: limit
+        )
+    }
+
     public func listRecords(
         collection: String?,
         limit: Int,

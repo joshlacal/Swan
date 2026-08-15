@@ -11,13 +11,13 @@ public struct ComAtprotoSpaceNotifyWrite {
 
     public static let typeIdentifier = "com.atproto.space.notifyWrite"
 public struct Input: ATProtocolCodable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let repo: DID
-        public let rev: String
+        public let rev: TID
         public let hash: Bytes
 
         /// Standard public initializer
-        public init(space: ATProtocolURI, repo: DID, rev: String, hash: Bytes) {
+        public init(space: SpaceRef, repo: DID, rev: TID, hash: Bytes) {
             self.space = space
             self.repo = repo
             self.rev = rev
@@ -27,9 +27,9 @@ public struct Input: ATProtocolCodable {
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.space = try container.decode(ATProtocolURI.self, forKey: .space)
+            self.space = try container.decode(SpaceRef.self, forKey: .space)
             self.repo = try container.decode(DID.self, forKey: .repo)
-            self.rev = try container.decode(String.self, forKey: .rev)
+            self.rev = try container.decode(TID.self, forKey: .rev)
             self.hash = try container.decode(Bytes.self, forKey: .hash)
         }
 

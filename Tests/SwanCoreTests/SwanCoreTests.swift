@@ -23,7 +23,7 @@ final class SwanCoreTests: XCTestCase {
 
     func testBootstrapWireRegistryCoversEveryPinnedOperation() {
         let methods = PermissionedData0016.methods
-        XCTAssertEqual(methods.count, 25)
+        XCTAssertEqual(methods.count, 27)
         XCTAssertEqual(Set(methods.map(\.nsid)).count, methods.count)
         XCTAssertTrue(methods.contains { $0.nsid == "com.atproto.space.getRepo" && $0.outputEncoding == "application/vnd.ipld.car" })
         XCTAssertTrue(methods.contains { $0.nsid == "com.atproto.space.getSpaceCredential" })

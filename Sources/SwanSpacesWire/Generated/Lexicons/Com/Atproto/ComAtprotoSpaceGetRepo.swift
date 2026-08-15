@@ -11,15 +11,18 @@ public struct ComAtprotoSpaceGetRepo {
 
     public static let typeIdentifier = "com.atproto.space.getRepo"    
 public struct Parameters: Parametrizable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let repo: DID
+        public let excludeValues: Bool?
         
         public init(
-            space: ATProtocolURI, 
-            repo: DID
+            space: SpaceRef, 
+            repo: DID, 
+            excludeValues: Bool? = nil
             ) {
             self.space = space
             self.repo = repo
+            self.excludeValues = excludeValues
             
         }
     }
@@ -134,7 +137,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
 extension ATProtoClient.Com.Atproto.Space {
     // MARK: - getRepo
 
-    /// Download an account's permissioned repo within a space as a CAR file, for full-state recovery. The CAR declares two roots in order: the signed commit, then a DRISL (DAG-CBOR) index mapping '{collection}/{rkey}' to record CID. Record blocks follow in lexicographic order. Blobs are not included and are fetched separately via getBlob. Served by a repo host. Callable with either OAuth (for the authenticated user's own data) or a space credential (for syncing services).
+    /// Download an account's permissioned repo within a space as a CAR file, for full-state recovery. The CAR declares two roots in order: the signed commit, then a DRISL (DAG-CBOR) index mapping '{collection}/{rkey}' to record CID. Record blocks follow, in the same canonical DAG-CBOR key order as the index (length-first, then bytewise). Blobs are not included and are fetched separately via getBlob. Served by a repo host. Callable with either OAuth (for the authenticated user's own data) or a space credential (for syncing services).
     /// 
     /// - Parameter input: The input parameters for the request
     /// 

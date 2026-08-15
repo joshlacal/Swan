@@ -409,6 +409,16 @@ public protocol AuthorizedSpaceNotificationDirectory: Sendable {
         authorization: AuthorizationContext
     ) async throws
 
+    /// Withdraws a subscriber's registration by service identity
+    /// (`com.atproto.space.unregisterNotify`). Idempotent: succeeds whether or
+    /// not a matching registration existed. Implementations gate on a space
+    /// credential for exactly this space and on the space still being active.
+    func unregisterSpaceNotification(
+        space: SpaceURI,
+        service: String,
+        authorization: AuthorizationContext
+    ) async throws
+
     /// Records a direct writer-to-authority service-authenticated announcement
     /// and atomically advances only the authority writer-set state. It does
     /// not create cross-host write-fanout intents: the pinned receiver
@@ -527,6 +537,19 @@ public protocol AuthorizedSpaceRepositoryDirectory: Sendable {
         _ uri: SpaceRecordURI,
         authorization: AuthorizationContext
     ) async throws -> SpaceRecord?
+
+    /// The distinct blob CIDs referenced by one account's records within a
+    /// space, ordered ascending (`com.atproto.space.listBlobs`). `since`
+    /// filters by the referencing record's last-write wire TID; `cursor` is
+    /// the last CID of the previous page.
+    func repositoryBlobCIDs(
+        space: SpaceURI,
+        author: String,
+        since: String?,
+        limit: Int,
+        cursor: String?,
+        authorization: AuthorizationContext
+    ) async throws -> [String]
 
     /// Returns a bounded, deterministic page from one durable permissioned
     /// repository. `cursor` is already syntactically bounded by the HTTP

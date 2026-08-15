@@ -1783,6 +1783,15 @@ private actor FailingPermissionedWriteDirectory:
         authorization: AuthorizationContext
     ) async throws -> [SpaceRecord] { [] }
 
+    func repositoryBlobCIDs(
+        space: SpaceURI,
+        author: String,
+        since: String?,
+        limit: Int,
+        cursor: String?,
+        authorization: AuthorizationContext
+    ) async throws -> [String] { [] }
+
     func repositoryCommitState(
         space: SpaceURI,
         author: String,

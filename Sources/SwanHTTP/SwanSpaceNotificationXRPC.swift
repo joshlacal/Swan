@@ -99,7 +99,7 @@ private struct AuthenticatedListSpaceReposHandler:
                 repos: try writers.map {
                     .init(
                         did: try DID(didString: $0.repository),
-                        rev: $0.wireRevision,
+                        rev: try TID(tidString: $0.wireRevision),
                         hash: Bytes(data: $0.commitment)
                     )
                 }
@@ -119,7 +119,7 @@ private struct AuthenticatedListSpaceReposHandler:
 /// is required, and when both are sent `service` decides, mirroring the
 /// reference handler.
 private struct RegisterSpaceNotifyWireInput: Decodable {
-    let space: ATProtocolURI
+    let space: SpaceRef
     let repo: DID?
     let endpoint: String?
     let service: String?
@@ -195,6 +195,32 @@ private struct AuthenticatedRegisterSpaceNotifyHandler {
     }
 }
 
+private struct AuthenticatedUnregisterSpaceNotifyHandler {
+    let capability: SwanAuthenticatedSpaceNotificationsCapability
+
+    func handle(
+        parameters _: Void,
+        input: ComAtprotoSpaceUnregisterNotify.Input,
+        context request: Request
+    ) async throws {
+        let space = try notificationSpace(input.space)
+        let authorization = try await credentialAuthorization(
+            capability,
+            request: request,
+            space: space
+        )
+        do {
+            try await capability.directory.unregisterSpaceNotification(
+                space: space,
+                service: input.service,
+                authorization: authorization
+            )
+        } catch {
+            throw notificationStorageFailure(error)
+        }
+    }
+}
+
 private struct AuthenticatedNotifySpaceWriteHandler:
     ComAtprotoSpaceNotifyWrite.ServerHandler
 {
@@ -208,8 +234,7 @@ private struct AuthenticatedNotifySpaceWriteHandler:
         context request: Request
     ) async throws {
         let space = try notificationSpace(input.space)
-        guard input.hash.data.count == 32,
-              (try? TID(tidString: input.rev)) != nil else {
+        guard input.hash.data.count == 32 else {
             throw AuthenticatedSpaceNotificationFailure.invalidRequest
         }
         let service = try await serviceAuthentication(
@@ -233,7 +258,7 @@ private struct AuthenticatedNotifySpaceWriteHandler:
                     eventID: service.eventID,
                     space: space,
                     repository: input.repo.didString(),
-                    wireRevision: input.rev,
+                    wireRevision: input.rev.toString(),
                     commitment: input.hash.data,
                     issuer: service.issuer,
                     audience: service.audience
@@ -342,6 +367,33 @@ func registerAuthenticatedRegisterSpaceNotifyEndpoint(
     registerAuthenticatedNotificationWrongMethods(on: router, path: path, allowed: .post)
 }
 
+func registerAuthenticatedUnregisterSpaceNotifyEndpoint(
+    on router: Router<BasicRequestContext>,
+    capability: SwanAuthenticatedSpaceNotificationsCapability,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration
+) {
+    let handler = AuthenticatedUnregisterSpaceNotifyHandler(capability: capability)
+    let path: RouterPath = "/xrpc/com.atproto.space.unregisterNotify"
+    router.post(path) { request, context async -> Response in
+        do {
+            let input = try await decodeUnregisterSpaceNotifyInput(
+                request, context: context, requestBodyAdmission: requestBodyAdmission,
+                decodeObserver: capability.notificationJSONDecodeObserver)
+            try await handler.handle(parameters: (), input: input, context: request)
+            return Response(status: .ok, headers: [.cacheControl: "no-store"])
+        } catch let failure as AuthenticatedSpaceNotificationFailure {
+            return authenticatedSpaceNotificationResponse(for: failure)
+        } catch let failure as SwanRequestBodyCollectionFailure {
+            return authenticatedSpaceNotificationResponse(
+                for: failure == .unavailable ? .unavailable : .invalidRequest
+            )
+        } catch {
+            return authenticatedSpaceNotificationError(.badRequest, code: "InvalidRequest")
+        }
+    }
+    registerAuthenticatedNotificationWrongMethods(on: router, path: path, allowed: .post)
+}
+
 func registerAuthenticatedNotifySpaceWriteEndpoint(
     on router: Router<BasicRequestContext>,
     capability: SwanAuthenticatedSpaceNotificationsCapability,
@@ -438,7 +490,7 @@ private func parseListSpaceReposParameters(
         }
     }
     do {
-        let space = try ATProtocolURI(uriString: rawSpace)
+        let space = try SpaceRef(uriString: rawSpace)
         _ = try SpaceURI(space.uriString())
         return .init(space: space, limit: limit, cursor: values["cursor"])
     } catch {
@@ -491,6 +543,36 @@ private func decodeRegisterSpaceNotifyInput(
     }
 }
 
+private func decodeUnregisterSpaceNotifyInput(
+    _ request: Request,
+    context: SwanHTTPRequestContext,
+    requestBodyAdmission: SwanRequestBodyAdmissionConfiguration,
+    decodeObserver: (@Sendable () async -> Void)?
+) async throws -> ComAtprotoSpaceUnregisterNotify.Input {
+    let admitted = try await notificationJSONBody(
+        request, context: context, requestBodyAdmission: requestBodyAdmission)
+    defer { withExtendedLifetime(admitted.body) {} }
+    let data = admitted.data
+    await decodeObserver?()
+    try notificationJSONObject(
+        data,
+        allowedKeys: ["space", "service"],
+        requiredKeys: ["space", "service"]
+    )
+    do {
+        let input = try JSONDecoder().decode(ComAtprotoSpaceUnregisterNotify.Input.self, from: data)
+        _ = try notificationSpace(input.space)
+        guard validNotificationServiceIdentifier(input.service) else {
+            throw AuthenticatedSpaceNotificationFailure.invalidRequest
+        }
+        return input
+    } catch let failure as AuthenticatedSpaceNotificationFailure {
+        throw failure
+    } catch {
+        throw AuthenticatedSpaceNotificationFailure.invalidRequest
+    }
+}
+
 /// A subscriber service identifier: `did:<method>:…` with at most one
 /// non-empty `#fragment`, printable ASCII, bounded. Resolution decides
 /// everything further — this only refuses shapes that could never name a
@@ -529,8 +611,7 @@ private func decodeNotifySpaceWriteInput(
         let input = try JSONDecoder().decode(ComAtprotoSpaceNotifyWrite.Input.self, from: data)
         _ = try notificationSpace(input.space)
         _ = try DID(didString: input.repo.didString())
-        guard (try? TID(tidString: input.rev)) != nil,
-              input.hash.data.count == 32 else {
+        guard input.hash.data.count == 32 else {
             throw AuthenticatedSpaceNotificationFailure.invalidRequest
         }
         return input
@@ -606,7 +687,7 @@ private func notificationJSONObject(
     }
 }
 
-private func notificationSpace(_ value: ATProtocolURI) throws -> SpaceURI {
+private func notificationSpace(_ value: SpaceRef) throws -> SpaceURI {
     do {
         return try SpaceURI(value.uriString())
     } catch {

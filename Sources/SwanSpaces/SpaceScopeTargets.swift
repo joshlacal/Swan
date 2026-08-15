@@ -131,6 +131,23 @@ public extension SpaceScopeTarget {
         )
     }
 
+    /// The `simplespace.getSpace` configuration read — the same deliberate
+    /// exception ``blobRead(_:)`` makes to the derived-aggregate rule, for the
+    /// same reason. The read answers with ONE configuration object for one
+    /// space; nothing about it enumerates or censors a cross-collection
+    /// record response, which is the hazard §6.5.5 exists for. The live
+    /// reference gates this surface on `action=read_self` and its read arms
+    /// are collection-independent, so a collection-qualified grant that can
+    /// read its own records can also describe the space they live in.
+    static func spaceDescriptionRead(_ space: SpaceURI) -> SpaceScopeTarget {
+        SpaceScopeTarget(
+            type: space.spaceType,
+            authority: space.authority,
+            skey: space.skey,
+            operation: .readSelf(aggregate: false, collection: nil)
+        )
+    }
+
     /// A space-lifecycle target. `manage=` is a DISJOINT vocabulary from
     /// `action=` (`space-permission.ts:32-36`); the mapping must keep `.manage`
     /// routing to the `manage=` parameter and never to `action=`.

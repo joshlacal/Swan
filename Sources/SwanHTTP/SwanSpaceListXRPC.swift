@@ -122,8 +122,7 @@ private struct AuthenticatedListSpacesHandler: ComAtprotoSpaceListSpaces.ServerH
                 cursor: page.cursor?.rawValue,
                 spaces: try page.spaces.map {
                     ComAtprotoSpaceListSpaces.SpaceView(
-                        uri: try ATProtocolURI(uriString: $0.space.rawValue),
-                        isOwner: $0.isOwner
+                        uri: try SpaceRef(uriString: $0.space.rawValue)
                     )
                 }
             )
@@ -237,7 +236,6 @@ private func authenticatedListSpacesResponse(
 private struct ListSpacesWireOutput: Encodable {
     struct Space: Encodable {
         let uri: String
-        let isOwner: Bool
     }
 
     let cursor: String?
@@ -252,7 +250,7 @@ private func authenticatedListSpacesJSON(
         status,
         ListSpacesWireOutput(
             cursor: output.cursor,
-            spaces: output.spaces.map { .init(uri: $0.uri.uriString(), isOwner: $0.isOwner) }
+            spaces: output.spaces.map { .init(uri: $0.uri.uriString()) }
         )
     )
 }

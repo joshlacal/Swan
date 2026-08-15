@@ -11,12 +11,12 @@ public struct ComAtprotoSimplespaceCheckUserAccess {
 
     public static let typeIdentifier = "com.atproto.simplespace.checkUserAccess"    
 public struct Parameters: Parametrizable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let user: DID
         public let clientId: String?
         
         public init(
-            space: ATProtocolURI, 
+            space: SpaceRef, 
             user: DID, 
             clientId: String? = nil
             ) {

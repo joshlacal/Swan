@@ -306,12 +306,24 @@ final class PreMigratedAccountDirectoryTests: XCTestCase {
                 authorization: .accountOAuthForTesting(subject: bob, scopes: ["atproto"])
             )
         )
+        // The live simplespace.getSpace contract gates the owner's OAuth on a
+        // read_self-satisfying space grant — a scoped read for exactly this
+        // space now succeeds where the retired manage-gated endpoint refused.
+        let scopedDescription = try await directory.space(
+            space,
+            authorization: .accountOAuthForTesting(
+                subject: alice,
+                scopes: ["space:app.bsky.bookmarks?authority=\(alice)&skey=directory&action=read"]
+            )
+        )
+        XCTAssertEqual(scopedDescription?.space, space)
+        // A grant for a different skey binds another space entirely.
         await XCTAssertSwanUnauthorizedAsync(
             try await directory.space(
                 space,
                 authorization: .accountOAuthForTesting(
                     subject: alice,
-                    scopes: ["space:app.bsky.bookmarks?authority=\(alice)&skey=directory&action=read"]
+                    scopes: ["space:app.bsky.bookmarks?authority=\(alice)&skey=other&action=read"]
                 )
             )
         )

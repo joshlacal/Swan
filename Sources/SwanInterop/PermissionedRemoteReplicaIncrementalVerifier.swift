@@ -77,13 +77,8 @@ public enum PermissionedRemoteReplicaIncrementalVerifier {
         operations.reserveCapacity(wireOperations.count)
 
         for (index, entry) in wireOperations.enumerated() {
-            let revision: TID
-            do {
-                revision = try TID(tidString: entry.rev)
-            } catch {
-                throw PermissionedRemoteReplicaIncrementalVerificationError
-                    .invalidRevisionOrder
-            }
+            // The generated wire type now carries a parsed TID directly.
+            let revision: TID = entry.rev
             guard revision > base.head.wireRevision,
                   revision >= previousRevision else {
                 throw PermissionedRemoteReplicaIncrementalVerificationError
@@ -185,15 +180,15 @@ public enum PermissionedRemoteReplicaIncrementalVerifier {
               commit.hash.data.count == 32,
               commit.ikm.data.count == 32,
               commit.sig.data.count == 64,
-              commit.mac.data.count == 32,
-              let revision = try? TID(tidString: commit.rev) else {
+              commit.mac.data.count == 32 else {
             throw PermissionedRemoteReplicaIncrementalVerificationError
                 .invalidCommit
         }
+        let revision = commit.rev
         let context = try SpaceCommitContext(
             space: target.space,
             author: target.repositoryDID,
-            rev: commit.rev,
+            rev: commit.rev.toString(),
             ikm: commit.ikm.data
         )
         let envelope = SpaceCommitEnvelope(

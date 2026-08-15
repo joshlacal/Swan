@@ -229,7 +229,7 @@ private func parseAuthenticatedGetSpaceDelegationTokenParameters(
         guard rawSpace.utf8.count <= 2_048 else {
             throw SpaceDelegationMintingFailure.invalidRequest
         }
-        let uri = try ATProtocolURI(uriString: rawSpace)
+        let uri = try SpaceRef(uriString: rawSpace)
         _ = try SpaceURI(uri.uriString())
         return .init(space: uri)
     } catch {

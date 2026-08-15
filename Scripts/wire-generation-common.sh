@@ -8,14 +8,11 @@ wire_generation_die() {
 }
 
 wire_generation_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-wire_generation_profile="${wire_generation_root}/Profiles/permissioned-data-0016-2026-07-30.json"
-readonly wire_generation_expected_petrel_generator_commit="c2a1cdbee8c621c7682416114700f032cc7e2b37"
+wire_generation_profile="${wire_generation_root}/Profiles/permissioned-data-0016-2026-08-15.json"
+readonly wire_generation_expected_petrel_generator_commit="710ecb0af23f07737c5c9b60eeed24092cb3aa3c"
 readonly wire_generation_sha256="${wire_generation_root}/Scripts/sha256.sh"
-readonly wire_generation_expected_profile_sha256="431294d96a4a82f15fe5cd0807d89dbcd76d1768a1762d2a0c6a5905e8083988"
-readonly wire_generation_expected_petrel_manifest_sha256="ac3c8b006e0e771f6e3cb0b5cbe6e93a78101dc49ce95ea9b3e1ed734a97636f"
-readonly wire_generation_legacy_profile_sha256="30a696e78f62b11f22dd669f6ebb9f7e08d6c1d3346ebd71ad5cf0cd49b3f4d0"
-readonly wire_generation_legacy_lexicons_sha256="9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f"
-readonly wire_generation_legacy_generated_sha256="c1d5697f351a4209c7f8a9faaf460d423f9f44f37845ae2c92e150e78c552609"
+readonly wire_generation_expected_profile_sha256="7c4733fdfb19246de785e7090b420b5cdfd95e2c9129de69625b860c35c11977"
+readonly wire_generation_expected_petrel_manifest_sha256="70fa60badb45cfd17a261d3395b6c4ef80d94bf2d951034359ed1df93adad9ca"
 
 wire_generation_profile_value() {
   local key="$1"
@@ -67,16 +64,19 @@ wire_generation_verify_legacy_profile_immutable() {
     [[ "${actual}" == "${expected}" ]] || wire_generation_die \
       "legacy profile artifact changed: ${relative}"
   done <<EOF
-Profiles/permissioned-data-0016-2026-07-03.json ${wire_generation_legacy_profile_sha256}
-Profiles/permissioned-data-0016-2026-07-03.lexicons.sha256 ${wire_generation_legacy_lexicons_sha256}
-Profiles/permissioned-data-0016-2026-07-03.generated-wire.sha256 ${wire_generation_legacy_generated_sha256}
+Profiles/permissioned-data-0016-2026-07-03.json 30a696e78f62b11f22dd669f6ebb9f7e08d6c1d3346ebd71ad5cf0cd49b3f4d0
+Profiles/permissioned-data-0016-2026-07-03.lexicons.sha256 9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f
+Profiles/permissioned-data-0016-2026-07-03.generated-wire.sha256 c1d5697f351a4209c7f8a9faaf460d423f9f44f37845ae2c92e150e78c552609
+Profiles/permissioned-data-0016-2026-07-30.json 431294d96a4a82f15fe5cd0807d89dbcd76d1768a1762d2a0c6a5905e8083988
+Profiles/permissioned-data-0016-2026-07-30.lexicons.sha256 9d36b3bf54e8c307b460dabaf93411bd75be44ba1737f29b13592b4b997b899f
+Profiles/permissioned-data-0016-2026-07-30.generated-wire.sha256 80f9f7b93127826d95d516a4a9d18b7ca245d82fc74f8fa484bbf3423d1f51db
 EOF
 }
 
 wire_generation_verify_checked_in_manifest() {
   local output_root="${1:-${wire_generation_root}}" manifest manifest_hash
   wire_generation_verify_legacy_profile_immutable
-  manifest="${wire_generation_root}/Profiles/permissioned-data-0016-2026-07-30.generated-wire.sha256"
+  manifest="${wire_generation_root}/Profiles/permissioned-data-0016-2026-08-15.generated-wire.sha256"
   manifest_hash="$("${wire_generation_sha256}" "${manifest}" | awk '{print $1}')"
   [[ "$(wire_generation_profile_value generatedWireManifestSHA256)" == "${manifest_hash}" ]] || \
     wire_generation_die "successor generated-wire manifest pin mismatch"

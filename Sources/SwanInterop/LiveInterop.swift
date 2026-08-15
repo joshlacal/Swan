@@ -2329,7 +2329,7 @@ public enum LiveInteropRunner {
                   let commit = output.commit,
                   commit.ver == 1,
                   commit.rev == output.ops.last?.rev,
-                  canonicalInteropTID(commit.rev) != nil,
+                  canonicalInteropTID(commit.rev.toString()) != nil,
                   commit.hash.data.count == 32,
                   commit.ikm.data.count == 32,
                   commit.sig.data.count == 64,
@@ -2346,12 +2346,12 @@ public enum LiveInteropRunner {
             let visibleCIDs = Set(output.ops.compactMap { $0.cid?.string })
             guard retainedResultCIDs.isSubset(of: visibleCIDs) else {
                 return TerminalApplyWritesWitness(
-                    status: response.status, revision: commit.rev, verified: false,
+                    status: response.status, revision: commit.rev.toString(), verified: false,
                     errorCode: "OperationMismatch"
                 )
             }
             let context = try SpaceCommitContext(
-                space: space, author: repository, rev: commit.rev, ikm: commit.ikm.data
+                space: space, author: repository, rev: commit.rev.toString(), ikm: commit.ikm.data
             )
             let envelope = SpaceCommitEnvelope(
                 ver: commit.ver, context: context, contextSignature: commit.sig.data,
@@ -2359,13 +2359,13 @@ public enum LiveInteropRunner {
             )
             guard SpaceCommitCodec.verifyContentBinding(envelope) else {
                 return TerminalApplyWritesWitness(
-                    status: response.status, revision: commit.rev, verified: false,
+                    status: response.status, revision: commit.rev.toString(), verified: false,
                     errorCode: "ContentBindingMismatch"
                 )
             }
             guard let key = member.permissionedCommitVerificationKey else {
                 return TerminalApplyWritesWitness(
-                    status: response.status, revision: commit.rev, verified: false,
+                    status: response.status, revision: commit.rev.toString(), verified: false,
                     errorCode: "MissingCommitKey"
                 )
             }
@@ -2379,12 +2379,12 @@ public enum LiveInteropRunner {
                 algorithm: algorithm
             ) else {
                 return TerminalApplyWritesWitness(
-                    status: response.status, revision: commit.rev, verified: false,
+                    status: response.status, revision: commit.rev.toString(), verified: false,
                     errorCode: "ContextSignatureMismatch"
                 )
             }
             return TerminalApplyWritesWitness(
-                status: response.status, revision: commit.rev, verified: true,
+                status: response.status, revision: commit.rev.toString(), verified: true,
                 errorCode: nil
             )
         } catch {
@@ -2534,15 +2534,15 @@ public enum LiveInteropRunner {
             )
             guard output.cursor == nil,
                   !output.ops.isEmpty,
-                  let operationRevisions = try? output.ops.map({ try TID(tidString: $0.rev) }),
+                  case let operationRevisions = output.ops.map(\.rev),
                   zip(operationRevisions, operationRevisions.dropFirst()).allSatisfy({
                       $0.0 <= $0.1
                   }) else {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: output.ops.first?.cid?.string,
-                    operationRevision: output.ops.first?.rev,
-                    commitment: nil, commitRevision: output.commit?.rev,
+                    operationRevision: output.ops.first?.rev.toString(),
+                    commitment: nil, commitRevision: output.commit?.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "InvalidOperation"
                 )
@@ -2552,7 +2552,7 @@ public enum LiveInteropRunner {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: output.ops.first?.cid?.string,
-                    operationRevision: output.ops.first?.rev,
+                    operationRevision: output.ops.first?.rev.toString(),
                     commitment: nil, commitRevision: nil,
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "OperationMismatch"
@@ -2562,7 +2562,7 @@ public enum LiveInteropRunner {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
-                    operationRevision: operation.rev,
+                    operationRevision: operation.rev.toString(),
                     commitment: nil, commitRevision: nil,
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "CommitMissing"
@@ -2570,7 +2570,6 @@ public enum LiveInteropRunner {
             }
             guard commit.ver == 1,
                   commit.rev == output.ops.last?.rev,
-                  (try? TID(tidString: commit.rev)) != nil,
                   commit.hash.data.count == 32,
                   commit.ikm.data.count == 32,
                   commit.sig.data.count == 64,
@@ -2578,8 +2577,8 @@ public enum LiveInteropRunner {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
-                    operationRevision: operation.rev,
-                    commitment: nil, commitRevision: commit.rev,
+                    operationRevision: operation.rev.toString(),
+                    commitment: nil, commitRevision: commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "InvalidCommit"
                 )
@@ -2593,8 +2592,8 @@ public enum LiveInteropRunner {
                         return PermissionedSyncResult(
                             status: response.status, opsCount: output.ops.count,
                             operationCID: operation.cid?.string,
-                            operationRevision: operation.rev,
-                            commitment: nil, commitRevision: commit.rev,
+                            operationRevision: operation.rev.toString(),
+                            commitment: nil, commitRevision: commit.rev.toString(),
                             commitVerified: false, valuesIncluded: includeValues,
                             errorCode: "ValueCIDMismatch"
                         )
@@ -2603,8 +2602,8 @@ public enum LiveInteropRunner {
                     return PermissionedSyncResult(
                         status: response.status, opsCount: output.ops.count,
                         operationCID: operation.cid?.string,
-                        operationRevision: operation.rev,
-                        commitment: nil, commitRevision: commit.rev,
+                        operationRevision: operation.rev.toString(),
+                        commitment: nil, commitRevision: commit.rev.toString(),
                         commitVerified: false, valuesIncluded: includeValues,
                         errorCode: "ValueMissing"
                     )
@@ -2614,8 +2613,8 @@ public enum LiveInteropRunner {
                         return PermissionedSyncResult(
                             status: response.status, opsCount: output.ops.count,
                             operationCID: operation.cid?.string,
-                            operationRevision: operation.rev,
-                            commitment: nil, commitRevision: commit.rev,
+                            operationRevision: operation.rev.toString(),
+                            commitment: nil, commitRevision: commit.rev.toString(),
                             commitVerified: false, valuesIncluded: includeValues,
                             errorCode: "InvalidOperation"
                         )
@@ -2624,8 +2623,8 @@ public enum LiveInteropRunner {
                         return PermissionedSyncResult(
                             status: response.status, opsCount: output.ops.count,
                             operationCID: operation.cid?.string,
-                            operationRevision: operation.rev,
-                            commitment: nil, commitRevision: commit.rev,
+                            operationRevision: operation.rev.toString(),
+                            commitment: nil, commitRevision: commit.rev.toString(),
                             commitVerified: false, valuesIncluded: includeValues,
                             errorCode: "InvalidOperation"
                         )
@@ -2642,8 +2641,8 @@ public enum LiveInteropRunner {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
-                    operationRevision: operation.rev,
-                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev,
+                    operationRevision: operation.rev.toString(),
+                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "CommitmentMismatch"
                 )
@@ -2651,7 +2650,7 @@ public enum LiveInteropRunner {
             let context = try SpaceCommitContext(
                 space: space,
                 author: author,
-                rev: commit.rev,
+                rev: commit.rev.toString(),
                 ikm: commit.ikm.data
             )
             let envelope = SpaceCommitEnvelope(
@@ -2665,8 +2664,8 @@ public enum LiveInteropRunner {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
-                    operationRevision: operation.rev,
-                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev,
+                    operationRevision: operation.rev.toString(),
+                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "ContentBindingMismatch"
                 )
@@ -2675,8 +2674,8 @@ public enum LiveInteropRunner {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
-                    operationRevision: operation.rev,
-                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev,
+                    operationRevision: operation.rev.toString(),
+                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "MissingCommitKey"
                 )
@@ -2693,8 +2692,8 @@ public enum LiveInteropRunner {
                 return PermissionedSyncResult(
                     status: response.status, opsCount: output.ops.count,
                     operationCID: operation.cid?.string,
-                    operationRevision: operation.rev,
-                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev,
+                    operationRevision: operation.rev.toString(),
+                    commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                     commitVerified: false, valuesIncluded: includeValues,
                     errorCode: "ContextSignatureMismatch"
                 )
@@ -2702,8 +2701,8 @@ public enum LiveInteropRunner {
             return PermissionedSyncResult(
                 status: response.status, opsCount: output.ops.count,
                 operationCID: operation.cid?.string,
-                operationRevision: operation.rev,
-                commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev,
+                operationRevision: operation.rev.toString(),
+                commitment: Hex.encode(commit.hash.data), commitRevision: commit.rev.toString(),
                 commitVerified: true, valuesIncluded: includeValues, errorCode: nil
             )
         } catch {

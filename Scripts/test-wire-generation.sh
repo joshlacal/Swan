@@ -51,7 +51,7 @@ assert_unchanged
 # this preflight directly with a throwaway profile while retaining the same
 # generated-output inventory assertion.
 bad_profile="${temporary_root}/profile.json"
-python3 - "Profiles/permissioned-data-0016-2026-07-30.json" "${bad_profile}" <<'PY'
+python3 - "Profiles/permissioned-data-0016-2026-08-15.json" "${bad_profile}" <<'PY'
 import json
 import sys
 with open(sys.argv[1], encoding="utf-8") as source:
@@ -83,7 +83,7 @@ assert_unchanged
 # discover during recursive traversal. Test it against a copied cache only.
 reference_copy="${temporary_root}/reference"
 mkdir -p "${reference_copy}"
-(cd .interop-cache/atproto-3f6c96d5d2d25438bd40fa89d6ecc37865f8e354 && tar -cf - lexicons) | (cd "${reference_copy}" && tar -xf -)
+(cd .interop-cache/atproto-bddc99fb24c34b4078b9bf65837283f37b49ab66 && tar -cf - lexicons) | (cd "${reference_copy}" && tar -xf -)
 printf '{"lexicon":1,"id":"com.atproto.space.injected","defs":{"main":{"type":"query"}}}\n' >"${reference_copy}/lexicons/com/atproto/space/injected.json"
 if ./Scripts/verify-profile.sh "${reference_copy}"; then
   echo "test-wire-generation: injected source lexicon unexpectedly succeeded" >&2

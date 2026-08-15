@@ -11,62 +11,40 @@ public struct ComAtprotoSpaceRegisterNotify {
 
     public static let typeIdentifier = "com.atproto.space.registerNotify"
 public struct Input: ATProtocolCodable {
-        public let space: ATProtocolURI
-        public let repo: DID?
-        public let endpoint: URI
+        public let space: SpaceRef
+        public let service: String
 
         /// Standard public initializer
-        public init(space: ATProtocolURI, repo: DID? = nil, endpoint: URI) {
+        public init(space: SpaceRef, service: String) {
             self.space = space
-            self.repo = repo
-            self.endpoint = endpoint
+            self.service = service
         }
         
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.space = try container.decode(ATProtocolURI.self, forKey: .space)
-            if container.contains(.repo) {
-                guard try !container.decodeNil(forKey: .repo) else {
-                    throw DecodingError.valueNotFound(
-                        DID.self,
-                        DecodingError.Context(
-                            codingPath: container.codingPath,
-                            debugDescription: "Property 'repo' must not be null"
-                        )
-                    )
-                }
-                self.repo = try container.decode(DID.self, forKey: .repo)
-            } else {
-                self.repo = nil
-            }
-            self.endpoint = try container.decode(URI.self, forKey: .endpoint)
+            self.space = try container.decode(SpaceRef.self, forKey: .space)
+            self.service = try container.decode(String.self, forKey: .service)
         }
 
         public func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(space, forKey: .space)
-            try container.encodeIfPresent(repo, forKey: .repo)
-            try container.encode(endpoint, forKey: .endpoint)
+            try container.encode(service, forKey: .service)
         }
 
         public func toCBORValue() throws -> Any {
             var map = OrderedCBORMap()
             let spaceValue = try space.toCBORValue()
             map = map.adding(key: "space", value: spaceValue)
-            if let value = repo {
-                let repoValue = try value.toCBORValue()
-                map = map.adding(key: "repo", value: repoValue)
-            }
-            let endpointValue = try endpoint.toCBORValue()
-            map = map.adding(key: "endpoint", value: endpointValue)
+            let serviceValue = try service.toCBORValue()
+            map = map.adding(key: "service", value: serviceValue)
             return map
         }
 
         private enum CodingKeys: String, CodingKey {
             case space
-            case repo
-            case endpoint
+            case service
         }
     }
     
@@ -136,6 +114,8 @@ public struct Output: ATProtocolCodable {
         
 public enum Error: String, Swift.Error, ATProtoErrorType, CustomStringConvertible {
                 case spaceNotFound = "SpaceNotFound"
+                /// The service identifier could not be resolved to a DID document with a matching service endpoint.
+                case serviceNotResolvable = "ServiceNotResolvable"
             public var description: String {
                 return self.rawValue
             }
@@ -156,7 +136,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
     public static let endpointDescriptor = XRPCMethodDescriptor(
         nsid: "com.atproto.space.registerNotify", kind: "procedure",
         inputEncoding: "application/json", outputEncoding: "application/json",
-        declaredErrors: ["SpaceNotFound"]
+        declaredErrors: ["SpaceNotFound", "ServiceNotResolvable"]
     )
 
     public protocol ServerHandler: Sendable {
@@ -174,7 +154,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
 extension ATProtoClient.Com.Atproto.Space {
     // MARK: - registerNotify
 
-    /// Register an endpoint to be notified of writes. On a space host, subscribes to all repos in the space; on a repo host with a `repo`, subscribes to that repo only. Authenticated with a space credential.
+    /// Register a service to be notified of writes to any repo in a space. Called on the space host. The registering service is named by its service identifier rather than a bare URL, because notifyWrite is delivered with service auth addressed to that identifier; the delivery endpoint is resolved from the service's DID document. Authenticated with a space credential. Re-registering an existing service replaces its registration and extends the expiry.
     /// 
     /// - Parameter input: The input parameters for the request
     

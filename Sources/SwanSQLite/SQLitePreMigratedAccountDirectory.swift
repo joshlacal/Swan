@@ -269,15 +269,16 @@ public actor SQLitePreMigratedAccountDirectory:
         guard !isClosed else {
             throw SwanError.unavailable("authenticated space directory is unavailable")
         }
-        // `hasBaseATProtocolScope` is the SAME predicate this site spelled
-        // before — literal `atproto`, narrower than the resource floor, so a
-        // space-only grant is still refused here. §6.5.1: do NOT "fix" this to
-        // `hasResourceScope` while migrating.
-        guard case let .accountOAuth(subject, permissions) = authorization,
-              subject == space.authority,
-              permissions.hasBaseATProtocolScope else {
-            throw SwanError.unauthorized("authority account OAuth with atproto scope is required")
-        }
+        // The live `simplespace.getSpace` contract: the authority's own OAuth
+        // session (read_self scope, with the ambient `atproto` bypass), or a
+        // space credential bound to exactly this space. The durable policy in
+        // `simpleSpace` re-evaluates the same predicate inside the read
+        // transaction; this early check keeps a foreign principal from
+        // observing account-lifecycle timing below.
+        try SpaceAuthorizationPolicy.requireSpaceDescriptionRead(
+            space: space,
+            authorization: authorization
+        )
 
         guard try await isActiveAccount(space.authority) else { return nil }
         guard !isClosed else {
@@ -686,6 +687,28 @@ public actor SQLitePreMigratedAccountDirectory:
         }
     }
 
+    public func unregisterSpaceNotification(
+        space: SpaceURI,
+        service: String,
+        authorization: AuthorizationContext
+    ) async throws {
+        let database = try await preopenedCredentialAuthorityDatabase(for: space)
+        do {
+            try await database.unregisterSpaceNotification(
+                space: space,
+                service: service,
+                authorization: authorization
+            )
+            try await requireCredentialAuthorityStillAvailable(space.authority)
+        } catch let error as SwanError {
+            throw error
+        } catch let error as AuthorizedSimpleSpaceLifecycleError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
     public func registerSpaceNotification(
         _ registration: AuthorizedSpaceNotificationRegistration,
         authorization: AuthorizationContext
@@ -807,6 +830,43 @@ public actor SQLitePreMigratedAccountDirectory:
     /// Ordering and tolerant cursor semantics live in
     /// ``DurableSpaceRepository/listRecords(collection:limit:cursor:reverse:authorization:)``
     /// so SQLite cannot bypass the domain's collection-scoped authorization.
+    public func repositoryBlobCIDs(
+        space: SpaceURI,
+        author: String,
+        since: String?,
+        limit: Int,
+        cursor: String?,
+        authorization: AuthorizationContext
+    ) async throws -> [String] {
+        let database = try await preopenedRepositoryDatabase(
+            for: author,
+            authorization: authorization
+        )
+        guard let database else { return [] }
+        do {
+            let repository = try DurableSpaceRepository(
+                database: database,
+                space: space,
+                author: author
+            )
+            let result = try await repository.listBlobCIDs(
+                since: since,
+                cursor: cursor,
+                limit: limit,
+                authorization: authorization
+            )
+            guard try await isActiveAccount(author) else { return [] }
+            guard !isClosed else {
+                throw SwanError.unavailable("authenticated space directory is unavailable")
+            }
+            return result
+        } catch let error as SwanError {
+            throw error
+        } catch {
+            throw SwanError.unavailable("authenticated space directory is unavailable")
+        }
+    }
+
     public func records(
         space: SpaceURI,
         author: String,

@@ -313,6 +313,126 @@ final class SpaceNotificationHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// `unregisterNotify` (live lexicon at bddc99fb): withdraws a subscriber
+    /// by service identity, idempotently, under the same space-credential
+    /// gate as `registerNotify`. Mirrors the reference handler, which deletes
+    /// by (space, serviceDid) without resolving the identifier again — a
+    /// subscriber whose DID document has since changed must still be able to
+    /// withdraw.
+    func testUnregisterNotifyWithdrawsByServiceIdempotentlyUnderCredentialGate() async throws {
+        let fixture = try await NotificationHTTPFixture.make(authority: authority, writer: writer)
+        defer { fixture.cleanup() }
+        do {
+            let subscriber = "did:web:events.bulleted.example"
+            let document = """
+            {"id":"\(subscriber)","service":[
+                {"id":"#a","serviceEndpoint":"https://a.bulleted.example"},
+                {"id":"#b","serviceEndpoint":"https://b.bulleted.example"}
+            ]}
+            """
+            let resolver = SwanServiceEndpointResolver(
+                documents: StubNotificationDIDDocumentFetcher(
+                    documents: [subscriber: Data(document.utf8)]
+                )
+            )
+            let app = try fixture.server(serviceEndpointResolver: resolver)
+                .buildApplication(logger: Logger(label: "SpaceNotificationHTTPTests.unregister"))
+            let credentialHeaders = try fixture.bearerHeaders()
+            let spaceURI = fixture.space.rawValue
+            let body: @Sendable (String) -> ByteBuffer = { fields in
+                ByteBuffer(string: "{\"space\":\"\(spaceURI)\",\(fields)}")
+            }
+            try await app.test(.router) { client in
+                for fragment in ["#a", "#b"] {
+                    try await client.execute(
+                        uri: "/xrpc/com.atproto.space.registerNotify",
+                        method: .post,
+                        headers: credentialHeaders,
+                        body: body("\"service\":\"\(subscriber)\(fragment)\"")
+                    ) { response in
+                        XCTAssertEqual(response.status, .ok)
+                    }
+                }
+                let afterRegister = await fixture.directory.registrations()
+                XCTAssertEqual(afterRegister.count, 2)
+
+                // Withdraw exactly one subscriber; the other survives.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.unregisterNotify",
+                    method: .post,
+                    headers: credentialHeaders,
+                    body: body("\"service\":\"\(subscriber)#a\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(response.headers[.cacheControl], "no-store")
+                    XCTAssertEqual(response.body.readableBytes, 0)
+                }
+                let remaining = await fixture.directory.registrations()
+                XCTAssertEqual(remaining.map(\.service), ["\(subscriber)#b"])
+
+                // Idempotent: withdrawing again, or a never-registered
+                // service, still succeeds — no existence oracle.
+                for target in ["\(subscriber)#a", "did:web:never.example#x"] {
+                    try await client.execute(
+                        uri: "/xrpc/com.atproto.space.unregisterNotify",
+                        method: .post,
+                        headers: credentialHeaders,
+                        body: body("\"service\":\"\(target)\"")
+                    ) { response in
+                        XCTAssertEqual(response.status, .ok, target)
+                    }
+                }
+                let afterIdempotent = await fixture.directory.registrations()
+                XCTAssertEqual(afterIdempotent.count, 1)
+
+                // The strict body fence: `service` is required, unknown keys
+                // and the retired `endpoint` locator are refused, and a
+                // malformed identifier never reaches storage.
+                for bad in [
+                    "\"repo\":\"\(self.writer)\"",
+                    "\"endpoint\":\"https://a.bulleted.example\"",
+                    "\"service\":\"https://not-a-did.example\"",
+                    "\"service\":\"\(subscriber)#a\",\"extra\":1",
+                ] {
+                    try await client.execute(
+                        uri: "/xrpc/com.atproto.space.unregisterNotify",
+                        method: .post,
+                        headers: credentialHeaders,
+                        body: body(bad)
+                    ) { response in
+                        XCTAssertEqual(response.status, .badRequest, bad)
+                        XCTAssertEqual(try notificationErrorCode(response.body), "InvalidRequest")
+                    }
+                }
+                // No credential (JSON content type, no Authorization):
+                // denied, nothing withdrawn.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.unregisterNotify",
+                    method: .post,
+                    headers: [.contentType: "application/json"],
+                    body: body("\"service\":\"\(subscriber)#b\"")
+                ) { response in
+                    XCTAssertEqual(response.status, .unauthorized)
+                }
+                // Wrong method stays on the opaque closed shape.
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.space.unregisterNotify",
+                    method: .get,
+                    headers: credentialHeaders
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(try notificationErrorCode(response.body), "permissioned_endpoint_unavailable")
+                }
+            }
+            let final = await fixture.directory.registrations()
+            XCTAssertEqual(final.count, 1)
+            try await fixture.close()
+        } catch {
+            try? await fixture.close()
+            throw error
+        }
+    }
+
     /// Erratum 03 addendum (defect class instance #8): the reference presents
     /// a space credential under the `DPoP` scheme, and Swan's Bearer-only
     /// reader answered a conformant presentation with 401 — the reference's
@@ -772,7 +892,7 @@ private struct NotificationHTTPFixture {
             try .init(authority: authority, generation: 1, publicKey: key.publicKey),
         ])
         return SwanHTTPServer(
-            profile: try ProtocolProfile.load(from: notificationPackageRoot().appending(path: "Profiles/permissioned-data-0016-2026-07-03.json")),
+            profile: try ProtocolProfile.load(from: notificationPackageRoot().appending(path: "Profiles/permissioned-data-0016-2026-08-15.json")),
             configuration: .init(host: "127.0.0.1", port: 3_000, publicURL: URL(string: "https://swan.example")!),
             oauthRuntime: runtime,
             authenticatedGetSpaceDirectory: directory,
@@ -1102,6 +1222,17 @@ private actor NotificationHTTPDirectory: AuthorizedSimpleSpaceDirectory, Authori
     ) async throws {
         registrationsValue.removeAll { $0.endpoint == registration.endpoint }
         registrationsValue.append(registration)
+    }
+
+    func unregisterSpaceNotification(
+        space: SpaceURI,
+        service: String,
+        authorization _: AuthorizationContext
+    ) async throws {
+        guard space.authority == authority else {
+            throw AuthorizedSimpleSpaceLifecycleError.notFound
+        }
+        registrationsValue.removeAll { $0.space == space && $0.service == service }
     }
 
     func receiveSpaceWriteNotification(_ notification: AuthorizedSpaceWriteNotification) async throws {

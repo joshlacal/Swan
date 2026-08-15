@@ -286,7 +286,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         }()
         try await withPipethrough(sender: sender) { client in
             try await client.execute(
-                uri: "/xrpc/com.atproto.space.getSpace",
+                uri: "/xrpc/com.atproto.simplespace.getSpace",
                 method: .get
             ) { response in
                 XCTAssertEqual(response.status, .notFound)
@@ -1177,7 +1177,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         try await withPipethrough(sender: sender, authorizer: authorizer) { client in
             for uri in [
                 "/xrpc/blue.catbird.anything.here",
-                "/xrpc/com.atproto.space.getSpace",
+                "/xrpc/com.atproto.simplespace.getSpace",
                 // Denied by exact NSID rather than by prefix.
                 "/xrpc/app.bsky.actor.getPreferences",
             ] {
@@ -1291,7 +1291,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
             let attempts = PipethroughCallRecorder()
             let profile = try ProtocolProfile.load(
                 from: packageRoot().appending(
-                    path: "Profiles/permissioned-data-0016-2026-07-30.json"
+                    path: "Profiles/permissioned-data-0016-2026-08-15.json"
                 )
             )
             let server = SwanHTTPServer(
@@ -1377,7 +1377,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
             let sender = RecordingProxySender()
             let profile = try ProtocolProfile.load(
                 from: packageRoot().appending(
-                    path: "Profiles/permissioned-data-0016-2026-07-30.json"
+                    path: "Profiles/permissioned-data-0016-2026-08-15.json"
                 )
             )
             let server = SwanHTTPServer(
@@ -1425,7 +1425,7 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
                 // status and body matters: a bare "not 200" would also pass if
                 // the proxy fallback had answered 404.
                 try await client.execute(
-                    uri: "/xrpc/com.atproto.space.getSpace",
+                    uri: "/xrpc/com.atproto.simplespace.getSpace",
                     method: .get
                 ) { response in
                     XCTAssertEqual(response.status, .serviceUnavailable)

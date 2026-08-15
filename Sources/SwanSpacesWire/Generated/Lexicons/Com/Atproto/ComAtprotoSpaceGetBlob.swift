@@ -11,12 +11,12 @@ public struct ComAtprotoSpaceGetBlob {
 
     public static let typeIdentifier = "com.atproto.space.getBlob"    
 public struct Parameters: Parametrizable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let repo: DID
         public let cid: CID
         
         public init(
-            space: ATProtocolURI, 
+            space: SpaceRef, 
             repo: DID, 
             cid: CID
             ) {
@@ -94,6 +94,7 @@ public struct Output: ATProtocolCodable {
 public enum Error: String, Swift.Error, ATProtoErrorType, CustomStringConvertible {
                 case blobNotFound = "BlobNotFound"
                 case spaceNotFound = "SpaceNotFound"
+                case repoNotFound = "RepoNotFound"
                 case repoTakendown = "RepoTakendown"
                 case repoSuspended = "RepoSuspended"
                 case repoDeactivated = "RepoDeactivated"
@@ -117,7 +118,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
     public static let endpointDescriptor = XRPCMethodDescriptor(
         nsid: "com.atproto.space.getBlob", kind: "query",
         inputEncoding: nil, outputEncoding: "*/*",
-        declaredErrors: ["BlobNotFound", "SpaceNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]
+        declaredErrors: ["BlobNotFound", "SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]
     )
 
     public protocol ServerHandler: Sendable {
@@ -137,7 +138,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
 extension ATProtoClient.Com.Atproto.Space {
     // MARK: - getBlob
 
-    /// Get a blob referenced from a record in a permissioned space. Returns the full blob as originally uploaded. Callable with either OAuth (for the authenticated user's own data) or a space credential (for syncing services).
+    /// Get a blob referenced from a record in a permissioned space. Returns the full blob as originally uploaded. Blobs are not uploaded through this namespace: a space record references a blob uploaded via com.atproto.repo.uploadBlob, so a client writing blob-bearing records into a space needs a blob permission alongside its space permission. Use listBlobs to enumerate a repo's blobs in a space. Callable with either OAuth (for the authenticated user's own data) or a space credential (for syncing services).
     /// 
     /// - Parameter input: The input parameters for the request
     /// 

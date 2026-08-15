@@ -14,11 +14,11 @@ public struct ComAtprotoSpaceListRepos {
 public struct Repo: ATProtocolCodable, ATProtocolValue {
             public static let typeIdentifier = "com.atproto.space.listRepos#repo"
             public let did: DID
-            public let rev: String?
-            public let hash: Bytes?
+            public let rev: TID
+            public let hash: Bytes
 
         public init(
-            did: DID, rev: String?, hash: Bytes?
+            did: DID, rev: TID, hash: Bytes
         ) {
             self.did = did
             self.rev = rev
@@ -34,20 +34,16 @@ public struct Repo: ATProtocolCodable, ATProtocolValue {
                 throw error
             }
             do {
-                self.rev = try container.decodeIfPresent(String.self, forKey: .rev)
+                self.rev = try container.decode(TID.self, forKey: .rev)
             } catch {
-                // Forward compatibility: a malformed or unknown-shaped optional field
-                // must not fail the whole response.
-                LogManager.logWarning("Decoding error for optional property 'rev' — degrading to nil: \(error)")
-                self.rev = nil
+                LogManager.logError("Decoding error for required property 'rev': \(error)")
+                throw error
             }
             do {
-                self.hash = try container.decodeIfPresent(Bytes.self, forKey: .hash)
+                self.hash = try container.decode(Bytes.self, forKey: .hash)
             } catch {
-                // Forward compatibility: a malformed or unknown-shaped optional field
-                // must not fail the whole response.
-                LogManager.logWarning("Decoding error for optional property 'hash' — degrading to nil: \(error)")
-                self.hash = nil
+                LogManager.logError("Decoding error for required property 'hash': \(error)")
+                throw error
             }
         }
 
@@ -55,22 +51,14 @@ public struct Repo: ATProtocolCodable, ATProtocolValue {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(Self.typeIdentifier, forKey: .typeIdentifier)
             try container.encode(did, forKey: .did)
-            try container.encodeIfPresent(rev, forKey: .rev)
-            try container.encodeIfPresent(hash, forKey: .hash)
+            try container.encode(rev, forKey: .rev)
+            try container.encode(hash, forKey: .hash)
         }
 
         public func hash(into hasher: inout Hasher) {
             hasher.combine(did)
-            if let value = rev {
-                hasher.combine(value)
-            } else {
-                hasher.combine(nil as Int?)
-            }
-            if let value = hash {
-                hasher.combine(value)
-            } else {
-                hasher.combine(nil as Int?)
-            }
+            hasher.combine(rev)
+            hasher.combine(hash)
         }
 
         public func isEqual(to other: any ATProtocolValue) -> Bool {
@@ -96,14 +84,10 @@ public struct Repo: ATProtocolCodable, ATProtocolValue {
             map = map.adding(key: "$type", value: Self.typeIdentifier)
             let didValue = try did.toCBORValue()
             map = map.adding(key: "did", value: didValue)
-            if let value = rev {
-                let revValue = try value.toCBORValue()
-                map = map.adding(key: "rev", value: revValue)
-            }
-            if let value = hash {
-                let hashValue = try value.toCBORValue()
-                map = map.adding(key: "hash", value: hashValue)
-            }
+            let revValue = try rev.toCBORValue()
+            map = map.adding(key: "rev", value: revValue)
+            let hashValue = try hash.toCBORValue()
+            map = map.adding(key: "hash", value: hashValue)
             return map
         }
 
@@ -115,12 +99,12 @@ public struct Repo: ATProtocolCodable, ATProtocolValue {
         }
     }    
 public struct Parameters: Parametrizable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let limit: Int?
         public let cursor: String?
         
         public init(
-            space: ATProtocolURI, 
+            space: SpaceRef, 
             limit: Int? = nil, 
             cursor: String? = nil
             ) {

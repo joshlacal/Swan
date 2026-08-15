@@ -11,11 +11,11 @@ public struct ComAtprotoSpaceGetLatestCommit {
 
     public static let typeIdentifier = "com.atproto.space.getLatestCommit"    
 public struct Parameters: Parametrizable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let repo: DID
         
         public init(
-            space: ATProtocolURI, 
+            space: SpaceRef, 
             repo: DID
             ) {
             self.space = space
@@ -27,7 +27,7 @@ public struct Parameters: Parametrizable {
 public struct Output: ATProtocolCodable {
         
         
-        public let commit: ComAtprotoSpaceDefs.SignedCommit?
+        public let commit: ComAtprotoSpaceDefs.SignedCommit
         
         
         
@@ -35,7 +35,7 @@ public struct Output: ATProtocolCodable {
         public init(
             
             
-            commit: ComAtprotoSpaceDefs.SignedCommit? = nil
+            commit: ComAtprotoSpaceDefs.SignedCommit
             
             
         ) {
@@ -51,13 +51,7 @@ public struct Output: ATProtocolCodable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             
             
-            do {
-                self.commit = try container.decodeIfPresent(ComAtprotoSpaceDefs.SignedCommit.self, forKey: .commit)
-            } catch {
-                // Forward compatibility: a malformed optional field must not fail the whole response.
-                LogManager.logWarning("Decoding error for optional property 'commit' — degrading to nil: \(error)")
-                self.commit = nil
-            }
+            self.commit = try container.decode(ComAtprotoSpaceDefs.SignedCommit.self, forKey: .commit)
             
             
             
@@ -67,8 +61,7 @@ public struct Output: ATProtocolCodable {
             
             var container = encoder.container(keyedBy: CodingKeys.self)
             
-            // Encode optional property even if it's an empty array
-            try container.encodeIfPresent(commit, forKey: .commit)
+            try container.encode(commit, forKey: .commit)
             
             
         }
@@ -79,11 +72,8 @@ public struct Output: ATProtocolCodable {
 
             
             
-            if let value = commit {
-                // Encode optional property even if it's an empty array for CBOR
-                let commitValue = try value.toCBORValue()
-                map = map.adding(key: "commit", value: commitValue)
-            }
+            let commitValue = try commit.toCBORValue()
+            map = map.adding(key: "commit", value: commitValue)
             
             
 
@@ -100,6 +90,7 @@ public struct Output: ATProtocolCodable {
         
 public enum Error: String, Swift.Error, ATProtoErrorType, CustomStringConvertible {
                 case spaceNotFound = "SpaceNotFound"
+                case repoNotFound = "RepoNotFound"
                 case repoTakendown = "RepoTakendown"
                 case repoSuspended = "RepoSuspended"
                 case repoDeactivated = "RepoDeactivated"
@@ -123,7 +114,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
     public static let endpointDescriptor = XRPCMethodDescriptor(
         nsid: "com.atproto.space.getLatestCommit", kind: "query",
         inputEncoding: nil, outputEncoding: "application/json",
-        declaredErrors: ["SpaceNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]
+        declaredErrors: ["SpaceNotFound", "RepoNotFound", "RepoTakendown", "RepoSuspended", "RepoDeactivated"]
     )
 
     public protocol ServerHandler: Sendable {
@@ -143,7 +134,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
 extension ATProtoClient.Com.Atproto.Space {
     // MARK: - getLatestCommit
 
-    /// Get the current signed commit for an account's permissioned repo within a space. Served by a repo host. Callable with either OAuth (for the authenticated user's own data) or a space credential (for syncing services).
+    /// Get the current signed commit for an account's permissioned repo within a space. Served by a repo host. Throws RepoNotFound when the account holds no repo in the space, including the case of a member that has never written to it. Callable with either OAuth (for the authenticated user's own data) or a space credential (for syncing services).
     /// 
     /// - Parameter input: The input parameters for the request
     /// 

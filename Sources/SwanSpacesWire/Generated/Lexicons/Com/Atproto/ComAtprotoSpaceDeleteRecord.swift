@@ -11,13 +11,13 @@ public struct ComAtprotoSpaceDeleteRecord {
 
     public static let typeIdentifier = "com.atproto.space.deleteRecord"
 public struct Input: ATProtocolCodable {
-        public let space: ATProtocolURI
+        public let space: SpaceRef
         public let repo: DID
         public let collection: NSID
         public let rkey: RecordKey
 
         /// Standard public initializer
-        public init(space: ATProtocolURI, repo: DID, collection: NSID, rkey: RecordKey) {
+        public init(space: SpaceRef, repo: DID, collection: NSID, rkey: RecordKey) {
             self.space = space
             self.repo = repo
             self.collection = collection
@@ -27,7 +27,7 @@ public struct Input: ATProtocolCodable {
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.space = try container.decode(ATProtocolURI.self, forKey: .space)
+            self.space = try container.decode(SpaceRef.self, forKey: .space)
             self.repo = try container.decode(DID.self, forKey: .repo)
             self.collection = try container.decode(NSID.self, forKey: .collection)
             self.rkey = try container.decode(RecordKey.self, forKey: .rkey)
@@ -138,7 +138,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
 extension ATProtoClient.Com.Atproto.Space {
     // MARK: - deleteRecord
 
-    /// Delete a record in a permissioned space, or ensure it doesn't exist. Requires auth, implemented by PDS.
+    /// Delete a record from a permissioned space, or ensure it doesn't exist. Succeeds whether or not the record was present. Requires auth, implemented by PDS.
     /// 
     /// - Parameter input: The input parameters for the request
     

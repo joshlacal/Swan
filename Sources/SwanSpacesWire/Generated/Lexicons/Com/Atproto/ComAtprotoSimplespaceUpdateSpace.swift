@@ -11,50 +11,34 @@ public struct ComAtprotoSimplespaceUpdateSpace {
 
     public static let typeIdentifier = "com.atproto.simplespace.updateSpace"
 public struct Input: ATProtocolCodable {
-        public let space: ATProtocolURI
-        public let policy: String?
-        public let managingApp: String?
+        public let space: SpaceRef
+        public let policy: InputPolicyUnion?
         public let appAccess: InputAppAccessUnion?
 
         /// Standard public initializer
-        public init(space: ATProtocolURI, policy: String? = nil, managingApp: String? = nil, appAccess: InputAppAccessUnion? = nil) {
+        public init(space: SpaceRef, policy: InputPolicyUnion? = nil, appAccess: InputAppAccessUnion? = nil) {
             self.space = space
             self.policy = policy
-            self.managingApp = managingApp
             self.appAccess = appAccess
         }
         
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            self.space = try container.decode(ATProtocolURI.self, forKey: .space)
+            self.space = try container.decode(SpaceRef.self, forKey: .space)
             if container.contains(.policy) {
                 guard try !container.decodeNil(forKey: .policy) else {
                     throw DecodingError.valueNotFound(
-                        String.self,
+                        InputPolicyUnion.self,
                         DecodingError.Context(
                             codingPath: container.codingPath,
                             debugDescription: "Property 'policy' must not be null"
                         )
                     )
                 }
-                self.policy = try container.decode(String.self, forKey: .policy)
+                self.policy = try container.decode(InputPolicyUnion.self, forKey: .policy)
             } else {
                 self.policy = nil
-            }
-            if container.contains(.managingApp) {
-                guard try !container.decodeNil(forKey: .managingApp) else {
-                    throw DecodingError.valueNotFound(
-                        String.self,
-                        DecodingError.Context(
-                            codingPath: container.codingPath,
-                            debugDescription: "Property 'managingApp' must not be null"
-                        )
-                    )
-                }
-                self.managingApp = try container.decode(String.self, forKey: .managingApp)
-            } else {
-                self.managingApp = nil
             }
             if container.contains(.appAccess) {
                 guard try !container.decodeNil(forKey: .appAccess) else {
@@ -76,7 +60,6 @@ public struct Input: ATProtocolCodable {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(space, forKey: .space)
             try container.encodeIfPresent(policy, forKey: .policy)
-            try container.encodeIfPresent(managingApp, forKey: .managingApp)
             try container.encodeIfPresent(appAccess, forKey: .appAccess)
         }
 
@@ -88,10 +71,6 @@ public struct Input: ATProtocolCodable {
                 let policyValue = try value.toCBORValue()
                 map = map.adding(key: "policy", value: policyValue)
             }
-            if let value = managingApp {
-                let managingAppValue = try value.toCBORValue()
-                map = map.adding(key: "managingApp", value: managingAppValue)
-            }
             if let value = appAccess {
                 let appAccessValue = try value.toCBORValue()
                 map = map.adding(key: "appAccess", value: appAccessValue)
@@ -102,13 +81,16 @@ public struct Input: ATProtocolCodable {
         private enum CodingKeys: String, CodingKey {
             case space
             case policy
-            case managingApp
             case appAccess
         }
     }        
 public enum Error: String, Swift.Error, ATProtoErrorType, CustomStringConvertible {
                 case spaceNotFound = "SpaceNotFound"
                 case notSpaceOwner = "NotSpaceOwner"
+                /// The requested policy is not one the host implements.
+                case unsupportedPolicy = "UnsupportedPolicy"
+                /// The requested appAccess variant is not one the host implements. A host will not store an app access policy it cannot enforce.
+                case unsupportedAppAccess = "UnsupportedAppAccess"
             public var description: String {
                 return self.rawValue
             }
@@ -129,7 +111,7 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
     public static let endpointDescriptor = XRPCMethodDescriptor(
         nsid: "com.atproto.simplespace.updateSpace", kind: "procedure",
         inputEncoding: "application/json", outputEncoding: nil,
-        declaredErrors: ["SpaceNotFound", "NotSpaceOwner"]
+        declaredErrors: ["SpaceNotFound", "NotSpaceOwner", "UnsupportedPolicy", "UnsupportedAppAccess"]
     )
 
     public protocol ServerHandler: Sendable {
@@ -140,6 +122,169 @@ public struct XRPCMethodDescriptor: Sendable, Equatable {
     }
 
 
+
+
+
+
+public enum InputPolicyUnion: Codable, ATProtocolCodable, ATProtocolValue, Sendable, Equatable {
+    case comAtprotoSimplespaceDefsPublicPolicy(ComAtprotoSimplespaceDefs.PublicPolicy)
+    case comAtprotoSimplespaceDefsMemberListPolicy(ComAtprotoSimplespaceDefs.MemberListPolicy)
+    case comAtprotoSimplespaceDefsManagingAppPolicy(ComAtprotoSimplespaceDefs.ManagingAppPolicy)
+    case unexpected(ATProtocolValueContainer)
+    public init(_ value: ComAtprotoSimplespaceDefs.PublicPolicy) {
+        self = .comAtprotoSimplespaceDefsPublicPolicy(value)
+    }
+    public init(_ value: ComAtprotoSimplespaceDefs.MemberListPolicy) {
+        self = .comAtprotoSimplespaceDefsMemberListPolicy(value)
+    }
+    public init(_ value: ComAtprotoSimplespaceDefs.ManagingAppPolicy) {
+        self = .comAtprotoSimplespaceDefsManagingAppPolicy(value)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let typeValue = try container.decode(String.self, forKey: .type)
+
+        switch typeValue {
+        case "com.atproto.simplespace.defs#publicPolicy":
+            let value = try ComAtprotoSimplespaceDefs.PublicPolicy(from: decoder)
+            self = .comAtprotoSimplespaceDefsPublicPolicy(value)
+        case "com.atproto.simplespace.defs#memberListPolicy":
+            let value = try ComAtprotoSimplespaceDefs.MemberListPolicy(from: decoder)
+            self = .comAtprotoSimplespaceDefsMemberListPolicy(value)
+        case "com.atproto.simplespace.defs#managingAppPolicy":
+            let value = try ComAtprotoSimplespaceDefs.ManagingAppPolicy(from: decoder)
+            self = .comAtprotoSimplespaceDefsManagingAppPolicy(value)
+        default:
+            let unknownValue = try ATProtocolValueContainer(from: decoder)
+            self = .unexpected(unknownValue)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+
+        switch self {
+        case .comAtprotoSimplespaceDefsPublicPolicy(let value):
+            try container.encode("com.atproto.simplespace.defs#publicPolicy", forKey: .type)
+            try value.encode(to: encoder)
+        case .comAtprotoSimplespaceDefsMemberListPolicy(let value):
+            try container.encode("com.atproto.simplespace.defs#memberListPolicy", forKey: .type)
+            try value.encode(to: encoder)
+        case .comAtprotoSimplespaceDefsManagingAppPolicy(let value):
+            try container.encode("com.atproto.simplespace.defs#managingAppPolicy", forKey: .type)
+            try value.encode(to: encoder)
+        case .unexpected(let container):
+            try container.encode(to: encoder)
+        }
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        switch self {
+        case .comAtprotoSimplespaceDefsPublicPolicy(let value):
+            hasher.combine("com.atproto.simplespace.defs#publicPolicy")
+            hasher.combine(value)
+        case .comAtprotoSimplespaceDefsMemberListPolicy(let value):
+            hasher.combine("com.atproto.simplespace.defs#memberListPolicy")
+            hasher.combine(value)
+        case .comAtprotoSimplespaceDefsManagingAppPolicy(let value):
+            hasher.combine("com.atproto.simplespace.defs#managingAppPolicy")
+            hasher.combine(value)
+        case .unexpected(let container):
+            hasher.combine("unexpected")
+            hasher.combine(container)
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type = "$type"
+    }
+    
+    public static func == (lhs: InputPolicyUnion, rhs: InputPolicyUnion) -> Bool {
+        switch (lhs, rhs) {
+        case (.comAtprotoSimplespaceDefsPublicPolicy(let lhsValue),
+              .comAtprotoSimplespaceDefsPublicPolicy(let rhsValue)):
+            return lhsValue == rhsValue
+        case (.comAtprotoSimplespaceDefsMemberListPolicy(let lhsValue),
+              .comAtprotoSimplespaceDefsMemberListPolicy(let rhsValue)):
+            return lhsValue == rhsValue
+        case (.comAtprotoSimplespaceDefsManagingAppPolicy(let lhsValue),
+              .comAtprotoSimplespaceDefsManagingAppPolicy(let rhsValue)):
+            return lhsValue == rhsValue
+        case (.unexpected(let lhsValue), .unexpected(let rhsValue)):
+            return lhsValue.isEqual(to: rhsValue)
+        default:
+            return false
+        }
+    }
+    
+    public func isEqual(to other: any ATProtocolValue) -> Bool {
+        guard let other = other as? InputPolicyUnion else { return false }
+        return self == other
+    }
+    
+    // DAGCBOR encoding with field ordering
+    public func toCBORValue() throws -> Any {
+        // Create an ordered map to maintain field order
+        var map = OrderedCBORMap()
+        
+        switch self {
+        case .comAtprotoSimplespaceDefsPublicPolicy(let value):
+            map = map.adding(key: "$type", value: "com.atproto.simplespace.defs#publicPolicy")
+            
+            let valueDict = try value.toCBORValue()
+
+            // If the value is already an OrderedCBORMap, merge its entries
+            if let orderedMap = valueDict as? OrderedCBORMap {
+                for (key, value) in orderedMap.entries where key != "$type" {
+                    map = map.adding(key: key, value: value)
+                }
+            } else if let dict = valueDict as? [String: Any] {
+                // Otherwise add each key-value pair from the dictionary
+                for (key, value) in dict where key != "$type" {
+                    map = map.adding(key: key, value: value)
+                }
+            }
+            return map
+        case .comAtprotoSimplespaceDefsMemberListPolicy(let value):
+            map = map.adding(key: "$type", value: "com.atproto.simplespace.defs#memberListPolicy")
+            
+            let valueDict = try value.toCBORValue()
+
+            // If the value is already an OrderedCBORMap, merge its entries
+            if let orderedMap = valueDict as? OrderedCBORMap {
+                for (key, value) in orderedMap.entries where key != "$type" {
+                    map = map.adding(key: key, value: value)
+                }
+            } else if let dict = valueDict as? [String: Any] {
+                // Otherwise add each key-value pair from the dictionary
+                for (key, value) in dict where key != "$type" {
+                    map = map.adding(key: key, value: value)
+                }
+            }
+            return map
+        case .comAtprotoSimplespaceDefsManagingAppPolicy(let value):
+            map = map.adding(key: "$type", value: "com.atproto.simplespace.defs#managingAppPolicy")
+            
+            let valueDict = try value.toCBORValue()
+
+            // If the value is already an OrderedCBORMap, merge its entries
+            if let orderedMap = valueDict as? OrderedCBORMap {
+                for (key, value) in orderedMap.entries where key != "$type" {
+                    map = map.adding(key: key, value: value)
+                }
+            } else if let dict = valueDict as? [String: Any] {
+                // Otherwise add each key-value pair from the dictionary
+                for (key, value) in dict where key != "$type" {
+                    map = map.adding(key: key, value: value)
+                }
+            }
+            return map
+        case .unexpected(let container):
+            return try container.toCBORValue()
+        }
+    }
+}
 
 
 

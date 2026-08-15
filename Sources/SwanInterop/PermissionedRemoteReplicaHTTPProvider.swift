@@ -137,9 +137,7 @@ public struct PermissionedRemoteReplicaHTTPSourceProvider:
             ComAtprotoSpaceGetLatestCommit.Output.self,
             from: latest.body
         )
-        guard let commit = output.commit else {
-            throw InteropHTTPError.unexpectedStatus(404)
-        }
+        let commit = output.commit
         let freshness = try verifyLatestCommit(
             commit,
             target: target,
@@ -238,7 +236,7 @@ public struct PermissionedRemoteReplicaHTTPSourceProvider:
         let context = try SpaceCommitContext(
             space: target.space,
             author: target.repositoryDID,
-            rev: commit.rev,
+            rev: commit.rev.toString(),
             ikm: commit.ikm.data
         )
         let envelope = SpaceCommitEnvelope(
@@ -261,7 +259,7 @@ public struct PermissionedRemoteReplicaHTTPSourceProvider:
             throw InteropHTTPError.unexpectedStatus(502)
         }
         return try PermissionedRemoteReplicaFreshnessWitness(
-            wireRevision: try TID(tidString: commit.rev),
+            wireRevision: commit.rev,
             commitment: commit.hash.data
         )
     }

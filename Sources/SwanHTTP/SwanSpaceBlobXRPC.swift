@@ -356,7 +356,7 @@ private func parseAuthenticatedGetSpaceBlobParameters(
         required: ["space", "repo", "cid"],
         optional: []
     )
-    let space = try ATProtocolURI(
+    let space = try SpaceRef(
         uriString: try requiredQueryValue("space", in: query, maximumBytes: 2_048)
     )
     let repo = try DID(

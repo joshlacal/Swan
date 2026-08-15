@@ -129,7 +129,7 @@ private func parseSimpleSpaceCheckUserAccessParameters(
         throw SimpleSpaceCheckUserAccessFailure.denied
     }
     do {
-        let space = try ATProtocolURI(uriString: rawSpace)
+        let space = try SpaceRef(uriString: rawSpace)
         let user = try DID(didString: rawUser)
         _ = try SpaceURI(space.uriString())
         return .init(space: space, user: user, clientId: values["clientId"])
