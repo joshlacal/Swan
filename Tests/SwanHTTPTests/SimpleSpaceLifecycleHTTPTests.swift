@@ -274,6 +274,45 @@ final class SimpleSpaceLifecycleHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testLifecycleCreateDefaultsOmittedDidToTheCaller() async throws {
+        let fixture = try await makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        do {
+            let app = try makeServer(fixture).buildApplication(logger: Logger(label: "SimpleSpaceLifecycleHTTPTests.didDefault"))
+            try await app.test(.router) { client in
+                // The reference implementation's canonical create body omits
+                // `did` — it defaults to the authenticated caller, and no
+                // other value is admissible anyway.
+                let create = #"{"type":"\#(Self.type)","skey":"did-defaulted"}"#
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "create-no-did"), body: ByteBuffer(string: create)) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let uri = try XCTUnwrap((try self.jsonObject(response.body))["uri"] as? String)
+                    let space = try SpaceURI(uri)
+                    XCTAssertEqual(space.authority, Self.alice)
+                    XCTAssertEqual(space.spaceType, Self.type)
+                    XCTAssertEqual(space.skey, "did-defaulted")
+                }
+                // An explicit foreign `did` stays indistinguishable from an
+                // absent space — the authority gate is unchanged.
+                let foreign = #"{"did":"\#(Self.bob)","type":"\#(Self.type)","skey":"foreign-did"}"#
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "create-foreign-did"), body: ByteBuffer(string: foreign)) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(try self.errorCode(response.body), "SpaceNotFound")
+                }
+                // `type` remains the one required field.
+                let missingType = #"{"skey":"typeless"}"#
+                try await client.execute(uri: Self.createPath, method: .post, headers: try self.postHeaders(fixture, path: Self.createPath, jti: "create-missing-type"), body: ByteBuffer(string: missingType)) { response in
+                    XCTAssertEqual(response.status, .badRequest)
+                    XCTAssertEqual(try self.errorCode(response.body), "InvalidRequest")
+                }
+            }
+            try await close(fixture)
+        } catch {
+            try? await close(fixture)
+            throw error
+        }
+    }
+
     func testLifecycleScopesAuthorityPrivacyAndRequestValidation() async throws {
         let fixture = try await makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.root) }

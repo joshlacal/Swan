@@ -43,15 +43,39 @@ private enum AuthenticatedSimpleSpaceLifecycleFailure: Error {
     case unavailable
 }
 
-private struct AuthenticatedSimpleSpaceCreateHandler: ComAtprotoSimplespaceCreateSpace.ServerHandler {
-    typealias Context = Request
+/// The wire input for `createSpace`. The pinned lexicon marks `did` required,
+/// but the reference implementation treats it as optional defaulting to the
+/// authenticated caller — its conformance suite's canonical create body is
+/// `{"type", "skey"}` — and rejects any explicit `did` that is not the caller.
+/// Since the only admissible value is derivable from the token, requiring it
+/// on the wire refuses conformant clients without protecting anything:
+/// `requireLifecycleAuthority` still rejects a foreign authority either way.
+private struct SimpleSpaceCreateWireInput: Decodable {
+    let did: DID?
+    let type: NSID
+    let skey: String?
+    let config: ComAtprotoSimplespaceDefs.SpaceConfig?
+}
+
+private struct AuthenticatedSimpleSpaceCreateHandler {
     let capability: SwanAuthenticatedSimpleSpaceLifecycleCapability
 
     func handle(
-        parameters: Void,
-        input: ComAtprotoSimplespaceCreateSpace.Input,
+        parameters _: Void,
+        input: SimpleSpaceCreateWireInput,
         context request: Request
     ) async throws -> ComAtprotoSimplespaceCreateSpace.Output {
+        // Authorization runs before the space URI is built: the authority
+        // defaults to the caller, so identity must be known first. The
+        // token is still validated exactly once.
+        let authorization = try await lifecycleAuthorization(
+            capability.authorizer,
+            request: request,
+            fixedPath: "/xrpc/com.atproto.simplespace.createSpace"
+        )
+        guard case let .accountOAuth(subject, _) = authorization else {
+            throw AuthenticatedSimpleSpaceLifecycleFailure.spaceNotFound
+        }
         let space: SpaceURI
         do {
             let skey: String
@@ -61,18 +85,13 @@ private struct AuthenticatedSimpleSpaceCreateHandler: ComAtprotoSimplespaceCreat
                 skey = try await capability.tidAllocator.next().toString()
             }
             space = try SpaceURI(
-                authority: input.did.didString(),
+                authority: input.did?.didString() ?? subject,
                 spaceType: input.type.nsidString(),
                 skey: skey
             )
         } catch {
             throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
         }
-        let authorization = try await lifecycleAuthorization(
-            capability.authorizer,
-            request: request,
-            fixedPath: "/xrpc/com.atproto.simplespace.createSpace"
-        )
         try requireLifecycleAuthority(authorization, space: space)
         let configuration: SimpleSpaceConfiguration
         do {
@@ -274,9 +293,9 @@ private func registerSimpleSpaceCreate(
         await withSimpleSpaceInput(
             request,
             context: context,
-            as: ComAtprotoSimplespaceCreateSpace.Input.self,
+            as: SimpleSpaceCreateWireInput.self,
             capability: capability,
-            required: ["did", "type"],
+            required: ["type"],
             allowed: ["did", "type", "skey", "config"]
         ) { input in
             authenticatedGetSpaceJSON(
@@ -561,6 +580,18 @@ private func withSimpleSpaceInput<Value: Decodable>(
                 Set(root.keys).isSubset(of: allowed),
                 required.isSubset(of: Set(root.keys)),
                 !root.values.contains(where: { $0 is NSNull }) else {
+                // Key names only — never field values, which may hold DIDs
+                // or space configuration the caller expects to stay private.
+                if let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    context.logger.info(
+                        "simplespace write rejected",
+                        metadata: [
+                            "stage": .string("key_set"),
+                            "received": .string(root.keys.sorted().joined(separator: ",")),
+                            "required": .string(required.sorted().joined(separator: ",")),
+                            "allowed": .string(allowed.sorted().joined(separator: ",")),
+                        ])
+                }
                 throw AuthenticatedSimpleSpaceLifecycleFailure.invalidRequest
             }
             try validateSimpleSpaceJSON(root)
