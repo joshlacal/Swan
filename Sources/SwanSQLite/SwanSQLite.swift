@@ -85,6 +85,42 @@ public enum SQLiteLayout {
         "CREATE INDEX IF NOT EXISTS account_app_passwords_lookup ON account_app_passwords(digest, did)",
         "CREATE INDEX IF NOT EXISTS account_app_passwords_by_account ON account_app_passwords(did)",
         """
+        CREATE TABLE IF NOT EXISTS legacy_session_families (
+            family_id TEXT PRIMARY KEY,
+            did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
+            -- The credential this session was born from.
+            --
+            -- ON DELETE CASCADE is the whole revocation mechanism: deleting an
+            -- app password deletes its session families, and the token rows
+            -- cascade from those. Upstream achieves the same by remembering to
+            -- call `revokeAppPasswordRefreshToken` beside `deleteAppPassword`
+            -- in one transaction (`account-manager.ts:674-681`). Expressing it
+            -- as a foreign key means a future revocation path cannot forget.
+            app_password_id TEXT NOT NULL
+                REFERENCES account_app_passwords(id) ON DELETE CASCADE,
+            created_at INTEGER NOT NULL CHECK(created_at >= 0),
+            -- Set when reuse of a rotated refresh token is detected. The family
+            -- is kept rather than deleted so the detection is auditable.
+            revoked_at INTEGER
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS legacy_session_tokens (
+            -- Keyed by digest, never by the token. Nothing here can be replayed
+            -- from a database read.
+            digest BLOB PRIMARY KEY,
+            family_id TEXT NOT NULL
+                REFERENCES legacy_session_families(family_id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK(kind IN ('access', 'refresh')),
+            expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
+            -- A refresh token is single-use. Presenting a consumed one is reuse,
+            -- which revokes the family.
+            consumed_at INTEGER
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS legacy_session_tokens_by_family ON legacy_session_tokens(family_id)",
+        "CREATE INDEX IF NOT EXISTS legacy_session_families_by_app_password ON legacy_session_families(app_password_id)",
+        """
         CREATE TABLE IF NOT EXISTS oauth_control_client_metadata (
             client_id TEXT PRIMARY KEY,
             document BLOB NOT NULL,
