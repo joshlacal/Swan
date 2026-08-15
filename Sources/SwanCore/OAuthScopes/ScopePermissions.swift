@@ -76,6 +76,27 @@ import Foundation
 // until the corresponding Swan route actually calls the matching `allowsX`
 // (§6.1, §9-D12):
 //
+// NOT SERVED AT ALL, and a trap for whoever serves it first:
+// `com.atproto.server.getServiceAuth`. Swan has no implementation and answers
+// 404 through the `com.atproto.server.*` guard (verified against a
+// `describeServer` positive control). It is listed here because it is a
+// scope-LAUNDERING primitive — it converts a narrow PDS credential into a token
+// a DIFFERENT service will honour — and because the obvious port reproduces a
+// live upstream hole.
+//
+// tranquil checks `lxm` only when it is supplied, and requires it only for
+// OAuth. A scoped app password that simply OMITS `lxm` therefore falls through
+// with no check at all and receives a token with `lxm: None`, which the
+// audience honours for any method; its own "post-only" preset, which grants
+// zero `rpc:` scopes, can obtain one. The 60-second lifetime bounds the damage
+// without closing the hole.
+//
+// If Swan serves this: require `lxm` from EVERY non-full-access credential, and
+// validate both `aud` and `lxm` against the granted `rpc:` scopes. Note
+// `RpcPermission.matches` compares `aud` as an exact string
+// (`rpc-permission.ts:43-49`) — there is no fragment stripping — so the caller
+// must present the same `did#fragment` form the pipethrough builds.
+//
 //   assertIdentity -> identity/{updateHandle.ts:13, signPlcOperation.ts:16,
 //                     submitPlcOperation.ts:12,
 //                     requestPlcOperationSignature.ts:14}. Swan serves none of
