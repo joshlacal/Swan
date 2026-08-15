@@ -6961,3 +6961,43 @@ saw and approved exactly what the token holds.
 
 Anything else a reader is tempted to reopen should be checked against §9.1
 D1-D23 first. If a question is not in this list, it has been ruled.
+
+---
+
+## Erratum 01 (2026-08-15) — §6.1 listing fence amended
+
+**Ruled by Josh ("Amend"), implemented in `allowsSpaceListing`
+(`ScopePermissions.swift`) the same day.**
+
+The original fence required a grant with stated keys exactly
+`{authority, skey, action}`, literal `skey=*`, action exactly `[read]`, and no
+stated `collection`/`manage`. Field evidence (bulleted.app against swan.place,
+2026-08-14): no real client can produce that shape. The `spaceAccess`
+permission-set expansion states `collection` and carries four actions; the
+direct scope upstream clients mint uses `read_self`, which upstream accepts
+for every `space.get*/list*` route (`space/util.ts:109-127`,
+`assertSpaceRead`). The fence as sealed made `listSpaces` unreachable for
+every conformant client.
+
+**Amended contract:** a grant lists when (1) its `action` list was **stated**
+(durable provenance, §9-D23 — this is the surviving §9-D21 witness: `action`
+defaults to a list containing `read`, so a bare `space:<type>` still never
+lists), (2) the stated actions include `read` or `read_self` (the route
+self-scopes — `hostedSpaces` takes the token's own subject — so `read_self`
+is sufficient for an inventory that is always OF SELF), and (3) type and
+authority cover the request under the unchanged `aggregateDimension` rule
+(a wildcard request still requires a wildcard grant; the route still refuses
+to fetch broadly and censor rows).
+
+Dropped: the stated-`skey` + literal-`skey=*` requirement (no upstream client
+states `skey`; §9-D23 canonicalisation had already shown the literal test was
+fragile), the exact-`[read]` action list, and the `collection`/`manage`
+disqualifiers (a `manage`-only grant still fails the stated-`action`
+witness). `spaceListingScopeNeeded` (logs only) now renders
+`space:<type>?authority=<a>&action=read`.
+
+Pinned by `ScopePermissionsFenceTests`: the amended acceptances (stated
+`read` without stated `skey`; stated `read_self`; the verbatim bulleted.app
+`spaceAccess` expansion shape) and the surviving refusals (bare grant;
+unstated-action `manage` grant; wildcard request against concrete grant;
+cross-authority; cross-type).

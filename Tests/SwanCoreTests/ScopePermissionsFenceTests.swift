@@ -282,14 +282,17 @@ final class ScopePermissionsFenceTests: XCTestCase {
         XCTAssertTrue(permissions.allowsSpaceListing(type: "x.y.z", authority: user))
     }
 
-    /// The inverse: the same canonical string whose durable record says `skey`
-    /// was NOT stated must refuse, even though the parsed value is `*` either way.
-    func testListingFenceRefusesADefaultedWildcardSkey() {
+    /// §6.1 AMENDED: a stated `action=read` grant lists even when `skey` was
+    /// never stated — the original literal-`skey=*` requirement made the fence
+    /// unreachable by real clients (no upstream client states `skey` at all).
+    func testListingFenceAcceptsAStatedReadGrantWithoutStatedSkey() {
         let canonical = "space:x.y.z?authority=\(user)&action=read"
         let permissions = permissions(canonical, stated: ["authority", "action"])
-        XCTAssertFalse(permissions.allowsSpaceListing(type: "x.y.z", authority: user))
+        XCTAssertTrue(permissions.allowsSpaceListing(type: "x.y.z", authority: user))
     }
 
+    /// The surviving §9-D21 witness: `action` defaults to a list containing
+    /// `read`, so a bare grant that never STATED an action must not list.
     func testListingFenceRefusesADefaultedActionList() {
         let bare = "space:x.y.z"
         XCTAssertFalse(
@@ -297,9 +300,13 @@ final class ScopePermissionsFenceTests: XCTestCase {
         )
     }
 
-    func testListingFenceRefusesAStatedCollectionOrManage() {
+    /// §6.1 AMENDED: a stated `collection` no longer disqualifies —
+    /// bulleted.app's `spaceAccess` permission set expands to exactly this
+    /// shape (stated authority/collection/action, four actions). A `manage`
+    /// grant whose action list was never stated still fails the witness.
+    func testListingFenceAcceptsStatedCollectionAndRefusesUnstatedActionManage() {
         let withCollection = "space:x.y.z?authority=\(user)&skey=*&action=read&collection=*"
-        XCTAssertFalse(
+        XCTAssertTrue(
             permissions(withCollection, stated: ["authority", "skey", "action", "collection"])
                 .allowsSpaceListing(type: "x.y.z", authority: user)
         )
@@ -308,6 +315,33 @@ final class ScopePermissionsFenceTests: XCTestCase {
             permissions(withManage, stated: ["authority", "skey", "manage"])
                 .allowsSpaceListing(type: "x.y.z", authority: user)
         )
+    }
+
+    /// §6.1 AMENDED: `read_self` suffices — upstream accepts it for every
+    /// `space.get*/list*` route (`space/util.ts:109-127`), and the list route
+    /// self-scopes to the token's own subject.
+    func testListingFenceAcceptsAStatedReadSelfGrant() {
+        let scope = "space:x.y.z?authority=\(user)&action=read_self"
+        let permissions = permissions(scope, stated: ["authority", "action"])
+        XCTAssertTrue(permissions.allowsSpaceListing(type: "x.y.z", authority: user))
+    }
+
+    /// The bulleted.app `spaceAccess` expansion, verbatim: wildcard authority,
+    /// six collections, four actions. Lists its declared type for a request
+    /// that names no authority (an unfiltered-authority request needs the
+    /// wildcard grant this set carries).
+    func testListingFenceAcceptsTheBulletedSpaceAccessExpansionShape() {
+        let scope = "space:app.bulleted.space?authority=*"
+            + "&collection=app.bulleted.node&collection=app.bulleted.note"
+            + "&collection=app.bulleted.outline&collection=app.bulleted.mirror"
+            + "&collection=app.bulleted.comment&collection=app.bulleted.commentPolicy"
+            + "&action=read&action=create&action=update&action=delete"
+        let permissions = permissions(scope, stated: ["authority", "collection", "action"])
+        XCTAssertTrue(permissions.allowsSpaceListing(type: "app.bulleted.space", authority: nil))
+        XCTAssertTrue(permissions.allowsSpaceListing(type: "app.bulleted.space", authority: user))
+        // Still no cross-type listing, and no unfiltered-type listing.
+        XCTAssertFalse(permissions.allowsSpaceListing(type: "app.other.space", authority: nil))
+        XCTAssertFalse(permissions.allowsSpaceListing(type: nil, authority: nil))
     }
 
     /// `aggregateDimension` (`SwanCore.swift:324-327`): an omitted request

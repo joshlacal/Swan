@@ -424,19 +424,15 @@ public extension SwanScopePermissions {
     /// (`space-permission.ts:94-98`), where a *concrete* grant dimension fails
     /// against a literal `'*'` target.
     ///
-    /// Two clauses are Swan's own and are HARDENINGS, not inherited:
-    ///
-    ///  * **The literal-`skey=*` / literal-single-`action=read` requirement.**
-    ///    Upstream's defaults are `skey` -> `'*'` and `action` ->
-    ///    `SPACE_DEFAULT_ACTIONS` (`space-permission.ts:186-191`, `:207-211`,
-    ///    `:25-30`), so a *bare* `space:<type>` satisfies upstream's assert with
-    ///    no query string at all. Swan refuses that. This is exactly the
-    ///    "default `self` / `skey=*` / default action sets amplifying" hazard
-    ///    §9-D21 names as the reason retiring `isIssuableQualified` is safe: the
-    ///    danger did not disappear, it moved here. **Deleting this fence and
-    ///    deleting that gate in the same release removes both halves.**
-    ///  * **`action == [.read]` exactly**, where upstream accepts `read_self`
-    ///    too (`space-permission.ts:108-110`).
+    /// One clause is Swan's own HARDENING, not inherited: the stated-`action`
+    /// witness. Upstream's defaults are `skey` -> `'*'` and `action` ->
+    /// `SPACE_DEFAULT_ACTIONS` (`space-permission.ts:186-191`, `:207-211`,
+    /// `:25-30`), so a *bare* `space:<type>` satisfies upstream's assert with
+    /// no query string at all. Swan refuses that. This is exactly the
+    /// "default `self` / `skey=*` / default action sets amplifying" hazard
+    /// §9-D21 names as the reason retiring `isIssuableQualified` is safe: the
+    /// danger did not disappear, it moved here. **Deleting this fence and
+    /// deleting that gate in the same release removes both halves.**
     ///
     /// Must NOT be folded into `allowsSpace`; it exists because the list route
     /// refuses to fetch broadly and then censor rows (`SwanCore.swift:320-323`).
@@ -445,19 +441,33 @@ public extension SwanScopePermissions {
     /// *defaults* to `["*"]` and `action` defaults to a list *containing*
     /// `read`, so without the stated-key witness a bare `space:<t>` grant would
     /// silently start satisfying `listSpaces?type=<t>&authority=<self>`.
+    /// **§6.1 AMENDED (2026-08-15, Josh: "Amend").** The original fence
+    /// additionally required stated `authority`+`skey` with literal `skey=*`,
+    /// action exactly `[.read]`, and no stated `collection`/`manage`. That
+    /// shape was unreachable by real clients: bulleted.app's permission set
+    /// expands to a stated-`collection`, four-action space grant, and its
+    /// direct scope uses `read_self` — which upstream itself accepts for
+    /// every `space.get*/list*` route (`space/util.ts:109-127`,
+    /// `assertSpaceRead`). The route also self-scopes: `hostedSpaces` takes
+    /// the token's own subject, so a listing is an inventory OF SELF, never
+    /// of another account. What remains load-bearing from §9-D21 is the
+    /// STATED-`action` witness: under the new grammar `action` *defaults* to
+    /// a list containing `read`, so without the witness a bare
+    /// `space:<type>` would silently satisfy listing. It still cannot.
     func allowsSpaceListing(type: String?, authority: String?) -> Bool {
         let requestedType = type ?? "*"
         let requestedAuthority = authority ?? "*"
         return grants.contains { grant in
             guard case let .space(permission) = grant.scope else { return false }
             let resolved = permission.resolvingSelf(as: subject)
-            let stated = grant.statedKeys
-            // 1. Exactly the three keys, all STATED — today's key-set equality.
-            guard stated.contains("authority"), stated.contains("skey"), stated.contains("action"),
-                  !stated.contains("collection"), !stated.contains("manage") else { return false }
-            // 2. LITERAL `skey=*` and LITERAL single `action=read`.
-            guard resolved.skey == .any, resolved.action == [.read] else { return false }
-            // 3. aggregateDimension on type and authority (SwanCore.swift:324-327):
+            // 1. The action list is STATED (the §9-D21 witness — a bare or
+            //    defaulted grant never lists) and grants a read: `read` or
+            //    upstream's `read_self`, which suffices for a route that
+            //    only ever lists the subject's own spaces.
+            guard grant.statedKeys.contains("action"),
+                  resolved.action.contains(.read) || resolved.action.contains(.readSelf)
+            else { return false }
+            // 2. aggregateDimension on type and authority (SwanCore.swift:324-327):
             //    a wildcard REQUEST is satisfied only by a wildcard GRANT. An
             //    unresolved `self` authority renders as "self", which no
             //    concrete request and no `*` request can match — fail closed.
@@ -469,7 +479,7 @@ public extension SwanScopePermissions {
     /// The scope string a denied listing would have needed. For LOGS ONLY
     /// (§6.5.8, §9-D6) — it never reaches the wire.
     static func spaceListingScopeNeeded(type: String?, authority: String?) -> String {
-        "space:\(type ?? "*")?authority=\(authority ?? "*")&skey=*&action=read"
+        "space:\(type ?? "*")?authority=\(authority ?? "*")&action=read"
     }
 
     /// Verbatim `SwanCore.swift:324-327`.
