@@ -586,7 +586,10 @@ public struct SwanHTTPServer: Sendable {
            let authorizer = try? SwanOAuthResourceAuthorizer(
                publicURL: configuration.publicURL,
                runtime: oauthRuntime,
-               accountControlStore: accountControlStore
+               accountControlStore: accountControlStore,
+               // `nil` unless the deployment enabled legacy sessions, which
+               // leaves this authorizer DPoP-only exactly as before.
+               legacySessions: legacySessionXRPC?.sessions
            ) {
             // Formed once, ahead of every capability that verifies compact
             // space credentials — including the description endpoint, whose

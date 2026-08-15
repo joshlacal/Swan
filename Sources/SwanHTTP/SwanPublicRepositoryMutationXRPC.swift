@@ -481,8 +481,26 @@ private func authorizedPublicMutationPrincipal(
     // once it has decoded its own input. `uploadBlob` is the exception and
     // asserts from the Content-Type HEADER, which is the porting detail most
     // easily lost — never from the body.
-    guard case let .accountOAuth(subject, permissions) = authorization,
-          permissions.hasBaseATProtocolScope else { throw PublicMutationFailure.unauthorized }
+    // OPT-IN for legacy sessions (§D3), the second of the two surfaces opened
+    // on purpose: without it the client can read but not post.
+    //
+    // Each route still asserts `requireRepo`/`requireBlob` against whatever
+    // permissions the principal carries, so an app-password session writes only
+    // what its row grants while an account-password session writes what full
+    // legacy authority grants.
+    let subject: String
+    let permissions: SwanScopePermissions
+    switch authorization {
+    case let .accountOAuth(oauthSubject, oauthPermissions):
+        subject = oauthSubject
+        permissions = oauthPermissions
+    case let .accountLegacySession(legacySubject, legacyPermissions):
+        subject = legacySubject
+        permissions = legacyPermissions
+    default:
+        throw PublicMutationFailure.unauthorized
+    }
+    guard permissions.hasBaseATProtocolScope else { throw PublicMutationFailure.unauthorized }
     return AuthorizedPrincipal(subject: subject, permissions: permissions)
 }
 

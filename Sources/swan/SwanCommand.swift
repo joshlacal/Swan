@@ -3175,7 +3175,8 @@ extension SwanCommand {
                     authorizer: try SwanOAuthResourceAuthorizer(
                         publicURL: baseURL,
                         runtime: oauthRuntime,
-                        accountControlStore: controlDatabase
+                        accountControlStore: controlDatabase,
+                        legacySessions: legacySessionXRPC?.sessions
                     ),
                     store: controlDatabase
                 )
@@ -3242,7 +3243,8 @@ extension SwanCommand {
                             authorizer: try SwanOAuthResourceAuthorizer(
                                 publicURL: baseURL,
                                 runtime: oauthRuntime,
-                                accountControlStore: controlDatabase
+                                accountControlStore: controlDatabase,
+                                legacySessions: legacySessionXRPC?.sessions
                             ),
                             tokens: LocalAccountProxyServiceTokenIssuer(
                                 accounts: accounts,

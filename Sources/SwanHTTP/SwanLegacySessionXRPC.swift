@@ -81,7 +81,9 @@ public struct SwanLegacySessionXRPCServer: Sendable {
         ComAtprotoServerRevokeAppPassword.typeIdentifier,
     ]
 
-    private let sessions: DurableLegacySessionService
+    /// Also handed to the resource authorizers, so a legacy bearer token is
+    /// recognised on the protected routes and not only on this service's own.
+    public let sessions: DurableLegacySessionService
     private let credentials: AppPasswordCredentials
     private let appPasswords: any AppPasswordStore
     private let accounts: DurableAccountDirectory

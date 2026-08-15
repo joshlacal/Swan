@@ -273,6 +273,51 @@ final class SwanXRPCPipethroughTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(claims["lxm"] as? String, "app.bsky.feed.getTimeline")
     }
 
+    /// The opt-in that makes the official client usable. `.accountLegacySession`
+    /// was introduced failing closed at every predicate; the proxy is one of two
+    /// surfaces deliberately opened, because a session that cannot proxy logs in
+    /// and then shows an empty app.
+    ///
+    /// It is still scope-enforced by the SAME `requireRPC` an OAuth caller
+    /// meets, so opting in widened who may proxy, not what they may reach.
+    func testLegacySessionsMayProxyAndAreStillScopeEnforced() async throws {
+        let sender = RecordingProxySender()
+        let granted = PipethroughAuthorizer(
+            result: .success(.accountLegacySessionForTesting(
+                subject: Self.did,
+                scopes: ["atproto", "transition:generic"]
+            ))
+        )
+        try await withPipethrough(sender: sender, authorizer: granted) { client in
+            try await client.execute(uri: "/xrpc/app.bsky.feed.getTimeline", method: .get) { response in
+                XCTAssertEqual(response.status, .ok)
+            }
+        }
+        XCTAssertEqual(sender.recorded().count, 1)
+
+        // Same credential type, out of scope: the DM fence applies identically.
+        let refused = RecordingProxySender()
+        try await withPipethrough(
+            sender: refused,
+            authorizer: PipethroughAuthorizer(
+                result: .success(.accountLegacySessionForTesting(
+                    subject: Self.did,
+                    scopes: ["atproto", "transition:generic"]
+                ))
+            ),
+            documents: Self.chatServiceDocuments
+        ) { client in
+            try await client.execute(
+                uri: "/xrpc/chat.bsky.convo.listConvos",
+                method: .get,
+                headers: Self.chatProxyHeaders
+            ) { response in
+                XCTAssertEqual(response.status, .unauthorized)
+            }
+        }
+        XCTAssertEqual(refused.recorded().count, 0)
+    }
+
     func testStripsInboundCredentialHeaders() async throws {
         let sender = RecordingProxySender()
         let headers: HTTPFields = {

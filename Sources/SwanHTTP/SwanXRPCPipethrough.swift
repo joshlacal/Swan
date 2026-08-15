@@ -554,8 +554,28 @@ private func authorizedPipethroughSubject(
     // decision's `did#serviceId`, which this function does not have and must
     // not compute — see the caller, which asserts immediately after this
     // returns and strictly before any outbound work.
-    guard case let .accountOAuth(subject, permissions) = authorization,
-          permissions.hasBaseATProtocolScope else {
+    // OPT-IN for legacy sessions (§D3). The `.accountLegacySession` case was
+    // introduced failing closed everywhere; this is one of the two surfaces
+    // deliberately opened, because the official client's traffic is almost
+    // entirely proxied reads and a session that cannot proxy is a session that
+    // logs in and then shows an empty app.
+    //
+    // Both cases carry a parsed permissions value and both are handed to the
+    // same `requireRPC` below, so opting in widens WHO may proxy, never WHAT
+    // they may reach.
+    let subject: String
+    let permissions: SwanScopePermissions
+    switch authorization {
+    case let .accountOAuth(oauthSubject, oauthPermissions):
+        subject = oauthSubject
+        permissions = oauthPermissions
+    case let .accountLegacySession(legacySubject, legacyPermissions):
+        subject = legacySubject
+        permissions = legacyPermissions
+    default:
+        throw SwanXRPCPipethroughFailure.unauthorized
+    }
+    guard permissions.hasBaseATProtocolScope else {
         throw SwanXRPCPipethroughFailure.unauthorized
     }
     return AuthorizedPrincipal(subject: subject, permissions: permissions)
