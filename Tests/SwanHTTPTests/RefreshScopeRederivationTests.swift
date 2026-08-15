@@ -249,14 +249,14 @@ final class RefreshScopeRederivationTests: XCTestCase, @unchecked Sendable {
     // MARK: - §9-D23: re-derivation must not invent or destroy provenance
 
     /// Refresh now REWRITES the family row, which is exactly the boundary
-    /// §9-D23 is about. The re-derivation starts from the requested strings and
-    /// their persisted provenance, so the delegation fence must answer the same
-    /// way after a rotation as it does after a mint: refuse, because the client
-    /// never wrote `authority`.
-    ///
-    /// A re-derivation that rebuilt `stated`/`defaulted` by re-parsing the
-    /// persisted scopes would flip this open — the stored string carries a
-    /// literal `authority=did:plc:…` that mint, not the client, wrote.
+    /// §9-D23 is about. **Rewritten by Erratum 02 (§5.6.3 amendment):** the
+    /// fence no longer consults `authority` statedness, only the stated
+    /// `action` (plus a concrete type), so the same grant must EXCHANGE after
+    /// a rotation just as it does after a mint. The assertion direction
+    /// flipped, but the property is the same: re-derivation must carry the
+    /// persisted provenance forward — if the stated-`action` bit were dropped
+    /// during rotation, this would refuse, and that regression is exactly what
+    /// this test now catches.
     func testRefreshDoesNotInventProvenanceForAResolvedAuthority() async throws {
         let requested = "space:\(Self.spaceType)?skey=*&action=read"
         let client = try PermissionedScopeClient(
@@ -283,7 +283,7 @@ final class RefreshScopeRederivationTests: XCTestCase, @unchecked Sendable {
         let permissions = try await reloaded.permissions(
             accessToken: rotated.accessToken, client: client, jti: "rederive-prov-authorize"
         )
-        XCTAssertFalse(
+        XCTAssertTrue(
             permissions.allowsSpace(
                 SpaceScopeTarget(
                     type: Self.spaceType,
@@ -293,11 +293,12 @@ final class RefreshScopeRederivationTests: XCTestCase, @unchecked Sendable {
                 )
             ),
             """
-            DELEGATION WIDENING THROUGH REFRESH (§9-D23). The client never wrote \
-            `authority`; mint resolved it; the rotation re-derived the grant and \
-            the fence now accepts. Re-derivation must carry provenance forward \
-            from `scope_provenance_requested`, never rebuild it from the \
-            serialised scopes.
+            PROVENANCE DROPPED THROUGH REFRESH (§9-D23, post-Erratum-02). The \
+            client stated `action=read`; rotation re-derived the grant; if the \
+            fence refuses, the stated-`action` bit was not carried forward from \
+            `scope_provenance_requested`. The amendment made that bit the single \
+            surviving delegation witness, so its survival across rotation is \
+            load-bearing.
             """
         )
         XCTAssertTrue(

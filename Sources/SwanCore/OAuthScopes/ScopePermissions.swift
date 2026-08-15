@@ -44,7 +44,7 @@ import Foundation
 // and `read` is in its default action set (`:207-211`), so upstream exchanges a
 // credential for a bare `space:<type>` and for a collection-qualified read.
 // Swan refuses both:
-//   * getDelegationToken -> `isExactReadOnlyDelegationGrant` (§5.6.3)
+//   * getDelegationToken -> `isExchangeableDelegationGrant` (§5.6.3)
 //   * listSpaces         -> `allowsSpaceListing` (§6.1)
 //
 // NOT YET PORTED — the four non-space families below have named upstream port
@@ -133,7 +133,7 @@ public struct SwanScopePermissions: Sendable, Equatable, Hashable {
     /// fence:
     ///
     ///  * *provenance invented* — `space:x.y.z?skey=*&action=read` has
-    ///    `authority` defaulted, so `isExactReadOnlyDelegationGrant` correctly
+    ///    `authority` defaulted, so `isExchangeableDelegationGrant` correctly
     ///    refuses. Mint resolves `self` and persists
     ///    `space:x.y.z?authority=did:plc:USER&skey=*&action=read`. Re-parsed,
     ///    all three keys look literal and the delegation fence flips
@@ -300,7 +300,7 @@ public extension SwanScopePermissions {
     ///
     /// ## Divergence from §5.6.3's literal placement, ruled by §9-D23
     ///
-    /// §5.6.3 spells `isExactReadOnlyDelegationGrant` as a `private var` on
+    /// §5.6.3 spells `isExchangeableDelegationGrant` as a `private var` on
     /// `SpacePermission` reading `scopeParameters.wasStated(...)` — i.e.
     /// parser-side provenance. On a *persisted* grant that is exactly the
     /// §9-D23 "provenance invented" failure: mint resolves `self` and persists
@@ -325,7 +325,7 @@ public extension SwanScopePermissions {
             guard case .delegationExchange = target.operation else {
                 return resolved.matches(target)
             }
-            guard Self.isExactReadOnlyDelegationGrant(
+            guard Self.isExchangeableDelegationGrant(
                 resolved,
                 statedKeys: grant.statedKeys
             ) else { return false }
@@ -366,48 +366,46 @@ public extension SwanScopePermissions {
 
     /// The delegation fence (§5.6.3), reading DURABLE provenance (§9-D23).
     ///
-    /// Every clause maps to a clause of `permitsWholeSpaceRead`
-    /// (`SwanCore.swift:270-279`); none may be dropped. **This fence is where
-    /// the retired `isIssuableQualified` gate's job now lives (§9-D21), and it
-    /// must not be re-litigated as redundant with a gate that no longer
-    /// exists.** Q9 moved those refusals from layer 1 (registration, which
-    /// grants nothing and therefore cannot see what is being asked) to layer 4
-    /// (the resource plane, which has the concrete operation in front of it).
-    /// This predicate and `allowsSpaceListing` ARE that layer-4 handling.
+    /// **§5.6.3 AMENDED (2026-08-15, Josh: option 2 — see Erratum 02 in the
+    /// scopes design doc).** The sealed fence demanded the grant be EXACTLY
+    /// `?authority=X&skey=Y&action=read` — action exactly `[read]`, no
+    /// collection, no manage, authority and skey both stated. No real client's
+    /// registered scopes produce that shape (Bulleted's `spaceAccess`
+    /// expansion states authority/collection/action with a four-action list),
+    /// so every conformant delegation exchange 401'd. Upstream's read arm is
+    /// collection-independent and satisfied by any grant whose actions include
+    /// `read` (`space-permission.ts:104-107`).
     ///
-    /// Every clause tests statedness — a PROVENANCE test, not a value test. A
-    /// defaulted `[read]` and a stated `[read]` carry the same value and must
-    /// not carry the same authority.
+    /// The amended contract, per the ruling:
+    /// 1. `action` was STATED and contains `read` — the §9-D21 bare-grant
+    ///    witness survives (a defaulted action list contains `read` and must
+    ///    still refuse), and extra write verbs alongside `read` are not an
+    ///    escalation for a credential that only reads: the caller already
+    ///    holds them. `read_self` alone remains non-exchangeable (§7.2 D7).
+    /// 2. The grant's space TYPE is concrete — Swan's hardening over upstream,
+    ///    kept from the ruling's option 2: a wildcard-type grant must not mint
+    ///    credentials for arbitrary space types.
+    /// 3. Value coverage (type/authority/skey) stays with `matches` in
+    ///    `allowsSpace` — §5.6.3 steps 1-3 are unchanged.
     ///
-    /// Swan's hardening over upstream, clause by clause (§6.2): upstream's read
-    /// arm is collection-independent (`space-permission.ts:104-107`, no
-    /// `collectionAllows` call) so upstream *does* let
-    /// `space:<t>?action=read&collection=x` be exchanged for a whole-space
-    /// credential; and upstream's default action set contains `read`
-    /// (`:25-30`, `:207-211`) so a bare `space:<t>` is exchangeable upstream.
-    /// Swan refuses both. That refusal is the substance of `SwanCore.swift:246-257`.
-    internal static func isExactReadOnlyDelegationGrant(
+    /// **What was knowingly conceded** (Erratum 02, do not re-litigate as an
+    /// oversight): a collection-qualified read grant now exchanges for a
+    /// whole-space read credential, upstream's documented semantics. The
+    /// original analysis (`SwanCore.swift:246-257`) was CORRECT — this is a
+    /// protocol credential-model limitation, not a retraction: the space
+    /// credential cannot carry collection restrictions, so the conversion is
+    /// lossy. The satisfactory long-term fix is a credential that carries the
+    /// originating grant's collection set, not a stricter predicate here.
+    internal static func isExchangeableDelegationGrant(
         _ grant: SpacePermission,
         statedKeys: Set<String>
     ) -> Bool {
-        // 1. `action` was named explicitly, and names exactly [read].
-        //    Not "contains read"; not a defaulted list.
-        //    <- SwanCore.swift:277 `parameters["action"] == "read"`
-        guard statedKeys.contains("action"), grant.action == [.read] else { return false }
-        // 2. The grant names no collection at all — a collection-qualified
-        //    grant (INCLUDING `collection=*`) must never be amplifiable into a
-        //    credential that reads every member repository.
-        //    <- SwanCore.swift:246-257 (doc comment) and :279 (key-set equality)
-        guard grant.collection.isEmpty, !statedKeys.contains("collection") else { return false }
-        // 3. No `manage` list. Today `hasAction != hasManage`
-        //    (`SwanCore.swift:243`) makes an action+manage grant unparseable,
-        //    so admitting one here would widen even though the manage list is
-        //    never consulted for a read.
-        guard grant.manage.isEmpty, !statedKeys.contains("manage") else { return false }
-        // 4. `authority` and `skey` were both named.
-        //    <- SwanCore.swift:279 `Set(keys) == ["authority","skey","action"]`
-        //       and :243 `requiredKeys == ["authority","skey"]`
-        return statedKeys.contains("authority") && statedKeys.contains("skey")
+        // 1. Stated action containing read (provenance witness — a missing
+        //    bit denies; it never grants).
+        guard statedKeys.contains("action"), grant.action.contains(.read) else { return false }
+        // 2. Concrete space type.
+        guard case .nsid = grant.type else { return false }
+        return true
     }
 
     /// The listing fence (§6.1), replacing `permitsAggregateSpaceList`

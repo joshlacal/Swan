@@ -31,9 +31,14 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
             let verifier = DurableSpaceDelegationVerifier(
                 publicKeys: fixture.localDelegationPublicKeys
             )
+            // Post-Erratum-02: a collection-qualified read grant on a CONCRETE
+            // type exchanges for the whole-space credential (upstream's
+            // collection-independent read arm; the conceded lossy conversion).
+            let collectionQualified =
+                "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=app.bsky.feed.post"
             let scopes = [
                 Set([wholeSpaceReadScope(for: fixture.space)]),
-                Set([wildcardWholeSpaceReadScope()]),
+                Set([collectionQualified]),
             ]
 
             try await app.test(.router) { client in
@@ -136,10 +141,11 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
             let app = try makeServer(fixture, enabled: true).buildApplication(
                 logger: Logger(label: "SpaceDelegationMintingHTTPTests.scope")
             )
-            let narrowCollection = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read&collection=app.bsky.feed.post"
-            // This is intentionally stricter than the reference matcher for
-            // delegation minting: collection constraints cannot be amplified
-            // into a credential which reads every member repository.
+            // Erratum 02, option 2: a WILDCARD-TYPE grant never mints, even in
+            // the exact sealed-era shape — the type axis is the hardening Swan
+            // kept when it conceded the collection axis. (The concrete-type
+            // collection-qualified vector moved to the success test.)
+            let wildcardType = wildcardWholeSpaceReadScope()
             let wildcardCollection = "space:*?authority=*&skey=*&action=read&collection=*"
             let readSelf = "space:\(fixture.space.spaceType)?authority=\(fixture.space.authority)&skey=\(fixture.space.skey)&action=read_self&collection=app.bsky.feed.post"
             let foreign = "space:\(fixture.space.spaceType)?authority=\(Self.unknown)&skey=\(fixture.space.skey)&action=read"
@@ -173,7 +179,7 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
             )
 
             for (index, scope) in [
-                narrowCollection, wildcardCollection, readSelf, foreign,
+                wildcardType, wildcardCollection, readSelf, foreign,
                 wildcardForeign,
             ].enumerated() {
                 let access = try await issueToken(
@@ -449,10 +455,9 @@ final class SpaceDelegationMintingHTTPTests: XCTestCase, @unchecked Sendable {
         "space:\(space.spaceType)?authority=\(space.authority)&skey=\(space.skey)&action=read"
     }
 
-    /// Matches the TypeScript `SpacePermission.matches` tuple semantics for a
-    /// whole-space read: each tuple member may be broad while `action=read`
-    /// remains explicit. The endpoint must mint for this reference-valid
-    /// OAuth grant.
+    /// Reference-valid under the TypeScript matcher, but REFUSED by Swan since
+    /// Erratum 02's option-2 clause: a wildcard-TYPE grant must not mint
+    /// credentials for arbitrary space types, however explicit its `action`.
     private func wildcardWholeSpaceReadScope() -> String {
         "space:*?authority=*&skey=*&action=read"
     }

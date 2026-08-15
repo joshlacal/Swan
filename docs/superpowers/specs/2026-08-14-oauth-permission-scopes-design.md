@@ -7001,3 +7001,49 @@ Pinned by `ScopePermissionsFenceTests`: the amended acceptances (stated
 `spaceAccess` expansion shape) and the surviving refusals (bare grant;
 unstated-action `manage` grant; wildcard request against concrete grant;
 cross-authority; cross-type).
+
+## Erratum 02 (2026-08-15) — §5.6.3 delegation fence amended
+
+Ruled by Josh (option 2 of the presented three). The sealed
+`isExactReadOnlyDelegationGrant` exchanged only a grant that was EXACTLY
+`space:<type>?authority=X&skey=Y&action=read` — action stated and exactly
+`[read]`, no collection, no manage, authority and skey both stated. No real
+client's registered scopes produce that shape: bulleted.app's `spaceAccess`
+expansion (stated authority/collection/action, four-action list, unstated
+skey) failed four clauses, so every conformant `getDelegationToken` call
+401'd and the entire space data plane was unreachable.
+
+Renamed `isExchangeableDelegationGrant`; the amended contract:
+
+1. `action` is STATED and CONTAINS `read` (upstream's read arm,
+   `space-permission.ts:104-107`, plus Swan's surviving §9-D21 bare-grant
+   witness: a defaulted action list contains `read` and still refuses).
+   `read_self` alone remains non-exchangeable (§7.2 D7). Extra write verbs
+   beside `read` are not an escalation for a credential that only reads —
+   the caller already holds them.
+2. The grant's space TYPE is concrete — the option-2 hardening Swan KEEPS
+   over upstream. A wildcard-type grant never mints, including the sealed
+   era's previously-exchangeable `space:*?authority=*&skey=*&action=read`
+   (a deliberate tightening on that one axis, pinned in
+   `SpaceDelegationMintingHTTPTests`).
+3. Tuple coverage (type/authority/skey vs the target) is unchanged —
+   `matches`, §5.6.3 steps 1-3.
+
+**The knowingly conceded widening, recorded so it is never re-read as an
+oversight:** a collection-qualified read grant now exchanges for a
+whole-space read credential. The original hardening's analysis was CORRECT
+— this is privilege amplification, and the sealed fence really did prevent
+it. What changed is the recognition that the protocol's credential model
+cannot represent a collection restriction: the space credential is not
+collection-aware, so the conversion is inherently lossy, and every upstream
+implementation performs it. A PDS that refuses it does not interoperate.
+The satisfactory long-term fix is a delegated credential that carries the
+originating grant's collection set (or is otherwise server-bound to it) —
+at which point this concession should be revisited — not a stricter
+predicate at this layer.
+
+Dropped clauses: exact-`[read]`, no-collection, no-manage,
+stated-authority/skey. Flipped tests are annotated in place
+(`ScopePermissionsFenceTests`, `ScopeProvenanceDurabilityTests`,
+`RefreshScopeRederivationTests`, `SpaceDelegationMintingHTTPTests`,
+`RemoteClientPermissionedScopeE2ETests` stage 6.6 kept as a refusal).

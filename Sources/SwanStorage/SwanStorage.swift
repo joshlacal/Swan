@@ -333,7 +333,7 @@ public struct OAuthConfidentialClientKeyBinding: Sendable, Equatable {
 /// scope string.
 ///
 /// This is durable state, not parser metadata (spec §9-D23). Two Swan fences —
-/// `isExactReadOnlyDelegationGrant` (§5.6.3) and `allowsSpaceListing` (§6.1) —
+/// `isExchangeableDelegationGrant` (§5.6.3) and `allowsSpaceListing` (§6.1) —
 /// require a parameter to have been literally stated by the client rather than
 /// defaulted into place by the grammar, and a serialised scope string cannot
 /// answer that question in either direction:

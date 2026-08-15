@@ -55,7 +55,7 @@ public struct ScopeParameter: Sendable {
 /// mistake as collapsing `ScopeParameterBag`'s tri-state into `String?`.
 ///
 /// Provenance is **never** consulted by upstream-conformant matching — only by
-/// the two Swan-specific narrowings (`isExactReadOnlyDelegationGrant`,
+/// the two Swan-specific narrowings (`isExchangeableDelegationGrant`,
 /// `allowsSpaceListing`) and by the fence tests.
 ///
 /// **These bits must be DURABLE — see §9-D23, which is a blocker.** They have to
@@ -91,7 +91,7 @@ public struct ScopeParameterValues: Sendable, Hashable {
     public func has(_ key: String) -> Bool { storage[key] != nil }
 
     /// True iff the key was physically present in the scope string. This is the
-    /// witness `isExactReadOnlyDelegationGrant` and `allowsSpaceListing` need.
+    /// witness `isExchangeableDelegationGrant` and `allowsSpaceListing` need.
     public func wasStated(_ key: String) -> Bool { storage[key]?.provenance == .stated }
 
     /// The raw provenance for `key`, or `nil` if the key is absent entirely.

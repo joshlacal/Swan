@@ -84,7 +84,7 @@ final class ScopeProvenanceDurabilityTests: XCTestCase, @unchecked Sendable {
             ),
             """
             The FACADE is the wrong suspect if this fails: given durable \
-            provenance, `isExactReadOnlyDelegationGrant` must accept a grant whose \
+            provenance, `isExchangeableDelegationGrant` must accept a grant whose \
             `authority`, `skey` and single `action=read` were all literally \
             written. If this passes while the end-to-end tests fail, the matcher \
             is fine and provenance is not reaching it.
@@ -103,10 +103,16 @@ final class ScopeProvenanceDurabilityTests: XCTestCase, @unchecked Sendable {
 
     // MARK: - Direction 1: minting must not INVENT provenance
 
-    /// The exact example §9-D23 names. `authority` is never written by the
-    /// client; mint resolves it; the delegation fence must still refuse on the
-    /// far side of storage.
-    func testDelegationFenceRefusesAResolvedAuthorityThatWasNeverStated() async throws {
+    /// **Rewritten by Erratum 02 (§5.6.3 amendment).** The sealed fence
+    /// consulted `authority`/`skey` statedness, so this test asserted refusal
+    /// when mint resolved a never-stated `authority`. The amended fence
+    /// consults only the stated-`action` witness (plus a concrete type), so
+    /// the same grant now EXCHANGES — the client stated `action=read`, and
+    /// that bit demonstrably survived storage, which is the §9-D23 property
+    /// this file exists to hold. The invented-provenance refusal is now
+    /// witnessed at the unit layer by
+    /// `testDelegationFenceRefusesADefaultedActionList` (SwanCoreTests).
+    func testDelegationFenceExchangesAResolvedAuthorityWhenActionWasStated() async throws {
         let requested = "space:\(Self.spaceType)?skey=*&action=read"
         let client = try PermissionedScopeClient(scopes: [requested])
         let minting = try await PermissionedScopeFixture.make()
@@ -140,10 +146,10 @@ final class ScopeProvenanceDurabilityTests: XCTestCase, @unchecked Sendable {
             jti: "d23-invented-authorize"
         )
 
-        // The grant reads as fully literal now. The fence must still refuse,
-        // because provenance came out of storage beside the grant rather than
-        // being re-derived from it.
-        XCTAssertFalse(
+        // Post-Erratum-02: the stated `action=read` bit came out of storage
+        // beside the grant, so the exchange is admitted. If this FAILS, the
+        // durable statedKeys are not reaching the matcher after a reload.
+        XCTAssertTrue(
             permissions.allowsSpace(
                 SpaceScopeTarget(
                     type: Self.spaceType,
@@ -153,11 +159,11 @@ final class ScopeProvenanceDurabilityTests: XCTestCase, @unchecked Sendable {
                 )
             ),
             """
-            DELEGATION WIDENING (§9-D23, direction "provenance invented"). The \
-            client never wrote `authority`; mint resolved it; the reloaded grant \
-            now reads as three literal values and the fence accepted it. \
-            `isExactReadOnlyDelegationGrant` must consult PERSISTED provenance \
-            (§5.6.3), never `wasStated` re-derived from the stored string.
+            PROVENANCE DESTROYED (§9-D23, direction 2, delegation arm). The \
+            client stated `action=read`; if `isExchangeableDelegationGrant` \
+            refuses after a storage round trip, the persisted statedKeys were \
+            dropped or never loaded — the amendment made stated-`action` the \
+            single surviving witness, so its durability is load-bearing.
             """
         )
 

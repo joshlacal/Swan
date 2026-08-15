@@ -850,17 +850,18 @@ final class RemoteClientPermissionedScopeE2ETests: XCTestCase, @unchecked Sendab
         }
 
         // 6. `getDelegationToken` for the space → DENIED. The grant's action is
-        //    `[read_self]`, not a stated single `read`, so
-        //    `isExactReadOnlyDelegationGrant` is false. This belongs in the
-        //    acceptance test as well as in the §7.3 fence because it is the one
-        //    place both a real token and a real handler are involved.
+        //    `[read_self]`, which does not contain `read`, so
+        //    `isExchangeableDelegationGrant` is false — a refusal Erratum 02
+        //    deliberately KEPT (§7.2 D7). This belongs in the acceptance test
+        //    as well as in the §7.3 fence because it is the one place both a
+        //    real token and a real handler are involved.
         XCTAssertFalse(
             permissions.allowsSpace(target(.delegationExchange, skey: "*")),
             """
             Stage 6.6: CRITICAL DELEGATION WIDENING. A `read_self` grant must never \
             be exchangeable for a whole-space credential — that credential reads \
-            every member's repo. §5.6.3's fence requires a stated single \
-            `action=read` and exactly the three stated keys.
+            every member's repo. The amended §5.6.3 fence (Erratum 02) still \
+            requires a STATED action list containing `read`.
             """
         )
 

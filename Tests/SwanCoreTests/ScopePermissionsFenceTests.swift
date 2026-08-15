@@ -101,18 +101,17 @@ final class ScopePermissionsFenceTests: XCTestCase {
         XCTAssertFalse(spaceOnly.hasBaseATProtocolScope)
     }
 
-    // MARK: - The delegation fence (§5.6.3)
+    // MARK: - The delegation fence (§5.6.3, amended per Erratum 02)
 
-    /// **The §9-D23 headline case.** The client requested
-    /// `space:x.y.z?skey=*&action=read` — `authority` DEFAULTED, so the fence
-    /// must refuse. Mint resolves `self` and persists the string below, in
-    /// which all three values are literal. Re-parsing that string would make
-    /// the fence flip false -> true. It must not, because provenance is read
-    /// from the durable record, which still says `authority` was never stated.
-    func testDelegationFenceRefusesAMintResolvedSelfAuthority() {
+    /// Post-amendment: a mint-resolved `self` authority with a STATED action
+    /// is exchangeable. The §9-D23 durable-provenance property is now
+    /// witnessed by `testDelegationFenceRefusesADefaultedActionList` — the
+    /// stated-action bit is still read from the durable record, never
+    /// reconstructed from the persisted string.
+    func testDelegationFenceAcceptsAMintResolvedSelfAuthorityWithStatedAction() {
         let persisted = "space:x.y.z?authority=\(user)&skey=*&action=read"
         let permissions = permissions(persisted, stated: ["skey", "action"])
-        XCTAssertFalse(permissions.allowsSpace(delegation(skey: "*")))
+        XCTAssertTrue(permissions.allowsSpace(delegation(skey: "*")))
     }
 
     func testDelegationFenceAcceptsAFullyStatedReadOnlyGrant() {
@@ -130,9 +129,8 @@ final class ScopePermissionsFenceTests: XCTestCase {
         )
     }
 
-    /// Clause 1. A DEFAULTED action list contains `read` and must still refuse
-    /// — this is the bare `space:<type>` shape §5.6.3 names as newly admitted
-    /// by a naive `action.contains(.read)` port.
+    /// The surviving §9-D21 witness. A DEFAULTED action list contains `read`
+    /// and must still refuse — a bare `space:<type>` never exchanges.
     func testDelegationFenceRefusesADefaultedActionList() {
         let bare = "space:x.y.z"
         XCTAssertFalse(
@@ -140,50 +138,82 @@ final class ScopePermissionsFenceTests: XCTestCase {
         )
     }
 
-    /// Clause 1, value half: `action` must be exactly `[read]`, not merely
-    /// contain it.
-    func testDelegationFenceRefusesAStatedMultiActionGrant() {
+    /// Amended clause 1: `action` need only CONTAIN `read`. Extra write verbs
+    /// are not an escalation for a read credential the caller could already
+    /// exceed with its write grants.
+    func testDelegationFenceAcceptsAStatedMultiActionGrant() {
         let scope = "space:x.y.z?authority=\(user)&skey=self&action=read&action=create"
+        XCTAssertTrue(
+            permissions(scope, stated: ["authority", "skey", "action"])
+                .allowsSpace(delegation())
+        )
+    }
+
+    /// **The Erratum 02 concession, pinned deliberately.** A
+    /// collection-qualified read grant now exchanges for a whole-space read
+    /// credential — upstream's semantics (`space-permission.ts:104-107`). The
+    /// original hardening's analysis was correct; the protocol's credential
+    /// model cannot carry the collection restriction, and interoperability
+    /// requires the lossy conversion. If a future credential model becomes
+    /// collection-aware, revisit — do not simply flip this back.
+    func testDelegationFenceAcceptsACollectionQualifiedGrant() {
+        for collection in ["*", "app.bsky.feed.post"] {
+            let scope = "space:x.y.z?authority=\(user)&skey=self&action=read&collection=\(collection)"
+            XCTAssertTrue(
+                permissions(scope, stated: ["authority", "skey", "action", "collection"])
+                    .allowsSpace(delegation()),
+                "collection=\(collection) is exchangeable post-Erratum-02"
+            )
+        }
+    }
+
+    /// Amended: a manage list alongside a stated read no longer disqualifies.
+    func testDelegationFenceAcceptsAStatedManageList() {
+        let scope = "space:x.y.z?authority=\(user)&skey=self&action=read&manage=delete"
+        XCTAssertTrue(
+            permissions(scope, stated: ["authority", "skey", "action", "manage"])
+                .allowsSpace(delegation())
+        )
+    }
+
+    /// Amended clause 2 (option 2 of the ruling): the grant's space type must
+    /// be concrete. A wildcard-type grant must not mint credentials for
+    /// arbitrary space types, even with a stated read.
+    func testDelegationFenceRefusesAWildcardTypeGrant() {
+        let scope = "space:*?authority=\(user)&skey=self&action=read"
         XCTAssertFalse(
             permissions(scope, stated: ["authority", "skey", "action"])
                 .allowsSpace(delegation())
         )
     }
 
-    /// Clause 2. A collection-qualified grant — INCLUDING `collection=*` — must
-    /// never be amplifiable into a credential that reads every member
-    /// repository (`SwanCore.swift:246-257`). Upstream permits exactly this
-    /// (`space-permission.ts:104-107` takes the read arm before
-    /// `collectionAllows`); Swan's refusal is the documented hardening.
-    func testDelegationFenceRefusesAnyStatedCollection() {
-        for collection in ["*", "app.bsky.feed.post"] {
-            let scope = "space:x.y.z?authority=\(user)&skey=self&action=read&collection=\(collection)"
-            XCTAssertFalse(
-                permissions(scope, stated: ["authority", "skey", "action", "collection"])
-                    .allowsSpace(delegation()),
-                "collection=\(collection) must not be exchangeable"
-            )
-        }
-    }
-
-    /// Clause 3.
-    func testDelegationFenceRefusesAStatedManageList() {
-        let scope = "space:x.y.z?authority=\(user)&skey=self&action=read&manage=delete"
-        XCTAssertFalse(
-            permissions(scope, stated: ["authority", "skey", "action", "manage"])
-                .allowsSpace(delegation())
-        )
-    }
-
-    /// Clause 4, both halves.
-    func testDelegationFenceRequiresBothAuthorityAndSkeyStated() {
+    /// Unstated authority/skey no longer disqualify — value coverage of the
+    /// tuple is still enforced by `matches` (§5.6.3 steps 1-3), and the only
+    /// admissible authority for a defaulted grant is the resolved subject.
+    func testDelegationFenceAcceptsUnstatedAuthorityAndSkey() {
         let scope = "space:x.y.z?authority=\(user)&skey=self&action=read"
-        XCTAssertFalse(
+        XCTAssertTrue(
             permissions(scope, stated: ["skey", "action"]).allowsSpace(delegation())
         )
-        XCTAssertFalse(
+        XCTAssertTrue(
             permissions(scope, stated: ["authority", "action"]).allowsSpace(delegation())
         )
+    }
+
+    /// The verbatim Bulleted `spaceAccess` expansion — the shape that was
+    /// 401ing on getDelegationToken before Erratum 02.
+    func testDelegationFenceAcceptsTheBulletedSpaceAccessExpansionShape() {
+        let scope = "space:app.bulleted.space?authority=*"
+            + "&collection=app.bulleted.node&collection=app.bulleted.note"
+            + "&collection=app.bulleted.outline&collection=app.bulleted.mirror"
+            + "&collection=app.bulleted.comment&collection=app.bulleted.commentPolicy"
+            + "&action=read&action=create&action=update&action=delete"
+        let permissions = permissions(scope, stated: ["authority", "collection", "action"])
+        XCTAssertTrue(
+            permissions.allowsSpace(delegation("app.bulleted.space", skey: "3m2abcdefgh22"))
+        )
+        // A different space type still refuses (§5.6.3 step 1).
+        XCTAssertFalse(permissions.allowsSpace(delegation("app.other.space")))
     }
 
     /// The fence does not replace the tuple match: a fully stated read-only
