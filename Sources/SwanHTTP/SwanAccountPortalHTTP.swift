@@ -15,6 +15,12 @@ public protocol SwanAccountPortalServing: Sendable {
     func mutate(path: String, accountDID: String, now: Date) async throws -> SwanAccountPortalMutation
 }
 
+public extension SwanAccountPortalServing {
+    func mutate(path: String, accountDID: String, payload: Data?, now: Date) async throws -> SwanAccountPortalMutation {
+        try await mutate(path: path, accountDID: accountDID, now: now)
+    }
+}
+
 public struct SwanAccountPortalAuthentication: Sendable, Equatable {
     public let accountDID: String
     public let strength: AuthenticationStrength
@@ -64,6 +70,10 @@ public struct SwanAccountPortalMutation: Codable, Sendable, Equatable {
     public let accepted: Bool
     public let message: String
     public init(accepted: Bool = true, message: String = "Accepted") { self.accepted = accepted; self.message = message }
+}
+private struct AuthenticatedPortalResponse: Encodable {
+    let snapshot: SwanAccountPortalSnapshot
+    let csrf: String
 }
 
 public struct SwanAccountPortalConfiguration: Sendable, Equatable {
@@ -131,7 +141,7 @@ public struct SwanAccountPortalHTTP: Sendable {
             guard mutationHeadersAllow(request, expectedOrigin: configuration.publicOrigin),
                   let csrf = accountCookie(named: SwanManagementSessionRuntime.preAuthCookieName, request: request),
                   let header = request.headers[HTTPField.Name("X-Swan-CSRF")!],
-                  constantTime(csrf, header), await sessions.consumePreAuth(csrf) else { return accountError(.forbidden) }
+                  constantTime(csrf, header), await sessions.validatesPreAuth(csrf) else { return accountError(.forbidden) }
             do {
                 let admitted = try await collectAdmittedRequestBody(request, mediaType: .json, admission: .managementProcessShared, policy: .productionDefault, maximumBytes: 16 * 1024, termination: context.jsonWriteBodyTermination)
                 defer { admitted.release() }
@@ -140,12 +150,30 @@ public struct SwanAccountPortalHTTP: Sendable {
                 let authentication = try await service.authenticate(handle: credentials.handle, password: credentials.password, now: Date())
                 let issued = try await sessions.issue(accountDID: authentication.accountDID, strength: authentication.strength)
                 let snapshot = try await service.portal(accountDID: authentication.accountDID, now: Date())
-                return accountJSON(.ok, snapshot, cookies: [managementCookie(issued.sessionValue), csrfCookie(issued.csrfValue), expiredPreAuthCookie()])
-            } catch is PortalRequestError { return accountError(.badRequest) }
-            catch { return accountError(.unauthorized) }
+                guard await sessions.consumePreAuth(csrf) else { return accountError(.forbidden) }
+                return accountJSON(.ok, AuthenticatedPortalResponse(snapshot: snapshot, csrf: issued.csrfValue), cookies: [managementCookie(issued.sessionValue), csrfCookie(issued.csrfValue), expiredPreAuthCookie()])
+            } catch is PortalRequestError { await sessions.releasePreAuth(csrf); return accountError(.badRequest) }
+            catch { await sessions.releasePreAuth(csrf); return accountError(.unauthorized) }
         }
 
-        for path in ["signup/email/request", "signup/authorize", "signup", "logout", "profile", "identity", "app-passwords", "scopes/validate", "factors", "factors/recovery-codes/rotate", "factors/step-up", "connected-apps", "export", "export/request", "migration", "migration/request", "lifecycle/delete", "step-up", "sessions/revoke-others"] {
+        for path in ["signup/email/request", "signup/authorize", "signup"] {
+            router.post("/account/api/\(path)") { [configuration, sessions, service] request, context async -> Response in
+                guard mutationHeadersAllow(request, expectedOrigin: configuration.publicOrigin),
+                      let csrf = accountCookie(named: SwanManagementSessionRuntime.preAuthCookieName, request: request),
+                      let header = request.headers[HTTPField.Name("X-Swan-CSRF")!], constantTime(csrf, header),
+                      await sessions.validatesPreAuth(csrf) else { return accountError(.forbidden) }
+                do {
+                    let admitted = try await collectAdmittedRequestBody(request, mediaType: .json, admission: .managementProcessShared, policy: .productionDefault, maximumBytes: 16 * 1024, termination: context.jsonWriteBodyTermination)
+                    defer { admitted.release() }
+                    let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
+                    let result = try await service.mutate(path: path, accountDID: "", payload: payload, now: Date())
+                    guard await sessions.consumePreAuth(csrf) else { return accountError(.forbidden) }
+                    return accountJSON(.ok, result, cookies: [expiredPreAuthCookie()])
+                } catch { await sessions.releasePreAuth(csrf); return accountError(.badRequest) }
+            }
+        }
+
+        for path in ["logout", "profile", "identity", "app-passwords", "scopes/validate", "factors", "factors/recovery-codes/rotate", "factors/step-up", "connected-apps", "export", "export/request", "migration", "migration/request", "lifecycle/delete", "step-up", "sessions/revoke-others"] {
             router.on("/account/api/\(path)", method: .post) { [configuration, sessions, service] request, _ async -> Response in
                 guard mutationHeadersAllow(request, expectedOrigin: configuration.publicOrigin),
                       let session = accountCookie(named: SwanManagementSessionRuntime.sessionCookieName, request: request),
@@ -156,7 +184,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                       (try? await sessions.acceptsCSRF(sessionValue: session, csrfValue: csrf)) == true else { return accountError(.forbidden) }
                 do {
                     let metadata = try await sessions.authenticate(sessionValue: session)
-                    let mutation = try await service.mutate(path: path, accountDID: metadata.accountDID, now: Date())
+                    let mutation = try await service.mutate(path: path, accountDID: metadata.accountDID, payload: nil, now: Date())
                     if path == "logout" { try await sessions.revoke(sessionValue: session) }
                     return accountJSON(.ok, mutation, cookies: path == "logout" ? [expiredManagementCookie(), expiredCSRFToken()] : [])
                 } catch { return accountError(.serviceUnavailable) }
@@ -252,7 +280,13 @@ private func staticAuthCSSResponse(configuration: SwanAccountPortalConfiguration
 }
 
 private func mutationHeadersAllow(_ request: Request, expectedOrigin: URL) -> Bool {
-    sameOrigin(request, expected: expectedOrigin) && fetchSiteAllows(request, requireHeader: true) && (request.headers[.contentType]?.lowercased().hasPrefix("application/json") == true)
+    sameOrigin(request, expected: expectedOrigin) && fetchSiteAllows(request, requireHeader: true) && exactJSONMediaType(request.headers[.contentType])
+}
+
+private func exactJSONMediaType(_ value: String?) -> Bool {
+    guard let value else { return false }
+    let parts = value.split(separator: ";", omittingEmptySubsequences: false)
+    return parts.count == 1 && parts[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "application/json"
 }
 
 private func sameOrigin(_ request: Request, expected: URL) -> Bool {

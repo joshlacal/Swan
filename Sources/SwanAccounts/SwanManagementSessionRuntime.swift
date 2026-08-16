@@ -10,13 +10,29 @@ import SwanStorage
 /// backed by the same account database as management sessions.
 public protocol SwanManagementPreAuthStore: Sendable {
     func put(digest: Data, expiresAt: Date) async
+    func contains(digest: Data, now: Date) async -> Bool
     func take(digest: Data, now: Date) async -> Bool
+}
+
+public protocol SwanManagementCSRFStore: Sendable {
+    func put(sessionDigest: Data, csrfDigest: Data) async throws
+    func digest(for sessionDigest: Data) async throws -> Data?
+    func remove(sessionDigest: Data) async throws
+}
+
+public actor SwanInMemoryManagementCSRFStore: SwanManagementCSRFStore {
+    private var values: [Data: Data] = [:]
+    public init() {}
+    public func put(sessionDigest: Data, csrfDigest: Data) async throws { values[sessionDigest] = csrfDigest }
+    public func digest(for sessionDigest: Data) async throws -> Data? { values[sessionDigest] }
+    public func remove(sessionDigest: Data) async throws { values.removeValue(forKey: sessionDigest) }
 }
 
 public actor SwanInMemoryManagementPreAuthStore: SwanManagementPreAuthStore {
     private var values: [Data: Date] = [:]
     public init() {}
     public func put(digest: Data, expiresAt: Date) async { values[digest] = expiresAt }
+    public func contains(digest: Data, now: Date) async -> Bool { values[digest].map { $0 >= now } ?? false }
     public func take(digest: Data, now: Date) async -> Bool {
         guard let expiry = values.removeValue(forKey: digest), expiry >= now else { return false }
         return true
@@ -29,19 +45,22 @@ public actor SwanManagementSessionRuntime {
     public static let preAuthCookieName = "swan_csrf_pre"
 
     private let store: any ManagementSessionStore
-    private var csrfDigests: [Data: Data] = [:]
     private let preAuthStore: any SwanManagementPreAuthStore
+    private let csrfStore: any SwanManagementCSRFStore
+    private var reservedPreAuth: Set<Data> = []
     private let idleLifetime: TimeInterval
     private let absoluteLifetime: TimeInterval
 
     public init(
         store: any ManagementSessionStore,
-        preAuthStore: any SwanManagementPreAuthStore = SwanInMemoryManagementPreAuthStore(),
+        preAuthStore: any SwanManagementPreAuthStore,
+        csrfStore: any SwanManagementCSRFStore,
         idleLifetime: TimeInterval = 12 * 60 * 60,
         absoluteLifetime: TimeInterval = 30 * 24 * 60 * 60
     ) {
         self.store = store
         self.preAuthStore = preAuthStore
+        self.csrfStore = csrfStore
         self.idleLifetime = idleLifetime
         self.absoluteLifetime = absoluteLifetime
     }
@@ -61,7 +80,7 @@ public actor SwanManagementSessionRuntime {
         let sessionDigest = Self.digest(sessionValue)
         let csrfDigest = Self.digest(csrfValue)
         try await store.createManagementSession(metadata, sessionDigest: sessionDigest, csrfDigest: csrfDigest, now: now)
-        csrfDigests[sessionDigest] = csrfDigest
+        try await csrfStore.put(sessionDigest: sessionDigest, csrfDigest: csrfDigest)
         return IssuedManagementSession(sessionValue: sessionValue, csrfValue: csrfValue, metadata: metadata)
     }
 
@@ -75,9 +94,19 @@ public actor SwanManagementSessionRuntime {
     /// to issue a new token, but a successful login/signup cannot replay one.
     public func consumePreAuth(_ value: String, now: Date = Date()) async -> Bool {
         let digest = Self.digest(value)
-        guard Self.validToken(value) else { return false }
+        guard Self.validToken(value), reservedPreAuth.remove(digest) != nil else { return false }
         return await preAuthStore.take(digest: digest, now: now)
     }
+
+    public func validatesPreAuth(_ value: String, now: Date = Date()) async -> Bool {
+        guard Self.validToken(value) else { return false }
+        let digest = Self.digest(value)
+        guard await preAuthStore.contains(digest: digest, now: now), !reservedPreAuth.contains(digest) else { return false }
+        reservedPreAuth.insert(digest)
+        return true
+    }
+
+    public func releasePreAuth(_ value: String) { reservedPreAuth.remove(Self.digest(value)) }
 
     public func authenticate(sessionValue: String, now: Date = Date()) async throws -> ManagementSessionMetadata {
         guard Self.validToken(sessionValue) else { throw SwanManagementSessionError.unauthorized }
@@ -95,7 +124,7 @@ public actor SwanManagementSessionRuntime {
               metadata.revokedAt == nil,
               Self.validToken(csrfValue) else { return false }
         let digest = Self.digest(sessionValue)
-        let expected = csrfDigests[digest] ?? Data()
+        let expected = (try? await csrfStore.digest(for: digest)) ?? Data()
         return Self.constantTimeEqual(expected, Self.digest(csrfValue))
     }
 
@@ -103,7 +132,7 @@ public actor SwanManagementSessionRuntime {
         guard Self.validToken(sessionValue) else { return }
         let digest = Self.digest(sessionValue)
         try await store.revokeManagementSession(digest: digest, now: now)
-        csrfDigests.removeValue(forKey: digest)
+        try await csrfStore.remove(sessionDigest: digest)
     }
 
     public func revokeOthers(accountDID: String, except sessionValue: String, now: Date = Date()) async throws {

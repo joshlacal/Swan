@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { accountFetch, bootstrap, type PortalSnapshot } from '$lib/api';
+  import { accountFetch, bootstrap, setCSRF, type PortalSnapshot } from '$lib/api';
 
   type Section = 'overview' | 'profile' | 'security' | 'recovery' | 'sessions' | 'apps' | 'passwords' | 'export' | 'lifecycle';
   const sections: { id: Section; label: string; note: string }[] = [
@@ -19,6 +19,9 @@
   let loading = true;
   let error = '';
   let notice = '';
+  let handle = '';
+  let password = '';
+  let signingIn = false;
 
   onMount(async () => {
     try {
@@ -33,6 +36,12 @@
   async function revokeOthers() {
     try { await accountFetch('sessions/revoke-others', { method: 'POST', body: '{}' }); notice = 'Other sessions were signed out.'; }
     catch { notice = 'We could not revoke sessions right now.'; }
+  }
+  async function signIn() {
+    signingIn = true; error = '';
+    try { const result = await accountFetch<{ snapshot: PortalSnapshot; csrf: string }>('login', { method: 'POST', body: JSON.stringify({ handle, password }) }); setCSRF(result.csrf); snapshot = result.snapshot; }
+    catch (caught) { error = caught instanceof Error ? caught.message : 'Sign-in was not accepted.'; }
+    finally { signingIn = false; }
   }
 </script>
 
@@ -50,7 +59,7 @@
   {#if loading}
     <main class="loading" aria-live="polite"><span class="spinner" aria-hidden="true"></span><p>Reading your private ledger…</p></main>
   {:else if error}
-    <main class="empty-state" aria-labelledby="sign-in-title"><p class="eyebrow">ACCOUNT ATLAS</p><h1 id="sign-in-title">A quiet place for your data.</h1><p>{error}</p><a class="button primary" href="/oauth/authorize">Sign in securely <span>↗</span></a></main>
+    <main class="empty-state" aria-labelledby="sign-in-title"><p class="eyebrow">ACCOUNT ATLAS</p><h1 id="sign-in-title">A quiet place for your data.</h1><p>{error}</p><form class="login-form" on:submit|preventDefault={signIn}><label>Handle<input bind:value={handle} autocomplete="username" required maxlength="2048" /></label><label>Password<input type="password" bind:value={password} autocomplete="current-password" required maxlength="4096" /></label><button class="button primary" disabled={signingIn}>{signingIn ? 'Signing in…' : 'Sign in securely'} <span>↗</span></button></form><a class="text-button" href="/oauth/authorize">Use OAuth instead ↗</a></main>
   {:else if snapshot}
     <div class="layout">
       <aside class="sidebar" aria-label="Account sections">

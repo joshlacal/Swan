@@ -18,6 +18,7 @@ export type PortalSnapshot = {
 };
 
 let csrf: string | undefined;
+export function setCSRF(value: string) { csrf = value; }
 
 export async function bootstrap(): Promise<string> {
   const response = await fetch('/account/api/bootstrap', { credentials: 'same-origin' });

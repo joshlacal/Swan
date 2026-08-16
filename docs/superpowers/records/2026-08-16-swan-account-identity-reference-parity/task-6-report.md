@@ -50,3 +50,7 @@ The pre-auth CSRF runtime now accepts an injected `SwanManagementPreAuthStore`
 for durable one-time persistence; its in-memory implementation is test-only and
 must not be selected by production assembly. Origin validation requires the
 configured HTTPS origin and rejects credentials, paths, queries, and fragments.
+The correction also adds a real bounded login form and authenticated response
+that hands the rotated management CSRF to the client, pre-auth signup handlers
+that do not require a management cookie, typed payload plumbing for mutations,
+and durable CSRF digest injection for restart-safe validation.
