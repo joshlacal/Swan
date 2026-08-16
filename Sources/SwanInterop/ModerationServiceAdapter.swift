@@ -51,24 +51,28 @@ public struct ModerationReportResult: Sendable, Equatable {
     public let status: Int
 }
 
-/// Bounded moderation delivery. The adapter deliberately sends a redacted
-/// category-only envelope: provider payloads, subject identifiers, and free
-/// text never cross the service boundary or enter logs.
+/// Bounded moderation delivery. Subject and details are sent only as
+/// correlation values produced by a deployment-provided keyed HMAC; unlike a
+/// plain hash this is not guessable from a public DID or short report text.
+/// The trusted moderation transport receives the typed envelope and is solely
+/// responsible for resolving those correlations. Raw values never enter logs.
 public struct ModerationServiceAdapter: Sendable {
     private let transport: any ModerationTransport
     private let allowedHost: String
     private let pinnedPeer: String
     private let maximumBodyBytes: Int
+    private let correlationKey: SymmetricKey
     private let maximumResponseBytes = 16 * 1_024
 
-    public init(transport: any ModerationTransport, allowedHost: String, pinnedPeer: String, maximumBodyBytes: Int = 64 * 1_024) throws {
-        guard !allowedHost.isEmpty, !pinnedPeer.isEmpty, (64...1_024 * 1_024).contains(maximumBodyBytes) else {
+    public init(transport: any ModerationTransport, allowedHost: String, pinnedPeer: String, maximumBodyBytes: Int = 64 * 1_024, correlationKey: Data) throws {
+        guard !allowedHost.isEmpty, !pinnedPeer.isEmpty, (64...1_024 * 1_024).contains(maximumBodyBytes), correlationKey.count >= 16 else {
             throw ModerationServiceAdapterError.invalidConfiguration
         }
         self.transport = transport
         self.allowedHost = allowedHost
         self.pinnedPeer = pinnedPeer
         self.maximumBodyBytes = maximumBodyBytes
+        self.correlationKey = SymmetricKey(data: correlationKey)
     }
 
     public func submit(_ request: ModerationReportRequest) async throws -> ModerationReportResult {
@@ -80,9 +84,9 @@ public struct ModerationServiceAdapter: Sendable {
             throw ModerationServiceAdapterError.invalidReport
         }
         let envelope = try JSONEncoder().encode(RedactedReport(
-            subjectDigest: Hex.encode(SHA256.hash(data: Data(request.subject.utf8))),
+            subjectCorrelation: correlation(for: request.subject),
             reason: request.reason,
-            detailsDigest: request.details.map { Hex.encode(SHA256.hash(data: Data($0.utf8))) }
+            detailsCorrelation: request.details.map { correlation(for: $0) }
         ))
         guard envelope.count <= maximumBodyBytes else { throw ModerationServiceAdapterError.responseTooLarge }
         let response = try await transport.send(.init(host: allowedHost, pinnedPeer: pinnedPeer, path: "/reports", body: envelope, maximumResponseBytes: maximumResponseBytes))
@@ -92,16 +96,20 @@ public struct ModerationServiceAdapter: Sendable {
         return .init(accepted: true, status: response.status)
     }
 
+    private func correlation(for value: String) -> String {
+        Hex.encode(HMAC<SHA256>.authenticationCode(for: Data(value.utf8), using: correlationKey))
+    }
+
     private struct RedactedReport: Codable {
-        let subjectDigest: String
+        let subjectCorrelation: String
         let reason: String
-        let detailsDigest: String?
+        let detailsCorrelation: String?
         let schema: String
 
-        init(subjectDigest: String, reason: String, detailsDigest: String?) {
-            self.subjectDigest = subjectDigest
+        init(subjectCorrelation: String, reason: String, detailsCorrelation: String?) {
+            self.subjectCorrelation = subjectCorrelation
             self.reason = reason
-            self.detailsDigest = detailsDigest
+            self.detailsCorrelation = detailsCorrelation
             schema = "swan.moderation.report.v1"
         }
     }

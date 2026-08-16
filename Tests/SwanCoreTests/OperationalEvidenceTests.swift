@@ -18,7 +18,7 @@ final class OperationalEvidenceTests: XCTestCase {
         XCTAssertFalse(checks.report().ready)
         checks.set(.backup, healthy: true)
         let report = checks.report()
-        XCTAssertTrue(report.ready)
+        XCTAssertFalse(report.ready)
         XCTAssertFalse(report.assembled)
     }
 }

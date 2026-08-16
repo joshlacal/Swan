@@ -9,7 +9,7 @@
     {"method":"com.atproto.sync.listMissingBlobs","capability":"sync-missing-blob-page","intent":"deduplicated bounded missing set","registered":false},
     {"method":"com.atproto.sync.listBlobs","capability":"sync-blob-page","intent":"bounded CID keyset enumeration with since revision","registered":false},
     {"method":"com.atproto.sync.listRepos","capability":"sync-repository-page","intent":"bounded DID keyset enumeration","registered":false},
-    {"method":"repo.import","capability":"transactional-import","intent":"signature/root/CID/blob validation with idempotent request digest and CAS","registered":false},
+    {"method":"com.atproto.repo.importRepo","capability":"transactional-import","intent":"signature/root/CID/blob validation with idempotent request digest and CAS","registered":false},
     {"method":"com.atproto.admin.updateAccountStatus","capability":"operator-admin-lifecycle","intent":"operator authorization and safe audit","registered":false},
     {"method":"moderation.report","capability":"moderation-service-adapter","intent":"allowlisted peer-pinned transport with subject/details digests","registered":false},
     {"method":"ops.readiness","capability":"operational-readiness","intent":"local evidence only; runtime health source unassembled","registered":false}

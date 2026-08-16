@@ -10,7 +10,7 @@ final class ReferenceAdminIdentityTests: XCTestCase {
         let policy = RecordingStepUpPolicy()
         let adapter = ReferencePLCIdentityUpdateAdapter(service: recorder, stepUp: policy)
         let result = try await adapter.update(
-            .init(accountDID: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", requestID: "r1", sessionID: try .init(rawValue: "session-1"), requiredStrength: .password),
+            .init(accountDID: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", requestID: "r1", sessionID: try .init(rawValue: "session-1")),
             now: Date()
         )
         XCTAssertEqual(result.generation, 2)
@@ -26,7 +26,7 @@ final class ReferenceAdminIdentityTests: XCTestCase {
         let policy = RecordingStepUpPolicy(shouldFail: true)
         let adapter = ReferencePLCIdentityUpdateAdapter(service: recorder, stepUp: policy)
         do {
-            _ = try await adapter.update(.init(accountDID: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", requestID: "r2", sessionID: try .init(rawValue: "session-2"), requiredStrength: .password))
+            _ = try await adapter.update(.init(accountDID: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", requestID: "r2", sessionID: try .init(rawValue: "session-2")))
             XCTFail("step-up unexpectedly succeeded")
         } catch { }
         let calls = await recorder.calls
@@ -61,7 +61,7 @@ final class ReferenceAdminIdentityTests: XCTestCase {
 
 private actor ReferencePLCUpdateRecorder: ReferencePLCIdentityUpdateService {
     var calls = 0
-    func updatePLCIdentity(accountDID: String, requestID: String, sessionID: ManagementSessionID, requiredStrength: AuthenticationStrength, now: Date) async throws -> ReferencePLCIdentityUpdateResult {
+    func updatePLCIdentity(accountDID: String, requestID: String, sessionID: ManagementSessionID, minimumStrength: AuthenticationStrength, now: Date) async throws -> ReferencePLCIdentityUpdateResult {
         calls += 1
         return .init(accountDID: accountDID, operationCID: "bafyreibbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", generation: 2)
     }

@@ -85,6 +85,6 @@ public final class OperationalReadiness: @unchecked Sendable {
     public func report() -> OperationalReadinessReport {
         lock.lock(); defer { lock.unlock() }
         let missing = OperationalReadinessCheck.allCases.filter { checks[$0] != true }
-        return .init(assembled: assembled, ready: missing.isEmpty, checks: checks, missing: missing)
+        return .init(assembled: assembled, ready: assembled && missing.isEmpty, checks: checks, missing: missing)
     }
 }

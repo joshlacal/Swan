@@ -9,7 +9,8 @@ final class ModerationServiceAdapterTests: XCTestCase {
             transport: transport,
             allowedHost: "moderation.example",
             pinnedPeer: "sha256/peer",
-            maximumBodyBytes: 256
+            maximumBodyBytes: 256,
+            correlationKey: Data(repeating: 4, count: 32)
         )
         let response = try await adapter.submit(.init(subject: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", reason: "spam", details: "secret details"))
         XCTAssertEqual(response.accepted, true)
@@ -18,8 +19,8 @@ final class ModerationServiceAdapterTests: XCTestCase {
         XCTAssertEqual(path, "/reports")
         XCTAssertFalse(body.contains("did:plc:"))
         XCTAssertFalse(body.contains("secret details"))
-        XCTAssertTrue(body.contains("subjectDigest"))
-        XCTAssertTrue(body.contains("detailsDigest"))
+        XCTAssertTrue(body.contains("subjectCorrelation"))
+        XCTAssertTrue(body.contains("detailsCorrelation"))
     }
 }
 

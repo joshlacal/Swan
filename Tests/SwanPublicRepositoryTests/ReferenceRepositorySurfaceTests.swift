@@ -32,7 +32,7 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
         XCTAssertNotNil(blockPage.cursor)
         XCTAssertEqual(blockPage.missing, [])
 
-        let records = try await surface.listRecords(collection: "app.bsky.feed.post", limit: 1)
+        let records = try await surface.listRecords(collection: "app.bsky.feed.post", limit: 1, reverse: true)
         XCTAssertEqual(records.records.count, 1)
         XCTAssertNotNil(records.cursor)
     }
@@ -116,6 +116,20 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
         XCTAssertEqual(states.count, 0)
     }
 
+    func testImportRejectsUnassembledCommitterBeforeMutation() async throws {
+        let bytes = Data([0xa0])
+        let root = CID.fromDAGCBOR(bytes)
+        let committer = RecordingImportCommitter(durable: false)
+        let verifier = try PublicRepositoryReferenceImportVerifier(maximumBlocks: 2, maximumBytes: 32)
+        let envelope = try PublicRepositoryImportEnvelope(did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", rootCID: root, blocks: [.init(cid: root, bytes: bytes)], signature: Data([1]), requestID: "unassembled", requestDigest: Data(repeating: 3, count: 32))
+        do {
+            _ = try await verifier.verifyAndCommit(envelope, committer: committer) { _, _, _ in true }
+            XCTFail("unassembled committer unexpectedly accepted import")
+        } catch let error as PublicRepositoryReferenceImportError {
+            XCTAssertEqual(error, .unassembled)
+        }
+    }
+
     private func makeBlocks(count: Int) throws -> [PublicRepositoryBlock] {
         try (0..<count).map { index in
             let data = Data([0xa1, 0x61, 0x69, UInt8(index)])
@@ -126,6 +140,8 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
 }
 
 private actor RecordingImportCommitter: PublicRepositoryImportCommitter {
+    let isDurableTransactional: Bool
+    init(durable: Bool = true) { isDurableTransactional = durable }
     var states: [PublicRepositoryImportedState] = []
     private var requests: [String: Data] = [:]
     func commit(_ state: PublicRepositoryImportedState, requestID: String, requestDigest: Data, expectedRootCID: CID?) async throws -> PublicRepositoryImportedState {

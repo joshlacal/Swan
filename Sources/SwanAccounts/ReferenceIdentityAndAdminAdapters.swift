@@ -5,16 +5,14 @@ public struct ReferencePLCIdentityUpdateRequest: Sendable, Equatable {
     public let accountDID: String
     public let requestID: String
     public let sessionID: ManagementSessionID
-    public let requiredStrength: AuthenticationStrength
 
-    public init(accountDID: String, requestID: String, sessionID: ManagementSessionID, requiredStrength: AuthenticationStrength) throws {
+    public init(accountDID: String, requestID: String, sessionID: ManagementSessionID) throws {
         self.accountDID = try AccountIdentifiers.validateDID(accountDID)
         guard !requestID.isEmpty, requestID.utf8.count <= 256, !requestID.contains("\0") else {
             throw SwanError.invalidIdentifier("PLC update request")
         }
         self.requestID = requestID
         self.sessionID = sessionID
-        self.requiredStrength = requiredStrength
     }
 }
 
@@ -31,7 +29,7 @@ public struct ReferencePLCIdentityUpdateResult: Sendable, Equatable {
 }
 
 public protocol ReferencePLCIdentityUpdateService: Sendable {
-    func updatePLCIdentity(accountDID: String, requestID: String, sessionID: ManagementSessionID, requiredStrength: AuthenticationStrength, now: Date) async throws -> ReferencePLCIdentityUpdateResult
+    func updatePLCIdentity(accountDID: String, requestID: String, sessionID: ManagementSessionID, minimumStrength: AuthenticationStrength, now: Date) async throws -> ReferencePLCIdentityUpdateResult
 }
 
 public protocol ReferenceStepUpPolicy: Sendable {
@@ -51,12 +49,13 @@ public struct ReferencePLCIdentityUpdateAdapter: Sendable {
     }
 
     public func update(_ request: ReferencePLCIdentityUpdateRequest, now: Date = Date()) async throws -> ReferencePLCIdentityUpdateResult {
-        try await stepUp.consumeFreshStepUp(sessionID: request.sessionID, accountDID: request.accountDID, requiredStrength: request.requiredStrength, now: now)
+        let minimumStrength: AuthenticationStrength = .passwordPlusTOTP
+        try await stepUp.consumeFreshStepUp(sessionID: request.sessionID, accountDID: request.accountDID, requiredStrength: minimumStrength, now: now)
         return try await service.updatePLCIdentity(
             accountDID: request.accountDID,
             requestID: request.requestID,
             sessionID: request.sessionID,
-            requiredStrength: request.requiredStrength,
+            minimumStrength: minimumStrength,
             now: now
         )
     }

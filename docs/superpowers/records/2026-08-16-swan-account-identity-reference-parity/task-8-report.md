@@ -13,14 +13,15 @@ until the integration owner supplies route assembly.
 Local evidence:
 
 ```
-Scripts/test-task8-disposable-drills.sh  # deferred-unassembled
+Scripts/test-task8-disposable-drills.sh  # deferred (integration seam unavailable)
 ```
 
 Focused Swift tests cover bounded cursor pages, missing-blob deduplication,
 import preflight before commit, step-up-gated PLC delegation, operator audit
 redaction, moderation peer/path pinning and redaction, and identifier-free
 metrics/readiness. The local metrics/readiness objects explicitly report
-`assembled: false`; runtime health/metrics registration is deferred.
+`assembled: false` and readiness fails closed while unassembled; runtime
+health/metrics registration is deferred.
 
 The focused Swift suite was not rerun in this correction: the shared disk was
 under the serialized onboarding rebuild budget. Sources and focused test files

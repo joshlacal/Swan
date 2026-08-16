@@ -9,6 +9,7 @@ public enum PublicRepositoryReferenceSurfaceError: Error, Sendable, Equatable {
     case missingBlock
     case invalidBinding
     case duplicatePath
+    case duplicateRepository
 }
 
 public struct PublicRepositorySyncRepository: Sendable, Equatable {
@@ -96,7 +97,9 @@ public actor PublicRepositoryReferenceSurface {
         // block when a caller does not provide a multi-repository fixture.
         let fallbackHead = blocks.first?.cid ?? repository.head
         let fallback = try PublicRepositorySyncRepository(did: did, head: fallbackHead, rev: revision)
-        self.repositories = (repositories ?? [fallback]).sorted { $0.did < $1.did }
+        let candidateRepositories = repositories ?? [fallback]
+        guard Set(candidateRepositories.map(\.did)).count == candidateRepositories.count else { throw PublicRepositoryReferenceSurfaceError.duplicateRepository }
+        self.repositories = candidateRepositories.sorted { $0.did < $1.did }
         self.blocks = Dictionary(uniqueKeysWithValues: map.cids.compactMap { cid in map.block(for: cid).map { (cid, $0) } })
         var recordMap: [PublicRepositoryPath: CID] = [:]
         for entry in records {
@@ -117,11 +120,13 @@ public actor PublicRepositoryReferenceSurface {
     private let blobCIDs: Set<CID>
     private let blobRevisions: [CID: String]
 
-    public func listRepos(limit: Int = 100, cursor: String? = nil) throws -> PublicRepositorySyncRepoPage {
+    public func listRepos(limit: Int = 100, cursor: String? = nil, reverse: Bool = false) throws -> PublicRepositorySyncRepoPage {
         guard (1...maximumPageSize).contains(limit) else { throw PublicRepositoryReferenceSurfaceError.invalidLimit }
-        let values = repositories.filter { repo in cursor.map { repo.did > $0 } ?? true }.prefix(limit)
+        let decodedCursor = try decodeCursor(cursor)
+        let ordered = reverse ? Array(repositories.reversed()) : repositories
+        let values = ordered.filter { repo in decodedCursor.map { reverse ? repo.did < $0 : repo.did > $0 } ?? true }.prefix(limit)
         let page = Array(values)
-        let next = page.count == limit && repositories.contains(where: { $0.did > (page.last?.did ?? "") }) ? page.last?.did : nil
+        let next = page.count == limit && ordered.contains(where: { reverse ? $0.did < (page.last?.did ?? "") : $0.did > (page.last?.did ?? "") }) ? encodeCursor(page.last?.did ?? "") : nil
         return .init(repos: page, cursor: next)
     }
 
@@ -142,28 +147,37 @@ public actor PublicRepositoryReferenceSurface {
         return .init(path: path, cid: cid, bytes: bytes)
     }
 
-    public func listRecords(collection: String, limit: Int = 100, cursor: String? = nil) throws -> PublicRepositorySyncRecordPage {
-        let values = records.keys.sorted { $0.mstKey < $1.mstKey }
+    public func listRecords(collection: String, limit: Int = 100, cursor: String? = nil, reverse: Bool = false) throws -> PublicRepositorySyncRecordPage {
+        guard (try? PublicRepositoryPath(collection: collection, recordKey: "_")) != nil else { throw PublicRepositoryReferenceSurfaceError.invalidBinding }
+        let decodedCursor = try decodeCursor(cursor)
+        let ordered = records.keys.sorted { reverse ? $0.mstKey > $1.mstKey : $0.mstKey < $1.mstKey }
+        let candidates = ordered
             .filter { path in
                 guard path.collection == collection else { return false }
-                return cursor.map { path.mstKey > $0 } ?? true
+                return decodedCursor.map { reverse ? path.mstKey < $0 : path.mstKey > $0 } ?? true
             }
-            .prefix(try validatedLimit(limit))
-            .compactMap { path in records[path].flatMap { cid in blocks[cid].map { PublicRepositorySyncRecord(path: path, cid: cid, bytes: $0) } } }
-        let page = Array(values)
-        let next = page.count == limit && records.keys.contains(where: { $0.collection == collection && $0.mstKey > (page.last?.path.mstKey ?? "") }) ? page.last?.path.mstKey : nil
+        let selected = Array(candidates.prefix(try validatedLimit(limit)))
+        var page: [PublicRepositorySyncRecord] = []
+        for path in selected {
+            guard let cid = records[path], let bytes = blocks[cid] else { throw PublicRepositoryReferenceSurfaceError.missingBlock }
+            page.append(.init(path: path, cid: cid, bytes: bytes))
+        }
+        let boundary = page.last?.path.mstKey ?? ""
+        let next = page.count == limit && ordered.contains(where: { $0.collection == collection && (reverse ? $0.mstKey < boundary : $0.mstKey > boundary) }) ? encodeCursor(boundary) : nil
         return .init(records: page, cursor: next)
     }
 
-    public func listBlobs(limit: Int = 100, since: String? = nil, cursor: String? = nil) throws -> PublicRepositorySyncBlobPage {
+    public func listBlobs(limit: Int = 100, since: String? = nil, cursor: String? = nil, reverse: Bool = false) throws -> PublicRepositorySyncBlobPage {
         if let since { _ = try PublicRepositoryTID(since) }
-        let values = blobCIDs.sorted { $0.description < $1.description }.filter { cid in
-            let afterCursor = cursor.map { cid.description > $0 } ?? true
+        let decodedCursor = try decodeCursor(cursor)
+        let values = blobCIDs.sorted { reverse ? $0.description > $1.description : $0.description < $1.description }.filter { cid in
+            let afterCursor = decodedCursor.map { reverse ? cid.description < $0 : cid.description > $0 } ?? true
             let afterRevision = since.map { blobRevisions[cid].map { $0 > $1 } ?? false } ?? true
             return afterCursor && afterRevision
         }
         let page = Array(values.prefix(try validatedLimit(limit)))
-        let next = page.count == limit && values.contains(where: { $0.description > (page.last?.description ?? "") }) ? page.last?.description : nil
+        let boundary = page.last?.description ?? ""
+        let next = page.count == limit && values.contains(where: { reverse ? $0.description < boundary : $0.description > boundary }) ? encodeCursor(boundary) : nil
         return .init(blobs: page, cursor: next)
     }
 
@@ -189,6 +203,19 @@ public actor PublicRepositoryReferenceSurface {
     private func validatedLimit(_ limit: Int) throws -> Int {
         guard (1...maximumPageSize).contains(limit) else { throw PublicRepositoryReferenceSurfaceError.invalidLimit }
         return limit
+    }
+
+    private func encodeCursor(_ value: String) -> String {
+        Data(value.utf8).base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+    }
+
+    private func decodeCursor(_ cursor: String?) throws -> String? {
+        guard let cursor else { return nil }
+        guard !cursor.isEmpty, cursor.utf8.count <= 2_048, cursor.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }) else { throw PublicRepositoryReferenceSurfaceError.invalidCursor }
+        var value = cursor.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        value += String(repeating: "=", count: (4 - value.count % 4) % 4)
+        guard let data = Data(base64Encoded: value), let decoded = String(data: data, encoding: .utf8), !decoded.isEmpty else { throw PublicRepositoryReferenceSurfaceError.invalidCursor }
+        return decoded
     }
 
     private func nextCursor(end: Int, count: Int) -> String? { end < count ? String(end) : nil }
