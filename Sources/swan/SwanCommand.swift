@@ -2024,6 +2024,80 @@ extension SwanCommand {
         @Option(name: .customLong("email-worker-id"), help: "Stable durable lease owner for the account-email worker")
         var emailWorkerID: String?
 
+        // MARK: Account program startup configuration (Task 2)
+
+        @Flag(
+            name: .customLong("enable-account-portal"),
+            help: "Enable the static account portal and its /account/** API surface"
+        )
+        var enableAccountPortal = false
+
+        @Option(
+            name: .customLong("account-portal-directory"),
+            help: "Directory containing the compiled account portal assets (container default: /usr/local/share/swan/account)"
+        )
+        var accountPortalDirectory: String?
+
+        @Option(
+            name: .customLong("signup-policy"),
+            help: "Signup admission policy: closed, inviteRequired, or openProtected (default: closed)"
+        )
+        var signupPolicy: String?
+
+        @Option(
+            name: .customLong("turnstile-secret-file"),
+            help: "Owner-only mounted Turnstile siteverify secret required by --signup-policy openProtected"
+        )
+        var turnstileSecretFile: String?
+
+        @Option(
+            name: .customLong("email-smtp-mode"),
+            help: "Authenticated SMTP mode: startTLS, implicitTLS, or plaintextLab; omit to use the Mailpit laboratory default"
+        )
+        var emailSMTPMode: String?
+
+        @Option(
+            name: .customLong("email-smtp-username-file"),
+            help: "Owner-only mounted SMTP username file required by startTLS and implicitTLS modes"
+        )
+        var emailSMTPUsernameFile: String?
+
+        @Option(
+            name: .customLong("email-smtp-password-file"),
+            help: "Owner-only mounted SMTP password file required by startTLS and implicitTLS modes"
+        )
+        var emailSMTPPasswordFile: String?
+
+        @Option(
+            name: .customLong("email-smtp-mechanism"),
+            help: "SMTP authentication mechanism: plain, login, or xoauth2 (required by startTLS and implicitTLS modes)"
+        )
+        var emailSMTPMechanism: String?
+
+        @Option(
+            name: .customLong("email-smtp-expected-hostname"),
+            help: "TLS certificate hostname expected from the SMTP server (required by startTLS and implicitTLS modes)"
+        )
+        var emailSMTPExpectedHostname: String?
+
+        @Option(
+            name: .customLong("email-smtp-max-attempts"),
+            help: "Bounded SMTP delivery attempts (default: 3)"
+        )
+        var emailSMTPMaxAttempts: Int?
+
+        @Option(
+            name: .customLong("did-web-revalidation-interval-seconds"),
+            help: "did:web background revalidation interval in seconds (default: 3600)"
+        )
+        var didWebRevalidationIntervalSeconds: Int = 3600
+
+        @Option(
+            name: .customLong("did-web-revalidation-grace-seconds"),
+            help: "did:web revalidation grace period in seconds (default: 86400)"
+        )
+        var didWebRevalidationGraceSeconds: Int = 86_400
+
         @Option(
             name: .customLong("managing-service-audience"),
             help: "Explicit service-JWT audience for com.atproto.simplespace.checkUserAccess"
@@ -2334,6 +2408,179 @@ extension SwanCommand {
             )
         }
 
+        // MARK: - Account program startup configuration (Task 2)
+
+        /// The container default for the compiled account portal assets. The
+        /// runtime image copies `web/build` to this exact path, so an
+        /// unconfigured `--enable-account-portal` deployment resolves here.
+        static let defaultAccountPortalDirectory = "/usr/local/share/swan/account"
+
+        /// Parses the `--signup-policy` option into the one `SignupPolicy`
+        /// that governs both the portal advertisement and
+        /// `SwanHTTPConfiguration.inviteCodeRequired`. An unrecognized value
+        /// is a startup refusal, never a silent fallback to `closed`.
+        static func parseSignupPolicy(_ raw: String?) throws -> SignupPolicy {
+            guard let raw else { return .closed }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let policy = SignupPolicy(rawValue: trimmed) else {
+                throw ValidationError(
+                    "--signup-policy must be one of closed, inviteRequired, or openProtected"
+                )
+            }
+            return policy
+        }
+
+        /// Resolves `--account-portal-directory` to the container default when
+        /// omitted, and validates an explicit override as an existing
+        /// directory. The default is deliberately not probed: the container
+        /// path is a deployment fact, and a local process that enables the
+        /// portal without mounting assets must fail at the first asset read
+        /// rather than at startup.
+        static func resolveAccountPortalDirectory(_ raw: String?) throws -> URL {
+            let path = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let path, !path.isEmpty else {
+                return URL(fileURLWithPath: defaultAccountPortalDirectory)
+            }
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(
+                atPath: path,
+                isDirectory: &isDirectory
+            ), isDirectory.boolValue else {
+                throw ValidationError(
+                    "--account-portal-directory must name an existing directory"
+                )
+            }
+            return URL(fileURLWithPath: path)
+        }
+
+        /// Validates an HTTPS public origin for the portal and the did:web
+        /// claim endpoint, reusing `SwanAccountPortalConfiguration`'s origin
+        /// validation so the two surfaces cannot drift apart.
+        static func validateHTTPSOrigin(_ url: URL, option: String) throws {
+            do {
+                _ = try SwanAccountPortalConfiguration(
+                    publicOrigin: url,
+                    staticDirectory: URL(fileURLWithPath: "/")
+                )
+            } catch {
+                throw ValidationError("\(option) must be an HTTPS origin")
+            }
+        }
+
+        /// Parses the `--email-smtp-mode` option. `nil` selects the Mailpit
+        /// laboratory default; an explicit mode is a refusal when it is not
+        /// one of the three supported values.
+        static func parseSMTPMode(_ raw: String?) throws -> SMTPMode? {
+            guard let raw else { return nil }
+            switch raw.trimmingCharacters(in: .whitespacesAndNewlines) {
+            case "startTLS": return .startTLS
+            case "implicitTLS": return .implicitTLS
+            case "plaintextLab": return .plaintextLab
+            default:
+                throw ValidationError(
+                    "--email-smtp-mode must be one of startTLS, implicitTLS, or plaintextLab"
+                )
+            }
+        }
+
+        /// Parses the `--email-smtp-mechanism` option.
+        static func parseSMTPMechanism(_ raw: String?) throws -> SMTPAuthMechanism? {
+            guard let raw else { return nil }
+            switch raw.trimmingCharacters(in: .whitespacesAndNewlines) {
+            case "plain": return .plain
+            case "login": return .login
+            case "xoauth2": return .xoauth2
+            default:
+                throw ValidationError(
+                    "--email-smtp-mechanism must be one of plain, login, or xoauth2"
+                )
+            }
+        }
+
+        /// Reads an SMTP credential from an owner-only mounted file. The
+        /// value is never echoed into descriptions, logs, errors, or test
+        /// snapshots; only the file path is validated here.
+        static func readMountedSMTPCredential(
+            file: String?,
+            option: String
+        ) throws -> String? {
+            guard let file else { return nil }
+            let trimmed = file.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                throw ValidationError("\(option) must not be empty")
+            }
+            let data = try readBoundedRegularFileNoFollow(
+                URL(fileURLWithPath: trimmed),
+                maximumBytes: 4 * 1_024,
+                validationMessage: "\(option) is unavailable"
+            )
+            var normalized = data
+            if normalized.last == 0x0A {
+                normalized.removeLast()
+                if normalized.last == 0x0D {
+                    normalized.removeLast()
+                }
+            }
+            guard !normalized.isEmpty,
+                  !normalized.contains(0),
+                  let value = String(data: normalized, encoding: .utf8) else {
+                throw ValidationError("\(option) is invalid")
+            }
+            return value
+        }
+
+        /// Resolves the authenticated SMTP configuration from the parsed
+        /// options. `nil` mode selects the Mailpit laboratory default (the
+        /// existing `--enable-email-recovery` path); an explicit non-lab mode
+        /// without the full username/password/mechanism/expected-hostname set
+        /// is a refusal, never a silent fallback to Mailpit.
+        static func resolveAuthenticatedSMTPConfiguration(
+            mode: SMTPMode?,
+            host: String?,
+            port: Int?,
+            usernameFile: String?,
+            passwordFile: String?,
+            mechanism: SMTPAuthMechanism?,
+            expectedHostname: String?,
+            maximumAttempts: Int?
+        ) throws -> AuthenticatedSMTPConfiguration? {
+            guard let mode else { return nil }
+            let username = try readMountedSMTPCredential(
+                file: usernameFile,
+                option: "--email-smtp-username-file"
+            )
+            let password = try readMountedSMTPCredential(
+                file: passwordFile,
+                option: "--email-smtp-password-file"
+            )
+            do {
+                return try AuthenticatedSMTPConfiguration(
+                    host: host?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "mailpit",
+                    port: port ?? 1025,
+                    mode: mode,
+                    username: username,
+                    password: password,
+                    mechanism: mechanism,
+                    expectedHostname: expectedHostname?.trimmingCharacters(in: .whitespacesAndNewlines),
+                    maximumAttempts: maximumAttempts ?? 3
+                )
+            } catch {
+                throw ValidationError(
+                    "--email-smtp-mode \(Self.smtpModeName(mode)) requires an owner-only --email-smtp-username-file, --email-smtp-password-file, --email-smtp-mechanism, and --email-smtp-expected-hostname"
+                )
+            }
+        }
+
+        /// Renders an SMTP mode for operator-facing messages without exposing
+        /// any credential material.
+        static func smtpModeName(_ mode: SMTPMode) -> String {
+            switch mode {
+            case .startTLS: "startTLS"
+            case .implicitTLS: "implicitTLS"
+            case .plaintextLab: "plaintextLab"
+            }
+        }
+
         func run() async throws {
             guard (1 ... 1_000_000).contains(spaceOplogRetention) else {
                 throw ValidationError(
@@ -2426,9 +2673,13 @@ extension SwanCommand {
             if !enableEmailRecovery {
                 guard emailProofKeyFile == nil,
                       emailSender == nil,
-                      emailSMTPHost == nil,
-                      emailSMTPPort == nil,
-                      emailWorkerID == nil else {
+                      emailWorkerID == nil,
+                      // `--email-smtp-host`/`--email-smtp-port` are shared
+                      // with the account program's authenticated SMTP
+                      // configuration, so they are exempt when that surface
+                      // is enabled.
+                      (emailSMTPHost == nil && emailSMTPPort == nil)
+                        || enableAccountPortal else {
                     throw ValidationError(
                         "email recovery options require --enable-email-recovery"
                     )
@@ -2450,6 +2701,76 @@ extension SwanCommand {
                     )
                 }
             }
+            // Account program startup configuration (Task 2). All refusals
+            // run before any storage, key store, or listener exists.
+            // The resolved portal directory is validated here; Task 5 consumes
+            // it when it constructs the portal service.
+            let accountPortalDirectoryURL = try Self.resolveAccountPortalDirectory(
+                accountPortalDirectory
+            )
+            let signupPolicy = try Self.parseSignupPolicy(signupPolicy)
+            if !enableAccountPortal {
+                guard accountPortalDirectory == nil,
+                      signupPolicy == nil,
+                      turnstileSecretFile == nil,
+                      emailSMTPMode == nil,
+                      emailSMTPUsernameFile == nil,
+                      emailSMTPPasswordFile == nil,
+                      emailSMTPMechanism == nil,
+                      emailSMTPExpectedHostname == nil,
+                      emailSMTPMaxAttempts == nil,
+                      didWebRevalidationIntervalSeconds == 3600,
+                      didWebRevalidationGraceSeconds == 86_400 else {
+                    throw ValidationError(
+                        "account program options require --enable-account-portal"
+                    )
+                }
+            } else {
+                guard (1 ... 86_400).contains(didWebRevalidationIntervalSeconds) else {
+                    throw ValidationError(
+                        "--did-web-revalidation-interval-seconds must be from 1 through 86400"
+                    )
+                }
+                guard (1 ... 86_400).contains(didWebRevalidationGraceSeconds) else {
+                    throw ValidationError(
+                        "--did-web-revalidation-grace-seconds must be from 1 through 86400"
+                    )
+                }
+                if signupPolicy == .openProtected {
+                    guard let turnstileSecretFile,
+                          !turnstileSecretFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw ValidationError(
+                            "--signup-policy openProtected requires an owner-only --turnstile-secret-file"
+                        )
+                    }
+                    guard emailSMTPMode != nil else {
+                        throw ValidationError(
+                            "--signup-policy openProtected requires --email-smtp-mode"
+                        )
+                    }
+                } else {
+                    guard turnstileSecretFile == nil else {
+                        throw ValidationError(
+                            "--turnstile-secret-file requires --signup-policy openProtected"
+                        )
+                    }
+                }
+            }
+            let smtpMode = try Self.parseSMTPMode(emailSMTPMode)
+            let smtpMechanism = try Self.parseSMTPMechanism(emailSMTPMechanism)
+            // Resolved and validated here so an incomplete authenticated SMTP
+            // configuration is a startup refusal; Task 3 consumes the value
+            // when it assembles the signup email worker.
+            _ = try Self.resolveAuthenticatedSMTPConfiguration(
+                mode: smtpMode,
+                host: emailSMTPHost,
+                port: emailSMTPPort,
+                usernameFile: emailSMTPUsernameFile,
+                passwordFile: emailSMTPPasswordFile,
+                mechanism: smtpMechanism,
+                expectedHostname: emailSMTPExpectedHostname,
+                maximumAttempts: emailSMTPMaxAttempts
+            )
             guard !enableManagementPLCProvisioning || managementPort != nil else {
                 throw ValidationError("--enable-management-plc-provisioning requires --management-port")
             }
@@ -2532,6 +2853,15 @@ extension SwanCommand {
                baseURL.scheme?.lowercased() != "https" {
                 throw ValidationError(
                     "--enable-local-space-interop requires an HTTPS --public-url"
+                )
+            }
+            // The account portal and the did:web claim endpoint are served
+            // from the same public origin; both require an HTTPS origin
+            // (reusing `SwanAccountPortalConfiguration`'s validation).
+            if enableAccountPortal {
+                try Self.validateHTTPSOrigin(
+                    baseURL,
+                    option: "--public-url"
                 )
             }
             // Both laboratory interlocks run here: after the public origin is
@@ -3281,6 +3611,11 @@ extension SwanCommand {
                         // `PublicFirehoseSubscriberAdmission` takes as a
                         // quarter of it.
                         maximumConnections: maxConnections,
+                        // Spec §4.1: `describeServer.inviteCodeRequired` is
+                        // derived as `policy == .inviteRequired` and is never
+                        // set independently. The same parsed policy drives the
+                        // portal advertisement.
+                        inviteCodeRequired: signupPolicy == .inviteRequired,
                         publicRouteSurface: publicRouteSurface
                     ),
                     oauthRuntime: oauthRuntime,

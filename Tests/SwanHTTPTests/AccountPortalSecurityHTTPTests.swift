@@ -179,7 +179,11 @@ final class AccountPortalSecurityHTTPTests: XCTestCase, @unchecked Sendable {
                 configuration: .init(
                     host: "127.0.0.1",
                     port: 3_000,
-                    publicURL: URL(string: "https://swan.example")!
+                    publicURL: URL(string: "https://swan.example")!,
+                    // Mirrors the CLI derivation (spec §4.1): the
+                    // configuration value is derived from the same policy the
+                    // portal advertises, never set independently.
+                    inviteCodeRequired: policy == .inviteRequired
                 ),
                 oauthRuntime: runtime,
                 accountPortalHTTP: portal

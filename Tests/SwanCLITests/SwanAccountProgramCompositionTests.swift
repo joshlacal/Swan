@@ -299,7 +299,6 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
         signupPolicy: SignupPolicy = .closed,
         installPipethrough: Bool = false,
         installFirehose: Bool = false,
-        inviteCodeRequired: Bool = false,
         publicURL: URL = URL(string: "https://swan.example")!,
         port: Int = 3000
     ) async throws -> CompositionFixture {
@@ -407,7 +406,10 @@ final class SwanAccountProgramCompositionTests: XCTestCase, @unchecked Sendable 
                     host: "127.0.0.1",
                     port: port,
                     publicURL: publicURL,
-                    inviteCodeRequired: inviteCodeRequired,
+                    // Mirrors the CLI derivation (spec §4.1): the
+                    // configuration value is derived from the same policy the
+                    // portal advertises, never set independently.
+                    inviteCodeRequired: signupPolicy == .inviteRequired,
                     publicRouteSurface: .default
                 ),
                 oauthRuntime: oauthRuntime,
