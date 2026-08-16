@@ -59,11 +59,11 @@ public enum TOTPAuthenticator {
         guard value.utf8.count <= 512 else { throw MFAError.invalidCode }
         let normalized = value.replacingOccurrences(of: "=", with: "").replacingOccurrences(of: " ", with: "").uppercased()
         let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
-        var output: [UInt8] = []; var buffer = 0; var bits = 0
+        var output: [UInt8] = []; var buffer: UInt32 = 0; var bits = 0
         for character in normalized {
             guard let index = alphabet.firstIndex(of: character) else { throw MFAError.invalidCode }
-            buffer = (buffer << 5) | index; bits += 5
-            if bits >= 8 { bits -= 8; output.append(UInt8((buffer >> bits) & 0xff)) }
+            buffer = (buffer << 5) | UInt32(index); bits += 5
+            if bits >= 8 { bits -= 8; output.append(UInt8((buffer >> UInt32(bits)) & 0xff)); buffer &= bits == 0 ? 0 : (UInt32(1) << UInt32(bits)) - 1 }
         }
         guard bits < 5, (bits == 0 || (buffer & ((1 << bits) - 1)) == 0) else { throw MFAError.invalidCode }
         return Data(output)

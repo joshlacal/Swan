@@ -77,7 +77,8 @@ extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, Rec
     }
 
     public func webAuthnCredential(credentialIDDigest: Data, accountDID: String, now: Date) async throws -> WebAuthnCredentialMetadata? {
-        try await withConnectionGate { let rows = try await connection.query("SELECT credential_id_digest, account_did, factor_id, public_key_reference, sign_count, transports, created_at, last_used_at, disabled_at FROM webauthn_credentials WHERE credential_id_digest = ? AND account_did = ?", [credentialIDDigest.sqliteData!, .text(accountDID)]); guard let row = rows.first else { return nil }; return try decodeCredential(row) }
+        // Future-created credentials are corrupt and never usable.
+        try await withConnectionGate { let rows = try await connection.query("SELECT credential_id_digest, account_did, factor_id, public_key_reference, sign_count, transports, created_at, last_used_at, disabled_at FROM webauthn_credentials WHERE credential_id_digest = ? AND account_did = ?", [credentialIDDigest.sqliteData!, .text(accountDID)]); guard let row = rows.first else { return nil }; let value = try decodeCredential(row); guard value.createdAt <= now else { throw AccountControlStoreError.malformedRecord }; return value }
     }
 
     public func compareAndSwapWebAuthnSignCount(_ update: WebAuthnSignCountUpdate) async throws -> WebAuthnSignCountUpdateOutcome {
