@@ -131,7 +131,8 @@ public struct SwanXRPCProxyRouter: Sendable {
             // does not proxy is unrouted whether or not the client named a
             // destination, and it reports the same 404 an unknown namespace
             // gets so this cannot be used to enumerate what Swan reserves.
-            guard GeneratedLegacyMethodRegistry.declarations[nsid] != nil
+            guard let disposition = GeneratedLegacyMethodRegistry.routing[nsid],
+                  disposition != .local
             else {
                 throw SwanXRPCProxyRoutingFailure.unrouted
             }
@@ -151,7 +152,7 @@ public struct SwanXRPCProxyRouter: Sendable {
         // admissible set is narrower still than `proxyablePrefixes`: only the
         // AppView's own namespace. `chat.bsky.` and `tools.ozone.` live at
         // other services and a client must name them explicitly.
-        guard GeneratedLegacyMethodRegistry.declarations[nsid] != nil,
+        guard GeneratedLegacyMethodRegistry.routing[nsid] == .proxyDefault,
               nsid.hasPrefix(Self.appViewPrefix) else {
             throw SwanXRPCProxyRoutingFailure.unrouted
         }

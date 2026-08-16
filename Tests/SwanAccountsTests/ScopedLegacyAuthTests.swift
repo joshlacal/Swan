@@ -92,6 +92,15 @@ final class ScopedLegacyAuthTests: XCTestCase {
         )
         XCTAssertFalse(GeneratedLegacyMethodRegistry.declarations.keys.contains("com.atproto.server.createSession"))
         XCTAssertFalse(GeneratedLegacyMethodRegistry.declarations.keys.contains("app.bsky.actor.defs"))
+        XCTAssertEqual(GeneratedLegacyMethodRegistry.declarations.count, 193)
+        XCTAssertEqual(GeneratedLegacyMethodRegistry.sourceDigest, "fc9ba90293fbe238224c0cf7456d3ea83750adf1ef1c63727be9fdea8c38f605")
+        for (method, scopes) in GeneratedLegacyMethodRegistry.declarations {
+            XCTAssertTrue(DeclaredMethodScopePolicy.isCanonicalMethod(method))
+            for scope in scopes { XCTAssertNoThrow(try SwanScope.parse(scope)) }
+        }
+        XCTAssertTrue(GeneratedLegacyMethodRegistry.routing["com.atproto.repo.getRecord"] == .local)
+        XCTAssertTrue(GeneratedLegacyMethodRegistry.routing["app.bsky.feed.getFeed"] == .proxyDefault)
+        XCTAssertTrue(GeneratedLegacyMethodRegistry.routing["com.atproto.moderation.createReport"] == .proxyExplicit)
     }
 
     func testAppPasswordSecretPresentedOnceAndScopeEditRevokesDerivedSession() async throws {
