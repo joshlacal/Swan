@@ -178,7 +178,7 @@ final class ScopedLegacyAuthTests: XCTestCase {
         do { _ = try await service.createAppPassword(accountDID: "did:plc:alice", name: "bad", scopes: ["repo:read"]); XCTFail("missing management proof must deny") } catch { }
     }
 
-    func testSQLiteBackedSessionFamilySurvivesRestartAndReplayRevocationHolds() async throws {
+    func testSQLiteBackedSessionFamilySurvivesRestartAndAppPasswordRevocationHolds() async throws {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "ScopedLegacyAuthTests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
