@@ -23,7 +23,12 @@ permanent product boundary.
 * OAuth and app passwords share one grammar/evaluator. `rpc:*?aud=*` is
   rejected, audience matching strips fragments, dot-boundary prefix matching is
   used, undeclared routes fail closed, and every non-full-access
-  `getServiceAuth` request requires a matching `lxm` and `aud`.
+  `getServiceAuth` request requires a matching `lxm` and `aud`. Authentication
+  runs first, then canonical method-policy evaluation, and only then may a
+  handler or service-token mint run. Empty, missing, malformed, and undeclared
+  scope requests deny. The only full-access value is the explicit internal
+  `ScopeGrant.fullAccessV1` sentinel; empty scope and `atproto` are not full
+  access, and no app-password or OAuth flow may widen to the sentinel.
 * Scope is validated at issuance, refresh re-derives current scope from the
   app-password row, refresh never widens, and a denial names the required scope
   in a machine-readable `403`.
@@ -46,6 +51,12 @@ step-up. Revoking “all others” preserves the current management session.
 Revoking an app password revokes all sessions derived from it. Failure behavior,
 cookie/CSRF/Origin checks, and rate bounds are defined centrally in the
 authoritative design and must not be re-specified by a lane.
+
+When MFA is enabled, account-password management/OAuth/legacy login requires a
+valid `authFactorToken` before a full session/token is minted. An app-password
+login remains a scoped legacy alternative only; it cannot create management or
+OAuth credentials. Recovery/email proof can revoke sessions or start password
+recovery, but cannot remove factors or authorize identity or deletion.
 
 ## Presets retained for implementation
 

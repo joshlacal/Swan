@@ -35,29 +35,29 @@ and double-submit CSRF; it is not copied as implementation.
 
 ## 2. Four-release program
 
-The releases are dependency boundaries, not deployment approvals. Each release
-must have a sealed jj checkpoint and local evidence before the next begins.
+The approved milestones are fixed product boundaries, not deployment approvals.
+Dependencies may be staged internally, but implementation notes must not move
+features between milestones. Each milestone gets a sealed jj checkpoint and
+local evidence before the next begins.
 
-1. **Secure account plane (Tasks 2 and the account-API portion of Task 6).**
-   Freeze shared identity/session/factor contracts, additive bounded control
-   tables, management sessions, exact API routing, static-asset isolation, and
-   the account portal shell.
-2. **Onboarding and identity (Tasks 3 and 4).** Implement PLC and externally
-   controlled `did:web` bindings, policy-driven signup, invite/email proof,
-   authenticated SMTP, account lifecycle, and reference-compatible lifecycle
-   adapters.
-3. **Credential and authentication strength (Tasks 5 and 7).** Implement
-   scoped app passwords and legacy sessions as a sibling credential family,
-   then passkeys, TOTP, recovery codes, and fresh step-up.
-4. **Parity and operational evidence (Tasks 8 and 9).** Add remaining reference
-   methods, moderation/metrics/backup evidence, integrate in dependency order,
-   and record unexecuted network/deployment gates. No release is a production
-   cutover.
+1. **M1 — compatibility + portal.** This milestone includes signup policy,
+   invites and email recovery/proof, PLC and BYO `did:web`, legacy sessions,
+   scoped app passwords, and the complete static account portal. Shared
+   contracts and migrations are prerequisites, not a separate product
+   milestone.
+2. **M2 — MFA.** This milestone includes passkeys, TOTP, recovery codes,
+   authentication-strength rules, and fresh step-up enforcement across M1
+   management, OAuth, legacy-password, and sensitive account operations.
+3. **M3 — remaining reference breadth.** This milestone includes identity,
+   repo/sync, admin, moderation, and other reference-compatible API breadth
+   not required to complete M1 or M2.
+4. **M4 — operations.** This milestone includes metrics/readiness, backup and
+   restore drills, rotation/recovery evidence, Linux/browser/client/network
+   acceptance artifacts, and final integration/handoff.
 
-The 2026-08-12 UI draft is therefore expanded from “credentials only” into the
-full portal in Release 1–3. The scoped-password draft remains the legacy-auth
-contract, but its implementation is sequenced with MFA and consumes the shared
-contracts from Release 1; it is not a reason to widen OAuth or cookie-authenticate
+No milestone is a production cutover. The 2026-08-12 UI draft is expanded from
+“credentials only” into the M1 portal, and the scoped-password draft is the M1
+legacy-auth contract. Neither permits widening OAuth or cookie-authenticating
 XRPC.
 
 ## 3. Account HTTP contract
@@ -71,6 +71,7 @@ runtime or SvelteKit server.
 | Method and path | Authentication | Purpose |
 |---|---|---|
 | `GET /account` and `GET /account/*` | none | Static portal shell/fallback. |
+| `GET /account/api/bootstrap` | pre-auth | Issues/refreshes a pre-auth CSRF cookie and returns its one-time bootstrap token; no account data or session is returned. |
 | `GET /account/api/signup/policy` | none | Exact advertised `SignupPolicy`, allowed handle domains, and enabled capabilities. |
 | `POST /account/api/signup/email/request` | none | Rate-limited verification-email request; always generic `202` for syntactically valid input. |
 | `POST /account/api/signup/authorize` | none | Validates policy proof and returns a short-lived, one-time `verificationCode` bound to the submitted handle/email/identity. |
@@ -110,18 +111,26 @@ legacy session, app password, or browser OAuth-consent cookie.
 * Session cookie: `__Secure-swan_management`, `HttpOnly; Secure;
   SameSite=Strict; Path=/account`, no `Domain`, bounded idle and absolute
   lifetimes, and rotation on login and privilege transition.
-* CSRF cookie: `swan_csrf`, `Secure; SameSite=Strict; Path=/account`, no
-  `Domain`, non-HttpOnly solely so the portal can echo it as
-  `X-Swan-CSRF`. The server compares cookie/header values in constant time;
-  the token is rotated with the management session.
-* Every state-changing `/account/api/*` request requires JSON content type,
-  an `Origin` exactly equal to the configured public URL origin (scheme,
-  host, and effective port), and matching CSRF cookie/header. Missing origin
-  is rejected; the API is not a cross-origin programmatic interface. Safe
-  `GET` requests do not require CSRF but still authenticate the cookie.
-* If present, `Sec-Fetch-Site` must be `same-origin` or `none`; `same-site`,
-  `cross-site`, and malformed values are rejected for mutations. CORS is not
-  enabled and no credentialed wildcard response is allowed.
+* Pre-auth bootstrap cookie: `swan_csrf_pre`, `Secure; SameSite=Strict;
+  Path=/account`, no `Domain`, non-HttpOnly solely so the portal can echo it
+  as `X-Swan-CSRF`. `GET /account/api/bootstrap` returns the matching token;
+  the token is short-lived, single-use for a successful authentication or
+  signup commit, and may be refreshed without account disclosure. If an
+  `Origin` is present on bootstrap it must equal the configured public origin;
+  a present `Sec-Fetch-Site` must be `same-origin` or `none`.
+* Every `POST`/`PUT`/`PATCH`/`DELETE` under `/account/api/*`, including login,
+  email request, signup authorization, and final signup, requires JSON content
+  type, an `Origin` exactly equal to the configured public URL origin (scheme,
+  host, and effective port), `Sec-Fetch-Site: same-origin` or `none`, and a
+  constant-time match of the pre-auth or management CSRF cookie/header. Missing
+  origin, fetch-site, cookie, or header is rejected. CORS is not enabled and
+  no credentialed wildcard response is allowed.
+* On successful login or final signup, the pre-auth token is consumed and both
+  the management session and its rotated `swan_csrf` token are issued in the
+  same response. Once a management session exists, mutations use only
+  `swan_csrf`; a pre-auth token cannot be replayed to create another session.
+  Safe `GET` requests do not require CSRF but still authenticate the cookie,
+  except the deliberately public bootstrap/policy GETs.
 * Management cookies are considered only under `/account/api/*`. Bearer,
   DPoP, OAuth, service, and app-password credentials are rejected there.
   `/xrpc/*` continues to accept its existing bearer/DPoP context only; it
@@ -143,7 +152,7 @@ secret, raw DID document, or provider response.
 |---|---|
 | Missing/malformed/expired/revoked credential, or wrong password | `401` with generic `authentication_required`; login timing and body do not reveal account existence. |
 | Wrong origin, CSRF, fetch-site, or credential family | `403` with generic `request_not_allowed`; do not distinguish which check failed to an attacker. |
-| Missing factor or stale step-up | `403` with `step_up_required` and an allowed-factor list only. |
+| Missing factor or stale step-up | `403` with `factor_required` or `step_up_required` and an allowed-factor list only. |
 | Suspended/deactivated/takedown account | `403` with `account_unavailable`; reads of public repository data remain governed by existing public lifecycle rules. |
 | Valid authentication but insufficient scope/ownership | `403` with `insufficient_scope`; XRPC adapters include the machine-readable required scope. |
 | Invalid field, DID document, scope, or proof | `422` with field-safe validation codes. |
@@ -172,21 +181,29 @@ Deployments may add stricter requirements, never weaker ones. Phone
 verification is not part of this program. `describeServer.inviteCodeRequired`
 is derived as `policy == .inviteRequired`, and is never set independently.
 
-Authorization is two phase:
+Authorization is two phase, with durable pending state so downstream failure
+does not burn a proof or invite:
 
 1. `signup/email/request` sends a bounded authenticated-SMTP verification
    message when the policy requires email. Syntactically invalid input is
    rejected; valid unknown and known addresses get the same response and
-   timing. A proof is single-use, short-lived, bound to email and requested
-   handle, and consumed in the same transaction as signup authorization.
-2. `signup/authorize` validates handle/domain/password preconditions, consumes
-   the invite atomically when required, verifies Turnstile `siteverify` for the
-   exact configured action/hostname when required, and issues an opaque
-   `verificationCode`. The code is bound to policy, email proof, handle,
-   identity claim (if any), client-IP admission bucket, and expiry. `signup`
-   consumes it exactly once before account/key creation. Retries with the same
-   request ID are idempotent; a new request cannot mint a second identity for
-   the same authorization.
+   timing. A proof is short-lived and bound to email and requested handle.
+2. `signup/authorize` validates handle/domain/password preconditions, reserves
+   (but does not consume) the invite and email proof, verifies Turnstile
+   `siteverify` for the exact configured action/hostname when required, and
+   creates a durable pending authorization keyed by a caller-supplied
+   idempotency/request ID. The pending row records `issued`, `committing`,
+   `committed`, or `failed`, an expiry/lease, and the exact policy, handle,
+   email, identity claim, and client-IP admission bucket. A lease expiry
+   releases reservations; it does not mark proof consumed.
+3. `signup` retries the same request ID against that pending row. One SQLite
+   transaction creates the account, identity binding, key references, and
+   initial session, then marks the invite/proof and pre-auth CSRF consumed and
+   the pending row `committed`. If key provisioning or another downstream
+   dependency fails before that transaction, the row is `failed`/retryable and
+   reservations remain available; if the commit succeeded, retries return the
+   same sanitized account/session result. A different request ID cannot mint a
+   second identity from the same proof or invite.
 
 The reference `com.atproto.server.createAccount` adapter maps its
 `verificationCode`, `inviteCode`, `email`, `handle`, `did`, `password`,
@@ -202,25 +219,43 @@ reserved signing/rotation references, and export/restore continuity remain the
 authority. A user may instead claim an externally controlled `did:web` only
 through the following one-time binding:
 
-1. The submitted DID is syntactically canonical and the DID document is fetched
+1. A reservation operation returns Swan's reserved repository public signing
+   key (the exact key ID, key type, and encoded public key bytes) and a fresh
+   32-byte one-time claim nonce. Swan never asks an external assertion key to
+   sign this claim. The canonical claim bytes are the length-delimited UTF-8
+   tuple `did`, `at://handle`, configured public PDS URL, key ID, encoded
+   reserved public key, nonce, and expiry, prefixed with the exact domain
+   separator `swan.didweb.claim.v1\0`. Each text field is UTF-8 preceded by a
+   big-endian `u64` byte length; nonce is exactly 32 raw bytes and expiry is a
+   big-endian `u64` Unix-millisecond value. The tuple order and byte encoding
+   are frozen and hashed with SHA-256 for the claim receipt.
+2. The submitted DID is syntactically canonical and the DID document is fetched
    through the hardened `did:web` resolver at the method-defined HTTPS URL;
    redirects, non-HTTPS endpoints, private/special-purpose resolved peers, and
-   subject changes are rejected.
-2. The document `id` equals the submitted DID, contains the exact requested
-   `at://handle` in `alsoKnownAs`, and has an `#atproto` service endpoint equal
-   to the configured Swan PDS URL. The document's assertion method/delegation
-   key signs a one-time claim containing DID, handle, Swan issuer, nonce, and
-   expiry. The nonce is consumed atomically.
-3. Swan stores a method-neutral identity binding with method `did:web`, the
-   verified document digest, claim receipt, and last successful revalidation.
-   Swan does not create, rotate, delete, or otherwise claim authority over the
-   user's domain, DNS, DID document, PLC, or external keys.
+   subject changes are rejected. The document must contain exact `id == did`,
+   exact `alsoKnownAs` entry `at://handle`, the exact reserved Swan signing
+   key returned by reservation (matching key ID/type/encoded bytes, with
+   `controller == did` and the key ID referenced from `assertionMethod`), the
+   exact `AtprotoPersonalDataServer` endpoint equal to Swan's canonical public
+   PDS URL, and one temporary `SwanDidWebClaim` service with
+   `id == did + "#swan-claim"` and endpoint exactly
+   `publicURL + "/.well-known/swan/did-web-claim/" + base64url(nonce)`.
+   The nonce is consumed atomically with the pending signup commit. The
+   reserved key is a binding check, not an external assertion-signature
+   requirement; no alternate document key can satisfy the claim.
+3. Swan stores a method-neutral `did:web` binding with the RFC 8785/JCS
+   canonical JSON document-byte digest, claim-receipt digest, reserved-key
+   identity, and last valid revalidation. Swan does not create, rotate, delete, or otherwise claim
+   authority over the user's domain, DNS, DID document, PLC, or external keys.
 4. Revalidation is required before writes and new token issuance. A default
    24-hour grace permits bounded continuity after a transient resolver outage;
    a document mismatch or expired grace fences writes and new tokens while
-   preserving public reads under the existing lifecycle policy. A later valid
-   document rotation replaces the binding after a fresh signed claim. Export
-   artifacts retain method, digest, claim receipt, and rotation history.
+   preserving public reads under the existing lifecycle policy. Any document
+   rotation, reserved-key change, endpoint change, or handle change requires a
+   new reservation, fresh canonical claim bytes/nonce, and a new temporary
+   claim service; continuity retains the prior digest and claim in history and
+   never accepts an unclaimed replacement. Export artifacts retain method,
+   digest, key identity, claim receipt, and rotation history.
 
 No `did:web` path may fall back to PLC signing or operator key custody. Handle
 change, domain release, and permanent deletion require fresh step-up and an
@@ -249,10 +284,25 @@ The shared scope grammar/evaluator covers OAuth and app passwords. `atproto`,
 `transition:*`, `repo:*`, `blob:*`, `rpc:*`, `account:*`, `identity:*`, and
 `include:*` follow the pinned reference syntax, including rejection of
 `rpc:*?aud=*`, fragment-stripping for audience matching, dot-boundary prefix
-matching, and fail-closed undeclared routes. `getServiceAuth` requires an
-`lxm` and matching `aud` for every non-full-access credential. Refresh
-re-derives scope from the app-password row and never widens it. A denial is
-`403` with the required machine scope.
+matching, and fail-closed undeclared routes. Empty, missing, malformed, or
+invalidly expanded scopes deny. The evaluator interface is
+`evaluate(credential, canonicalMethod, declaredMethodPolicy)`, and every
+request follows this order: authenticate the credential, canonicalize the
+method and evaluate its declared policy, then invoke the local handler or mint
+an upstream service token. No handler or service-token mint occurs before a
+successful evaluation. A method absent from the declaration is denied.
+
+The only full-access value is the non-user-supplied internal sentinel
+`ScopeGrant.fullAccessV1`; it is never represented by an empty scope, the
+`atproto` identity scope, a wildcard, or a missing declaration. It may be put
+on a credential only by the explicit full-access issuance policy. Refresh,
+`include:` expansion, app-password editing, OAuth consent, and service-token
+minting cannot upgrade a non-full grant to this sentinel. `getServiceAuth`
+requires an `lxm` and matching `aud` for every non-full-access credential.
+Refresh re-derives scope from the app-password row and never widens it. A
+denial is `403` with the required machine scope. Permissioned-space code must
+explicitly deny `.accountLegacySession`; app passwords and OAuth cannot widen
+or inherit one another's authorization context.
 
 App-password secrets are Argon2id-hashed, shown once, rate-limited at
 `createSession`, and absent from all list/log/error paths. The official-client
@@ -263,12 +313,27 @@ the pinned lexicons. Existing OAuth code remains DPoP-only.
 ### 5.2 Authentication strength and factors
 
 ```text
+AuthenticationStrength.none
 AuthenticationStrength.password
 AuthenticationStrength.passwordPlusTOTP
 AuthenticationStrength.passwordPlusPasskey
-AuthenticationStrength.recovery
-AuthenticationStrength.stepUp(factor, verifiedAt)
+AuthenticationStrength.emailRecovery
+AuthenticationStrength.scopedAppPassword
+AuthenticationStrength.stepUp(base: password|passwordPlusTOTP|passwordPlusPasskey,
+                               factor, verifiedAt)
 ```
+
+Strength ordering is `none < emailRecovery < password < passwordPlusTOTP /
+passwordPlusPasskey < stepUp`; `scopedAppPassword` is incomparable and valid
+only for its stored legacy scopes. TOTP and passkey are the only MFA upgrades.
+Once any factor is enabled, password login for management, OAuth, or a legacy
+password session must include a valid `authFactorToken` assertion before a
+full session/token is minted. An app-password login remains a scoped legacy
+alternative only; it cannot create a management session, OAuth token, or
+full-access grant and does not disable the MFA requirement elsewhere.
+OAuth browser consent and token issuance re-check the account's factor state;
+an authorization request cannot reuse a pre-MFA browser session after a factor
+is enabled.
 
 Passkeys provide MFA and step-up only; passwordless sign-in is out of scope.
 TOTP uses an encrypted envelope with a key held outside the control database.
@@ -277,8 +342,15 @@ replaced as a complete set. WebAuthn checks RP ID, origin, challenge,
 user-verification, signature, and monotonic counter. Factor enrollment,
 removal, export, password/email/handle/DID changes, app-password operations,
 migrations, and deletion require a fresh step-up (default ten-minute age).
-Password recovery revokes sessions and legacy families but preserves enrolled
-factors until an explicit, separately authorized factor change.
+The required fresh strength is `stepUp(passwordPlusTOTP|passwordPlusPasskey)`
+for factor removal, email/password/handle/DID changes, app-password creation or
+revocation, export, migration, connected-app revocation, and deletion whenever
+MFA is enabled; with MFA disabled, a fresh `stepUp(password)` is sufficient
+for the operations that do not establish identity authority. Email recovery or
+a recovery code alone can revoke sessions and initiate password recovery but
+can never remove a factor, authorize identity/domain changes, or authorize
+deletion. Password recovery preserves enrolled factors until an explicit,
+separately authorized factor change.
 
 ## 6. Frontend and verification boundaries
 
@@ -307,7 +379,7 @@ No lane edits another lane's path, and no lane pushes or deploys.
 
 | Lane | Owned paths | Explicitly not owned |
 |---|---|---|
-| Task 2 foundation | New shared contract files under `Sources/SwanStorage/`, `Sources/SwanAccounts/`, `Sources/SwanOAuth/`, plus matching focused tests. | Existing migration functions, `Package.swift`, router/runtime/Dockerfile. |
+| Task 2 foundation (serial) | The integration owner executes Task 2 in the integration workspace: shared contract files/tests plus the reserved shared SQLite migrations, `Package.swift`, and exhaustive authorization-context switches. | No Task 2 lane/workspace is created; later parallel lanes may not edit these reserved paths. |
 | Task 3 identity | New `did:web`/identity-binding files and tests. | Shared contracts, migration, router, PLC existing files unless an integration patch is requested. |
 | Task 4 onboarding | Signup policy/service, invite/proof, SMTP adapter, lifecycle adapters, and tests. | Migration, router assembly, live Turnstile widget, production secrets. |
 | Task 5 legacy auth | Scope grammar/evaluator, app-password service, legacy session service/adapters, and tests. | OAuth DPoP token-family implementation and shared migration. |
@@ -315,6 +387,13 @@ No lane edits another lane's path, and no lane pushes or deploys.
 | Task 7 factors | WebAuthn/TOTP/recovery/step-up services, audit events, and tests. | Portal router assembly and shared migration. |
 | Task 8 parity/ops | Remaining adapters, moderation integration, metrics/health, backup/restore drills, and disposable evidence scripts. | Production mutation and other lanes' owned implementation. |
 | Integration owner | `Sources/SwanSQLite/AccountControlStore.swift`, `Sources/SwanSQLite/OAuthControlStore.swift` migration invocation/order, `Package.swift`, `SwanHTTP.buildRouter`/`Sources/swan/SwanCommand.swift`, generated-wire regeneration checkpoints, and `Dockerfile`. | Lane-owned behavior except conflict reconciliation. |
+
+Task 2 is intentionally serial because its migration numbers, package graph,
+and authorization enum cases are the integration spine. After Task 2 is sealed,
+Tasks 3–8 may run in their listed non-overlapping workspaces, but they may not
+edit the reserved migration, `Package.swift`, or authorization-switch paths;
+they submit integration patches to the owner. The integration owner alone
+changes router/runtime/Docker wiring and reconciles final conflicts.
 
 Control-database migrations are additive and bounded. New tables have explicit
 foreign keys and delete behavior, capacity limits, indexes, and reserved

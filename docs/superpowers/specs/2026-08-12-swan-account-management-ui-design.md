@@ -12,13 +12,12 @@ program.
 
 ## Reconciliation
 
-The earlier “credentials only” v1 is replaced by the four-release portal:
-secure account management and static assets (Release 1), onboarding and PLC/
-`did:web` identity (Release 2), scoped legacy credentials and MFA (Release 3),
-and remaining parity/operational evidence (Release 4). Account creation,
-profile/lifecycle, recovery, export, migration, factors, connected apps, and
-sessions are therefore planned, but each sensitive mutation requires the
-authoritative design's fresh step-up and evidence.
+The earlier “credentials only” v1 is replaced by the approved milestones:
+M1 compatibility + portal (signup, invites, `did:web`, recovery, legacy
+sessions, app passwords, portal), M2 MFA, M3 remaining reference breadth, and
+M4 operations. Dependencies may be staged internally but milestone content is
+not redefined. Each sensitive mutation requires the authoritative design's
+fresh-step-up and evidence rules.
 
 The following decisions remain binding:
 
@@ -44,7 +43,7 @@ are its compatibility summary:
 
 | Group | Routes |
 |---|---|
-| Public onboarding | `signup/policy`, `signup/email/request`, `signup/authorize`, `signup`, `login` |
+| Public onboarding | `bootstrap`, `signup/policy`, `signup/email/request`, `signup/authorize`, `signup`, `login` |
 | Session | `session`, `logout`, `sessions`, `sessions/:id`, `sessions/revoke-others` |
 | Account/identity | `profile`, `identity`, `connected-apps`, `export`, `migration`, `lifecycle/delete` |
 | Credentials | `app-passwords`, `app-passwords/:name`, `scope-presets`, `scopes/validate` |
@@ -54,6 +53,15 @@ All mutating routes require exact configured Origin, matching CSRF cookie/header
 same-origin fetch-site when present, JSON body admission, and bounded rate
 limits. Failure bodies use stable safe codes and do not disclose account
 existence or credential material.
+
+`GET /account/api/bootstrap` issues the pre-auth CSRF cookie/token. Login and
+all signup POSTs require exact Origin, JSON, `Sec-Fetch-Site: same-origin` or
+`none`, and a matching pre-auth CSRF cookie/header; successful authentication
+consumes it and rotates to the management CSRF token. There is no wholesale
+public-POST exemption. Once MFA is enabled, password management/OAuth/legacy
+login requires a valid factor assertion; an app password remains scoped legacy
+access only. Recovery/email alone cannot remove factors or authorize identity
+or deletion.
 
 ## Historical architecture sketch
 
