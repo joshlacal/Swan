@@ -300,7 +300,7 @@ public struct WebAuthnVerifier: Sendable {
     }
 
     public func verify(assertion: WebAuthnAssertion, accountDID: String, challenge: Data, purpose: FactorChallengePurpose = .assertion, now: Date) async throws -> WebAuthnVerificationResult {
-        guard assertion.credentialID.count <= 1024, assertion.clientDataJSON.count <= 4096, assertion.authenticatorData.count <= 4096, assertion.signature.count <= 512, challenge.count <= 256 else { throw MFAError.invalidChallenge }
+        guard assertion.credentialID.count <= 1024, assertion.clientDataJSON.count <= 4096, assertion.authenticatorData.count <= 4096, assertion.signature.count <= 512, assertion.userHandle.map({ $0.count <= 128 }) ?? true, challenge.count <= 256 else { throw MFAError.invalidChallenge }
         let credentialDigest = Data(SHA256.hash(data: assertion.credentialID))
         guard let credential = try await credentialStore.webAuthnCredential(credentialIDDigest: credentialDigest, accountDID: accountDID, now: now), credential.disabledAt == nil else { throw MFAError.credentialNotFound }
         guard try await factorStore.listFactors(accountDID: accountDID, now: now).contains(where: { $0.id == credential.factorID && $0.kind == .passkey && $0.disabledAt == nil }) else { throw MFAError.credentialNotFound }
