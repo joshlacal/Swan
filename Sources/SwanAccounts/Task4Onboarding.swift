@@ -641,11 +641,11 @@ public struct SignupService: Sendable {
         }
         guard AccountControlIdentifiers.isDID(input.identityDID) else { throw SignupServiceError.invalidIdentity }
         let authorization = try SignupAuthorization(id: input.authorizationID, requestID: input.requestID, policy: policy.policy, handle: input.handle, email: input.email?.value, identityDID: input.identityDID, emailProofDigest: input.emailProofDigest, inviteDigest: input.inviteDigest, clientIPBucketDigest: input.clientIPBucketDigest, issuedAt: now, expiresAt: now.addingTimeInterval(lifetime), leaseExpiresAt: now.addingTimeInterval(120))
-        try await store.reserve(authorization, now: now)
         if let verificationCode, let verifier = proofVerifier, let proofService, let email = input.email {
             let digest = try await verifier.verifySubmittedCode(verificationCode, email: email, handle: input.handle, authorizationID: input.authorizationID, proof: proofService, now: now)
             guard digest == input.emailProofDigest else { throw SignupServiceError.emailProofRequired }
         }
+        try await store.reserve(authorization, now: now)
         return authorization
     }
 
@@ -736,7 +736,7 @@ public actor BoundedSignupEmailProofVerifier: SignupEmailProofVerifier {
     }
 
     public func verifySubmittedCode(_ code: String, email: AccountEmailAddress, handle: String, authorizationID: SignupAuthorizationID, proof: SignupEmailProofService, now: Date = Date()) async throws -> Data {
-        let key = try "\(proof.digest(code: code, email: email, handle: handle).base64EncodedString())\0\(email.value)"
+        let key = Data(SHA256.hash(data: Data("swan.signup.proof-attempts.v1\0\(email.value)\0\(handle)".utf8))).base64EncodedString()
         attempts = attempts.filter { now.timeIntervalSince($0.value.started) < 900 }
         guard attempts[key] != nil || attempts.count < 4096 else { throw SwanError.unavailable("email proof capacity") }
         if let current = attempts[key] {
