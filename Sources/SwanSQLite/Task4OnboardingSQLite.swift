@@ -22,10 +22,11 @@ public struct SQLiteSignupFinalizationTransaction: SignupFinalizationTransaction
 public struct SignupEmailOutboxMessage: Sendable, Equatable {
     public let deliveryID: String
     public let email: String
+    public let handle: String
     public let protectedEnvelope: Data
     public let leaseToken: Data
-    public init(deliveryID: String, email: String, protectedEnvelope: Data, leaseToken: Data) {
-        self.deliveryID = deliveryID; self.email = email; self.protectedEnvelope = protectedEnvelope; self.leaseToken = leaseToken
+    public init(deliveryID: String, email: String, handle: String, protectedEnvelope: Data, leaseToken: Data) {
+        self.deliveryID = deliveryID; self.email = email; self.handle = handle; self.protectedEnvelope = protectedEnvelope; self.leaseToken = leaseToken
     }
 }
 
@@ -142,9 +143,9 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupFinalizati
         let current = try task4Timestamp(now), until = try task4Timestamp(now.addingTimeInterval(lease))
         guard until > current else { throw AccountControlStoreError.invalidInput }
         return try await withConnectionGate { try await transaction {
-            let rows = try await connection.query("UPDATE signup_email_request_outbox SET state='sending',lease_token=randomblob(16),lease_expires_at=?,attempts=attempts+1 WHERE rowid=(SELECT rowid FROM signup_email_request_outbox WHERE expires_at>? AND next_attempt_at<=? AND attempts<8 AND (state='pending' OR (state='sending' AND lease_expires_at<=?)) ORDER BY issued_at LIMIT 1) RETURNING delivery_id,email,protected_envelope,lease_token", [.integer(until), .integer(current), .integer(current), .integer(current)])
-            guard let row = rows.first, let deliveryID = task4Text(row, "delivery_id"), let email = task4Text(row, "email"), let envelope = task4BlobValue(row, "protected_envelope"), let leaseToken = task4BlobValue(row, "lease_token") else { return nil }
-            return SignupEmailOutboxMessage(deliveryID: deliveryID, email: email, protectedEnvelope: envelope, leaseToken: leaseToken)
+            let rows = try await connection.query("UPDATE signup_email_request_outbox SET state='sending',lease_token=randomblob(16),lease_expires_at=?,attempts=attempts+1 WHERE rowid=(SELECT rowid FROM signup_email_request_outbox WHERE expires_at>? AND next_attempt_at<=? AND attempts<8 AND (state='pending' OR (state='sending' AND lease_expires_at<=?)) ORDER BY issued_at LIMIT 1) RETURNING delivery_id,email,handle,protected_envelope,lease_token", [.integer(until), .integer(current), .integer(current), .integer(current)])
+            guard let row = rows.first, let deliveryID = task4Text(row, "delivery_id"), let email = task4Text(row, "email"), let handle = task4Text(row, "handle"), let envelope = task4BlobValue(row, "protected_envelope"), let leaseToken = task4BlobValue(row, "lease_token") else { return nil }
+            return SignupEmailOutboxMessage(deliveryID: deliveryID, email: email, handle: handle, protectedEnvelope: envelope, leaseToken: leaseToken)
         } }
     }
 

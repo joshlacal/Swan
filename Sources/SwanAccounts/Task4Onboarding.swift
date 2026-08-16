@@ -156,6 +156,7 @@ public struct SignupEmailProofService: Sendable {
     public func openProtectedEnvelope(_ envelope: Data, email: AccountEmailAddress, handle: String, deliveryID: String) throws -> String {
         guard envelope.count > 1, envelope[0] == 1 else { throw SwanError.invalidIdentifier("signup email envelope") }
         let aad = Data("swan.signup.email-envelope.v1\0\(envelope[0])\0\(deliveryID)\0\(email.value)\0\(handle)".utf8)
+        guard envelope.dropFirst().prefix(aad.count) == aad else { throw SwanError.invalidIdentifier("signup email envelope") }
         let combined = envelope.dropFirst().dropFirst(aad.count)
         let box = try AES.GCM.SealedBox(combined: combined)
         let code = try AES.GCM.open(box, using: SymmetricKey(data: secret.bytes), authenticating: aad)
@@ -314,6 +315,7 @@ public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPTransport {
     }
 
     public func deliver(configuration: AuthenticatedSMTPConfiguration, to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String) async throws {
+        guard configuration.mode != .plaintextLab else { throw MailpitSMTPDeliveryError.invalidConfiguration }
         let connection = try await connect(configuration)
         if configuration.mode != .plaintextLab {
             guard connection.authenticatedHostname.lowercased() == configuration.expectedHostname?.lowercased() else { throw MailpitSMTPDeliveryError.unavailable }
@@ -321,6 +323,15 @@ public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPTransport {
             try await connection.authenticate(username: username, password: password, mechanism: mechanism)
         }
         try await connection.send(to: to, subject: subject, body: body, idempotencyKey: idempotencyKey, deadline: .now.advanced(by: .seconds(30)))
+    }
+}
+
+public struct MailpitSMTPConfiguration: Sendable, Equatable {
+    public let host: String
+    public let port: Int
+    public init(host: String = "127.0.0.1", port: Int = 1025) throws {
+        guard !host.isEmpty, (1 ... 65535).contains(port) else { throw SwanError.invalidIdentifier("Mailpit configuration") }
+        self.host = host; self.port = port
     }
 }
 
@@ -335,8 +346,12 @@ public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
     }
 
     public func deliver(to: AccountEmailAddress, subject: String, body: String) async throws {
-        guard !subject.contains("\r"), !subject.contains("\n"), body.utf8.count <= 32768 else { throw MailpitSMTPDeliveryError.invalidMessage }
         let key = String(SHA256.hash(data: Data("\(to.value)\0\(subject)\0\(body)".utf8)).description)
+        try await deliver(to: to, subject: subject, body: body, idempotencyKey: key)
+    }
+
+    public func deliver(to: AccountEmailAddress, subject: String, body: String, idempotencyKey _: String) async throws {
+        guard !subject.contains("\r"), !subject.contains("\n"), body.utf8.count <= 32768 else { throw MailpitSMTPDeliveryError.invalidMessage }
         var last: Error?
         for attempt in 0 ..< configuration.maximumAttempts {
             do {
@@ -347,7 +362,14 @@ public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
                     try await group.next()!
                 }
                 return
-            } catch { last = error; if attempt + 1 < configuration.maximumAttempts { try? await Task.sleep(for: .milliseconds(Int64(100 * (1 << attempt)))) } }
+            } catch {
+                if Task.isCancelled { throw CancellationError() }
+                last = error
+                if attempt + 1 < configuration.maximumAttempts {
+                    try Task.checkCancellation()
+                    try await Task.sleep(for: .milliseconds(Int64(100 * (1 << attempt))))
+                }
+            }
         }
         throw last ?? MailpitSMTPDeliveryError.unavailable
     }
@@ -456,6 +478,10 @@ public struct SignupAuthorizationInput: Sendable, Equatable {
     fileprivate var isTrustedBucket: Bool {
         trustedBucket
     }
+}
+
+public protocol SignupTrustedPeerIPExtractor: Sendable {
+    func bucketDigest(forCanonicalPeerIP peerIP: String) throws -> Data
 }
 
 @available(*, deprecated, message: "Use SignupFinalizationCoordinator; generic callback finalization is not atomic")
