@@ -67,3 +67,43 @@ signup policy, and run the adapter against a disposable Swift/Hummingbird
 harness. The checked-in Playwright fixture is deliberately disposable HTTPS
 coverage for static/CSP/browser behavior; it is not claimed as live Swift
 adapter evidence.
+
+## Portal storage and atomic-auth correction
+
+The dependency-neutral pre-auth and CSRF protocols now live in `SwanStorage`,
+alongside `SwanManagementPreAuthSessionCoordinator`. `SwanAccounts` retains
+only the runtime and test-only in-memory implementations. `SwanSQLite` adds
+`AccountPortalSessionStore.swift`, which implements management-session,
+pre-auth, CSRF, and atomic consume-plus-session creation against the existing
+foundation `management_sessions` table. Its `migrateAccountPortalSessionSchema`
+method creates only the lane-owned `management_pre_auth` table and is
+intentionally not registered in the shared migration spine.
+
+Portal login and signup now call `SwanManagementSessionRuntime.issueAfterPreAuth`;
+there is no non-atomic fallback for those paths. If session insertion fails,
+the held SQLite transaction rolls back pre-auth consumption and does not leave
+an orphaned management session. `SwanAccountPortalConfiguration` carries the
+injected `SignupPolicy`, and the API advertisement is derived from it.
+
+Integration owner wiring:
+
+```swift
+try await database.migrateAccountPortalSessionSchema()
+let portalSessions = SwanManagementSessionRuntime(
+    store: database,
+    preAuthStore: database,
+    csrfStore: database,
+    preAuthSessionCoordinator: database
+)
+let portal = SwanAccountPortalHTTP(
+    configuration: try .init(publicOrigin: configuration.publicURL,
+                             staticDirectory: accountPortalDirectory,
+                             signupPolicy: signupPolicy),
+    sessions: portalSessions,
+    service: accountPortalService
+)
+portal.register(on: router)
+```
+
+The migration call, router order, Docker build stage, and signup service
+assembly remain integration-owned and were not changed in this lane.

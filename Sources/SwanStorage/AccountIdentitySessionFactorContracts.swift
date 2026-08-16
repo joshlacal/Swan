@@ -479,6 +479,37 @@ public protocol ManagementSessionStore: Sendable {
     func purgeExpiredManagementSessions(now: Date) async throws
 }
 
+/// Durable one-time state used before an account-management session exists.
+/// The browser only receives the bearer value; implementations persist its
+/// keyed digest and must consume it atomically.
+public protocol SwanManagementPreAuthStore: Sendable {
+    func put(digest: Data, expiresAt: Date) async
+    func contains(digest: Data, now: Date) async -> Bool
+    func take(digest: Data, now: Date) async -> Bool
+}
+
+/// Durable double-submit CSRF state for management sessions. Implementations
+/// must retain only the digest and compare it in constant time at the runtime
+/// boundary.
+public protocol SwanManagementCSRFStore: Sendable {
+    func put(sessionDigest: Data, csrfDigest: Data) async throws
+    func digest(for sessionDigest: Data) async throws -> Data?
+    func remove(sessionDigest: Data) async throws
+}
+
+/// Atomic bridge used by login and signup: pre-auth consumption and
+/// management-session creation must share one durable transaction so a race or
+/// failed consume cannot leave an orphaned authenticated session.
+public protocol SwanManagementPreAuthSessionCoordinator: Sendable {
+    func consumePreAuthAndCreateManagementSession(
+        preAuthDigest: Data,
+        session: ManagementSessionMetadata,
+        sessionDigest: Data,
+        csrfDigest: Data,
+        now: Date
+    ) async throws -> Bool
+}
+
 public protocol LegacySessionStore: Sendable {
     func createLegacySessionFamily(_ family: LegacySessionFamilyMetadata, session: LegacySessionMetadata, sessionDigest: Data, now: Date) async throws
     func legacySession(digest: Data, now: Date) async throws -> LegacySessionMetadata?

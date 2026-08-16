@@ -86,7 +86,8 @@ private struct AuthenticatedPortalResponse: Encodable {
 public struct SwanAccountPortalConfiguration: Sendable, Equatable {
     public let publicOrigin: URL
     public let staticDirectory: URL
-    public init(publicOrigin: URL, staticDirectory: URL) throws {
+    public let signupPolicy: SignupPolicy
+    public init(publicOrigin: URL, staticDirectory: URL, signupPolicy: SignupPolicy = .closed) throws {
         guard let components = URLComponents(url: publicOrigin, resolvingAgainstBaseURL: false),
               components.scheme?.lowercased() == "https", components.host != nil,
               components.user == nil, components.password == nil,
@@ -96,6 +97,7 @@ public struct SwanAccountPortalConfiguration: Sendable, Equatable {
         }
         self.publicOrigin = publicOrigin
         self.staticDirectory = staticDirectory
+        self.signupPolicy = signupPolicy
     }
 }
 
@@ -116,8 +118,8 @@ public struct SwanAccountPortalHTTP: Sendable {
     }
 
     public func register(on router: Router<SwanHTTPRequestContext>) {
-        router.get("/account/api/signup/policy") { _ , _ -> Response in
-            accountJSON(.ok, SignupPolicyView())
+        router.get("/account/api/signup/policy") { [configuration] _ , _ -> Response in
+            accountJSON(.ok, SignupPolicyView(policy: configuration.signupPolicy))
         }
         router.get("/account/api/bootstrap") { [configuration, sessions] request, _ async -> Response in
             guard originPermits(request, expected: configuration.publicOrigin), fetchSiteAllows(request) else { return accountError(.forbidden) }
@@ -155,9 +157,8 @@ public struct SwanAccountPortalHTTP: Sendable {
                 guard let bytes = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes) else { throw PortalRequestError.malformed }
                 let credentials = try JSONDecoder().decode(PortalLoginCredentials.self, from: Data(bytes))
                 let authentication = try await service.authenticate(handle: credentials.handle, password: credentials.password, authFactorToken: credentials.authFactorToken, now: Date())
-                let issued = try await sessions.issue(accountDID: authentication.accountDID, strength: authentication.strength)
                 let snapshot = try await service.portal(accountDID: authentication.accountDID, now: Date())
-                guard await sessions.consumePreAuth(csrf) else { return accountError(.forbidden) }
+                let issued = try await sessions.issueAfterPreAuth(csrf, accountDID: authentication.accountDID, strength: authentication.strength)
                 return accountJSON(.ok, AuthenticatedPortalResponse(snapshot: snapshot, csrf: issued.csrfValue), cookies: [managementCookie(issued.sessionValue), csrfCookie(issued.csrfValue), expiredPreAuthCookie()])
             } catch is PortalRequestError { await sessions.releasePreAuth(csrf); return accountError(.badRequest) }
             catch { await sessions.releasePreAuth(csrf); return accountError(.unauthorized) }
@@ -176,8 +177,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                     let result = try await service.mutate(path: path, context: .init(sessionID: "preauth", accountDID: "", strength: .password), payload: payload, now: Date())
                     if path == "signup" {
                         guard let accountDID = result.accountDID else { return accountError(.serviceUnavailable) }
-                        let issued = try await sessions.issue(accountDID: accountDID)
-                        guard await sessions.consumePreAuth(csrf) else { return accountError(.forbidden) }
+                        let issued = try await sessions.issueAfterPreAuth(csrf, accountDID: accountDID)
                         return accountJSON(.ok, result, cookies: [managementCookie(issued.sessionValue), csrfCookie(issued.csrfValue), expiredPreAuthCookie()])
                     }
                     return accountJSON(.ok, result)
@@ -252,9 +252,17 @@ public struct SwanAccountPortalHTTP: Sendable {
 }
 
 private struct SignupPolicyView: Encodable {
-    let policy = "closed"
-    let inviteCodeRequired = false
-    let capabilities = [String]()
+    let policy: String
+    let inviteCodeRequired: Bool
+    let turnstileRequired: Bool
+    let emailVerificationRequired: Bool
+
+    init(policy: SignupPolicy) {
+        self.policy = policy.rawValue
+        inviteCodeRequired = policy.advertisesInviteCodeRequired
+        turnstileRequired = policy.requiresTurnstile
+        emailVerificationRequired = policy != .closed
+    }
 }
 
 private func staticAccountResponse(configuration: SwanAccountPortalConfiguration, requestPath: String) -> Response {

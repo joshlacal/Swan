@@ -3,23 +3,6 @@ import Foundation
 import SwanCore
 import SwanStorage
 
-/// Cookie/session boundary for the account portal. The browser sees only the
-/// random values; the durable store receives keyed digests and metadata.
-/// Durable pre-auth CSRF storage is injected by the integration lane. The
-/// default actor keeps local tests useful while production supplies a store
-/// backed by the same account database as management sessions.
-public protocol SwanManagementPreAuthStore: Sendable {
-    func put(digest: Data, expiresAt: Date) async
-    func contains(digest: Data, now: Date) async -> Bool
-    func take(digest: Data, now: Date) async -> Bool
-}
-
-public protocol SwanManagementCSRFStore: Sendable {
-    func put(sessionDigest: Data, csrfDigest: Data) async throws
-    func digest(for sessionDigest: Data) async throws -> Data?
-    func remove(sessionDigest: Data) async throws
-}
-
 public actor SwanInMemoryManagementCSRFStore: SwanManagementCSRFStore {
     private var values: [Data: Data] = [:]
     public init() {}
@@ -47,6 +30,7 @@ public actor SwanManagementSessionRuntime {
     private let store: any ManagementSessionStore
     private let preAuthStore: any SwanManagementPreAuthStore
     private let csrfStore: any SwanManagementCSRFStore
+    private let preAuthSessionCoordinator: (any SwanManagementPreAuthSessionCoordinator)?
     private let idleLifetime: TimeInterval
     private let absoluteLifetime: TimeInterval
 
@@ -54,12 +38,14 @@ public actor SwanManagementSessionRuntime {
         store: any ManagementSessionStore,
         preAuthStore: any SwanManagementPreAuthStore,
         csrfStore: any SwanManagementCSRFStore,
+        preAuthSessionCoordinator: (any SwanManagementPreAuthSessionCoordinator)? = nil,
         idleLifetime: TimeInterval = 12 * 60 * 60,
         absoluteLifetime: TimeInterval = 30 * 24 * 60 * 60
     ) {
         self.store = store
         self.preAuthStore = preAuthStore
         self.csrfStore = csrfStore
+        self.preAuthSessionCoordinator = preAuthSessionCoordinator
         self.idleLifetime = idleLifetime
         self.absoluteLifetime = absoluteLifetime
     }
@@ -89,6 +75,41 @@ public actor SwanManagementSessionRuntime {
         return value
     }
 
+    /// Consume a pre-auth token and issue the authenticated session through
+    /// the durable coordinator. There is intentionally no fallback to the
+    /// non-atomic `issue` path: production must not be able to create a
+    /// session when the one-time pre-auth state was lost to a race.
+    public func issueAfterPreAuth(
+        _ value: String,
+        accountDID: String,
+        strength: AuthenticationStrength = .password,
+        now: Date = Date()
+    ) async throws -> IssuedManagementSession {
+        guard Self.validToken(value), let coordinator = preAuthSessionCoordinator else {
+            throw SwanManagementSessionError.unavailable
+        }
+        let sessionValue = Self.randomToken()
+        let csrfValue = Self.randomToken()
+        let sessionID = try ManagementSessionID(rawValue: sessionValue)
+        let metadata = try ManagementSessionMetadata(
+            sessionID: sessionID,
+            accountDID: accountDID,
+            issuedAt: now,
+            idleExpiresAt: now.addingTimeInterval(idleLifetime),
+            absoluteExpiresAt: now.addingTimeInterval(absoluteLifetime),
+            strength: strength
+        )
+        let consumed = try await coordinator.consumePreAuthAndCreateManagementSession(
+            preAuthDigest: Self.digest(value),
+            session: metadata,
+            sessionDigest: Self.digest(sessionValue),
+            csrfDigest: Self.digest(csrfValue),
+            now: now
+        )
+        guard consumed else { throw SwanManagementSessionError.unauthorized }
+        return IssuedManagementSession(sessionValue: sessionValue, csrfValue: csrfValue, metadata: metadata)
+    }
+
     /// Consumes a pre-auth token exactly once. A bootstrap refresh is allowed
     /// to issue a new token, but a successful login/signup cannot replay one.
     public func consumePreAuth(_ value: String, now: Date = Date()) async -> Bool {
@@ -113,7 +134,20 @@ public actor SwanManagementSessionRuntime {
               metadata.absoluteExpiresAt >= now else {
             throw SwanManagementSessionError.unauthorized
         }
-        return metadata
+        // Storage intentionally persists only the keyed digest. Re-bind the
+        // opaque identifier to the value presented by this authenticated
+        // request so callers such as revokeOthers do not hash a synthetic
+        // identifier and accidentally revoke the current session as well.
+        return try ManagementSessionMetadata(
+            sessionID: try ManagementSessionID(rawValue: sessionValue),
+            accountDID: metadata.accountDID,
+            issuedAt: metadata.issuedAt,
+            idleExpiresAt: metadata.idleExpiresAt,
+            absoluteExpiresAt: metadata.absoluteExpiresAt,
+            lastStepUpAt: metadata.lastStepUpAt,
+            strength: metadata.strength,
+            revokedAt: metadata.revokedAt
+        )
     }
 
     public func acceptsCSRF(sessionValue: String, csrfValue: String, now: Date = Date()) async throws -> Bool {
@@ -176,4 +210,5 @@ public struct IssuedManagementSession: Sendable, Equatable {
 public enum SwanManagementSessionError: Error, Sendable, Equatable {
     case unauthorized
     case requestNotAllowed
+    case unavailable
 }
