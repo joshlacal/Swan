@@ -10,6 +10,12 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-16-swan-account-identity-reference-parity-design.md`
 
+## Execution status at checkpoint `2ca80d27` (2026-08-16)
+
+This plan has produced a reviewed, locally verified integration checkpoint, but it has **not** produced a production-composed four-milestone release. Tasks 1-8 delivered designs, storage/domain implementations, static UI, adapters, and operational seams. Task 9 integrated those lanes, centralized migration v8, added the portal router hook and static Docker build stage, and passed the full local Swift/frontend gates.
+
+The remaining work is production composition and external acceptance: `SwanCommand` does not construct the portal, signup, legacy-auth, `did:web`, MFA, authenticated-SMTP, or Task 8 reference services; Task 8 manifest entries remain `registered: false`. Use the layered handoff beginning at `docs/superpowers/handoffs/2026-08-16-swan-account-program-handoff.md` rather than interpreting unchecked boxes or lane-local “implemented” language as runtime availability.
+
 ## Global Constraints
 
 - Use jj as the sole history writer. Use only `jj workspace add`; never mutate Git.
