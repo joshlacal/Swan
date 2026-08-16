@@ -71,6 +71,17 @@ final class ScopedLegacyAuthTests: XCTestCase {
         XCTAssertFalse(DeclaredMethodScopePolicy.referenceLegacy.declares("app.bsky.feed.unknown"))
     }
 
+    func testReferenceRegistryCoversPinnedProxyParityManifest() {
+        let proxyManifest: Set<String> = [
+            "app.bsky.actor.getPreferences", "app.bsky.actor.getPreferencesExtended",
+            "app.bsky.actor.getProfile", "app.bsky.actor.putPreferences", "app.bsky.actor.searchActors",
+            "app.bsky.feed.getAuthorFeed", "app.bsky.feed.getFeed", "app.bsky.feed.getFeedSkeleton",
+            "app.bsky.feed.getTimeline", "app.bsky.notification.updateSeen", "chat.bsky.convo.listConvos"
+        ]
+        XCTAssertTrue(proxyManifest.isSubset(of: DeclaredMethodScopePolicy.referenceLegacy.declaredMethods))
+        XCTAssertFalse(DeclaredMethodScopePolicy.referenceLegacy.declaredMethods.contains("app.bsky.unknown.getFeed"))
+    }
+
     func testAppPasswordSecretPresentedOnceAndScopeEditRevokesDerivedSession() async throws {
         let store = InMemoryLegacyAuthStore()
         let service = try LegacyAuthService(store: store, accountResolver: .fixture, secretKey: Data(repeating: 7, count: 32), tokenIssuer: HMACLegacyTokenIssuer(key: Data(repeating: 8, count: 32), issuer: "swan.test"), managementAuthorizer: LegacyManagementAuthorizer { _, session, stepUp in session == "management" && (stepUp.isEmpty || stepUp == "step-up") }, loginAdmission: LegacyLoginAdmission { _ in }, methodPolicy: DeclaredMethodScopePolicy.fullAccessV1)

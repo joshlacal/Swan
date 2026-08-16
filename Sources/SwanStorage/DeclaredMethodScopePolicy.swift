@@ -82,6 +82,10 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
         declarations[method] != nil
     }
 
+    /// Stable manifest view used by parity tests and integration diagnostics.
+    /// Callers still must use `allows` for authorization decisions.
+    public var declaredMethods: Set<String> { Set(declarations.keys) }
+
     public func requiredScopes(for method: String) -> Set<String>? {
         declarations[method]
     }
