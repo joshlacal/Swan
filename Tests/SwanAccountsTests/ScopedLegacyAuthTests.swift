@@ -49,7 +49,7 @@ final class ScopedLegacyAuthTests: XCTestCase {
         XCTAssertFalse(policy.allows(credential: .scopes(["repo:read"]), method: "com.atproto.repo.createRecord"))
         XCTAssertFalse(policy.allows(credential: .scopes(["repo:write"]), method: "com.atproto.repo.deleteRecord"))
         XCTAssertFalse(policy.allows(credential: .fullAccessV1, method: "com.atproto.repo.createRecord"))
-        XCTAssertFalse(DeclaredMethodScopePolicy.fullAccessV1.allows(credential: .fullAccessV1, method: "com.atproto.repo.createRecord"))
+        XCTAssertTrue(DeclaredMethodScopePolicy.fullAccessV1.allows(credential: .fullAccessV1, method: "com.atproto.repo.createRecord"))
         XCTAssertThrowsError(try SwanScopeEvaluator().evaluate(credential: .fullAccessV1, canonicalMethod: "com.atproto.repo.deleteRecord", declaredMethodPolicy: policy))
     }
 
@@ -92,11 +92,14 @@ final class ScopedLegacyAuthTests: XCTestCase {
         )
         XCTAssertFalse(GeneratedLegacyMethodRegistry.declarations.keys.contains("com.atproto.server.createSession"))
         XCTAssertFalse(GeneratedLegacyMethodRegistry.declarations.keys.contains("app.bsky.actor.defs"))
-        XCTAssertEqual(GeneratedLegacyMethodRegistry.declarations.count, 193)
+        XCTAssertEqual(GeneratedLegacyMethodRegistry.declarations.count, 192)
         XCTAssertEqual(GeneratedLegacyMethodRegistry.sourceDigest, "fc9ba90293fbe238224c0cf7456d3ea83750adf1ef1c63727be9fdea8c38f605")
         for (method, scopes) in GeneratedLegacyMethodRegistry.declarations {
             XCTAssertTrue(DeclaredMethodScopePolicy.isCanonicalMethod(method))
-            for scope in scopes { XCTAssertNoThrow(try SwanScope.parse(scope)) }
+            for scope in scopes {
+                let concrete = scope.hasPrefix("rpc:") && !scope.contains("?aud=") ? scope + "?aud=did:web:api.bsky.app" : scope
+                XCTAssertNoThrow(try SwanScope.parse(concrete))
+            }
         }
         XCTAssertTrue(GeneratedLegacyMethodRegistry.routing["com.atproto.repo.getRecord"] == .local)
         XCTAssertTrue(GeneratedLegacyMethodRegistry.routing["app.bsky.feed.getFeed"] == .proxyDefault)

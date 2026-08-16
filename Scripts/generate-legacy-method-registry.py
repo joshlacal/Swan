@@ -4,7 +4,7 @@ import argparse, hashlib, json, pathlib, sys, tempfile, os
 
 parser = argparse.ArgumentParser(add_help=False); parser.add_argument('--root', type=pathlib.Path); parser.add_argument('--output', type=pathlib.Path)
 args = parser.parse_args([a for a in sys.argv[1:] if a != '--check'])
-ROOT = args.root or pathlib.Path(os.environ.get('SWAN_PINNED_LEXICONS', pathlib.Path(__file__).parents[3] / 'Petrel/atproto/lexicons'))
+ROOT = args.root or pathlib.Path(os.environ.get('SWAN_PINNED_LEXICONS', pathlib.Path(__file__).parents[2] / 'Petrel/atproto/lexicons'))
 OUT = args.output or pathlib.Path(__file__).parents[1] / 'Sources/SwanStorage/GeneratedLegacyMethodRegistry.swift'
 allowed = ('app.bsky.', 'chat.bsky.', 'tools.ozone.')
 exact = {
@@ -24,7 +24,7 @@ local = {
     'com.atproto.repo.applyWrites': {'repo:write'}, 'com.atproto.repo.createRecord': {'repo:write'}, 'com.atproto.repo.deleteRecord': {'repo:write'}, 'com.atproto.repo.describeRepo': {'repo:read'},
     'com.atproto.repo.getRecord': {'repo:read'}, 'com.atproto.repo.listRecords': {'repo:read'}, 'com.atproto.repo.putRecord': {'repo:write'}, 'com.atproto.repo.uploadBlob': {'blob:write'},
     'com.atproto.sync.getBlob': {'blob:read'}, 'com.atproto.sync.getLatestCommit': {'repo:read'}, 'com.atproto.sync.getRepo': {'repo:read'}, 'com.atproto.sync.getRepoStatus': {'repo:read'},
-    'com.atproto.identity.resolveHandle': {'identity:read'}, 'app.bsky.actor.getPreferences': {'rpc:app.bsky'}, 'app.bsky.actor.getPreferencesExtended': {'rpc:app.bsky'}, 'app.bsky.actor.putPreferences': {'rpc:app.bsky'},
+    'com.atproto.identity.resolveHandle': {'identity:read'}, 'app.bsky.actor.getPreferences': {'rpc:app.bsky'}, 'app.bsky.actor.putPreferences': {'rpc:app.bsky'},
 }
 denied = set()
 rows = []

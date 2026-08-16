@@ -25,7 +25,7 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
     /// Explicitly enumerated legacy methods. Full access is still bounded by
     /// this registry; it is never a wildcard over arbitrary route strings.
     public static let fullAccessV1 = DeclaredMethodScopePolicy(
-        declarations: GeneratedLegacyMethodRegistry.declarations
+        declarations: GeneratedLegacyMethodRegistry.declarations, permitsFullAccess: true
     )
     /* Legacy method declarations are generated from the pinned lexicons.
         The old hand-written map is intentionally retained below as a review
