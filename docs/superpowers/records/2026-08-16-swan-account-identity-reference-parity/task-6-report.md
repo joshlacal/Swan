@@ -54,3 +54,7 @@ The correction also adds a real bounded login form and authenticated response
 that hands the rotated management CSRF to the client, pre-auth signup handlers
 that do not require a management cookie, typed payload plumbing for mutations,
 and durable CSRF digest injection for restart-safe validation.
+Signup pre-auth state is retained through email/request and authorize, and is
+consumed only after final signup returns an account-bound identity; successful
+signup issues the management cookie and rotated CSRF. Mutations now admit and
+forward bounded JSON payloads, including recursive identifier DELETE routes.

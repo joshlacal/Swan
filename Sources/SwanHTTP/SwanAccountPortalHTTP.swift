@@ -33,12 +33,14 @@ public struct SwanAccountPortalAuthentication: Sendable, Equatable {
 private struct PortalLoginCredentials: Decodable {
     let handle: String
     let password: String
-    enum CodingKeys: String, CodingKey, CaseIterable { case handle, password }
+    let authFactorToken: String?
+    enum CodingKeys: String, CodingKey, CaseIterable { case handle, password, authFactorToken }
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         guard Set(container.allKeys) == Set(CodingKeys.allCases) else { throw PortalRequestError.malformed }
         handle = try container.decode(String.self, forKey: .handle)
         password = try container.decode(String.self, forKey: .password)
+        authFactorToken = try container.decodeIfPresent(String.self, forKey: .authFactorToken)
         guard (1...2_048).contains(handle.utf8.count), (1...4_096).contains(password.utf8.count),
               !handle.utf8.contains(0), !password.utf8.contains(0) else { throw PortalRequestError.malformed }
     }
@@ -69,7 +71,8 @@ public struct SwanAccountPortalSnapshot: Codable, Sendable, Equatable {
 public struct SwanAccountPortalMutation: Codable, Sendable, Equatable {
     public let accepted: Bool
     public let message: String
-    public init(accepted: Bool = true, message: String = "Accepted") { self.accepted = accepted; self.message = message }
+    public let accountDID: String?
+    public init(accepted: Bool = true, message: String = "Accepted", accountDID: String? = nil) { self.accepted = accepted; self.message = message; self.accountDID = accountDID }
 }
 private struct AuthenticatedPortalResponse: Encodable {
     let snapshot: SwanAccountPortalSnapshot
@@ -128,7 +131,7 @@ public struct SwanAccountPortalHTTP: Sendable {
         // Register every read surface explicitly. They all share the same
         // sanitized snapshot until their domain adapter supplies a narrower
         // projection; none can fall through to the SPA.
-        for path in ["session", "sessions", "profile", "identity", "app-passwords", "scope-presets", "factors", "connected-apps", "export", "migration", "signup/policy"] {
+        for path in ["session", "sessions", "profile", "identity", "app-passwords", "scope-presets", "factors", "connected-apps", "export", "migration"] {
             router.get("/account/api/\(path)") { [sessions, service] request, _ async -> Response in
                 guard let session = accountCookie(named: SwanManagementSessionRuntime.sessionCookieName, request: request),
                       let metadata = try? await sessions.authenticate(sessionValue: session) else { return accountError(.unauthorized) }
@@ -167,14 +170,19 @@ public struct SwanAccountPortalHTTP: Sendable {
                     defer { admitted.release() }
                     let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
                     let result = try await service.mutate(path: path, accountDID: "", payload: payload, now: Date())
-                    guard await sessions.consumePreAuth(csrf) else { return accountError(.forbidden) }
-                    return accountJSON(.ok, result, cookies: [expiredPreAuthCookie()])
+                    if path == "signup" {
+                        guard let accountDID = result.accountDID else { return accountError(.serviceUnavailable) }
+                        let issued = try await sessions.issue(accountDID: accountDID)
+                        guard await sessions.consumePreAuth(csrf) else { return accountError(.forbidden) }
+                        return accountJSON(.ok, result, cookies: [managementCookie(issued.sessionValue), csrfCookie(issued.csrfValue), expiredPreAuthCookie()])
+                    }
+                    return accountJSON(.ok, result)
                 } catch { await sessions.releasePreAuth(csrf); return accountError(.badRequest) }
             }
         }
 
         for path in ["logout", "profile", "identity", "app-passwords", "scopes/validate", "factors", "factors/recovery-codes/rotate", "factors/step-up", "connected-apps", "export", "export/request", "migration", "migration/request", "lifecycle/delete", "step-up", "sessions/revoke-others"] {
-            router.on("/account/api/\(path)", method: .post) { [configuration, sessions, service] request, _ async -> Response in
+            router.on("/account/api/\(path)", method: .post) { [configuration, sessions, service] request, context async -> Response in
                 guard mutationHeadersAllow(request, expectedOrigin: configuration.publicOrigin),
                       let session = accountCookie(named: SwanManagementSessionRuntime.sessionCookieName, request: request),
                       let csrf = accountCookie(named: SwanManagementSessionRuntime.csrfCookieName, request: request),
@@ -184,7 +192,10 @@ public struct SwanAccountPortalHTTP: Sendable {
                       (try? await sessions.acceptsCSRF(sessionValue: session, csrfValue: csrf)) == true else { return accountError(.forbidden) }
                 do {
                     let metadata = try await sessions.authenticate(sessionValue: session)
-                    let mutation = try await service.mutate(path: path, accountDID: metadata.accountDID, payload: nil, now: Date())
+                    let admitted = try await collectAdmittedRequestBody(request, mediaType: .json, admission: .managementProcessShared, policy: .productionDefault, maximumBytes: 16 * 1024, termination: context.jsonWriteBodyTermination)
+                    defer { admitted.release() }
+                    let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
+                    let mutation = try await service.mutate(path: path, accountDID: metadata.accountDID, payload: payload, now: Date())
                     if path == "logout" { try await sessions.revoke(sessionValue: session) }
                     return accountJSON(.ok, mutation, cookies: path == "logout" ? [expiredManagementCookie(), expiredCSRFToken()] : [])
                 } catch { return accountError(.serviceUnavailable) }
@@ -205,10 +216,29 @@ public struct SwanAccountPortalHTTP: Sendable {
             }
         }
 
+        for prefix in ["sessions", "app-passwords", "factors/passkeys"] {
+            router.on("/account/api/\(prefix)/*", method: .delete) { [configuration, sessions, service] request, context async -> Response in
+                guard mutationHeadersAllow(request, expectedOrigin: configuration.publicOrigin),
+                      let session = accountCookie(named: SwanManagementSessionRuntime.sessionCookieName, request: request),
+                      let csrf = accountCookie(named: SwanManagementSessionRuntime.csrfCookieName, request: request),
+                      request.headers[HTTPField.Name("X-Swan-CSRF")!] == csrf,
+                      (try? await sessions.acceptsCSRF(sessionValue: session, csrfValue: csrf)) == true else { return accountError(.forbidden) }
+                do {
+                    let metadata = try await sessions.authenticate(sessionValue: session)
+                    let admitted = try await collectAdmittedRequestBody(request, mediaType: .json, admission: .managementProcessShared, policy: .productionDefault, maximumBytes: 16 * 1024, termination: context.jsonWriteBodyTermination)
+                    defer { admitted.release() }
+                    let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
+                    return accountJSON(.ok, try await service.mutate(path: request.uri.path, accountDID: metadata.accountDID, payload: payload, now: Date()))
+                } catch { return accountError(.serviceUnavailable) }
+            }
+        }
+
         let methods: [HTTPRequest.Method] = [.get, .head, .post, .put, .patch, .delete, .options, .connect, .trace]
         for method in methods {
             router.on("/account/api/*", method: method) { _, _ -> Response in accountError(.notFound) }
             router.on("/account/api/*/*", method: method) { _, _ -> Response in accountError(.notFound) }
+            router.on("/account/api/*/*/*", method: method) { _, _ -> Response in accountError(.notFound) }
+            router.on("/account/api/*/*/*/*", method: method) { _, _ -> Response in accountError(.notFound) }
         }
 
         router.get("/account") { [configuration] _, _ -> Response in staticAccountResponse(configuration: configuration, requestPath: "/account") }
@@ -310,8 +340,8 @@ private func accountCookie(named name: String, request: Request) -> String? { re
 private func constantTime(_ lhs: String, _ rhs: String) -> Bool { guard lhs.utf8.count == rhs.utf8.count else { return false }; var result: UInt8 = 0; for (a, b) in zip(lhs.utf8, rhs.utf8) { result |= a ^ b }; return result == 0 }
 
 private func accountJSON(_ status: HTTPResponse.Status, _ body: some Encodable, cookies: [String] = []) -> Response { var headers: HTTPFields = [.contentType: "application/json", .cacheControl: "no-store"]; for cookie in cookies { headers.append(.init(name: HTTPField.Name("Set-Cookie")!, value: cookie)) }; let data = (try? JSONEncoder().encode(body)) ?? Data("{}".utf8); return Response(status: status, headers: headers, body: .init(byteBuffer: ByteBuffer(data: data))) }
-private enum AccountStatus { case ok, badRequest, unauthorized, forbidden, notFound, serviceUnavailable }
-private func accountError(_ status: AccountStatus) -> Response { let code = switch status { case .badRequest: "invalid_request"; case .unauthorized: "authentication_required"; case .forbidden: "request_not_allowed"; case .notFound: "not_found"; case .serviceUnavailable: "service_unavailable"; case .ok: "ok" }; let http: HTTPResponse.Status = switch status { case .badRequest: .badRequest; case .unauthorized: .unauthorized; case .forbidden: .forbidden; case .notFound: .notFound; case .serviceUnavailable: .serviceUnavailable; case .ok: .ok }; return accountJSON(http, ["code": code, "message": code == "request_not_allowed" ? "Request not allowed." : code == "invalid_request" ? "Invalid request." : "The account service is unavailable."]) }
+private enum AccountStatus { case ok, badRequest, unauthorized, forbidden, conflict, unprocessable, rateLimited, notFound, serviceUnavailable }
+private func accountError(_ status: AccountStatus) -> Response { let code = switch status { case .badRequest: "invalid_request"; case .unauthorized: "authentication_required"; case .forbidden: "request_not_allowed"; case .conflict: "conflict"; case .unprocessable: "unprocessable_entity"; case .rateLimited: "rate_limited"; case .notFound: "not_found"; case .serviceUnavailable: "service_unavailable"; case .ok: "ok" }; let http: HTTPResponse.Status = switch status { case .badRequest: .badRequest; case .unauthorized: .unauthorized; case .forbidden: .forbidden; case .conflict: .conflict; case .unprocessable: HTTPResponse.Status(code: 422); case .rateLimited: .tooManyRequests; case .notFound: .notFound; case .serviceUnavailable: .serviceUnavailable; case .ok: .ok }; return accountJSON(http, ["code": code, "message": code == "request_not_allowed" ? "Request not allowed." : code == "invalid_request" ? "Invalid request." : "The account service is unavailable."]) }
 private func managementCookie(_ value: String) -> String { "\(SwanManagementSessionRuntime.sessionCookieName)=\(value); Path=/account; Secure; HttpOnly; SameSite=Strict" }
 private func csrfCookie(_ value: String) -> String { "\(SwanManagementSessionRuntime.csrfCookieName)=\(value); Path=/account; Secure; SameSite=Strict" }
 private func preAuthCookie(_ value: String) -> String { "\(SwanManagementSessionRuntime.preAuthCookieName)=\(value); Path=/account; Secure; SameSite=Strict" }
