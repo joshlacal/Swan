@@ -103,7 +103,7 @@ final class SwanDidWebIdentityTests: XCTestCase {
         let replacement = try await service.reserveSigningKey(requestID: "replace-2", accountDID: account, targetDID: "did:web:new.example", handle: handle, expiresAt: Date().addingTimeInterval(300))
         let replacementJSON = try SwanDidWebDocumentFixture.json(did: replacement.targetDID, handle: handle, pds: pds, key: replacement.key, claimEndpoint: replacement.claimServiceEndpoint)
         await XCTAssertThrowsAsyncError { _ = try await service.claim(reservation: replacement, documentJSON: replacementJSON) }
-        let auth = try SwanDidWebReplacementAuthorization(accountDID: account, sessionAccountDID: account, sessionID: "session-1", stepUpAt: Date(), stepUpReceiptDigest: Data(repeating: 7, count: 32))
+        let auth = try SwanDidWebReplacementAuthorization(accountDID: account, sessionAccountDID: account, sessionID: "session-1", stepUpAt: Date(), stepUpReceiptDigest: Data(repeating: 7, count: 32), mfaStrength: .phishingResistant, receiptConsumed: true)
         _ = try await service.claim(reservation: replacement, documentJSON: replacementJSON, authorization: auth)
     }
 

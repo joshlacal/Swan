@@ -7,7 +7,7 @@ import SwanStorage
 /// SQLite implementation of the reviewed method-neutral claim contract. The
 /// claim, replacement history, and nonce consumption are committed under one
 /// BEGIN IMMEDIATE transaction; no router or migration ownership is required.
-extension SQLiteControlDatabase: SwanGraceAwareIdentityBindingStore, SwanIdentityContinuityStore, SwanExpiredIdentityClaimReleasingStore {
+extension SQLiteControlDatabase: SwanGraceAwareIdentityBindingStore, SwanConditionalIdentityContinuityStore, SwanExpiredIdentityClaimReleasingStore {
     public func identityBinding(accountDID: String) async throws -> IdentityBinding? {
         try await withConnectionGate {
             let rows = try await connection.query("SELECT * FROM identity_bindings WHERE account_did = ?", [.text(accountDID)])
@@ -110,6 +110,23 @@ extension SQLiteControlDatabase: SwanGraceAwareIdentityBindingStore, SwanIdentit
                       binding.graceExpiresAt.map { .integer(timestamp($0)) } ?? .null,
                       .text(binding.state.rawValue), .text(binding.accountDID)])
             return binding
+        }
+    }
+
+    public func compareAndPersistIdentityContinuity(expected: IdentityBinding, replacement: IdentityBinding) async throws -> IdentityBinding {
+        try await withConnectionGate {
+            let result = try await connection.query("""
+                UPDATE identity_bindings SET state = ?, last_validated_at = ?, grace_expires_at = ?
+                WHERE account_did = ? AND identity_did = ? AND document_digest = ?
+                """, [.text(replacement.state.rawValue), replacement.lastValidatedAt.map { .integer(timestamp($0)) } ?? .null,
+                      replacement.graceExpiresAt.map { .integer(timestamp($0)) } ?? .null, .text(expected.accountDID),
+                      .text(expected.identityDID), expected.documentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null])
+            guard result.count == 0 || result.count == 1 else { throw AccountControlStoreError.malformedRecord }
+            let rows = try await connection.query("SELECT * FROM identity_bindings WHERE account_did = ?", [.text(expected.accountDID)])
+            guard rows.count == 1, try decodeIdentityBinding(rows[0]) == replacement else {
+                throw SwanError.conflict(expected: 0, actual: 1)
+            }
+            return replacement
         }
     }
 

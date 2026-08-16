@@ -73,14 +73,18 @@ public protocol SwanDurableSigningKeyReservationService: SwanSigningKeyReservati
 }
 
 public struct SwanDidWebReplacementAuthorization: Sendable, Equatable {
+    public enum MFAStrength: String, Codable, Sendable { case phishingResistant }
     public let accountDID: String
     public let sessionAccountDID: String
     public let sessionID: String
     public let stepUpAt: Date
     public let stepUpReceiptDigest: Data
+    public let mfaStrength: MFAStrength
+    public let receiptConsumed: Bool
 
     public init(accountDID: String, sessionAccountDID: String, sessionID: String,
-                stepUpAt: Date, stepUpReceiptDigest: Data) throws {
+                stepUpAt: Date, stepUpReceiptDigest: Data,
+                mfaStrength: MFAStrength, receiptConsumed: Bool) throws {
         guard !sessionID.isEmpty, stepUpReceiptDigest.count == 32 else {
             throw SwanError.invalidIdentifier("did:web replacement authorization")
         }
@@ -89,6 +93,8 @@ public struct SwanDidWebReplacementAuthorization: Sendable, Equatable {
         self.sessionID = sessionID
         self.stepUpAt = stepUpAt
         self.stepUpReceiptDigest = stepUpReceiptDigest
+        self.mfaStrength = mfaStrength
+        self.receiptConsumed = receiptConsumed
     }
 }
 
@@ -139,6 +145,10 @@ public actor InMemorySwanSigningKeyReservationService: SwanDurableSigningKeyRese
         guard let value = reservations[reservation.requestID], value.2 != .released,
               value.0 == reservation.key, value.1 == reservation.nonce else {
             throw SwanError.unauthorized("reservation tuple mismatch")
+        }
+        if let existing = value.3 {
+            guard existing == reservation else { throw SwanError.conflict(expected: 0, actual: 1) }
+            return
         }
         reservations[reservation.requestID] = (value.0, value.1, value.2, reservation)
     }
@@ -363,7 +373,7 @@ public enum SwanRFC8785JSON {
     }
 }
 
-public actor InMemoryIdentityBindingStore: SwanGraceAwareIdentityBindingStore, SwanIdentityContinuityStore, SwanExpiredIdentityClaimReleasingStore {
+public actor InMemoryIdentityBindingStore: SwanGraceAwareIdentityBindingStore, SwanConditionalIdentityContinuityStore, SwanExpiredIdentityClaimReleasingStore {
     private var claims: [String: DidWebClaimTransaction] = [:]
     private var bindings: [String: IdentityBinding] = [:]
     private var consumedNonces: Set<Data> = []
@@ -426,6 +436,11 @@ public actor InMemoryIdentityBindingStore: SwanGraceAwareIdentityBindingStore, S
         bindings[binding.accountDID] = binding
         return binding
     }
+    public func compareAndPersistIdentityContinuity(expected: IdentityBinding, replacement: IdentityBinding) async throws -> IdentityBinding {
+        guard bindings[expected.accountDID] == expected else { throw SwanError.conflict(expected: 0, actual: 1) }
+        bindings[expected.accountDID] = replacement
+        return replacement
+    }
     public func purgeExpiredIdentityClaims(now: Date) async throws {
         claims = claims.filter { $0.value.expiresAt > now || $0.value.state == .committed }
     }
@@ -437,16 +452,15 @@ public actor InMemoryIdentityBindingStore: SwanGraceAwareIdentityBindingStore, S
 }
 
 public actor SwanDidWebIdentityService {
-    private let reservations: any SwanSigningKeyReservationService
+    private let reservations: any SwanDurableSigningKeyReservationService
     private let bindings: any IdentityBindingStore
     private let publicPDSURL: String
     private let publicURL: String
     private let gracePeriod: TimeInterval
     private let replacementAuthorizer: (any SwanDidWebReplacementAuthorizing)?
-    private var issuedReservations: [String: SwanDidWebClaimReservation] = [:]
 
     public init(
-        reservations: any SwanSigningKeyReservationService,
+        reservations: any SwanDurableSigningKeyReservationService,
         bindings: any IdentityBindingStore,
         publicPDSURL: String, publicURL: String,
         gracePeriod: TimeInterval = 86_400,
@@ -463,7 +477,12 @@ public actor SwanDidWebIdentityService {
         expiresAt: Date, now: Date = Date()
     ) async throws -> SwanDidWebClaimReservation {
         guard expiresAt > now else { throw SwanError.expired }
-        _ = try AccountIdentifiers.validateDID(targetDID)
+        guard !requestID.isEmpty else { throw SwanError.invalidIdentifier("claim request") }
+        guard try AccountIdentifiers.validateDID(targetDID) == targetDID,
+              targetDID.hasPrefix("did:web:") else { throw SwanError.invalidIdentifier("did:web target") }
+        if let accountDID {
+            guard try AccountIdentifiers.validateDID(accountDID) == accountDID else { throw SwanError.invalidIdentifier("claim account") }
+        }
         let canonicalHandle = try AccountIdentifiers.canonicalHandle(handle)
         let reserved = try await reservations.reserveSigningKey(requestID: requestID)
         let claimBytes = try SwanDidWebClaimCanonicalizer.canonicalBytes(
@@ -480,19 +499,7 @@ public actor SwanDidWebIdentityService {
             claimReceiptDigest: SwanDidWebClaimCanonicalizer.receiptDigest(for: claimBytes),
             claimServiceEndpoint: endpoint
         )
-        if let existing = issuedReservations[requestID] {
-            guard existing.accountDID == result.accountDID,
-                  existing.targetDID == result.targetDID,
-                  existing.handle == result.handle,
-                  existing.expiresAt == result.expiresAt else {
-                throw SwanError.conflict(expected: 0, actual: 1)
-            }
-            return existing
-        }
-        if let durable = reservations as? any SwanDurableSigningKeyReservationService {
-            try await durable.recordIssuedReservation(result)
-        }
-        issuedReservations[requestID] = result
+        try await reservations.recordIssuedReservation(result)
         return result
     }
 
@@ -505,12 +512,8 @@ public actor SwanDidWebIdentityService {
             throw SwanError.expired
         }
         guard let accountDID = reservation.accountDID else { throw SwanError.invalidIdentifier("claim account") }
-        if let durable = reservations as? any SwanDurableSigningKeyReservationService {
-            guard let issued = try await durable.issuedReservation(requestID: reservation.requestID),
-                  issued == reservation else {
-                throw SwanError.unauthorized("did:web reservation tuple mismatch")
-            }
-        } else if issuedReservations[reservation.requestID] != reservation {
+        guard let issued = try await reservations.issuedReservation(requestID: reservation.requestID),
+              issued == reservation else {
             throw SwanError.unauthorized("did:web reservation tuple mismatch")
         }
         let recomputedClaim = try SwanDidWebClaimCanonicalizer.canonicalBytes(
@@ -542,14 +545,15 @@ public actor SwanDidWebIdentityService {
            existing.documentDigest == validated.documentDigest,
            existing.claimReceiptDigest == reservation.claimReceiptDigest,
            existing.reservedKeyID == reservation.key.keyID {
-            if let durable = reservations as? any SwanDurableSigningKeyReservationService {
-                try? await durable.repairCommittedReservation(requestID: reservation.requestID)
-            }
+            try? await reservations.repairCommittedReservation(requestID: reservation.requestID)
             return existing
         }
         if existingBinding != nil {
             guard let authorization, authorization.accountDID == accountDID,
                   let replacementAuthorizer,
+                  authorization.mfaStrength == .phishingResistant,
+                  authorization.receiptConsumed,
+                  now.timeIntervalSince(authorization.stepUpAt) <= 300,
                   try await replacementAuthorizer.authorize(authorization, now: now) else {
                 throw SwanError.unauthorized("fresh step-up required for identity replacement")
             }
@@ -559,7 +563,9 @@ public actor SwanDidWebIdentityService {
             targetDID: reservation.targetDID, handle: reservation.handle,
             claimNonceDigest: Data(SHA256.hash(data: reservation.nonce)),
             requestedDocumentDigest: validated.documentDigest, state: .reserved,
-            expiresAt: reservation.expiresAt, reservedKeyID: reservation.key.keyID,
+            expiresAt: reservation.expiresAt,
+            stepUpReceiptDigest: authorization?.stepUpReceiptDigest,
+            reservedKeyID: reservation.key.keyID,
             claimReceiptDigest: reservation.claimReceiptDigest
         )
         try await bindings.reserveDidWebClaim(transaction, now: now)
@@ -589,11 +595,7 @@ public actor SwanDidWebIdentityService {
             try await bindings.commitDidWebClaim(request, history: history, now: now)
         }
         do {
-            if let durable = reservations as? any SwanDurableSigningKeyReservationService {
-                try await durable.markReservationCommitted(requestID: reservation.requestID)
-            } else {
-                try await reservations.consumeSigningKeyReservation(requestID: reservation.requestID)
-            }
+            try await reservations.markReservationCommitted(requestID: reservation.requestID)
         } catch {
             // The durable binding is committed, so leave the provider tuple in
             // repairable committed/outbox state rather than releasing it.
@@ -613,10 +615,7 @@ public actor SwanDidWebIdentityService {
 
     public func releaseSigningKeyReservation(_ reservation: SwanDidWebClaimReservation, now: Date = Date()) async throws {
         _ = now
-        if let durable = reservations as? any SwanDurableSigningKeyReservationService {
-            try await durable.releaseSigningKeyReservation(requestID: reservation.requestID)
-        }
-        issuedReservations.removeValue(forKey: reservation.requestID)
+        try await reservations.releaseSigningKeyReservation(requestID: reservation.requestID)
     }
 
     public func purgeExpiredClaims(now: Date = Date()) async throws {
@@ -624,23 +623,22 @@ public actor SwanDidWebIdentityService {
             try await bindings.purgeExpiredIdentityClaims(now: now); return
         }
         for requestID in try await store.purgeExpiredIdentityClaimsReturningRequests(now: now) {
-            if let durable = reservations as? any SwanDurableSigningKeyReservationService {
-                try? await durable.releaseSigningKeyReservation(requestID: requestID)
-            }
+            try? await reservations.releaseSigningKeyReservation(requestID: requestID)
         }
     }
 
     public func repairCommittedClaim(_ reservation: SwanDidWebClaimReservation) async throws {
-        guard let durable = reservations as? any SwanDurableSigningKeyReservationService else {
-            throw SwanError.unavailable("claim provider is not repairable")
-        }
-        try await durable.repairCommittedReservation(requestID: reservation.requestID)
+        try await reservations.repairCommittedReservation(requestID: reservation.requestID)
     }
 
-    public func removeIdentity(binding: IdentityBinding, authorization: SwanDidWebReplacementAuthorization,
+    public func removeIdentity(accountDID: String, authorization: SwanDidWebReplacementAuthorization,
                                now: Date = Date()) async throws -> IdentityBinding {
-        guard binding.method == .didWeb, binding.accountDID == authorization.accountDID,
+        guard let binding = try await bindings.identityBinding(accountDID: accountDID),
+              binding.method == .didWeb, binding.accountDID == authorization.accountDID,
               let replacementAuthorizer,
+              authorization.mfaStrength == .phishingResistant,
+              authorization.receiptConsumed,
+              now.timeIntervalSince(authorization.stepUpAt) <= 300,
               try await replacementAuthorizer.authorize(authorization, now: now) else {
             throw SwanError.unauthorized("fresh step-up required for identity removal")
         }
@@ -653,7 +651,10 @@ public actor SwanDidWebIdentityService {
             lastValidatedAt: binding.lastValidatedAt,
             graceExpiresAt: binding.graceExpiresAt, state: .released
         )
-        return try await persistContinuity(released)
+        guard let conditional = bindings as? any SwanConditionalIdentityContinuityStore else {
+            throw SwanError.unavailable("identity removal requires conditional durable store")
+        }
+        return try await conditional.compareAndPersistIdentityContinuity(expected: binding, replacement: released)
     }
 
     public func revalidate(
@@ -665,6 +666,41 @@ public actor SwanDidWebIdentityService {
         }
         _ = documents; _ = now
         throw SwanError.unavailable("did:web revalidation requires stored reserved key material")
+    }
+
+    /// Applies only a document already validated with the stored reserved key
+    /// and exact claim endpoint. Startup/background/sensitive-operation
+    /// composition calls this after fetching and validating the full binding.
+    public func applyValidatedRevalidation(binding: IdentityBinding,
+                                           validated: SwanValidatedDidWebDocument?,
+                                           now: Date = Date(), transientFailure: Bool = false) async throws -> IdentityBinding {
+        guard binding.method == .didWeb, let digest = binding.documentDigest else {
+            throw SwanError.invalidIdentifier("did:web binding")
+        }
+        if transientFailure {
+            let withinGrace = binding.graceExpiresAt.map { now <= $0 } ?? false
+            let next = try IdentityBinding(accountDID: binding.accountDID, identityDID: binding.identityDID,
+                                           method: binding.method, handle: binding.handle,
+                                           documentDigest: binding.documentDigest, claimReceiptDigest: binding.claimReceiptDigest,
+                                           reservedKeyID: binding.reservedKeyID, lastValidatedAt: binding.lastValidatedAt,
+                                           graceExpiresAt: binding.graceExpiresAt,
+                                           state: withinGrace ? .active : .suspended)
+            return try await persistContinuity(next)
+        }
+        guard let validated, validated.documentDigest == digest else {
+            let next = try IdentityBinding(accountDID: binding.accountDID, identityDID: binding.identityDID,
+                                           method: binding.method, handle: binding.handle,
+                                           documentDigest: binding.documentDigest, claimReceiptDigest: binding.claimReceiptDigest,
+                                           reservedKeyID: binding.reservedKeyID, lastValidatedAt: binding.lastValidatedAt,
+                                           graceExpiresAt: binding.graceExpiresAt, state: .suspended)
+            return try await persistContinuity(next)
+        }
+        let next = try IdentityBinding(accountDID: binding.accountDID, identityDID: binding.identityDID,
+                                       method: binding.method, handle: binding.handle,
+                                       documentDigest: digest, claimReceiptDigest: binding.claimReceiptDigest,
+                                       reservedKeyID: binding.reservedKeyID, lastValidatedAt: now,
+                                       graceExpiresAt: now.addingTimeInterval(gracePeriod), state: .active)
+        return try await persistContinuity(next)
     }
 
     private func persistContinuity(_ binding: IdentityBinding) async throws -> IdentityBinding {
