@@ -8,11 +8,14 @@ public struct ModerationTransportRequest: Sendable, Equatable {
     public let path: String
     public let body: Data
     public let maximumResponseBytes: Int
+    public let subject: String
+    public let details: String?
 }
 
 public struct ModerationReportRequest: Sendable, Equatable {
     public let subject: String
     public let reason: String
+    public var reasonType: String { reason }
     public let details: String?
 
     public init(subject: String, reason: String, details: String? = nil) {
@@ -49,6 +52,7 @@ public enum ModerationServiceAdapterError: Error, Sendable, Equatable {
 public struct ModerationReportResult: Sendable, Equatable {
     public let accepted: Bool
     public let status: Int
+    public let output: Data
 }
 
 /// Bounded moderation delivery. Subject and details are sent only as
@@ -62,10 +66,12 @@ public struct ModerationServiceAdapter: Sendable {
     private let pinnedPeer: String
     private let maximumBodyBytes: Int
     private let correlationKey: SymmetricKey
+    private let correlationKeyID: String
+    private let correlationKeyVersion: Int
     private let maximumResponseBytes = 16 * 1_024
 
-    public init(transport: any ModerationTransport, allowedHost: String, pinnedPeer: String, maximumBodyBytes: Int = 64 * 1_024, correlationKey: Data) throws {
-        guard !allowedHost.isEmpty, !pinnedPeer.isEmpty, (64...1_024 * 1_024).contains(maximumBodyBytes), correlationKey.count >= 16 else {
+    public init(transport: any ModerationTransport, allowedHost: String, pinnedPeer: String, maximumBodyBytes: Int = 64 * 1_024, correlationKeyID: String, correlationKeyVersion: Int, correlationKey: Data) throws {
+        guard !allowedHost.isEmpty, !pinnedPeer.isEmpty, (64...1_024 * 1_024).contains(maximumBodyBytes), (1...128).contains(correlationKeyID.utf8.count), correlationKeyVersion > 0, correlationKey.count >= 32, Set(correlationKey).count >= 4 else {
             throw ModerationServiceAdapterError.invalidConfiguration
         }
         self.transport = transport
@@ -73,6 +79,8 @@ public struct ModerationServiceAdapter: Sendable {
         self.pinnedPeer = pinnedPeer
         self.maximumBodyBytes = maximumBodyBytes
         self.correlationKey = SymmetricKey(data: correlationKey)
+        self.correlationKeyID = correlationKeyID
+        self.correlationKeyVersion = correlationKeyVersion
     }
 
     public func submit(_ request: ModerationReportRequest) async throws -> ModerationReportResult {
@@ -86,14 +94,16 @@ public struct ModerationServiceAdapter: Sendable {
         let envelope = try JSONEncoder().encode(RedactedReport(
             subjectCorrelation: correlation(for: request.subject),
             reason: request.reason,
-            detailsCorrelation: request.details.map { correlation(for: $0) }
+            detailsCorrelation: request.details.map { correlation(for: $0) },
+            keyID: correlationKeyID,
+            keyVersion: correlationKeyVersion
         ))
         guard envelope.count <= maximumBodyBytes else { throw ModerationServiceAdapterError.responseTooLarge }
-        let response = try await transport.send(.init(host: allowedHost, pinnedPeer: pinnedPeer, path: "/reports", body: envelope, maximumResponseBytes: maximumResponseBytes))
+        let response = try await transport.send(.init(host: allowedHost, pinnedPeer: pinnedPeer, path: "/reports", body: envelope, maximumResponseBytes: maximumResponseBytes, subject: request.subject, details: request.details))
         guard response.peer == pinnedPeer else { throw ModerationServiceAdapterError.peerMismatch }
         guard response.body.count <= maximumResponseBytes else { throw ModerationServiceAdapterError.responseTooLarge }
         guard (200...299).contains(response.status) else { throw ModerationServiceAdapterError.rejected }
-        return .init(accepted: true, status: response.status)
+        return .init(accepted: true, status: response.status, output: response.body)
     }
 
     private func correlation(for value: String) -> String {
@@ -105,11 +115,15 @@ public struct ModerationServiceAdapter: Sendable {
         let reason: String
         let detailsCorrelation: String?
         let schema: String
+        let keyID: String
+        let keyVersion: Int
 
-        init(subjectCorrelation: String, reason: String, detailsCorrelation: String?) {
+        init(subjectCorrelation: String, reason: String, detailsCorrelation: String?, keyID: String, keyVersion: Int) {
             self.subjectCorrelation = subjectCorrelation
             self.reason = reason
             self.detailsCorrelation = detailsCorrelation
+            self.keyID = keyID
+            self.keyVersion = keyVersion
             schema = "swan.moderation.report.v1"
         }
     }

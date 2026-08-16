@@ -1,5 +1,6 @@
 import Foundation
 import Petrel
+import Crypto
 
 public struct PublicRepositoryImportEnvelope: Sendable {
     public let requestID: String
@@ -26,6 +27,11 @@ public struct PublicRepositoryImportEnvelope: Sendable {
         self.referencedBlobs = referencedBlobs
         self.blobPayloads = blobPayloads
         self.signature = signature
+    }
+
+    public static func make(did: String, rootCID: CID, expectedExistingRootCID: CID? = nil, blocks: [PublicRepositoryBlock], referencedBlobs: [CID] = [], blobPayloads: [PublicRepositoryBlock] = [], signature: Data, requestID: String) throws -> Self {
+        let provisional = try Self(did: did, rootCID: rootCID, expectedExistingRootCID: expectedExistingRootCID, blocks: blocks, referencedBlobs: referencedBlobs, blobPayloads: blobPayloads, signature: signature, requestID: requestID, requestDigest: Data(repeating: 0, count: 32))
+        return try Self(did: did, rootCID: rootCID, expectedExistingRootCID: expectedExistingRootCID, blocks: blocks, referencedBlobs: referencedBlobs, blobPayloads: blobPayloads, signature: signature, requestID: requestID, requestDigest: PublicRepositoryReferenceImportVerifier.canonicalRequestDigest(for: provisional))
     }
 }
 
@@ -58,6 +64,7 @@ public protocol PublicRepositoryBlobResolver: Sendable {
 public enum PublicRepositoryReferenceImportError: Error, Sendable, Equatable {
     case invalidDID
     case invalidBinding
+    case requestDigestMismatch
     case invalidRoot
     case blockLimitExceeded
     case byteLimitExceeded
@@ -81,16 +88,37 @@ public struct PublicRepositoryReferenceImportVerifier: Sendable {
         self.maximumBytes = maximumBytes
     }
 
+    public static func canonicalRequestDigest(for envelope: PublicRepositoryImportEnvelope) -> Data {
+        var bytes = Data("swan.repo.import.v1\0".utf8)
+        func append(_ data: Data) { var n = UInt64(data.count).bigEndian; bytes.append(Data(bytes: &n, count: 8)); bytes.append(data) }
+        let normalizedDID = (try? DID(didString: envelope.did)).map { String(describing: $0) } ?? envelope.did
+        append(Data(normalizedDID.utf8)); append(Data(envelope.rootCID.bytes)); append(envelope.signature)
+        for block in envelope.blocks.sorted(by: { $0.cid.description < $1.cid.description }) { append(Data(block.cid.bytes)); append(block.bytes) }
+        for cid in envelope.referencedBlobs.sorted(by: { $0.description < $1.description }) { append(Data(cid.bytes)) }
+        for block in envelope.blobPayloads.sorted(by: { $0.cid.description < $1.cid.description }) { append(Data(block.cid.bytes)); append(block.bytes) }
+        return Data(SHA256.hash(data: bytes))
+    }
+
+    public protocol FullRepositoryImportVerifier: Sendable {
+        var isAssembled: Bool { get }
+        func verifyAndStage(_ envelope: PublicRepositoryImportEnvelope) async throws -> PublicRepositoryImportedState
+    }
+
     public func verifyAndCommit(
         _ envelope: PublicRepositoryImportEnvelope,
         committer: any PublicRepositoryImportCommitter,
+        fullVerifier: any FullRepositoryImportVerifier,
         existingBlobResolver: (any PublicRepositoryBlobResolver)? = nil,
         verifySignature: @escaping @Sendable (String, CID, Data) throws -> Bool
     ) async throws -> PublicRepositoryImportedState {
         guard committer.isDurableTransactional else { throw PublicRepositoryReferenceImportError.unassembled }
+        guard fullVerifier.isAssembled else { throw PublicRepositoryReferenceImportError.unassembled }
+        guard envelope.requestDigest == Self.canonicalRequestDigest(for: envelope) else { throw PublicRepositoryReferenceImportError.requestDigestMismatch }
         guard (try? DID(didString: envelope.did)) != nil else { throw PublicRepositoryReferenceImportError.invalidDID }
         try PublicRepositoryCID.validate(envelope.rootCID)
         for blob in envelope.referencedBlobs { try PublicRepositoryCID.validate(blob) }
+        let referencedBlobSet = Set(envelope.referencedBlobs)
+        guard envelope.blobPayloads.allSatisfy({ referencedBlobSet.contains($0.cid) }) else { throw PublicRepositoryReferenceImportError.invalidBinding }
         guard envelope.blocks.count + envelope.blobPayloads.count <= maximumBlocks else { throw PublicRepositoryReferenceImportError.blockLimitExceeded }
         var totalBytes = 0
         for block in envelope.blocks {
@@ -122,7 +150,8 @@ public struct PublicRepositoryReferenceImportVerifier: Sendable {
                 throw PublicRepositoryReferenceImportError.missingBlob(blob)
             }
         }
-        let state = PublicRepositoryImportedState(did: envelope.did, rootCID: envelope.rootCID, blocks: byCID.map { .init(cid: $0.key, bytes: $0.value) }.sorted { $0.cid.description < $1.cid.description })
+        _ = byCID
+        let state = try await fullVerifier.verifyAndStage(envelope)
         return try await committer.commit(state, requestID: envelope.requestID, requestDigest: envelope.requestDigest, expectedRootCID: envelope.expectedExistingRootCID)
     }
 }

@@ -10,6 +10,8 @@ final class ModerationServiceAdapterTests: XCTestCase {
             allowedHost: "moderation.example",
             pinnedPeer: "sha256/peer",
             maximumBodyBytes: 256,
+            correlationKeyID: "test-key",
+            correlationKeyVersion: 1,
             correlationKey: Data(repeating: 4, count: 32)
         )
         let response = try await adapter.submit(.init(subject: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", reason: "spam", details: "secret details"))

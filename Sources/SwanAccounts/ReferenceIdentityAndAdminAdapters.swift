@@ -106,6 +106,7 @@ public struct ReferenceAdminLifecycleService: Sendable {
     }
 
     public func suspend(accountDID: String, reason: String, authorization: AccountOperatorAuthorization) async throws -> ReferenceAdminLifecycleResult {
+        guard authorization.isVerifiedForBoundary else { throw AccountOperatorError.operatorSecretRejected }
         let did = try AccountIdentifiers.validateDID(accountDID)
         guard !reason.isEmpty, reason.utf8.count <= 512 else { throw SwanError.invalidIdentifier("admin reason") }
         let result = try await mutation.suspend(accountDID: did, reason: reason)
@@ -114,6 +115,7 @@ public struct ReferenceAdminLifecycleService: Sendable {
     }
 
     public func reactivate(accountDID: String, authorization: AccountOperatorAuthorization) async throws -> ReferenceAdminLifecycleResult {
+        guard authorization.isVerifiedForBoundary else { throw AccountOperatorError.operatorSecretRejected }
         let did = try AccountIdentifiers.validateDID(accountDID)
         let result = try await mutation.reactivate(accountDID: did)
         await audit.append(.init(operation: "reactivate", accountDID: did))

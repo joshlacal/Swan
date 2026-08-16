@@ -29,7 +29,7 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
 
         let blockPage = try await surface.getBlocks([blocks[0].cid, blocks[1].cid, blocks[2].cid], limit: 2)
         XCTAssertEqual(blockPage.blocks.count, 2)
-        XCTAssertNotNil(blockPage.cursor)
+        XCTAssertNil(blockPage.cursor)
         XCTAssertEqual(blockPage.missing, [])
 
         let records = try await surface.listRecords(collection: "app.bsky.feed.post", limit: 1, reverse: true)
@@ -58,7 +58,7 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
             blocks: [], records: [], maximumPageSize: 2
         )
         let page = try await surface.listMissingBlobs([cid, cid], limit: 1)
-        XCTAssertEqual(page.missing, [cid])
+        XCTAssertEqual(page.blobs, [cid])
         XCTAssertNil(page.cursor)
     }
 
@@ -67,13 +67,12 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
         let root = CID.fromDAGCBOR(bytes)
         let committer = RecordingImportCommitter()
         let verifier = try PublicRepositoryReferenceImportVerifier(maximumBlocks: 2, maximumBytes: 32)
-        let envelope = try PublicRepositoryImportEnvelope(
+        let envelope = try PublicRepositoryImportEnvelope.make(
             did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
             rootCID: root,
-            blocks: [.init(cid: root, bytes: bytes)],
-            signature: Data([1]), requestID: "import-1", requestDigest: Data(repeating: 7, count: 32)
+            blocks: [.init(cid: root, bytes: bytes)], signature: Data([1]), requestID: "import-1"
         )
-        _ = try await verifier.verifyAndCommit(envelope, committer: committer, existingBlobResolver: nil) { did, cid, signature in
+        _ = try await verifier.verifyAndCommit(envelope, committer: committer, fullVerifier: FullVerifier(), existingBlobResolver: nil) { did, cid, signature in
             did == "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa" && cid == root && signature == Data([1])
         }
         let committed = await committer.states
@@ -88,9 +87,9 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
         let blob = CID.fromDAGCBOR(blobBytes)
         let committer = RecordingImportCommitter()
         let verifier = try PublicRepositoryReferenceImportVerifier(maximumBlocks: 3, maximumBytes: 64)
-        let envelope = try PublicRepositoryImportEnvelope(did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", rootCID: root, blocks: [.init(cid: root, bytes: rootBytes)], referencedBlobs: [blob], blobPayloads: [.init(cid: blob, bytes: blobBytes)], signature: Data([1]), requestID: "import-2", requestDigest: Data(repeating: 8, count: 32))
-        _ = try await verifier.verifyAndCommit(envelope, committer: committer) { _, _, _ in true }
-        _ = try await verifier.verifyAndCommit(envelope, committer: committer) { _, _, _ in true }
+        let envelope = try PublicRepositoryImportEnvelope.make(did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", rootCID: root, blocks: [.init(cid: root, bytes: rootBytes)], referencedBlobs: [blob], blobPayloads: [.init(cid: blob, bytes: blobBytes)], signature: Data([1]), requestID: "import-2")
+        _ = try await verifier.verifyAndCommit(envelope, committer: committer, fullVerifier: FullVerifier()) { _, _, _ in true }
+        _ = try await verifier.verifyAndCommit(envelope, committer: committer, fullVerifier: FullVerifier()) { _, _, _ in true }
         let states = await committer.states
         XCTAssertEqual(states.count, 1)
     }
@@ -100,14 +99,13 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
         let root = CID.fromDAGCBOR(bytes)
         let committer = RecordingImportCommitter()
         let verifier = try PublicRepositoryReferenceImportVerifier(maximumBlocks: 2, maximumBytes: 32)
-        let envelope = PublicRepositoryImportEnvelope(
+        let envelope = try PublicRepositoryImportEnvelope.make(
             did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
             rootCID: root,
-            blocks: [.init(cid: root, bytes: bytes)],
-            signature: Data([9]), requestID: "import-invalid", requestDigest: Data(repeating: 9, count: 32)
+            blocks: [.init(cid: root, bytes: bytes)], signature: Data([9]), requestID: "import-invalid"
         )
         do {
-            _ = try await verifier.verifyAndCommit(envelope, committer: committer) { _, _, _ in false }
+            _ = try await verifier.verifyAndCommit(envelope, committer: committer, fullVerifier: FullVerifier()) { _, _, _ in false }
             XCTFail("invalid signature unexpectedly committed")
         } catch let error as PublicRepositoryReferenceImportError {
             XCTAssertEqual(error, .invalidSignature)
@@ -121,9 +119,9 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
         let root = CID.fromDAGCBOR(bytes)
         let committer = RecordingImportCommitter(durable: false)
         let verifier = try PublicRepositoryReferenceImportVerifier(maximumBlocks: 2, maximumBytes: 32)
-        let envelope = try PublicRepositoryImportEnvelope(did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", rootCID: root, blocks: [.init(cid: root, bytes: bytes)], signature: Data([1]), requestID: "unassembled", requestDigest: Data(repeating: 3, count: 32))
+        let envelope = try PublicRepositoryImportEnvelope.make(did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", rootCID: root, blocks: [.init(cid: root, bytes: bytes)], signature: Data([1]), requestID: "unassembled")
         do {
-            _ = try await verifier.verifyAndCommit(envelope, committer: committer) { _, _, _ in true }
+            _ = try await verifier.verifyAndCommit(envelope, committer: committer, fullVerifier: FullVerifier()) { _, _, _ in true }
             XCTFail("unassembled committer unexpectedly accepted import")
         } catch let error as PublicRepositoryReferenceImportError {
             XCTAssertEqual(error, .unassembled)
@@ -136,6 +134,13 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
             let cid = CID.fromDAGCBOR(data)
             return PublicRepositoryBlock(cid: cid, bytes: data)
         }
+    }
+}
+
+private struct FullVerifier: PublicRepositoryReferenceImportVerifier.FullRepositoryImportVerifier {
+    let isAssembled = true
+    func verifyAndStage(_ envelope: PublicRepositoryImportEnvelope) async throws -> PublicRepositoryImportedState {
+        .init(did: envelope.did, rootCID: envelope.rootCID, blocks: envelope.blocks + envelope.blobPayloads)
     }
 }
 
