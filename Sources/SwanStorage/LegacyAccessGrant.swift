@@ -1,4 +1,5 @@
 import Foundation
+import SwanCore
 
 /// Dependency-neutral credential grant carried by legacy authorization
 /// contexts and signed access tokens.

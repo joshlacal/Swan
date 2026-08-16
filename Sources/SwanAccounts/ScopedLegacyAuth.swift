@@ -253,7 +253,7 @@ public actor LegacyAuthService {
     public func listAppPasswords(accountDID: String, managementSessionToken: String? = nil, stepUpToken: String? = nil, now: Date = Date()) async throws -> [PublicAppPasswordMetadata] {
         guard let managementSessionToken else { throw SwanError.unauthorized("management session required") }
         try await managementAuthorizer.authorizeSession(accountDID: accountDID, managementSessionToken: managementSessionToken)
-        try await store.listAppPasswords(accountDID: accountDID, now: now).map(PublicAppPasswordMetadata.init(metadata:))
+        return try await store.listAppPasswords(accountDID: accountDID, now: now).map(PublicAppPasswordMetadata.init(metadata:))
     }
 
     public func updateAppPasswordScopes(accountDID: String, name: String, scopes: Set<String>, managementSessionToken: String? = nil, stepUpToken: String? = nil, now: Date = Date()) async throws {
@@ -415,14 +415,14 @@ public actor LegacyAuthService {
         let salt = Self.randomBytes(count: Int(crypto_pwhash_SALTBYTES))
         let passwordBytes = secret.utf8CString
         let result = passwordBytes.withUnsafeBufferPointer { passwordBuffer in
-            salt.withUnsafeBytes { saltBuffer in
+            salt.withUnsafeBytes { (saltBuffer: UnsafeRawBufferPointer) in
                 guard let saltBase = saltBuffer.baseAddress else { return -1 }
-                crypto_pwhash(
+                return Int(crypto_pwhash(
                     &output, UInt64(output.count), passwordBuffer.baseAddress!,
                     UInt64(passwordBuffer.count - 1), saltBase.assumingMemoryBound(to: UInt8.self),
-                    crypto_pwhash_OPSLIMIT_INTERACTIVE, crypto_pwhash_MEMLIMIT_INTERACTIVE,
+                    UInt64(crypto_pwhash_OPSLIMIT_INTERACTIVE), Int(crypto_pwhash_MEMLIMIT_INTERACTIVE),
                     crypto_pwhash_ALG_ARGON2ID13
-                )
+                ))
             }
         }
         guard result == 0 else { throw SwanError.unavailable("Argon2id app-password hashing failed") }
@@ -436,14 +436,14 @@ public actor LegacyAuthService {
         var output = [UInt8](repeating: 0, count: expected.count)
         let passwordBytes = secret.utf8CString
         let result = passwordBytes.withUnsafeBufferPointer { passwordBuffer in
-            salt.withUnsafeBytes { saltBuffer in
+            salt.withUnsafeBytes { (saltBuffer: UnsafeRawBufferPointer) in
                 guard let saltBase = saltBuffer.baseAddress else { return -1 }
-                return crypto_pwhash(
+                return Int(crypto_pwhash(
                     &output, UInt64(output.count), passwordBuffer.baseAddress!,
                     UInt64(passwordBuffer.count - 1), saltBase.assumingMemoryBound(to: UInt8.self),
-                    crypto_pwhash_OPSLIMIT_INTERACTIVE, crypto_pwhash_MEMLIMIT_INTERACTIVE,
+                    UInt64(crypto_pwhash_OPSLIMIT_INTERACTIVE), Int(crypto_pwhash_MEMLIMIT_INTERACTIVE),
                     crypto_pwhash_ALG_ARGON2ID13
-                )
+                ))
             }
         }
         guard result == 0 else { throw SwanError.unavailable("Argon2id app-password verification failed") }

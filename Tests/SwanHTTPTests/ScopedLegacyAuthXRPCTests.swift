@@ -1,6 +1,7 @@
 import XCTest
 import Petrel
 import SwanAccounts
+import SwanStorage
 @testable import SwanHTTP
 
 final class ScopedLegacyAuthXRPCTests: XCTestCase {

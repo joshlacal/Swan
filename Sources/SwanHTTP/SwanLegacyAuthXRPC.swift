@@ -1,6 +1,7 @@
 import Foundation
 import Petrel
 import SwanAccounts
+import SwanCore
 
 /// Pure XRPC boundary for the pinned `com.atproto.server` lexicons. Router
 /// registration is intentionally left to the integration owner; this adapter
