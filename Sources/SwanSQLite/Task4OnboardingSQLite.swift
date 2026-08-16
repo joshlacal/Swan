@@ -196,6 +196,7 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
     }
 
     public func claimSignupEmailOutbox(now: Date = Date(), lease: TimeInterval = 60) async throws -> SignupEmailOutboxMessage? {
+        guard (1 ... 300).contains(lease) else { throw AccountControlStoreError.invalidInput }
         let current = try task4Timestamp(now), until = try task4Timestamp(now.addingTimeInterval(lease))
         guard until > current else { throw AccountControlStoreError.invalidInput }
         return try await withConnectionGate { try await transaction {
@@ -208,14 +209,14 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
     public func markSignupEmailOutboxDelivered(deliveryID: String, leaseToken: Data, now: Date = Date()) async throws {
         let current = try task4Timestamp(now)
         try await withConnectionGate { try await transaction {
-            _ = try await connection.query("UPDATE signup_email_request_outbox SET state='delivered',delivered_at=?,lease_expires_at=NULL,lease_token=NULL WHERE delivery_id=? AND state='sending' AND lease_token=?", [.integer(current), .text(deliveryID), task4Blob(leaseToken)])
+            guard try await connection.query("UPDATE signup_email_request_outbox SET state='delivered',delivered_at=?,lease_expires_at=NULL,lease_token=NULL WHERE delivery_id=? AND state='sending' AND lease_token=? AND lease_expires_at>=?", [.integer(current), .text(deliveryID), task4Blob(leaseToken), .integer(current)]).count == 1 else { throw AccountControlStoreError.unavailable }
         } }
     }
 
     public func failSignupEmailOutbox(deliveryID: String, leaseToken: Data, now: Date = Date()) async throws {
         let current = try task4Timestamp(now)
         try await withConnectionGate { try await transaction {
-            _ = try await connection.query("UPDATE signup_email_request_outbox SET state=CASE WHEN attempts>=8 THEN 'failed' ELSE 'pending' END,lease_expires_at=NULL,lease_token=NULL,next_attempt_at=? + min(3600000000,1000000 * (1 << min(attempts,10))) WHERE delivery_id=? AND state='sending' AND lease_token=?", [.integer(current), .text(deliveryID), task4Blob(leaseToken)])
+            guard try await connection.query("UPDATE signup_email_request_outbox SET state=CASE WHEN attempts>=8 THEN 'failed' ELSE 'pending' END,lease_expires_at=NULL,lease_token=NULL,next_attempt_at=? + min(3600000000,1000000 * (1 << min(attempts,10))) WHERE delivery_id=? AND state='sending' AND lease_token=? AND lease_expires_at>=?", [.integer(current), .text(deliveryID), task4Blob(leaseToken), .integer(current)]).count == 1 else { throw AccountControlStoreError.unavailable }
         } }
     }
 
@@ -320,7 +321,8 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
         return try SignupFinalizationResult(accountDID: did, managementSessionID: ManagementSessionID(rawValue: session), idempotencyKey: request.idempotencyKey, committedAt: Date(timeIntervalSince1970: Double(committed) / 1_000_000))
     }
 
-    public func purgeExpiredSignupState(now: Date) async throws {
+    public func purgeExpiredSignupState(now: Date, batchSize: Int = 500) async throws {
+        guard (1 ... 1000).contains(batchSize) else { throw AccountControlStoreError.invalidInput }
         let current = try task4Timestamp(now)
         let retention = max(0, current - 30 * 24 * 60 * 60 * 1_000_000)
         try await withConnectionGate { try await transaction {
@@ -328,9 +330,9 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
             _ = try await connection.query("DELETE FROM signup_email_proof_reservations WHERE reserved_until<=?", [.integer(current)])
             _ = try await connection.query("DELETE FROM signup_authorization_reservations WHERE reserved_until<=?", [.integer(current)])
             _ = try await connection.query("DELETE FROM signup_email_proofs WHERE expires_at<=? AND consumed_at IS NULL", [.integer(current)])
-            _ = try await connection.query("DELETE FROM signup_authorization_results WHERE committed_at<=?", [.integer(retention)])
-            _ = try await connection.query("DELETE FROM signup_authorizations WHERE state IN('failed','committed') AND expires_at<=?", [.integer(retention)])
-            _ = try await connection.query("DELETE FROM signup_email_request_outbox WHERE (state IN('delivered','failed') AND COALESCE(delivered_at,expires_at)<=?) OR expires_at<=?", [.integer(retention), .integer(current)])
+            _ = try await connection.query("DELETE FROM signup_authorization_results WHERE committed_at<=? LIMIT ?", [.integer(retention), .integer(batchSize)])
+            _ = try await connection.query("DELETE FROM signup_authorizations WHERE state IN('failed','committed') AND expires_at<=? LIMIT ?", [.integer(retention), .integer(batchSize)])
+            _ = try await connection.query("DELETE FROM signup_email_request_outbox WHERE ((state IN('delivered','failed') AND COALESCE(delivered_at,expires_at)<=?) OR expires_at<=?) LIMIT ?", [.integer(retention), .integer(current), .integer(batchSize)])
         } }
     }
 }

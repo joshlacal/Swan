@@ -195,6 +195,13 @@ public struct TurnstileSiteVerifyResponse: Sendable, Equatable {
 
 public protocol TurnstileHTTPTransport: Sendable {
     func verify(_ request: TurnstileSiteVerifyRequest) async throws -> TurnstileSiteVerifyResponse
+    func verify(_ request: TurnstileSiteVerifyRequest, deadline: ContinuousClock.Instant) async throws -> TurnstileSiteVerifyResponse
+}
+
+public extension TurnstileHTTPTransport {
+    func verify(_ request: TurnstileSiteVerifyRequest, deadline _: ContinuousClock.Instant) async throws -> TurnstileSiteVerifyResponse {
+        try await verify(request)
+    }
 }
 
 public enum TurnstileVerificationError: Error, Sendable, Equatable {
@@ -229,12 +236,7 @@ public actor TurnstileVerifier {
         let request = TurnstileSiteVerifyRequest(secret: secret, response: token, remoteIP: remoteIP)
         let response: TurnstileSiteVerifyResponse
         do {
-            response = try await withThrowingTaskGroup(of: TurnstileSiteVerifyResponse.self) { group in
-                group.addTask { try await transport.verify(request) }
-                group.addTask { try await Task.sleep(for: self.timeout); throw TurnstileVerificationError.transport }
-                defer { group.cancelAll() }
-                return try await group.next()!
-            }
+            response = try await transport.verify(request, deadline: .now.advanced(by: timeout))
         } catch let error as TurnstileVerificationError { reservations.removeValue(forKey: digest); throw error }
         catch { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.transport }
         guard response.success else { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.failed }
@@ -267,6 +269,11 @@ public struct URLSessionTurnstileTransport: TurnstileHTTPTransport {
     }
 
     public func verify(_ request: TurnstileSiteVerifyRequest) async throws -> TurnstileSiteVerifyResponse {
+        try await verify(request, deadline: .now.advanced(by: .seconds(timeout)))
+    }
+
+    public func verify(_ request: TurnstileSiteVerifyRequest, deadline: ContinuousClock.Instant) async throws -> TurnstileSiteVerifyResponse {
+        _ = deadline
         var urlRequest = URLRequest(url: endpoint, timeoutInterval: timeout)
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
@@ -318,6 +325,7 @@ public protocol SMTPTLSConnection: Sendable {
 /// NIO implementations should close the channel at this deadline; this is a
 /// transport contract, not merely a cooperative task-group timeout.
 public protocol SMTPTLSConnectionWithDeadline: SMTPTLSConnection {
+    func authenticate(username: String, password: String, mechanism: SMTPAuthMechanism, deadline: ContinuousClock.Instant) async throws
     func send(to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String, deadline: ContinuousClock.Instant) async throws
 }
 
@@ -337,7 +345,7 @@ public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPDeadlineTransp
         if configuration.mode != .plaintextLab {
             guard connection.authenticatedHostname.lowercased() == configuration.expectedHostname?.lowercased() else { throw MailpitSMTPDeliveryError.unavailable }
             guard let username = configuration.username, let password = configuration.password, let mechanism = configuration.mechanism else { throw MailpitSMTPDeliveryError.invalidConfiguration }
-            try await connection.authenticate(username: username, password: password, mechanism: mechanism)
+            try await connection.authenticate(username: username, password: password, mechanism: mechanism, deadline: deadline)
         }
         try await connection.send(to: to, subject: subject, body: body, idempotencyKey: idempotencyKey, deadline: deadline)
     }
@@ -371,7 +379,6 @@ public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
         guard !key.isEmpty, !subject.contains("\r"), !subject.contains("\n"), body.utf8.count <= 32768 else { throw MailpitSMTPDeliveryError.invalidMessage }
         var last: Error?
         guard let deadlineTransport = transport as? any AuthenticatedSMTPDeadlineTransport else { throw MailpitSMTPDeliveryError.invalidConfiguration }
-        let transport = self.transport
         let configuration = self.configuration
         let attemptTimeout = self.attemptTimeout
         for attempt in 0 ..< configuration.maximumAttempts {
