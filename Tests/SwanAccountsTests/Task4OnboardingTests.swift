@@ -98,6 +98,16 @@ final class Task4OnboardingTests: XCTestCase {
         XCTAssertThrowsError(try AuthenticatedSMTPConfiguration(host: "relay.example", port: 587, mode: .startTLS))
         XCTAssertNoThrow(try AuthenticatedSMTPConfiguration(host: "relay.example", port: 587, mode: .startTLS, username: "u", password: "p", mechanism: .plain, expectedHostname: "relay.example"))
     }
+
+    func testSignupEmailEnvelopeRoundTripsAndRejectsTampering() throws {
+        let proof = try SignupSecret(Data(repeating: 8, count: 32))
+        let service = SignupEmailProofService(secret: proof)
+        let email = try AccountEmailAddress("alice@example.com")
+        let envelope = try service.protectedEnvelope(code: "code-123456789012", email: email, handle: "alice.example.com", deliveryID: "delivery-1")
+        XCTAssertEqual(try service.openProtectedEnvelope(envelope, email: email, handle: "alice.example.com", deliveryID: "delivery-1"), "code-123456789012")
+        var tampered = envelope; tampered[tampered.count - 1] ^= 1
+        XCTAssertThrowsError(try service.openProtectedEnvelope(tampered, email: email, handle: "alice.example.com", deliveryID: "delivery-1"))
+    }
 }
 
 private struct StubTurnstileTransport: TurnstileHTTPTransport {

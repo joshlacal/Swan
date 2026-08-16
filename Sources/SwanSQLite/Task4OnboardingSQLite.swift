@@ -59,7 +59,20 @@ public struct SQLiteSignupTransactionCoordinator: Sendable {
     }
 }
 
-extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupFinalizationCoordinator, SignupEmailRequestStore {
+extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupFinalizationCoordinator, SignupEmailRequestStore, SignupEmailOutboxStore {
+    public typealias Message = SignupEmailOutboxMessage
+    public func claim(now: Date) async throws -> SignupEmailOutboxMessage? {
+        try await claimSignupEmailOutbox(now: now)
+    }
+
+    public func markDelivered(_ message: SignupEmailOutboxMessage, now: Date) async throws {
+        try await markSignupEmailOutboxDelivered(deliveryID: message.deliveryID, leaseToken: message.leaseToken, now: now)
+    }
+
+    public func markFailed(_ message: SignupEmailOutboxMessage, now: Date) async throws {
+        try await failSignupEmailOutbox(deliveryID: message.deliveryID, leaseToken: message.leaseToken, now: now)
+    }
+
     public func migrateTask4OnboardingSchema() async throws {
         try await withConnectionGate { try await transaction {
             _ = try await connection.query("""
@@ -94,7 +107,8 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupFinalizati
                 delivery_id TEXT NOT NULL UNIQUE, email TEXT NOT NULL, handle TEXT NOT NULL,
                 protected_envelope BLOB NOT NULL, issued_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
-                lease_token BLOB, lease_expires_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0, delivered_at INTEGER)
+                lease_token BLOB, lease_expires_at INTEGER, next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0, delivered_at INTEGER)
             """)
         } }
     }
@@ -128,7 +142,7 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupFinalizati
         let current = try task4Timestamp(now), until = try task4Timestamp(now.addingTimeInterval(lease))
         guard until > current else { throw AccountControlStoreError.invalidInput }
         return try await withConnectionGate { try await transaction {
-            let rows = try await connection.query("UPDATE signup_email_request_outbox SET state='sending',lease_token=randomblob(16),lease_expires_at=?,attempts=attempts+1 WHERE rowid=(SELECT rowid FROM signup_email_request_outbox WHERE expires_at>? AND attempts<8 AND (state='pending' OR (state='sending' AND lease_expires_at<=?)) ORDER BY issued_at LIMIT 1) RETURNING delivery_id,email,protected_envelope,lease_token", [.integer(until), .integer(current), .integer(current)])
+            let rows = try await connection.query("UPDATE signup_email_request_outbox SET state='sending',lease_token=randomblob(16),lease_expires_at=?,attempts=attempts+1 WHERE rowid=(SELECT rowid FROM signup_email_request_outbox WHERE expires_at>? AND next_attempt_at<=? AND attempts<8 AND (state='pending' OR (state='sending' AND lease_expires_at<=?)) ORDER BY issued_at LIMIT 1) RETURNING delivery_id,email,protected_envelope,lease_token", [.integer(until), .integer(current), .integer(current), .integer(current)])
             guard let row = rows.first, let deliveryID = task4Text(row, "delivery_id"), let email = task4Text(row, "email"), let envelope = task4BlobValue(row, "protected_envelope"), let leaseToken = task4BlobValue(row, "lease_token") else { return nil }
             return SignupEmailOutboxMessage(deliveryID: deliveryID, email: email, protectedEnvelope: envelope, leaseToken: leaseToken)
         } }
@@ -144,7 +158,7 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupFinalizati
     public func failSignupEmailOutbox(deliveryID: String, leaseToken: Data, now: Date = Date()) async throws {
         let current = try task4Timestamp(now)
         try await withConnectionGate { try await transaction {
-            _ = try await connection.query("UPDATE signup_email_request_outbox SET state=CASE WHEN attempts>=8 THEN 'failed' ELSE 'pending' END,lease_expires_at=NULL,lease_token=NULL WHERE delivery_id=? AND state='sending' AND lease_token=?", [.text(deliveryID), task4Blob(leaseToken)])
+            _ = try await connection.query("UPDATE signup_email_request_outbox SET state=CASE WHEN attempts>=8 THEN 'failed' ELSE 'pending' END,lease_expires_at=NULL,lease_token=NULL,next_attempt_at=? + min(3600000000,1000000 * (1 << min(attempts,10))) WHERE delivery_id=? AND state='sending' AND lease_token=?", [.integer(current), .text(deliveryID), task4Blob(leaseToken)])
         } }
     }
 

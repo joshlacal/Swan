@@ -152,6 +152,16 @@ public struct SignupEmailProofService: Sendable {
         let sealed = try AES.GCM.seal(plaintext, using: key, authenticating: aad)
         return Data([keyVersion]) + aad + sealed.combined!
     }
+
+    public func openProtectedEnvelope(_ envelope: Data, email: AccountEmailAddress, handle: String, deliveryID: String) throws -> String {
+        guard envelope.count > 1, envelope[0] == 1 else { throw SwanError.invalidIdentifier("signup email envelope") }
+        let aad = Data("swan.signup.email-envelope.v1\0\(envelope[0])\0\(deliveryID)\0\(email.value)\0\(handle)".utf8)
+        let combined = envelope.dropFirst().dropFirst(aad.count)
+        let box = try AES.GCM.SealedBox(combined: combined)
+        let code = try AES.GCM.open(box, using: SymmetricKey(data: secret.bytes), authenticating: aad)
+        guard (16 ... 256).contains(code.count) else { throw SwanError.invalidIdentifier("signup email code") }
+        return String(decoding: code, as: UTF8.self)
+    }
 }
 
 // MARK: - Turnstile siteverify
@@ -196,7 +206,7 @@ public actor TurnstileVerifier {
     private let maximumReservations = 1024
 
     public init(secret: Data, hostname: String, action: String, maxAge: TimeInterval = 300, timeout: Duration = .seconds(5), transport: any TurnstileHTTPTransport) throws {
-        guard secret.count >= 16, !hostname.isEmpty, !action.isEmpty, maxAge.isFinite, (1 ... 900).contains(maxAge), timeout > .zero else { throw SwanError.invalidIdentifier("Turnstile configuration") }
+        guard secret.count >= 16, (1 ... 253).contains(hostname.utf8.count), (1 ... 128).contains(action.utf8.count), maxAge.isFinite, (1 ... 900).contains(maxAge), timeout > .zero, timeout <= .seconds(30) else { throw SwanError.invalidIdentifier("Turnstile configuration") }
         self.secret = secret; self.hostname = hostname.lowercased(); self.action = action; self.maxAge = maxAge; self.timeout = timeout; self.transport = transport
     }
 
@@ -602,5 +612,27 @@ public struct SignupEmailRequestService: Sendable {
               lifetime.isFinite, (60 ... 900).contains(lifetime) else { throw SwanError.invalidIdentifier("signup email request") }
         try await store.persistSignupEmailRequest(email: email, handle: handle, proofDigest: proofDigest, protectedEnvelope: protectedEnvelope, issuedAt: now, expiresAt: now.addingTimeInterval(lifetime))
         return SignupEmailRequestOutcome()
+    }
+}
+
+public protocol SignupEmailOutboxStore: Sendable {
+    associatedtype Message: Sendable
+    func claim(now: Date) async throws -> Message?
+    func markDelivered(_ message: Message, now: Date) async throws
+    func markFailed(_ message: Message, now: Date) async throws
+}
+
+public struct SignupEmailOutboxWorker<Store: SignupEmailOutboxStore>: Sendable where Store.Message: Sendable {
+    private let store: Store
+    private let deliver: @Sendable (Store.Message) async throws -> Void
+    public init(store: Store, deliver: @escaping @Sendable (Store.Message) async throws -> Void) {
+        self.store = store; self.deliver = deliver
+    }
+
+    public func runOnce(now: Date = Date()) async throws -> Bool {
+        guard let message = try await store.claim(now: now) else { return false }
+        do { try await deliver(message); try await store.markDelivered(message, now: now) }
+        catch { try? await store.markFailed(message, now: now); throw error }
+        return true
     }
 }
