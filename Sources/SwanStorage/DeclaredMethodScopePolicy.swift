@@ -55,6 +55,7 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
             "chat.bsky.convo.getConvo": ["rpc:chat.bsky"], "chat.bsky.convo.getMessages": ["rpc:chat.bsky"],
             "chat.bsky.convo.listConvos": ["rpc:chat.bsky"], "chat.bsky.convo.sendMessage": ["rpc:chat.bsky"]
             ,"tools.ozone.moderation.emitEvent": ["rpc:tools.ozone"],
+            "tools.ozone.moderation.getRepo": ["rpc:tools.ozone"],
             "com.atproto.moderation.createReport": ["rpc:com.atproto.moderation"],
             "com.atproto.label.queryLabels": ["rpc:com.atproto.label"]
         ], permitsFullAccess: true

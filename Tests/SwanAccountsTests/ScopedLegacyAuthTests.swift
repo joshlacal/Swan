@@ -82,6 +82,7 @@ final class ScopedLegacyAuthTests: XCTestCase {
         XCTAssertFalse(DeclaredMethodScopePolicy.referenceLegacy.declaredMethods.contains("app.bsky.unknown.getFeed"))
         XCTAssertTrue(DeclaredMethodScopePolicy.referenceLegacy.allows(credential: .fullAccessV1, method: "com.atproto.repo.getRecord"))
         XCTAssertTrue(DeclaredMethodScopePolicy.referenceLegacy.allows(credential: .fullAccessV1, method: "tools.ozone.moderation.emitEvent"))
+        XCTAssertTrue(DeclaredMethodScopePolicy.referenceLegacy.declares("tools.ozone.moderation.getRepo"))
     }
 
     func testAppPasswordSecretPresentedOnceAndScopeEditRevokesDerivedSession() async throws {
