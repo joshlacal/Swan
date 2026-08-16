@@ -70,6 +70,11 @@ public struct SwanAccountLifecycleXRPCAdapter: Sendable {
         return try await provisioning.createAccount(input, now: now)
     }
 
+    public func capability(role: AccountLifecycleAuthorizationRole, subjectDID: String?, sessionDigest: Data, stepUpReceipt: Data, now: Date = Date()) async throws -> AccountLifecycleCapability {
+        guard let capabilityVerifier else { throw SwanError.unavailable("lifecycle authorization unavailable") }
+        return try await capabilityVerifier.verify(role: role, subjectDID: subjectDID, sessionDigest: sessionDigest, stepUpReceipt: stepUpReceipt, now: now)
+    }
+
     public func activate(did: String, capability: AccountLifecycleCapability, now: Date = Date()) async throws -> AccountControlAccount {
         guard capability.role == .operatorRole else { throw SwanError.unavailable("operator authorization required") }
         return try await lifecycle.activate(did: did, now: now)
