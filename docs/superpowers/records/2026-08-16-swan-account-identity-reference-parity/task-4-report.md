@@ -110,3 +110,5 @@ The assembled coordinator now runs the foundation writer and the connection-scop
 Final P1 correction adds the public `SignupAuthorizationInput.make(...peer:)` factory and a SocketAddress/extractor authorization path; arbitrary raw bucket construction remains internal. Connection-scoped finalization now checks persisted handle, identity, and account fields and requires live authorization-owned invite/proof reservations in the final CAS transaction.
 
 The coordinator now checks and returns a persisted finalization result before invoking the foundation writer. Invite consumption verifies expiry, retry reservation renewal is constrained to the same authorization/input digest and unconsumed material, and SQLite exposes durable invite persist/list methods through the lane persistence protocol.
+
+Lifecycle invite issuance now requires durable hashed persistence before returning the raw code and supports operator-authenticated listing metadata. Reservation renewal rechecks underlying invite/proof expiry and consumption for owned leases. Turnstile URL validation rejects non-default ports, credentials, query, or fragment; envelope sealing accepts only key version 1.

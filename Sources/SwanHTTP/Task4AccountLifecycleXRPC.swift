@@ -111,6 +111,13 @@ public struct SwanAccountLifecycleXRPCAdapter: Sendable {
         guard let capabilityVerifier else { throw SwanError.unavailable("lifecycle authorization unavailable") }
         guard capability.permits(did: capability.subjectDID ?? "", action: "invite", now: Date()), capability.role == .operatorRole else { throw SwanError.unavailable("operator authorization required") }
         try await capabilityVerifier.consume(capability, action: "invite", now: Date())
-        return try lifecycle.invite(code: code, expiresAt: expiresAt)
+        return try await lifecycle.issueInvite(code: code, expiresAt: expiresAt)
+    }
+
+    public func listInvites(capability: AccountLifecycleCapability, limit: Int = 100) async throws -> [SignupInvite] {
+        guard let capabilityVerifier else { throw SwanError.unavailable("lifecycle authorization unavailable") }
+        guard capability.role == .operatorRole, capability.permits(did: capability.subjectDID ?? "", action: "invite.list", now: Date()) else { throw SwanError.unavailable("operator authorization required") }
+        try await capabilityVerifier.consume(capability, action: "invite.list", now: Date())
+        return try await lifecycle.listInvites(limit: limit)
     }
 }

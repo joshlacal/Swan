@@ -151,7 +151,7 @@ public struct SignupEmailProofService: Sendable {
     }
 
     public func protectedEnvelope(code: String, email: AccountEmailAddress, handle: String, deliveryID: String, keyVersion: UInt8 = 1) throws -> Data {
-        guard (16 ... 256).contains(code.utf8.count), !deliveryID.isEmpty, AccountControlIdentifiers.isCanonicalHandle(handle) else { throw SwanError.invalidIdentifier("signup email envelope") }
+        guard keyVersion == 1, (16 ... 256).contains(code.utf8.count), !deliveryID.isEmpty, AccountControlIdentifiers.isCanonicalHandle(handle) else { throw SwanError.invalidIdentifier("signup email envelope") }
         let key = SymmetricKey(data: secret.bytes)
         let aad = Data("swan.signup.email-envelope.v1\0\(keyVersion)\0\(deliveryID)\0\(email.value)\0\(handle)".utf8)
         let plaintext = Data(code.utf8)
@@ -258,8 +258,11 @@ public struct URLSessionTurnstileTransport: TurnstileHTTPTransport {
     public init(endpoint: URL = URL(string: "https://challenges.cloudflare.com/turnstile/v0/siteverify")!, timeout: TimeInterval = 5) throws {
         guard endpoint.scheme?.lowercased() == "https",
               endpoint.host?.lowercased() == "challenges.cloudflare.com",
-              endpoint.path == "/turnstile/v0/siteverify",
-              timeout.isFinite, (0.1 ... 30).contains(timeout) else { throw SwanError.invalidIdentifier("Turnstile endpoint") }
+              endpoint.port.map { $0 == 443 } ?? true,
+            endpoint.user == nil, endpoint.password == nil,
+            endpoint.query == nil, endpoint.fragment == nil,
+            endpoint.path == "/turnstile/v0/siteverify",
+            timeout.isFinite, (0.1 ... 30).contains(timeout) else { throw SwanError.invalidIdentifier("Turnstile endpoint") }
         self.endpoint = endpoint; self.timeout = timeout
     }
 
@@ -427,8 +430,9 @@ public struct AccountLifecycleService: Sendable {
     private let store: any AccountControlStore
     private let deletion: (any AccountDeletionControlStore)?
     private let invites: SignupInviteService?
-    public init(store: any AccountControlStore, deletion: (any AccountDeletionControlStore)? = nil, invites: SignupInviteService? = nil) {
-        self.store = store; self.deletion = deletion; self.invites = invites
+    private let invitePersistence: (any SignupInvitePersistence)?
+    public init(store: any AccountControlStore, deletion: (any AccountDeletionControlStore)? = nil, invites: SignupInviteService? = nil, invitePersistence: (any SignupInvitePersistence)? = nil) {
+        self.store = store; self.deletion = deletion; self.invites = invites; self.invitePersistence = invitePersistence
     }
 
     public func createAccount(_ registration: AccountControlRegistration) async throws -> AccountControlAccount {
@@ -455,6 +459,19 @@ public struct AccountLifecycleService: Sendable {
     public func invite(code: String, expiresAt: Date? = nil) throws -> SignupInviteIssue {
         guard let invites else { throw SwanError.unavailable("invites unavailable") }
         return try invites.issue(code: code, expiresAt: expiresAt)
+    }
+
+    public func issueInvite(code: String, expiresAt: Date? = nil) async throws -> SignupInviteIssue {
+        let issue = try invite(code: code, expiresAt: expiresAt)
+        guard let invitePersistence else { throw SwanError.unavailable("invite persistence unavailable") }
+        let invite = try SignupInvite(digest: issue.digest, issuedAt: Date(), expiresAt: expiresAt)
+        try await invitePersistence.persistInvite(invite)
+        return issue
+    }
+
+    public func listInvites(limit: Int = 100) async throws -> [SignupInvite] {
+        guard let invitePersistence else { throw SwanError.unavailable("invite persistence unavailable") }
+        return try await invitePersistence.listInvites(limit: limit)
     }
 }
 
