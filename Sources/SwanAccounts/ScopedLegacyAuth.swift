@@ -166,7 +166,7 @@ public struct HMACLegacyTokenIssuer: LegacyTokenIssuer, Sendable {
         let payload = try verify(token)
         guard payload["kind"] as? String == "access", let grantValue = payload["grant"] as? String, let grant = LegacyAccessGrant(rawValue: grantValue), payload["iss"] as? String == issuer, payload["aud"] == nil, payload["lxm"] == nil, let sub = payload["sub"] as? String, let sid = payload["sid"] as? String,
               let iat = payload["iat"] as? Int, let exp = payload["exp"] as? Int, let jti = payload["jti"] as? String,
-              iat <= Int(now.timeIntervalSince1970), exp > iat, exp > Int(now.timeIntervalSince1970), exp - iat <= Int(LegacyAuthService.accessLifetime), let sessionID = try? LegacySessionID(rawValue: sid), !jti.isEmpty else { throw SwanError.unauthorized("invalid access token") }
+              iat <= Int(now.timeIntervalSince1970) + 1, exp > iat, exp > Int(now.timeIntervalSince1970), exp - iat <= Int(LegacyAuthService.accessLifetime), let sessionID = try? LegacySessionID(rawValue: sid), !jti.isEmpty else { throw SwanError.unauthorized("invalid access token") }
         let scopes = Set((payload["scope"] as? String ?? "").split(separator: " ").map(String.init))
         guard LegacyAccessGrant.validateClaims(scopes: scopes, grant: grant),
               scopes.allSatisfy({ (try? SwanScope.parse($0)) != nil }) else { throw SwanError.unauthorized("invalid access grant") }
@@ -410,7 +410,9 @@ public actor LegacyAuthService {
             throw SwanError.unavailable("libsodium initialization failed")
         }
         _ = accountDID
-        let outputLength = 15
+        // libsodium requires an Argon2 output of at least 16 bytes; retain a
+        // 15-byte truncated digest in the fixed 32-byte storage schema.
+        let outputLength = 16
         var output = [UInt8](repeating: 0, count: outputLength)
         let salt = Self.randomBytes(count: Int(crypto_pwhash_SALTBYTES))
         let passwordBytes = secret.utf8CString
@@ -426,14 +428,14 @@ public actor LegacyAuthService {
             }
         }
         guard result == 0 else { throw SwanError.unavailable("Argon2id app-password hashing failed") }
-        return Data([1]) + salt + Data(output)
+        return Data([1]) + salt + Data(output.prefix(15))
     }
 
     private func verifySecret(_ secret: String, encoded: Data) throws -> Bool {
         guard encoded.count == 32, encoded[0] == 1 else { return false }
         let salt = encoded[1..<17]
         let expected = encoded[17...]
-        var output = [UInt8](repeating: 0, count: expected.count)
+        var output = [UInt8](repeating: 0, count: 16)
         let passwordBytes = secret.utf8CString
         let result = passwordBytes.withUnsafeBufferPointer { passwordBuffer in
             salt.withUnsafeBytes { (saltBuffer: UnsafeRawBufferPointer) in
@@ -447,7 +449,7 @@ public actor LegacyAuthService {
             }
         }
         guard result == 0 else { throw SwanError.unavailable("Argon2id app-password verification failed") }
-        return constantTimeEqual(Data(output), Data(expected))
+        return constantTimeEqual(Data(output.prefix(expected.count)), Data(expected))
     }
 
     private static let sodiumInitializationResult = sodium_init()
