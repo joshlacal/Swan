@@ -97,7 +97,7 @@ public enum SQLiteLayout {
     public static let controlMigrations = controlConnectionPragmas + [
         "CREATE TABLE IF NOT EXISTS accounts (did TEXT PRIMARY KEY, handle TEXT UNIQUE NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL)",
         // Dedicated additive marker. Version 1 records the pre-account
-        // program control schema; versions 2-6 are reserved in dependency
+        // program control schema; versions 2-7 are reserved in dependency
         // order and must never be reordered by a later lane.
         "CREATE TABLE IF NOT EXISTS control_schema_migrations (version INTEGER PRIMARY KEY CHECK(version > 0), applied_at INTEGER NOT NULL CHECK(applied_at >= 0))",
         "INSERT OR IGNORE INTO control_schema_migrations(version, applied_at) VALUES (1, unixepoch())",
@@ -118,6 +118,7 @@ public enum SQLiteLayout {
             last_validated_at INTEGER,
             grace_expires_at INTEGER,
             state TEXT NOT NULL CHECK(state IN ('active', 'suspended', 'released')),
+            CHECK(method = 'did-web' OR (document_digest IS NULL AND claim_receipt_digest IS NULL AND reserved_key_id IS NULL)),
             CHECK(method = 'plc' OR (document_digest IS NOT NULL AND claim_receipt_digest IS NOT NULL AND reserved_key_id IS NOT NULL))
         )
         """,
@@ -196,6 +197,8 @@ public enum SQLiteLayout {
             created_at INTEGER NOT NULL CHECK(created_at >= 0),
             expires_at INTEGER NOT NULL CHECK(expires_at >= created_at),
             revoked_at INTEGER,
+            reuse_detected_at INTEGER,
+            CHECK(reuse_detected_at IS NULL OR revoked_at IS NOT NULL),
             UNIQUE(family_id, account_did),
             FOREIGN KEY(app_password_id, account_did) REFERENCES app_passwords(app_password_id, account_did) ON DELETE CASCADE
         )
@@ -214,6 +217,8 @@ public enum SQLiteLayout {
             replaced_by_digest BLOB CHECK(replaced_by_digest IS NULL OR length(replaced_by_digest) = 32),
             previous_session_digest BLOB CHECK(previous_session_digest IS NULL OR length(previous_session_digest) = 32),
             reuse_detected_at INTEGER,
+            CHECK(replaced_by_digest IS NULL OR rotated_at IS NOT NULL),
+            CHECK(reuse_detected_at IS NULL OR revoked_at IS NOT NULL),
             FOREIGN KEY(family_id, account_did) REFERENCES legacy_session_families(family_id, account_did),
             FOREIGN KEY(app_password_id, account_did) REFERENCES app_passwords(app_password_id, account_did)
         )

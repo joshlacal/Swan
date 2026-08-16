@@ -39,7 +39,13 @@ public struct IdentityBinding: Codable, Sendable, Equatable {
         guard [documentDigest, claimReceiptDigest].compactMap({ $0 }).allSatisfy({ $0.count == 32 }) else {
             throw SwanError.invalidIdentifier("identity binding digest")
         }
-        guard method == .didWeb || (documentDigest == nil && claimReceiptDigest == nil && reservedKeyID == nil) else {
+        let methodMaterialValid: Bool = switch method {
+        case .plc:
+            documentDigest == nil && claimReceiptDigest == nil && reservedKeyID == nil
+        case .didWeb:
+            documentDigest != nil && claimReceiptDigest != nil && reservedKeyID.map { !$0.isEmpty } == true
+        }
+        guard methodMaterialValid else {
             throw SwanError.invalidIdentifier("PLC identity binding")
         }
         self.accountDID = accountDID
@@ -160,6 +166,7 @@ public struct DidWebClaimTransaction: Codable, Sendable, Equatable {
         let valid: Bool
         switch (state, next) {
         case (.reserved, .pendingValidation), (.pendingValidation, .committing),
+             (.failed, .pendingValidation), (.failed, .reserved),
              (.committing, .committed), (.reserved, .failed),
              (.pendingValidation, .failed), (.committing, .failed),
              (.reserved, .expired), (.pendingValidation, .expired), (.committing, .expired):
@@ -209,6 +216,7 @@ public struct DidWebClaimCommitRequest: Sendable, Equatable {
     public let claimNonceDigest: Data
     public let claimReceiptDigest: Data
     public let idempotencyKey: String
+    public let identityBinding: IdentityBinding
 
     public init(transaction: DidWebClaimTransaction, accountDID: String, targetDID: String, handle: String, documentDigest: Data, reservedKeyID: String, claimNonceDigest: Data, claimReceiptDigest: Data, idempotencyKey: String, now: Date) throws {
         guard transaction.state == .committing,
@@ -234,6 +242,16 @@ public struct DidWebClaimCommitRequest: Sendable, Equatable {
         self.claimNonceDigest = claimNonceDigest
         self.claimReceiptDigest = claimReceiptDigest
         self.idempotencyKey = idempotencyKey
+        self.identityBinding = try IdentityBinding(
+            accountDID: accountDID,
+            identityDID: targetDID,
+            method: .didWeb,
+            handle: handle,
+            documentDigest: documentDigest,
+            claimReceiptDigest: claimReceiptDigest,
+            reservedKeyID: reservedKeyID,
+            lastValidatedAt: now
+        )
     }
 }
 
@@ -241,7 +259,7 @@ public protocol IdentityBindingStore: Sendable {
     func identityBinding(accountDID: String) async throws -> IdentityBinding?
     func reserveDidWebClaim(_ transaction: DidWebClaimTransaction, now: Date) async throws
     func transitionDidWebClaim(_ transaction: DidWebClaimTransaction, from expected: DidWebClaimTransactionState, now: Date) async throws
-    func commitDidWebClaim(_ request: DidWebClaimCommitRequest, binding: IdentityBinding, history: IdentityBindingHistoryEntry?, now: Date) async throws
+    func commitDidWebClaim(_ request: DidWebClaimCommitRequest, history: IdentityBindingHistoryEntry?, now: Date) async throws
     func purgeExpiredIdentityClaims(now: Date) async throws
 }
 
@@ -297,9 +315,13 @@ public struct LegacySessionFamilyMetadata: Codable, Sendable, Equatable {
     public let createdAt: Date
     public let expiresAt: Date
     public let revokedAt: Date?
+    public let reuseDetectedAt: Date?
 
-    public init(familyID: String, accountDID: String, appPasswordID: String?, createdAt: Date, expiresAt: Date, revokedAt: Date? = nil) throws {
-        guard !familyID.isEmpty, expiresAt >= createdAt, revokedAt.map({ $0 >= createdAt }) ?? true else {
+    public init(familyID: String, accountDID: String, appPasswordID: String?, createdAt: Date, expiresAt: Date, revokedAt: Date? = nil, reuseDetectedAt: Date? = nil) throws {
+        guard !familyID.isEmpty, expiresAt >= createdAt,
+              revokedAt.map({ $0 >= createdAt }) ?? true,
+              reuseDetectedAt.map({ $0 >= createdAt }) ?? true,
+              reuseDetectedAt == nil || revokedAt != nil else {
             throw SwanError.invalidIdentifier("legacy session family metadata")
         }
         self.familyID = familyID
@@ -308,9 +330,10 @@ public struct LegacySessionFamilyMetadata: Codable, Sendable, Equatable {
         self.createdAt = createdAt
         self.expiresAt = expiresAt
         self.revokedAt = revokedAt
+        self.reuseDetectedAt = reuseDetectedAt
     }
 
-    private enum CodingKeys: String, CodingKey { case familyID, accountDID, appPasswordID, createdAt, expiresAt, revokedAt }
+    private enum CodingKeys: String, CodingKey { case familyID, accountDID, appPasswordID, createdAt, expiresAt, revokedAt, reuseDetectedAt }
 
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -320,7 +343,8 @@ public struct LegacySessionFamilyMetadata: Codable, Sendable, Equatable {
             appPasswordID: c.decodeIfPresent(String.self, forKey: .appPasswordID),
             createdAt: c.decode(Date.self, forKey: .createdAt),
             expiresAt: c.decode(Date.self, forKey: .expiresAt),
-            revokedAt: c.decodeIfPresent(Date.self, forKey: .revokedAt)
+            revokedAt: c.decodeIfPresent(Date.self, forKey: .revokedAt),
+            reuseDetectedAt: c.decodeIfPresent(Date.self, forKey: .reuseDetectedAt)
         )
     }
 }
@@ -339,7 +363,9 @@ public struct LegacySessionMetadata: Codable, Sendable, Equatable {
         guard !familyID.isEmpty, expiresAt >= issuedAt,
               [replacedByDigest, previousSessionDigest].compactMap({ $0 }).allSatisfy({ $0.count == 32 }),
               rotatedAt.map({ $0 >= issuedAt }) ?? true,
-              reuseDetectedAt.map({ $0 >= issuedAt }) ?? true else {
+              reuseDetectedAt.map({ $0 >= issuedAt }) ?? true,
+              replacedByDigest == nil || rotatedAt != nil,
+              reuseDetectedAt == nil || revokedAt != nil else {
             throw SwanError.invalidIdentifier("legacy session metadata")
         }
         self.sessionID = sessionID
@@ -436,7 +462,7 @@ public protocol ManagementSessionStore: Sendable {
 public protocol LegacySessionStore: Sendable {
     func createLegacySessionFamily(_ family: LegacySessionFamilyMetadata, session: LegacySessionMetadata, sessionDigest: Data, now: Date) async throws
     func legacySession(digest: Data, now: Date) async throws -> LegacySessionMetadata?
-    func rotateOrDetectReuse(_ request: LegacySessionRotationRequest) async throws -> LegacySessionRotationOutcome
+    func rotateOrRevokeFamilyOnReuse(_ request: LegacySessionRotationRequest) async throws -> LegacySessionRotationOutcome
     func revokeLegacySessionFamily(familyID: String, now: Date) async throws
     func purgeExpiredLegacySessions(now: Date) async throws
 }
@@ -745,7 +771,7 @@ public protocol WebAuthnCredentialStore: Sendable {
 
 public enum LegacySessionRotationOutcome: Sendable, Equatable {
     case rotated(sessionID: LegacySessionID)
-    case reuseDetected(familyID: String, detectedAt: Date)
+    case reuseDetectedAndFamilyRevoked(familyID: String, detectedAt: Date, revokedAt: Date)
 }
 
 public struct LegacySessionRotationRequest: Sendable, Equatable {

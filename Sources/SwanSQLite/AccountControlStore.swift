@@ -473,6 +473,253 @@ extension SQLiteControlDatabase {
         try await migrateAccountPermanentDeletionSchema()
         try await migratePublicCrawlAnnouncerSchema()
         try await migrateActorPreferencesSchema()
+        try await migrateAccountControlHardeningV7()
+    }
+
+    /// Version 7 is a real in-place migration for databases created before
+    /// the account-foundation hardening.  The CREATE TABLE statements above
+    /// are intentionally idempotent, but cannot alter an already-created
+    /// SQLite table.  All introspection, additive columns, validation,
+    /// triggers, and the marker are therefore kept in this transaction.
+    private func migrateAccountControlHardeningV7() async throws {
+        let marker = try await connection.query(
+            "SELECT 1 FROM control_schema_migrations WHERE version = 7 LIMIT 1"
+        )
+        guard marker.isEmpty else { return }
+
+        for (table, column, definition) in [
+            ("identity_bindings", "claim_receipt_digest", "BLOB"),
+            ("identity_bindings", "reserved_key_id", "TEXT"),
+            ("did_web_claim_transactions", "reserved_key_id", "TEXT"),
+            ("did_web_claim_transactions", "claim_receipt_digest", "BLOB"),
+            ("legacy_session_families", "reuse_detected_at", "INTEGER"),
+            ("legacy_sessions", "rotated_at", "INTEGER"),
+            ("legacy_sessions", "replaced_by_digest", "BLOB"),
+            ("legacy_sessions", "previous_session_digest", "BLOB"),
+            ("legacy_sessions", "reuse_detected_at", "INTEGER"),
+        ] {
+            try await addColumnIfMissing(table: table, column: column, definition: definition)
+        }
+
+        // Existing rows must not be silently downgraded or made valid by a
+        // migration. Reject an old record that cannot satisfy the new
+        // method/lineage invariants; the enclosing transaction then rolls
+        // back both the marker and every preceding ALTER/trigger operation.
+        let malformed = try await connection.query(
+            """
+            SELECT 1 FROM identity_bindings
+            WHERE method = 'did-web'
+              AND (document_digest IS NULL OR claim_receipt_digest IS NULL OR reserved_key_id IS NULL)
+            UNION ALL
+            SELECT 1 FROM identity_bindings
+            WHERE method = 'plc'
+              AND (document_digest IS NOT NULL OR claim_receipt_digest IS NOT NULL OR reserved_key_id IS NOT NULL)
+            UNION ALL
+            SELECT 1 FROM legacy_session_families
+            WHERE reuse_detected_at IS NOT NULL AND revoked_at IS NULL
+            UNION ALL
+            SELECT 1 FROM legacy_sessions
+            WHERE (replaced_by_digest IS NOT NULL AND rotated_at IS NULL)
+               OR (reuse_detected_at IS NOT NULL AND revoked_at IS NULL)
+            LIMIT 1
+            """
+        )
+        guard malformed.isEmpty else { throw AccountControlStoreError.malformedRecord }
+
+        let triggers = [
+            """
+            CREATE TRIGGER IF NOT EXISTS identity_bindings_method_material_v7_insert
+            BEFORE INSERT ON identity_bindings
+            WHEN NEW.method = 'did-web'
+             AND (NEW.document_digest IS NULL OR NEW.claim_receipt_digest IS NULL OR NEW.reserved_key_id IS NULL)
+            BEGIN SELECT RAISE(ABORT, 'did:web binding material is required'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS identity_bindings_plc_material_v7_insert
+            BEFORE INSERT ON identity_bindings
+            WHEN NEW.method = 'plc'
+             AND (NEW.document_digest IS NOT NULL OR NEW.claim_receipt_digest IS NOT NULL OR NEW.reserved_key_id IS NOT NULL)
+            BEGIN SELECT RAISE(ABORT, 'PLC binding cannot carry did:web material'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS identity_bindings_method_material_v7_update
+            BEFORE UPDATE OF method, document_digest, claim_receipt_digest, reserved_key_id ON identity_bindings
+            WHEN NEW.method = 'did-web'
+             AND (NEW.document_digest IS NULL OR NEW.claim_receipt_digest IS NULL OR NEW.reserved_key_id IS NULL)
+            BEGIN SELECT RAISE(ABORT, 'did:web binding material is required'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS identity_bindings_plc_material_v7_update
+            BEFORE UPDATE OF method, document_digest, claim_receipt_digest, reserved_key_id ON identity_bindings
+            WHEN NEW.method = 'plc'
+             AND (NEW.document_digest IS NOT NULL OR NEW.claim_receipt_digest IS NOT NULL OR NEW.reserved_key_id IS NOT NULL)
+            BEGIN SELECT RAISE(ABORT, 'PLC binding cannot carry did:web material'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS did_web_claim_account_immutable_v7
+            BEFORE UPDATE OF account_did ON did_web_claim_transactions
+            WHEN NEW.account_did IS NOT OLD.account_did
+             AND NOT (OLD.account_did IS NULL AND NEW.account_did IS NOT NULL)
+            BEGIN SELECT RAISE(ABORT, 'identity claim account ownership is immutable'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS did_web_claim_account_capacity_v7
+            BEFORE UPDATE OF account_did ON did_web_claim_transactions
+            WHEN OLD.account_did IS NULL AND NEW.account_did IS NOT NULL
+             AND (SELECT COUNT(*) FROM did_web_claim_transactions WHERE account_did = NEW.account_did) >= 16
+            BEGIN SELECT RAISE(ABORT, 'identity claim account capacity exhausted'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS signup_authorization_account_immutable_v7
+            BEFORE UPDATE OF account_did ON signup_authorizations
+            WHEN NEW.account_did IS NOT OLD.account_did
+             AND NOT (OLD.account_did IS NULL AND NEW.account_did IS NOT NULL)
+            BEGIN SELECT RAISE(ABORT, 'signup authorization account ownership is immutable'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS signup_authorization_account_capacity_v7
+            BEFORE UPDATE OF account_did ON signup_authorizations
+            WHEN OLD.account_did IS NULL AND NEW.account_did IS NOT NULL
+             AND (SELECT COUNT(*) FROM signup_authorizations WHERE account_did = NEW.account_did) >= 16
+            BEGIN SELECT RAISE(ABORT, 'signup authorization account capacity exhausted'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS signup_invite_redemption_immutable_v7
+            BEFORE UPDATE OF redemption_account_did ON signup_invites
+            WHEN OLD.redemption_account_did IS NOT NULL
+             AND NEW.redemption_account_did IS NOT OLD.redemption_account_did
+            BEGIN SELECT RAISE(ABORT, 'signup invite redemption ownership is immutable'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS signup_invite_redemption_capacity_v7
+            BEFORE UPDATE OF redemption_account_did ON signup_invites
+            WHEN OLD.redemption_account_did IS NULL AND NEW.redemption_account_did IS NOT NULL
+             AND (SELECT COUNT(*) FROM signup_invites WHERE redemption_account_did = NEW.redemption_account_did) >= 32
+            BEGIN SELECT RAISE(ABORT, 'redeemed signup invite account capacity exhausted'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS legacy_family_app_password_account_v7_insert
+            BEFORE INSERT ON legacy_session_families
+            WHEN NEW.app_password_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM app_passwords WHERE app_password_id = NEW.app_password_id AND account_did = NEW.account_did)
+            BEGIN SELECT RAISE(ABORT, 'legacy family app-password account mismatch'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS legacy_family_app_password_account_v7_update
+            BEFORE UPDATE OF account_did, app_password_id ON legacy_session_families
+            WHEN NEW.app_password_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM app_passwords WHERE app_password_id = NEW.app_password_id AND account_did = NEW.account_did)
+            BEGIN SELECT RAISE(ABORT, 'legacy family app-password account mismatch'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS legacy_session_family_account_v7_insert
+            BEFORE INSERT ON legacy_sessions
+            WHEN NOT EXISTS (SELECT 1 FROM legacy_session_families WHERE family_id = NEW.family_id AND account_did = NEW.account_did)
+            BEGIN SELECT RAISE(ABORT, 'legacy session family account mismatch'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS legacy_session_family_account_v7_update
+            BEFORE UPDATE OF account_did, family_id ON legacy_sessions
+            WHEN NOT EXISTS (SELECT 1 FROM legacy_session_families WHERE family_id = NEW.family_id AND account_did = NEW.account_did)
+            BEGIN SELECT RAISE(ABORT, 'legacy session family account mismatch'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS legacy_session_app_password_account_v7_insert
+            BEFORE INSERT ON legacy_sessions
+            WHEN NEW.app_password_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM app_passwords WHERE app_password_id = NEW.app_password_id AND account_did = NEW.account_did)
+            BEGIN SELECT RAISE(ABORT, 'legacy session app-password account mismatch'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS legacy_session_app_password_account_v7_update
+            BEFORE UPDATE OF account_did, app_password_id ON legacy_sessions
+            WHEN NEW.app_password_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM app_passwords WHERE app_password_id = NEW.app_password_id AND account_did = NEW.account_did)
+            BEGIN SELECT RAISE(ABORT, 'legacy session app-password account mismatch'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS factor_challenge_factor_account_v7_insert
+            BEFORE INSERT ON factor_challenges
+            WHEN NEW.factor_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM authentication_factors WHERE factor_id = NEW.factor_id AND account_did = NEW.account_did)
+            BEGIN SELECT RAISE(ABORT, 'factor challenge account mismatch'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS factor_challenge_factor_account_v7_update
+            BEFORE UPDATE OF account_did, factor_id ON factor_challenges
+            WHEN NEW.factor_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM authentication_factors WHERE factor_id = NEW.factor_id AND account_did = NEW.account_did)
+            BEGIN SELECT RAISE(ABORT, 'factor challenge account mismatch'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS totp_factor_account_v7_insert
+            BEFORE INSERT ON totp_secret_envelopes
+            WHEN NOT EXISTS (SELECT 1 FROM authentication_factors WHERE factor_id = NEW.factor_id AND account_did = NEW.account_did)
+            BEGIN SELECT RAISE(ABORT, 'TOTP factor account mismatch'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS totp_factor_account_v7_update
+            BEFORE UPDATE OF account_did, factor_id ON totp_secret_envelopes
+            WHEN NOT EXISTS (SELECT 1 FROM authentication_factors WHERE factor_id = NEW.factor_id AND account_did = NEW.account_did)
+            BEGIN SELECT RAISE(ABORT, 'TOTP factor account mismatch'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS webauthn_credential_factor_account_v7_insert
+            BEFORE INSERT ON webauthn_credentials
+            WHEN NOT EXISTS (SELECT 1 FROM authentication_factors WHERE factor_id = NEW.factor_id AND account_did = NEW.account_did)
+            BEGIN SELECT RAISE(ABORT, 'WebAuthn credential account mismatch'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS webauthn_credential_factor_account_v7_update
+            BEFORE UPDATE OF account_did, factor_id ON webauthn_credentials
+            WHEN NOT EXISTS (SELECT 1 FROM authentication_factors WHERE factor_id = NEW.factor_id AND account_did = NEW.account_did)
+            BEGIN SELECT RAISE(ABORT, 'WebAuthn credential account mismatch'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS webauthn_challenge_credential_account_v7_insert
+            BEFORE INSERT ON webauthn_challenges
+            WHEN NEW.credential_id_digest IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM webauthn_credentials WHERE credential_id_digest = NEW.credential_id_digest AND account_did = NEW.account_did)
+            BEGIN SELECT RAISE(ABORT, 'WebAuthn challenge account mismatch'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS webauthn_challenge_credential_account_v7_update
+            BEFORE UPDATE OF account_did, credential_id_digest ON webauthn_challenges
+            WHEN NEW.credential_id_digest IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM webauthn_credentials WHERE credential_id_digest = NEW.credential_id_digest AND account_did = NEW.account_did)
+            BEGIN SELECT RAISE(ABORT, 'WebAuthn challenge account mismatch'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS legacy_family_reuse_requires_revoke_v7
+            BEFORE INSERT ON legacy_session_families
+            WHEN NEW.reuse_detected_at IS NOT NULL AND NEW.revoked_at IS NULL
+            BEGIN SELECT RAISE(ABORT, 'legacy family reuse requires revocation'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS legacy_family_reuse_requires_revoke_update_v7
+            BEFORE UPDATE OF reuse_detected_at, revoked_at ON legacy_session_families
+            WHEN NEW.reuse_detected_at IS NOT NULL AND NEW.revoked_at IS NULL
+            BEGIN SELECT RAISE(ABORT, 'legacy family reuse requires revocation'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS legacy_session_lineage_consistency_v7
+            BEFORE INSERT ON legacy_sessions
+            WHEN (NEW.replaced_by_digest IS NOT NULL AND NEW.rotated_at IS NULL)
+               OR (NEW.reuse_detected_at IS NOT NULL AND NEW.revoked_at IS NULL)
+            BEGIN SELECT RAISE(ABORT, 'legacy session lineage is inconsistent'); END
+            """,
+            """
+            CREATE TRIGGER IF NOT EXISTS legacy_session_lineage_consistency_update_v7
+            BEFORE UPDATE OF replaced_by_digest, rotated_at, reuse_detected_at, revoked_at ON legacy_sessions
+            WHEN (NEW.replaced_by_digest IS NOT NULL AND NEW.rotated_at IS NULL)
+               OR (NEW.reuse_detected_at IS NOT NULL AND NEW.revoked_at IS NULL)
+            BEGIN SELECT RAISE(ABORT, 'legacy session lineage is inconsistent'); END
+            """,
+        ]
+        for trigger in triggers { _ = try await connection.query(trigger) }
+        _ = try await connection.query(
+            "INSERT INTO control_schema_migrations(version, applied_at) VALUES (7, unixepoch())"
+        )
     }
 
     // MARK: AccountControlStore

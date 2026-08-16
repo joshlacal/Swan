@@ -50,6 +50,24 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         XCTAssertThrowsError(try decoder.decode(LegacySessionFamilyMetadata.self, from: Data(#"{"familyID":"f","accountDID":"did:plc:a","createdAt":2,"expiresAt":1}"#.utf8)))
         XCTAssertThrowsError(try decoder.decode(LegacySessionMetadata.self, from: Data(#"{"sessionID":"legacy-1","familyID":"f","accountDID":"did:plc:a","scopeStrings":[],"issuedAt":1,"expiresAt":2,"replacedByDigest":"AQI="}"#.utf8)))
         XCTAssertThrowsError(try decoder.decode(ManagementSessionMetadata.self, from: Data(#"{"sessionID":"management-1","accountDID":"did:plc:a","issuedAt":2,"idleExpiresAt":1,"absoluteExpiresAt":3,"strength":{"kind":"password"}}"#.utf8)))
+        XCTAssertThrowsError(try decoder.decode(IdentityBinding.self, from: Data(#"{"accountDID":"did:plc:a","identityDID":"did:web:example.com","method":"didWeb","handle":"a","state":"active"}"#.utf8)))
+    }
+
+    func testIdentityBindingRequiresMethodSpecificClaimMaterial() throws {
+        XCTAssertThrowsError(try IdentityBinding(
+            accountDID: accountA, identityDID: "did:web:example.com", method: .didWeb,
+            handle: "alice.example", documentDigest: nil,
+            claimReceiptDigest: Data(repeating: 1, count: 32), reservedKeyID: "key-1"
+        ))
+        XCTAssertThrowsError(try IdentityBinding(
+            accountDID: accountA, identityDID: accountA, method: .plc,
+            handle: "alice.example", documentDigest: Data(repeating: 1, count: 32)
+        ))
+        XCTAssertNoThrow(try IdentityBinding(
+            accountDID: accountA, identityDID: "did:web:example.com", method: .didWeb,
+            handle: "alice.example", documentDigest: Data(repeating: 1, count: 32),
+            claimReceiptDigest: Data(repeating: 2, count: 32), reservedKeyID: "key-1"
+        ))
     }
 
     func testAuthorizationContextKeepsLegacyAndManagementDistinct() throws {
@@ -157,7 +175,20 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         )
         XCTAssertEqual(old.familyID, family.familyID)
         let detectedAt = Date(timeIntervalSince1970: 5)
-        XCTAssertEqual(LegacySessionRotationOutcome.reuseDetected(familyID: family.familyID, detectedAt: detectedAt), .reuseDetected(familyID: family.familyID, detectedAt: detectedAt))
+        let revokedAt = Date(timeIntervalSince1970: 6)
+        XCTAssertEqual(
+            LegacySessionRotationOutcome.reuseDetectedAndFamilyRevoked(
+                familyID: family.familyID, detectedAt: detectedAt, revokedAt: revokedAt
+            ),
+            .reuseDetectedAndFamilyRevoked(
+                familyID: family.familyID, detectedAt: detectedAt, revokedAt: revokedAt
+            )
+        )
+        XCTAssertThrowsError(try LegacySessionFamilyMetadata(
+            familyID: family.familyID, accountDID: accountA, appPasswordID: nil,
+            createdAt: Date(timeIntervalSince1970: 1), expiresAt: Date(timeIntervalSince1970: 10),
+            reuseDetectedAt: detectedAt
+        ))
     }
 
     func testDidWebCommitRequiresExactReservationAndIdempotencyMatch() throws {
@@ -182,12 +213,36 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         ))
     }
 
+    func testDidWebFailedClaimCanRetryBeforeExpiryAndCommitDerivesBinding() throws {
+        let transaction = try DidWebClaimTransaction(
+            requestID: "claim-retry", accountDID: accountA, targetDID: "did:web:example.com",
+            handle: "alice.example", claimNonceDigest: Data(repeating: 1, count: 32),
+            requestedDocumentDigest: Data(repeating: 2, count: 32), state: .failed,
+            expiresAt: Date(timeIntervalSinceNow: 60), reservedKeyID: "key-1",
+            claimReceiptDigest: Data(repeating: 4, count: 32)
+        )
+        let pending = try transaction.transition(to: .pendingValidation, now: Date())
+        XCTAssertEqual(pending.state, .pendingValidation)
+        let committing = try pending.transition(to: .committing, now: Date())
+        let request = try DidWebClaimCommitRequest(
+            transaction: committing, accountDID: accountA, targetDID: "did:web:example.com",
+            handle: "alice.example", documentDigest: Data(repeating: 2, count: 32),
+            reservedKeyID: "key-1", claimNonceDigest: Data(repeating: 1, count: 32),
+            claimReceiptDigest: Data(repeating: 4, count: 32), idempotencyKey: "claim-retry", now: Date()
+        )
+        XCTAssertEqual(request.identityBinding.method, .didWeb)
+        XCTAssertEqual(request.identityBinding.documentDigest, Data(repeating: 2, count: 32))
+        XCTAssertEqual(request.identityBinding.claimReceiptDigest, Data(repeating: 4, count: 32))
+        XCTAssertEqual(request.identityBinding.reservedKeyID, "key-1")
+    }
+
     func testControlSchemaReservationsAreAdditiveAndBounded() async throws {
         XCTAssertEqual(ControlSchemaMigrationVersion.identity.rawValue, 2)
         XCTAssertEqual(ControlSchemaMigrationVersion.signup.rawValue, 3)
         XCTAssertEqual(ControlSchemaMigrationVersion.legacySessions.rawValue, 4)
         XCTAssertEqual(ControlSchemaMigrationVersion.managementSessions.rawValue, 5)
         XCTAssertEqual(ControlSchemaMigrationVersion.factors.rawValue, 6)
+        XCTAssertEqual(ControlSchemaMigrationVersion.hardening.rawValue, 7)
         let schema = SQLiteLayout.controlMigrations.joined(separator: "\n")
         for table in [
             "control_schema_migrations", "identity_bindings", "did_web_claim_transactions",
@@ -217,7 +272,7 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         let markerRows = try await database.connection.query(
             "SELECT version FROM control_schema_migrations ORDER BY version"
         )
-        XCTAssertEqual(markerRows.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6])
+        XCTAssertEqual(markerRows.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7])
         let tables = try await database.connection.query(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('identity_bindings', 'signup_authorizations', 'legacy_sessions', 'management_sessions', 'authentication_factors', 'factor_challenges', 'totp_secret_envelopes', 'recovery_code_digests', 'webauthn_credentials', 'webauthn_challenges')"
         )
@@ -286,7 +341,126 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         try await database.close()
         let reopened = try await SQLiteControlDatabase(dataDirectory: root)
         let reopenedMarkers = try await reopened.connection.query("SELECT version FROM control_schema_migrations ORDER BY version")
-        XCTAssertEqual(reopenedMarkers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6])
+        XCTAssertEqual(reopenedMarkers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7])
         try await reopened.close()
+    }
+
+    func testHardeningMigrationUpgradesOldFoundationFixtureAndPreservesRows() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swan-account-foundation-v7-old-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let initial = try await SQLiteControlDatabase(dataDirectory: root)
+        try await initial.connection.query("INSERT INTO accounts(did, handle, status, created_at) VALUES ('\(accountA)', 'alice.example', 'active', 1), ('\(accountB)', 'bob.example', 'active', 1)")
+        try await initial.connection.query("PRAGMA foreign_keys = OFF")
+        for table in [
+            "webauthn_challenges", "webauthn_credentials", "recovery_code_digests",
+            "totp_secret_envelopes", "factor_challenges", "authentication_factors",
+            "management_sessions", "legacy_sessions", "legacy_session_families",
+            "app_passwords", "signup_invites", "signup_authorizations",
+            "did_web_claim_transactions", "identity_binding_history", "identity_bindings"
+        ] {
+            try await initial.connection.query("DROP TABLE IF EXISTS \(table)")
+        }
+        try await initial.connection.query("""
+            CREATE TABLE identity_bindings (
+                account_did TEXT PRIMARY KEY REFERENCES accounts(did) ON DELETE CASCADE,
+                identity_did TEXT NOT NULL UNIQUE, method TEXT NOT NULL, handle TEXT NOT NULL,
+                document_digest BLOB, last_validated_at INTEGER, grace_expires_at INTEGER, state TEXT NOT NULL
+            )
+            """)
+        try await initial.connection.query("""
+            CREATE TABLE identity_binding_history (
+                account_did TEXT NOT NULL, replaced_at INTEGER NOT NULL, identity_did TEXT NOT NULL,
+                document_digest BLOB, claim_receipt_digest BLOB, reserved_key_id TEXT,
+                PRIMARY KEY(account_did, replaced_at)
+            )
+            """)
+        try await initial.connection.query("""
+            CREATE TABLE did_web_claim_transactions (
+                request_id TEXT PRIMARY KEY, account_did TEXT REFERENCES accounts(did) ON DELETE CASCADE,
+                target_did TEXT NOT NULL, handle TEXT NOT NULL, claim_nonce_digest BLOB NOT NULL,
+                requested_document_digest BLOB, state TEXT NOT NULL, expires_at INTEGER NOT NULL,
+                step_up_receipt_digest BLOB
+            )
+            """)
+        try await initial.connection.query("""
+            CREATE TABLE signup_authorizations (
+                authorization_id TEXT PRIMARY KEY, request_id TEXT NOT NULL UNIQUE,
+                account_did TEXT REFERENCES accounts(did) ON DELETE CASCADE, policy TEXT NOT NULL,
+                handle TEXT NOT NULL, email TEXT, identity_did TEXT, email_proof_digest BLOB,
+                invite_digest BLOB, client_ip_bucket_digest BLOB NOT NULL, state TEXT NOT NULL,
+                issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, lease_expires_at INTEGER
+            )
+            """)
+        try await initial.connection.query("CREATE TABLE signup_invites (invite_digest BLOB PRIMARY KEY, issued_at INTEGER NOT NULL, expires_at INTEGER, redeemed_at INTEGER, redemption_account_did TEXT)")
+        try await initial.connection.query("CREATE TABLE app_passwords (app_password_id TEXT PRIMARY KEY, account_did TEXT NOT NULL, canonical_name TEXT NOT NULL, scope_strings BLOB NOT NULL, secret_digest BLOB NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER, revoked_at INTEGER)")
+        try await initial.connection.query("CREATE TABLE legacy_session_families (family_id TEXT PRIMARY KEY, account_did TEXT NOT NULL, app_password_id TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER)")
+        try await initial.connection.query("CREATE TABLE legacy_sessions (session_digest BLOB PRIMARY KEY, family_id TEXT NOT NULL, account_did TEXT NOT NULL, app_password_id TEXT, scope_strings BLOB NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER)")
+        try await initial.connection.query("CREATE TABLE management_sessions (session_digest BLOB PRIMARY KEY, account_did TEXT NOT NULL, csrf_digest BLOB NOT NULL, issued_at INTEGER NOT NULL, idle_expires_at INTEGER NOT NULL, absolute_expires_at INTEGER NOT NULL, last_step_up_at INTEGER, strength TEXT NOT NULL, revoked_at INTEGER)")
+        try await initial.connection.query("CREATE TABLE authentication_factors (factor_id TEXT PRIMARY KEY, account_did TEXT NOT NULL, kind TEXT NOT NULL, label TEXT NOT NULL, lookup_digest BLOB NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER, disabled_at INTEGER)")
+        try await initial.connection.query("CREATE TABLE factor_challenges (challenge_digest BLOB PRIMARY KEY, account_did TEXT NOT NULL, factor_id TEXT, purpose TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER)")
+        try await initial.connection.query("CREATE TABLE totp_secret_envelopes (factor_id TEXT PRIMARY KEY, account_did TEXT NOT NULL, key_reference TEXT NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL, authentication_tag BLOB NOT NULL)")
+        try await initial.connection.query("CREATE TABLE recovery_code_digests (account_did TEXT NOT NULL, digest BLOB NOT NULL, issued_at INTEGER NOT NULL, consumed_at INTEGER, PRIMARY KEY(account_did, digest))")
+        try await initial.connection.query("CREATE TABLE webauthn_credentials (credential_id_digest BLOB PRIMARY KEY, account_did TEXT NOT NULL, factor_id TEXT NOT NULL, public_key_reference TEXT NOT NULL, sign_count INTEGER NOT NULL, transports BLOB NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER, disabled_at INTEGER)")
+        try await initial.connection.query("CREATE TABLE webauthn_challenges (challenge_digest BLOB PRIMARY KEY, account_did TEXT NOT NULL, credential_id_digest BLOB, relying_party_id TEXT NOT NULL, origin TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER)")
+        try await initial.connection.query("INSERT INTO identity_bindings(account_did, identity_did, method, handle, state) VALUES ('\(accountA)', '\(accountA)', 'plc', 'alice.example', 'active')")
+        try await initial.connection.query("INSERT INTO did_web_claim_transactions(request_id, account_did, target_did, handle, claim_nonce_digest, state, expires_at) VALUES ('claim-old', '\(accountA)', 'did:web:example.com', 'alice.example', zeroblob(32), 'reserved', 100)")
+        try await initial.connection.query("INSERT INTO app_passwords(app_password_id, account_did, canonical_name, scope_strings, secret_digest, created_at) VALUES ('app-old', '\(accountA)', 'primary', x'00', zeroblob(32), 1)")
+        try await initial.connection.query("INSERT INTO legacy_session_families(family_id, account_did, app_password_id, created_at, expires_at) VALUES ('family-old', '\(accountA)', 'app-old', 1, 100)")
+        try await initial.connection.query("INSERT INTO legacy_sessions(session_digest, family_id, account_did, app_password_id, scope_strings, issued_at, expires_at) VALUES (zeroblob(32), 'family-old', '\(accountA)', 'app-old', x'00', 1, 100)")
+        try await initial.connection.query("DELETE FROM control_schema_migrations WHERE version = 7")
+        try await initial.close()
+
+        let upgraded = try await SQLiteControlDatabase(dataDirectory: root)
+        let markers = try await upgraded.connection.query("SELECT version FROM control_schema_migrations ORDER BY version")
+        XCTAssertEqual(markers.compactMap { $0.column("version")?.integer }, [1, 2, 3, 4, 5, 6, 7])
+        for (table, column) in [("did_web_claim_transactions", "reserved_key_id"), ("did_web_claim_transactions", "claim_receipt_digest"), ("legacy_session_families", "reuse_detected_at"), ("legacy_sessions", "rotated_at"), ("legacy_sessions", "replaced_by_digest"), ("legacy_sessions", "previous_session_digest"), ("legacy_sessions", "reuse_detected_at")] {
+            let columns = try await upgraded.connection.query("PRAGMA table_info(\(table))")
+            XCTAssertTrue(columns.contains { $0.column("name")?.string == column }, "\(table).\(column)")
+        }
+        let claimRows = try await upgraded.connection.query("SELECT COUNT(*) AS count FROM did_web_claim_transactions WHERE request_id = 'claim-old'")
+        let sessionRows = try await upgraded.connection.query("SELECT COUNT(*) AS count FROM legacy_sessions WHERE family_id = 'family-old'")
+        XCTAssertEqual(claimRows.first?.column("count")?.integer, 1)
+        XCTAssertEqual(sessionRows.first?.column("count")?.integer, 1)
+        do {
+            try await upgraded.connection.query("INSERT INTO legacy_session_families(family_id, account_did, app_password_id, created_at, expires_at) VALUES ('family-cross', '\(accountB)', 'app-old', 1, 100)")
+            XCTFail("v7 must enforce family/app-password account ownership")
+        } catch { }
+        do {
+            try await upgraded.connection.query("UPDATE did_web_claim_transactions SET account_did = NULL WHERE request_id = 'claim-old'")
+            XCTFail("v7 must reject clearing nullable claim ownership")
+        } catch { }
+        do {
+            try await upgraded.connection.query("UPDATE did_web_claim_transactions SET account_did = '\(accountB)' WHERE request_id = 'claim-old'")
+            XCTFail("v7 must reject changing claim ownership")
+        } catch { }
+        try await upgraded.close()
+    }
+
+    func testHardeningMigrationFailureRollsBackMarkerAndPreservesInvalidLegacyData() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swan-account-foundation-v7-rollback-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try await SQLiteControlDatabase(dataDirectory: root)
+        try await database.connection.query("PRAGMA foreign_keys = OFF")
+        try await database.connection.query("DROP TABLE legacy_session_families")
+        try await database.connection.query("""
+            CREATE TABLE legacy_session_families (
+                family_id TEXT PRIMARY KEY, account_did TEXT NOT NULL, app_password_id TEXT,
+                created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, revoked_at INTEGER,
+                reuse_detected_at INTEGER
+            )
+            """)
+        try await database.connection.query("INSERT INTO legacy_session_families(family_id, account_did, created_at, expires_at, reuse_detected_at) VALUES ('invalid-family', '\(accountA)', 1, 100, 5)")
+        try await database.connection.query("DELETE FROM control_schema_migrations WHERE version = 7")
+        do {
+            _ = try await SQLiteControlDatabase(dataDirectory: root)
+            XCTFail("invalid legacy lineage must abort v7 migration")
+        } catch { }
+        let marker = try await database.connection.query("SELECT version FROM control_schema_migrations WHERE version = 7")
+        let row = try await database.connection.query("SELECT reuse_detected_at FROM legacy_session_families WHERE family_id = 'invalid-family'")
+        XCTAssertTrue(marker.isEmpty)
+        XCTAssertEqual(row.first?.column("reuse_detected_at")?.integer, 5)
+        try await database.close()
     }
 }

@@ -9,4 +9,5 @@ public enum ControlSchemaMigrationVersion: Int, CaseIterable, Codable, Sendable 
     case legacySessions = 4
     case managementSessions = 5
     case factors = 6
+    case hardening = 7
 }
