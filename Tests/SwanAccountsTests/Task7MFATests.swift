@@ -17,6 +17,8 @@ final class Task7MFATests: XCTestCase {
         try await database.saveFactor(factor, now: Date(timeIntervalSince1970: 1))
         let factors = try await database.listFactors(accountDID: "did:plc:alice", now: Date(timeIntervalSince1970: 1))
         XCTAssertEqual(factors, [factor])
+        let recoveryFactor = try AuthenticationFactorMetadata(id: "recovery", accountDID: "did:plc:alice", kind: .recoveryCode, label: "Recovery", lookupDigest: Data(repeating: 4, count: 32), createdAt: Date(timeIntervalSince1970: 1))
+        try await database.saveFactor(recoveryFactor, now: Date(timeIntervalSince1970: 1))
         let code = try RecoveryCodeDigest(accountDID: "did:plc:alice", digest: Data(repeating: 2, count: 32), issuedAt: Date(timeIntervalSince1970: 1))
         try await database.replaceRecoveryCodeDigests(accountDID: "did:plc:alice", digests: [code], now: Date(timeIntervalSince1970: 1))
         _ = try await database.consumeRecoveryCode(digest: code.digest, accountDID: "did:plc:alice", now: Date(timeIntervalSince1970: 2))
