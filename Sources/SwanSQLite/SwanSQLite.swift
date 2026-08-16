@@ -140,6 +140,8 @@ public enum SQLiteLayout {
             handle TEXT NOT NULL,
             claim_nonce_digest BLOB NOT NULL CHECK(length(claim_nonce_digest) = 32),
             requested_document_digest BLOB CHECK(requested_document_digest IS NULL OR length(requested_document_digest) = 32),
+            reserved_key_id TEXT,
+            claim_receipt_digest BLOB CHECK(claim_receipt_digest IS NULL OR length(claim_receipt_digest) = 32),
             state TEXT NOT NULL CHECK(state IN ('reserved', 'pendingValidation', 'committing', 'committed', 'failed', 'expired')),
             expires_at INTEGER NOT NULL CHECK(expires_at >= 0),
             step_up_receipt_digest BLOB CHECK(step_up_receipt_digest IS NULL OR length(step_up_receipt_digest) = 32)
@@ -182,29 +184,38 @@ public enum SQLiteLayout {
             created_at INTEGER NOT NULL CHECK(created_at >= 0),
             last_used_at INTEGER,
             revoked_at INTEGER,
-            UNIQUE(account_did, canonical_name)
+            UNIQUE(account_did, canonical_name),
+            UNIQUE(app_password_id, account_did)
         )
         """,
         """
         CREATE TABLE IF NOT EXISTS legacy_session_families (
             family_id TEXT PRIMARY KEY,
             account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
-            app_password_id TEXT REFERENCES app_passwords(app_password_id) ON DELETE CASCADE,
+            app_password_id TEXT,
             created_at INTEGER NOT NULL CHECK(created_at >= 0),
             expires_at INTEGER NOT NULL CHECK(expires_at >= created_at),
-            revoked_at INTEGER
+            revoked_at INTEGER,
+            UNIQUE(family_id, account_did),
+            FOREIGN KEY(app_password_id, account_did) REFERENCES app_passwords(app_password_id, account_did) ON DELETE CASCADE
         )
         """,
         """
         CREATE TABLE IF NOT EXISTS legacy_sessions (
             session_digest BLOB PRIMARY KEY CHECK(length(session_digest) = 32),
-            family_id TEXT NOT NULL REFERENCES legacy_session_families(family_id) ON DELETE CASCADE,
+            family_id TEXT NOT NULL,
             account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
-            app_password_id TEXT REFERENCES app_passwords(app_password_id) ON DELETE CASCADE,
+            app_password_id TEXT,
             scope_strings BLOB NOT NULL,
             issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
             expires_at INTEGER NOT NULL CHECK(expires_at >= issued_at),
-            revoked_at INTEGER
+            revoked_at INTEGER,
+            rotated_at INTEGER,
+            replaced_by_digest BLOB CHECK(replaced_by_digest IS NULL OR length(replaced_by_digest) = 32),
+            previous_session_digest BLOB CHECK(previous_session_digest IS NULL OR length(previous_session_digest) = 32),
+            reuse_detected_at INTEGER,
+            FOREIGN KEY(family_id, account_did) REFERENCES legacy_session_families(family_id, account_did),
+            FOREIGN KEY(app_password_id, account_did) REFERENCES app_passwords(app_password_id, account_did)
         )
         """,
         """
@@ -230,28 +241,31 @@ public enum SQLiteLayout {
             created_at INTEGER NOT NULL CHECK(created_at >= 0),
             last_used_at INTEGER,
             disabled_at INTEGER,
-            UNIQUE(account_did, lookup_digest)
+            UNIQUE(account_did, lookup_digest),
+            UNIQUE(factor_id, account_did)
         )
         """,
         """
         CREATE TABLE IF NOT EXISTS factor_challenges (
             challenge_digest BLOB PRIMARY KEY CHECK(length(challenge_digest) = 32),
             account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
-            factor_id TEXT REFERENCES authentication_factors(factor_id) ON DELETE CASCADE,
+            factor_id TEXT,
             purpose TEXT NOT NULL CHECK(purpose IN ('enrollment', 'assertion', 'stepUp')),
             issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
             expires_at INTEGER NOT NULL CHECK(expires_at >= issued_at),
-            consumed_at INTEGER
+            consumed_at INTEGER,
+            FOREIGN KEY(factor_id, account_did) REFERENCES authentication_factors(factor_id, account_did) ON DELETE CASCADE
         )
         """,
         """
         CREATE TABLE IF NOT EXISTS totp_secret_envelopes (
-            factor_id TEXT PRIMARY KEY REFERENCES authentication_factors(factor_id) ON DELETE CASCADE,
+            factor_id TEXT PRIMARY KEY,
             account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
             key_reference TEXT NOT NULL,
             nonce BLOB NOT NULL CHECK(length(nonce) = 12),
             ciphertext BLOB NOT NULL CHECK(length(ciphertext) > 0),
-            authentication_tag BLOB NOT NULL CHECK(length(authentication_tag) = 16)
+            authentication_tag BLOB NOT NULL CHECK(length(authentication_tag) = 16),
+            FOREIGN KEY(factor_id, account_did) REFERENCES authentication_factors(factor_id, account_did) ON DELETE CASCADE
         )
         """,
         """
@@ -267,13 +281,15 @@ public enum SQLiteLayout {
         CREATE TABLE IF NOT EXISTS webauthn_credentials (
             credential_id_digest BLOB PRIMARY KEY CHECK(length(credential_id_digest) = 32),
             account_did TEXT NOT NULL REFERENCES accounts(did) ON DELETE CASCADE,
-            factor_id TEXT NOT NULL REFERENCES authentication_factors(factor_id) ON DELETE CASCADE,
+            factor_id TEXT NOT NULL,
             public_key_reference TEXT NOT NULL,
             sign_count INTEGER NOT NULL CHECK(sign_count >= 0),
             transports BLOB NOT NULL,
             created_at INTEGER NOT NULL CHECK(created_at >= 0),
             last_used_at INTEGER,
-            disabled_at INTEGER
+            disabled_at INTEGER,
+            UNIQUE(credential_id_digest, account_did),
+            FOREIGN KEY(factor_id, account_did) REFERENCES authentication_factors(factor_id, account_did) ON DELETE CASCADE
         )
         """,
         """
@@ -285,7 +301,8 @@ public enum SQLiteLayout {
             origin TEXT NOT NULL,
             issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
             expires_at INTEGER NOT NULL CHECK(expires_at >= issued_at),
-            consumed_at INTEGER
+            consumed_at INTEGER,
+            FOREIGN KEY(credential_id_digest, account_did) REFERENCES webauthn_credentials(credential_id_digest, account_did) ON DELETE CASCADE
         )
         """,
         "CREATE INDEX IF NOT EXISTS did_web_claim_transactions_expiry ON did_web_claim_transactions(expires_at, request_id)",
@@ -332,6 +349,25 @@ public enum SQLiteLayout {
         "CREATE TRIGGER IF NOT EXISTS webauthn_credentials_account_capacity BEFORE INSERT ON webauthn_credentials WHEN (SELECT COUNT(*) FROM webauthn_credentials WHERE account_did = NEW.account_did) >= 16 BEGIN SELECT RAISE(ABORT, 'WebAuthn credential account capacity exhausted'); END",
         "CREATE TRIGGER IF NOT EXISTS webauthn_challenges_account_capacity BEFORE INSERT ON webauthn_challenges WHEN (SELECT COUNT(*) FROM webauthn_challenges WHERE account_did = NEW.account_did) >= 64 BEGIN SELECT RAISE(ABORT, 'WebAuthn challenge account capacity exhausted'); END",
         "CREATE TRIGGER IF NOT EXISTS recovery_code_digests_account_capacity BEFORE INSERT ON recovery_code_digests WHEN (SELECT COUNT(*) FROM recovery_code_digests WHERE account_did = NEW.account_did) >= 32 BEGIN SELECT RAISE(ABORT, 'recovery code account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS identity_bindings_account_immutable BEFORE UPDATE OF account_did ON identity_bindings WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'identity binding account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS identity_binding_history_account_immutable BEFORE UPDATE OF account_did ON identity_binding_history WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'identity history account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS did_web_claim_transactions_account_immutable BEFORE UPDATE OF account_did ON did_web_claim_transactions WHEN NEW.account_did IS NOT OLD.account_did AND NOT (OLD.account_did IS NULL AND NEW.account_did IS NOT NULL) BEGIN SELECT RAISE(ABORT, 'identity claim account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS did_web_claim_transactions_account_transition_capacity BEFORE UPDATE OF account_did ON did_web_claim_transactions WHEN OLD.account_did IS NULL AND NEW.account_did IS NOT NULL AND (SELECT COUNT(*) FROM did_web_claim_transactions WHERE account_did = NEW.account_did) >= 16 BEGIN SELECT RAISE(ABORT, 'identity claim account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS signup_authorizations_account_immutable BEFORE UPDATE OF account_did ON signup_authorizations WHEN NEW.account_did IS NOT OLD.account_did AND NOT (OLD.account_did IS NULL AND NEW.account_did IS NOT NULL) BEGIN SELECT RAISE(ABORT, 'signup authorization account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS signup_authorizations_account_transition_capacity BEFORE UPDATE OF account_did ON signup_authorizations WHEN OLD.account_did IS NULL AND NEW.account_did IS NOT NULL AND (SELECT COUNT(*) FROM signup_authorizations WHERE account_did = NEW.account_did) >= 16 BEGIN SELECT RAISE(ABORT, 'signup authorization account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS app_passwords_account_immutable BEFORE UPDATE OF account_did ON app_passwords WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'app password account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS legacy_session_families_account_immutable BEFORE UPDATE OF account_did ON legacy_session_families WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'legacy family account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS legacy_sessions_account_immutable BEFORE UPDATE OF account_did ON legacy_sessions WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'legacy session account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS management_sessions_account_immutable BEFORE UPDATE OF account_did ON management_sessions WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'management session account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS authentication_factors_account_immutable BEFORE UPDATE OF account_did ON authentication_factors WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'factor account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS factor_challenges_account_immutable BEFORE UPDATE OF account_did ON factor_challenges WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'factor challenge account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS totp_secret_envelopes_account_immutable BEFORE UPDATE OF account_did ON totp_secret_envelopes WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'TOTP envelope account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS recovery_code_digests_account_immutable BEFORE UPDATE OF account_did ON recovery_code_digests WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'recovery code account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS webauthn_credentials_account_immutable BEFORE UPDATE OF account_did ON webauthn_credentials WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'WebAuthn credential account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS webauthn_challenges_account_immutable BEFORE UPDATE OF account_did ON webauthn_challenges WHEN NEW.account_did <> OLD.account_did BEGIN SELECT RAISE(ABORT, 'WebAuthn challenge account ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS signup_invites_redemption_capacity BEFORE UPDATE OF redemption_account_did ON signup_invites WHEN OLD.redemption_account_did IS NOT NULL AND NEW.redemption_account_did IS NOT OLD.redemption_account_did BEGIN SELECT RAISE(ABORT, 'signup invite redemption ownership is immutable'); END",
+        "CREATE TRIGGER IF NOT EXISTS signup_invites_redemption_account_capacity BEFORE UPDATE OF redemption_account_did ON signup_invites WHEN OLD.redemption_account_did IS NULL AND NEW.redemption_account_did IS NOT NULL AND (SELECT COUNT(*) FROM signup_invites WHERE redemption_account_did = NEW.redemption_account_did) >= 32 BEGIN SELECT RAISE(ABORT, 'redeemed signup invite account capacity exhausted'); END",
+        "CREATE TRIGGER IF NOT EXISTS webauthn_sign_count_monotonic BEFORE UPDATE OF sign_count ON webauthn_credentials WHEN NEW.sign_count <= OLD.sign_count BEGIN SELECT RAISE(ABORT, 'WebAuthn sign count rollback'); END",
         "CREATE TABLE IF NOT EXISTS oauth_tokens (digest BLOB PRIMARY KEY, family_id TEXT NOT NULL, subject TEXT NOT NULL, expires_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)",
         "CREATE TABLE IF NOT EXISTS oauth_client_metadata (client_id TEXT PRIMARY KEY, document BLOB NOT NULL, expires_at INTEGER NOT NULL)",
         """

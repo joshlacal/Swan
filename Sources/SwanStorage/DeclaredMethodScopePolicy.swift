@@ -25,12 +25,12 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
     public static let fullAccessV1 = DeclaredMethodScopePolicy(permitsFullAccess: true)
 
     public init(declarations: [String: Set<String>] = [:], permitsFullAccess: Bool = false) {
-        self.declarations = declarations
+        self.declarations = declarations.filter { Self.isCanonicalMethod($0.key) }
         self.permitsFullAccess = permitsFullAccess
     }
 
     public func allows(credential: ScopeCredential, method: String) -> Bool {
-        guard !method.isEmpty, method.utf8.count <= 512 else { return false }
+        guard Self.isCanonicalMethod(method) else { return false }
         switch credential {
         case .fullAccessV1:
             return permitsFullAccess
@@ -38,5 +38,24 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
             guard let required = declarations[method], !required.isEmpty else { return false }
             return required.isSubset(of: scopes)
         }
+    }
+
+    public static func isCanonicalMethod(_ method: String) -> Bool {
+        guard method.utf8.count <= 512 else { return false }
+        let parts = method.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 3 else { return false }
+        for (index, part) in parts.enumerated() {
+            guard !part.isEmpty else { return false }
+            let bytes = part.utf8
+            guard bytes.allSatisfy({
+                ($0 >= 97 && $0 <= 122) || ($0 >= 65 && $0 <= 90)
+                    || ($0 >= 48 && $0 <= 57) || $0 == 45
+            }) else { return false }
+            guard let first = bytes.first,
+                  (first >= 65 && first <= 90) || (first >= 97 && first <= 122) else { return false }
+            if index < parts.count - 1,
+               bytes.contains(where: { $0 >= 65 && $0 <= 90 }) { return false }
+        }
+        return true
     }
 }
