@@ -17,6 +17,15 @@ authorization context, never a browser cookie. App-password login CAS-checks
 the active row and scope snapshot while atomically updating `lastUsedAt` and
 creating the derived family/session.
 
+## Final integration patch
+
+The integration owner must extend the shared `AuthorizationContext` foundation
+with `.accountLegacySession(grant: LegacyAccessGrant, ...)` and preserve the
+grant as a typed value through bearer authentication. The router must reject a
+missing or unknown grant, reject a scoped token presented as full access, and
+reject a full-access token whose method is absent from the registered policy.
+The lane intentionally does not edit the shared owner file or router assembly.
+
 ## Lane scope
 
 Implemented from foundation `884b92fd` in the `Swan-account-legacy-auth` lane.
