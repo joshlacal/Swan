@@ -80,7 +80,7 @@ public struct LegacyXRPCAuthorizationContext: Sendable {
     public let accountDID: String
     public let opaqueAuthorization: String
     public let freshStepUpReceipt: String?
-    public init(accountDID: String, opaqueAuthorization: String, freshStepUpReceipt: String? = nil) {
+    internal init(accountDID: String, opaqueAuthorization: String, freshStepUpReceipt: String? = nil) {
         self.accountDID = accountDID; self.opaqueAuthorization = opaqueAuthorization; self.freshStepUpReceipt = freshStepUpReceipt
     }
 }

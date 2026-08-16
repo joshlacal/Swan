@@ -42,7 +42,7 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
     }
 
     public func allows(credential: ScopeCredential, method: String) -> Bool {
-        guard Self.isCanonicalMethod(method) else { return false }
+        guard Self.isCanonicalMethod(method), declarations[method] != nil else { return false }
         switch credential {
         case .fullAccessV1:
             return permitsFullAccess

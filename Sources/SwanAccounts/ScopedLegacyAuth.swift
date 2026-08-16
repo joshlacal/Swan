@@ -209,6 +209,7 @@ public actor LegacyAuthService {
     private let tokenIssuer: any LegacyTokenIssuer
     private let managementAuthorizer: LegacyManagementAuthorizer
     private let loginAdmission: LegacyLoginAdmission
+    private let methodPolicy: DeclaredMethodScopePolicy
     private let secretKey: SymmetricKey
 
     public init(
@@ -217,7 +218,8 @@ public actor LegacyAuthService {
         secretKey: Data,
         tokenIssuer: any LegacyTokenIssuer,
         managementAuthorizer: LegacyManagementAuthorizer,
-        loginAdmission: LegacyLoginAdmission
+        loginAdmission: LegacyLoginAdmission,
+        methodPolicy: DeclaredMethodScopePolicy
     ) throws {
         guard secretKey.count >= 16 else { throw SwanError.invalidIdentifier("legacy auth secret key") }
         self.store = store
@@ -225,6 +227,7 @@ public actor LegacyAuthService {
         self.tokenIssuer = tokenIssuer
         self.managementAuthorizer = managementAuthorizer
         self.loginAdmission = loginAdmission
+        self.methodPolicy = methodPolicy
         self.secretKey = SymmetricKey(data: secretKey)
     }
 
@@ -269,10 +272,12 @@ public actor LegacyAuthService {
         guard let account = try await accountResolver.resolve(identifier) else {
             throw SwanError.unauthorized("invalid identifier or password")
         }
+        guard account.active != false, !["suspended", "deactivated", "takedown"].contains(account.status?.lowercased()) else {
+            throw SwanError.unauthorized("account unavailable")
+        }
         let passwords = try await store.listAppPasswords(accountDID: account.did, now: now)
         for app in passwords where app.revokedAt == nil {
             if try verifySecret(password, encoded: app.secretDigest) {
-                try await store.markAppPasswordUsed(id: app.id, now: now)
                 return try await issueSession(account: account, appPassword: app, now: now)
             }
         }
@@ -345,8 +350,7 @@ public actor LegacyAuthService {
         guard let lxm, let aud else { throw SwanError.unauthorized("lxm and aud are required") }
         let session = try await getSession(accessToken, now: now)
         let isFull = session.fullAccess
-        let policy = isFull ? DeclaredMethodScopePolicy.fullAccessV1 : DeclaredMethodScopePolicy(declarations: [lxm: ["rpc:\(lxm)?aud=\(aud)"]])
-        try SwanScopeEvaluator().evaluate(credential: isFull ? .fullAccessV1 : .scopes(session.scopes), canonicalMethod: lxm, declaredMethodPolicy: policy, audience: aud)
+        try SwanScopeEvaluator().evaluate(credential: isFull ? .fullAccessV1 : .scopes(session.scopes), canonicalMethod: lxm, declaredMethodPolicy: methodPolicy, audience: aud)
         let expiry = now.addingTimeInterval(Self.serviceAuthLifetime)
         return LegacyServiceAuthToken(token: try tokenIssuer.issueServiceAuth(subject: session.did, audience: aud, method: lxm, issuedAt: now, expiresAt: expiry), subject: session.did, audience: aud, expiresAt: expiry)
     }
@@ -357,7 +361,11 @@ public actor LegacyAuthService {
         let sessionID = try LegacySessionID(digest: digest(refresh))
         let session = try LegacySessionMetadata(sessionID: sessionID, familyID: familyID, accountDID: account.did, appPasswordID: appPassword?.id, scopeStrings: scopes ?? appPassword?.scopeStrings ?? [], issuedAt: now, expiresAt: now.addingTimeInterval(Self.refreshLifetime))
         let family = try LegacySessionFamilyMetadata(familyID: familyID, accountDID: account.did, appPasswordID: appPassword?.id, createdAt: now, expiresAt: session.expiresAt)
-        try await store.createLegacySessionFamily(family, session: session, sessionDigest: digest(refresh), now: now)
+        if let appPassword {
+            try await store.createLegacySessionFromAppPassword(appPassword, family: family, session: session, sessionDigest: digest(refresh), now: now)
+        } else {
+            try await store.createLegacySessionFamily(family, session: session, sessionDigest: digest(refresh), now: now)
+        }
         let access = try tokenIssuer.issueAccess(subject: account.did, sessionID: sessionID, scopes: session.scopeStrings == [Self.fullAccessMarker] ? [] : session.scopeStrings, issuedAt: now, expiresAt: now.addingTimeInterval(Self.accessLifetime))
         let fullAccess = session.scopeStrings.contains(Self.fullAccessMarker)
         return LegacySessionTokens(accessToken: access, refreshToken: refresh, did: account.did, handle: account.handle, scopes: fullAccess ? [] : session.scopeStrings, sessionID: sessionID, email: account.email, emailConfirmed: account.emailConfirmed, emailAuthFactor: account.emailAuthFactor, active: account.active, status: account.status, fullAccess: fullAccess)
@@ -488,6 +496,11 @@ public actor InMemoryLegacyAuthStore: AppPasswordStore, LegacySessionStore {
     public func markAppPasswordUsed(id: String, now: Date) async throws {
         guard let old = appPasswords[id], old.revokedAt == nil else { return }
         appPasswords[id] = try AppPasswordMetadata(id: old.id, accountDID: old.accountDID, canonicalName: old.canonicalName, scopeStrings: old.scopeStrings, secretDigest: old.secretDigest, createdAt: old.createdAt, lastUsedAt: now, revokedAt: old.revokedAt)
+    }
+    public func createLegacySessionFromAppPassword(_ metadata: AppPasswordMetadata, family: LegacySessionFamilyMetadata, session: LegacySessionMetadata, sessionDigest: Data, now: Date) async throws {
+        guard let current = appPasswords[metadata.id], current.revokedAt == nil, current.scopeStrings == metadata.scopeStrings else { throw SwanError.unauthorized("app password changed or revoked") }
+        appPasswords[metadata.id] = try AppPasswordMetadata(id: current.id, accountDID: current.accountDID, canonicalName: current.canonicalName, scopeStrings: current.scopeStrings, secretDigest: current.secretDigest, createdAt: current.createdAt, lastUsedAt: now, revokedAt: current.revokedAt)
+        families[family.familyID] = family; sessions[Hex.encode(sessionDigest)] = session
     }
     public func createLegacySessionFamily(_ family: LegacySessionFamilyMetadata, session: LegacySessionMetadata, sessionDigest: Data, now: Date) async throws { families[family.familyID] = family; sessions[Hex.encode(sessionDigest)] = session }
     public func legacySession(digest: Data, now: Date) async throws -> LegacySessionMetadata? { sessions[Hex.encode(digest)].flatMap { $0.expiresAt > now && $0.revokedAt == nil ? $0 : $0 } }

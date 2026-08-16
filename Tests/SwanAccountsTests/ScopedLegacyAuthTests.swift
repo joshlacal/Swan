@@ -32,7 +32,7 @@ final class ScopedLegacyAuthTests: XCTestCase {
 
     func testAppPasswordSecretPresentedOnceAndScopeEditRevokesDerivedSession() async throws {
         let store = InMemoryLegacyAuthStore()
-        let service = try LegacyAuthService(store: store, accountResolver: .fixture, secretKey: Data(repeating: 7, count: 32), tokenIssuer: HMACLegacyTokenIssuer(key: Data(repeating: 8, count: 32), issuer: "swan.test"), managementAuthorizer: LegacyManagementAuthorizer { _, session, stepUp in session == "management" && (stepUp.isEmpty || stepUp == "step-up") }, loginAdmission: LegacyLoginAdmission { _ in })
+        let service = try LegacyAuthService(store: store, accountResolver: .fixture, secretKey: Data(repeating: 7, count: 32), tokenIssuer: HMACLegacyTokenIssuer(key: Data(repeating: 8, count: 32), issuer: "swan.test"), managementAuthorizer: LegacyManagementAuthorizer { _, session, stepUp in session == "management" && (stepUp.isEmpty || stepUp == "step-up") }, loginAdmission: LegacyLoginAdmission { _ in }, methodPolicy: DeclaredMethodScopePolicy.fullAccessV1)
         let created = try await service.createAppPassword(accountDID: "did:plc:alice", name: "writer", scopes: ["repo:write"], managementSessionToken: "management", stepUpToken: "step-up", now: Date(timeIntervalSince1970: 10))
         XCTAssertFalse(created.secret.isEmpty)
         let listed = try await service.listAppPasswords(accountDID: "did:plc:alice", managementSessionToken: "management")
@@ -50,7 +50,7 @@ final class ScopedLegacyAuthTests: XCTestCase {
 
     func testRefreshReuseAtomicallyRevokesFamilyAndAppPasswordRevokesDerivedSessions() async throws {
         let store = InMemoryLegacyAuthStore()
-        let service = try LegacyAuthService(store: store, accountResolver: .fixture, secretKey: Data(repeating: 7, count: 32), tokenIssuer: HMACLegacyTokenIssuer(key: Data(repeating: 8, count: 32), issuer: "swan.test"), managementAuthorizer: LegacyManagementAuthorizer { _, _, _ in true }, loginAdmission: LegacyLoginAdmission { _ in })
+        let service = try LegacyAuthService(store: store, accountResolver: .fixture, secretKey: Data(repeating: 7, count: 32), tokenIssuer: HMACLegacyTokenIssuer(key: Data(repeating: 8, count: 32), issuer: "swan.test"), managementAuthorizer: LegacyManagementAuthorizer { _, _, _ in true }, loginAdmission: LegacyLoginAdmission { _ in }, methodPolicy: DeclaredMethodScopePolicy.fullAccessV1)
         let created = try await service.createAppPassword(accountDID: "did:plc:alice", name: "writer", scopes: ["repo:write"], managementSessionToken: "m", stepUpToken: "s", now: Date(timeIntervalSince1970: 10))
         let session = try await service.createSession(identifier: "did:plc:alice", password: created.secret, now: Date(timeIntervalSince1970: 11))
         _ = try await service.refreshSession(session.refreshToken, now: Date(timeIntervalSince1970: 12))
@@ -72,7 +72,7 @@ final class ScopedLegacyAuthTests: XCTestCase {
                 account.passwordVerifier == password && factor == "valid-factor"
             }
         )
-        let service = try LegacyAuthService(store: store, accountResolver: resolver, secretKey: Data(repeating: 7, count: 32), tokenIssuer: HMACLegacyTokenIssuer(key: Data(repeating: 8, count: 32), issuer: "swan.test"), managementAuthorizer: LegacyManagementAuthorizer { _, _, _ in true }, loginAdmission: LegacyLoginAdmission { _ in })
+        let service = try LegacyAuthService(store: store, accountResolver: resolver, secretKey: Data(repeating: 7, count: 32), tokenIssuer: HMACLegacyTokenIssuer(key: Data(repeating: 8, count: 32), issuer: "swan.test"), managementAuthorizer: LegacyManagementAuthorizer { _, _, _ in true }, loginAdmission: LegacyLoginAdmission { _ in }, methodPolicy: DeclaredMethodScopePolicy.fullAccessV1)
         do { _ = try await service.createSession(identifier: "did:plc:mfa", password: "password") ; XCTFail("MFA password login must require a factor") } catch { }
         let app = try await service.createAppPassword(accountDID: "did:plc:mfa", name: "scoped", scopes: ["repo:read"], managementSessionToken: "m", stepUpToken: "s")
         let scoped = try await service.createSession(identifier: "did:plc:mfa", password: app.secret)
@@ -85,7 +85,7 @@ final class ScopedLegacyAuthTests: XCTestCase {
 
     func testManagementMutationWithoutVerifiedSessionOrStepUpIsDenied() async throws {
         let store = InMemoryLegacyAuthStore()
-        let service = try LegacyAuthService(store: store, accountResolver: .fixture, secretKey: Data(repeating: 7, count: 32), tokenIssuer: HMACLegacyTokenIssuer(key: Data(repeating: 8, count: 32), issuer: "swan.test"), managementAuthorizer: LegacyManagementAuthorizer { _, _, _ in XCTFail("authorizer must not run without both proofs"); return true }, loginAdmission: LegacyLoginAdmission { _ in })
+        let service = try LegacyAuthService(store: store, accountResolver: .fixture, secretKey: Data(repeating: 7, count: 32), tokenIssuer: HMACLegacyTokenIssuer(key: Data(repeating: 8, count: 32), issuer: "swan.test"), managementAuthorizer: LegacyManagementAuthorizer { _, _, _ in XCTFail("authorizer must not run without both proofs"); return true }, loginAdmission: LegacyLoginAdmission { _ in }, methodPolicy: DeclaredMethodScopePolicy.fullAccessV1)
         do { _ = try await service.createAppPassword(accountDID: "did:plc:alice", name: "bad", scopes: ["repo:read"]); XCTFail("missing management proof must deny") } catch { }
     }
 }

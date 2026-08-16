@@ -71,6 +71,19 @@ extension SQLiteControlDatabase: AppPasswordStore, LegacySessionStore {
         try await withConnectionGate { _ = try await connection.query("UPDATE app_passwords SET last_used_at = ? WHERE app_password_id = ? AND revoked_at IS NULL", [.integer(Self.seconds(now)), .text(id)]) }
     }
 
+    public func createLegacySessionFromAppPassword(_ metadata: AppPasswordMetadata, family: LegacySessionFamilyMetadata, session: LegacySessionMetadata, sessionDigest: Data, now: Date) async throws {
+        try await withConnectionGate {
+            try await transaction {
+                let encoded = try Self.encodeScopes(metadata.scopeStrings)
+                let check = try await connection.query("SELECT app_password_id FROM app_passwords WHERE app_password_id = ? AND revoked_at IS NULL AND scope_strings = ? LIMIT 1", [.text(metadata.id), .blob(encoded)])
+                guard !check.isEmpty else { throw SwanError.unauthorized("app password changed or revoked") }
+                _ = try await connection.query("UPDATE app_passwords SET last_used_at = ? WHERE app_password_id = ? AND revoked_at IS NULL", [.integer(Self.seconds(now)), .text(metadata.id)])
+                _ = try await connection.query("INSERT INTO legacy_session_families(family_id, account_did, app_password_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)", [.text(family.familyID), .text(family.accountDID), .text(metadata.id), .integer(Self.seconds(family.createdAt)), .integer(Self.seconds(family.expiresAt))])
+                try await insertSession(session, digest: sessionDigest)
+            }
+        }
+    }
+
     public func createLegacySessionFamily(_ family: LegacySessionFamilyMetadata, session: LegacySessionMetadata, sessionDigest: Data, now: Date) async throws {
         let familyExpiry = Self.seconds(family.expiresAt)
         try await withConnectionGate {

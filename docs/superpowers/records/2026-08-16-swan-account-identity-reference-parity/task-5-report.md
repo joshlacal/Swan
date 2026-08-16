@@ -13,7 +13,9 @@ JWTs with issuer, audience/method, `iat`, `exp`, and `jti` claims; access JWTs
 carry the durable session ID for cross-replica lookup. Password sessions use
 an internal marker evaluated only against the explicit full-access method
 registry; app-password management adapters consume a typed opaque XRPC
-authorization context, never a browser cookie.
+authorization context, never a browser cookie. App-password login CAS-checks
+the active row and scope snapshot while atomically updating `lastUsedAt` and
+creating the derived family/session.
 
 ## Lane scope
 
