@@ -111,6 +111,11 @@ public struct SignupInviteService: Sendable {
     }
 }
 
+public protocol SignupInvitePersistence: Sendable {
+    func persistInvite(_ invite: SignupInvite) async throws
+    func listInvites(limit: Int) async throws -> [SignupInvite]
+}
+
 public struct SignupEmailProofIssue: Sendable, Equatable {
     public let code: String
     public let digest: Data
