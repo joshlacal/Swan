@@ -403,7 +403,14 @@ public struct SignupAuthorizationInput: Sendable, Equatable {
 }
 
 public protocol SignupFoundationBundle: Sendable {
-    func commitSignup(_ input: SignupFinalizationRequest, now: Date) async throws -> SignupFinalizationResult
+    /// The foundation implementation performs account/identity/session work
+    /// and invokes `finalize` exactly once from its idempotent commit path.
+    /// Retrying the same canonical request must return the persisted result.
+    func commitSignup(
+        _ input: SignupFinalizationRequest,
+        finalize: @escaping @Sendable () async throws -> SignupFinalizationResult,
+        now: Date
+    ) async throws -> SignupFinalizationResult
 }
 
 public enum SignupServiceError: Error, Sendable, Equatable { case closed, inviteRequired, emailProofRequired, turnstileRequired, invalidIdentity, duplicateRequest }
@@ -436,8 +443,12 @@ public struct SignupService: Sendable {
         guard let authorization = try await store.authorization(id: request.authorizationID, now: now), authorization.requestID == request.idempotencyKey else { throw AccountControlStoreError.notFound }
         guard authorization.handle == request.handle, authorization.identityDID == request.identityDID else { throw SignupServiceError.duplicateRequest }
         do {
-            _ = try await foundation.commitSignup(request, now: now)
-            return try await store.finalize(request, now: now)
+            let store = store
+            return try await foundation.commitSignup(
+                request,
+                finalize: { try await store.finalize(request, now: now) },
+                now: now
+            )
         } catch { try? await store.fail(id: request.authorizationID, now: now); throw error }
     }
 }
