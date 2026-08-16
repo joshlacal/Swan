@@ -40,6 +40,14 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
         }
     }
 
+    public func declares(_ method: String) -> Bool {
+        declarations[method] != nil
+    }
+
+    public func requiredScopes(for method: String) -> Set<String>? {
+        declarations[method]
+    }
+
     public static func isCanonicalMethod(_ method: String) -> Bool {
         guard method.utf8.count <= 512 else { return false }
         let parts = method.split(separator: ".", omittingEmptySubsequences: false)
