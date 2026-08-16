@@ -132,11 +132,31 @@ extension SQLiteControlDatabase: SwanAtomicDidWebClaimStore, SwanAtomicIdentityC
                     _ = try await connection.query("INSERT INTO identity_binding_history(account_did, replaced_at, identity_did, document_digest, claim_receipt_digest, reserved_key_id) VALUES (?, ?, ?, ?, ?, ?)", [.text(history.accountDID), .integer(timestamp(history.replacedAt)), .text(history.identityDID), history.documentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null, history.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null, history.reservedKeyID.map(SQLiteData.text) ?? .null])
                 }
                 let binding = request.identityBinding
-                _ = try await connection.query("""
-                    INSERT INTO identity_bindings(account_did, identity_did, method, handle, document_digest, claim_receipt_digest, reserved_key_id, last_validated_at, grace_expires_at, state)
-                    VALUES (?, ?, 'did-web', ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(account_did) DO UPDATE SET identity_did = excluded.identity_did, method = excluded.method, handle = excluded.handle, document_digest = excluded.document_digest, claim_receipt_digest = excluded.claim_receipt_digest, reserved_key_id = excluded.reserved_key_id, last_validated_at = excluded.last_validated_at, grace_expires_at = excluded.grace_expires_at, state = excluded.state
-                    """, [.text(binding.accountDID), .text(binding.identityDID), .text(binding.handle), .blob(ByteBuffer(data: binding.documentDigest!)), .blob(ByteBuffer(data: binding.claimReceiptDigest!)), .text(binding.reservedKeyID!), .integer(timestamp(now)), .integer(timestamp(now.addingTimeInterval(gracePeriod))), .text(binding.state.rawValue)])
+                // The shared `identity_bindings_account_capacity` trigger
+                // aborts any INSERT for an account that already holds a
+                // binding row, including the INSERT path of an upsert. A
+                // replacement must therefore UPDATE the existing row first
+                // (the trigger guards only INSERTs) and INSERT only when no
+                // row exists yet. Both paths stay inside this one
+                // BEGIN IMMEDIATE transaction with the nonce consumption.
+                let updated = try await connection.query("""
+                    UPDATE identity_bindings SET identity_did = ?, method = 'did-web', handle = ?,
+                        document_digest = ?, claim_receipt_digest = ?, reserved_key_id = ?,
+                        last_validated_at = ?, grace_expires_at = ?, state = ?
+                    WHERE account_did = ?
+                    RETURNING account_did
+                    """, [.text(binding.identityDID), .text(binding.handle),
+                          .blob(ByteBuffer(data: binding.documentDigest!)),
+                          .blob(ByteBuffer(data: binding.claimReceiptDigest!)),
+                          .text(binding.reservedKeyID!), .integer(timestamp(now)),
+                          .integer(timestamp(now.addingTimeInterval(gracePeriod))),
+                          .text(binding.state.rawValue), .text(binding.accountDID)])
+                if updated.count == 0 {
+                    _ = try await connection.query("""
+                        INSERT INTO identity_bindings(account_did, identity_did, method, handle, document_digest, claim_receipt_digest, reserved_key_id, last_validated_at, grace_expires_at, state)
+                        VALUES (?, ?, 'did-web', ?, ?, ?, ?, ?, ?, ?)
+                        """, [.text(binding.accountDID), .text(binding.identityDID), .text(binding.handle), .blob(ByteBuffer(data: binding.documentDigest!)), .blob(ByteBuffer(data: binding.claimReceiptDigest!)), .text(binding.reservedKeyID!), .integer(timestamp(now)), .integer(timestamp(now.addingTimeInterval(gracePeriod))), .text(binding.state.rawValue)])
+                }
                 let committed = try await connection.query("UPDATE did_web_claim_transactions SET state = 'committed' WHERE request_id = ? AND state = 'committing' RETURNING request_id", [.text(request.requestID)])
                 guard committed.count == 1 else { throw SwanError.conflict(expected: 0, actual: 1) }
                 return reservationFinalized
@@ -165,7 +185,8 @@ extension SQLiteControlDatabase: SwanAtomicDidWebClaimStore, SwanAtomicIdentityC
                     document_digest = ?, claim_receipt_digest = ?, reserved_key_id = ?,
                     last_validated_at = ?, grace_expires_at = ?, state = ?
                 WHERE account_did = ?
-                """, [.text(binding.identityDID), .text(binding.method.rawValue), .text(binding.handle),
+                RETURNING account_did
+                """, [.text(binding.identityDID), .text(methodName(binding.method)), .text(binding.handle),
                       binding.documentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
                       binding.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
                       binding.reservedKeyID.map(SQLiteData.text) ?? .null,
@@ -187,13 +208,13 @@ extension SQLiteControlDatabase: SwanAtomicDidWebClaimStore, SwanAtomicIdentityC
                   AND document_digest IS ? AND claim_receipt_digest IS ?
                   AND reserved_key_id IS ? AND state = ?
                 RETURNING account_did
-                """, [.text(replacement.identityDID), .text(replacement.method.rawValue), .text(replacement.handle),
+                """, [.text(replacement.identityDID), .text(methodName(replacement.method)), .text(replacement.handle),
                       replacement.documentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
                       replacement.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
                       replacement.reservedKeyID.map(SQLiteData.text) ?? .null, .text(replacement.state.rawValue),
                       replacement.lastValidatedAt.map { .integer(timestamp($0)) } ?? .null,
                       replacement.graceExpiresAt.map { .integer(timestamp($0)) } ?? .null,
-                      .text(expected.accountDID), .text(expected.identityDID), .text(expected.method.rawValue),
+                      .text(expected.accountDID), .text(expected.identityDID), .text(methodName(expected.method)),
                       .text(expected.handle), expected.documentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
                       expected.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
                       expected.reservedKeyID.map(SQLiteData.text) ?? .null, .text(expected.state.rawValue)])
@@ -223,16 +244,16 @@ extension SQLiteControlDatabase: SwanAtomicDidWebClaimStore, SwanAtomicIdentityC
                       AND document_digest IS ? AND claim_receipt_digest IS ?
                       AND reserved_key_id IS ? AND state = ?
                     RETURNING account_did
-                    """, [.text(replacement.identityDID), .text(replacement.method.rawValue), .text(replacement.handle),
-                          replacement.documentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
-                          replacement.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
-                          replacement.reservedKeyID.map(SQLiteData.text) ?? .null, .text(replacement.state.rawValue),
-                          replacement.lastValidatedAt.map { .integer(timestamp($0)) } ?? .null,
-                          replacement.graceExpiresAt.map { .integer(timestamp($0)) } ?? .null,
-                          .text(expected.accountDID), .text(expected.identityDID), .text(expected.method.rawValue),
-                          .text(expected.handle), expected.documentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
-                          expected.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
-                          expected.reservedKeyID.map(SQLiteData.text) ?? .null, .text(expected.state.rawValue)])
+                    """, [.text(replacement.identityDID), .text(methodName(replacement.method)), .text(replacement.handle),
+                      replacement.documentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
+                      replacement.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
+                      replacement.reservedKeyID.map(SQLiteData.text) ?? .null, .text(replacement.state.rawValue),
+                      replacement.lastValidatedAt.map { .integer(timestamp($0)) } ?? .null,
+                      replacement.graceExpiresAt.map { .integer(timestamp($0)) } ?? .null,
+                      .text(expected.accountDID), .text(expected.identityDID), .text(methodName(expected.method)),
+                      .text(expected.handle), expected.documentDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
+                      expected.claimReceiptDigest.map { .blob(ByteBuffer(data: $0)) } ?? .null,
+                      expected.reservedKeyID.map(SQLiteData.text) ?? .null, .text(expected.state.rawValue)])
                 guard result.count == 1 else { throw SwanError.conflict(expected: 0, actual: 1) }
                 return replacement
             }
@@ -276,6 +297,24 @@ extension SQLiteControlDatabase: SwanAtomicDidWebClaimStore, SwanAtomicIdentityC
         guard rows.count == 1 else { throw SwanError.unauthorized("invalid or replayed identity step-up receipt") }
     }
 
+    /// The schema stores the method as `'did-web'` while the storage-neutral
+    /// enum raw value is `didWeb`. Keep the mapping in one place so decode and
+    /// every write agree with the CHECK constraint.
+    private func methodName(_ method: IdentityMethod) -> String {
+        switch method {
+        case .plc: return "plc"
+        case .didWeb: return "did-web"
+        }
+    }
+
+    private func method(from name: String) -> IdentityMethod? {
+        switch name {
+        case "plc": return .plc
+        case "did-web": return .didWeb
+        default: return nil
+        }
+    }
+
     private func timestamp(_ value: Date) -> Int { Int((value.timeIntervalSince1970 * 1_000_000).rounded(.down)) }
 
     private func decodeClaim(_ row: SQLiteRow) throws -> DidWebClaimTransaction {
@@ -286,7 +325,7 @@ extension SQLiteControlDatabase: SwanAtomicDidWebClaimStore, SwanAtomicIdentityC
 
     private func decodeIdentityBinding(_ row: SQLiteRow) throws -> IdentityBinding {
         func data(_ name: String) -> Data? { row.column(name)?.blob.map { Data(buffer: $0) } }
-        guard let account = row.column("account_did")?.string, let identity = row.column("identity_did")?.string, let method = row.column("method")?.string.flatMap(IdentityMethod.init(rawValue:)), let handle = row.column("handle")?.string, let state = row.column("state")?.string.flatMap(IdentityBindingState.init(rawValue:)) else { throw AccountControlStoreError.malformedRecord }
+        guard let account = row.column("account_did")?.string, let identity = row.column("identity_did")?.string, let method = row.column("method")?.string.flatMap(method(from:)), let handle = row.column("handle")?.string, let state = row.column("state")?.string.flatMap(IdentityBindingState.init(rawValue:)) else { throw AccountControlStoreError.malformedRecord }
         let date: (String) -> Date? = { name in row.column(name)?.integer.map { Date(timeIntervalSince1970: Double($0) / 1_000_000) } }
         return try IdentityBinding(accountDID: account, identityDID: identity, method: method, handle: handle, documentDigest: data("document_digest"), claimReceiptDigest: data("claim_receipt_digest"), reservedKeyID: row.column("reserved_key_id")?.string, lastValidatedAt: date("last_validated_at"), graceExpiresAt: date("grace_expires_at"), state: state)
     }

@@ -102,6 +102,11 @@ public struct SwanDurableSigningKeyReservationAdapter: SwanContextualSigningKeyR
         guard let row = try await store.loadDidWebSigningReservation(requestID: requestID), !row.claimBytes.isEmpty else { return nil }
         return try claim(row)
     }
+    public func issuedReservation(nonce: Data) async throws -> SwanDidWebClaimReservation? {
+        guard let row = try await store.loadDidWebSigningReservation(nonce: nonce),
+              row.state == .issued, !row.claimBytes.isEmpty else { return nil }
+        return try claim(row)
+    }
     public func committedReservation(accountDID: String) async throws -> SwanDidWebClaimReservation? {
         guard let row = try await store.committedDidWebSigningReservation(accountDID: accountDID) else { return nil }
         return try claim(row)
@@ -133,6 +138,7 @@ public struct SwanDurableSigningKeyReservationAdapter: SwanContextualSigningKeyR
 /// source-compatible with existing callers and test doubles.
 public protocol SwanDurableSigningKeyReservationService: SwanSigningKeyReservationService {
     func issuedReservation(requestID: String) async throws -> SwanDidWebClaimReservation?
+    func issuedReservation(nonce: Data) async throws -> SwanDidWebClaimReservation?
     func committedReservation(accountDID: String) async throws -> SwanDidWebClaimReservation?
     func recordIssuedReservation(_ reservation: SwanDidWebClaimReservation) async throws
     func markReservationCommitted(requestID: String) async throws
@@ -236,6 +242,12 @@ public actor InMemorySwanSigningKeyReservationService: SwanDurableSigningKeyRese
 
     public func issuedReservation(requestID: String) async throws -> SwanDidWebClaimReservation? {
         guard let value = reservations[requestID], value.2 != .released else { return nil }
+        return value.3
+    }
+
+    public func issuedReservation(nonce: Data) async throws -> SwanDidWebClaimReservation? {
+        guard let value = reservations.values.first(where: { $0.1 == nonce }),
+              value.2 == .issued else { return nil }
         return value.3
     }
 

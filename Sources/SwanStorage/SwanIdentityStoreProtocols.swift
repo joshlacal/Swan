@@ -54,6 +54,7 @@ public protocol SwanDidWebReservationStore: Sendable {
                                  publicURL: String, signingKey: SwanSigningKeyMaterial) async throws -> SwanPersistedDidWebReservation
     func persistDidWebSigningReservation(_ reservation: SwanPersistedDidWebReservation) async throws
     func loadDidWebSigningReservation(requestID: String) async throws -> SwanPersistedDidWebReservation?
+    func loadDidWebSigningReservation(nonce: Data) async throws -> SwanPersistedDidWebReservation?
     func markDidWebSigningReservationCommitted(requestID: String) async throws
     func releaseDidWebSigningReservation(requestID: String) async throws
     func repairDidWebSigningReservation(requestID: String) async throws
@@ -73,6 +74,17 @@ public protocol SwanIdentityStepUpReceiptStore: Sendable {
                                       operation: String, mfaStrength: String,
                                       verifiedAt: Date, expiresAt: Date,
                                       receiptDigest: Data, now: Date) async throws
+}
+
+/// Read-only receipt verification for the replacement-authorization
+/// pre-check. The atomic identity store remains the authoritative consumer;
+/// this capability only fast-fails mutations whose receipt row is absent,
+/// expired, or already consumed, so a stale or replayed step-up never reaches
+/// the durable CAS.
+public protocol SwanIdentityStepUpReceiptVerifying: Sendable {
+    func verifyIdentityStepUpReceipt(sessionID: String, accountDID: String,
+                                     mfaStrength: String, receiptDigest: Data,
+                                     now: Date) async throws -> Bool
 }
 
 /// A receipt presented with an identity mutation. Implementations must consume

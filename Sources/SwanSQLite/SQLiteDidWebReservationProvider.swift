@@ -33,7 +33,7 @@ public enum SQLiteDidWebReservationMigration {
     """
 }
 
-extension SQLiteControlDatabase: SwanDidWebReservationStore, SwanIdentityReservedMaterialStore, SwanIdentityStepUpReceiptStore {
+extension SQLiteControlDatabase: SwanDidWebReservationStore, SwanIdentityReservedMaterialStore, SwanIdentityStepUpReceiptStore, SwanIdentityStepUpReceiptVerifying {
     public func reserveDidWebSigningKey(requestID: String, accountDID: String?, targetDID: String,
                                         handle: String, expiresAt: Date, pdsURL: String,
                                         publicURL: String, signingKey: SwanSigningKeyMaterial) async throws -> SwanPersistedDidWebReservation {
@@ -90,6 +90,14 @@ extension SQLiteControlDatabase: SwanDidWebReservationStore, SwanIdentityReserve
         }
     }
 
+    public func loadDidWebSigningReservation(nonce: Data) async throws -> SwanPersistedDidWebReservation? {
+        guard nonce.count == 32 else { throw AccountControlStoreError.invalidInput }
+        return try await withConnectionGate {
+            let rows = try await connection.query("SELECT * FROM did_web_signing_key_reservations WHERE nonce = ?", [.blob(ByteBuffer(data: nonce))])
+            return try rows.first.map(decodeReservation)
+        }
+    }
+
     public func markDidWebSigningReservationCommitted(requestID: String) async throws { try await updateReservationState(requestID, state: .committed, allowCommitted: true) }
     public func repairDidWebSigningReservation(requestID: String) async throws { try await updateReservationState(requestID, state: .committed, allowCommitted: true) }
     public func releaseDidWebSigningReservation(requestID: String) async throws { try await updateReservationState(requestID, state: .released, allowCommitted: false) }
@@ -135,6 +143,25 @@ extension SQLiteControlDatabase: SwanDidWebReservationStore, SwanIdentityReserve
                           .integer(timestamp(verifiedAt)), .integer(timestamp(now))])
                 guard rows.count == 1 else { throw AccountControlStoreError.malformedRecord }
             }
+        }
+    }
+
+    public func verifyIdentityStepUpReceipt(sessionID: String, accountDID: String,
+                                            mfaStrength: String, receiptDigest: Data,
+                                            now: Date) async throws -> Bool {
+        guard receiptDigest.count == 32, !sessionID.isEmpty, !accountDID.isEmpty else {
+            throw AccountControlStoreError.invalidInput
+        }
+        return try await withConnectionGate {
+            let rows = try await connection.query("""
+                SELECT 1 FROM did_web_step_up_receipts
+                WHERE receipt_digest=? AND session_id=? AND account_did=?
+                  AND mfa_strength=? AND verified_at<=? AND expires_at>?
+                  AND consumed_at IS NULL
+                LIMIT 1
+                """, [.blob(ByteBuffer(data: receiptDigest)), .text(sessionID), .text(accountDID),
+                      .text(mfaStrength), .integer(timestamp(now)), .integer(timestamp(now))])
+            return rows.count == 1
         }
     }
 
