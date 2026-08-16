@@ -509,18 +509,19 @@ extension SQLiteControlDatabase {
             """
             SELECT 1 FROM identity_bindings
             WHERE method = 'did-web'
-              AND (document_digest IS NULL OR claim_receipt_digest IS NULL OR reserved_key_id IS NULL)
+              AND (document_digest IS NULL OR claim_receipt_digest IS NULL OR reserved_key_id IS NULL OR length(reserved_key_id) = 0)
             UNION ALL
             SELECT 1 FROM identity_bindings
             WHERE method = 'plc'
               AND (document_digest IS NOT NULL OR claim_receipt_digest IS NOT NULL OR reserved_key_id IS NOT NULL)
             UNION ALL
             SELECT 1 FROM legacy_session_families
-            WHERE reuse_detected_at IS NOT NULL AND revoked_at IS NULL
+            WHERE reuse_detected_at IS NOT NULL
+              AND (revoked_at IS NULL OR revoked_at < reuse_detected_at)
             UNION ALL
             SELECT 1 FROM legacy_sessions
             WHERE (replaced_by_digest IS NOT NULL AND rotated_at IS NULL)
-               OR (reuse_detected_at IS NOT NULL AND revoked_at IS NULL)
+               OR (reuse_detected_at IS NOT NULL AND (revoked_at IS NULL OR revoked_at < reuse_detected_at))
             LIMIT 1
             """
         )
@@ -531,7 +532,7 @@ extension SQLiteControlDatabase {
             CREATE TRIGGER IF NOT EXISTS identity_bindings_method_material_v7_insert
             BEFORE INSERT ON identity_bindings
             WHEN NEW.method = 'did-web'
-             AND (NEW.document_digest IS NULL OR NEW.claim_receipt_digest IS NULL OR NEW.reserved_key_id IS NULL)
+             AND (NEW.document_digest IS NULL OR NEW.claim_receipt_digest IS NULL OR NEW.reserved_key_id IS NULL OR length(NEW.reserved_key_id) = 0)
             BEGIN SELECT RAISE(ABORT, 'did:web binding material is required'); END
             """,
             """
@@ -545,7 +546,7 @@ extension SQLiteControlDatabase {
             CREATE TRIGGER IF NOT EXISTS identity_bindings_method_material_v7_update
             BEFORE UPDATE OF method, document_digest, claim_receipt_digest, reserved_key_id ON identity_bindings
             WHEN NEW.method = 'did-web'
-             AND (NEW.document_digest IS NULL OR NEW.claim_receipt_digest IS NULL OR NEW.reserved_key_id IS NULL)
+             AND (NEW.document_digest IS NULL OR NEW.claim_receipt_digest IS NULL OR NEW.reserved_key_id IS NULL OR length(NEW.reserved_key_id) = 0)
             BEGIN SELECT RAISE(ABORT, 'did:web binding material is required'); END
             """,
             """
@@ -692,30 +693,46 @@ extension SQLiteControlDatabase {
             """
             CREATE TRIGGER IF NOT EXISTS legacy_family_reuse_requires_revoke_v7
             BEFORE INSERT ON legacy_session_families
-            WHEN NEW.reuse_detected_at IS NOT NULL AND NEW.revoked_at IS NULL
+            WHEN NEW.reuse_detected_at IS NOT NULL
+             AND (NEW.revoked_at IS NULL OR NEW.revoked_at < NEW.reuse_detected_at)
             BEGIN SELECT RAISE(ABORT, 'legacy family reuse requires revocation'); END
             """,
             """
             CREATE TRIGGER IF NOT EXISTS legacy_family_reuse_requires_revoke_update_v7
             BEFORE UPDATE OF reuse_detected_at, revoked_at ON legacy_session_families
-            WHEN NEW.reuse_detected_at IS NOT NULL AND NEW.revoked_at IS NULL
+            WHEN NEW.reuse_detected_at IS NOT NULL
+             AND (NEW.revoked_at IS NULL OR NEW.revoked_at < NEW.reuse_detected_at)
             BEGIN SELECT RAISE(ABORT, 'legacy family reuse requires revocation'); END
             """,
             """
             CREATE TRIGGER IF NOT EXISTS legacy_session_lineage_consistency_v7
             BEFORE INSERT ON legacy_sessions
             WHEN (NEW.replaced_by_digest IS NOT NULL AND NEW.rotated_at IS NULL)
-               OR (NEW.reuse_detected_at IS NOT NULL AND NEW.revoked_at IS NULL)
+               OR (NEW.reuse_detected_at IS NOT NULL AND (NEW.revoked_at IS NULL OR NEW.revoked_at < NEW.reuse_detected_at))
             BEGIN SELECT RAISE(ABORT, 'legacy session lineage is inconsistent'); END
             """,
             """
             CREATE TRIGGER IF NOT EXISTS legacy_session_lineage_consistency_update_v7
             BEFORE UPDATE OF replaced_by_digest, rotated_at, reuse_detected_at, revoked_at ON legacy_sessions
             WHEN (NEW.replaced_by_digest IS NOT NULL AND NEW.rotated_at IS NULL)
-               OR (NEW.reuse_detected_at IS NOT NULL AND NEW.revoked_at IS NULL)
+               OR (NEW.reuse_detected_at IS NOT NULL AND (NEW.revoked_at IS NULL OR NEW.revoked_at < NEW.reuse_detected_at))
             BEGIN SELECT RAISE(ABORT, 'legacy session lineage is inconsistent'); END
             """,
         ]
+        // Old schemas did not necessarily declare the WebAuthn credential
+        // cascade. This trigger is harmless alongside the fresh composite FK
+        // cascade and makes the upgraded behavior identical.
+        _ = try await connection.query(
+            """
+            CREATE TRIGGER IF NOT EXISTS webauthn_credentials_delete_challenges_v7
+            AFTER DELETE ON webauthn_credentials
+            BEGIN
+                DELETE FROM webauthn_challenges
+                WHERE credential_id_digest = OLD.credential_id_digest
+                  AND account_did = OLD.account_did;
+            END
+            """
+        )
         for trigger in triggers { _ = try await connection.query(trigger) }
         _ = try await connection.query(
             "INSERT INTO control_schema_migrations(version, applied_at) VALUES (7, unixepoch())"

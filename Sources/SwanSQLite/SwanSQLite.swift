@@ -119,7 +119,7 @@ public enum SQLiteLayout {
             grace_expires_at INTEGER,
             state TEXT NOT NULL CHECK(state IN ('active', 'suspended', 'released')),
             CHECK(method = 'did-web' OR (document_digest IS NULL AND claim_receipt_digest IS NULL AND reserved_key_id IS NULL)),
-            CHECK(method = 'plc' OR (document_digest IS NOT NULL AND claim_receipt_digest IS NOT NULL AND reserved_key_id IS NOT NULL))
+            CHECK(method = 'plc' OR (document_digest IS NOT NULL AND claim_receipt_digest IS NOT NULL AND length(reserved_key_id) > 0))
         )
         """,
         """
@@ -198,7 +198,7 @@ public enum SQLiteLayout {
             expires_at INTEGER NOT NULL CHECK(expires_at >= created_at),
             revoked_at INTEGER,
             reuse_detected_at INTEGER,
-            CHECK(reuse_detected_at IS NULL OR revoked_at IS NOT NULL),
+            CHECK(reuse_detected_at IS NULL OR (revoked_at IS NOT NULL AND revoked_at >= reuse_detected_at)),
             UNIQUE(family_id, account_did),
             FOREIGN KEY(app_password_id, account_did) REFERENCES app_passwords(app_password_id, account_did) ON DELETE CASCADE
         )
@@ -218,7 +218,7 @@ public enum SQLiteLayout {
             previous_session_digest BLOB CHECK(previous_session_digest IS NULL OR length(previous_session_digest) = 32),
             reuse_detected_at INTEGER,
             CHECK(replaced_by_digest IS NULL OR rotated_at IS NOT NULL),
-            CHECK(reuse_detected_at IS NULL OR revoked_at IS NOT NULL),
+            CHECK(reuse_detected_at IS NULL OR (revoked_at IS NOT NULL AND revoked_at >= reuse_detected_at)),
             FOREIGN KEY(family_id, account_did) REFERENCES legacy_session_families(family_id, account_did),
             FOREIGN KEY(app_password_id, account_did) REFERENCES app_passwords(app_password_id, account_did)
         )

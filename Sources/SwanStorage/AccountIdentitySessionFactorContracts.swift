@@ -321,7 +321,7 @@ public struct LegacySessionFamilyMetadata: Codable, Sendable, Equatable {
         guard !familyID.isEmpty, expiresAt >= createdAt,
               revokedAt.map({ $0 >= createdAt }) ?? true,
               reuseDetectedAt.map({ $0 >= createdAt }) ?? true,
-              reuseDetectedAt == nil || revokedAt != nil else {
+              reuseDetectedAt.map({ detectedAt in revokedAt.map({ $0 >= detectedAt }) ?? false }) ?? true else {
             throw SwanError.invalidIdentifier("legacy session family metadata")
         }
         self.familyID = familyID
@@ -365,7 +365,7 @@ public struct LegacySessionMetadata: Codable, Sendable, Equatable {
               rotatedAt.map({ $0 >= issuedAt }) ?? true,
               reuseDetectedAt.map({ $0 >= issuedAt }) ?? true,
               replacedByDigest == nil || rotatedAt != nil,
-              reuseDetectedAt == nil || revokedAt != nil else {
+              reuseDetectedAt.map({ detectedAt in revokedAt.map({ $0 >= detectedAt }) ?? false }) ?? true else {
             throw SwanError.invalidIdentifier("legacy session metadata")
         }
         self.sessionID = sessionID
@@ -769,9 +769,36 @@ public protocol WebAuthnCredentialStore: Sendable {
     func disableWebAuthnCredential(credentialIDDigest: Data, accountDID: String, now: Date) async throws
 }
 
-public enum LegacySessionRotationOutcome: Sendable, Equatable {
-    case rotated(sessionID: LegacySessionID)
-    case reuseDetectedAndFamilyRevoked(familyID: String, detectedAt: Date, revokedAt: Date)
+public struct LegacySessionRotationOutcome: Sendable, Equatable {
+    public enum Kind: Sendable, Equatable {
+        case rotated
+        case reuseDetectedAndFamilyRevoked
+    }
+
+    public let kind: Kind
+    public let sessionID: LegacySessionID?
+    public let familyID: String?
+    public let detectedAt: Date?
+    public let revokedAt: Date?
+
+    private init(kind: Kind, sessionID: LegacySessionID?, familyID: String?, detectedAt: Date?, revokedAt: Date?) {
+        self.kind = kind
+        self.sessionID = sessionID
+        self.familyID = familyID
+        self.detectedAt = detectedAt
+        self.revokedAt = revokedAt
+    }
+
+    public static func rotated(sessionID: LegacySessionID) -> Self {
+        Self(kind: .rotated, sessionID: sessionID, familyID: nil, detectedAt: nil, revokedAt: nil)
+    }
+
+    public static func reuseDetectedAndFamilyRevoked(familyID: String, detectedAt: Date, revokedAt: Date) throws -> Self {
+        guard !familyID.isEmpty, revokedAt >= detectedAt else {
+            throw SwanError.invalidIdentifier("legacy reuse revocation ordering")
+        }
+        return Self(kind: .reuseDetectedAndFamilyRevoked, sessionID: nil, familyID: familyID, detectedAt: detectedAt, revokedAt: revokedAt)
+    }
 }
 
 public struct LegacySessionRotationRequest: Sendable, Equatable {

@@ -48,7 +48,9 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         XCTAssertThrowsError(try decoder.decode(SignupAuthorization.self, from: Data(#"{"id":"signup-1","requestID":"r","policy":"closed","handle":"a","clientIPBucketDigest":"AQI=","state":"issued","issuedAt":1,"expiresAt":2}"#.utf8)))
         XCTAssertThrowsError(try decoder.decode(SignupInvite.self, from: Data(#"{"digest":"AQI=","issuedAt":1}"#.utf8)))
         XCTAssertThrowsError(try decoder.decode(LegacySessionFamilyMetadata.self, from: Data(#"{"familyID":"f","accountDID":"did:plc:a","createdAt":2,"expiresAt":1}"#.utf8)))
+        XCTAssertThrowsError(try decoder.decode(LegacySessionFamilyMetadata.self, from: Data(#"{"familyID":"f","accountDID":"did:plc:a","createdAt":1,"expiresAt":10,"revokedAt":4,"reuseDetectedAt":6}"#.utf8)))
         XCTAssertThrowsError(try decoder.decode(LegacySessionMetadata.self, from: Data(#"{"sessionID":"legacy-1","familyID":"f","accountDID":"did:plc:a","scopeStrings":[],"issuedAt":1,"expiresAt":2,"replacedByDigest":"AQI="}"#.utf8)))
+        XCTAssertThrowsError(try decoder.decode(LegacySessionMetadata.self, from: Data(#"{"sessionID":"legacy-1","familyID":"f","accountDID":"did:plc:a","scopeStrings":[],"issuedAt":1,"expiresAt":10,"revokedAt":4,"reuseDetectedAt":6}"#.utf8)))
         XCTAssertThrowsError(try decoder.decode(ManagementSessionMetadata.self, from: Data(#"{"sessionID":"management-1","accountDID":"did:plc:a","issuedAt":2,"idleExpiresAt":1,"absoluteExpiresAt":3,"strength":{"kind":"password"}}"#.utf8)))
         XCTAssertThrowsError(try decoder.decode(IdentityBinding.self, from: Data(#"{"accountDID":"did:plc:a","identityDID":"did:web:example.com","method":"didWeb","handle":"a","state":"active"}"#.utf8)))
     }
@@ -176,18 +178,31 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         XCTAssertEqual(old.familyID, family.familyID)
         let detectedAt = Date(timeIntervalSince1970: 5)
         let revokedAt = Date(timeIntervalSince1970: 6)
-        XCTAssertEqual(
-            LegacySessionRotationOutcome.reuseDetectedAndFamilyRevoked(
+        let outcome = try LegacySessionRotationOutcome.reuseDetectedAndFamilyRevoked(
                 familyID: family.familyID, detectedAt: detectedAt, revokedAt: revokedAt
-            ),
-            .reuseDetectedAndFamilyRevoked(
-                familyID: family.familyID, detectedAt: detectedAt, revokedAt: revokedAt
-            )
         )
+        XCTAssertEqual(outcome.kind, .reuseDetectedAndFamilyRevoked)
+        XCTAssertEqual(outcome.familyID, Optional(family.familyID))
+        XCTAssertEqual(outcome.detectedAt, Optional(detectedAt))
+        XCTAssertEqual(outcome.revokedAt, Optional(revokedAt))
         XCTAssertThrowsError(try LegacySessionFamilyMetadata(
             familyID: family.familyID, accountDID: accountA, appPasswordID: nil,
             createdAt: Date(timeIntervalSince1970: 1), expiresAt: Date(timeIntervalSince1970: 10),
             reuseDetectedAt: detectedAt
+        ))
+        XCTAssertThrowsError(try LegacySessionFamilyMetadata(
+            familyID: family.familyID, accountDID: accountA, appPasswordID: nil,
+            createdAt: Date(timeIntervalSince1970: 1), expiresAt: Date(timeIntervalSince1970: 10),
+            revokedAt: Date(timeIntervalSince1970: 4), reuseDetectedAt: detectedAt
+        ))
+        XCTAssertThrowsError(try LegacySessionMetadata(
+            sessionID: try LegacySessionID(rawValue: "legacy-reuse"), familyID: family.familyID,
+            accountDID: accountA, appPasswordID: nil, scopeStrings: [],
+            issuedAt: Date(timeIntervalSince1970: 1), expiresAt: Date(timeIntervalSince1970: 10),
+            revokedAt: Date(timeIntervalSince1970: 4), reuseDetectedAt: detectedAt
+        ))
+        XCTAssertThrowsError(try LegacySessionRotationOutcome.reuseDetectedAndFamilyRevoked(
+            familyID: family.familyID, detectedAt: detectedAt, revokedAt: Date(timeIntervalSince1970: 4)
         ))
     }
 
@@ -283,6 +298,10 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         try await database.connection.query("INSERT INTO accounts(did, handle, status, created_at) VALUES ('\(accountA)', 'alice.example', 'active', 1), ('\(accountB)', 'bob.example', 'active', 1)")
         try await database.connection.query("INSERT INTO identity_bindings(account_did, identity_did, method, handle, state) VALUES ('\(accountA)', '\(accountA)', 'plc', 'alice.example', 'active')")
         do {
+            try await database.connection.query("INSERT INTO identity_bindings(account_did, identity_did, method, handle, document_digest, claim_receipt_digest, reserved_key_id, state) VALUES ('\(accountB)', 'did:web:empty-key.example', 'did-web', 'empty.example', zeroblob(32), zeroblob(32), '', 'active')")
+            XCTFail("did:web reserved key ID must not be empty")
+        } catch { }
+        do {
             try await database.connection.query("UPDATE identity_bindings SET account_did = '\(accountB)' WHERE account_did = '\(accountA)'")
             XCTFail("account ownership must be immutable")
         } catch { }
@@ -308,8 +327,16 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         } catch { }
         try await database.connection.query("INSERT INTO legacy_session_families(family_id, account_did, app_password_id, created_at, expires_at) VALUES ('family-a', '\(accountA)', 'app-a', 1, 100)")
         do {
+            try await database.connection.query("INSERT INTO legacy_session_families(family_id, account_did, app_password_id, created_at, expires_at, revoked_at, reuse_detected_at) VALUES ('family-order', '\(accountA)', 'app-a', 1, 100, 5, 6)")
+            XCTFail("legacy family revocation cannot precede reuse detection")
+        } catch { }
+        do {
             try await database.connection.query("INSERT INTO legacy_sessions(session_digest, family_id, account_did, app_password_id, scope_strings, issued_at, expires_at) VALUES (randomblob(32), 'family-a', '\(accountB)', 'app-a', x'00', 1, 100)")
             XCTFail("legacy session must match family and app-password account")
+        } catch { }
+        do {
+            try await database.connection.query("INSERT INTO legacy_sessions(session_digest, family_id, account_did, app_password_id, scope_strings, issued_at, expires_at, revoked_at, reuse_detected_at) VALUES (randomblob(32), 'family-a', '\(accountA)', 'app-a', x'00', 1, 100, 5, 6)")
+            XCTFail("legacy session revocation cannot precede reuse detection")
         } catch { }
         try await database.connection.query("INSERT INTO authentication_factors(factor_id, account_did, kind, label, lookup_digest, created_at) VALUES ('factor-a', '\(accountA)', 'totp', 'a', zeroblob(32), 1), ('factor-b', '\(accountB)', 'totp', 'b', randomblob(32), 1)")
         do {
@@ -404,6 +431,9 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         try await initial.connection.query("CREATE TABLE webauthn_credentials (credential_id_digest BLOB PRIMARY KEY, account_did TEXT NOT NULL, factor_id TEXT NOT NULL, public_key_reference TEXT NOT NULL, sign_count INTEGER NOT NULL, transports BLOB NOT NULL, created_at INTEGER NOT NULL, last_used_at INTEGER, disabled_at INTEGER)")
         try await initial.connection.query("CREATE TABLE webauthn_challenges (challenge_digest BLOB PRIMARY KEY, account_did TEXT NOT NULL, credential_id_digest BLOB, relying_party_id TEXT NOT NULL, origin TEXT NOT NULL, issued_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, consumed_at INTEGER)")
         try await initial.connection.query("INSERT INTO identity_bindings(account_did, identity_did, method, handle, state) VALUES ('\(accountA)', '\(accountA)', 'plc', 'alice.example', 'active')")
+        try await initial.connection.query("INSERT INTO authentication_factors(factor_id, account_did, kind, label, lookup_digest, created_at) VALUES ('factor-old', '\(accountA)', 'passkey', 'old', zeroblob(32), 1)")
+        try await initial.connection.query("INSERT INTO webauthn_credentials(credential_id_digest, account_did, factor_id, public_key_reference, sign_count, transports, created_at) VALUES (x'0303030303030303030303030303030303030303030303030303030303030303', '\(accountA)', 'factor-old', 'old-key', 1, x'00', 1)")
+        try await initial.connection.query("INSERT INTO webauthn_challenges(challenge_digest, account_did, credential_id_digest, relying_party_id, origin, issued_at, expires_at) VALUES (x'0404040404040404040404040404040404040404040404040404040404040404', '\(accountA)', x'0303030303030303030303030303030303030303030303030303030303030303', 'example.com', 'https://example.com', 1, 100)")
         try await initial.connection.query("INSERT INTO did_web_claim_transactions(request_id, account_did, target_did, handle, claim_nonce_digest, state, expires_at) VALUES ('claim-old', '\(accountA)', 'did:web:example.com', 'alice.example', zeroblob(32), 'reserved', 100)")
         try await initial.connection.query("INSERT INTO app_passwords(app_password_id, account_did, canonical_name, scope_strings, secret_digest, created_at) VALUES ('app-old', '\(accountA)', 'primary', x'00', zeroblob(32), 1)")
         try await initial.connection.query("INSERT INTO legacy_session_families(family_id, account_did, app_password_id, created_at, expires_at) VALUES ('family-old', '\(accountA)', 'app-old', 1, 100)")
@@ -422,6 +452,21 @@ final class SwanAccountFoundationContractTests: XCTestCase {
         let sessionRows = try await upgraded.connection.query("SELECT COUNT(*) AS count FROM legacy_sessions WHERE family_id = 'family-old'")
         XCTAssertEqual(claimRows.first?.column("count")?.integer, 1)
         XCTAssertEqual(sessionRows.first?.column("count")?.integer, 1)
+        do {
+            try await upgraded.connection.query("UPDATE legacy_session_families SET revoked_at = 5, reuse_detected_at = 6 WHERE family_id = 'family-old'")
+            XCTFail("v7 must reject family revocation before reuse detection")
+        } catch { }
+        do {
+            try await upgraded.connection.query("UPDATE legacy_sessions SET revoked_at = 5, reuse_detected_at = 6 WHERE family_id = 'family-old'")
+            XCTFail("v7 must reject session revocation before reuse detection")
+        } catch { }
+        do {
+            try await upgraded.connection.query("INSERT INTO identity_bindings(account_did, identity_did, method, handle, document_digest, claim_receipt_digest, reserved_key_id, state) VALUES ('\(accountB)', 'did:web:empty-key.example', 'did-web', 'empty.example', zeroblob(32), zeroblob(32), '', 'active')")
+            XCTFail("v7 must reject empty did:web reserved key IDs")
+        } catch { }
+        try await upgraded.connection.query("DELETE FROM webauthn_credentials WHERE credential_id_digest = x'0303030303030303030303030303030303030303030303030303030303030303'")
+        let orphanedChallengeRows = try await upgraded.connection.query("SELECT COUNT(*) AS count FROM webauthn_challenges WHERE challenge_digest = x'0404040404040404040404040404040404040404040404040404040404040404'")
+        XCTAssertEqual(orphanedChallengeRows.first?.column("count")?.integer, 0)
         do {
             try await upgraded.connection.query("INSERT INTO legacy_session_families(family_id, account_did, app_password_id, created_at, expires_at) VALUES ('family-cross', '\(accountB)', 'app-old', 1, 100)")
             XCTFail("v7 must enforce family/app-password account ownership")
