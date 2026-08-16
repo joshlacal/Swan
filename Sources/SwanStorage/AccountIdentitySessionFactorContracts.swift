@@ -250,7 +250,8 @@ public struct DidWebClaimCommitRequest: Sendable, Equatable {
             documentDigest: documentDigest,
             claimReceiptDigest: claimReceiptDigest,
             reservedKeyID: reservedKeyID,
-            lastValidatedAt: now
+            lastValidatedAt: now,
+            graceExpiresAt: now.addingTimeInterval(86_400)
         )
     }
 }
