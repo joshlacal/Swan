@@ -7,12 +7,13 @@ import SwanStorage
 extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, RecoveryCodeStore, WebAuthnCredentialStore, WebAuthnChallengeStore, WebAuthnChallengeLookupStore, WebAuthnAtomicVerificationStore, WebAuthnEnrollmentStore, TOTPReplayStore, DurableFactorTokenStore, MFAAuditStore {
     public func listFactors(accountDID: String, now: Date) async throws -> [AuthenticationFactorMetadata] {
         return try await withConnectionGate {
-            let rows = try await connection.query("SELECT factor_id, account_did, kind, label, lookup_digest, created_at, last_used_at, disabled_at FROM authentication_factors WHERE account_did = ? AND disabled_at IS NULL ORDER BY created_at, factor_id", [.text(accountDID)])
+            let rows = try await connection.query("SELECT factor_id, account_did, kind, label, lookup_digest, created_at, last_used_at, disabled_at FROM authentication_factors WHERE account_did = ? AND created_at <= ? AND disabled_at IS NULL ORDER BY created_at, factor_id", [.text(accountDID), .integer(try! factorTimestamp(now))])
             return try rows.map(decodeFactor)
         }
     }
 
     public func saveFactor(_ factor: AuthenticationFactorMetadata, now: Date) async throws {
+        guard factor.createdAt <= now, factor.lastUsedAt.map({ $0 <= now }) ?? true, factor.disabledAt.map({ $0 <= now }) ?? true else { throw AccountControlStoreError.invalidInput }
         try await withConnectionGate {
             _ = try await connection.query("INSERT INTO authentication_factors(factor_id, account_did, kind, label, lookup_digest, created_at, last_used_at, disabled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [.text(factor.id), .text(factor.accountDID), .text(factor.kind.rawValue), .text(factor.label), factor.lookupDigest.sqliteData!, .integer(try! factorTimestamp(factor.createdAt)), optionalTimestamp(factor.lastUsedAt), optionalTimestamp(factor.disabledAt)])
         }
