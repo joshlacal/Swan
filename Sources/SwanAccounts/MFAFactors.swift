@@ -41,7 +41,7 @@ public protocol TOTPEnvelopeKeyStore: Sendable {
 
 public enum TOTPEnvelopeCrypto {
     public static func seal(secret: Data, factorID: String, keyReference: String, key: Data) throws -> TOTPSecretEnvelope {
-        guard key.count == 32, !secret.isEmpty else { throw MFAError.invalidEnvelope }
+        guard key.count == 32, !secret.isEmpty, secret.count <= 128, factorID.utf8.count <= 128, keyReference.utf8.count <= 256 else { throw MFAError.invalidEnvelope }
         let nonceData = randomBytes(count: 12)
         let sealed = try AES.GCM.seal(secret, using: SymmetricKey(data: key), nonce: AES.GCM.Nonce(data: nonceData), authenticating: Data(factorID.utf8))
         return try TOTPSecretEnvelope(factorID: factorID, keyReference: keyReference, nonce: nonceData, ciphertext: sealed.ciphertext, authenticationTag: sealed.tag)
@@ -56,6 +56,7 @@ public enum TOTPEnvelopeCrypto {
 
 public enum TOTPAuthenticator {
     public static func decodeBase32(_ value: String) throws -> Data {
+        guard value.utf8.count <= 512 else { throw MFAError.invalidCode }
         let normalized = value.replacingOccurrences(of: "=", with: "").replacingOccurrences(of: " ", with: "").uppercased()
         let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
         var output: [UInt8] = []; var buffer = 0; var bits = 0
@@ -180,7 +181,10 @@ public actor FactorTokenService {
             else if factor == .passkey { if case .stepUpMFA(base: .passwordPlusPasskey, verifiedAt: _) = strength { valid = true } else { valid = false } }
             else { valid = false }
         case .loginRecovery: valid = factor == .recoveryCode && strength == .emailRecovery
-        case .managementLogin, .oauthToken: valid = factor != .recoveryCode && (factor == .totp || factor == .passkey)
+        case .managementLogin, .oauthToken:
+            if factor == .totp { if case .stepUpMFA(base: .passwordPlusTOTP, verifiedAt: _) = strength { valid = true } else { valid = false } }
+            else if factor == .passkey { if case .stepUpMFA(base: .passwordPlusPasskey, verifiedAt: _) = strength { valid = true } else { valid = false } }
+            else { valid = false }
         }
         guard valid else { throw MFAError.stepUpRequired }
         let token = randomBytes(count: 32).base64URLEncodedString(); let digest = Data(SHA256.hash(data: Data(token.utf8)))
@@ -309,7 +313,7 @@ public struct WebAuthnVerifier: Sendable {
         guard constantTimeEqual(Data(assertion.authenticatorData.prefix(32)), Data(SHA256.hash(data: Data(expectedRelyingPartyID.utf8)))) else { throw MFAError.invalidRelyingParty }
         let flags = assertion.authenticatorData[32]; guard flags & 0x01 != 0, flags & 0x04 != 0 else { throw MFAError.invalidAuthenticatorData }
         let count = assertion.authenticatorData[33 ..< 37].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-        guard let key = try await keyStore.publicKey(reference: credential.publicKeyReference), let signature = try? P256WireSignature.decodeCanonical(assertion.signature), key.isValidSignature(signature, for: assertion.authenticatorData + Data(SHA256.hash(data: assertion.clientDataJSON))) else { throw MFAError.invalidSignature }
+        guard let key = try await keyStore.publicKey(reference: credential.publicKeyReference), let signature = try? decodeWebAuthnSignature(assertion.signature), key.isValidSignature(signature, for: assertion.authenticatorData + Data(SHA256.hash(data: assertion.clientDataJSON))) else { throw MFAError.invalidSignature }
         // A zero counter is explicitly supported by WebAuthn. There is no
         // monotonic signal to CAS in that mode, so the one-time challenge is
         // the replay boundary until an authenticator reports a positive count.
@@ -324,6 +328,18 @@ public struct WebAuthnVerifier: Sendable {
             return WebAuthnVerificationResult(accountDID: accountDID, newSignCount: newCount)
         case .rollbackDetected: throw MFAError.counterRollback
         }
+    }
+
+    private func decodeWebAuthnSignature(_ data: Data) throws -> P256.Signing.ECDSASignature {
+        if data.count == 64 { return try P256WireSignature.decodeMalleabilityTolerant(data) }
+        guard data.count >= 8 && data[0] == 0x30 else { throw MFAError.invalidSignature }
+        var i = 1
+        func length() throws -> Int { guard i < data.count else { throw MFAError.invalidSignature }; let b = data[i]; i += 1; guard b & 0x80 == 0 else { throw MFAError.invalidSignature }; return Int(b) }
+        func integer() throws -> Data { guard i < data.count && data[i] == 0x02 else { throw MFAError.invalidSignature }; i += 1; let n = try length(); guard n > 0, n <= 33, i + n <= data.count else { throw MFAError.invalidSignature }; let value = Data(data[i ..< i + n]); i += n; guard value[0] & 0x80 == 0, !(n > 1 && value[0] == 0 && value[1] & 0x80 == 0) else { throw MFAError.invalidSignature }; return value }
+        let total = try length(); guard total == data.count - i else { throw MFAError.invalidSignature }; let r = try integer(); let s = try integer(); guard i == data.count, r.count <= 33, s.count <= 33 else { throw MFAError.invalidSignature }
+        let rawR = r.count == 33 ? Data(r.dropFirst()) : Data(repeating: 0, count: 32 - r.count) + r
+        let rawS = s.count == 33 ? Data(s.dropFirst()) : Data(repeating: 0, count: 32 - s.count) + s
+        return try P256WireSignature.decodeMalleabilityTolerant(rawR + rawS)
     }
     private struct ClientData: Decodable { let type: String; let challenge: String; let origin: String; let crossOrigin: Bool
         enum CodingKeys: String, CodingKey { case type, challenge, origin, crossOrigin }
@@ -415,9 +431,10 @@ public struct WebAuthnEnrollmentService: Sendable {
     public init(store: any WebAuthnEnrollmentStore, factorStore: any AuthenticationFactorStore) { self.store = store; self.factorStore = factorStore }
     public func enroll(clientDataJSON: Data, authenticatorData: Data, challenge: Data, accountDID: String, factorID: String, publicKeyReference: String, transports: Set<String>, challengeRecord: WebAuthnChallenge, expectedOrigin: String, relyingPartyID: String, now: Date) async throws -> WebAuthnRegistrationResult {
         guard try await factorStore.listFactors(accountDID: accountDID, now: now).contains(where: { $0.id == factorID && $0.kind == .passkey && $0.disabledAt == nil }) else { throw MFAError.credentialNotFound }
-        let result = try WebAuthnRegistrationVerifier.verify(clientDataJSON: clientDataJSON, authenticatorData: authenticatorData, challenge: challenge, accountDID: accountDID, challengeRecord: challengeRecord, expectedOrigin: expectedOrigin, relyingPartyID: relyingPartyID, now: now)
+        guard let current = try await store.webAuthnChallenge(digest: challengeRecord.challengeDigest, accountDID: accountDID, now: now), current.purpose == .enrollment, current.credentialIDDigest == nil else { throw MFAError.invalidChallenge }
+        let result = try WebAuthnRegistrationVerifier.verify(clientDataJSON: clientDataJSON, authenticatorData: authenticatorData, challenge: challenge, accountDID: accountDID, challengeRecord: current, expectedOrigin: expectedOrigin, relyingPartyID: relyingPartyID, now: now)
         let credential = try WebAuthnCredentialMetadata(credentialIDDigest: result.credentialIDDigest, accountDID: accountDID, factorID: factorID, publicKeyReference: publicKeyReference, signCount: result.signCount, transports: transports, createdAt: now)
-        do { try await store.consumeEnrollmentChallengeAndSaveCredential(challengeDigest: challengeRecord.challengeDigest, accountDID: accountDID, credential: credential, now: now) } catch { throw MFAError.storageUnavailable }
+        do { try await store.consumeEnrollmentChallengeAndSaveCredential(challengeDigest: current.challengeDigest, accountDID: accountDID, credential: credential, now: now) } catch { throw MFAError.storageUnavailable }
         return result
     }
 }

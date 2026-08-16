@@ -7,13 +7,13 @@
   - AES-GCM TOTP envelopes with a key-reference-only external key-store boundary.
   - High-entropy recovery-code generation, digest-only replacement, and single-use consumption through the storage contract.
   - Short-lived, durable, revocable, single-purpose tokens bound to session/account/factor/authentication strength.
-  - WebAuthn ES256/P-256 registration and assertion checks: parsed attested COSE key, exact HTTPS origin/RP, client-data type/challenge/crossOrigin, RP hash, UP+UV, canonical signature, account/credential/purpose binding, one-time challenge and monotonic sign-count policy. Invalid assertions are validated before challenge consumption.
+  - WebAuthn ES256/P-256 registration and assertion checks: parsed attested COSE key, exact HTTPS origin/RP, client-data type/challenge/crossOrigin, RP hash, UP+UV, bounded strict DER (or fixed raw) ECDSA signature parsing without low-S enforcement, account/credential/purpose binding, one-time challenge and monotonic sign-count policy. Invalid assertions are validated before challenge consumption.
   - Freshness/MFA step-up policy and a bounded, durable, secret-redacting MFA audit seam.
 - `Sources/SwanStorage/Task7MFAStorageContracts.swift`
   - Durable replay, factor-token, WebAuthn challenge lookup, and audit-store contracts.
 - `Sources/SwanSQLite/AccountFactorStore.swift`
   - SQLite implementations for factor metadata, generic/WebAuthn challenges, TOTP envelopes/replay state, recovery digests, WebAuthn credential metadata, durable tokens/audit events, and atomic CAS/consume operations.
-  - WebAuthn assertion CAS plus challenge consumption is one transaction; enrollment challenge consumption plus credential insertion is one transaction and fails closed when the seam is unavailable. Missing/invalid challenge-purpose context is corruption, never an assertion default.
+  - WebAuthn assertion CAS plus challenge consumption is one transaction; enrollment reloads and validates the durable enrollment context, then consumes challenge plus inserts credential atomically. TOTP/recovery/WebAuthn atomic paths re-check active parent factor kind in SQL. Missing/invalid challenge-purpose context is corruption, never an assertion default.
 - `Tests/SwanAccountsTests/Task7MFATests.swift`
   - RFC vectors, drift/replay/concurrency, recovery single-use, token/policy, WebAuthn registration/assertion negative cases, and SQLite durable round-trip/CAS coverage.
 
