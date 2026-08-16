@@ -174,7 +174,7 @@ private actor InMemoryRecoveryCodeStore: RecoveryCodeStore {
 private actor InMemoryFactorStore: AuthenticationFactorStore {
     private var factors: [AuthenticationFactorMetadata]
     init(factors: [AuthenticationFactorMetadata]) { self.factors = factors }
-    func listFactors(accountDID: String, now: Date) async throws -> [AuthenticationFactorMetadata] { factors.filter { $0.accountDID == accountDID && ($0.disabledAt == nil || $0.disabledAt! > now) } }
+    func listFactors(accountDID: String, now: Date) async throws -> [AuthenticationFactorMetadata] { factors.filter { $0.accountDID == accountDID && $0.disabledAt == nil } }
     func saveFactor(_ factor: AuthenticationFactorMetadata, now: Date) async throws { factors.append(factor) }
     func disableFactor(id: String, accountDID: String, now: Date) async throws { factors = try factors.map { value in guard value.id == id && value.accountDID == accountDID else { return value }; return try AuthenticationFactorMetadata(id: value.id, accountDID: value.accountDID, kind: value.kind, label: value.label, lookupDigest: value.lookupDigest, createdAt: value.createdAt, lastUsedAt: value.lastUsedAt, disabledAt: now) } }
     func reserveChallenge(_ challenge: FactorChallenge, now: Date) async throws {}

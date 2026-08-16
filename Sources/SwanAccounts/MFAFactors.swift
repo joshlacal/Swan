@@ -48,7 +48,7 @@ public enum TOTPEnvelopeCrypto {
     }
 
     public static func open(_ envelope: TOTPSecretEnvelope, key: Data) throws -> Data {
-        guard key.count == 32 else { throw MFAError.invalidEnvelope }
+        guard key.count == 32, envelope.ciphertext.count <= 4096, envelope.nonce.count == 12, envelope.authenticationTag.count == 16 else { throw MFAError.invalidEnvelope }
         let box = try AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: envelope.nonce), ciphertext: envelope.ciphertext, tag: envelope.authenticationTag)
         return try AES.GCM.open(box, using: SymmetricKey(data: key), authenticating: Data(envelope.factorID.utf8))
     }

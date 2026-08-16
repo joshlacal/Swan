@@ -7,7 +7,7 @@ import SwanStorage
 extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, RecoveryCodeStore, WebAuthnCredentialStore, WebAuthnChallengeStore, WebAuthnChallengeLookupStore, WebAuthnAtomicVerificationStore, WebAuthnEnrollmentStore, TOTPReplayStore, DurableFactorTokenStore, MFAAuditStore {
     public func listFactors(accountDID: String, now: Date) async throws -> [AuthenticationFactorMetadata] {
         return try await withConnectionGate {
-            let rows = try await connection.query("SELECT factor_id, account_did, kind, label, lookup_digest, created_at, last_used_at, disabled_at FROM authentication_factors WHERE account_did = ? AND (disabled_at IS NULL OR disabled_at > ? ) ORDER BY created_at, factor_id", [.text(accountDID), .integer(factorTimestamp(now))])
+            let rows = try await connection.query("SELECT factor_id, account_did, kind, label, lookup_digest, created_at, last_used_at, disabled_at FROM authentication_factors WHERE account_did = ? AND disabled_at IS NULL ORDER BY created_at, factor_id", [.text(accountDID)])
             return try rows.map(decodeFactor)
         }
     }
@@ -58,7 +58,7 @@ extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, Rec
 
     public func replaceRecoveryCodeDigests(accountDID: String, digests: [RecoveryCodeDigest], now: Date) async throws {
         guard digests.count <= 32 else { throw AccountControlStoreError.invalidInput }
-        try await withConnectionGate { try await transaction { _ = try await connection.query("DELETE FROM recovery_code_digests WHERE account_did = ?", [.text(accountDID)]); for digest in digests { _ = try await connection.query("INSERT INTO recovery_code_digests(account_did, digest, issued_at, consumed_at) VALUES (?, ?, ?, ?)", [.text(accountDID), digest.digest.sqliteData!, .integer(factorTimestamp(digest.issuedAt)), optionalTimestamp(digest.consumedAt)]) } } }
+        try await withConnectionGate { try await transaction { let parent = try await connection.query("SELECT factor_id FROM authentication_factors WHERE account_did = ? AND kind = 'recoveryCode' AND disabled_at IS NULL", [.text(accountDID)]); guard !parent.isEmpty else { throw AccountControlStoreError.notFound }; _ = try await connection.query("DELETE FROM recovery_code_digests WHERE account_did = ?", [.text(accountDID)]); for digest in digests { _ = try await connection.query("INSERT INTO recovery_code_digests(account_did, digest, issued_at, consumed_at) VALUES (?, ?, ?, ?)", [.text(accountDID), digest.digest.sqliteData!, .integer(factorTimestamp(digest.issuedAt)), optionalTimestamp(digest.consumedAt)]) } } }
     }
 
     public func consumeRecoveryCode(digest: Data, accountDID: String, now: Date) async throws -> RecoveryCodeDigest {
@@ -136,6 +136,7 @@ extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, Rec
     }
 
     public func saveFactorToken(_ record: DurableFactorTokenRecord, now: Date) async throws {
+        guard record.issuedAt <= now, record.expiresAt > now else { throw AccountControlStoreError.invalidInput }
         try await withConnectionGate {
             try await ensureTask7DurableTables()
             let strength = try JSONEncoder().encode(record.strength)
