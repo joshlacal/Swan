@@ -43,13 +43,21 @@ public struct SwanIdentitySnapshot: Codable, Sendable, Equatable {
     /// callers can then place this versioned object inside the existing
     /// portable export envelope without rewriting PLC archive bytes.
     public static func capture(accountDID: String, bindings: any IdentityBindingStore,
-                               reservations: (any SwanIdentityReservedMaterialStore)? = nil) async throws -> Self {
+                               reservations: (any SwanIdentityReservedMaterialStore)? = nil,
+                               historyStore: (any SwanIdentityBindingHistoryStore)? = nil) async throws -> Self {
         guard let binding = try await bindings.identityBinding(accountDID: accountDID) else {
             throw SwanPortableExportError.invalidManifest
         }
         let material = try await reservations?.reservedMaterial(accountDID: accountDID)
         let key = try material.map { try SwanReservedSigningKey(keyID: $0.keyID, keyType: $0.keyType, publicKey: $0.publicKey) }
-        return try Self(binding: binding, history: [], reservedKey: key,
+        let history: [IdentityBindingHistoryEntry]
+        if binding.method == .didWeb {
+            guard let historyStore else { throw SwanPortableExportError.missingSource }
+            history = try await historyStore.identityBindingHistory(accountDID: accountDID)
+        } else {
+            history = []
+        }
+        return try Self(binding: binding, history: history, reservedKey: key,
                         claimServiceEndpoint: material?.claimServiceEndpoint, pdsURL: material?.pdsURL)
     }
 
@@ -68,7 +76,8 @@ public struct SwanIdentitySnapshot: Codable, Sendable, Equatable {
             guard binding.documentDigest?.count == 32,
                   binding.claimReceiptDigest?.count == 32,
                   binding.reservedKeyID?.isEmpty == false,
-                  binding.identityDID.hasPrefix("did:web:") else {
+                  binding.identityDID.hasPrefix("did:web:"),
+                  try SwanDidWebCanonicalizer.canonical(binding.identityDID) == binding.identityDID else {
                 throw SwanPortableExportError.invalidManifest
             }
             guard let reservedKey, reservedKey.keyID == binding.reservedKeyID,

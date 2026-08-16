@@ -75,6 +75,45 @@ public protocol SwanIdentityStepUpReceiptStore: Sendable {
                                       receiptDigest: Data, now: Date) async throws
 }
 
+/// A receipt presented with an identity mutation. Implementations must consume
+/// it in the same transaction as the mutation; this type deliberately carries
+/// all of the predicates needed by the durable CAS.
+public struct SwanIdentityStepUpReceipt: Sendable, Equatable {
+    public let sessionID: String
+    public let accountDID: String
+    public let operation: String
+    public let mfaStrength: String
+    public let verifiedAt: Date
+    public let expiresAt: Date
+    public let receiptDigest: Data
+
+    public init(sessionID: String, accountDID: String, operation: String,
+                mfaStrength: String, verifiedAt: Date, expiresAt: Date,
+                receiptDigest: Data) throws {
+        guard !sessionID.isEmpty, !accountDID.isEmpty, !operation.isEmpty,
+              !mfaStrength.isEmpty, verifiedAt <= expiresAt,
+              receiptDigest.count == 32 else {
+            throw SwanError.invalidIdentifier("identity step-up receipt")
+        }
+        self.sessionID = sessionID
+        self.accountDID = accountDID
+        self.operation = operation
+        self.mfaStrength = mfaStrength
+        self.verifiedAt = verifiedAt
+        self.expiresAt = expiresAt
+        self.receiptDigest = receiptDigest
+    }
+}
+
+/// Transactional identity mutations. The receipt, when present, is consumed
+/// before the mutation's CAS and rolls back with it on any failure.
+public protocol SwanAtomicDidWebClaimStore: SwanGraceAwareIdentityBindingStore {
+    func commitDidWebClaimAtomically(_ request: DidWebClaimCommitRequest,
+                                     history: IdentityBindingHistoryEntry?, now: Date,
+                                     gracePeriod: TimeInterval,
+                                     stepUpReceipt: SwanIdentityStepUpReceipt?) async throws
+}
+
 public protocol SwanIdentityBindingEnumerating: Sendable {
     func identityBindings(afterAccountDID: String?, limit: Int) async throws -> [IdentityBinding]
 }
@@ -94,6 +133,17 @@ public protocol SwanIdentityContinuityStore: Sendable {
 
 public protocol SwanConditionalIdentityContinuityStore: SwanIdentityContinuityStore {
     func compareAndPersistIdentityContinuity(expected: IdentityBinding, replacement: IdentityBinding) async throws -> IdentityBinding
+}
+
+public protocol SwanAtomicIdentityContinuityStore: SwanConditionalIdentityContinuityStore {
+    func compareAndPersistIdentityContinuityAtomically(expected: IdentityBinding,
+                                                       replacement: IdentityBinding,
+                                                       now: Date,
+                                                       stepUpReceipt: SwanIdentityStepUpReceipt?) async throws -> IdentityBinding
+}
+
+public protocol SwanIdentityBindingHistoryStore: Sendable {
+    func identityBindingHistory(accountDID: String) async throws -> [IdentityBindingHistoryEntry]
 }
 
 public protocol SwanExpiredIdentityClaimReleasingStore: IdentityBindingStore {

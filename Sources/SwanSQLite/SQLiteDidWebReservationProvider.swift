@@ -2,6 +2,7 @@ import Crypto
 import Foundation
 import NIOCore
 import SQLiteNIO
+import SwanCore
 import SwanStorage
 
 /// Migration SQL is returned to the root migration owner; this lane does not
@@ -140,7 +141,14 @@ extension SQLiteControlDatabase: SwanDidWebReservationStore, SwanIdentityReserve
     private func updateReservationState(_ requestID: String, state: SwanPersistedDidWebReservation.State, allowCommitted: Bool) async throws {
         try await withConnectionGate {
             let predicate = allowCommitted ? "state != 'released'" : "state = 'issued'"
-            _ = try await connection.query("UPDATE did_web_signing_key_reservations SET state=?, updated_at=? WHERE request_id=? AND \(predicate)", [.text(state.rawValue), .integer(timestamp(Date())), .text(requestID)])
+            let rows = try await connection.query("UPDATE did_web_signing_key_reservations SET state=?, updated_at=? WHERE request_id=? AND \(predicate) RETURNING request_id", [.text(state.rawValue), .integer(timestamp(Date())), .text(requestID)])
+            if rows.count == 1 { return }
+            // Idempotent retries are safe only when the tuple already reached
+            // the requested terminal state. Every other miss is a failed CAS.
+            let current = try await connection.query("SELECT state FROM did_web_signing_key_reservations WHERE request_id=?", [.text(requestID)])
+            guard current.count == 1, current[0].column("state")?.string == state.rawValue else {
+                throw SwanError.conflict(expected: 1, actual: 0)
+            }
         }
     }
 
