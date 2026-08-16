@@ -1,0 +1,88 @@
+import Foundation
+import Petrel
+
+public struct PublicRepositoryImportEnvelope: Sendable {
+    public let did: String
+    public let rootCID: CID
+    public let blocks: [PublicRepositoryBlock]
+    public let referencedBlobs: [CID]
+    public let signature: Data
+
+    public init(did: String, rootCID: CID, blocks: [PublicRepositoryBlock], referencedBlobs: [CID] = [], signature: Data) {
+        self.did = did
+        self.rootCID = rootCID
+        self.blocks = blocks
+        self.referencedBlobs = referencedBlobs
+        self.signature = signature
+    }
+}
+
+public struct PublicRepositoryImportedState: Sendable, Equatable {
+    public let did: String
+    public let rootCID: CID
+    public let blocks: [PublicRepositoryBlock]
+
+    public init(did: String, rootCID: CID, blocks: [PublicRepositoryBlock]) {
+        self.did = did
+        self.rootCID = rootCID
+        self.blocks = blocks
+    }
+}
+
+public protocol PublicRepositoryImportCommitter: Sendable {
+    func commit(_ state: PublicRepositoryImportedState) async throws
+}
+
+public enum PublicRepositoryReferenceImportError: Error, Sendable, Equatable {
+    case invalidDID
+    case invalidRoot
+    case blockLimitExceeded
+    case byteLimitExceeded
+    case duplicateBlockConflict
+    case missingBlob(CID)
+    case invalidSignature
+}
+
+/// Verifies an import completely before invoking the injected durable commit
+/// boundary. No block, blob, or root is published on a failed preflight.
+public struct PublicRepositoryReferenceImportVerifier: Sendable {
+    public let maximumBlocks: Int
+    public let maximumBytes: Int
+
+    public init(maximumBlocks: Int = 100_000, maximumBytes: Int = 512 * 1_024 * 1_024) throws {
+        guard maximumBlocks > 0, maximumBytes > 0 else { throw PublicRepositoryReferenceImportError.blockLimitExceeded }
+        self.maximumBlocks = maximumBlocks
+        self.maximumBytes = maximumBytes
+    }
+
+    public func verifyAndCommit(
+        _ envelope: PublicRepositoryImportEnvelope,
+        committer: any PublicRepositoryImportCommitter,
+        verifySignature: @escaping @Sendable (String, CID, Data) throws -> Bool
+    ) async throws -> PublicRepositoryImportedState {
+        guard (try? DID(didString: envelope.did)) != nil else { throw PublicRepositoryReferenceImportError.invalidDID }
+        try PublicRepositoryCID.validate(envelope.rootCID)
+        guard envelope.blocks.count <= maximumBlocks else { throw PublicRepositoryReferenceImportError.blockLimitExceeded }
+        var totalBytes = 0
+        for block in envelope.blocks {
+            let (next, overflow) = totalBytes.addingReportingOverflow(block.bytes.count)
+            guard !overflow, next <= maximumBytes else { throw PublicRepositoryReferenceImportError.byteLimitExceeded }
+            totalBytes = next
+        }
+        guard try verifySignature(envelope.did, envelope.rootCID, envelope.signature) else { throw PublicRepositoryReferenceImportError.invalidSignature }
+
+        var byCID: [CID: Data] = [:]
+        for block in envelope.blocks {
+            try PublicRepositoryCID.validate(block.cid, blockBytes: block.bytes)
+            if let existing = byCID[block.cid], existing != block.bytes { throw PublicRepositoryReferenceImportError.duplicateBlockConflict }
+            byCID[block.cid] = block.bytes
+        }
+        guard byCID[envelope.rootCID] != nil else { throw PublicRepositoryReferenceImportError.invalidRoot }
+        for blob in Set(envelope.referencedBlobs) where byCID[blob] == nil {
+            throw PublicRepositoryReferenceImportError.missingBlob(blob)
+        }
+        let state = PublicRepositoryImportedState(did: envelope.did, rootCID: envelope.rootCID, blocks: byCID.map { .init(cid: $0.key, bytes: $0.value) }.sorted { $0.cid.description < $1.cid.description })
+        try await committer.commit(state)
+        return state
+    }
+}

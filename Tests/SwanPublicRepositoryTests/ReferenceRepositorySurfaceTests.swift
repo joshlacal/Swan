@@ -1,0 +1,100 @@
+import Foundation
+import XCTest
+import Petrel
+@testable import SwanPublicRepository
+
+final class ReferenceRepositorySurfaceTests: XCTestCase {
+    func testSyncEnumerationIsBoundedAndCursorStable() async throws {
+        let blocks = try makeBlocks(count: 3)
+        let surface = try PublicRepositoryReferenceSurface(
+            did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            revision: "3jzfc6r5bqg2a",
+            blocks: blocks,
+            records: [
+                .init(path: try .init(collection: "app.bsky.feed.post", recordKey: "a"), cid: blocks[0].cid),
+                .init(path: try .init(collection: "app.bsky.feed.post", recordKey: "b"), cid: blocks[1].cid)
+            ],
+            repositories: [
+                try .init(did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", head: blocks[0].cid, rev: "3jzfc6r5bqg2a"),
+                try .init(did: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", head: blocks[1].cid, rev: "3jzfc6r5bqg2a")
+            ],
+            maximumPageSize: 2
+        )
+
+        let first = try await surface.listRepos(limit: 1)
+        XCTAssertEqual(first.repos.count, 1)
+        XCTAssertNotNil(first.cursor)
+        let second = try await surface.listRepos(limit: 1, cursor: try XCTUnwrap(first.cursor))
+        XCTAssertEqual(second.repos.map(\.did), ["did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"])
+
+        let blockPage = try await surface.getBlocks([blocks[0].cid, blocks[1].cid, blocks[2].cid], limit: 2)
+        XCTAssertEqual(blockPage.blocks.count, 2)
+        XCTAssertNotNil(blockPage.cursor)
+        XCTAssertEqual(blockPage.missing, [])
+    }
+
+    func testMissingBlobListingIsPaginatedAndDoesNotMaterializeUnboundedInput() async throws {
+        let cid = CID.fromDAGCBOR(Data([0xa0]))
+        let surface = try PublicRepositoryReferenceSurface(
+            did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            revision: "3jzfc6r5bqg2a",
+            blocks: [], records: [], maximumPageSize: 2
+        )
+        let page = try await surface.listMissingBlobs([cid, cid], limit: 1)
+        XCTAssertEqual(page.missing, [cid])
+        XCTAssertNil(page.cursor)
+    }
+
+    func testImportVerifiesRootAndSignatureBeforeTransactionalCommit() async throws {
+        let bytes = Data([0xa0])
+        let root = CID.fromDAGCBOR(bytes)
+        let committer = RecordingImportCommitter()
+        let verifier = try PublicRepositoryReferenceImportVerifier(maximumBlocks: 2, maximumBytes: 32)
+        let envelope = PublicRepositoryImportEnvelope(
+            did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            rootCID: root,
+            blocks: [.init(cid: root, bytes: bytes)],
+            signature: Data([1])
+        )
+        _ = try await verifier.verifyAndCommit(envelope, committer: committer) { did, cid, signature in
+            did == "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa" && cid == root && signature == Data([1])
+        }
+        let committed = await committer.states
+        XCTAssertEqual(committed.count, 1)
+        XCTAssertEqual(committed[0].rootCID, root)
+    }
+
+    func testImportRejectsInvalidSignatureWithoutCallingCommitter() async throws {
+        let bytes = Data([0xa0])
+        let root = CID.fromDAGCBOR(bytes)
+        let committer = RecordingImportCommitter()
+        let verifier = try PublicRepositoryReferenceImportVerifier(maximumBlocks: 2, maximumBytes: 32)
+        let envelope = PublicRepositoryImportEnvelope(
+            did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            rootCID: root,
+            blocks: [.init(cid: root, bytes: bytes)],
+            signature: Data([9])
+        )
+        do {
+            _ = try await verifier.verifyAndCommit(envelope, committer: committer) { _, _, _ in false }
+            XCTFail("invalid signature unexpectedly committed")
+        } catch let error as PublicRepositoryReferenceImportError {
+            XCTAssertEqual(error, .invalidSignature)
+        }
+        let states = await committer.states
+        XCTAssertEqual(states.count, 0)
+    }
+
+    private func makeBlocks(count: Int) throws -> [PublicRepositoryBlock] {
+        try (0..<count).map { index in
+            let data = Data([0xa1, 0x61, 0x69, UInt8(index)])
+            let cid = CID.fromDAGCBOR(data)
+            return PublicRepositoryBlock(cid: cid, bytes: data)
+        }
+    }
+}
+
+private actor RecordingImportCommitter: PublicRepositoryImportCommitter {
+    var states: [PublicRepositoryImportedState] = []
+    func commit(_ state: PublicRepositoryImportedState) { states.append(state) }
+}
