@@ -1,3 +1,4 @@
+import Crypto
 import Foundation
 import Hummingbird
 import HummingbirdTesting
@@ -6,6 +7,10 @@ import Logging
 import NIOCore
 @testable import SwanAccounts
 @testable import SwanHTTP
+import SwanCore
+import SwanOAuth
+import SwanSQLite
+import SwanSpaces
 import SwanStorage
 import XCTest
 
@@ -71,8 +76,232 @@ final class AccountPortalSecurityHTTPTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    // MARK: - Production construction path (Task 1)
+
+    /// The portal installed through the production `SwanHTTPServer` hook —
+    /// the type `swan serve` builds — must serve the compiled bundle without
+    /// shadowing the portal's own API routes, `/xrpc/*`, health, discovery,
+    /// or OAuth.
+    func testPortalComposesIntoProductionServerWithoutShadowingRoutes() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "AccountPortalSecurityHTTPTests-production-\(UUID().uuidString)")
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let runtime = try SwanOAuthRuntime(
+                controlStore: control,
+                serverKey: Data(repeating: 0x5C, count: 32)
+            )
+            let profile = try ProtocolProfile.load(
+                from: packageRoot().appending(
+                    path: "Profiles/permissioned-data-0016-2026-07-30.json"
+                )
+            )
+            let portal = try makePortal(policy: .openProtected)
+            let server = SwanHTTPServer(
+                profile: profile,
+                configuration: .init(
+                    host: "127.0.0.1",
+                    port: 3_000,
+                    publicURL: URL(string: "https://swan.example")!
+                ),
+                oauthRuntime: runtime,
+                accountPortalHTTP: portal
+            )
+            let app = server.buildApplication(
+                logger: Logger(label: "AccountPortalSecurityHTTPTests.production")
+            )
+            try await app.test(.router) { client in
+                // The compiled bundle is served at /account/ and /account.
+                for uri in ["/account/", "/account"] {
+                    try await client.execute(uri: uri, method: .get) { response in
+                        XCTAssertEqual(response.status, .ok, uri)
+                        XCTAssertTrue(
+                            response.headers[.contentType]?.hasPrefix("text/html") == true,
+                            uri
+                        )
+                    }
+                }
+                // The portal's API routes beat the SPA fallback.
+                try await client.execute(uri: "/account/api/bootstrap", method: .get) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    XCTAssertEqual(response.headers[.contentType], "application/json")
+                }
+                try await client.execute(uri: "/account/api/unknown/deep", method: .get) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                    XCTAssertEqual(response.headers[.contentType], "application/json")
+                }
+                // /xrpc/*, health, discovery, and OAuth are untouched.
+                try await client.execute(uri: "/xrpc/com.atproto.server.describeServer", method: .get) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                try await client.execute(uri: "/health", method: .get) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                try await client.execute(uri: "/.well-known/did.json", method: .get) { response in
+                    XCTAssertEqual(response.status, .ok)
+                }
+                try await client.execute(uri: "/oauth/authorize", method: .get) { response in
+                    XCTAssertEqual(response.status, .serviceUnavailable)
+                }
+            }
+            try await control.close()
+        } catch {
+            try? await control.close()
+            throw error
+        }
+    }
+
+    /// Configuration truth through the production path: the portal advertises
+    /// the signup policy, and `describeServer.inviteCodeRequired` must be
+    /// derived from that same policy. RED until the CLI derives the
+    /// configuration value from policy (Task 2): today the server is built
+    /// with the default `false` while the portal carries `.inviteRequired`.
+    func testDescribeServerInviteCodeRequiredAgreesWithPortalPolicy() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "AccountPortalSecurityHTTPTests-invite-\(UUID().uuidString)")
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let runtime = try SwanOAuthRuntime(
+                controlStore: control,
+                serverKey: Data(repeating: 0x5C, count: 32)
+            )
+            let profile = try ProtocolProfile.load(
+                from: packageRoot().appending(
+                    path: "Profiles/permissioned-data-0016-2026-07-30.json"
+                )
+            )
+            let policy = SignupPolicy.inviteRequired
+            let portal = try makePortal(policy: policy)
+            let server = SwanHTTPServer(
+                profile: profile,
+                configuration: .init(
+                    host: "127.0.0.1",
+                    port: 3_000,
+                    publicURL: URL(string: "https://swan.example")!
+                ),
+                oauthRuntime: runtime,
+                accountPortalHTTP: portal
+            )
+            let app = server.buildApplication(
+                logger: Logger(label: "AccountPortalSecurityHTTPTests.invite")
+            )
+            try await app.test(.router) { client in
+                try await client.execute(uri: "/account/api/signup/policy", method: .get) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let body = try XCTUnwrap(String(data: Data(response.body.readableBytesView), encoding: .utf8))
+                    XCTAssertTrue(body.contains("\"inviteCodeRequired\":true"))
+                }
+                try await client.execute(uri: "/xrpc/com.atproto.server.describeServer", method: .get) { response in
+                    XCTAssertEqual(response.status, .ok)
+                    let body = try XCTUnwrap(String(data: Data(response.body.readableBytesView), encoding: .utf8))
+                    XCTAssertTrue(
+                        body.contains("\"inviteCodeRequired\":\(policy.advertisesInviteCodeRequired)")
+                    )
+                }
+            }
+            try await control.close()
+        } catch {
+            try? await control.close()
+            throw error
+        }
+    }
+
+    /// Credential isolation through the production path: with the portal and
+    /// a permissive proxy fallback both installed, `createSession` and
+    /// `createAccount` remain stable local refusals — the credentials never
+    /// leave the host, even when the client names a destination.
+    func testCredentialMethodsStayLocalRefusalsWithPortalAndProxyInstalled() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "AccountPortalSecurityHTTPTests-credentials-\(UUID().uuidString)")
+        let control = try await SQLiteControlDatabase(dataDirectory: root)
+        defer { try? FileManager.default.removeItem(at: root) }
+        do {
+            let runtime = try SwanOAuthRuntime(
+                controlStore: control,
+                serverKey: Data(repeating: 0x5C, count: 32)
+            )
+            let profile = try ProtocolProfile.load(
+                from: packageRoot().appending(
+                    path: "Profiles/permissioned-data-0016-2026-07-30.json"
+                )
+            )
+            let portal = try makePortal(policy: .openProtected)
+            let sender = RecordingProxySender()
+            let pipethrough = SwanXRPCPipethroughServer(
+                authorizer: PipethroughAuthorizer(
+                    result: .success(
+                        .accountOAuth(subject: "did:plc:alice", scopes: ["atproto"])
+                    )
+                ),
+                tokens: TestProxyServiceTokenIssuer(),
+                sender: sender,
+                resolver: SwanServiceEndpointResolver(
+                    documents: StubDIDDocuments(
+                        documents: [
+                            "did:web:attacker.example": Data(
+                                """
+                                {"id":"did:web:attacker.example","service":[
+                                  {"id":"#svc","type":"AtprotoPersonalDataServer",
+                                   "serviceEndpoint":"https://attacker.example"}]}
+                                """.utf8
+                            )
+                        ]
+                    )
+                ),
+                appView: try SwanAppViewConfiguration()
+            )
+            let server = SwanHTTPServer(
+                profile: profile,
+                configuration: .init(
+                    host: "127.0.0.1",
+                    port: 3_000,
+                    publicURL: URL(string: "https://swan.example")!
+                ),
+                oauthRuntime: runtime,
+                accountPortalHTTP: portal,
+                xrpcPipethrough: pipethrough
+            )
+            let app = server.buildApplication(
+                logger: Logger(label: "AccountPortalSecurityHTTPTests.credentials")
+            )
+            try await app.test(.router) { client in
+                var steered = HTTPFields()
+                steered[.contentType] = "application/json"
+                steered[HTTPField.Name("atproto-proxy")!] = "did:web:attacker.example#svc"
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.server.createSession",
+                    method: .post,
+                    headers: steered,
+                    body: ByteBuffer(string: #"{"identifier":"alice.test","password":"hunter2"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                }
+                try await client.execute(
+                    uri: "/xrpc/com.atproto.server.createAccount",
+                    method: .post,
+                    headers: steered,
+                    body: ByteBuffer(string: #"{"handle":"alice.test","email":"alice@example.com","password":"hunter2"}"#)
+                ) { response in
+                    XCTAssertEqual(response.status, .notFound)
+                }
+            }
+            XCTAssertEqual(sender.recorded().count, 0)
+            try await control.close()
+        } catch {
+            try? await control.close()
+            throw error
+        }
+    }
+
     private func makePortalRouter(policy: SignupPolicy = .closed) throws -> Router<SwanHTTPRequestContext> {
         let router = Router(context: SwanHTTPRequestContext.self)
+        try makePortal(policy: policy).register(on: router)
+        return router
+    }
+
+    private func makePortal(policy: SignupPolicy = .closed) throws -> SwanAccountPortalHTTP {
         let sessions = SwanManagementSessionRuntime(
             store: PortalMemorySessionStore(),
             preAuthStore: SwanInMemoryManagementPreAuthStore(),
@@ -87,8 +316,14 @@ final class AccountPortalSecurityHTTPTests: XCTestCase, @unchecked Sendable {
             staticDirectory: buildDirectory,
             signupPolicy: policy
         )
-        SwanAccountPortalHTTP(configuration: configuration, sessions: sessions, service: service).register(on: router)
-        return router
+        return SwanAccountPortalHTTP(configuration: configuration, sessions: sessions, service: service)
+    }
+
+    private func packageRoot() -> URL {
+        URL(filePath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
     }
 }
 
@@ -108,4 +343,100 @@ private struct PortalMemoryService: SwanAccountPortalServing {
         .init(account: .init(did: accountDID, handle: "alice.example", email: nil, lifecycle: "active"), identity: nil, strength: "password", factors: [], sessions: [], apps: [], passwords: [])
     }
     func mutate(path _: String, context _: SwanAccountPortalMutationContext, payload _: Data?, now _: Date) async throws -> SwanAccountPortalMutation { .init() }
+}
+
+// MARK: - Proxy doubles (production-construction credential-isolation tests)
+
+/// Admits every pipethrough request, so a fail-open route would really reach
+/// the sender. The credential-isolation tests assert the sender is never
+/// consulted despite this permissive authorizer.
+private struct PipethroughAuthorizer: SwanXRPCPipethroughResourceAuthorizing {
+    let result: Result<AuthorizationContext, SwanResourceAuthorizationFailure>
+
+    init(result: Result<AuthorizationContext, SwanResourceAuthorizationFailure>) {
+        self.result = result
+    }
+
+    func authorizePipethrough(
+        request _: Request,
+        method _: String,
+        fixedPath _: String,
+        now _: Date
+    ) async throws -> AuthorizationContext {
+        try result.get()
+    }
+
+    func issuePipethroughNonce(now _: Date) async -> String { "test-nonce" }
+}
+
+/// Mints a real `ProxyServiceJWT` from a per-process test key, so the proxy
+/// path is exercised with actual signed claims rather than a placeholder.
+private struct TestProxyServiceTokenIssuer: SwanProxyServiceTokenIssuing {
+    static let key = P256.Signing.PrivateKey()
+
+    func issueProxyServiceToken(
+        issuer: String,
+        audience: String,
+        method: String,
+        now: Date
+    ) async throws -> String {
+        try ProxyServiceJWT.create(
+            issuer: issuer,
+            audience: audience,
+            method: method,
+            eventID: UUID().uuidString,
+            key: Self.key,
+            now: now
+        )
+    }
+}
+
+private struct StubDIDDocuments: SwanDIDDocumentFetching {
+    let documents: [String: Data]
+
+    func documentJSON(forDID did: String) async throws -> Data {
+        guard let data = documents[did] else {
+            throw SwanError.unavailable("no stub DID document")
+        }
+        return data
+    }
+}
+
+/// Records every outbound proxy request. The credential-isolation tests
+/// assert `recorded().isEmpty` — nothing left the host.
+private final class RecordingProxySender: SwanProxySending, @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [SwanProxyRequest] = []
+    private let result: Result<OAuthRemoteHTTPResponse, any Error>
+
+    init(result: Result<OAuthRemoteHTTPResponse, any Error>? = nil) {
+        self.result = result
+            ?? .success(
+                OAuthRemoteHTTPResponse(
+                    status: 200,
+                    headers: ["Content-Type": ["application/json"]],
+                    body: Data(#"{"feed":[]}"#.utf8),
+                    responseURL: URL(string: "https://api.bsky.app/xrpc/x")!
+                )
+            )
+    }
+
+    func send(
+        _ request: SwanProxyRequest, timeout _: TimeInterval, maximumBodyBytes _: Int
+    ) async throws -> OAuthRemoteHTTPResponse {
+        record(request)
+        return try result.get()
+    }
+
+    private func record(_ request: SwanProxyRequest) {
+        lock.lock()
+        defer { lock.unlock() }
+        requests.append(request)
+    }
+
+    func recorded() -> [SwanProxyRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requests
+    }
 }
