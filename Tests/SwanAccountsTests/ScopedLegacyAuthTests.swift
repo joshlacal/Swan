@@ -52,6 +52,24 @@ final class ScopedLegacyAuthTests: XCTestCase {
         XCTAssertThrowsError(try SwanScopeEvaluator().evaluate(credential: .fullAccessV1, canonicalMethod: "com.atproto.repo.deleteRecord", declaredMethodPolicy: policy))
     }
 
+    func testReferenceLegacyMethodMatrixUsesPresetCompatibleRequiredScopes() throws {
+        let matrix: [(String, Set<String>)] = [
+            ("com.atproto.repo.getRecord", ["repo:read"]),
+            ("com.atproto.repo.createRecord", ["repo:write"]),
+            ("com.atproto.sync.getBlob", ["blob:read"]),
+            ("com.atproto.identity.resolveHandle", ["identity:read"]),
+            ("app.bsky.feed.getTimeline", ["rpc:app.bsky?aud=https://api.bsky.app"]),
+            ("chat.bsky.convo.listConvos", ["rpc:chat.bsky?aud=https://api.bsky.app"])
+        ]
+        for (method, scopes) in matrix {
+            XCTAssertEqual(DeclaredMethodScopePolicy.referenceLegacy.requiredScopes(for: method), scopes.contains(where: { $0.hasPrefix("rpc:") }) ? [scopes.first!.split(separator: "?").first.map(String.init)!] : scopes)
+            let audience = scopes.first?.contains("?aud=") == true ? "https://api.bsky.app" : nil
+            XCTAssertNoThrow(try SwanScopeEvaluator().evaluate(credential: .scopes(scopes), canonicalMethod: method, declaredMethodPolicy: .referenceLegacy, audience: audience))
+            XCTAssertTrue(DeclaredMethodScopePolicy.fullAccessV1.declares(method))
+        }
+        XCTAssertFalse(DeclaredMethodScopePolicy.referenceLegacy.declares("app.bsky.feed.unknown"))
+    }
+
     func testAppPasswordSecretPresentedOnceAndScopeEditRevokesDerivedSession() async throws {
         let store = InMemoryLegacyAuthStore()
         let service = try LegacyAuthService(store: store, accountResolver: .fixture, secretKey: Data(repeating: 7, count: 32), tokenIssuer: HMACLegacyTokenIssuer(key: Data(repeating: 8, count: 32), issuer: "swan.test"), managementAuthorizer: LegacyManagementAuthorizer { _, session, stepUp in session == "management" && (stepUp.isEmpty || stepUp == "step-up") }, loginAdmission: LegacyLoginAdmission { _ in }, methodPolicy: DeclaredMethodScopePolicy.fullAccessV1)
@@ -107,6 +125,10 @@ final class ScopedLegacyAuthTests: XCTestCase {
         let fetched = try await service.getSession(refreshed.accessToken)
         XCTAssertTrue(fetched.fullAccess)
         _ = try await service.getServiceAuth(accessToken: fetched.accessToken, lxm: "com.atproto.repo.getRecord", aud: "https://pds.example.test")
+        let exactExpiry = Date(timeIntervalSince1970: 50)
+        let serviceToken = try await service.getServiceAuth(accessToken: fetched.accessToken, lxm: "com.atproto.repo.getRecord", aud: "https://pds.example.test", requestedExpiry: exactExpiry, now: Date(timeIntervalSince1970: 15))
+        XCTAssertEqual(serviceToken.expiresAt, exactExpiry)
+        do { _ = try await service.getServiceAuth(accessToken: fetched.accessToken, lxm: "com.atproto.repo.getRecord", aud: "https://pds.example.test", requestedExpiry: Date(timeIntervalSince1970: 76), now: Date(timeIntervalSince1970: 15)); XCTFail("expiry over 60 seconds must deny") } catch { }
         do { _ = try await service.getServiceAuth(accessToken: password.accessToken, lxm: "com.atproto.repo.undeclared", aud: "https://pds.example.test"); XCTFail("undeclared full-access method must deny") } catch { }
     }
 

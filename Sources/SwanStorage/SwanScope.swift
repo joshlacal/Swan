@@ -170,9 +170,9 @@ public enum SwanScopePreset: String, Codable, CaseIterable, Sendable {
     public var scopes: Set<String> {
         switch self {
         case .bluesky:
-            return ["repo:read", "repo:write", "blob:read", "blob:write", "rpc:app.bsky?aud=https://api.bsky.app", "rpc:chat.bsky?aud=https://api.bsky.app"]
+            return ["repo:read", "repo:write", "blob:read", "blob:write", "identity:read", "rpc:app.bsky?aud=https://api.bsky.app", "rpc:chat.bsky?aud=https://api.bsky.app"]
         case .full: return [] // fullAccessV1 is internal and cannot be requested
-        case .readOnly: return ["repo:read", "blob:read", "account:read"]
+        case .readOnly: return ["repo:read", "blob:read", "identity:read", "account:read"]
         case .postOnly: return ["repo:write", "blob:write"]
         }
     }

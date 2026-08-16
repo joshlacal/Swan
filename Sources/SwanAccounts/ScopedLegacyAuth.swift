@@ -221,7 +221,7 @@ public actor LegacyAuthService {
         tokenIssuer: any LegacyTokenIssuer,
         managementAuthorizer: LegacyManagementAuthorizer,
         loginAdmission: LegacyLoginAdmission,
-        methodPolicy: DeclaredMethodScopePolicy
+        methodPolicy: DeclaredMethodScopePolicy = .referenceLegacy
     ) throws {
         guard secretKey.count >= 16 else { throw SwanError.invalidIdentifier("legacy auth secret key") }
         self.store = store
@@ -359,12 +359,15 @@ public actor LegacyAuthService {
         try await store.revokeLegacySessionFamily(familyID: session.familyID, now: now)
     }
 
-    public func getServiceAuth(accessToken: String, lxm: String?, aud: String?, now: Date = Date()) async throws -> LegacyServiceAuthToken {
+    public func getServiceAuth(accessToken: String, lxm: String?, aud: String?, requestedExpiry: Date? = nil, now: Date = Date()) async throws -> LegacyServiceAuthToken {
         guard let lxm, let aud else { throw SwanError.unauthorized("lxm and aud are required") }
         let session = try await getSession(accessToken, now: now)
         let isFull = session.fullAccess
         try SwanScopeEvaluator().evaluate(credential: isFull ? .fullAccessV1 : .scopes(session.scopes), canonicalMethod: lxm, declaredMethodPolicy: methodPolicy, audience: aud)
-        let expiry = now.addingTimeInterval(Self.serviceAuthLifetime)
+        let expiry = requestedExpiry ?? now.addingTimeInterval(Self.serviceAuthLifetime)
+        guard expiry.timeIntervalSince(now) >= 1, expiry.timeIntervalSince(now) <= Self.serviceAuthLifetime else {
+            throw SwanError.unauthorized("invalid service auth expiry")
+        }
         return LegacyServiceAuthToken(token: try tokenIssuer.issueServiceAuth(subject: session.did, audience: aud, method: lxm, issuedAt: now, expiresAt: expiry), subject: session.did, audience: aud, expiresAt: expiry)
     }
 

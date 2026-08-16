@@ -31,30 +31,35 @@ public struct DeclaredMethodScopePolicy: MethodScopePolicy, Sendable, Equatable 
             "com.atproto.server.getServiceAuth": [], "com.atproto.server.createAppPassword": [],
             "com.atproto.server.listAppPasswords": [], "com.atproto.server.revokeAppPassword": [],
             // Reference-compatible account/session methods.
-            "com.atproto.repo.applyWrites": [], "com.atproto.repo.createRecord": [],
-            "com.atproto.repo.deleteRecord": [], "com.atproto.repo.describeRepo": [],
-            "com.atproto.repo.getRecord": [], "com.atproto.repo.listRecords": [],
-            "com.atproto.repo.putRecord": [], "com.atproto.repo.uploadBlob": [],
-            "com.atproto.sync.getBlob": [], "com.atproto.sync.getLatestCommit": [],
-            "com.atproto.sync.getRepo": [], "com.atproto.sync.getRepoStatus": [],
-            "com.atproto.identity.resolveHandle": [],
+            "com.atproto.repo.applyWrites": ["repo:write"], "com.atproto.repo.createRecord": ["repo:write"],
+            "com.atproto.repo.deleteRecord": ["repo:write"], "com.atproto.repo.describeRepo": ["repo:read"],
+            "com.atproto.repo.getRecord": ["repo:read"], "com.atproto.repo.listRecords": ["repo:read"],
+            "com.atproto.repo.putRecord": ["repo:write"], "com.atproto.repo.uploadBlob": ["blob:write"],
+            "com.atproto.sync.getBlob": ["blob:read"], "com.atproto.sync.getLatestCommit": ["repo:read"],
+            "com.atproto.sync.getRepo": ["repo:read"], "com.atproto.sync.getRepoStatus": ["repo:read"],
+            "com.atproto.identity.resolveHandle": ["identity:read"],
             // Official-client AppView feed/identity methods.
-            "app.bsky.actor.getPreferences": [], "app.bsky.actor.getPreferencesExtended": [],
-            "app.bsky.actor.getProfile": [], "app.bsky.actor.putPreferences": [],
-            "app.bsky.actor.searchActors": [],
-            "app.bsky.feed.getAuthorFeed": [], "app.bsky.feed.getFeedSkeleton": [],
-            "app.bsky.feed.getPostThread": [], "app.bsky.feed.getPosts": [],
-            "app.bsky.feed.getTimeline": [], "app.bsky.feed.post": [],
-            "app.bsky.graph.getBlocks": [], "app.bsky.graph.getFollowers": [],
-            "app.bsky.graph.getFollows": [], "app.bsky.graph.getMutes": [],
-            "app.bsky.graph.getLists": [], "app.bsky.graph.muteActor": [],
-            "app.bsky.graph.unmuteActor": [],
-            "app.bsky.notification.listNotifications": [],
-            "app.bsky.notification.updateSeen": [],
+            "app.bsky.actor.getPreferences": ["rpc:app.bsky"], "app.bsky.actor.getPreferencesExtended": ["rpc:app.bsky"],
+            "app.bsky.actor.getProfile": ["rpc:app.bsky"], "app.bsky.actor.putPreferences": ["rpc:app.bsky"],
+            "app.bsky.actor.searchActors": ["rpc:app.bsky"],
+            "app.bsky.feed.getAuthorFeed": ["rpc:app.bsky"], "app.bsky.feed.getFeedSkeleton": ["rpc:app.bsky"],
+            "app.bsky.feed.getPostThread": ["rpc:app.bsky"], "app.bsky.feed.getPosts": ["rpc:app.bsky"],
+            "app.bsky.feed.getTimeline": ["rpc:app.bsky"], "app.bsky.feed.post": ["rpc:app.bsky"],
+            "app.bsky.graph.getBlocks": ["rpc:app.bsky"], "app.bsky.graph.getFollowers": ["rpc:app.bsky"],
+            "app.bsky.graph.getFollows": ["rpc:app.bsky"], "app.bsky.graph.getMutes": ["rpc:app.bsky"],
+            "app.bsky.graph.getLists": ["rpc:app.bsky"], "app.bsky.graph.muteActor": ["rpc:app.bsky"],
+            "app.bsky.graph.unmuteActor": ["rpc:app.bsky"],
+            "app.bsky.notification.listNotifications": ["rpc:app.bsky"],
+            "app.bsky.notification.updateSeen": ["rpc:app.bsky"],
             // Official-client chat methods.
-            "chat.bsky.convo.getConvo": [], "chat.bsky.convo.getMessages": [],
-            "chat.bsky.convo.listConvos": [], "chat.bsky.convo.sendMessage": []
+            "chat.bsky.convo.getConvo": ["rpc:chat.bsky"], "chat.bsky.convo.getMessages": ["rpc:chat.bsky"],
+            "chat.bsky.convo.listConvos": ["rpc:chat.bsky"], "chat.bsky.convo.sendMessage": ["rpc:chat.bsky"]
         ], permitsFullAccess: true
+    )
+    /// The scoped reference policy uses exactly the same declarations and
+    /// required capabilities, but does not enable the internal full grant.
+    public static let referenceLegacy = DeclaredMethodScopePolicy(
+        declarations: fullAccessV1.declarations
     )
 
     public init(declarations: [String: Set<String>] = [:], permitsFullAccess: Bool = false) {

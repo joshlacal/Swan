@@ -31,7 +31,7 @@ public struct SwanLegacyAuthXRPCAdapter: Sendable {
     }
 
     public func getServiceAuth(accessToken: String, parameters: ComAtprotoServerGetServiceAuth.Parameters, now: Date = Date()) async throws -> ComAtprotoServerGetServiceAuth.Output {
-        let result = try await service.getServiceAuth(accessToken: accessToken, lxm: parameters.lxm.map(\.description), aud: parameters.aud, now: now)
+        let result = try await service.getServiceAuth(accessToken: accessToken, lxm: parameters.lxm.map(\.description), aud: parameters.aud, requestedExpiry: parameters.exp.map { Date(timeIntervalSince1970: TimeInterval($0)) }, now: now)
         return ComAtprotoServerGetServiceAuth.Output(token: result.token)
     }
 

@@ -46,6 +46,10 @@ Dockerfile, generated wire, or OAuth DPoP family source was changed.
 - The explicit full-access registry includes the currently registered
   repo/blob/sync, identity, feed, notification, and chat methods used by the
   parity surface; unknown methods and broad prefixes remain denied.
+- `referenceLegacy` reuses that explicit registry with preset-compatible
+  `repo:*`, `blob:*`, `identity:read`, and AppView/chat `rpc:` requirements;
+  service-auth accepts only a requested integer expiry 1–60 seconds ahead and
+  passes it unchanged to the signed issuer.
 - `LegacyAuthService` creates/list/edits/revokes app passwords, presents a
   generated secret only from create, stores versioned random-salt Argon2id
   digests, and
