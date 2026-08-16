@@ -1,5 +1,6 @@
 import XCTest
 @testable import SwanAccounts
+@testable import SwanSQLite
 import SwanStorage
 
 final class ScopedLegacyAuthTests: XCTestCase {
@@ -175,5 +176,77 @@ final class ScopedLegacyAuthTests: XCTestCase {
         let store = InMemoryLegacyAuthStore()
         let service = try LegacyAuthService(store: store, accountResolver: .fixture, secretKey: Data(repeating: 7, count: 32), tokenIssuer: HMACLegacyTokenIssuer(key: Data(repeating: 8, count: 32), issuer: "swan.test"), managementAuthorizer: LegacyManagementAuthorizer { _, _, _ in XCTFail("authorizer must not run without both proofs"); return true }, loginAdmission: LegacyLoginAdmission { _ in }, methodPolicy: DeclaredMethodScopePolicy.fullAccessV1)
         do { _ = try await service.createAppPassword(accountDID: "did:plc:alice", name: "bad", scopes: ["repo:read"]); XCTFail("missing management proof must deny") } catch { }
+    }
+
+    func testSQLiteBackedSessionFamilySurvivesRestartAndReplayRevocationHolds() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "ScopedLegacyAuthTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let accountDID = "did:plc:abcdefghijklmnopqrstuvwx"
+        let secretKey = Data(repeating: 7, count: 32)
+        let issuerKey = Data(repeating: 8, count: 32)
+        let managementAuthorizer = LegacyManagementAuthorizer { _, _, _ in true }
+        let loginAdmission = LegacyLoginAdmission { _ in }
+        let resolver = LegacyAccountResolver(
+            resolve: { identifier in
+                guard identifier == accountDID || identifier == "alice.test" else { return nil }
+                return LegacyAccountRecord(did: accountDID, handle: "alice.test", passwordVerifier: "password")
+            },
+            verifyPassword: { account, password, factor in
+                account.passwordVerifier == password && (!account.mfaEnabled || factor == "valid-factor")
+            }
+        )
+
+        func makeService(_ store: any AppPasswordStore & LegacySessionStore) throws -> LegacyAuthService {
+            try LegacyAuthService(
+                store: store,
+                accountResolver: resolver,
+                secretKey: secretKey,
+                tokenIssuer: HMACLegacyTokenIssuer(key: issuerKey, issuer: "swan.test"),
+                managementAuthorizer: managementAuthorizer,
+                loginAdmission: loginAdmission,
+                methodPolicy: DeclaredMethodScopePolicy.fullAccessV1
+            )
+        }
+
+        // First process: create the account, an app password, and a derived
+        // session family, then rotate once so the family has a live refresh
+        // token that must survive the restart.
+        let first = try await SQLiteControlDatabase(dataDirectory: root)
+        addTeardownBlock { try? await first.close() }
+        _ = try await first.createAccount(try AccountControlRegistration(
+            did: accountDID,
+            canonicalHandle: "alice.test",
+            passwordVerifier: "$argon2id$v=19$m=65536,t=2,p=1$initialsalt$initial-precomputed-verifier",
+            signingKey: try AccountControlKeyReference(purpose: .signing, generation: 1),
+            rotationKey: try AccountControlKeyReference(purpose: .rotation, generation: 1),
+            createdAt: Date(timeIntervalSince1970: 10)
+        ))
+        let firstService = try makeService(first)
+        let created = try await firstService.createAppPassword(accountDID: accountDID, name: "writer", scopes: ["repo:write"], managementSessionToken: "m", stepUpToken: "s", now: Date(timeIntervalSince1970: 11))
+        let session = try await firstService.createSession(identifier: accountDID, password: created.secret, now: Date(timeIntervalSince1970: 12))
+        let rotated = try await firstService.refreshSession(session.refreshToken, now: Date(timeIntervalSince1970: 13))
+        XCTAssertEqual(rotated.scopes, ["repo:write"])
+        try await first.close()
+
+        // Restart: reopen the same data directory and rebuild the service.
+        // The rotated refresh token must still be live, and the app-password
+        // revocation performed after restart must still revoke the derived
+        // session family.
+        let reopened = try await SQLiteControlDatabase(dataDirectory: root)
+        addTeardownBlock { try? await reopened.close() }
+        let restartedService = try makeService(reopened)
+        let afterRestart = try await restartedService.refreshSession(rotated.refreshToken, now: Date(timeIntervalSince1970: 14))
+        XCTAssertEqual(afterRestart.scopes, ["repo:write"])
+        try await restartedService.revokeAppPassword(accountDID: accountDID, name: "writer", managementSessionToken: "m", stepUpToken: "s", now: Date(timeIntervalSince1970: 15))
+        do {
+            _ = try await restartedService.getSession(afterRestart.accessToken, now: Date(timeIntervalSince1970: 16))
+            XCTFail("app-password revocation after restart must reject derived access")
+        } catch { }
+        do {
+            _ = try await restartedService.refreshSession(afterRestart.refreshToken, now: Date(timeIntervalSince1970: 17))
+            XCTFail("app-password revocation after restart must reject derived refresh")
+        } catch { }
+        try await reopened.close()
     }
 }
