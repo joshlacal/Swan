@@ -19,6 +19,45 @@ public struct SQLiteSignupFinalizationTransaction: SignupFinalizationTransaction
     }
 }
 
+public struct SignupEmailOutboxMessage: Sendable, Equatable {
+    public let deliveryID: String
+    public let email: String
+    public let protectedEnvelope: Data
+    public init(deliveryID: String, email: String, protectedEnvelope: Data) {
+        self.deliveryID = deliveryID; self.email = email; self.protectedEnvelope = protectedEnvelope
+    }
+}
+
+/// Concrete integration seam: the writer is an object (not an escaping
+/// callback) and all of its account/identity/session writes run under this
+/// connection's transaction. Until the foundation supplies this writer, the
+/// signup service fails closed rather than pretending its side effects are
+/// atomic.
+public protocol SignupTransactionScopedFoundationWriter: Sendable {
+    func write(_ context: SQLiteSignupTransactionContext, request: SignupFinalizationRequest) async throws
+}
+
+public struct SQLiteSignupTransactionContext: Sendable {
+    fileprivate let executeSQL: @Sendable (String, [SQLiteData]) async throws -> Void
+    public func execute(_ sql: String, _ binds: [SQLiteData] = []) async throws {
+        try await executeSQL(sql, binds)
+    }
+}
+
+public struct SQLiteSignupTransactionCoordinator: Sendable {
+    private let database: SQLiteControlDatabase
+    public init(database: SQLiteControlDatabase) {
+        self.database = database
+    }
+
+    public func run(_ request: SignupFinalizationRequest, writer: any SignupTransactionScopedFoundationWriter) async throws {
+        try await database.withConnectionGate { try await database.transaction {
+            let context = SQLiteSignupTransactionContext { sql, binds in _ = try await database.connection.query(sql, binds) }
+            try await writer.write(context, request: request)
+        } }
+    }
+}
+
 extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailRequestStore {
     public func migrateTask4OnboardingSchema() async throws {
         try await withConnectionGate { try await transaction {
@@ -51,8 +90,10 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
             _ = try await connection.query("""
             CREATE TABLE IF NOT EXISTS signup_email_request_outbox(
                 proof_digest BLOB PRIMARY KEY CHECK(length(proof_digest)=32),
-                email TEXT NOT NULL, handle TEXT NOT NULL, issued_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL, delivered_at INTEGER)
+                delivery_id TEXT NOT NULL UNIQUE, email TEXT NOT NULL, handle TEXT NOT NULL,
+                protected_envelope BLOB NOT NULL, issued_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                lease_expires_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0, delivered_at INTEGER)
             """)
         } }
     }
@@ -72,12 +113,30 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
         } }
     }
 
-    public func persistSignupEmailRequest(email: AccountEmailAddress, handle: String, proofDigest: Data, issuedAt: Date, expiresAt: Date) async throws {
-        guard proofDigest.count == 32, AccountControlIdentifiers.isCanonicalHandle(handle), expiresAt > issuedAt else { throw AccountControlStoreError.invalidInput }
+    public func persistSignupEmailRequest(email: AccountEmailAddress, handle: String, proofDigest: Data, protectedEnvelope: Data, issuedAt: Date, expiresAt: Date) async throws {
+        guard proofDigest.count == 32, !protectedEnvelope.isEmpty, protectedEnvelope.count <= 16384, AccountControlIdentifiers.isCanonicalHandle(handle), expiresAt > issuedAt else { throw AccountControlStoreError.invalidInput }
         let issued = try task4Timestamp(issuedAt), expiry = try task4Timestamp(expiresAt)
+        let deliveryID = "signup-" + proofDigest.map { String(format: "%02x", $0) }.joined()
         try await withConnectionGate { try await transaction {
             _ = try await connection.query("INSERT INTO signup_email_proofs(proof_digest,email,handle,issued_at,expires_at) VALUES(?,?,?,?,?) ON CONFLICT(proof_digest) DO NOTHING", [task4Blob(proofDigest), .text(email.value), .text(handle), .integer(issued), .integer(expiry)])
-            _ = try await connection.query("INSERT INTO signup_email_request_outbox(proof_digest,email,handle,issued_at,expires_at) VALUES(?,?,?,?,?) ON CONFLICT(proof_digest) DO NOTHING", [task4Blob(proofDigest), .text(email.value), .text(handle), .integer(issued), .integer(expiry)])
+            _ = try await connection.query("INSERT INTO signup_email_request_outbox(proof_digest,delivery_id,email,handle,protected_envelope,issued_at,expires_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(proof_digest) DO NOTHING", [task4Blob(proofDigest), .text(deliveryID), .text(email.value), .text(handle), task4Blob(protectedEnvelope), .integer(issued), .integer(expiry)])
+        } }
+    }
+
+    public func claimSignupEmailOutbox(now: Date = Date(), lease: TimeInterval = 60) async throws -> SignupEmailOutboxMessage? {
+        let current = try task4Timestamp(now), until = try task4Timestamp(now.addingTimeInterval(lease))
+        guard until > current else { throw AccountControlStoreError.invalidInput }
+        return try await withConnectionGate { try await transaction {
+            let rows = try await connection.query("UPDATE signup_email_request_outbox SET state='sending',lease_expires_at=?,attempts=attempts+1 WHERE rowid=(SELECT rowid FROM signup_email_request_outbox WHERE expires_at>? AND (state='pending' OR (state='sending' AND lease_expires_at<=?)) ORDER BY issued_at LIMIT 1) RETURNING delivery_id,email,protected_envelope", [.integer(until), .integer(current), .integer(current)])
+            guard let row = rows.first, let deliveryID = task4Text(row, "delivery_id"), let email = task4Text(row, "email"), let envelope = task4BlobValue(row, "protected_envelope") else { return nil }
+            return SignupEmailOutboxMessage(deliveryID: deliveryID, email: email, protectedEnvelope: envelope)
+        } }
+    }
+
+    public func markSignupEmailOutboxDelivered(deliveryID: String, now: Date = Date()) async throws {
+        let current = try task4Timestamp(now)
+        try await withConnectionGate { try await transaction {
+            _ = try await connection.query("UPDATE signup_email_request_outbox SET state='delivered',delivered_at=?,lease_expires_at=NULL WHERE delivery_id=? AND state='sending'", [.integer(current), .text(deliveryID)])
         } }
     }
 
@@ -199,12 +258,16 @@ private func task4DecodeAuthorization(_ row: SQLiteRow) throws -> SignupAuthoriz
 }
 
 private func task4AuthorizationDigest(_ value: SignupAuthorization) -> Data {
-    Data(SHA256.hash(data: Data("\(value.requestID)\0\(value.policy.rawValue)\0\(value.handle)\0\(value.email ?? "")\0\(value.identityDID ?? "")\0\(value.emailProofDigest?.base64EncodedString() ?? "")\0\(value.inviteDigest?.base64EncodedString() ?? "")\0\(value.clientIPBucketDigest.base64EncodedString())".utf8)))
+    task4CanonicalDigest([
+        value.requestID, value.policy.rawValue, value.handle, value.email ?? "", value.identityDID ?? "",
+        value.emailProofDigest?.base64EncodedString() ?? "", value.inviteDigest?.base64EncodedString() ?? "",
+        value.clientIPBucketDigest.base64EncodedString(),
+    ])
 }
 
 private func task4FinalizationDigest(_ value: SignupFinalizationRequest) -> Data {
     let session = value.managementSession
-    let canonical = [
+    return task4CanonicalDigest([
         value.authorizationID.rawValue, value.idempotencyKey, value.accountDID,
         value.handle, value.identityDID, value.reservedKeyID ?? "",
         value.sessionDigest.base64EncodedString(), value.csrfDigest.base64EncodedString(),
@@ -213,6 +276,15 @@ private func task4FinalizationDigest(_ value: SignupFinalizationRequest) -> Data
         String(session.issuedAt.timeIntervalSince1970), String(session.idleExpiresAt.timeIntervalSince1970),
         String(session.absoluteExpiresAt.timeIntervalSince1970), session.lastStepUpAt.map { String($0.timeIntervalSince1970) } ?? "",
         String(describing: session.strength), session.revokedAt.map { String($0.timeIntervalSince1970) } ?? "",
-    ].joined(separator: "\0")
-    return Data(SHA256.hash(data: Data(canonical.utf8)))
+    ])
+}
+
+private func task4CanonicalDigest(_ fields: [String]) -> Data {
+    var bytes = Data("swan.signup.digest.v2".utf8)
+    for field in fields {
+        var length = UInt64(field.utf8.count).bigEndian
+        withUnsafeBytes(of: &length) { bytes.append(contentsOf: $0) }
+        bytes.append(contentsOf: field.utf8)
+    }
+    return Data(SHA256.hash(data: bytes))
 }

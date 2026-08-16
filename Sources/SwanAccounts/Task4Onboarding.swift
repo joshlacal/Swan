@@ -182,19 +182,20 @@ public actor TurnstileVerifier {
     private let maxAge: TimeInterval
     private let timeout: Duration
     private let transport: any TurnstileHTTPTransport
-    private var used: Set<Data> = []
+    private var used: [Data: Date] = [:]
     private var reservations: [Data: Date] = [:]
     private let maximumReservations = 1024
 
     public init(secret: Data, hostname: String, action: String, maxAge: TimeInterval = 300, timeout: Duration = .seconds(5), transport: any TurnstileHTTPTransport) throws {
-        guard secret.count >= 16, !hostname.isEmpty, !action.isEmpty, maxAge.isFinite, (1 ... 900).contains(maxAge) else { throw SwanError.invalidIdentifier("Turnstile configuration") }
+        guard secret.count >= 16, !hostname.isEmpty, !action.isEmpty, maxAge.isFinite, (1 ... 900).contains(maxAge), timeout > .zero else { throw SwanError.invalidIdentifier("Turnstile configuration") }
         self.secret = secret; self.hostname = hostname.lowercased(); self.action = action; self.maxAge = maxAge; self.timeout = timeout; self.transport = transport
     }
 
     public func verify(token: String, remoteIP: String?, now: Date = Date()) async throws {
         guard !token.isEmpty, token.utf8.count <= 2048 else { throw TurnstileVerificationError.missing }
         let digest = Data(SHA256.hash(data: Data(token.utf8)))
-        guard !used.contains(digest) else { throw TurnstileVerificationError.duplicate }
+        used = used.filter { $0.value > now }
+        guard used[digest] == nil else { throw TurnstileVerificationError.duplicate }
         reservations = reservations.filter { $0.value > now }
         guard reservations.count < maximumReservations else { throw TurnstileVerificationError.transport }
         guard reservations.updateValue(now.addingTimeInterval(maxAge), forKey: digest) == nil else { throw TurnstileVerificationError.duplicate }
@@ -212,12 +213,12 @@ public actor TurnstileVerifier {
         catch { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.transport }
         guard response.success else { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.failed }
         guard let challenged = response.challengeTimestamp,
-              challenged <= now.addingTimeInterval(5),
+              challenged <= now,
               now.timeIntervalSince(challenged) <= maxAge else { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.expired }
         guard response.hostname?.lowercased() == hostname else { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.wrongHostname }
         guard response.action == action else { reservations.removeValue(forKey: digest); throw TurnstileVerificationError.wrongAction }
         reservations.removeValue(forKey: digest)
-        used.insert(digest)
+        used[digest] = now.addingTimeInterval(maxAge)
     }
 }
 
@@ -281,6 +282,12 @@ public protocol SMTPTLSConnection: Sendable {
     func send(to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String) async throws
 }
 
+/// NIO implementations should close the channel at this deadline; this is a
+/// transport contract, not merely a cooperative task-group timeout.
+public protocol SMTPTLSConnectionWithDeadline: SMTPTLSConnection {
+    func send(to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String, deadline: ContinuousClock.Instant) async throws
+}
+
 public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPTransport {
     private let connect: @Sendable (AuthenticatedSMTPConfiguration) async throws -> any SMTPTLSConnection
     public init(connect: @escaping @Sendable (AuthenticatedSMTPConfiguration) async throws -> any SMTPTLSConnection) {
@@ -294,7 +301,11 @@ public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPTransport {
             guard let username = configuration.username, let password = configuration.password, let mechanism = configuration.mechanism else { throw MailpitSMTPDeliveryError.invalidConfiguration }
             try await connection.authenticate(username: username, password: password, mechanism: mechanism)
         }
-        try await connection.send(to: to, subject: subject, body: body, idempotencyKey: idempotencyKey)
+        if let bounded = connection as? any SMTPTLSConnectionWithDeadline {
+            try await bounded.send(to: to, subject: subject, body: body, idempotencyKey: idempotencyKey, deadline: .now.advanced(by: .seconds(30)))
+        } else {
+            try await connection.send(to: to, subject: subject, body: body, idempotencyKey: idempotencyKey)
+        }
     }
 }
 
@@ -507,11 +518,8 @@ public struct SignupService: Sendable {
         guard authorization.handle == request.handle, authorization.identityDID == request.identityDID else { throw SignupServiceError.duplicateRequest }
         do {
             let transaction: any SignupFinalizationTransaction
-            if let atomicStore = store as? any SignupAtomicFinalizationStore {
-                transaction = try await atomicStore.makeFinalizationTransaction(request, now: now)
-            } else {
-                transaction = StoreOwnedSignupFinalizationTransaction(store: store, request: request, now: now)
-            }
+            guard let atomicStore = store as? any SignupAtomicFinalizationStore else { throw SwanError.unavailable("atomic signup transaction unavailable") }
+            transaction = try await atomicStore.makeFinalizationTransaction(request, now: now)
             return try await foundation.commitSignup(request, transaction: transaction, now: now)
         } catch { try? await store.fail(id: request.authorizationID, now: now); throw error }
     }
@@ -525,9 +533,13 @@ public struct AccountEmailUpdateService: Sendable {
     }
 
     public func requestUpdate(did: String, email: AccountEmailAddress, now: Date = Date()) async throws {
-        try await store.associateEmail(did: did, email: email, now: now)
-        try await recovery.requestEmailConfirmation(did: did, email: email, now: now)
+        guard let atomic = store as? any AccountEmailUpdateAtomicStore else { throw SwanError.unavailable("atomic email update unavailable") }
+        try await atomic.associateEmailAndEnqueueConfirmation(did: did, email: email, now: now, recovery: recovery)
     }
+}
+
+public protocol AccountEmailUpdateAtomicStore: AccountControlStore {
+    func associateEmailAndEnqueueConfirmation(did: String, email: AccountEmailAddress, now: Date, recovery: AccountEmailRecoveryService) async throws
 }
 
 public struct SignupEmailRequestOutcome: Sendable, Equatable {
@@ -541,7 +553,7 @@ public struct SignupEmailRequestOutcome: Sendable, Equatable {
 /// persist the proof and enqueue an outbox row in one transaction; callers get
 /// the same response for existing and new addresses.
 public protocol SignupEmailRequestStore: Sendable {
-    func persistSignupEmailRequest(email: AccountEmailAddress, handle: String, proofDigest: Data, issuedAt: Date, expiresAt: Date) async throws
+    func persistSignupEmailRequest(email: AccountEmailAddress, handle: String, proofDigest: Data, protectedEnvelope: Data, issuedAt: Date, expiresAt: Date) async throws
 }
 
 public struct SignupEmailRequestService: Sendable {
@@ -550,10 +562,11 @@ public struct SignupEmailRequestService: Sendable {
         self.store = store
     }
 
-    public func request(email: AccountEmailAddress, handle: String, proofDigest: Data, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupEmailRequestOutcome {
+    public func request(email: AccountEmailAddress, handle: String, proofDigest: Data, protectedEnvelope: Data, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupEmailRequestOutcome {
         guard AccountControlIdentifiers.isCanonicalHandle(handle), proofDigest.count == 32,
+              !protectedEnvelope.isEmpty, protectedEnvelope.count <= 16384,
               lifetime.isFinite, (60 ... 900).contains(lifetime) else { throw SwanError.invalidIdentifier("signup email request") }
-        try await store.persistSignupEmailRequest(email: email, handle: handle, proofDigest: proofDigest, issuedAt: now, expiresAt: now.addingTimeInterval(lifetime))
+        try await store.persistSignupEmailRequest(email: email, handle: handle, proofDigest: proofDigest, protectedEnvelope: protectedEnvelope, issuedAt: now, expiresAt: now.addingTimeInterval(lifetime))
         return SignupEmailRequestOutcome()
     }
 }

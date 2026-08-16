@@ -36,13 +36,16 @@ public enum AccountLifecycleAuthorizationRole: String, Sendable, Equatable {
 public struct AccountLifecycleCapability: Sendable, Equatable {
     public let role: AccountLifecycleAuthorizationRole
     public let subjectDID: String?
-    fileprivate init(role: AccountLifecycleAuthorizationRole, subjectDID: String?) {
-        self.role = role
-        self.subjectDID = subjectDID
+    public let nonce: Data
+    public let expiresAt: Date
+    public let action: String
+    public let stepUpDigest: Data
+    fileprivate init(role: AccountLifecycleAuthorizationRole, subjectDID: String?, nonce: Data, expiresAt: Date, action: String, stepUpDigest: Data) {
+        self.role = role; self.subjectDID = subjectDID; self.nonce = nonce; self.expiresAt = expiresAt; self.action = action; self.stepUpDigest = stepUpDigest
     }
 
-    public func permits(did: String) -> Bool {
-        role == .operatorRole || subjectDID == did
+    public func permits(did: String, action: String, now: Date) -> Bool {
+        expiresAt > now && self.action == action && !nonce.isEmpty && !stepUpDigest.isEmpty && (role == .operatorRole || subjectDID == did)
     }
 }
 
@@ -50,6 +53,7 @@ public struct AccountLifecycleCapability: Sendable, Equatable {
 /// capability. XRPC callers cannot construct one from a role string.
 public protocol AccountLifecycleCapabilityVerifier: Sendable {
     func verify(role: AccountLifecycleAuthorizationRole, subjectDID: String?, sessionDigest: Data, stepUpReceipt: Data, now: Date) async throws -> AccountLifecycleCapability
+    func consume(_ capability: AccountLifecycleCapability, action: String, now: Date) async throws
 }
 
 public struct SwanAccountLifecycleXRPCAdapter: Sendable {
@@ -76,27 +80,37 @@ public struct SwanAccountLifecycleXRPCAdapter: Sendable {
     }
 
     public func activate(did: String, capability: AccountLifecycleCapability, now: Date = Date()) async throws -> AccountControlAccount {
-        guard capability.role == .operatorRole else { throw SwanError.unavailable("operator authorization required") }
+        guard let capabilityVerifier else { throw SwanError.unavailable("lifecycle authorization unavailable") }
+        guard capability.permits(did: did, action: "activate", now: now), capability.role == .operatorRole else { throw SwanError.unavailable("operator authorization required") }
+        try await capabilityVerifier.consume(capability, action: "activate", now: now)
         return try await lifecycle.activate(did: did, now: now)
     }
 
     public func status(did: String, capability: AccountLifecycleCapability) async throws -> AccountControlAccount? {
-        guard capability.permits(did: did) else { throw SwanError.unavailable("account authorization required") }
+        guard let capabilityVerifier else { throw SwanError.unavailable("lifecycle authorization unavailable") }
+        guard capability.permits(did: did, action: "status", now: Date()) else { throw SwanError.unavailable("account authorization required") }
+        try await capabilityVerifier.consume(capability, action: "status", now: Date())
         return try await lifecycle.status(did: did)
     }
 
     public func deactivate(did: String, capability: AccountLifecycleCapability, now: Date = Date()) async throws -> AccountControlAccount {
-        guard capability.permits(did: did) else { throw SwanError.unavailable("account authorization required") }
+        guard let capabilityVerifier else { throw SwanError.unavailable("lifecycle authorization unavailable") }
+        guard capability.permits(did: did, action: "deactivate", now: now) else { throw SwanError.unavailable("account authorization required") }
+        try await capabilityVerifier.consume(capability, action: "deactivate", now: now)
         return try await lifecycle.deactivate(did: did, now: now)
     }
 
     public func delete(did: String, capability: AccountLifecycleCapability, now: Date = Date()) async throws -> AccountDeletionJob {
-        guard capability.permits(did: did) else { throw SwanError.unavailable("account authorization required") }
+        guard let capabilityVerifier else { throw SwanError.unavailable("lifecycle authorization unavailable") }
+        guard capability.permits(did: did, action: "delete", now: now) else { throw SwanError.unavailable("account authorization required") }
+        try await capabilityVerifier.consume(capability, action: "delete", now: now)
         return try await lifecycle.delete(did: did, now: now)
     }
 
-    public func invite(code: String, capability: AccountLifecycleCapability, expiresAt: Date? = nil) throws -> SignupInviteIssue {
-        guard capability.role == .operatorRole else { throw SwanError.unavailable("operator authorization required") }
+    public func invite(code: String, capability: AccountLifecycleCapability, expiresAt: Date? = nil) async throws -> SignupInviteIssue {
+        guard let capabilityVerifier else { throw SwanError.unavailable("lifecycle authorization unavailable") }
+        guard capability.permits(did: capability.subjectDID ?? "", action: "invite", now: Date()), capability.role == .operatorRole else { throw SwanError.unavailable("operator authorization required") }
+        try await capabilityVerifier.consume(capability, action: "invite", now: Date())
         return try lifecycle.invite(code: code, expiresAt: expiresAt)
     }
 }
