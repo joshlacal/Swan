@@ -694,11 +694,18 @@ public struct SignupEmailRequestService: Sendable {
         self.store = store
     }
 
-    public func request(email: AccountEmailAddress, handle: String, code: String, proof: SignupEmailProofService, now: Date = Date(), lifetime: TimeInterval = 600, keyVersion: UInt8 = 1) async throws -> SignupEmailRequestOutcome {
+    public func request(email: AccountEmailAddress, handle: String, proof: SignupEmailProofService, now: Date = Date(), lifetime: TimeInterval = 600, keyVersion: UInt8 = 1) async throws -> SignupEmailRequestOutcome {
+        var generator = SystemRandomNumberGenerator()
+        let bytes = Data((0 ..< 24).map { _ in UInt8.random(in: 0 ... 255, using: &generator) })
+        let code = bytes.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
         let digest = try proof.digest(code: code, email: email, handle: handle)
         let deliveryID = "signup-" + digest.map { String(format: "%02x", $0) }.joined()
         let envelope = try proof.protectedEnvelope(code: code, email: email, handle: handle, deliveryID: deliveryID, keyVersion: keyVersion)
         return try await request(email: email, handle: handle, proofDigest: digest, protectedEnvelope: envelope, now: now, lifetime: lifetime)
+    }
+
+    fileprivate func verifySubmittedCode(_ code: String, email: AccountEmailAddress, handle: String, proof: SignupEmailProofService) throws -> Data {
+        try proof.digest(code: code, email: email, handle: handle)
     }
 
     private func request(email: AccountEmailAddress, handle: String, proofDigest: Data, protectedEnvelope: Data, now: Date, lifetime: TimeInterval) async throws -> SignupEmailRequestOutcome {
