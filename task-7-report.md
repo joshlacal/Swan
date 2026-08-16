@@ -13,6 +13,7 @@
   - Durable replay, factor-token, WebAuthn challenge lookup, and audit-store contracts.
 - `Sources/SwanSQLite/AccountFactorStore.swift`
   - SQLite implementations for factor metadata, generic/WebAuthn challenges, TOTP envelopes/replay state, recovery digests, WebAuthn credential metadata, durable tokens/audit events, and atomic CAS/consume operations.
+  - Save, reservation, replay-CAS, and assertion/enrollment transactions enforce active parent factor kind; cryptographic inputs are bounded before hashing/parsing.
   - WebAuthn assertion CAS plus challenge consumption is one transaction; enrollment reloads and validates the durable enrollment context, then consumes challenge plus inserts credential atomically. TOTP/recovery/WebAuthn atomic paths re-check active parent factor kind in SQL. Missing/invalid challenge-purpose context is corruption, never an assertion default.
 - `Tests/SwanAccountsTests/Task7MFATests.swift`
   - RFC vectors, drift/replay/concurrency, recovery single-use, token/policy, WebAuthn registration/assertion negative cases, and SQLite durable round-trip/CAS coverage.

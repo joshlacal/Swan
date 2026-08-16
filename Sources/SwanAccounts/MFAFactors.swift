@@ -187,6 +187,9 @@ public actor FactorTokenService {
             else { valid = false }
         }
         guard valid else { throw MFAError.stepUpRequired }
+        let verifiedAt: Date
+        if case let .stepUpMFA(_, date) = strength { verifiedAt = date } else { throw MFAError.stepUpRequired }
+        guard verifiedAt <= now, now.timeIntervalSince(verifiedAt) <= 600 else { throw MFAError.stepUpRequired }
         let token = randomBytes(count: 32).base64URLEncodedString(); let digest = Data(SHA256.hash(data: Data(token.utf8)))
         let expires = now.addingTimeInterval(lifetime)
         try await store.saveFactorToken(try DurableFactorTokenRecord(digest: digest, accountDID: accountDID, sessionID: sessionID, purpose: purpose.rawValue, factor: factor, strength: strength, issuedAt: now, expiresAt: expires), now: now)
@@ -297,6 +300,7 @@ public struct WebAuthnVerifier: Sendable {
     }
 
     public func verify(assertion: WebAuthnAssertion, accountDID: String, challenge: Data, purpose: FactorChallengePurpose = .assertion, now: Date) async throws -> WebAuthnVerificationResult {
+        guard assertion.credentialID.count <= 1024, assertion.clientDataJSON.count <= 4096, assertion.authenticatorData.count <= 4096, assertion.signature.count <= 512, challenge.count <= 256 else { throw MFAError.invalidChallenge }
         let credentialDigest = Data(SHA256.hash(data: assertion.credentialID))
         guard let credential = try await credentialStore.webAuthnCredential(credentialIDDigest: credentialDigest, accountDID: accountDID, now: now), credential.disabledAt == nil else { throw MFAError.credentialNotFound }
         guard try await factorStore.listFactors(accountDID: accountDID, now: now).contains(where: { $0.id == credential.factorID && $0.kind == .passkey && $0.disabledAt == nil }) else { throw MFAError.credentialNotFound }
@@ -335,7 +339,7 @@ public struct WebAuthnVerifier: Sendable {
         guard data.count >= 8 && data[0] == 0x30 else { throw MFAError.invalidSignature }
         var i = 1
         func length() throws -> Int { guard i < data.count else { throw MFAError.invalidSignature }; let b = data[i]; i += 1; guard b & 0x80 == 0 else { throw MFAError.invalidSignature }; return Int(b) }
-        func integer() throws -> Data { guard i < data.count && data[i] == 0x02 else { throw MFAError.invalidSignature }; i += 1; let n = try length(); guard n > 0, n <= 33, i + n <= data.count else { throw MFAError.invalidSignature }; let value = Data(data[i ..< i + n]); i += n; guard value[0] & 0x80 == 0, !(n > 1 && value[0] == 0 && value[1] & 0x80 == 0) else { throw MFAError.invalidSignature }; return value }
+        func integer() throws -> Data { guard i < data.count && data[i] == 0x02 else { throw MFAError.invalidSignature }; i += 1; let n = try length(); guard n > 0, n <= 33, i + n <= data.count else { throw MFAError.invalidSignature }; let value = Data(data[i ..< i + n]); i += n; guard value[0] & 0x80 == 0, !(n > 1 && value[0] == 0 && value[1] & 0x80 == 0), !(n == 33 && (value[0] != 0 || value[1] & 0x80 == 0)) else { throw MFAError.invalidSignature }; return value }
         let total = try length(); guard total == data.count - i else { throw MFAError.invalidSignature }; let r = try integer(); let s = try integer(); guard i == data.count, r.count <= 33, s.count <= 33 else { throw MFAError.invalidSignature }
         let rawR = r.count == 33 ? Data(r.dropFirst()) : Data(repeating: 0, count: 32 - r.count) + r
         let rawS = s.count == 33 ? Data(s.dropFirst()) : Data(repeating: 0, count: 32 - s.count) + s
