@@ -231,9 +231,10 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
                 guard task4Text(row, "request_id") == authorization.requestID else { throw AccountControlStoreError.duplicateDID }
                 let stored = try await connection.query("SELECT input_digest FROM signup_authorization_reservations WHERE authorization_id=?", [.text(authorization.id.rawValue)])
                 guard task4BlobValue(stored.first, "input_digest") == inputDigest else { throw AccountControlStoreError.duplicateDID }
-                _ = try await connection.query("UPDATE signup_authorization_reservations SET reserved_until=? WHERE authorization_id=?", [.integer(lease), .text(authorization.id.rawValue)])
-                if let invite = authorization.inviteDigest { _ = try await connection.query("UPDATE signup_invite_reservations SET reserved_until=? WHERE invite_digest=? AND authorization_id=? AND EXISTS(SELECT 1 FROM signup_invites WHERE invite_digest=? AND redeemed_at IS NULL AND (expires_at IS NULL OR expires_at>?))", [.integer(lease), task4Blob(invite), .text(authorization.id.rawValue), task4Blob(invite), .integer(current)]) }
-                if let proof = authorization.emailProofDigest { _ = try await connection.query("UPDATE signup_email_proof_reservations SET reserved_until=? WHERE proof_digest=? AND authorization_id=? AND EXISTS(SELECT 1 FROM signup_email_proofs WHERE proof_digest=? AND consumed_at IS NULL AND expires_at>?)", [.integer(lease), task4Blob(proof), .text(authorization.id.rawValue), task4Blob(proof), .integer(current)]) }
+                guard try await connection.query("UPDATE signup_authorizations SET lease_expires_at=? WHERE authorization_id=? AND request_id=? AND state IN('issued','failed') AND expires_at>? RETURNING authorization_id", [.integer(lease), .text(authorization.id.rawValue), .text(authorization.requestID), .integer(current)]).count == 1 else { throw SwanError.expired }
+                guard try await connection.query("UPDATE signup_authorization_reservations SET reserved_until=? WHERE authorization_id=? RETURNING authorization_id", [.integer(lease), .text(authorization.id.rawValue)]).count == 1 else { throw SwanError.expired }
+                if let invite = authorization.inviteDigest { guard try await connection.query("UPDATE signup_invite_reservations SET reserved_until=? WHERE invite_digest=? AND authorization_id=? AND EXISTS(SELECT 1 FROM signup_invites WHERE invite_digest=? AND redeemed_at IS NULL AND (expires_at IS NULL OR expires_at>?)) RETURNING invite_digest", [.integer(lease), task4Blob(invite), .text(authorization.id.rawValue), task4Blob(invite), .integer(current)]).count == 1 else { throw SwanError.expired } }
+                if let proof = authorization.emailProofDigest { guard try await connection.query("UPDATE signup_email_proof_reservations SET reserved_until=? WHERE proof_digest=? AND authorization_id=? AND EXISTS(SELECT 1 FROM signup_email_proofs WHERE proof_digest=? AND consumed_at IS NULL AND expires_at>?) RETURNING proof_digest", [.integer(lease), task4Blob(proof), .text(authorization.id.rawValue), task4Blob(proof), .integer(current)]).count == 1 else { throw SwanError.expired } }
                 return
             }
             if let digest = authorization.inviteDigest {
@@ -321,11 +322,15 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
 
     public func purgeExpiredSignupState(now: Date) async throws {
         let current = try task4Timestamp(now)
+        let retention = max(0, current - 30 * 24 * 60 * 60 * 1_000_000)
         try await withConnectionGate { try await transaction {
             _ = try await connection.query("DELETE FROM signup_invite_reservations WHERE reserved_until<=?", [.integer(current)])
             _ = try await connection.query("DELETE FROM signup_email_proof_reservations WHERE reserved_until<=?", [.integer(current)])
             _ = try await connection.query("DELETE FROM signup_authorization_reservations WHERE reserved_until<=?", [.integer(current)])
             _ = try await connection.query("DELETE FROM signup_email_proofs WHERE expires_at<=? AND consumed_at IS NULL", [.integer(current)])
+            _ = try await connection.query("DELETE FROM signup_authorization_results WHERE committed_at<=?", [.integer(retention)])
+            _ = try await connection.query("DELETE FROM signup_authorizations WHERE state IN('failed','committed') AND expires_at<=?", [.integer(retention)])
+            _ = try await connection.query("DELETE FROM signup_email_request_outbox WHERE (state IN('delivered','failed') AND COALESCE(delivered_at,expires_at)<=?) OR expires_at<=?", [.integer(retention), .integer(current)])
         } }
     }
 }

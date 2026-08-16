@@ -302,6 +302,10 @@ public protocol AuthenticatedSMTPTransport: Sendable {
     func deliver(configuration: AuthenticatedSMTPConfiguration, to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String) async throws
 }
 
+public protocol AuthenticatedSMTPDeadlineTransport: AuthenticatedSMTPTransport {
+    func deliver(configuration: AuthenticatedSMTPConfiguration, to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String, deadline: ContinuousClock.Instant) async throws
+}
+
 /// Concrete transport seam for the NIO SMTP implementation. A TLS session
 /// must report the hostname authenticated by certificate validation before
 /// this adapter permits SMTP AUTH; callers cannot downgrade that check.
@@ -317,13 +321,17 @@ public protocol SMTPTLSConnectionWithDeadline: SMTPTLSConnection {
     func send(to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String, deadline: ContinuousClock.Instant) async throws
 }
 
-public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPTransport {
+public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPDeadlineTransport {
     private let connect: @Sendable (AuthenticatedSMTPConfiguration) async throws -> any SMTPTLSConnectionWithDeadline
     public init(connect: @escaping @Sendable (AuthenticatedSMTPConfiguration) async throws -> any SMTPTLSConnectionWithDeadline) {
         self.connect = connect
     }
 
     public func deliver(configuration: AuthenticatedSMTPConfiguration, to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String) async throws {
+        try await deliver(configuration: configuration, to: to, subject: subject, body: body, idempotencyKey: idempotencyKey, deadline: .now.advanced(by: .seconds(30)))
+    }
+
+    public func deliver(configuration: AuthenticatedSMTPConfiguration, to: AccountEmailAddress, subject: String, body: String, idempotencyKey: String, deadline: ContinuousClock.Instant) async throws {
         guard configuration.mode != .plaintextLab else { throw MailpitSMTPDeliveryError.invalidConfiguration }
         let connection = try await connect(configuration)
         if configuration.mode != .plaintextLab {
@@ -331,7 +339,7 @@ public struct AuthenticatedSMTPNetworkTransport: AuthenticatedSMTPTransport {
             guard let username = configuration.username, let password = configuration.password, let mechanism = configuration.mechanism else { throw MailpitSMTPDeliveryError.invalidConfiguration }
             try await connection.authenticate(username: username, password: password, mechanism: mechanism)
         }
-        try await connection.send(to: to, subject: subject, body: body, idempotencyKey: idempotencyKey, deadline: .now.advanced(by: .seconds(30)))
+        try await connection.send(to: to, subject: subject, body: body, idempotencyKey: idempotencyKey, deadline: deadline)
     }
 }
 
@@ -362,17 +370,13 @@ public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
     public func deliver(to: AccountEmailAddress, subject: String, body: String, idempotencyKey key: String) async throws {
         guard !key.isEmpty, !subject.contains("\r"), !subject.contains("\n"), body.utf8.count <= 32768 else { throw MailpitSMTPDeliveryError.invalidMessage }
         var last: Error?
+        guard let deadlineTransport = transport as? any AuthenticatedSMTPDeadlineTransport else { throw MailpitSMTPDeliveryError.invalidConfiguration }
         let transport = self.transport
         let configuration = self.configuration
         let attemptTimeout = self.attemptTimeout
         for attempt in 0 ..< configuration.maximumAttempts {
             do {
-                try await withThrowingTaskGroup(of: Void.self) { group in
-                    group.addTask { try await transport.deliver(configuration: configuration, to: to, subject: subject, body: body, idempotencyKey: key) }
-                    group.addTask { try await Task.sleep(for: attemptTimeout); throw MailpitSMTPDeliveryError.timedOut }
-                    defer { group.cancelAll() }
-                    try await group.next()!
-                }
+                try await deadlineTransport.deliver(configuration: configuration, to: to, subject: subject, body: body, idempotencyKey: key, deadline: .now.advanced(by: attemptTimeout))
                 return
             } catch {
                 if Task.isCancelled { throw CancellationError() }
