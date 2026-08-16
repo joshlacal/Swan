@@ -219,6 +219,12 @@ public struct SpaceGrant: Codable, Sendable, Equatable {
 public enum AuthorizationContext: Sendable, Equatable {
     case `public`
     case accountOAuth(subject: String, scopes: Set<String>)
+    /// An opaque, revocable management session used only by `/account/api/*`.
+    /// It is never accepted as an XRPC bearer or permissioned-space grant.
+    case accountManagement(subject: String, sessionID: ManagementSessionID, strength: AuthenticationStrength)
+    /// A legacy/app-password session is a sibling credential family to OAuth;
+    /// it is deliberately denied by permissioned-space policy.
+    case accountLegacySession(subject: String, sessionID: LegacySessionID, scopes: Set<String>)
     /// A short-lived, signature-verified user-to-space-host delegation. This
     /// context exists only while the authority evaluates whether that user may
     /// exchange it for a read credential. It is deliberately not a repository
@@ -264,6 +270,8 @@ public enum SpaceAuthorizationPolicy {
             else {
                 throw SwanError.unauthorized("OAuth scope does not cover this space operation")
             }
+        case .accountManagement, .accountLegacySession:
+            throw SwanError.unauthorized("account session cannot access permissioned repositories")
         case let .service(_, audience):
             guard permission == .read, audience == space.authority else {
                 throw SwanError.unauthorized("service authentication is read-only")
