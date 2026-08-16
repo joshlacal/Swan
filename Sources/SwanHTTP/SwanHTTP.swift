@@ -790,6 +790,13 @@ public struct SwanHTTPServer: Sendable {
     /// supported server assembly boundary.
     public func buildRouter() -> Router<SwanHTTPRequestContext> {
         let router = Router(context: SwanHTTPRequestContext.self)
+        // MUST precede every route registration below. Hummingbird bakes the
+        // middleware stack into each responder as the route is added
+        // (`Router.swift:90`), so a middleware registered later silently binds
+        // to nothing. Registering it first also covers the not-found responder
+        // (`Router.swift:70`), which is the exact path a preflight takes when
+        // a path matches but the method has no responder.
+        router.add(middleware: SwanCORSMiddleware<SwanHTTPRequestContext>())
         let requestBodyAdmission = SwanRequestBodyAdmissionConfiguration(
             admission: jsonWriteAdmission,
             policy: jsonWriteBodyPolicy
