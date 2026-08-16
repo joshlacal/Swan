@@ -124,3 +124,5 @@ Retention correction purges expired issued authorizations/owned reservations, co
 Verification correction adds a persisted proof verifier that recomputes HMAC over submitted code/email/handle, requires an authorization-owned live reservation, and applies bounded attempts. Reservation/proof purge deletes use bounded key subqueries.
 
 Final review correction wires the persisted verifier into `SignupService.authorize` when injected, fixes the sixth-attempt bypass, caps the attempt dictionary at 4096 with fail-closed admission, and caps SMTP attempt timeout at 300 seconds. `swift build --target SwanAccounts` completed successfully with pre-existing warnings.
+
+Latest correction requires the proof verifier/service for `openProtected`, performs verification after the authorization-owned reservation is created, keys attempts by proof digest rather than authorization ID, adds the verification code to the typed peer overload, and rejects explicit Turnstile ports including `:443`. `BoundedSignupEmailProofVerifier` is now the production injectable implementation.

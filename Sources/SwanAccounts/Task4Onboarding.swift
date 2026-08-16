@@ -262,11 +262,11 @@ public struct URLSessionTurnstileTransport: TurnstileHTTPTransport {
     public init(endpoint: URL = URL(string: "https://challenges.cloudflare.com/turnstile/v0/siteverify")!, timeout: TimeInterval = 5) throws {
         guard endpoint.scheme?.lowercased() == "https",
               endpoint.host?.lowercased() == "challenges.cloudflare.com",
-              endpoint.port.map { $0 == 443 } ?? true,
-            endpoint.user == nil, endpoint.password == nil,
-            endpoint.query == nil, endpoint.fragment == nil,
-            endpoint.path == "/turnstile/v0/siteverify",
-            timeout.isFinite, (0.1 ... 30).contains(timeout) else { throw SwanError.invalidIdentifier("Turnstile endpoint") }
+              endpoint.port == nil,
+              endpoint.user == nil, endpoint.password == nil,
+              endpoint.query == nil, endpoint.fragment == nil,
+              endpoint.path == "/turnstile/v0/siteverify",
+              timeout.isFinite, (0.1 ... 30).contains(timeout) else { throw SwanError.invalidIdentifier("Turnstile endpoint") }
         self.endpoint = endpoint; self.timeout = timeout
     }
 
@@ -628,10 +628,7 @@ public struct SignupService: Sendable {
         guard policy.policy.permitsPublicSignup, input.isTrustedBucket else { throw SignupServiceError.closed }
         guard lifetime.isFinite, (1 ... 900).contains(lifetime) else { throw SwanError.invalidIdentifier("signup authorization lifetime") }
         guard input.email != nil, input.emailProofDigest != nil else { throw SignupServiceError.emailProofRequired }
-        if let verificationCode, let verifier = proofVerifier, let proofService, let email = input.email {
-            let digest = try await verifier.verifySubmittedCode(verificationCode, email: email, handle: input.handle, authorizationID: input.authorizationID, proof: proofService, now: now)
-            guard digest == input.emailProofDigest else { throw SignupServiceError.emailProofRequired }
-        } else if proofVerifier != nil { throw SignupServiceError.emailProofRequired }
+        if policy.policy == .openProtected { guard proofVerifier != nil, proofService != nil, verificationCode != nil else { throw SignupServiceError.emailProofRequired } }
         guard policy.permits(handle: input.handle, inviteCode: input.inviteDigest == nil ? nil : "present") else { throw SignupServiceError.inviteRequired }
         if policy.policy == .inviteRequired {
             guard let rateAdmission, try await rateAdmission.permits(bucket: input.clientIPBucketDigest, now: now) else { throw SignupServiceError.inviteRequired }
@@ -645,14 +642,18 @@ public struct SignupService: Sendable {
         guard AccountControlIdentifiers.isDID(input.identityDID) else { throw SignupServiceError.invalidIdentity }
         let authorization = try SignupAuthorization(id: input.authorizationID, requestID: input.requestID, policy: policy.policy, handle: input.handle, email: input.email?.value, identityDID: input.identityDID, emailProofDigest: input.emailProofDigest, inviteDigest: input.inviteDigest, clientIPBucketDigest: input.clientIPBucketDigest, issuedAt: now, expiresAt: now.addingTimeInterval(lifetime), leaseExpiresAt: now.addingTimeInterval(120))
         try await store.reserve(authorization, now: now)
+        if let verificationCode, let verifier = proofVerifier, let proofService, let email = input.email {
+            let digest = try await verifier.verifySubmittedCode(verificationCode, email: email, handle: input.handle, authorizationID: input.authorizationID, proof: proofService, now: now)
+            guard digest == input.emailProofDigest else { throw SignupServiceError.emailProofRequired }
+        }
         return authorization
     }
 
-    public func authorize(requestID: String, authorizationID: SignupAuthorizationID, handle: String, email: AccountEmailAddress?, identityDID: String, emailProofDigest: Data?, inviteDigest: Data?, turnstileToken: String? = nil, peerAddress: SocketAddress, extractor: any SignupTrustedPeerIPExtractor, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupAuthorization {
+    public func authorize(requestID: String, authorizationID: SignupAuthorizationID, handle: String, email: AccountEmailAddress?, identityDID: String, emailProofDigest: Data?, inviteDigest: Data?, verificationCode: String?, turnstileToken: String? = nil, peerAddress: SocketAddress, extractor: any SignupTrustedPeerIPExtractor, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupAuthorization {
         guard let peerIP = peerAddress.ipAddress else { throw SwanError.invalidIdentifier("peer address") }
         let bucket = try extractor.bucket(forCanonicalPeerIP: peerIP)
         let input = try SignupAuthorizationInput.make(requestID: requestID, authorizationID: authorizationID, handle: handle, email: email, identityDID: identityDID, emailProofDigest: emailProofDigest, inviteDigest: inviteDigest, peer: bucket)
-        return try await authorize(input, turnstileToken: turnstileToken, remoteIP: peerIP, now: now, lifetime: lifetime)
+        return try await authorize(input, verificationCode: verificationCode, turnstileToken: turnstileToken, remoteIP: peerIP, now: now, lifetime: lifetime)
     }
 
     public func finalize(_ request: SignupFinalizationRequest, now: Date = Date()) async throws -> SignupFinalizationResult {
@@ -727,7 +728,7 @@ public protocol SignupEmailProofVerifier: Sendable {
     func verifySubmittedCode(_ code: String, email: AccountEmailAddress, handle: String, authorizationID: SignupAuthorizationID, proof: SignupEmailProofService, now: Date) async throws -> Data
 }
 
-public actor BoundedSignupEmailProofVerifier {
+public actor BoundedSignupEmailProofVerifier: SignupEmailProofVerifier {
     private let store: any SignupEmailProofVerifier
     private var attempts: [String: (started: Date, count: Int)] = [:]
     public init(store: any SignupEmailProofVerifier) {
@@ -735,7 +736,7 @@ public actor BoundedSignupEmailProofVerifier {
     }
 
     public func verifySubmittedCode(_ code: String, email: AccountEmailAddress, handle: String, authorizationID: SignupAuthorizationID, proof: SignupEmailProofService, now: Date = Date()) async throws -> Data {
-        let key = "\(authorizationID.rawValue)\0\(email.value)"
+        let key = try "\(proof.digest(code: code, email: email, handle: handle).base64EncodedString())\0\(email.value)"
         attempts = attempts.filter { now.timeIntervalSince($0.value.started) < 900 }
         guard attempts[key] != nil || attempts.count < 4096 else { throw SwanError.unavailable("email proof capacity") }
         if let current = attempts[key] {

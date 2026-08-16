@@ -165,7 +165,7 @@ extension SQLiteControlDatabase: SignupAtomicFinalizationStore, SignupEmailReque
         let digest = try proof.digest(code: code, email: email, handle: handle)
         let current = try task4Timestamp(now)
         return try await withConnectionGate {
-            let rows = try await connection.query("SELECT proof_digest FROM signup_email_proofs WHERE proof_digest=? AND email=? AND handle=? AND consumed_at IS NULL AND expires_at>?", [task4Blob(digest), .text(email.value), .text(handle), .integer(current)])
+            let rows = try await connection.query("SELECT p.proof_digest FROM signup_email_proofs p JOIN signup_email_proof_reservations r ON r.proof_digest=p.proof_digest WHERE p.proof_digest=? AND p.email=? AND p.handle=? AND p.consumed_at IS NULL AND p.expires_at>? AND r.authorization_id=? AND r.reserved_until>?", [task4Blob(digest), .text(email.value), .text(handle), .integer(current), .text(authorizationID.rawValue), .integer(current)])
             guard rows.count == 1 else { throw AccountControlStoreError.invalidInput }
             return digest
         }
