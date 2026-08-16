@@ -7,7 +7,7 @@ import SwanStorage
 extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, RecoveryCodeStore, WebAuthnCredentialStore, WebAuthnChallengeStore, WebAuthnChallengeLookupStore, WebAuthnAtomicVerificationStore, WebAuthnEnrollmentStore, TOTPReplayStore, DurableFactorTokenStore, MFAAuditStore {
     public func listFactors(accountDID: String, now: Date) async throws -> [AuthenticationFactorMetadata] {
         return try await withConnectionGate {
-            let rows = try await connection.query("SELECT factor_id, account_did, kind, label, lookup_digest, created_at, last_used_at, disabled_at FROM authentication_factors WHERE account_did = ? AND created_at <= ? AND disabled_at IS NULL ORDER BY created_at, factor_id", [.text(accountDID), .integer(try factorTimestamp(now)), .integer(try factorTimestamp(now))])
+            let rows = try await connection.query("SELECT factor_id, account_did, kind, label, lookup_digest, created_at, last_used_at, disabled_at FROM authentication_factors WHERE account_did = ? AND created_at <= ? AND disabled_at IS NULL ORDER BY created_at, factor_id", [.text(accountDID), .integer(try factorTimestamp(now))])
             return try rows.map(decodeFactor)
         }
     }
@@ -24,7 +24,7 @@ extension SQLiteControlDatabase: AuthenticationFactorStore, TOTPSecretStore, Rec
     }
 
     public func reserveChallenge(_ challenge: FactorChallenge, now: Date) async throws {
-        guard challenge.issuedAt <= now, challenge.expiresAt > now, (challenge.purpose == .enrollment ? challenge.credentialIDDigest == nil : challenge.credentialIDDigest != nil) else { throw AccountControlStoreError.invalidInput }
+        guard challenge.issuedAt <= now, challenge.expiresAt > now else { throw AccountControlStoreError.invalidInput }
         try await withConnectionGate { if let factorID = challenge.factorID { let parent = try await connection.query("SELECT factor_id FROM authentication_factors WHERE factor_id = ? AND account_did = ? AND disabled_at IS NULL AND kind IN ('totp','passkey','recoveryCode')", [.text(factorID), .text(challenge.accountDID)]); guard !parent.isEmpty else { throw AccountControlStoreError.notFound } }; _ = try await connection.query("INSERT INTO factor_challenges(challenge_digest, account_did, factor_id, purpose, issued_at, expires_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [challenge.challengeDigest.sqliteData!, .text(challenge.accountDID), challenge.factorID.map(SQLiteData.text) ?? .null, .text(challenge.purpose.rawValue), .integer(try factorTimestamp(challenge.issuedAt)), .integer(try factorTimestamp(challenge.expiresAt)), try optionalTimestamp(challenge.consumedAt)]) }
     }
 
