@@ -91,3 +91,23 @@ limit. Re-run the focused tests with the integration owner's consolidated
 scratch path after the other workspace builds finish.
 
 No push, deployment, external network flow, or production mutation was run.
+
+## Final MFA timing correction (2026-08-16)
+
+The MFA full-access test was constructing a synthetic-clock session and then
+verifying it against wall-clock time. The test now passes the same injected
+epoch through password-session creation, refresh, get-session, and service-auth
+verification. The access-token verifier remains strict: integer `iat`/`exp`,
+positive lifetime, one-hour maximum, and expiry checked against the supplied
+clock; no assertion was weakened and the `grant=fullAccessV1, scope=[]`
+invariant is unchanged.
+
+Evidence from this lane:
+
+- `swift test --filter ScopedLegacyAuthTests`: 11 tests, 0 failures.
+- `swift test --filter SwanXRPCProxyRoutingTests --skip-build`: 17 tests, 0 failures.
+- `swift build --target SwanStorage`: passed.
+
+The commands emitted only existing pkg-config/libsodium deployment-target
+warnings. The integration owner should rerun the consolidated Linux/toolchain
+gate and apply the router/authorization-context handoff above.

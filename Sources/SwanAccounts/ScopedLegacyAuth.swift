@@ -164,9 +164,12 @@ public struct HMACLegacyTokenIssuer: LegacyTokenIssuer, Sendable {
     }
     public func verifyAccess(_ token: String, now: Date) throws -> LegacyAccessClaims {
         let payload = try verify(token)
+        let nowEpoch = Int(now.timeIntervalSince1970)
         guard payload["kind"] as? String == "access", let grantValue = payload["grant"] as? String, let grant = LegacyAccessGrant(rawValue: grantValue), payload["iss"] as? String == issuer, payload["aud"] == nil, payload["lxm"] == nil, let sub = payload["sub"] as? String, let sid = payload["sid"] as? String,
               let iat = payload["iat"] as? Int, let exp = payload["exp"] as? Int, let jti = payload["jti"] as? String,
-              iat <= Int(now.timeIntervalSince1970) + 1, exp > iat, exp > Int(now.timeIntervalSince1970), exp - iat <= Int(LegacyAuthService.accessLifetime), let sessionID = try? LegacySessionID(rawValue: sid), !jti.isEmpty else { throw SwanError.unauthorized("invalid access token") }
+              iat <= nowEpoch + 1, exp > iat, exp > nowEpoch, exp - iat <= Int(LegacyAuthService.accessLifetime), let sessionID = try? LegacySessionID(rawValue: sid), !jti.isEmpty else {
+            throw SwanError.unauthorized("invalid access token")
+        }
         let scopes = Set((payload["scope"] as? String ?? "").split(separator: " ").map(String.init))
         guard LegacyAccessGrant.validateClaims(scopes: scopes, grant: grant),
               scopes.allSatisfy({ (try? SwanScope.parse($0)) != nil }) else { throw SwanError.unauthorized("invalid access grant") }
