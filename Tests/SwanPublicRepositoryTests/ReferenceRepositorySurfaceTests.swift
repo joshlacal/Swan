@@ -27,10 +27,9 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
         let second = try await surface.listRepos(limit: 1, cursor: try XCTUnwrap(first.cursor))
         XCTAssertEqual(second.repos.map(\.did), ["did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"])
 
-        let blockPage = try await surface.getBlocks([blocks[0].cid, blocks[1].cid, blocks[2].cid], limit: 2)
-        XCTAssertEqual(blockPage.blocks.count, 2)
-        XCTAssertNil(blockPage.cursor)
-        XCTAssertEqual(blockPage.missing, [])
+        let blockPage = try await surface.getBlocks([blocks[0].cid, blocks[1].cid, blocks[2].cid], limit: 3)
+        XCTAssertEqual(blockPage.blocks.count, 3)
+        XCTAssertFalse(blockPage.car.isEmpty)
 
         let records = try await surface.listRecords(collection: "app.bsky.feed.post", limit: 1, reverse: true)
         XCTAssertEqual(records.records.count, 1)
@@ -57,8 +56,10 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
             revision: "3jzfc6r5bqg2a",
             blocks: [], records: [], maximumPageSize: 2
         )
-        let page = try await surface.listMissingBlobs([cid, cid], limit: 1)
-        XCTAssertEqual(page.blobs, [cid])
+        let store = TestMissingBlobStore()
+        let surfaceWithStore = try PublicRepositoryReferenceSurface(did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", revision: "3jzfc6r5bqg2a", blocks: [], records: [], missingBlobStore: store, maximumPageSize: 2)
+        let page = try await surfaceWithStore.listMissingBlobs(accountDID: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", limit: 1)
+        XCTAssertEqual(page.blobs.map(\.cid), [cid])
         XCTAssertNil(page.cursor)
     }
 
@@ -70,6 +71,7 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
         let envelope = try PublicRepositoryImportEnvelope.make(
             did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
             rootCID: root,
+            expectedExistingRootCID: root,
             blocks: [.init(cid: root, bytes: bytes)], signature: Data([1]), requestID: "import-1"
         )
         _ = try await verifier.verifyAndCommit(envelope, committer: committer, fullVerifier: FullVerifier(), existingBlobResolver: nil) { did, cid, signature in
@@ -134,6 +136,12 @@ final class ReferenceRepositorySurfaceTests: XCTestCase {
             let cid = CID.fromDAGCBOR(data)
             return PublicRepositoryBlock(cid: cid, bytes: data)
         }
+    }
+}
+
+private actor TestMissingBlobStore: PublicRepositoryMissingBlobStore {
+    func listMissingBlobs(accountDID: String, limit: Int, cursor: String?) async throws -> PublicRepositorySyncBlobPage {
+        .init(blobs: [.init(cid: CID.fromDAGCBOR(Data([0xa0])), recordURI: "at://\(accountDID)/app.bsky.feed.post/a")], cursor: nil)
     }
 }
 

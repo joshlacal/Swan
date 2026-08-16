@@ -14,7 +14,7 @@ final class ModerationServiceAdapterTests: XCTestCase {
             correlationKeyVersion: 1,
             correlationKey: Data(repeating: 4, count: 32)
         )
-        let response = try await adapter.submit(.init(subject: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", reason: "spam", details: "secret details"))
+        let response = try await adapter.submit(.init(subject: .repoRef(did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"), reasonType: "com.atproto.moderation.defs#reasonSpam", reason: "spam", details: "secret details"))
         XCTAssertEqual(response.accepted, true)
         let path = await transport.path
         let body = await transport.body

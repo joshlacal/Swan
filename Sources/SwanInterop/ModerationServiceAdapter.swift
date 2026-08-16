@@ -8,18 +8,24 @@ public struct ModerationTransportRequest: Sendable, Equatable {
     public let path: String
     public let body: Data
     public let maximumResponseBytes: Int
-    public let subject: String
+    public let subject: ModerationSubject
     public let details: String?
 }
 
+public enum ModerationSubject: Sendable, Equatable, Codable {
+    case repoRef(did: String)
+    case strongRef(uri: String)
+}
+
 public struct ModerationReportRequest: Sendable, Equatable {
-    public let subject: String
-    public let reason: String
-    public var reasonType: String { reason }
+    public let subject: ModerationSubject
+    public let reasonType: String
+    public let reason: String?
     public let details: String?
 
-    public init(subject: String, reason: String, details: String? = nil) {
+    public init(subject: ModerationSubject, reasonType: String, reason: String? = nil, details: String? = nil) {
         self.subject = subject
+        self.reasonType = reasonType
         self.reason = reason
         self.details = details
     }
@@ -53,13 +59,14 @@ public struct ModerationReportResult: Sendable, Equatable {
     public let accepted: Bool
     public let status: Int
     public let output: Data
+    public let reportedBy: String?
 }
 
 /// Bounded moderation delivery. Subject and details are sent only as
-/// correlation values produced by a deployment-provided keyed HMAC; unlike a
-/// plain hash this is not guessable from a public DID or short report text.
-/// The trusted moderation transport receives the typed envelope and is solely
-/// responsible for resolving those correlations. Raw values never enter logs.
+/// correlation values produced by a deployment-provided keyed HMAC. The
+/// trusted moderation transport also receives the typed subject/details over
+/// its pinned channel; HMAC values are for log correlation only and are not a
+/// privacy transformation for public identifiers.
 public struct ModerationServiceAdapter: Sendable {
     private let transport: any ModerationTransport
     private let allowedHost: String
@@ -84,16 +91,15 @@ public struct ModerationServiceAdapter: Sendable {
     }
 
     public func submit(_ request: ModerationReportRequest) async throws -> ModerationReportResult {
-        guard (1...128).contains(request.reason.utf8.count),
-              request.reason.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }),
-              !request.subject.isEmpty,
-              request.subject.utf8.count <= 512,
+        guard (1...256).contains(request.reasonType.utf8.count),
+              request.reasonType.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || $0 == "." || $0 == "/" || $0 == "#" }),
               request.details.map({ $0.utf8.count <= maximumBodyBytes }) ?? true else {
             throw ModerationServiceAdapterError.invalidReport
         }
         let envelope = try JSONEncoder().encode(RedactedReport(
-            subjectCorrelation: correlation(for: request.subject),
+            subjectCorrelation: correlation(for: String(describing: request.subject)),
             reason: request.reason,
+            reasonType: request.reasonType,
             detailsCorrelation: request.details.map { correlation(for: $0) },
             keyID: correlationKeyID,
             keyVersion: correlationKeyVersion
@@ -103,7 +109,7 @@ public struct ModerationServiceAdapter: Sendable {
         guard response.peer == pinnedPeer else { throw ModerationServiceAdapterError.peerMismatch }
         guard response.body.count <= maximumResponseBytes else { throw ModerationServiceAdapterError.responseTooLarge }
         guard (200...299).contains(response.status) else { throw ModerationServiceAdapterError.rejected }
-        return .init(accepted: true, status: response.status, output: response.body)
+        return .init(accepted: true, status: response.status, output: response.body, reportedBy: nil)
     }
 
     private func correlation(for value: String) -> String {
@@ -112,15 +118,17 @@ public struct ModerationServiceAdapter: Sendable {
 
     private struct RedactedReport: Codable {
         let subjectCorrelation: String
-        let reason: String
+        let reason: String?
+        let reasonType: String
         let detailsCorrelation: String?
         let schema: String
         let keyID: String
         let keyVersion: Int
 
-        init(subjectCorrelation: String, reason: String, detailsCorrelation: String?, keyID: String, keyVersion: Int) {
+        init(subjectCorrelation: String, reason: String?, reasonType: String, detailsCorrelation: String?, keyID: String, keyVersion: Int) {
             self.subjectCorrelation = subjectCorrelation
             self.reason = reason
+            self.reasonType = reasonType
             self.detailsCorrelation = detailsCorrelation
             self.keyID = keyID
             self.keyVersion = keyVersion

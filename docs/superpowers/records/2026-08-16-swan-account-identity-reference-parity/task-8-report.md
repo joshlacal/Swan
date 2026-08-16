@@ -16,14 +16,16 @@ Local evidence:
 Scripts/test-task8-disposable-drills.sh  # deferred (integration seam unavailable)
 ```
 
-Focused Swift tests cover bounded cursor pages, createdAt+DID keyset ordering,
-missing-blob reference semantics, import digest/signature preflight before
-commit, and the explicit full-CAR/MST verifier seam. Import remains
+Focused Swift tests cover bounded cursor pages, createdAt-key+DID keyset
+ordering, account-bound missing-blob store enumeration, import digest/signature
+preflight before commit, and the explicit full-CAR/MST verifier seam. Import remains
 `assembled: false` until a durable full verifier is injected; the in-memory
 CAS committer is only a conformance model. PLC step-up, operator authorization
-verification, audit-on-success, moderation typed subject/details delivery with
-versioned keyed HMAC correlations, and identifier-free metrics/readiness are
-also covered. Runtime health/metrics and route registration remain deferred.
+verification, audit-on-success, moderation typed repoRef/strongRef subject and
+details delivery over a trusted pinned transport with versioned keyed HMAC log
+correlations, and identifier-free metrics/readiness are also covered. HMAC is
+not claimed to redact public values. Runtime health/metrics and route
+registration remain deferred.
 
 The focused Swift suite was not rerun in this correction: the shared disk was
 under the serialized onboarding rebuild budget. Changed sources and focused

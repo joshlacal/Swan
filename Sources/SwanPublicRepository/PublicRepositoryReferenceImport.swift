@@ -93,6 +93,7 @@ public struct PublicRepositoryReferenceImportVerifier: Sendable {
         func append(_ data: Data) { var n = UInt64(data.count).bigEndian; bytes.append(Data(bytes: &n, count: 8)); bytes.append(data) }
         let normalizedDID = (try? DID(didString: envelope.did)).map { String(describing: $0) } ?? envelope.did
         append(Data(normalizedDID.utf8)); append(Data(envelope.rootCID.bytes)); append(envelope.signature)
+        if let expected = envelope.expectedExistingRootCID { append(Data([1])); append(Data(expected.bytes)) } else { append(Data([0])) }
         for block in envelope.blocks.sorted(by: { $0.cid.description < $1.cid.description }) { append(Data(block.cid.bytes)); append(block.bytes) }
         for cid in envelope.referencedBlobs.sorted(by: { $0.description < $1.description }) { append(Data(cid.bytes)) }
         for block in envelope.blobPayloads.sorted(by: { $0.cid.description < $1.cid.description }) { append(Data(block.cid.bytes)); append(block.bytes) }
