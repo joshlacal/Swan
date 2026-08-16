@@ -126,11 +126,6 @@ public struct LegacyAccessClaims: Sendable, Equatable {
     public let grant: LegacyAccessGrant
 }
 
-public enum LegacyAccessGrant: String, Codable, Sendable, Equatable {
-    case fullAccessV1
-    case scoped
-}
-
 public protocol LegacyTokenIssuer: Sendable {
     func issueAccess(subject: String, sessionID: LegacySessionID, scopes: Set<String>, grant: LegacyAccessGrant, issuedAt: Date, expiresAt: Date) throws -> String
     func verifyAccess(_ token: String, now: Date) throws -> LegacyAccessClaims
@@ -173,7 +168,8 @@ public struct HMACLegacyTokenIssuer: LegacyTokenIssuer, Sendable {
               let iat = payload["iat"] as? Int, let exp = payload["exp"] as? Int, let jti = payload["jti"] as? String,
               iat <= Int(now.timeIntervalSince1970), exp > iat, exp > Int(now.timeIntervalSince1970), exp - iat <= Int(LegacyAuthService.accessLifetime), let sessionID = try? LegacySessionID(rawValue: sid), !jti.isEmpty else { throw SwanError.unauthorized("invalid access token") }
         let scopes = Set((payload["scope"] as? String ?? "").split(separator: " ").map(String.init))
-        guard grant == .fullAccessV1 ? scopes.isEmpty : !scopes.isEmpty else { throw SwanError.unauthorized("invalid access grant") }
+        guard LegacyAccessGrant.validate(scopes: grant == .fullAccessV1 ? [] : scopes, grant: grant),
+              scopes.allSatisfy({ (try? SwanScope.parse($0)) != nil }) else { throw SwanError.unauthorized("invalid access grant") }
         return LegacyAccessClaims(subject: sub, sessionID: sessionID, scopes: scopes, issuedAt: Date(timeIntervalSince1970: TimeInterval(iat)), expiresAt: Date(timeIntervalSince1970: TimeInterval(exp)), tokenID: jti, grant: grant)
     }
     public func issueServiceAuth(subject: String, audience: String, method: String, issuedAt: Date, expiresAt: Date) throws -> String {
@@ -206,7 +202,6 @@ public struct HMACLegacyTokenIssuer: LegacyTokenIssuer, Sendable {
 }
 
 public actor LegacyAuthService {
-    private static let fullAccessMarker = "__swan_fullAccessV1"
     public static let accessLifetime: TimeInterval = 3_600
     public static let refreshLifetime: TimeInterval = 90 * 24 * 3_600
     public static let serviceAuthLifetime: TimeInterval = 60
@@ -294,7 +289,7 @@ public actor LegacyAuthService {
         // Password sessions are deliberately not full-access. The reference
         // server's legacy compatibility grant is represented explicitly and
         // can never be produced by app-password input.
-        let sessionScopes: Set<String> = [Self.fullAccessMarker]
+        let sessionScopes: Set<String> = [LegacyAccessGrant.fullAccessMarker]
         return try await issueSession(account: account, appPassword: nil, scopes: sessionScopes, now: now)
     }
 
@@ -317,9 +312,9 @@ public actor LegacyAuthService {
         }
         let refresh = Self.randomToken(prefix: "rf")
         let replacementID = try LegacySessionID(digest: digest(refresh))
-        let replacement = try LegacySessionMetadata(
-            sessionID: replacementID, familyID: old.familyID, accountDID: old.accountDID,
-            appPasswordID: old.appPasswordID, scopeStrings: newScopes, issuedAt: now,
+        let replacement = try LegacySessionMetadata.validatedGrant(
+            newScopes, sessionID: replacementID, familyID: old.familyID, accountDID: old.accountDID,
+            appPasswordID: old.appPasswordID, issuedAt: now,
             // Family expiry is absolute; refresh never slides it forward.
             expiresAt: old.expiresAt, previousSessionDigest: oldDigest
         )
@@ -329,7 +324,7 @@ public actor LegacyAuthService {
         guard case .rotated = outcome.kind else {
             throw SwanError.unauthorized("refresh token reuse detected")
         }
-        let grant: LegacyAccessGrant = newScopes == [Self.fullAccessMarker] ? .fullAccessV1 : .scoped
+        let grant: LegacyAccessGrant = newScopes == [LegacyAccessGrant.fullAccessMarker] ? .fullAccessV1 : .scoped
         let access = try tokenIssuer.issueAccess(subject: old.accountDID, sessionID: replacementID, scopes: grant == .fullAccessV1 ? [] : newScopes, grant: grant, issuedAt: now, expiresAt: now.addingTimeInterval(Self.accessLifetime))
         return try await makeTokens(access: access, refresh: refresh, session: replacement)
     }
@@ -339,7 +334,9 @@ public actor LegacyAuthService {
         guard let digest = Data(hex: claims.sessionID.rawValue),
               let session = try await store.legacySession(digest: digest, now: now),
               session.accountDID == claims.subject,
-              (session.scopeStrings.contains(Self.fullAccessMarker) ? .fullAccessV1 : .scoped) == claims.grant,
+              (session.scopeStrings.contains(LegacyAccessGrant.fullAccessMarker) ? .fullAccessV1 : .scoped) == claims.grant,
+              LegacyAccessGrant.validate(scopes: claims.scopes, grant: claims.grant),
+              (claims.grant == .fullAccessV1 ? session.scopeStrings == [LegacyAccessGrant.fullAccessMarker] : claims.scopes == session.scopeStrings),
               session.revokedAt == nil, session.expiresAt > now else {
             throw SwanError.unauthorized("invalid access token")
         }
@@ -351,7 +348,9 @@ public actor LegacyAuthService {
         guard let digest = Data(hex: claims.sessionID.rawValue),
               let session = try await store.legacySession(digest: digest, now: now),
               session.accountDID == claims.subject,
-              (session.scopeStrings.contains(Self.fullAccessMarker) ? .fullAccessV1 : .scoped) == claims.grant,
+              (session.scopeStrings.contains(LegacyAccessGrant.fullAccessMarker) ? .fullAccessV1 : .scoped) == claims.grant,
+              LegacyAccessGrant.validate(scopes: claims.scopes, grant: claims.grant),
+              (claims.grant == .fullAccessV1 ? session.scopeStrings == [LegacyAccessGrant.fullAccessMarker] : claims.scopes == session.scopeStrings),
               session.revokedAt == nil, session.expiresAt > now else {
             throw SwanError.unauthorized("invalid access token")
         }
@@ -371,22 +370,23 @@ public actor LegacyAuthService {
         let familyID = Self.randomIdentifier()
         let refresh = Self.randomToken(prefix: "rf")
         let sessionID = try LegacySessionID(digest: digest(refresh))
-        let session = try LegacySessionMetadata(sessionID: sessionID, familyID: familyID, accountDID: account.did, appPasswordID: appPassword?.id, scopeStrings: scopes ?? appPassword?.scopeStrings ?? [], issuedAt: now, expiresAt: now.addingTimeInterval(Self.refreshLifetime))
+        let sessionScopes = scopes ?? appPassword?.scopeStrings ?? []
+        let session = try LegacySessionMetadata.validatedGrant(sessionScopes, sessionID: sessionID, familyID: familyID, accountDID: account.did, appPasswordID: appPassword?.id, issuedAt: now, expiresAt: now.addingTimeInterval(Self.refreshLifetime))
         let family = try LegacySessionFamilyMetadata(familyID: familyID, accountDID: account.did, appPasswordID: appPassword?.id, createdAt: now, expiresAt: session.expiresAt)
         if let appPassword {
             try await store.createLegacySessionFromAppPassword(appPassword, family: family, session: session, sessionDigest: digest(refresh), now: now)
         } else {
             try await store.createLegacySessionFamily(family, session: session, sessionDigest: digest(refresh), now: now)
         }
-        let grant: LegacyAccessGrant = session.scopeStrings == [Self.fullAccessMarker] ? .fullAccessV1 : .scoped
+        let grant: LegacyAccessGrant = session.scopeStrings == [LegacyAccessGrant.fullAccessMarker] ? .fullAccessV1 : .scoped
         let access = try tokenIssuer.issueAccess(subject: account.did, sessionID: sessionID, scopes: grant == .fullAccessV1 ? [] : session.scopeStrings, grant: grant, issuedAt: now, expiresAt: now.addingTimeInterval(Self.accessLifetime))
-        let fullAccess = session.scopeStrings.contains(Self.fullAccessMarker)
+        let fullAccess = session.scopeStrings.contains(LegacyAccessGrant.fullAccessMarker)
         return LegacySessionTokens(accessToken: access, refreshToken: refresh, did: account.did, handle: account.handle, scopes: fullAccess ? [] : session.scopeStrings, sessionID: sessionID, email: account.email, emailConfirmed: account.emailConfirmed, emailAuthFactor: account.emailAuthFactor, active: account.active, status: account.status, fullAccess: fullAccess)
     }
 
     private func makeTokens(access: String, refresh: String, session: LegacySessionMetadata) async throws -> LegacySessionTokens {
         guard let account = try await accountResolver.resolve(session.accountDID) else { throw SwanError.unauthorized("account unavailable") }
-        let fullAccess = session.scopeStrings.contains(Self.fullAccessMarker)
+        let fullAccess = session.scopeStrings.contains(LegacyAccessGrant.fullAccessMarker)
         return LegacySessionTokens(accessToken: access, refreshToken: refresh, did: account.did, handle: account.handle, scopes: fullAccess ? [] : session.scopeStrings, sessionID: session.sessionID, email: account.email, emailConfirmed: account.emailConfirmed, emailAuthFactor: account.emailAuthFactor, active: account.active, status: account.status, fullAccess: fullAccess)
     }
 

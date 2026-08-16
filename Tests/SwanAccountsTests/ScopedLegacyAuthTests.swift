@@ -16,6 +16,8 @@ final class ScopedLegacyAuthTests: XCTestCase {
         XCTAssertTrue(scope.allows(method: "com.atproto.repo.createRecord", audience: "https://pds.example.test/service/v1#x"))
         XCTAssertFalse(scope.allows(method: "com.atproto.repository.createRecord", audience: "https://pds.example.test/service/v1"))
         XCTAssertFalse(scope.allows(method: "com.atproto.repo.createRecord", audience: "https://pds.example.test/service-evil"))
+        XCTAssertFalse(SwanScope.audienceMatches("https://api.bsky.app", "https://api.bsky.app.evil/"))
+        XCTAssertTrue(SwanScope.audienceMatches("https://api.bsky.app", "https://api.bsky.app:443/"))
     }
 
     func testDeclaredMethodPolicyDeniesUndeclaredMethodsAndRequiresScopes() throws {

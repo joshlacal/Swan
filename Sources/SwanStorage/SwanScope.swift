@@ -82,7 +82,19 @@ public struct SwanScope: Codable, Hashable, Sendable, Equatable {
         let expected = stripFragment(expected)
         let actual = stripFragment(actual)
         guard !expected.isEmpty, !actual.isEmpty else { return false }
-        return actual == expected || actual.hasPrefix(expected + "/") || actual.hasPrefix(expected + ".")
+        guard let expectedURL = URLComponents(string: expected), let actualURL = URLComponents(string: actual),
+              let expectedScheme = expectedURL.scheme?.lowercased(), let actualScheme = actualURL.scheme?.lowercased(),
+              let expectedHost = expectedURL.host?.lowercased(), let actualHost = actualURL.host?.lowercased(),
+              expectedScheme == actualScheme, expectedHost == actualHost,
+              normalizedPort(expectedURL) == normalizedPort(actualURL) else { return actual == expected }
+        let expectedPath = expectedURL.path.isEmpty ? "/" : expectedURL.path
+        let actualPath = actualURL.path.isEmpty ? "/" : actualURL.path
+        return actualPath == expectedPath || actualPath.hasPrefix(expectedPath.hasSuffix("/") ? expectedPath : expectedPath + "/")
+    }
+
+    private static func normalizedPort(_ value: URLComponents) -> Int? {
+        if let port = value.port { return port }
+        switch value.scheme?.lowercased() { case "https": return 443; case "http": return 80; default: return nil }
     }
 
     public static func dotBoundaryPrefix(_ value: String, _ prefix: String) -> Bool {
