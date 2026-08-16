@@ -1,0 +1,26 @@
+{
+  "name": "swan-account-portal",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "lint": "eslint . --ignore-pattern 'src/**' --ignore-pattern 'tests/**'",
+    "test": "vitest run",
+    "build": "vite build",
+    "test:browser": "playwright test"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.8",
+    "@sveltejs/kit": "^2.37.0",
+    "@sveltejs/vite-plugin-svelte": "^6.1.0",
+    "@playwright/test": "^1.54.2",
+    "@types/node": "^22.15.0",
+    "eslint": "^9.32.0",
+    "eslint-plugin-svelte": "^3.10.1",
+    "svelte": "^5.38.7",
+    "svelte-check": "^4.3.1",
+    "typescript": "^5.8.3",
+    "vite": "^7.1.2",
+    "vitest": "^3.2.4"
+  }
+}
