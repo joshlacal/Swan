@@ -122,3 +122,5 @@ Residual hardening adds remaining-deadline rejection and cancellation checks to 
 Retention correction purges expired issued authorizations/owned reservations, consumed proofs after audit retention, expired invites, and redeemed invites after retention in bounded batches. Signup email issuance now generates the code internally with CSPRNG, persists only the digest plus protected envelope, and exposes submitted-code digest verification rather than a public raw-code issuance path.
 
 Verification correction adds a persisted proof verifier that recomputes HMAC over submitted code/email/handle, requires an authorization-owned live reservation, and applies bounded attempts. Reservation/proof purge deletes use bounded key subqueries.
+
+Final review correction wires the persisted verifier into `SignupService.authorize` when injected, fixes the sixth-attempt bypass, caps the attempt dictionary at 4096 with fail-closed admission, and caps SMTP attempt timeout at 300 seconds. `swift build --target SwanAccounts` completed successfully with pre-existing warnings.

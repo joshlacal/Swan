@@ -373,7 +373,7 @@ public actor AuthenticatedSMTPDelivery: AccountEmailDelivery {
     private let transport: any AuthenticatedSMTPTransport
     private let attemptTimeout: Duration
     public init(configuration: AuthenticatedSMTPConfiguration, transport: any AuthenticatedSMTPTransport, attemptTimeout: Duration = .seconds(30)) throws {
-        guard attemptTimeout > .zero else { throw SwanError.invalidIdentifier("SMTP attempt timeout") }
+        guard attemptTimeout > .zero, attemptTimeout <= .seconds(300) else { throw SwanError.invalidIdentifier("SMTP attempt timeout") }
         self.configuration = configuration; self.transport = transport; self.attemptTimeout = attemptTimeout
     }
 
@@ -618,14 +618,20 @@ public struct SignupService: Sendable {
     private let finalizationCoordinator: (any SignupFinalizationCoordinator)?
     private let turnstile: TurnstileVerifier?
     private let rateAdmission: (any SignupRateAdmission)?
-    public init(policy: SignupPolicyService, store: any SignupAuthorizationStore, finalizationCoordinator: (any SignupFinalizationCoordinator)? = nil, turnstile: TurnstileVerifier? = nil, rateAdmission: (any SignupRateAdmission)? = nil) {
-        self.policy = policy; self.store = store; self.finalizationCoordinator = finalizationCoordinator; self.turnstile = turnstile; self.rateAdmission = rateAdmission
+    private let proofVerifier: (any SignupEmailProofVerifier)?
+    private let proofService: SignupEmailProofService?
+    public init(policy: SignupPolicyService, store: any SignupAuthorizationStore, finalizationCoordinator: (any SignupFinalizationCoordinator)? = nil, turnstile: TurnstileVerifier? = nil, rateAdmission: (any SignupRateAdmission)? = nil, proofVerifier: (any SignupEmailProofVerifier)? = nil, proofService: SignupEmailProofService? = nil) {
+        self.policy = policy; self.store = store; self.finalizationCoordinator = finalizationCoordinator; self.turnstile = turnstile; self.rateAdmission = rateAdmission; self.proofVerifier = proofVerifier; self.proofService = proofService
     }
 
-    public func authorize(_ input: SignupAuthorizationInput, turnstileToken: String? = nil, remoteIP: String? = nil, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupAuthorization {
+    public func authorize(_ input: SignupAuthorizationInput, verificationCode: String? = nil, turnstileToken: String? = nil, remoteIP: String? = nil, now: Date = Date(), lifetime: TimeInterval = 600) async throws -> SignupAuthorization {
         guard policy.policy.permitsPublicSignup, input.isTrustedBucket else { throw SignupServiceError.closed }
         guard lifetime.isFinite, (1 ... 900).contains(lifetime) else { throw SwanError.invalidIdentifier("signup authorization lifetime") }
         guard input.email != nil, input.emailProofDigest != nil else { throw SignupServiceError.emailProofRequired }
+        if let verificationCode, let verifier = proofVerifier, let proofService, let email = input.email {
+            let digest = try await verifier.verifySubmittedCode(verificationCode, email: email, handle: input.handle, authorizationID: input.authorizationID, proof: proofService, now: now)
+            guard digest == input.emailProofDigest else { throw SignupServiceError.emailProofRequired }
+        } else if proofVerifier != nil { throw SignupServiceError.emailProofRequired }
         guard policy.permits(handle: input.handle, inviteCode: input.inviteDigest == nil ? nil : "present") else { throw SignupServiceError.inviteRequired }
         if policy.policy == .inviteRequired {
             guard let rateAdmission, try await rateAdmission.permits(bucket: input.clientIPBucketDigest, now: now) else { throw SignupServiceError.inviteRequired }
@@ -731,9 +737,13 @@ public actor BoundedSignupEmailProofVerifier {
     public func verifySubmittedCode(_ code: String, email: AccountEmailAddress, handle: String, authorizationID: SignupAuthorizationID, proof: SignupEmailProofService, now: Date = Date()) async throws -> Data {
         let key = "\(authorizationID.rawValue)\0\(email.value)"
         attempts = attempts.filter { now.timeIntervalSince($0.value.started) < 900 }
-        guard let current = attempts[key], current.count >= 5 ? false : true else { attempts[key] = (now, 1); return try await store.verifySubmittedCode(code, email: email, handle: handle, authorizationID: authorizationID, proof: proof, now: now) }
-        attempts[key] = (current.started, current.count + 1)
-        guard current.count < 5 else { throw SwanError.unavailable("email proof rate limited") }
+        guard attempts[key] != nil || attempts.count < 4096 else { throw SwanError.unavailable("email proof capacity") }
+        if let current = attempts[key] {
+            guard current.count < 5 else { throw SwanError.unavailable("email proof rate limited") }
+            attempts[key] = (current.started, current.count + 1)
+        } else {
+            attempts[key] = (now, 1)
+        }
         return try await store.verifySubmittedCode(code, email: email, handle: handle, authorizationID: authorizationID, proof: proof, now: now)
     }
 }
