@@ -131,7 +131,7 @@ public struct SwanAccountPortalHTTP: Sendable {
             guard let session = accountCookie(named: SwanManagementSessionRuntime.sessionCookieName, request: request),
                   let metadata = try? await sessions.authenticate(sessionValue: session) else { return accountError(.unauthorized) }
             do { return accountJSON(.ok, try await service.portal(accountDID: metadata.accountDID, now: Date())) }
-            catch { return accountError(.serviceUnavailable) }
+            catch { return portalErrorResponse(error) }
         }
 
         // Register every read surface explicitly. They all share the same
@@ -142,7 +142,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                 guard let session = accountCookie(named: SwanManagementSessionRuntime.sessionCookieName, request: request),
                       let metadata = try? await sessions.authenticate(sessionValue: session) else { return accountError(.unauthorized) }
                 do { return accountJSON(.ok, try await service.portal(accountDID: metadata.accountDID, now: Date())) }
-                catch { return accountError(.serviceUnavailable) }
+                catch { return portalErrorResponse(error) }
             }
         }
 
@@ -202,7 +202,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                     let mutation = try await service.mutate(path: path, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength), payload: payload, now: Date())
                     if path == "logout" { try await sessions.revoke(sessionValue: session) }
                     return accountJSON(.ok, mutation, cookies: path == "logout" ? [expiredManagementCookie(), expiredCSRFToken()] : [])
-                } catch { return accountError(.serviceUnavailable) }
+                } catch { return portalErrorResponse(error) }
             }
         }
 
@@ -216,7 +216,7 @@ public struct SwanAccountPortalHTTP: Sendable {
                 do {
                     let metadata = try await sessions.authenticate(sessionValue: session)
                     return accountJSON(.ok, try await service.mutate(path: path, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength), payload: nil, now: Date()))
-                } catch { return accountError(.serviceUnavailable) }
+                } catch { return portalErrorResponse(error) }
             }
         }
 
@@ -232,8 +232,9 @@ public struct SwanAccountPortalHTTP: Sendable {
                     let admitted = try await collectAdmittedRequestBody(request, mediaType: .json, admission: .managementProcessShared, policy: .productionDefault, maximumBytes: 16 * 1024, termination: context.jsonWriteBodyTermination)
                     defer { admitted.release() }
                     let payload = admitted.getBytes(at: admitted.readerIndex, length: admitted.readableBytes).map { Data($0) }
-                    return accountJSON(.ok, try await service.mutate(path: request.uri.path, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength), payload: payload, now: Date()))
-                } catch { return accountError(.serviceUnavailable) }
+                    let mutationPath = String(request.uri.path.dropFirst("/account/api/".count))
+                    return accountJSON(.ok, try await service.mutate(path: mutationPath, context: .init(sessionID: metadata.sessionID.rawValue, accountDID: metadata.accountDID, strength: metadata.strength), payload: payload, now: Date()))
+                } catch { return portalErrorResponse(error) }
             }
         }
 
@@ -354,6 +355,19 @@ private func constantTime(_ lhs: String, _ rhs: String) -> Bool { guard lhs.utf8
 private func accountJSON(_ status: HTTPResponse.Status, _ body: some Encodable, cookies: [String] = []) -> Response { var headers: HTTPFields = [.contentType: "application/json", .cacheControl: "no-store"]; for cookie in cookies { headers.append(.init(name: HTTPField.Name("Set-Cookie")!, value: cookie)) }; let data = (try? JSONEncoder().encode(body)) ?? Data("{}".utf8); return Response(status: status, headers: headers, body: .init(byteBuffer: ByteBuffer(data: data))) }
 private enum AccountStatus { case ok, badRequest, unauthorized, forbidden, conflict, unprocessable, rateLimited, notFound, serviceUnavailable }
 private func accountError(_ status: AccountStatus) -> Response { let code = switch status { case .badRequest: "invalid_request"; case .unauthorized: "authentication_required"; case .forbidden: "request_not_allowed"; case .conflict: "conflict"; case .unprocessable: "unprocessable_entity"; case .rateLimited: "rate_limited"; case .notFound: "not_found"; case .serviceUnavailable: "service_unavailable"; case .ok: "ok" }; let http: HTTPResponse.Status = switch status { case .badRequest: .badRequest; case .unauthorized: .unauthorized; case .forbidden: .forbidden; case .conflict: .conflict; case .unprocessable: HTTPResponse.Status(code: 422); case .rateLimited: .tooManyRequests; case .notFound: .notFound; case .serviceUnavailable: .serviceUnavailable; case .ok: .ok }; return accountJSON(http, ["code": code, "message": code == "request_not_allowed" ? "Request not allowed." : code == "invalid_request" ? "Invalid request." : "The account service is unavailable."]) }
+private func portalErrorResponse(_ error: Error) -> Response {
+    guard let error = error as? SwanAccountPortalServiceError else {
+        return accountError(.serviceUnavailable)
+    }
+    switch error {
+    case .unauthorized: return accountError(.unauthorized)
+    case .forbidden: return accountError(.forbidden)
+    case .notFound: return accountError(.notFound)
+    case .invalidRequest: return accountError(.badRequest)
+    case .unsupported, .unavailable: return accountError(.serviceUnavailable)
+    }
+}
+
 private func managementCookie(_ value: String) -> String { "\(SwanManagementSessionRuntime.sessionCookieName)=\(value); Path=/account; Secure; HttpOnly; SameSite=Strict" }
 private func csrfCookie(_ value: String) -> String { "\(SwanManagementSessionRuntime.csrfCookieName)=\(value); Path=/account; Secure; SameSite=Strict" }
 private func preAuthCookie(_ value: String) -> String { "\(SwanManagementSessionRuntime.preAuthCookieName)=\(value); Path=/account; Secure; SameSite=Strict" }

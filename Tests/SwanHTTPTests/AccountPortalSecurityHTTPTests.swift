@@ -15,6 +15,60 @@ import SwanStorage
 import XCTest
 
 final class AccountPortalSecurityHTTPTests: XCTestCase, @unchecked Sendable {
+    func testProductionPortalFacadeRejectsUnknownAccountWithStableTypedError() async throws {
+        let service = SwanAccountPortalService(
+            accountDirectory: RejectingAccountDirectory(),
+            sessions: SwanManagementSessionRuntime(
+                store: PortalMemorySessionStore(),
+                preAuthStore: SwanInMemoryManagementPreAuthStore(),
+                csrfStore: SwanInMemoryManagementCSRFStore()
+            )
+        )
+
+        do {
+            _ = try await service.portal(accountDID: "did:plc:unknown", now: Date())
+            XCTFail("unknown accounts must not produce a portal snapshot")
+        } catch let error as SwanAccountPortalServiceError {
+            XCTAssertEqual(error, .notFound)
+        }
+    }
+    func testProductionFacadeUsesConfiguredStaticDirectoryWithDurableSessions() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "AccountPortalSecurityHTTPTests-static-\(UUID().uuidString)")
+        let staticDirectory = root.appending(path: "account")
+        try FileManager.default.createDirectory(at: staticDirectory, withIntermediateDirectories: true)
+        try Data("<!doctype html><title>production portal</title>".utf8).write(to: staticDirectory.appending(path: "index.html"))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let database = try await SQLiteControlDatabase(dataDirectory: root.appending(path: "data"))
+        defer { Task { try? await database.close() } }
+        try await database.migrateAccountPortalSessionSchema()
+        let sessions = SwanManagementSessionRuntime(
+            store: database,
+            preAuthStore: database,
+            csrfStore: database,
+            preAuthSessionCoordinator: database
+        )
+        let service = SwanAccountPortalService(accountDirectory: RejectingAccountDirectory(), sessions: sessions)
+        let configuration = try SwanAccountPortalConfiguration(
+            publicOrigin: URL(string: "https://accounts.example")!,
+            staticDirectory: staticDirectory
+        )
+        let router = Router(context: SwanHTTPRequestContext.self)
+        SwanAccountPortalHTTP(configuration: configuration, sessions: sessions, service: service).register(on: router)
+        let app = Application(
+            router: router,
+            configuration: .init(address: .hostname("127.0.0.1", port: 0), serverName: "portal-production-static"),
+            logger: Logger(label: "portal-production-static")
+        )
+        try await app.test(.router) { client in
+            try await client.execute(uri: "/account", method: .get) { response in
+                XCTAssertEqual(response.status, .ok)
+                XCTAssertEqual(String(decoding: response.body.readableBytesView, as: UTF8.self), "<!doctype html><title>production portal</title>")
+            }
+        }
+    }
+
+
     func testAccountAPIRoutesBeatRecursiveSPAAndExposeConfiguredPolicy() async throws {
         let router = try makePortalRouter(policy: .openProtected)
         let app = Application(
@@ -330,6 +384,12 @@ final class AccountPortalSecurityHTTPTests: XCTestCase, @unchecked Sendable {
             .deletingLastPathComponent()
     }
 }
+private struct RejectingAccountDirectory: SwanAccountPortalAccountDirectory {
+    func account(did _: String) async throws -> AccountControlAccount? { nil }
+    func resolve(handle _: String) async throws -> AccountControlAccount? { nil }
+    func authenticateForLogin(handle _: String, password _: String, now _: Date) async throws -> AccountLoginAuthenticationOutcome { .rejected }
+}
+
 
 private actor PortalMemorySessionStore: ManagementSessionStore {
     private var values: [Data: ManagementSessionMetadata] = [:]
